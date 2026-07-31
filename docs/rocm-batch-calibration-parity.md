@@ -214,6 +214,12 @@ Cost: ambient-restricted hosts (Slurm-style schedulers set ROCR) stay
 unpriced in v1 — safe, documented, and revisitable once the single-var
 ROCR-only composition is worth the complexity.
 
+Blanking the inventory withdraws the pins *we* derive; it does not decide
+what happens to a pin the **operator** wrote in the registry. That depends
+on which layer their restriction sits in, so the probe records the kind
+alongside the blanked inventory (`rocm::ambient_hip_restriction`, carried on
+`MemoryBackend::RocmSysfs`) and D2 acts on it.
+
 ### D2 (G2) — Pinning: `HIP_VISIBLE_DEVICES=<row index>`
 
 The spawn layer writes the env var the backend dictates:
@@ -223,7 +229,11 @@ board's position in the openable KFD-node-order inventory (D1), which is
 the HIP device order on an unrestricted host. `WorkerSpawnConfig` learns
 the accelerator (or a resolved "pin env var" field) to select the form;
 `resolve_pin` on ROCm resolves registry `devices` entries (board key or
-index) to the row index. Pin-string handling differs from CUDA where
+index) to the row index; the board-key match is **exact** (case-insensitive),
+not CUDA's abbreviated-prefix match, because CUDA's abbreviation is a
+property of the string handed to the CUDA runtime while these keys never
+reach HIP at all — and a prefix could name two `GPU-BDF-…` boards on one
+bus. Pin-string handling differs from CUDA where
 verbatim pass-through would change meaning (review F8): an unresolvable
 **numeric** pin (an index we cannot see, a comma-separated index list)
 passes through verbatim with a warning — HIP accepts indices, so the
@@ -232,6 +242,44 @@ operator's intent survives; an unresolvable **non-numeric** pin (a
 HIP accepts only indices, so writing it would hide every device and send
 the worker to CPU, which is strictly worse than the no-pin behaviour the
 warning preserves.
+
+Both numeric forms are **canonicalised** (`"00"` → `"0"`, `" 1 , 2 "` →
+`"1,2"`) rather than echoed as spelled. Pins are compared as strings
+elsewhere — `prewarm.rs` hands a parked worker to a replica only when the
+recorded and resolved pin strings are equal — so two spellings of one device
+have to converge here or pooling silently stops matching the
+`default_pin()` rendering.
+
+The variable is chosen by the **resolved accelerator, not by the inventory**,
+and a ROCm host whose inventory came back unknown (ambient restriction,
+probe failure, non-Linux) therefore keeps HIP's vocabulary rather than
+falling back to CUDA's passthrough: the backend on that blanked inventory is
+still `RocmSysfs`, so its memory refresh is still amdgpu's and its pins are
+still indices. What it does with a registry pin:
+
+- a **HIP-legal** pin (an index, or an index list) → canonicalised and
+  written to `HIP_VISIBLE_DEVICES`. There is no inventory to translate a
+  board key against or to range-check the index with, but HIP reads an index
+  without our help.
+- **anything else** → dropped with a warning, exactly as on a known ROCm
+  host. The harm — every board hidden, worker silently on CPU — does not
+  depend on whether we could enumerate the boards.
+- **anything at all, including an index, when the ambient restriction is at
+  HIP's own layer** (`HIP_VISIBLE_DEVICES`, its `CUDA_VISIBLE_DEVICES`
+  alias, or `GPU_DEVICE_ORDINAL`) → dropped with a warning: the operator's
+  restriction wins and there is no pinning on that host at all. Ours would
+  overwrite theirs, or outrank it as the stronger alias, widening a set they
+  deliberately narrowed.
+- an ambient **`ROCR_VISIBLE_DEVICES` alone does not** trigger that: it
+  filters below HIP, and a HIP index counts into the filtered set, so a
+  numeric registry pin composes with the operator's restriction instead of
+  escaping it. (The *inventory* is still blanked there — D1 is unchanged —
+  so this only concerns pins the operator wrote themselves.)
+
+Choosing by the inventory instead would send those pins to
+`CUDA_VISIBLE_DEVICES`, which HIP consults only when `HIP_VISIBLE_DEVICES`
+is unset — the weaker of the two aliases, on exactly the hosts that are
+hardest to reason about.
 
 Why HIP and not ROCR form: torch honours HIP first on every relevant
 version, torch < 2.6 (possible in user-managed venvs) crashes outright
@@ -242,6 +290,30 @@ also set on ROCm (it is a HIP alias; setting both is documented as
 worker env (`accelerator_env::worker_env`) composes untouched — it never
 sets visibility vars. eocr's internal `cuda:0` single-device string is a
 no-op under a single visible device.
+
+**Known gap this opens (found implementing D2, 2026-07-31):** *load
+reservations* are keyed by the resolved pin string
+(`ModelManager::spawn_model` → `VramLedger::reserve_load(…, pin, …)`, which
+looks the board up in the ledger's board map). That map is keyed by board
+*key*, so on ROCm — where the pin is now an index — the lookup misses and no
+load reservation is ever taken; the in-flight load simply is not charged
+until the worker registers. Not a regression (before D2 a ROCm host had no
+pins at all, so the same code reserved nothing), and it fails in the safe
+direction, but it is a real parity gap: a second model loading concurrently
+can be granted a window against memory the first load is about to take.
+Closing it needs a pin → board-key mapping at that call site, which belongs
+with D3's identity work rather than here.
+
+Two reviewer-confirmed reasons the deferral is the right call rather than a
+shortcut. First, **CUDA already misses** at this same call site: an
+abbreviated-UUID pin and an index pin we could not resolve are both written
+verbatim and neither matches a ledger board key, so ROCm differs from CUDA
+in *frequency*, not in kind — the fix is one mechanism for both, not a ROCm
+patch. Second, **ROCm is unpriced end to end until D3**: `register_worker`
+matches on a torch-rendered UUID a ROCm worker cannot produce, so no ROCm
+replica is admitted to the ledger at all, and a load reservation there would
+be protecting memory against admissions that cannot happen. The call site
+carries a `TODO(D3)` anchor pointing here.
 
 The enumeration-order assumption (openable KFD node order = HIP order) is
 the one load-bearing unverifiable here, and D3's registration cross-check

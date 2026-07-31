@@ -113,10 +113,13 @@ enum Slot {
     Parked {
         worker: Worker,
         failed_prepare: bool,
-        /// The `CUDA_VISIBLE_DEVICES` pin this process was spawned with —
-        /// the default GPU's UUID when the inventory is known. A claim is
-        /// only valid for a replica whose resolved pin is the same, so the
-        /// pin has to be recorded rather than assumed.
+        /// The device pin this process was spawned with — the default
+        /// GPU's UUID when a CUDA inventory is known, its HIP device index
+        /// when a ROCm one is (`gpu::GpuInventory::default_pin`). A claim is
+        /// only valid for a replica whose resolved pin is the same string,
+        /// which works in either vocabulary because both sides of the
+        /// comparison come from the same resolver — so the pin has to be
+        /// recorded rather than assumed.
         pin: Option<String>,
     },
 }
@@ -217,8 +220,8 @@ impl PrewarmPool {
     /// fresh spawn. A `Spawning` slot is left alone (the warm-up lands in
     /// the pool for next time).
     ///
-    /// `wanted_pin` is the resolved `CUDA_VISIBLE_DEVICES` value of the
-    /// replica being filled. The claim only happens when the parked worker
+    /// `wanted_pin` is the resolved device pin of the replica being filled
+    /// (a board UUID on CUDA, a HIP device index on ROCm). The claim only happens when the parked worker
     /// was spawned with exactly that pin: handing a worker pinned to board A
     /// to a replica that must run on board B would put its footprint on the
     /// wrong ledger (and on the wrong GPU). A mismatch leaves the worker
@@ -612,6 +615,9 @@ mod tests {
             env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
+            // The fixture impls echo `CUDA_VISIBLE_DEVICES`, which is also
+            // what every non-ROCm host writes.
+            pin_env_var: crate::inferio::gpu::CUDA_PIN_ENV_VAR,
         }
     }
 

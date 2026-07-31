@@ -152,6 +152,13 @@ impl InferioState {
             env_remove: Vec::new(),
             cwd: None,
             deadlines,
+            // The pin *variable* follows the same resolved accelerator as the
+            // worker env and the profile keys — not the inventory: a ROCm
+            // host whose inventory came back unknown (ambient restriction,
+            // probe failure) still passes the operator's registry pin
+            // through verbatim, and a HIP index only means what they meant in
+            // HIP's own variable (docs/rocm-batch-calibration-parity.md, D2).
+            pin_env_var: super::gpu::pin_env_var(accelerator),
         };
         // One probe answers both hardware questions: which boards exist
         // (worker→GPU pinning, the per-GPU ledger) and what they can do (the
@@ -1078,6 +1085,9 @@ mod tests {
             env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
+            // The fixture impls echo `CUDA_VISIBLE_DEVICES`, which is also
+            // what every non-ROCm host writes.
+            pin_env_var: crate::inferio::gpu::CUDA_PIN_ENV_VAR,
         }
     }
 

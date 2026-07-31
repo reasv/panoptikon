@@ -52,6 +52,20 @@ pub(super) const VISIBILITY_VARS: [&str; 4] = [
     "GPU_DEVICE_ORDINAL",
 ];
 
+/// The HIP-layer subset of [`VISIBILITY_VARS`] — the ones a pin of ours
+/// would collide with rather than compose with. `HIP_VISIBLE_DEVICES` is the
+/// variable D2 writes, so we would overwrite the operator's value outright;
+/// `CUDA_VISIBLE_DEVICES` is its alias, which the one we write takes
+/// precedence over; `GPU_DEVICE_ORDINAL` filters at the same layer, so our
+/// value and theirs contend. `ROCR_VISIBLE_DEVICES` is deliberately absent:
+/// it filters *below* HIP, and a HIP index counts into the ROCr-filtered
+/// set, so the two compose correctly (see [`ambient_hip_restriction`]).
+const HIP_LAYER_VISIBILITY_VARS: [&str; 3] = [
+    "HIP_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "GPU_DEVICE_ORDINAL",
+];
+
 /// The three filesystem roots the probe reads. Injectable so the parse and
 /// build logic is exercised against fixture trees rather than hardware
 /// (and so those tests run on non-Linux dev machines).
@@ -94,6 +108,11 @@ impl Default for SysfsRoots {
 /// mistake that makes cross-vocabulary AMD device matching unsound. Cost:
 /// scheduler-managed hosts (Slurm sets `ROCR_VISIBLE_DEVICES`) stay
 /// unpriced, which is safe and today's behaviour.
+///
+/// Blanking the inventory withdraws the pins *we* derive. It does not by
+/// itself decide what happens to a pin the operator wrote in the registry;
+/// that depends on which layer the ambient restriction sits in, which is
+/// what [`ambient_hip_restriction`] records for `gpu.rs`.
 pub(super) fn build(
     roots: &SysfsRoots,
     ambient: [Option<&str>; VISIBILITY_VARS.len()],
@@ -101,10 +120,13 @@ pub(super) fn build(
     if let Some(var) = ambient_restriction(ambient) {
         tracing::info!(
             variable = var,
+            hip_layer = ambient_hip_restriction(ambient),
             "an ambient GPU visibility restriction is set; leaving the ROCm \
              GPU inventory unknown (HIP device indices count the filtered \
              set, so our pins cannot compose with it) — workers inherit the \
-             restriction as-is"
+             restriction as-is: a HIP-layer restriction suppresses our \
+             pinning entirely, and under a ROCR-only one a registry index \
+             pin selects *within* the operator's set"
         );
         return None;
     }
@@ -157,15 +179,44 @@ fn ambient_restriction(ambient: [Option<&str>; VISIBILITY_VARS.len()]) -> Option
     VISIBILITY_VARS
         .iter()
         .zip(ambient)
-        .find(|(_, value)| {
-            value.is_some_and(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .any(|entry| !entry.is_empty())
-            })
-        })
+        .find(|(_, value)| is_set(*value))
         .map(|(var, _)| *var)
+}
+
+/// Whether any [`HIP_LAYER_VISIBILITY_VARS`] entry is set — i.e. whether the
+/// operator's ambient restriction lives in the *same* layer the pin would be
+/// written to.
+///
+/// This is not the same question as [`ambient_restriction`], which answers
+/// "is the inventory knowable" and is satisfied by any of the four. It is
+/// the pin question: a HIP index composes correctly with an ambient
+/// `ROCR_VISIBLE_DEVICES` (HIP indexes into the ROCr-filtered set, so the
+/// operator's filter still holds and ours selects within it), but there is
+/// no composing with a HIP-layer restriction — writing one clobbers or
+/// overrides it, quietly widening what the operator deliberately narrowed.
+/// So the *kind* is recorded here and `gpu.rs` refuses to pin at all in that
+/// case, rather than only refusing to pin what it cannot name.
+///
+/// Scans every variable rather than stopping at the first set one:
+/// `ROCR_VISIBLE_DEVICES` comes first positionally, and a host with both
+/// would otherwise be read as ROCR-only.
+pub(super) fn ambient_hip_restriction(ambient: [Option<&str>; VISIBILITY_VARS.len()]) -> bool {
+    VISIBILITY_VARS
+        .iter()
+        .zip(ambient)
+        .any(|(var, value)| HIP_LAYER_VISIBILITY_VARS.contains(var) && is_set(value))
+}
+
+/// A visibility variable counts as set only when it names at least one
+/// entry: whitespace- and comma-only values are "not configured", matching
+/// how the CUDA path treats an empty `CUDA_VISIBLE_DEVICES`.
+fn is_set(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .any(|entry| !entry.is_empty())
+    })
 }
 
 /// GPU nodes whose render node this process can actually open, in ascending

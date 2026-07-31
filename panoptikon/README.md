@@ -899,7 +899,10 @@ These are deliberately *not* TOML keys:
   set and supports per-module directives.
 - Variables the gateway *sets* on child processes (internal protocol):
   `INFERIO_WORKER`, `PYTHONIOENCODING`, `PYTHONPATH` (prepended),
-  `CUDA_VISIBLE_DEVICES` (per-replica device pins), plus plain environment
+  `CUDA_VISIBLE_DEVICES` (per-replica device pins; on a ROCm host the pin is
+  a HIP device index in `HIP_VISIBLE_DEVICES` instead, and
+  `CUDA_VISIBLE_DEVICES` is left alone — a pin that cannot be resolved to an
+  index there is dropped rather than written), plus plain environment
   inheritance (except `PYTHONHOME`, which is removed — launcher-exported
   values break venv interpreters). Declared Inferio external inputs are then explicitly set or
   removed from each new worker using the current just-in-time snapshot; the UI

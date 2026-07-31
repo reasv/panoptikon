@@ -137,6 +137,15 @@ pub struct WorkerSpawnConfig {
     pub env_remove: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub deadlines: WorkerDeadlines,
+    /// The variable a resolved device pin is written to:
+    /// `CUDA_VISIBLE_DEVICES` on CUDA (and on hosts with no accelerator of
+    /// their own), `HIP_VISIBLE_DEVICES` on ROCm — the two vocabularies are
+    /// not interchangeable, so the pin *value* (`gpu::GpuInventory::resolve_pin`)
+    /// and this name are one decision made in one place
+    /// (`gpu::pin_env_var`, from the resolved accelerator; see
+    /// docs/rocm-batch-calibration-parity.md, D2). This layer only writes
+    /// what it is handed.
+    pub pin_env_var: &'static str,
 }
 
 /// One entry of a `predict` request: JSON-like `data` and/or raw `file`
@@ -286,12 +295,18 @@ pub struct BatchSample {
 /// eviction) is step 1b.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerTelemetry {
-    /// Resolved `CUDA_VISIBLE_DEVICES` pin: a `GPU-…` board UUID once the
-    /// inventory is known, else whatever the registry asked for, else
-    /// `None` on hosts with no GPU inventory. Never changes after spawn.
-    /// Kept beside the worker-reported [`LoadReport::gpu_uuid`], which is the
-    /// identity the ledger keys on — the two can differ (an index pin, an
-    /// unknown inventory, a MIG instance).
+    /// Resolved device pin, in the vocabulary of the variable it was written
+    /// to ([`WorkerSpawnConfig::pin_env_var`]): a `GPU-…` board UUID on a
+    /// known CUDA inventory, a **HIP device index string** on a known ROCm
+    /// one (`HIP_VISIBLE_DEVICES` accepts nothing else), else whatever the
+    /// registry asked for, else `None` on hosts with no GPU inventory. Never
+    /// changes after spawn.
+    ///
+    /// Operator-facing provenance only — it is surfaced on `/health` and
+    /// nothing keys on it. The identity the ledger keys on is the
+    /// worker-reported [`LoadReport::gpu_uuid`], and the two can differ in
+    /// form as well as in value (an index pin, an unknown inventory, a MIG
+    /// instance, any ROCm host).
     pub gpu: Option<String>,
     pub load: Option<Timestamped<LoadReport>>,
     /// Freshest sample, from whichever response carried one last.
@@ -435,11 +450,124 @@ pub struct Worker {
     dead: bool,
 }
 
+/// The fully environment-shaped child command for one worker, per the
+/// protocol's spawn contract (docs/inferio-worker-protocol.md,
+/// "Environment"). Separate from [`Worker::spawn`] so the environment it
+/// composes — in particular *which* visibility variable a device pin lands
+/// in — is assertable without a Python interpreter on the box.
+///
+/// `device` is the pin `gpu::GpuInventory::resolve_pin` already resolved,
+/// and [`WorkerSpawnConfig::pin_env_var`] is the variable that vocabulary
+/// belongs to. Exactly one of them is ever written: `CUDA_VISIBLE_DEVICES`
+/// is deliberately not also set on ROCm (it is a HIP alias, and AMD
+/// documents setting both as unintended-behaviour territory), and the ROCm
+/// worker env from `accelerator_env` sets no visibility variable at all, so
+/// the two compose without overlapping.
+fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Command> {
+    let mut command = Command::new(&cfg.python);
+    command
+        .arg("-m")
+        .arg("inferio_worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("INFERIO_WORKER", "1")
+        // Defense in depth for the stderr forwarder: keep Python's own
+        // text streams UTF-8 regardless of the console code page
+        // (cp1252 tracebacks on Windows). The Rust side still tolerates
+        // arbitrary bytes — native libraries write to fd 2 directly.
+        .env("PYTHONIOENCODING", "utf-8")
+        // A set PYTHONHOME is never valid for a venv interpreter, and
+        // AppImage-style launchers export one pointing into their mount,
+        // which kills the child before main (missing 'encodings'). The
+        // PYTHONPATH inherit below stays: it is a deliberate dev hook.
+        .env_remove("PYTHONHOME");
+    if !cfg.pythonpath.is_empty() {
+        let mut entries = cfg.pythonpath.clone();
+        if let Some(existing) = env::var_os("PYTHONPATH") {
+            entries.extend(env::split_paths(&existing));
+        }
+        let joined =
+            env::join_paths(&entries).context("PYTHONPATH entries contain the path separator")?;
+        command.env("PYTHONPATH", joined);
+    }
+    if let Some(device) = device {
+        command.env(cfg.pin_env_var, device);
+    }
+    for (key, value) in &cfg.env {
+        command.env(key, value);
+    }
+    for key in &cfg.env_remove {
+        command.env_remove(key);
+    }
+    warn_on_visibility_overrides(cfg, device);
+    if let Some(cwd) = &cfg.cwd {
+        command.current_dir(cwd);
+    }
+    // An interactive Ctrl-C must reach the gateway alone; the shutdown
+    // ladder (unload → terminate → kill) does the stopping. A worker hit
+    // directly by the console signal dies before `unload` is sent and is
+    // reported as an unexpected death.
+    detach_from_console(&mut command);
+    // And if the gateway dies with no cleanup at all (forced exit, OOM
+    // kill), the kernel reaps the worker: job object on Windows,
+    // PR_SET_PDEATHSIG on Unix.
+    die_with_parent(&mut command);
+    Ok(command)
+}
+
+/// One line when a worker's own env config touches a GPU-visibility
+/// variable, because that config is applied *after* the pin and therefore
+/// silently outranks it.
+///
+/// Two shapes of collision, both worth the same warning. An entry for the
+/// variable the pin was written to replaces the pin outright (or, via
+/// `env_remove`, deletes it, leaving the worker whatever the gateway
+/// inherited). An entry for a *different* visibility variable does not
+/// overwrite anything, but the AMD stack still resolves the pair by its own
+/// precedence — `HIP_VISIBLE_DEVICES` over its `CUDA_VISIBLE_DEVICES` alias,
+/// both indexing into whatever `ROCR_VISIBLE_DEVICES` already filtered — so
+/// the boards the worker ends up on are not necessarily the ones the pin
+/// named. Neither case is an error: an operator may well mean it. It is
+/// simply the one env interaction whose symptom (a model running on the
+/// wrong board, or on the CPU) points nowhere near its cause.
+///
+/// One line per spawn, listing every colliding variable, and only when there
+/// is a collision to report.
+fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, device: Option<&str>) {
+    let overrides: Vec<&str> = super::rocm::VISIBILITY_VARS
+        .into_iter()
+        .filter(|var| {
+            let set = cfg.env.iter().any(|(key, _)| key.eq_ignore_ascii_case(var));
+            let removed = cfg
+                .env_remove
+                .iter()
+                .any(|key| key.eq_ignore_ascii_case(var));
+            set || removed
+        })
+        .collect();
+    if overrides.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        variables = overrides.join(", "),
+        pin_variable = cfg.pin_env_var,
+        pin = device.unwrap_or("(none)"),
+        "this worker's env config sets or removes a GPU-visibility variable; \
+         it is applied after the device pin, so an entry naming the pin's own \
+         variable replaces (or deletes) the pin, and an entry naming another \
+         one is resolved against it by the runtime's own precedence — either \
+         way the worker may not end up on the board it was pinned to"
+    );
+}
+
 impl Worker {
     /// Spawn `python -m inferio_worker` per the protocol's spawn contract
-    /// (INFERIO_WORKER=1, PYTHONPATH prepend, CUDA_VISIBLE_DEVICES when a
-    /// device pin is given, PYTHONHOME removed, inherited env otherwise)
-    /// — `device` is the *resolved* pin, normally a `GPU-…` board UUID
+    /// (INFERIO_WORKER=1, PYTHONPATH prepend, the backend's device-visibility
+    /// variable when a pin is given, PYTHONHOME removed, inherited env
+    /// otherwise — see [`worker_command`]) — `device` is the *resolved* pin,
+    /// a `GPU-…` board UUID on CUDA and a HIP device index on ROCm
     /// (`gpu.rs`); this layer only writes what it is handed —
     /// and perform the v2
     /// handshake — identity only (`impl_class` + the config's `impl_dirs`),
@@ -453,56 +581,7 @@ impl Worker {
         impl_class: &str,
         device: Option<String>,
     ) -> Result<Worker> {
-        let mut command = Command::new(&cfg.python);
-        command
-            .arg("-m")
-            .arg("inferio_worker")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .env("INFERIO_WORKER", "1")
-            // Defense in depth for the stderr forwarder: keep Python's own
-            // text streams UTF-8 regardless of the console code page
-            // (cp1252 tracebacks on Windows). The Rust side still tolerates
-            // arbitrary bytes — native libraries write to fd 2 directly.
-            .env("PYTHONIOENCODING", "utf-8")
-            // A set PYTHONHOME is never valid for a venv interpreter, and
-            // AppImage-style launchers export one pointing into their mount,
-            // which kills the child before main (missing 'encodings'). The
-            // PYTHONPATH inherit below stays: it is a deliberate dev hook.
-            .env_remove("PYTHONHOME");
-        if !cfg.pythonpath.is_empty() {
-            let mut entries = cfg.pythonpath.clone();
-            if let Some(existing) = env::var_os("PYTHONPATH") {
-                entries.extend(env::split_paths(&existing));
-            }
-            let joined = env::join_paths(&entries)
-                .context("PYTHONPATH entries contain the path separator")?;
-            command.env("PYTHONPATH", joined);
-        }
-        if let Some(device) = device.as_deref() {
-            command.env("CUDA_VISIBLE_DEVICES", device);
-        }
-        for (key, value) in &cfg.env {
-            command.env(key, value);
-        }
-        for key in &cfg.env_remove {
-            command.env_remove(key);
-        }
-        if let Some(cwd) = &cfg.cwd {
-            command.current_dir(cwd);
-        }
-        // An interactive Ctrl-C must reach the gateway alone; the shutdown
-        // ladder (unload → terminate → kill) does the stopping. A worker hit
-        // directly by the console signal dies before `unload` is sent and is
-        // reported as an unexpected death.
-        detach_from_console(&mut command);
-        // And if the gateway dies with no cleanup at all (forced exit, OOM
-        // kill), the kernel reaps the worker: job object on Windows,
-        // PR_SET_PDEATHSIG on Unix.
-        die_with_parent(&mut command);
-
+        let mut command = worker_command(cfg, device.as_deref())?;
         let mut child = command.spawn().with_context(|| {
             format!(
                 "failed to spawn inferio worker for impl class {impl_class} via {}",
@@ -1511,6 +1590,9 @@ pub(super) mod testing {
             env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
+            // The fixture impls echo `CUDA_VISIBLE_DEVICES`, which is also
+            // what every non-ROCm host writes.
+            pin_env_var: crate::inferio::gpu::CUDA_PIN_ENV_VAR,
         }
     }
 
@@ -1530,6 +1612,63 @@ mod tests {
     use super::*;
     use super::testing::*;
     use serde_json::json;
+
+    /// D2's spawn half: a resolved pin goes into the visibility variable the
+    /// backend dictates and into **no other one**. `CUDA_VISIBLE_DEVICES` is
+    /// deliberately not also set on ROCm — it is a HIP alias, and setting
+    /// both is documented unintended-behaviour territory — and the CUDA
+    /// vocabulary must never reach HIP's variable, where a `GPU-…` string
+    /// hides every board.
+    ///
+    /// Asserted against the composed command rather than a live worker, so
+    /// it holds on any box, with or without an interpreter or a GPU.
+    #[test]
+    fn the_device_pin_goes_into_the_backends_visibility_variable() {
+        use crate::inferio::gpu::{CUDA_PIN_ENV_VAR, HIP_PIN_ENV_VAR};
+
+        fn config(pin_env_var: &'static str) -> WorkerSpawnConfig {
+            WorkerSpawnConfig {
+                python: PathBuf::from("python"),
+                impl_dirs: Vec::new(),
+                pythonpath: Vec::new(),
+                env: Vec::new(),
+                env_remove: Vec::new(),
+                cwd: None,
+                deadlines: WorkerDeadlines::default(),
+                pin_env_var,
+            }
+        }
+        fn pin_env(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Vec<(String, String)> {
+            worker_command(cfg, device)
+                .expect("the command composes")
+                .as_std()
+                .get_envs()
+                .filter(|(key, _)| key.to_string_lossy().ends_with("VISIBLE_DEVICES"))
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.unwrap_or_default().to_string_lossy().into_owned(),
+                    )
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            pin_env(&config(CUDA_PIN_ENV_VAR), Some("GPU-1a2b")),
+            vec![("CUDA_VISIBLE_DEVICES".to_owned(), "GPU-1a2b".to_owned())],
+            "a CUDA host writes the board UUID, and only that variable"
+        );
+        assert_eq!(
+            pin_env(&config(HIP_PIN_ENV_VAR), Some("1")),
+            vec![("HIP_VISIBLE_DEVICES".to_owned(), "1".to_owned())],
+            "a ROCm host writes the HIP device index, and CUDA_VISIBLE_DEVICES \
+             is deliberately left alone"
+        );
+        // No pin: no visibility variable at all, on either backend — the
+        // worker inherits whatever the operator's environment says.
+        assert!(pin_env(&config(CUDA_PIN_ENV_VAR), None).is_empty());
+        assert!(pin_env(&config(HIP_PIN_ENV_VAR), None).is_empty());
+    }
 
     /// Full happy path against a real worker subprocess: spawn+handshake
     /// resolves the echo_test fixture impl, load succeeds, a mixed predict

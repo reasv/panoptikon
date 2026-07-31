@@ -213,8 +213,10 @@ impl From<CostDimension> for CostHealth {
 /// host, or no predict yet).
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ReplicaTelemetryHealth {
-    /// Resolved `CUDA_VISIBLE_DEVICES` pin the worker was *spawned* with — a
-    /// board UUID when the GPU inventory is known.
+    /// Resolved device pin the worker was *spawned* with — a board UUID on a
+    /// known CUDA inventory, a HIP device index on a known ROCm one (the two
+    /// backends' visibility variables accept different vocabularies; see
+    /// `gpu::pin_env_var`).
     pub gpu: Option<String>,
     /// The board the worker itself reports being on, which is what step 1b's
     /// ledger keys by: the pin above can be an index, absent, or a UUID CUDA
@@ -752,8 +754,8 @@ impl ModelManager {
         // (claim eligibility is pin equality — see `spawn_model`).
         let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone(), cfg.gpus.clone());
         // The ledger's board set comes from the same one-shot probe the pins
-        // do, so a grant's board key and a worker's `CUDA_VISIBLE_DEVICES`
-        // can never describe different hardware. The calibration store primes
+        // do, so a grant's board key and the board a worker's spawn pin
+        // selects can never describe different hardware. The calibration store primes
         // it (fit, expected base, and — from local profiles only — the
         // ratchet anchor) and receives its updates.
         let ledger = VramLedger::new(&cfg.gpus, cfg.vram.clone(), cfg.calibration.clone());
@@ -1311,8 +1313,8 @@ impl ModelManager {
     /// Spawn + handshake + configure + load the model's whole WorkerSet
     /// (design §8, protocol v2 flow — handshake carries the impl class
     /// identity, `configure` binds the model's kwargs and instantiates):
-    /// one worker per entry of the spec's `device_pins`, each pinned via
-    /// `CUDA_VISIBLE_DEVICES` at spawn, all spawned and loaded
+    /// one worker per entry of the spec's `device_pins`, each pinned via the
+    /// backend's device-visibility variable at spawn, all spawned and loaded
     /// *concurrently*. Any replica failing kills the others — a load either
     /// yields the complete set or nothing (no partial sets to reason
     /// about). The registry is re-resolved at every spawn (design §4:
@@ -1394,6 +1396,10 @@ impl ModelManager {
         // not worth reserving for: the ledger answers `None` for the
         // `none`-class, and likewise for a model whose earlier load in this run
         // reported no device footprint at all.
+        // TODO(D3): the resolved pin is not the ledger board key — on ROCm
+        // (index pins) and for abbreviated CUDA UUID pins this lookup misses
+        // and no load reservation is taken. D3 resolves (pin, board_key) as
+        // a pair; see docs/rocm-batch-calibration-parity.md D2.
         let _load_reservations: Vec<LoadReservation> = device_pins
             .iter()
             .flatten()
@@ -1814,6 +1820,9 @@ config.impl_class = "cls"
             env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
+            // The fixture impls echo `CUDA_VISIBLE_DEVICES`, which is also
+            // what every non-ROCm host writes.
+            pin_env_var: crate::inferio::gpu::CUDA_PIN_ENV_VAR,
         }
     }
 

@@ -8665,7 +8665,7 @@
               "string",
               "null"
             ],
-            "description": "Resolved `CUDA_VISIBLE_DEVICES` pin the worker was *spawned* with — a\nboard UUID when the GPU inventory is known."
+            "description": "Resolved device pin the worker was *spawned* with — a board UUID on a\nknown CUDA inventory, a HIP device index on a known ROCm one (the two\nbackends' visibility variables accept different vocabularies; see\n`gpu::pin_env_var`)."
           },
           "gpu_name": {
             "type": [

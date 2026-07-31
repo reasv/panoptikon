@@ -121,8 +121,8 @@ def _nvml() -> tuple[Any, Any] | None:
     """`(pynvml, handle)` for the GPU this worker is pinned to, else None.
 
     NVML enumerates physical boards and ignores `CUDA_VISIBLE_DEVICES`, so
-    the pin has to be resolved explicitly. The orchestrator writes the pin
-    in UUID form precisely so this lookup is unambiguous
+    the pin has to be resolved explicitly. The orchestrator writes CUDA
+    pins in UUID form precisely so this lookup is unambiguous
     (batch-calibration design, "Every worker is pinned to exactly one
     GPU"); the torch and single-GPU paths cover hosts where it could not.
 
@@ -174,6 +174,12 @@ def _nvml_module() -> Any | None:
 
 
 def _nvml_handle(pynvml: Any) -> Any | None:
+    # `CUDA_VISIBLE_DEVICES` deliberately, with no HIP_VISIBLE_DEVICES
+    # fallback: NVML is an NVIDIA driver interface and `nvmlInit` fails on a
+    # ROCm host before this is ever reached, and the ROCm pin is a HIP device
+    # index anyway (never a UUID), so reading it here could not produce a
+    # handle. ROCm gets its own memory tiers from amdgpu sysfs
+    # (docs/rocm-batch-calibration-parity.md, D4).
     pin = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
     if pin.upper().startswith(("GPU-", "MIG-")):
         handle = _nvml_handle_by_uuid(pynvml, pin)
@@ -328,8 +334,8 @@ def device_identity() -> tuple[str | None, str | None]:
     The UUID is rendered in nvidia-smi/NVML form (`GPU-<uuid>`), which is
     byte-identical to what the orchestrator's inventory holds, so the
     ledger can key on what the worker *actually* got rather than on the
-    `CUDA_VISIBLE_DEVICES` string it was spawned with. `(None, None)`
-    whenever CUDA is not live (see `_torch_cuda`).
+    device-pin string it was spawned with. `(None, None)` whenever CUDA is
+    not live (see `_torch_cuda`).
     """
     torch = _torch_cuda()
     if torch is None:

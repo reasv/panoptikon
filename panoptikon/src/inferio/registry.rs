@@ -43,8 +43,8 @@
 //! directives, not impl constructor arguments) and, being ordinary config
 //! keys, inherit from group config like everything else. Resolution
 //! (`resolve_device_pins`):
-//! - `devices = ["3", "7"]` -> 2 replicas, replica i pinned
-//!   `CUDA_VISIBLE_DEVICES=devices[i]`;
+//! - `devices = ["3", "7"]` -> 2 replicas, replica i pinned to
+//!   `devices[i]` (resolved to the backend's pin form by `gpu.rs`);
 //! - `replicas = N` alone -> N replicas pinned `"0"`..`"N-1"`;
 //! - neither -> 1 replica, no pin (today's behavior);
 //! - both with mismatched lengths, a non-positive/non-integer `replicas`,
@@ -58,13 +58,28 @@
 //! (`gpu.rs`), so a pin means the same physical card across reboots and the
 //! ledger key never moves. They are *not* CUDA-runtime indices, which depend
 //! on `CUDA_DEVICE_ORDER` (default `FASTEST_FIRST`) and can name a different
-//! board than the same number does here. A `GPU-…`/`MIG-…` UUID in `devices`
-//! bypasses the mapping and is passed to `CUDA_VISIBLE_DEVICES` verbatim,
-//! which is the unambiguous form to write. When the GPU inventory is unknown
-//! (no nvidia-smi: CPU/MPS/ROCm hosts, or an ambient `CUDA_VISIBLE_DEVICES`
-//! that names indices) the string is passed through raw exactly as it was
-//! before pinning existed — no mapping, no new environment variables, no
-//! behaviour change on those hosts.
+//! board than the same number does here. **On CUDA hosts**, a
+//! `GPU-…`/`MIG-…` UUID in `devices` bypasses the mapping and is passed to
+//! `CUDA_VISIBLE_DEVICES` verbatim, which is the unambiguous form to write
+//! (on ROCm the same string is a board *key* and is translated, never
+//! written — see below). When the GPU inventory is unknown (no nvidia-smi:
+//! CPU/MPS hosts, or an ambient visibility restriction that names indices)
+//! the string is passed through raw exactly as it was before pinning
+//! existed — no mapping, no new environment variables, no behaviour change
+//! on those hosts.
+//!
+//! On a ROCm host the vocabulary flips (docs/rocm-batch-calibration-parity.md,
+//! D2): the pin is written to `HIP_VISIBLE_DEVICES`, which accepts **device
+//! indices only**, so a `devices` entry naming a board *key*
+//! (`GPU-<16hex>`/`GPU-BDF-…`) is translated to that board's index and an
+//! index is passed through (canonicalised: `"00"` and `" 0 "` both become
+//! `"0"`). Indices there are HIP's own — positions in the openable KFD-node
+//! order the inventory enumerates. A non-numeric entry that matches no board
+//! key is dropped with a warning rather than written, because HIP would read
+//! it as "hide every device". A ROCm host whose own probe came back unknown
+//! keeps those HIP rules rather than the raw passthrough above — index-shaped
+//! entries survive, everything else is dropped — and pins nothing at all when
+//! the gateway's own environment already carries a HIP-layer restriction.
 //!
 //! JSON object key order IS semantic here: Python dicts preserve insertion
 //! order, FastAPI serializes `/metadata` in that order, and the web UI
@@ -170,9 +185,11 @@ pub struct SpawnSpec {
     /// and the orchestrator-only `replicas`/`devices` keys
     /// (process_model.py:209-211 for the Python-parity part).
     pub config_kwargs: JsonValue,
-    /// Per-replica `CUDA_VISIBLE_DEVICES` pins (design §8): one entry per
-    /// replica to spawn, `None` = no pin (inherit the parent env). Always
-    /// non-empty; `vec![None]` is the single-replica default.
+    /// Per-replica device pins (design §8), as written in the registry: one
+    /// entry per replica to spawn, `None` = no pin (inherit the parent env).
+    /// Always non-empty; `vec![None]` is the single-replica default.
+    /// `gpu::GpuInventory::resolve_pin` turns each into the value the
+    /// backend's visibility variable takes.
     pub device_pins: Vec<Option<String>>,
     /// Declared environment-backed external inputs, resolved immediately
     /// before this worker is spawned and applied explicitly to the child.
@@ -376,8 +393,8 @@ impl Registry {
 }
 
 /// Resolve the WorkerSet shape from a merged id config (design §8; see the
-/// module docs for the rules). Returns one entry per replica: the
-/// `CUDA_VISIBLE_DEVICES` value to pin at spawn, or `None` for no pin.
+/// module docs for the rules). Returns one entry per replica: the device pin
+/// to resolve and write at spawn, or `None` for no pin.
 fn resolve_device_pins(config: &JsonMap<String, JsonValue>) -> Result<Vec<Option<String>>> {
     // Hard ceiling on the WorkerSet size: each replica is a full Python
     // process, so anything past this is a config typo, and the pin vector is

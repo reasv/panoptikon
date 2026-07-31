@@ -214,7 +214,7 @@ cannot do without creating one.
 | `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"free_delta"` (driver free-memory delta across the load), or `"alloc_delta"` (allocator peak delta plus a fixed context allowance — the floor). Always names the term that actually produced the reported number |
 | `reserved_at_load_mb` | allocator pool size right after load; the orchestrator prices later pool growth against this |
 | `dtype` | the negotiated load precision, one of `"fp16"`, `"bf16"`, `"fp32"` (part of the calibration profile key). Absent when the impl does not negotiate one (CPU impls, remote APIs) |
-| `gpu_uuid` | the board the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the `CUDA_VISIBLE_DEVICES` value the orchestrator spawned it with — is the authoritative GPU identity for the calibration ledger. Absent when the worker has no initialized CUDA device |
+| `gpu_uuid` | the board the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the device-visibility variable the orchestrator spawned it with (`CUDA_VISIBLE_DEVICES`, or a bare device index in `HIP_VISIBLE_DEVICES` on ROCm) — is the authoritative GPU identity for the calibration ledger. Absent when the worker has no initialized CUDA device |
 | `gpu_name` | that board's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), part of the calibration profile key |
 | `torch_version` | `torch.__version__` (e.g. `"2.7.1+cu128"`), part of the calibration profile key. Only the worker knows which torch its venv holds. Absent when the impl never imported torch |
 | `memory` | a memory sample taken right after load |
@@ -383,7 +383,22 @@ window is in flight per worker either way, so a trim never races a batch.
 
 The orchestrator sets for every worker:
 
-- `CUDA_VISIBLE_DEVICES` — when device pinning is active (absent = default).
+- One device-visibility variable, when device pinning is active (absent =
+  default). Which one, and in what vocabulary, is decided by the resolved
+  accelerator (docs/rocm-batch-calibration-parity.md, D2):
+  - `CUDA_VISIBLE_DEVICES` — CUDA hosts, and every host with no accelerator
+    of its own. Normally a `GPU-…` board UUID; an unresolvable registry pin
+    passes through as written.
+  - `HIP_VISIBLE_DEVICES` — ROCm hosts, always a **device index** (HIP reads
+    nothing else); a registry pin that cannot be resolved to one is *dropped*
+    rather than passed through, so the variable is simply not written and the
+    worker inherits the environment. `CUDA_VISIBLE_DEVICES` is deliberately
+    *not* also set there: it is a HIP alias, and setting both is documented
+    unintended-behaviour territory. `ROCR_VISIBLE_DEVICES` is never set —
+    torch < 2.6 crashes at init when it is.
+
+  Exactly one is written, and only when a pin resolved; a worker is never
+  handed both.
 - `INFERIO_WORKER=1` — marker for impl code that wants to know.
 - `PYTHONIOENCODING=utf-8` — keeps worker stderr valid UTF-8 (defense in
   depth; the orchestrator's stderr forwarder tolerates arbitrary bytes from

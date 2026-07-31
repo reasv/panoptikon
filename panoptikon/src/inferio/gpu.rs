@@ -6,7 +6,11 @@
 //! change (docs/batch-calibration-design.md, "Two keyspaces"). This module
 //! is the source of those identities, and the one place that turns a
 //! registry `devices` entry (or the absence of one) into the concrete
-//! `CUDA_VISIBLE_DEVICES` value a worker is spawned with.
+//! pin value a worker is spawned with — plus, in [`pin_env_var`], the
+//! variable that value is written to, because the two are one decision: a
+//! board UUID belongs in `CUDA_VISIBLE_DEVICES` and only a device index
+//! belongs in `HIP_VISIBLE_DEVICES`, and writing either into the other's
+//! variable hides every board from the worker.
 //!
 //! Probing reuses the Package-1 philosophy from `capability.rs`: one short
 //! `nvidia-smi` call with a timeout, and any unparseable *identity* makes
@@ -50,6 +54,49 @@ use super::capability::{
 };
 use super::rocm;
 use crate::config::Accelerator;
+
+/// The variable CUDA filters devices with, and HIP's compatibility alias for
+/// its own. Written with a `GPU-…` board UUID on CUDA hosts.
+pub const CUDA_PIN_ENV_VAR: &str = "CUDA_VISIBLE_DEVICES";
+
+/// HIP's own device filter, written with a **device index** (D2).
+///
+/// The two AMD variables do not compete, they *compose*:
+/// `ROCR_VISIBLE_DEVICES` filters below, at the ROCr/KFD layer, and a HIP
+/// index counts into whatever survived that filter. We choose the HIP form
+/// because AMD documents it as the application-scoped mechanism, because it
+/// is the layer our own indices are enumerated in (`rocm.rs` reconstructs
+/// ROCr's agent order), and — decisively — because torch < 2.6 crashes at
+/// init when the ROCR form is set, which a user-managed venv can still be.
+pub const HIP_PIN_ENV_VAR: &str = "HIP_VISIBLE_DEVICES";
+
+/// Which variable a resolved pin is written to, decided by the **resolved
+/// accelerator** rather than by the inventory (docs/rocm-batch-calibration-parity.md,
+/// D2).
+///
+/// Deciding by the accelerator is what makes the *unknown-inventory* ROCm
+/// host behave: an ambient visibility restriction or a probe failure blanks
+/// the inventory, and `resolve_pin` still lets a HIP-legal registry pin
+/// through — an index, the only form HIP accepts, has to reach HIP to mean
+/// anything. Deciding by the *inventory* would send it to
+/// `CUDA_VISIBLE_DEVICES` instead, which HIP only consults when
+/// `HIP_VISIBLE_DEVICES` is unset — so the pin would land in the weaker of
+/// the two aliases on exactly the hosts that are hardest to reason about.
+///
+/// `CUDA_VISIBLE_DEVICES` is deliberately **not** also set on ROCm: it is a
+/// HIP alias, and AMD documents setting both as unintended-behaviour
+/// territory. The accelerator sentinel's HSA/MIOpen worker env
+/// (`accelerator_env::worker_env`) composes with this untouched — it never
+/// sets a visibility variable.
+pub fn pin_env_var(accelerator: Accelerator) -> &'static str {
+    match accelerator {
+        Accelerator::Rocm => HIP_PIN_ENV_VAR,
+        // Including `Auto`, which only reaches here unresolved from a caller
+        // that has no sentinel to resolve with — the CUDA form is what those
+        // hosts wrote before this dispatch existed.
+        Accelerator::Cuda | Accelerator::Cpu | Accelerator::Auto => CUDA_PIN_ENV_VAR,
+    }
+}
 
 /// One visible board, from nvidia-smi (CUDA) or KFD topology (ROCm).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -112,7 +159,16 @@ pub struct GpuInventory {
     backend: MemoryBackend,
 }
 
-/// Which kernel/driver interface answers this host's live-memory questions.
+/// Which kernel/driver interface answers this host's live-memory questions
+/// — and, by the same token, which vocabulary its pins are written in
+/// ([`GpuInventory::pins_are_indices`]). The two travel together because
+/// they are the same fact about the host: an amdgpu-sysfs host is a HIP
+/// host.
+///
+/// Set from the **resolved accelerator**, not from whether any board was
+/// found: a ROCm host whose probe came back empty is still a ROCm host, and
+/// forgetting that would send its pins into CUDA's variable and its memory
+/// refresh to nvidia-smi.
 #[derive(Debug, Clone, Default)]
 enum MemoryBackend {
     #[default]
@@ -123,6 +179,20 @@ enum MemoryBackend {
         /// identified from instead of re-deriving the production default —
         /// which is what makes the refresh path testable from a fixture.
         pci_devices: PathBuf,
+        /// Whether an ambient restriction at HIP's own layer
+        /// (`HIP_VISIBLE_DEVICES`, its `CUDA_VISIBLE_DEVICES` alias, or
+        /// `GPU_DEVICE_ORDINAL`) was in force when the probe ran
+        /// (`rocm::ambient_hip_restriction`). Only ever true alongside a
+        /// blanked board list, since any such variable also makes the
+        /// inventory unknown.
+        ///
+        /// It decides what happens to a registry pin on that blanked host:
+        /// an index we write would clobber or override the operator's
+        /// restriction and widen what they narrowed, so nothing is written
+        /// at all. An ambient `ROCR_VISIBLE_DEVICES` does **not** set this
+        /// — HIP indexes into the ROCr-filtered set, so an index pin
+        /// selects within the operator's set instead of escaping it.
+        ambient_hip_restriction: bool,
     },
 }
 
@@ -164,19 +234,40 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
 /// Off Linux this is unconditionally unknown — the `rocm` torch extra
 /// carries a `sys_platform == 'linux'` marker, so no supported install has
 /// ROCm wheels anywhere else, and the sysfs paths do not exist.
+///
+/// "Unknown" here means *no boards*, never *not a ROCm host*: the backend is
+/// [`MemoryBackend::RocmSysfs`] on every path out of this function, including
+/// the ambient-restricted, probe-failed and non-Linux ones. A
+/// `GpuInventory::default()` there would silently hand the host CUDA's
+/// vocabulary — nvidia-smi for the memory refresh, and a registry pin
+/// written verbatim into `CUDA_VISIBLE_DEVICES` — on a machine that has
+/// neither.
 fn probe_rocm() -> HostGpus {
     let roots = rocm::SysfsRoots::default();
-    let inventory = if cfg!(target_os = "linux") {
+    let (inventory, ambient_hip_restriction) = if cfg!(target_os = "linux") {
         let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
         let ambient = ambient.each_ref().map(Option::as_deref);
-        rocm::build(&roots, ambient)
+        (
+            rocm::build(&roots, ambient),
+            rocm::ambient_hip_restriction(ambient),
+        )
     } else {
-        None
+        // Nothing was read, so nothing is known about the ambient
+        // environment either; the legality filter in `resolve_pin` still
+        // applies, it just has no restriction to defer to.
+        (None, false)
+    };
+    let backend = MemoryBackend::RocmSysfs {
+        pci_devices: roots.pci_devices.clone(),
+        ambient_hip_restriction,
     };
     let Some(gpus) = inventory else {
         return HostGpus {
             caps: HostComputeCaps::unknown(),
-            inventory: GpuInventory::default(),
+            inventory: GpuInventory {
+                boards: None,
+                backend,
+            },
         };
     };
     for gpu in &gpus {
@@ -193,9 +284,7 @@ fn probe_rocm() -> HostGpus {
         caps: HostComputeCaps::unknown(),
         inventory: GpuInventory {
             boards: Some(gpus.into()),
-            backend: MemoryBackend::RocmSysfs {
-                pci_devices: roots.pci_devices,
-            },
+            backend,
         },
     }
 }
@@ -257,6 +346,13 @@ pub enum MemoryQuery {
     /// stale reading while believing it was just refreshed. Refusing the
     /// whole refresh is the honest answer, and matches the all-or-nothing
     /// rule both backends' parsers already follow.
+    ///
+    /// A ROCm host with **no** board list at all (ambient restriction, probe
+    /// failure, non-Linux) lands here too. Its ledger is empty and would
+    /// never refresh anything anyway; the point is that it must not fall
+    /// through to [`Self::NvidiaSmi`] and start shelling out to a binary
+    /// that is not on this machine and could not describe its boards if it
+    /// were.
     Unavailable,
 }
 
@@ -494,10 +590,14 @@ impl GpuInventory {
     /// readings it believes are fresh. That is phantom headroom, so the
     /// whole refresh is withdrawn instead ([`MemoryQuery::Unavailable`]).
     pub fn memory_query(&self) -> MemoryQuery {
-        let MemoryBackend::RocmSysfs { pci_devices } = &self.backend else {
+        let MemoryBackend::RocmSysfs { pci_devices, .. } = &self.backend else {
             return MemoryQuery::NvidiaSmi;
         };
-        let boards = self.gpus().unwrap_or(&[]);
+        let Some(boards) = self.gpus() else {
+            // A ROCm host with no inventory: nothing to refresh, and above
+            // all not nvidia-smi's business (see `MemoryQuery::Unavailable`).
+            return MemoryQuery::Unavailable;
+        };
         let mut keyed = Vec::with_capacity(boards.len());
         for gpu in boards {
             let Some(bdf) = gpu.bdf.clone() else {
@@ -544,31 +644,58 @@ impl GpuInventory {
     /// so on a host whose fastest board has no kernels the impl-side filter
     /// falls back to CPU instead of silently using another board.
     ///
-    /// # ROCm: always `None` — Step-1 interim contract
+    /// # ROCm: the default board's HIP device index
     ///
-    /// **This is temporary and must be revisited when D2 lands.** The spawn
-    /// layer writes whatever comes back here into `CUDA_VISIBLE_DEVICES`,
-    /// which on a HIP host is an alias for `HIP_VISIBLE_DEVICES` and
-    /// accepts **only device indices**. A `GPU-…` board key there matches
-    /// nothing, hides every device from the worker, and sends it silently
-    /// to CPU — strictly worse than not pinning at all. Until D2 plumbs
-    /// `HIP_VISIBLE_DEVICES=<row index>` through the spawn config, a ROCm
-    /// host therefore gets no universal pinning: the boards are still
-    /// inventoried (the ledger, the `/metadata` calibration overlay and
-    /// [`Self::default_board_name`] all work), they are just not pinned.
-    /// See docs/rocm-batch-calibration-parity.md, D2.
+    /// Universal pinning holds on ROCm too, in HIP's vocabulary: the pin is
+    /// the board's **row index**, which is its position in the openable
+    /// KFD-node order `rocm.rs` enumerates — the order ROCr builds its agent
+    /// list in, hence the order HIP indexes devices in (D1/D2). A `GPU-…`
+    /// board key would match nothing in `HIP_VISIBLE_DEVICES`, hide every
+    /// device, and drop the worker to CPU in silence; the key stays what the
+    /// *ledger* is keyed by, and the index is only ever a pin.
+    ///
+    /// The row-order-is-HIP-order assumption is this design's one
+    /// unverifiable, and D3's registration cross-check is its guard: a worker
+    /// whose self-reported PCI address does not match the row it was pinned
+    /// to is refused admission (unpriced) rather than priced against the
+    /// wrong board.
     pub fn default_pin(&self) -> Option<String> {
-        if self.pins_are_indices() {
-            return None;
-        }
-        self.default_board().map(|gpu| gpu.uuid.clone())
+        let gpu = self.default_board()?;
+        Some(if self.pins_are_indices() {
+            gpu.index.to_string()
+        } else {
+            gpu.uuid.clone()
+        })
     }
 
-    /// Whether this host's pin vocabulary is HIP's (bare indices) rather
-    /// than CUDA's (board UUIDs). See [`Self::default_pin`] for why Step 1
-    /// answers "then emit no pin" rather than translating.
+    /// Whether this host's pin vocabulary is HIP's (device indices) rather
+    /// than CUDA's (board UUIDs). The distinction is the whole of D2: the
+    /// same board is named by its key in the ledger and by its index in the
+    /// worker's environment, and the two must never be swapped.
+    ///
+    /// This is the **single source** of that answer: it is what
+    /// [`Self::default_pin`] and [`Self::resolve_pin`] choose their
+    /// vocabulary by, and — through the same `Accelerator::Rocm` that set
+    /// the backend — what [`pin_env_var`] chooses the variable by. A host
+    /// whose inventory is unknown still answers truthfully, which is what
+    /// keeps an ambient-restricted ROCm host from being handed CUDA's rules
+    /// by default.
     fn pins_are_indices(&self) -> bool {
         matches!(self.backend, MemoryBackend::RocmSysfs { .. })
+    }
+
+    /// Whether the operator had a HIP-layer visibility restriction in force
+    /// when this inventory was probed (`rocm::ambient_hip_restriction`);
+    /// always false on CUDA, where the ambient value is *composed with*
+    /// rather than fought over.
+    fn ambient_hip_restriction(&self) -> bool {
+        matches!(
+            self.backend,
+            MemoryBackend::RocmSysfs {
+                ambient_hip_restriction: true,
+                ..
+            }
+        )
     }
 
     /// The default board's **model name** — the calibration keyspace, which
@@ -589,11 +716,17 @@ impl GpuInventory {
         })
     }
 
-    /// Resolve one replica's registry pin into the `CUDA_VISIBLE_DEVICES`
-    /// value it is spawned with:
+    /// Resolve one replica's registry pin into the value it is spawned with,
+    /// in the vocabulary of the variable it will be written to
+    /// ([`pin_env_var`]).
+    ///
+    /// On CUDA (and on every non-ROCm host with no inventory), that variable
+    /// is `CUDA_VISIBLE_DEVICES` and the vocabulary is board UUIDs:
     ///
     /// - unknown inventory → the request verbatim (`None` stays `None`):
-    ///   exactly today's behaviour, which is what CPU/MPS/ROCm hosts need;
+    ///   exactly today's behaviour, which is what CPU/MPS hosts and CUDA
+    ///   hosts with an ambient restriction need. ROCm's unknown-inventory
+    ///   arm is *not* this one — see the last section;
     /// - no request → the default board's UUID (universal pinning);
     /// - a UUID request (`GPU-…`/`MIG-…`) → verbatim; CUDA accepts it;
     /// - an index request → that board's UUID, so the ledger key is stable
@@ -602,36 +735,73 @@ impl GpuInventory {
     ///   templated leftover) → verbatim with a warning. Passing it through
     ///   preserves whatever the operator meant; guessing would not.
     ///
-    /// # ROCm: indices pass, everything else is dropped — Step-1 interim
+    /// # ROCm: the vocabulary is HIP device indices
     ///
-    /// **Temporary; D2 replaces this.** On a known ROCm inventory the only
-    /// safe value to write into the worker's `CUDA_VISIBLE_DEVICES` (a HIP
-    /// alias) is a **plain numeric index**, because that is the only form
-    /// HIP understands. So a numeric request survives verbatim — the
-    /// operator's intent is expressible — and *everything else* resolves to
-    /// no pin at all: a board key or a `GPU-…` leftover written there would
-    /// match no device, hide the whole board set, and drop the worker to
-    /// CPU without a word. No pin is worse than a correct pin and far
-    /// better than a device-hiding one. The board-key → row-index
-    /// translation this should eventually do arrives with
-    /// `HIP_VISIBLE_DEVICES` plumbing (docs/rocm-batch-calibration-parity.md,
-    /// D2).
+    /// A known ROCm inventory resolves into `HIP_VISIBLE_DEVICES`, which
+    /// accepts **indices only** — the row index of D1's openable-KFD-node
+    /// enumeration (see [`Self::default_pin`]):
+    ///
+    /// - no request → the default board's index (universal pinning, as on
+    ///   CUDA);
+    /// - a **board key** (`GPU-<16hex>` or `GPU-BDF-…`, the row's `uuid`,
+    ///   matched case-insensitively) → that row's index. This is the whole
+    ///   point of D2: an operator writes the same stable identity in
+    ///   `devices` that the ledger and the per-board VRAM overrides use, and
+    ///   the translation to HIP's index happens here, once. The match is
+    ///   **exact**, unlike CUDA's abbreviated-UUID prefixes: CUDA's
+    ///   abbreviation is a runtime feature of the string we hand it, whereas
+    ///   these keys never reach HIP at all, and a prefix could name two
+    ///   `GPU-BDF-…` boards on the same bus and silently pin the wrong one;
+    /// - a **numeric** request → that index, even when it names no row we
+    ///   can see, with a warning in that case. HIP takes indices, so the
+    ///   operator's intent survives — the mirror of the CUDA arm's
+    ///   unresolvable-index passthrough;
+    /// - an **all-numeric comma list** → that list, with a warning. Multiple
+    ///   visible devices per worker is not something this layer arranges,
+    ///   but HIP accepts the form and it is the operator's business;
+    ///
+    /// - anything **non-numeric that matches no board key** (a `GPU-…`
+    ///   leftover from a CUDA config, an unexpanded template) → **no pin at
+    ///   all**, with a warning. Written into a HIP visibility variable such
+    ///   a string matches no device, hides the entire board set, and drops
+    ///   the worker to the CPU without a word; no pin is strictly better,
+    ///   and the warning says so.
+    ///
+    /// Both numeric forms come back **canonicalised** (`"00"` → `"0"`,
+    /// `" 1 , 2 "` → `"1,2"`), not as the operator spelled them: pins are
+    /// compared as strings elsewhere — `prewarm.rs` hands a parked worker to
+    /// a replica only when the two pin strings are equal — so two spellings
+    /// of one device have to converge here or the pool silently stops
+    /// matching (see [`canonical_index_list`]).
+    ///
+    /// # ROCm with an unknown inventory: the vocabulary still holds
+    ///
+    /// A ROCm host that found no boards (ambient restriction, probe failure,
+    /// non-Linux) has nothing to translate against, but it has not stopped
+    /// being a HIP host, so the CUDA passthrough is *not* what it gets:
+    ///
+    /// - a HIP-legal request (an index or an index list) → canonicalised and
+    ///   passed through, since HIP can read it without an inventory;
+    /// - anything else → dropped with a warning, for the same reason a known
+    ///   ROCm host drops it — the harm (every board hidden, silent CPU) does
+    ///   not depend on whether we could enumerate the boards;
+    /// - **anything at all, including an index, when the operator's own
+    ///   ambient restriction is at HIP's layer** → dropped with a warning.
+    ///   Our value would overwrite `HIP_VISIBLE_DEVICES` outright, or take
+    ///   precedence over their `CUDA_VISIBLE_DEVICES`, widening a set they
+    ///   deliberately narrowed. An ambient `ROCR_VISIBLE_DEVICES` is a
+    ///   different matter and does not trigger this: HIP indexes into the
+    ///   ROCr-filtered set, so the pin composes with the restriction instead
+    ///   of escaping it.
     pub fn resolve_pin(&self, requested: Option<&str>) -> Option<String> {
         let Some(gpus) = self.boards.as_deref() else {
+            if self.pins_are_indices() {
+                return self.resolve_hip_pin_uninventoried(requested);
+            }
             return requested.map(str::to_owned);
         };
         if self.pins_are_indices() {
-            let index = requested?.trim();
-            if index.parse::<u32>().is_ok() {
-                return Some(index.to_owned());
-            }
-            tracing::warn!(
-                pin = %index,
-                "this ROCm host pins by HIP device index; dropping a device \
-                 pin that is not one rather than hiding every board from the \
-                 worker (which would silently run it on the CPU)"
-            );
-            return None;
+            return self.resolve_hip_pin(gpus, requested);
         }
         let Some(requested) = requested else {
             return self.default_pin();
@@ -652,6 +822,124 @@ impl GpuInventory {
         );
         Some(requested.to_owned())
     }
+
+    /// The ROCm arm of [`Self::resolve_pin`] (see its docs for the full
+    /// vocabulary and the reasoning). Split out because HIP's rules diverge
+    /// from CUDA's at every branch: the board key translates instead of
+    /// passing through, and an unresolvable non-numeric string is dropped
+    /// instead of passed through.
+    fn resolve_hip_pin(&self, gpus: &[GpuInfo], requested: Option<&str>) -> Option<String> {
+        let Some(requested) = requested else {
+            return self.default_pin();
+        };
+        let trimmed = requested.trim();
+        if let Some(gpu) = gpus
+            .iter()
+            .find(|gpu| gpu.uuid.eq_ignore_ascii_case(trimmed))
+        {
+            return Some(gpu.index.to_string());
+        }
+        if let Ok(index) = trimmed.parse::<u32>() {
+            if !gpus.iter().any(|gpu| gpu.index == index) {
+                tracing::warn!(
+                    pin = %trimmed,
+                    boards = gpus.len(),
+                    "device pin names no board in this host's HIP enumeration; \
+                     writing the index to HIP_VISIBLE_DEVICES anyway (HIP \
+                     takes indices, so the operator's intent survives — but a \
+                     worker pinned out of range falls back to the CPU)"
+                );
+            }
+            return Some(index.to_string());
+        }
+        if let Some(list) = canonical_index_list(trimmed) {
+            tracing::warn!(
+                pin = %trimmed,
+                "device pin is a HIP device list; writing it to \
+                 HIP_VISIBLE_DEVICES as asked — a worker left with more than \
+                 one visible board is not something the per-GPU ledger can \
+                 price"
+            );
+            return Some(list);
+        }
+        tracing::warn!(
+            pin = %trimmed,
+            "device pin is neither a HIP device index nor a board key this \
+             host reports; dropping it rather than writing it to \
+             HIP_VISIBLE_DEVICES, where it would match no device, hide every \
+             board and silently run the worker on the CPU"
+        );
+        None
+    }
+
+    /// The ROCm arm of [`Self::resolve_pin`] for a host with **no boards**
+    /// (see its docs). There is nothing to translate a board key against and
+    /// no index to check for range, so all that is left is HIP's grammar —
+    /// and, first, whether the operator already restricted this layer
+    /// themselves.
+    fn resolve_hip_pin_uninventoried(&self, requested: Option<&str>) -> Option<String> {
+        // No request is no pin here regardless: with no boards there is no
+        // default board to pin to either.
+        let trimmed = requested?.trim();
+        if self.ambient_hip_restriction() {
+            tracing::warn!(
+                pin = %trimmed,
+                "ignoring this device pin: a HIP-layer visibility restriction \
+                 (HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES / \
+                 GPU_DEVICE_ORDINAL) is already set in this gateway's own \
+                 environment, and writing our own would override it and hand \
+                 the worker boards the operator deliberately hid — the \
+                 operator's restriction wins, and the worker inherits it \
+                 as-is"
+            );
+            return None;
+        }
+        if let Some(pin) = canonical_hip_pin(trimmed) {
+            return Some(pin);
+        }
+        tracing::warn!(
+            pin = %trimmed,
+            "this ROCm host reports no boards to resolve device pins \
+             against, and this pin is not a HIP device index either; \
+             dropping it rather than writing it to HIP_VISIBLE_DEVICES, \
+             where it would match no device, hide every board and silently \
+             run the worker on the CPU"
+        );
+        None
+    }
+}
+
+/// The HIP-legal pin forms, canonicalised: one device index, or a list of
+/// them. `None` for anything HIP cannot read as an index — which on ROCm
+/// means "write no pin at all", never "write it and hope".
+fn canonical_hip_pin(value: &str) -> Option<String> {
+    if let Ok(index) = value.parse::<u32>() {
+        return Some(index.to_string());
+    }
+    canonical_index_list(value)
+}
+
+/// A HIP-shaped multi-device pin: at least one entry, every entry a device
+/// index. Trailing/empty entries are ignored (`"0,"` is the operator asking
+/// for device 0), which is how HIP's own parser reads the list.
+///
+/// Returns the **canonical** rendering — entries re-parsed and re-joined
+/// with `,` — rather than the operator's spelling. Every index this module
+/// emits has to be byte-comparable with every other one: `prewarm.rs` claims
+/// a parked worker only when its recorded pin string *equals* the replica's
+/// resolved pin, so `" 0 "` and `"00"` reaching that comparison as
+/// themselves would silently defeat pooling against a `default_pin()` that
+/// renders `0`.
+fn canonical_index_list(value: &str) -> Option<String> {
+    let mut canonical = String::new();
+    for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let index = entry.parse::<u32>().ok()?;
+        if !canonical.is_empty() {
+            canonical.push(',');
+        }
+        canonical.push_str(&index.to_string());
+    }
+    (!canonical.is_empty()).then_some(canonical)
 }
 
 /// `GPU-…` (and MIG's `MIG-…`) are the forms CUDA accepts in
@@ -761,7 +1049,26 @@ mod tests {
     fn rocm_inventory(pci_devices: PathBuf, gpus: Vec<GpuInfo>) -> GpuInventory {
         GpuInventory {
             boards: Some(gpus.into()),
-            backend: MemoryBackend::RocmSysfs { pci_devices },
+            backend: MemoryBackend::RocmSysfs {
+                pci_devices,
+                // A knowable inventory is proof there was no ambient
+                // restriction of any layer: the probe blanks it otherwise.
+                ambient_hip_restriction: false,
+            },
+        }
+    }
+
+    /// A ROCm host with **no** boards — the ambient-restricted, probe-failed
+    /// and non-Linux shape. It is still a ROCm host: the backend, and with it
+    /// the pin vocabulary and the memory interface, is what `probe_rocm`
+    /// leaves behind on every one of those paths.
+    fn uninventoried_rocm(ambient_hip_restriction: bool) -> GpuInventory {
+        GpuInventory {
+            boards: None,
+            backend: MemoryBackend::RocmSysfs {
+                pci_devices: PathBuf::from("/sys/bus/pci/devices"),
+                ambient_hip_restriction,
+            },
         }
     }
 
@@ -1043,6 +1350,19 @@ mod tests {
             ),
             other => panic!("expected the sysfs query, got {other:?}"),
         }
+        // And a ROCm host with no boards at all (ambient restriction, probe
+        // failure, non-Linux) must not fall back to CUDA's interface: there
+        // is nothing to refresh, but nvidia-smi is not the thing that would
+        // have refreshed it.
+        for ambient_hip_restriction in [false, true] {
+            let query = uninventoried_rocm(ambient_hip_restriction).memory_query();
+            assert!(
+                matches!(query, MemoryQuery::Unavailable),
+                "expected no refresh at all, got {query:?}"
+            );
+            assert_eq!(query.free_source(), "amdgpu-sysfs");
+            assert!(query.run().is_none());
+        }
     }
 
     /// The refresh is total or withdrawn. A row without a PCI address
@@ -1131,9 +1451,10 @@ mod tests {
             let rocm = probe(Accelerator::Rocm);
             assert!(rocm.inventory.gpus().is_none(), "no KFD topology off Linux");
             assert!(
-                matches!(rocm.inventory.memory_query(), MemoryQuery::NvidiaSmi),
-                "an unknown host stays on the default backend rather than \
-                 promising sysfs reads it cannot do"
+                matches!(rocm.inventory.memory_query(), MemoryQuery::Unavailable),
+                "an unknown ROCm host has nothing to refresh, but it is still \
+                 a ROCm host — falling back to nvidia-smi would ask an \
+                 NVIDIA binary about AMD boards"
             );
         }
         for accelerator in [Accelerator::Cuda, Accelerator::Cpu] {
@@ -1163,12 +1484,12 @@ mod tests {
         );
     }
 
-    /// Step-1 interim contract (D2 replaces it): the spawn layer writes
-    /// whatever `resolve_pin` returns into `CUDA_VISIBLE_DEVICES`, which on
-    /// a HIP host aliases `HIP_VISIBLE_DEVICES` and accepts only device
-    /// indices. A board key there would match nothing, hide every device,
-    /// and drop the worker to CPU in silence — so a known ROCm inventory
-    /// emits an index or no pin at all, never a `GPU-…` string.
+    /// A known ROCm inventory speaks HIP's vocabulary: every pin it emits is
+    /// a device index, never a `GPU-…` string. Written into
+    /// `HIP_VISIBLE_DEVICES` a board key matches nothing, hides every
+    /// device, and drops the worker to CPU in silence, so it must never get
+    /// there — the key stays the *ledger's* identity and the index is the
+    /// pin (D2).
     #[test]
     fn a_rocm_inventory_never_emits_a_board_key_as_a_pin() {
         let host = rocm_inventory(
@@ -1178,20 +1499,342 @@ mod tests {
                 amd_gpu(1, "0000:0c:00.0", 24576),
             ],
         );
-        assert_eq!(host.default_pin(), None, "no universal pinning yet");
-        assert_eq!(host.resolve_pin(None), None);
-        assert_eq!(
-            host.resolve_pin(Some("1")),
-            Some("1".to_string()),
-            "HIP understands indices, so the operator's intent survives"
-        );
-        assert_eq!(host.resolve_pin(Some("GPU-BDF-0000:03:00.0")), None);
-        assert_eq!(host.resolve_pin(Some("cpu")), None);
+        // Universal pinning, in indices: the fastest board is the tie-break
+        // winner (equal VRAM here, so the lowest index).
+        assert_eq!(host.default_pin(), Some("0".to_string()));
+        assert_eq!(host.resolve_pin(None), Some("0".to_string()));
+        // The property, over every shape a registry can hand this host —
+        // resolvable, unresolvable, hostile, empty. Whatever comes back is
+        // HIP-readable or nothing; a `None` is a passing outcome, so the
+        // drop cases belong in the same sweep rather than in a list of
+        // hand-checked equalities.
+        for requested in [
+            None,
+            Some("1"),
+            Some("GPU-BDF-0000:0c:00.0"),
+            Some("gpu-bdf-0000:0C:00.0"),
+            Some("7"),
+            Some("0,1"),
+            Some(" 1 , 2 "),
+            Some("00"),
+            Some("cpu"),
+            Some("${DEVICE}"),
+            Some("GPU-1a2b"),
+            Some("0,GPU-BDF-0000:03:00.0"),
+            Some("4294967296"),
+            Some(""),
+            Some("  "),
+        ] {
+            let Some(pin) = host.resolve_pin(requested) else {
+                continue;
+            };
+            assert!(
+                !pin.is_empty() && pin.split(',').all(|entry| entry.parse::<u32>().is_ok()),
+                "{requested:?} resolved to {pin:?}, which HIP cannot read as a \
+                 device index"
+            );
+        }
         // The board name is still available: the /metadata calibration
         // overlay needs it, and it never reaches a worker's environment.
         assert_eq!(
             host.default_board_name().as_deref(),
             Some("AMD gfx1100 (24 GB)")
+        );
+    }
+
+    /// Default placement on ROCm ranks by VRAM (every board's `compute_cap`
+    /// is `None`) and answers in HIP's vocabulary — the row's position in
+    /// the openable KFD-node order, which is the HIP device index.
+    #[test]
+    fn the_rocm_default_pin_is_the_default_boards_index() {
+        let host = rocm_inventory(
+            PathBuf::from("/sys/bus/pci/devices"),
+            vec![
+                // An APU-shaped first row: enumerated first, far smaller.
+                amd_gpu(0, "0000:03:00.0", 2048),
+                amd_gpu(1, "0000:0c:00.0", 24576),
+            ],
+        );
+        assert_eq!(
+            host.default_pin(),
+            Some("1".to_string()),
+            "the dGPU wins on VRAM, and its pin is its index — not its key"
+        );
+        assert_eq!(host.resolve_pin(None), Some("1".to_string()));
+    }
+
+    /// The board key an operator writes in `devices` (the same string the
+    /// ledger and the per-board VRAM overrides use) is translated to the
+    /// row's HIP index here, once. Both key forms, either case, with
+    /// whatever whitespace the TOML carried.
+    #[test]
+    fn rocm_board_keys_resolve_to_their_row_index() {
+        let mut fused = amd_gpu(0, "0000:03:00.0", 24576);
+        fused.uuid = "GPU-0123456789abcdef".to_owned();
+        let host = rocm_inventory(
+            PathBuf::from("/sys/bus/pci/devices"),
+            vec![fused, amd_gpu(1, "0000:0c:00.0", 16384)],
+        );
+        assert_eq!(
+            host.resolve_pin(Some("GPU-0123456789abcdef")),
+            Some("0".to_string()),
+            "the fused KFD unique_id form"
+        );
+        assert_eq!(
+            host.resolve_pin(Some("GPU-BDF-0000:0c:00.0")),
+            Some("1".to_string()),
+            "the synthetic BDF form"
+        );
+        assert_eq!(
+            host.resolve_pin(Some("  gpu-bdf-0000:0C:00.0  ")),
+            Some("1".to_string()),
+            "case-insensitive and trimmed, like the CUDA UUID handling"
+        );
+        // Exact, not prefix: CUDA's abbreviated UUIDs are a runtime feature
+        // of a string we hand to CUDA, but these keys never reach HIP, and a
+        // prefix could name two boards on the same bus.
+        assert_eq!(
+            host.resolve_pin(Some("GPU-BDF-0000:0c")),
+            None,
+            "a truncated key is not a key"
+        );
+    }
+
+    /// HIP takes indices, so a numeric pin survives even when it names no
+    /// row we can see (the mirror of the CUDA arm's unresolvable-index
+    /// passthrough), and so does an all-numeric list. Both warn; the
+    /// operator's intent is the thing being preserved.
+    ///
+    /// What survives is the *canonical* rendering, not the operator's
+    /// spelling: `prewarm.rs` claims a parked worker only when its recorded
+    /// pin string equals the replica's resolved one, so `"00"` and `" 0 "`
+    /// have to converge on the `"0"` that `default_pin` renders or pooling
+    /// quietly stops matching on this host.
+    #[test]
+    fn rocm_numeric_pins_pass_through_canonicalised() {
+        let host = rocm_inventory(
+            PathBuf::from("/sys/bus/pci/devices"),
+            vec![
+                amd_gpu(0, "0000:03:00.0", 24576),
+                amd_gpu(1, "0000:0c:00.0", 24576),
+            ],
+        );
+        assert_eq!(host.resolve_pin(Some("1")), Some("1".to_string()));
+        assert_eq!(host.resolve_pin(Some(" 0 ")), Some("0".to_string()));
+        assert_eq!(
+            host.resolve_pin(Some("7")),
+            Some("7".to_string()),
+            "an index beyond this host's boards is still the operator's call"
+        );
+        assert_eq!(
+            host.resolve_pin(Some("0,1")),
+            Some("0,1".to_string()),
+            "a multi-device list is HIP-legal; the ledger simply cannot price it"
+        );
+        // Canonical forms. `u32::from_str` accepts a leading `+`, and that is
+        // fine here precisely because the value is normalised away rather
+        // than forwarded: HIP never sees the `+`.
+        assert_eq!(host.default_pin(), Some("0".to_string()));
+        for spelling in ["00", " 0 ", "+0", "0000"] {
+            assert_eq!(
+                host.resolve_pin(Some(spelling)),
+                host.default_pin(),
+                "{spelling:?} names the default board and must render \
+                 identically to it, or the prewarm pool stops claiming"
+            );
+        }
+        assert_eq!(host.resolve_pin(Some(" 1 , 2 ")), Some("1,2".to_string()));
+        assert_eq!(
+            host.resolve_pin(Some("0,")),
+            Some("0".to_string()),
+            "a trailing separator is how HIP's own parser reads a one-device \
+             list"
+        );
+        assert_eq!(
+            host.resolve_pin(Some("4294967296")),
+            None,
+            "numeric but past u32: not an index HIP could act on, so it is \
+             dropped like any other unreadable string"
+        );
+    }
+
+    /// The one place ROCm refuses to pass a pin through: a non-numeric
+    /// string that matches no board key. In `HIP_VISIBLE_DEVICES` it would
+    /// match no device, hide the whole board set and drop the worker to the
+    /// CPU — strictly worse than the no-pin behaviour dropping it preserves.
+    #[test]
+    fn rocm_drops_a_pin_hip_could_not_read() {
+        let host = rocm_inventory(
+            PathBuf::from("/sys/bus/pci/devices"),
+            vec![amd_gpu(0, "0000:03:00.0", 24576)],
+        );
+        // A CUDA config's board UUID, carried over to an AMD host.
+        assert_eq!(host.resolve_pin(Some("GPU-1a2b")), None);
+        // A board key for a board this host does not have.
+        assert_eq!(host.resolve_pin(Some("GPU-BDF-0000:ff:00.0")), None);
+        // An unexpanded template and a stray word.
+        assert_eq!(host.resolve_pin(Some("${DEVICE}")), None);
+        assert_eq!(host.resolve_pin(Some("cpu")), None);
+        // A mixed list is not an index list.
+        assert_eq!(host.resolve_pin(Some("0,GPU-BDF-0000:03:00.0")), None);
+        // The empty string, which a templated config expands to more often
+        // than anything else here. It is *not* "no pin": no pin means the
+        // default board, and silently promoting an expansion failure to
+        // universal pinning would put a worker on a board nobody named.
+        assert_eq!(host.resolve_pin(Some("")), None);
+        assert_eq!(host.resolve_pin(Some("   ")), None);
+        assert_eq!(host.resolve_pin(Some(",")), None);
+        assert_eq!(
+            host.resolve_pin(None),
+            Some("0".to_string()),
+            "and *that* is what no pin means"
+        );
+    }
+
+    /// An unknown inventory keeps today's passthrough on the CUDA and
+    /// no-accelerator backends — which is why the *variable* is chosen by
+    /// the resolved accelerator and not by the inventory.
+    #[test]
+    fn the_pin_variable_follows_the_resolved_accelerator() {
+        assert_eq!(pin_env_var(Accelerator::Rocm), "HIP_VISIBLE_DEVICES");
+        for accelerator in [Accelerator::Cuda, Accelerator::Cpu, Accelerator::Auto] {
+            assert_eq!(
+                pin_env_var(accelerator),
+                "CUDA_VISIBLE_DEVICES",
+                "{accelerator:?} keeps the pre-ROCm variable"
+            );
+        }
+        let unknown = GpuInventory::unknown();
+        assert_eq!(unknown.resolve_pin(Some("1")), Some("1".to_string()));
+        // Verbatim means verbatim on that backend: nothing is filtered,
+        // nothing is normalised, because CUDA is the one that reads it and
+        // an unresolvable string there is the operator's to explain.
+        for requested in ["GPU-1a2b", "${DEVICE}", "cpu", " 0 ", ""] {
+            assert_eq!(
+                unknown.resolve_pin(Some(requested)),
+                Some(requested.to_string()),
+                "the non-ROCm unknown-inventory arm must not have changed"
+            );
+        }
+        assert_eq!(unknown.resolve_pin(None), None);
+    }
+
+    /// A ROCm host that found no boards (ambient restriction, probe failure,
+    /// non-Linux) does not thereby forget it is a ROCm host. It has nothing
+    /// to translate a board key against, but HIP's grammar still applies —
+    /// so an index passes and a `GPU-…` string, which would hide every board
+    /// and drop the worker to the CPU, still does not.
+    #[test]
+    fn an_unknown_rocm_inventory_keeps_hips_vocabulary() {
+        let host = uninventoried_rocm(false);
+        assert!(host.gpus().is_none());
+        // HIP-legal, so it survives — canonicalised, exactly as it would be
+        // on a host whose boards we could see.
+        assert_eq!(host.resolve_pin(Some("0")), Some("0".to_string()));
+        assert_eq!(host.resolve_pin(Some("0,1")), Some("0,1".to_string()));
+        assert_eq!(host.resolve_pin(Some(" 1 , 2 ")), Some("1,2".to_string()));
+        assert_eq!(host.resolve_pin(Some("00")), Some("0".to_string()));
+        // Not HIP-legal, so it is dropped rather than passed through the way
+        // an unknown *CUDA* host would pass it.
+        assert_eq!(host.resolve_pin(Some("GPU-1a2b")), None);
+        assert_eq!(host.resolve_pin(Some("${DEVICE}")), None);
+        assert_eq!(host.resolve_pin(Some("cpu")), None);
+        assert_eq!(host.resolve_pin(Some("")), None);
+        assert_eq!(host.resolve_pin(Some("4294967296")), None);
+        // And with no boards there is no default board either.
+        assert_eq!(host.resolve_pin(None), None);
+        assert_eq!(host.default_pin(), None);
+    }
+
+    /// When the operator's own ambient restriction is at HIP's layer, it
+    /// wins outright: we write nothing, not even the index we would
+    /// otherwise be allowed to write. Ours would overwrite theirs (same
+    /// variable) or outrank it (the alias), handing the worker boards they
+    /// deliberately hid.
+    ///
+    /// An ambient `ROCR_VISIBLE_DEVICES` alone is the other case and does
+    /// **not** set the flag: it filters below HIP, so a HIP index counts
+    /// into the operator's set instead of escaping it.
+    #[test]
+    fn an_ambient_hip_restriction_outranks_a_registry_pin() {
+        let restricted = uninventoried_rocm(true);
+        for requested in ["0", "0,1", "GPU-1a2b", "cpu", ""] {
+            assert_eq!(
+                restricted.resolve_pin(Some(requested)),
+                None,
+                "{requested:?} must not be written over the operator's own \
+                 HIP-layer restriction"
+            );
+        }
+        assert_eq!(restricted.resolve_pin(None), None);
+        // The flag is what distinguishes them, and it comes from the same
+        // positional array the probe reads the environment into.
+        use super::rocm::{VISIBILITY_VARS, ambient_hip_restriction};
+        let ambient = |set: &str| {
+            let values = VISIBILITY_VARS.map(|var| (var == set).then_some("0"));
+            ambient_hip_restriction(values)
+        };
+        assert!(!ambient("ROCR_VISIBLE_DEVICES"), "composes with a HIP index");
+        assert!(ambient("HIP_VISIBLE_DEVICES"), "the variable we write");
+        assert!(ambient("CUDA_VISIBLE_DEVICES"), "the alias we outrank");
+        assert!(ambient("GPU_DEVICE_ORDINAL"), "the same layer");
+        assert!(!ambient("NOTHING_SET_AT_ALL"));
+        // Both set: the scan must not stop at ROCR, which comes first.
+        assert!(ambient_hip_restriction(VISIBILITY_VARS.map(|var| {
+            (var == "ROCR_VISIBLE_DEVICES" || var == "HIP_VISIBLE_DEVICES").then_some("0")
+        })));
+        // Whitespace/comma-only values are "not configured", as everywhere.
+        assert!(!ambient_hip_restriction(
+            VISIBILITY_VARS.map(|var| (var == "HIP_VISIBLE_DEVICES").then_some(" , "))
+        ));
+    }
+
+    /// The pin *vocabulary* and the pin *variable* are one decision.
+    /// `pins_are_indices()` is the single source of the first — it is what
+    /// `default_pin` and `resolve_pin` branch on — and it and `pin_env_var`
+    /// must never disagree, because a board UUID in `HIP_VISIBLE_DEVICES` or
+    /// an index in `CUDA_VISIBLE_DEVICES` hides every board from the worker.
+    ///
+    /// Asserted against the real `probe`, which is where the two are
+    /// actually wired together (the backend and the variable both come from
+    /// the resolved accelerator), and against the known-inventory fixtures
+    /// for the vocabulary each one then emits.
+    #[test]
+    fn the_pin_vocabulary_and_the_pin_variable_agree() {
+        // ROCm, including on this box — the probe finds no AMD boards off
+        // Linux, and that must not change the answer.
+        let probed = probe(Accelerator::Rocm).inventory;
+        assert!(
+            probed.pins_are_indices(),
+            "a ROCm host pins by index whether or not its probe found boards"
+        );
+        assert_eq!(pin_env_var(Accelerator::Rocm), HIP_PIN_ENV_VAR);
+        let known_rocm = rocm_inventory(
+            PathBuf::from("/sys/bus/pci/devices"),
+            vec![amd_gpu(0, "0000:03:00.0", 24576)],
+        );
+        assert!(known_rocm.pins_are_indices());
+        assert_eq!(
+            known_rocm.default_pin(),
+            Some("0".to_string()),
+            "an index — never the GPU-BDF-… key the ledger is keyed by"
+        );
+        assert_eq!(
+            known_rocm.gpus().expect("known")[0].uuid,
+            "GPU-BDF-0000:03:00.0",
+            "and the key is still there, for everything that is not a pin"
+        );
+        // CUDA, and every accelerator that is not ROCm.
+        for accelerator in [Accelerator::Cuda, Accelerator::Cpu, Accelerator::Auto] {
+            assert_eq!(pin_env_var(accelerator), CUDA_PIN_ENV_VAR);
+        }
+        assert!(!probe(Accelerator::Cuda).inventory.pins_are_indices());
+        let known_cuda = inventory();
+        assert!(!known_cuda.pins_are_indices());
+        assert_eq!(
+            known_cuda.default_pin(),
+            Some("GPU-1111".to_string()),
+            "a UUID, which is the only unambiguous form CUDA takes"
         );
     }
 
