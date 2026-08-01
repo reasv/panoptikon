@@ -14,7 +14,7 @@ use ractor::factory::{
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::sync::{OnceCell, oneshot};
 
-use crate::api_error::ApiError;
+use crate::api_error::{ApiError, Blocker};
 use crate::db::files::has_blurhash;
 use crate::db::{
     file_scans::{FileScanUpdate, get_open_file_scan_id},
@@ -24,6 +24,7 @@ use crate::db::{
     },
     index_writer::{IndexDbWriterMessage, call_index_db_writer},
     open_index_db_read,
+    scan_errors::{ScanErrorRecord, get_scan_error},
     storage::{has_frame, has_thumbnail},
     system_config::{SystemConfig, SystemConfigStore},
 };
@@ -34,8 +35,9 @@ use crate::jobs::files::{
     FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, SCAN_PROGRESS_INTERVAL, ScanOptions,
     ScanTimers, THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data,
     check_folder_validity, current_iso_timestamp, deduplicate_paths, folder_is_empty,
-    get_last_modified_time_and_size, has_allowed_extension, is_excluded, is_hidden_or_temp,
-    normalize_path, parse_filescan_filter, process_file, run_post_job_maintenance,
+    format_system_time, get_last_modified_time_and_size, has_allowed_extension, infer_mime_type,
+    is_excluded, is_hidden_or_temp, normalize_path, parse_filescan_filter, process_file,
+    run_post_job_maintenance,
 };
 use crate::pql::model::Match;
 
@@ -111,31 +113,66 @@ impl Worker for ContinuousWorker {
         // the full-scan dedup: spurious watcher events and re-dispatched paths
         // cost one stat and one point query instead of a full re-process.
         let stat_path = path.clone();
-        let disk_mtime = tokio::task::spawn_blocking(move || {
-            get_last_modified_time_and_size(&stat_path).map(|(mtime, _)| mtime)
-        })
-        .await
-        .ok()
-        .and_then(|res| res.ok());
-        if let Some(disk_mtime) = &disk_mtime {
-            if let Ok(mut conn) = open_index_db_read(&index_db, &user_data_db).await {
-                if let Ok(Some(existing)) =
-                    get_file_by_path(&mut conn, path.to_string_lossy().as_ref()).await
-                {
-                    if &existing.last_modified == disk_mtime {
+        let stat = tokio::task::spawn_blocking(move || get_last_modified_time_and_size(&stat_path))
+            .await
+            .ok()
+            .and_then(|res| res.ok());
+        let path_str = path.to_string_lossy().to_string();
+        // The path *as the ledger stores it*, when it has a row at all. Gates
+        // the success-side delete below and carries the stored casing, which
+        // on Windows need not be the casing this event reported. The batch
+        // walker gets the same thing from its per-root preload; an
+        // event-driven scan gets it from the lookup it is doing here anyway.
+        let mut ledger_path: Option<String> = None;
+
+        if let Some((disk_mtime, file_size)) = &stat
+            && let Ok(mut conn) = open_index_db_read(&index_db, &user_data_db).await
+        {
+            // The recorded-failure check comes first: a file the scan
+            // already gave up on has no `files` row for the mtime shortcut
+            // to find, so this is the only thing between a watcher event
+            // and a full re-hash of a file that will fail again.
+            match get_scan_error(&mut conn, &path_str).await {
+                Ok(Some(skip)) => {
+                    let suppressed = skip.suppresses(disk_mtime, *file_size);
+                    ledger_path = Some(skip.path);
+                    if suppressed {
                         let _ = reply_to.cast(ContinuousScanMessage::WorkerResult {
                             epoch,
                             scan_time,
-                            result: Err(FileProcessError::Unchanged),
+                            path,
+                            stat,
+                            ledger_path,
+                            result: Err(FileProcessError::KnownBad),
                         });
                         return Ok(job.key);
                     }
                 }
+                Ok(None) => {}
+                // Advisory: without the verdict the file is simply
+                // processed, which is exactly the old behavior.
+                Err(err) => {
+                    tracing::warn!(error = ?err, path = %path.display(), "scan failure lookup failed")
+                }
+            }
+            if let Ok(Some(existing)) = get_file_by_path(&mut conn, &path_str).await
+                && &existing.last_modified == disk_mtime
+            {
+                let _ = reply_to.cast(ContinuousScanMessage::WorkerResult {
+                    epoch,
+                    scan_time,
+                    path,
+                    stat,
+                    ledger_path,
+                    result: Err(FileProcessError::Unchanged),
+                });
+                return Ok(job.key);
             }
         }
 
+        let work_path = path.clone();
         let result =
-            tokio::task::spawn_blocking(move || process_file(path, filescan_filter, &timers))
+            tokio::task::spawn_blocking(move || process_file(work_path, filescan_filter, &timers))
                 .await
                 .map_err(|err| FileProcessError::Worker(err.to_string()))
                 .and_then(|res| res);
@@ -143,6 +180,9 @@ impl Worker for ContinuousWorker {
         let _ = reply_to.cast(ContinuousScanMessage::WorkerResult {
             epoch,
             scan_time,
+            path,
+            stat,
+            ledger_path,
             result,
         });
         Ok(job.key)
@@ -199,6 +239,16 @@ pub(crate) enum ContinuousScanMessage {
     WorkerResult {
         epoch: u64,
         scan_time: String,
+        /// The path the worker handled. Carried because the failure half needs
+        /// an identity: `FileProcessError` says what went wrong, not to what.
+        path: PathBuf,
+        /// The file as the worker saw it — the `scan_errors` retry key. `None`
+        /// when the stat itself failed, which is transient and never recorded.
+        stat: Option<(String, i64)>,
+        /// The path the ledger stores for this file, when it had a row at all.
+        /// Gates the success-side delete (so a healthy file costs no writer
+        /// round-trip) and is what that delete binds.
+        ledger_path: Option<String>,
         result: Result<PreparedFile, FileProcessError>,
     },
     /// Point-in-time state for the status endpoint.
@@ -249,6 +299,11 @@ struct ScanStats {
     modified_files: i64,
     marked_unavailable: i64,
     errors: i64,
+    /// Events skipped on an active recorded scan failure. Deliberately not
+    /// folded into `errors` (nothing was attempted) and not persisted on the
+    /// scan row (`file_scans` has no column for it); logged when the scan
+    /// record closes.
+    known_bad: i64,
     total_available: i64,
     false_changes: i64,
 }
@@ -262,6 +317,7 @@ impl ScanStats {
             modified_files: 0,
             marked_unavailable: 0,
             errors: 0,
+            known_bad: 0,
             total_available: 0,
             false_changes: 0,
         }
@@ -380,6 +436,20 @@ pub(crate) struct ContinuousScanState {
     watcher_fallback: bool,
     enable_watcher: bool,
     deletions_since_maintenance: u64,
+    /// Files this session already classified as failing, with the
+    /// `(last_modified, file_size)` they failed at.
+    ///
+    /// The ledger alone cannot stop the re-attempt storm here: an ambiguous
+    /// verdict needs two attempts, and `attempts` is deduped on the *scan id*,
+    /// which for a continuous scan spans the whole session — so a file that
+    /// keeps generating watcher events would be re-hashed, re-decoded and
+    /// re-upserted (bumping the search-cache epoch each time) forever without
+    /// its count ever moving. This is the per-session half of that gate: the
+    /// second event for an unchanged failing file costs one stat.
+    ///
+    /// Not persistence, and not a substitute for the ledger: it is dropped on
+    /// every scan restart, so "attempts stays 1 per session" is unchanged.
+    failed_stats: HashMap<PathBuf, (String, i64)>,
 }
 impl ContinuousScanState {
     fn reset_stats(&mut self) {
@@ -462,6 +532,15 @@ impl ContinuousScanState {
     }
 
     async fn start_scan(&mut self) -> ApiResult<()> {
+        // Before anything is processed, exactly like the batch scan: a
+        // dependency that was missing when these files failed may be installed
+        // now, and this is the only place a long-lived watching session ever
+        // re-probes. Cheap — one indexed query returning nothing — when the
+        // ledger has no blocked rows, which is the normal case.
+        if let Err(err) = crate::jobs::files::heal_blocked_scan_errors(&self.index_db).await {
+            tracing::warn!(error = ?err, "failed to re-probe blocked scan failures");
+        }
+
         let scan_time = current_iso_timestamp();
         let scan_id =
             call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::AddFileScan {
@@ -473,13 +552,128 @@ impl ContinuousScanState {
         self.scan_id = Some(scan_id);
         self.scan_time = Some(scan_time);
         self.reset_stats();
+        // The session cache is scoped to the scan record it counts attempts
+        // against, so a new record starts with an empty one.
+        self.failed_stats.clear();
         Ok(())
+    }
+
+    /// Logs one file failure and, when its class is one the ledger stores,
+    /// records it. Before this the error variant was discarded outright: the
+    /// counter moved and nothing said which file or why.
+    ///
+    /// The scan id is the continuous scan's own `file_scans` row, which is
+    /// what dedups `attempts`. That row is long-lived — it spans the whole
+    /// watching session — so a `skip_after = 2` verdict written here is
+    /// normally confirmed by the next *batch* scan (or by the next session)
+    /// rather than by a second event. That is the intended conservatism: an
+    /// ambiguous verdict from an external tool should not be settled by two
+    /// events seconds apart on the same flaky mount.
+    async fn record_file_failure(
+        &mut self,
+        path: &Path,
+        stat: Option<(String, i64)>,
+        error: &FileProcessError,
+    ) {
+        if matches!(error, FileProcessError::Filtered) {
+            tracing::debug!(
+                path = %path.display(),
+                "file does not match the filescan filter, skipping"
+            );
+            return;
+        }
+        let classified = error.classified();
+        tracing::error!(
+            error = ?error,
+            path = %path.display(),
+            stage = classified.map(|failure| failure.stage).unwrap_or("-"),
+            error_class = classified
+                .and_then(|failure| failure.kind.persisted_class())
+                .unwrap_or("transient"),
+            blocker = classified
+                .and_then(|failure| failure.kind.blocker())
+                .map(Blocker::as_str)
+                .unwrap_or("none"),
+            "failed to process file"
+        );
+
+        // Transient classes are never recorded: the file simply fails this
+        // event and is retried untouched.
+        let (Some(failure), Some((last_modified, file_size))) = (classified, stat) else {
+            return;
+        };
+        // The session cache goes in *with* the ledger row, so the next event
+        // for these same bytes is answered by one stat instead of another full
+        // process + upsert + epoch bump. See `failed_stats`.
+        self.failed_stats
+            .insert(path.to_path_buf(), (last_modified.clone(), file_size));
+        let record = ScanErrorRecord {
+            path: path.to_string_lossy().to_string(),
+            last_modified,
+            file_size,
+            stage: failure.stage.to_string(),
+            kind: failure.kind,
+            // Re-guessed rather than threaded back from the worker: it is a
+            // pure function of the file name and only runs on the failure
+            // path. `None` when the guess is what failed.
+            mime_type: infer_mime_type(path).ok(),
+            error: failure.message.clone(),
+            skip_after: failure.skip_after,
+        };
+        let scan_id = self.scan_id;
+        if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::UpsertScanError {
+                record: record.clone(),
+                scan_id,
+                reply,
+            }
+        })
+        .await
+        {
+            tracing::warn!(
+                error = ?err,
+                path = %path.display(),
+                "failed to record a scan failure; it will be re-attempted"
+            );
+        }
+    }
+
+    /// Success path: the file made it through, so its verdict goes away.
+    /// Called only when the worker's lookup found a row, so a healthy file
+    /// never pays a writer round-trip (or a search-cache epoch bump) for it.
+    /// `path` is the *stored* path the worker's lookup returned, which on
+    /// Windows need not be the casing the event reported; the delete binds
+    /// bytes.
+    async fn clear_file_failure(&self, path: String) {
+        match call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteScanError {
+                path: path.clone(),
+                reply,
+            }
+        })
+        .await
+        {
+            Ok(cleared) => {
+                if cleared > 0 {
+                    tracing::info!(path, "cleared a recorded scan failure after a good pass");
+                }
+            }
+            // Advisory: a lost delete costs one wasted re-attempt, never
+            // correctness.
+            Err(err) => tracing::warn!(error = ?err, path, "failed to clear a scan failure"),
+        }
     }
 
     async fn close_scan(&mut self) -> ApiResult<()> {
         let Some(scan_id) = self.scan_id.take() else {
             return Ok(());
         };
+        if self.stats.known_bad > 0 {
+            tracing::info!(
+                known_bad = self.stats.known_bad,
+                "skipped files with an active recorded scan failure"
+            );
+        }
         let end_time = current_iso_timestamp();
         // Stored times are phase wall-clock (busy) from the shared timers, not
         // sums of per-file spans across concurrent workers.
@@ -635,19 +829,46 @@ impl ContinuousScanState {
         Ok(())
     }
 
-    fn dispatch_path(&self, path: PathBuf) {
+    fn dispatch_path(&mut self, path: PathBuf) {
         if self.paused {
             return;
         }
         if !self.should_process_path(&path) {
             return;
         }
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            if !metadata.is_file() {
-                return;
-            }
-        } else {
+        let Ok(metadata) = std::fs::metadata(&path) else {
             return;
+        };
+        if !metadata.is_file() {
+            return;
+        }
+
+        // The session cache, consulted on the stat this function already had
+        // to take. A file that failed earlier in this session and has not
+        // moved since is not dispatched at all: no worker, no re-hash, no
+        // re-upsert, no epoch bump. See `failed_stats`.
+        if let Some((failed_mtime, failed_size)) = self.failed_stats.get(&path) {
+            let current = metadata
+                .modified()
+                .ok()
+                .and_then(format_system_time)
+                .map(|mtime| (mtime, metadata.len() as i64));
+            match current {
+                Some((mtime, size)) if &mtime == failed_mtime && size == *failed_size => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "skipping a file that already failed in this session"
+                    );
+                    self.stats.known_bad += 1;
+                    return;
+                }
+                // Its bytes moved (or the stat is unreadable): the verdict was
+                // about different content, so it is re-attempted and the cache
+                // entry goes.
+                _ => {
+                    self.failed_stats.remove(&path);
+                }
+            }
         }
         let scan_time = match &self.scan_time {
             Some(value) => value.clone(),
@@ -867,6 +1088,7 @@ impl Actor for ContinuousScanActor {
             watcher_fallback: false,
             enable_watcher: args.enable_watcher,
             deletions_since_maintenance: 0,
+            failed_stats: HashMap::new(),
         };
 
         let roots_ok = state.refresh_roots().await;
@@ -1141,6 +1363,9 @@ impl Actor for ContinuousScanActor {
             ContinuousScanMessage::WorkerResult {
                 epoch,
                 scan_time,
+                path,
+                stat,
+                ledger_path,
                 result,
             } => {
                 if state.paused || epoch != state.epoch {
@@ -1153,8 +1378,20 @@ impl Actor for ContinuousScanActor {
                         state.maybe_report_progress().await;
                         return Ok(());
                     }
-                    Err(_) => {
+                    Err(FileProcessError::KnownBad) => {
+                        // Nothing was attempted, so this is not an error of
+                        // this run; the file keeps its recorded verdict until
+                        // its bytes move.
+                        state.stats.known_bad += 1;
+                        state.maybe_report_progress().await;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        // Used to be discarded outright — no log line, no path,
+                        // no class. Now it is both visible and, when the class
+                        // is one the ledger stores, remembered.
                         state.stats.errors += 1;
+                        state.record_file_failure(&path, stat, &error).await;
                         state.maybe_report_progress().await;
                         return Ok(());
                     }
@@ -1282,6 +1519,13 @@ impl Actor for ContinuousScanActor {
                             state.stats.new_files += 1;
                         }
                         state.stats.total_available += 1;
+                        // The file made it through, so it owes no verdict.
+                        // Gated on the worker's lookup, so the healthy path
+                        // pays nothing.
+                        state.failed_stats.remove(&path);
+                        if let Some(stored) = ledger_path {
+                            state.clear_file_failure(stored).await;
+                        }
                     }
                     Err(err) => {
                         tracing::error!(error = ?err, "failed to update file data");
@@ -1902,6 +2146,9 @@ mod tests {
             .cast(ContinuousScanMessage::WorkerResult {
                 epoch: 0,
                 scan_time: current_iso_timestamp(),
+                path: file_path.clone(),
+                stat: None,
+                ledger_path: None,
                 result: Ok(prepared),
             })
             .unwrap();
@@ -1990,6 +2237,9 @@ mod tests {
             .cast(ContinuousScanMessage::WorkerResult {
                 epoch: 0,
                 scan_time: current_iso_timestamp(),
+                path: file_path.clone(),
+                stat: None,
+                ledger_path: None,
                 result: Ok(prepared),
             })
             .unwrap();
@@ -2127,6 +2377,138 @@ mod tests {
 
         actor.stop(None);
         assert!(found, "poll mode did not index the new file in time");
+    }
+
+    // The continuous scan used to throw the error variant away entirely — the
+    // counter moved and nothing said which file or why, so a broken file was
+    // re-hashed on every watcher event forever. It now records the verdict and
+    // consults it before dispatching the next event for the same path.
+    #[tokio::test]
+    async fn continuous_scan_records_and_then_skips_a_broken_file() {
+        let test_env = test_data_dir();
+        let root = test_env.path().to_path_buf();
+        let index_db = unique_db_name("contledger");
+        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
+
+        let watch_dir = root.join("ledgerwatch");
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let broken = watch_dir.join("broken.png");
+        std::fs::write(&broken, b"this claims to be a png and is not").unwrap();
+
+        let store = SystemConfigStore::new(root.clone());
+        let mut config = store.load(&index_db).unwrap();
+        config.continuous_filescan.enabled = true;
+        config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let (actor, handle) = Actor::spawn(
+            None,
+            ContinuousScanActor,
+            ContinuousScanActorArgs {
+                index_db: index_db.clone(),
+                user_data_db: index_db.clone(),
+                data_dir: root.clone(),
+                // No watcher and no poller: the events under test are cast by
+                // hand, so nothing else can dispatch this path.
+                enable_watcher: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        async fn row(index_db: &str) -> Option<(String, String, i64, i64)> {
+            let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+                .await
+                .unwrap();
+            sqlx::query_as("SELECT stage, error_class, attempts, skip_after FROM scan_errors")
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap()
+        }
+
+        actor
+            .cast(ContinuousScanMessage::DispatchStable {
+                epoch: 0,
+                path: broken.clone(),
+            })
+            .unwrap();
+
+        let mut recorded = None;
+        for _ in 0..120 {
+            if let Some(found) = row(&index_db).await {
+                recorded = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            recorded,
+            Some(("decode".to_string(), "input".to_string(), 1, 2)),
+            "an undecodable image is an unconfirmed input verdict"
+        );
+
+        // A second event for the same unchanged file must not re-process it.
+        //
+        // The ledger cannot do this on its own here: the verdict is still
+        // unconfirmed (one attempt of two), and `attempts` dedups on the scan
+        // id, which for a continuous scan spans the whole session — so without
+        // the session cache this event would re-hash, re-decode and re-upsert
+        // the file, bumping the search-cache epoch, and would do it again for
+        // every event after that. The recorded row is unchanged either way;
+        // the scan's own error counter, asserted after the stop below, is what
+        // distinguishes "suppressed" from "silently redone".
+        actor
+            .cast(ContinuousScanMessage::DispatchStable {
+                epoch: 0,
+                path: broken.clone(),
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            row(&index_db).await,
+            Some(("decode".to_string(), "input".to_string(), 1, 2)),
+            "a suppressed file is not re-attempted"
+        );
+
+        // Repairing it clears the verdict and indexes the file.
+        write_test_image(&broken);
+        actor
+            .cast(ContinuousScanMessage::DispatchStable {
+                epoch: 0,
+                path: broken.clone(),
+            })
+            .unwrap();
+        let mut cleared = false;
+        for _ in 0..120 {
+            if row(&index_db).await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        actor.stop(None);
+        let _ = handle.await;
+        assert!(cleared, "a file that works owes no verdict");
+
+        // Stopping closes the scan record, which is where the counters land.
+        // Exactly one failure was ever *processed*: the second event was
+        // answered from the session cache with a single stat.
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let errors: i64 = sqlx::query_scalar(
+            "SELECT errors FROM file_scans WHERE path = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(CONTINUOUS_PATH_SENTINEL)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            errors, 1,
+            "the second event must be suppressed, not re-processed"
+        );
     }
 
     #[test]

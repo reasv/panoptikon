@@ -39,12 +39,29 @@ pub(crate) fn ffprobe() -> &'static OsStr {
 /// `blocked`, never `input`"). Only `NotFound` means the toolchain is
 /// missing; a permission or resource failure is this machine's problem and
 /// stays transient, so the item is retried untouched.
+///
+/// The blocker is derived from `tool` rather than assumed: a `blocked` row
+/// names the dependency the auto-heal will probe, so a third tool routed
+/// through here and silently recorded as `ffmpeg` would be healed by an
+/// ffmpeg that has nothing to do with it. An unknown tool falls back to
+/// transient, which costs a re-attempt and never a wrong verdict.
 pub(crate) fn spawn_error(tool: &str, err: &std::io::Error) -> crate::api_error::ApiError {
     if err.kind() == std::io::ErrorKind::NotFound {
-        return crate::api_error::ApiError::blocked(
-            crate::api_error::Blocker::Ffmpeg,
-            format!("{tool} is not installed: {err}"),
-        );
+        match tool {
+            "ffmpeg" | "ffprobe" => {
+                return crate::api_error::ApiError::blocked(
+                    crate::api_error::Blocker::Ffmpeg,
+                    format!("{tool} is not installed: {err}"),
+                );
+            }
+            other => {
+                debug_assert!(false, "spawn_error has no blocker for {other}");
+                tracing::warn!(
+                    tool = other,
+                    "spawn failure for a tool with no known blocker"
+                );
+            }
+        }
     }
     crate::api_error::ApiError::internal(format!("{tool} failed to start: {err}"))
 }

@@ -39,6 +39,10 @@ use crate::db::{
         delete_files_under_excluded_folders, delete_folders_not_in_list,
     },
     open_index_db_read_no_user_data, open_index_db_write_no_user_data,
+    scan_errors::{
+        ScanErrorRecord, delete_blocked_scan_errors, delete_scan_error, delete_scan_errors,
+        upsert_scan_error,
+    },
     storage::{
         StoredImage, delete_orphaned_frames, delete_orphaned_thumbnails, store_frames,
         store_thumbnails,
@@ -211,6 +215,31 @@ pub(crate) enum IndexDbWriterMessage {
     /// Auto-heal: clears the `blocked` rows of every dependency that now
     /// binds, so those items become selectable in the same run.
     ClearBlockedErrors {
+        blockers: Vec<Blocker>,
+        reply: Reply<u64>,
+    },
+    /// Records one non-transient filescan failure
+    /// (docs/failed-media-retry-design.md). The scan already routes every
+    /// write through this actor, so the ledger rides the same serialized path
+    /// rather than opening a second writer. `scan_id` is the run that saw the
+    /// failure, which is what dedups `attempts`.
+    UpsertScanError {
+        record: ScanErrorRecord,
+        scan_id: Option<i64>,
+        reply: Reply<()>,
+    },
+    /// Success path: the scan can process this path after all.
+    DeleteScanError {
+        path: String,
+        reply: Reply<u64>,
+    },
+    /// End-of-root sweep: rows the walk never reached, in one statement.
+    DeleteScanErrors {
+        paths: Vec<String>,
+        reply: Reply<u64>,
+    },
+    /// Auto-heal for the scan ledger, the twin of [`Self::ClearBlockedErrors`].
+    ClearBlockedScanErrors {
         blockers: Vec<Blocker>,
         reply: Reply<u64>,
     },
@@ -821,6 +850,42 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move { delete_blocked_errors(conn, &blockers).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::UpsertScanError {
+                record,
+                scan_id,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { upsert_scan_error(conn, &record, scan_id).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteScanError { path, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_scan_error(conn, &path).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteScanErrors { paths, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_scan_errors(conn, &paths).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::ClearBlockedScanErrors { blockers, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_blocked_scan_errors(conn, &blockers).await })
                     })
                     .await;
                 let _ = reply.send(result);

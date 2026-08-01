@@ -29,7 +29,7 @@ use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
 use crate::{
-    api_error::ApiError,
+    api_error::{ApiError, ApiErrorKind, Blocker, SKIP_AFTER_AMBIGUOUS, SKIP_AFTER_CONFIRMED},
     db::{
         file_scans::{FileScanUpdate, get_completed_scan_paths, get_open_file_scan_id},
         files::{
@@ -39,6 +39,10 @@ use crate::{
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
         open_index_db_read, open_index_db_read_no_user_data,
+        scan_errors::{
+            STAGE_DECODE, STAGE_METADATA, STAGE_MIME, ScanErrorRecord, ScanErrorSkip,
+            fold_scan_path, list_distinct_scan_blockers, load_scan_errors_under,
+        },
         storage::{StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail},
         system_config::{SystemConfig, SystemConfigStore},
     },
@@ -96,6 +100,11 @@ struct ScanTotals {
     marked_unavailable: i64,
     /// Thumbnail/frame/blurhash rows written for already-indexed content.
     backfilled_visuals: i64,
+    /// Files skipped on an active `scan_errors` verdict. Not a write and not
+    /// an error, so it stays out of [`Self::wrote_data`] and off the scan row;
+    /// it exists so the job summary can say the scan deliberately left files
+    /// alone instead of silently doing less than the user expected.
+    known_bad: i64,
 }
 
 impl ScanTotals {
@@ -115,6 +124,7 @@ impl ScanTotals {
         self.modified_files += stats.modified_files;
         self.marked_unavailable += stats.marked_unavailable;
         self.backfilled_visuals += stats.backfilled_visuals;
+        self.known_bad += stats.known_bad;
     }
 }
 
@@ -568,6 +578,16 @@ async fn execute_folder_scan(
     }
     drop(conn);
 
+    // Before any root is walked: a dependency that was missing when these
+    // files failed may be installed now, and the files waiting on it become
+    // scannable again in this same run. Usually one indexed query returning
+    // nothing.
+    if !starting_points.is_empty() {
+        if let Err(err) = heal_blocked_scan_errors(index_db).await {
+            tracing::warn!(error = ?err, "failed to re-probe blocked scan failures");
+        }
+    }
+
     let scan_time = current_iso_timestamp();
     let mut scan_ids = Vec::new();
     let mut totals = ScanTotals::default();
@@ -621,7 +641,70 @@ async fn execute_folder_scan(
         .await?;
     }
 
+    // The job's own summary line. `known_bad` has no column on any scan row —
+    // it is not something a scan did, it is something it deliberately did not
+    // do — so this log is the only place the whole run's count surfaces until
+    // the failures API lands.
+    if totals.known_bad > 0 {
+        tracing::info!(
+            known_bad = totals.known_bad,
+            roots = scan_ids.len(),
+            "file scan skipped files with an active recorded scan failure"
+        );
+    }
+
     Ok((scan_ids, totals))
+}
+
+/// `blocked` auto-heal for the scan ledger (docs/failed-media-retry-design.md,
+/// req 10). The twin of the extraction job's `heal_blocked_errors`, and the
+/// same shape: read the dependencies the ledger is actually waiting on — the
+/// usual answer is none, one indexed query — probe only those, and clear the
+/// rows of the ones that now bind.
+///
+/// The backends are cached in `OnceLock`s, so a dependency installed while the
+/// gateway runs is seen at the next restart; the ledger clears on the first
+/// scan after that.
+pub(crate) async fn heal_blocked_scan_errors(index_db: &str) -> ApiResult<()> {
+    let waiting = {
+        let mut conn = open_index_db_read_no_user_data(index_db).await?;
+        list_distinct_scan_blockers(&mut conn).await?
+    };
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    // Binding pdfium and spawning ffmpeg both block; the probes run off the
+    // async runtime.
+    let present = tokio::task::spawn_blocking(move || {
+        waiting
+            .into_iter()
+            .filter(|blocker| probe_blocker(*blocker))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| ApiError::internal("Blocker probe task failed"))?;
+    heal_blocked_scan(index_db, present).await.map(|_| ())
+}
+
+/// The write half, with the probe results handed in: probing real binaries is
+/// what makes this untestable, and the clearing is what has to be right.
+async fn heal_blocked_scan(index_db: &str, present: Vec<Blocker>) -> ApiResult<u64> {
+    if present.is_empty() {
+        return Ok(0);
+    }
+    let cleared = call_index_db_writer(index_db, |reply| {
+        IndexDbWriterMessage::ClearBlockedScanErrors {
+            blockers: present.clone(),
+            reply,
+        }
+    })
+    .await?;
+    tracing::info!(
+        cleared,
+        blockers = ?present.iter().map(|blocker| blocker.as_str()).collect::<Vec<_>>(),
+        "dependencies are available again; cleared their blocked scan failures"
+    );
+    Ok(cleared)
 }
 
 pub(crate) const THUMBNAIL_PROCESS_VERSION: i64 = 1;
@@ -645,6 +728,12 @@ struct FolderStats {
     marked_unavailable: i64,
     /// Not persisted on the scan row; only feeds [`ScanTotals::wrote_data`].
     backfilled_visuals: i64,
+    /// Files the walk skipped on an active `scan_errors` verdict. Deliberately
+    /// *not* folded into `errors`, which means "failed during this run": these
+    /// files were not attempted at all. Logged at the end of the folder scan;
+    /// `file_scans` has no column for them, and adding one would say a scan
+    /// went worse than it did.
+    known_bad: i64,
     errors: i64,
     total_available: i64,
     false_changes: i64,
@@ -675,6 +764,7 @@ impl FolderStats {
             modified_files: 0,
             marked_unavailable: 0,
             backfilled_visuals: 0,
+            known_bad: 0,
             errors: 0,
             total_available: 0,
             false_changes: 0,
@@ -720,6 +810,29 @@ struct BackfillResult {
 struct FailedFile {
     path: PathBuf,
     error: FileProcessError,
+    /// The file exactly as the worker saw it — a verdict is only ever about
+    /// these bytes, and `(last_modified, file_size)` is what the ledger
+    /// re-checks before suppressing anything. `None` when the failure happened
+    /// before the stat, or when the task itself died; both are transient and
+    /// never recorded, so nothing is lost.
+    stat: Option<(String, i64)>,
+    /// The extension guess, so retry directives can target a format. `None`
+    /// when guessing it is what failed.
+    mime_type: Option<String>,
+}
+
+impl FailedFile {
+    /// A failure with no recordable identity: every caller of this is a
+    /// transient class (a dead worker task, a read that never got as far as a
+    /// stat), which the ledger refuses anyway.
+    fn transient(path: PathBuf, error: FileProcessError) -> Self {
+        Self {
+            path,
+            error,
+            stat: None,
+            mime_type: None,
+        }
+    }
 }
 
 enum TaskOutcome {
@@ -748,6 +861,16 @@ struct ScanContext {
     timers: ScanTimers,
     last_progress: Instant,
     error_paths: Vec<String>,
+    /// Every `scan_errors` row under this root, read once before the walk and
+    /// keyed by [`fold_scan_path`]. Normally empty, so the healthy path costs
+    /// one lookup in an empty map per file and no query at all — the whole
+    /// point of preloading rather than asking per file across 90k files on a
+    /// network mount.
+    scan_errors: HashMap<String, ScanErrorSkip>,
+    /// Which of those keys the walk actually reached (skipped or not). The
+    /// difference against `scan_errors` is the end-of-root sweep, so the sweep
+    /// is a set difference over ledger rows only — never over every file.
+    seen_scan_errors: HashSet<String>,
     conn: sqlx::SqliteConnection,
 }
 
@@ -769,7 +892,18 @@ async fn scan_single_folder(
     options: ScanOptions,
 ) -> ApiResult<FolderStats> {
     let allowed_extensions = build_extension_set(config);
-    let conn = open_index_db_read(index_db, user_data_db).await?;
+    let mut conn = open_index_db_read(index_db, user_data_db).await?;
+    // One indexed read per root, before the walk. A library with no recorded
+    // failures — the normal case — gets an empty map and pays nothing per file
+    // from here on.
+    let scan_errors = load_scan_errors_under(&mut conn, folder).await?;
+    if !scan_errors.is_empty() {
+        tracing::info!(
+            folder,
+            rows = scan_errors.len(),
+            "loaded recorded scan failures for this root"
+        );
+    }
     let mut ctx = ScanContext {
         index_db: index_db.to_string(),
         scan_id,
@@ -783,9 +917,15 @@ async fn scan_single_folder(
         timers: ScanTimers::default(),
         last_progress: Instant::now(),
         error_paths: Vec::new(),
+        scan_errors,
+        seen_scan_errors: HashSet::new(),
         conn,
     };
 
+    // Every directory the walk could not read. A single one of these makes
+    // "the walk never reached this path" ambiguous, which is what the sweep
+    // reads as "the file is gone" — see `sweepable_scan_errors`.
+    let mut walk_errors: u64 = 0;
     for entry in WalkDir::new(folder)
         .follow_links(true)
         .into_iter()
@@ -801,6 +941,7 @@ async fn scan_single_folder(
             Ok(entry) => entry,
             Err(err) => {
                 tracing::error!(error = %err, "error walking directory");
+                walk_errors += 1;
                 continue;
             }
         };
@@ -830,8 +971,27 @@ async fn scan_single_folder(
         mut stats,
         timers,
         error_paths,
+        scan_errors,
+        seen_scan_errors,
         ..
     } = ctx;
+
+    let vanished = sweepable_scan_errors(walk_errors, &scan_errors, &seen_scan_errors);
+    if !vanished.is_empty() {
+        match call_index_db_writer(index_db, |reply| IndexDbWriterMessage::DeleteScanErrors {
+            paths: vanished.clone(),
+            reply,
+        })
+        .await
+        {
+            Ok(swept) => {
+                tracing::info!(folder, swept, "cleared scan failures for vanished files")
+            }
+            // Advisory: a lost sweep leaves a row describing a file that is no
+            // longer there, which suppresses nothing and costs nothing.
+            Err(err) => tracing::warn!(error = ?err, folder, "failed to sweep scan failures"),
+        }
+    }
 
     let (marked_unavailable, total_available) = call_index_db_writer(index_db, |reply| {
         IndexDbWriterMessage::MarkUnavailableFiles {
@@ -851,6 +1011,13 @@ async fn scan_single_folder(
     stats.hashing_time = timers.hashing.busy_secs();
     stats.thumbgen_time = timers.thumbgen.busy_secs();
     stats.blurhash_time = timers.blurhash.busy_secs();
+    if stats.known_bad > 0 {
+        tracing::info!(
+            folder,
+            known_bad = stats.known_bad,
+            "skipped files with an active recorded scan failure"
+        );
+    }
     tracing::info!(
         folder,
         hashing_busy_secs = stats.hashing_time,
@@ -865,6 +1032,43 @@ async fn scan_single_folder(
     );
 
     Ok(stats)
+}
+
+/// Which ledger rows the end-of-root sweep may clear: the stored paths of the
+/// rows the walk never reached.
+///
+/// The sweep reads "not reached" as "the file is no longer there", which is
+/// only sound when the walk actually saw the whole tree. A `WalkDir` error is
+/// an unreadable directory (a permission change, a dropped mount, a network
+/// share that timed out), and every file beneath it looks exactly like a file
+/// that was deleted. Clearing then throws away verdicts for files that are
+/// still on disk and hands the next scan all of their work back — the one
+/// failure mode a *cache* must not have. So a walk with any error sweeps
+/// nothing and the rows wait for a clean one; a stale row suppresses nothing
+/// and costs nothing.
+fn sweepable_scan_errors(
+    walk_errors: u64,
+    scan_errors: &HashMap<String, ScanErrorSkip>,
+    seen: &HashSet<String>,
+) -> Vec<String> {
+    if scan_errors.is_empty() {
+        return Vec::new();
+    }
+    if walk_errors > 0 {
+        tracing::warn!(
+            walk_errors,
+            rows = scan_errors.len(),
+            "the walk could not read part of the tree; deferring the scan-failure sweep"
+        );
+        return Vec::new();
+    }
+    scan_errors
+        .iter()
+        .filter(|(key, _)| !seen.contains(*key))
+        // The *stored* path, not the folded key: on Windows they differ, and
+        // the delete binds bytes.
+        .map(|(_, entry)| entry.path.clone())
+        .collect()
 }
 
 impl ScanContext {
@@ -907,21 +1111,69 @@ impl ScanContext {
     /// database record are updated directly without hashing or decoding;
     /// everything else is dispatched to the worker pool.
     async fn scan_path(&mut self, path: PathBuf) -> ApiResult<()> {
+        let path_str = path.to_string_lossy().to_string();
+        // The whole ledger side of the walk is gated on the map being
+        // non-empty, which it is for essentially every scan there has ever
+        // been: no fold, no hash, no lookup per file.
+        //
+        // Mark the path reached before anything can fail, so the end-of-root
+        // sweep only ever clears rows for files the walk genuinely did not
+        // see. A file that is here but unreadable today keeps its verdict —
+        // and so does one this scan will reject at a *later* gate (the
+        // filescan filter, a mime guess that no longer resolves). Such a row
+        // suppresses nothing that would otherwise be processed, and keeping
+        // it means a filter the user narrows and widens again does not cost a
+        // full re-attempt of every broken file it swept out.
+        let ledger_entry = if self.scan_errors.is_empty() {
+            None
+        } else {
+            let key = fold_scan_path(&path_str);
+            let found = self.scan_errors.get(&key).cloned();
+            if found.is_some() {
+                self.seen_scan_errors.insert(key);
+            }
+            found
+        };
+
         let (last_modified, file_size) = match get_last_modified_time_and_size(&path) {
             Ok(value) => value,
             Err(err) => {
                 tracing::info!(error = %err, path = %path.display(), "failed to stat file");
                 self.stats.errors += 1;
-                self.error_paths.push(path.to_string_lossy().to_string());
+                self.error_paths.push(path_str);
                 return Ok(());
             }
         };
+
+        // The whole point of the ledger: a file whose verdict is confirmed and
+        // whose bytes have not moved is not hashed, probed or decoded again.
+        // It is *not* an error of this run — nothing was attempted — but it
+        // still has to stay out of unavailable-marking, exactly like a file
+        // that failed, or a previously indexed copy of it would be marked gone
+        // and then deleted.
+        let suppressed = ledger_entry
+            .as_ref()
+            .is_some_and(|skip| skip.suppresses(&last_modified, file_size));
+        if suppressed {
+            tracing::debug!(
+                path = %path.display(),
+                "skipping a file with an active recorded scan failure"
+            );
+            self.stats.known_bad += 1;
+            self.error_paths.push(path_str);
+            return Ok(());
+        }
+
         let mime_type = match infer_mime_type(&path) {
             Ok(mime) => mime,
-            Err(_) => {
-                tracing::error!(path = %path.display(), "could not determine mime type");
-                self.stats.errors += 1;
-                self.error_paths.push(path.to_string_lossy().to_string());
+            Err(error) => {
+                self.fail_file(FailedFile {
+                    path,
+                    error,
+                    stat: Some((last_modified, file_size)),
+                    mime_type: None,
+                })
+                .await;
                 return Ok(());
             }
         };
@@ -940,7 +1192,6 @@ impl ScanContext {
             return Ok(());
         }
 
-        let path_str = path.to_string_lossy().to_string();
         let existing = get_file_by_path(&mut self.conn, &path_str).await?;
 
         if let Some(existing) = &existing {
@@ -1023,26 +1274,125 @@ impl ScanContext {
                 Ok(())
             }
             TaskOutcome::Failed(failed) => {
-                self.stats.errors += 1;
-                match &failed.error {
-                    FileProcessError::Filtered => {
-                        tracing::debug!(
-                            path = %failed.path.display(),
-                            "file does not match the filescan filter (stage 2), skipping"
-                        );
-                    }
-                    error => {
-                        tracing::error!(
-                            error = ?error,
-                            path = %failed.path.display(),
-                            "failed to process file"
-                        );
-                        self.error_paths
-                            .push(failed.path.to_string_lossy().to_string());
-                    }
-                }
+                self.fail_file(failed).await;
                 Ok(())
             }
+        }
+    }
+
+    /// The one place a file failure is accounted: the counters, the
+    /// unavailable-marking exclusion, the log line, and — for the classes the
+    /// ledger stores — the row that stops the next scan repeating the work.
+    ///
+    /// Never returns an error. A failed ledger write is advisory here (unlike
+    /// the extraction job, whose completion classifier depends on it): the
+    /// worst case is that the same file fails again next scan, which is
+    /// exactly today's behavior.
+    async fn fail_file(&mut self, failed: FailedFile) {
+        let FailedFile {
+            path,
+            error,
+            stat,
+            mime_type,
+        } = failed;
+        self.stats.errors += 1;
+
+        if matches!(error, FileProcessError::Filtered) {
+            tracing::debug!(
+                path = %path.display(),
+                "file does not match the filescan filter (stage 2), skipping"
+            );
+            return;
+        }
+
+        let path_str = path.to_string_lossy().to_string();
+        let classified = error.classified();
+        tracing::error!(
+            error = ?error,
+            path = %path.display(),
+            stage = classified.map(|failure| failure.stage).unwrap_or("-"),
+            error_class = classified
+                .and_then(|failure| failure.kind.persisted_class())
+                .unwrap_or("transient"),
+            blocker = classified
+                .and_then(|failure| failure.kind.blocker())
+                .map(Blocker::as_str)
+                .unwrap_or("none"),
+            "failed to process file"
+        );
+        self.error_paths.push(path_str.clone());
+
+        // Transient classes are never recorded: the file simply fails this run
+        // and is retried untouched, which is what "transient" means.
+        let (Some(failure), Some((last_modified, file_size))) = (classified, stat) else {
+            return;
+        };
+        let record = ScanErrorRecord {
+            path: path_str,
+            last_modified,
+            file_size,
+            stage: failure.stage.to_string(),
+            kind: failure.kind,
+            mime_type,
+            error: failure.message.clone(),
+            skip_after: failure.skip_after,
+        };
+        let scan_id = self.scan_id;
+        if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::UpsertScanError {
+                record: record.clone(),
+                // Always the real scan: `attempts` dedups on it, and a
+                // scan-less write would stop counting across consecutive runs.
+                scan_id: Some(scan_id),
+                reply,
+            }
+        })
+        .await
+        {
+            tracing::warn!(
+                error = ?err,
+                path = %path.display(),
+                "failed to record a scan failure; it will be re-attempted next scan"
+            );
+        }
+    }
+
+    /// The success path: a file the scan just got through owes no ledger row.
+    ///
+    /// Gated on the preloaded map, so a healthy library pays no writer
+    /// round-trip (and no search-cache epoch bump) per successful file — the
+    /// map is empty for almost every scan there has ever been. Deliberately
+    /// not gated on the row being *active*: the only rows a success can own
+    /// are the sub-threshold ones a single blip left behind, and leaving those
+    /// would let a second blip years later confirm a verdict on a file that
+    /// has succeeded a thousand times in between.
+    async fn clear_scan_error(&mut self, path: &str) {
+        if self.scan_errors.is_empty() {
+            return;
+        }
+        let key = fold_scan_path(path);
+        // The row is deleted by the path that is actually stored, which on
+        // Windows need not be the casing the walk produced.
+        let Some(stored) = self.scan_errors.get(&key).map(|entry| entry.path.clone()) else {
+            return;
+        };
+        match call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteScanError {
+                path: stored.clone(),
+                reply,
+            }
+        })
+        .await
+        {
+            Ok(cleared) => {
+                if cleared > 0 {
+                    self.scan_errors.remove(&key);
+                    tracing::info!(path, "cleared a recorded scan failure after a good pass");
+                }
+            }
+            // Advisory: a lost delete costs one wasted re-attempt after the
+            // file has already succeeded, never correctness.
+            Err(err) => tracing::warn!(error = ?err, path, "failed to clear a scan failure"),
         }
     }
 
@@ -1096,8 +1446,16 @@ impl ScanContext {
             return self.maybe_dispatch_backfill(sha256, mime_type, path).await;
         }
 
-        self.dispatch_prepare(path, last_modified, real_size, mime_type, md5, sha256)
-            .await
+        self.dispatch_prepare(
+            path,
+            last_modified,
+            real_size,
+            reported_size,
+            mime_type,
+            md5,
+            sha256,
+        )
+        .await
     }
 
     async fn handle_new_item(&mut self, item: NewItemData) -> ApiResult<()> {
@@ -1400,14 +1758,17 @@ impl ScanContext {
                     sha256,
                     real_size,
                 }),
-                Ok(Err(err)) => TaskOutcome::Failed(FailedFile {
+                // Both are transient: a read that failed is this run's
+                // problem, and a dead task is no verdict at all. Neither is
+                // recorded, so neither needs the ledger's identity.
+                Ok(Err(err)) => TaskOutcome::Failed(FailedFile::transient(
                     path,
-                    error: FileProcessError::Io(err.to_string()),
-                }),
-                Err(err) => TaskOutcome::Failed(FailedFile {
+                    FileProcessError::Io(err.to_string()),
+                )),
+                Err(err) => TaskOutcome::Failed(FailedFile::transient(
                     path,
-                    error: FileProcessError::Worker(err.to_string()),
-                }),
+                    FileProcessError::Worker(err.to_string()),
+                )),
             }
         });
         self.task_paths.insert(handle.id(), tracked);
@@ -1416,11 +1777,18 @@ impl ScanContext {
 
     /// Runs full metadata extraction, the stage-2 filter, and visual
     /// generation for files whose content is new to the index.
+    ///
+    /// `file_size` is the byte count the hasher read (what gets stored on the
+    /// file row); `stat_size` is what the walker's stat reported, which is the
+    /// half of the ledger's retry key. They differ only for files that changed
+    /// under the scan, and the two must not be swapped — see `prepare_new_item`.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_prepare(
         &mut self,
         path: PathBuf,
         last_modified: String,
         file_size: i64,
+        stat_size: i64,
         mime_type: String,
         md5: String,
         sha256: String,
@@ -1445,6 +1813,7 @@ impl ScanContext {
                     path,
                     last_modified,
                     file_size,
+                    stat_size,
                     mime_type,
                     md5,
                     sha256,
@@ -1455,18 +1824,22 @@ impl ScanContext {
             .await;
             match joined {
                 Ok(outcome) => outcome,
-                Err(err) => TaskOutcome::Failed(FailedFile {
-                    path: outer_path,
-                    error: FileProcessError::Worker(err.to_string()),
-                }),
+                Err(err) => TaskOutcome::Failed(FailedFile::transient(
+                    outer_path,
+                    FileProcessError::Worker(err.to_string()),
+                )),
             }
         });
         self.task_paths.insert(handle.id(), tracked);
         Ok(())
     }
 
+    /// The single choke point every success path goes through (unchanged
+    /// files, false changes, already-known content, and new items alike),
+    /// which is why the ledger's success-side delete hangs off it.
     async fn update_file_data(&mut self, data: FileScanData) -> ApiResult<FileUpsertResult> {
-        call_index_db_writer(&self.index_db, |reply| {
+        let path = data.path.clone();
+        let result = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::UpdateFileData {
                 time_added: self.scan_time.clone(),
                 scan_id: self.scan_id,
@@ -1474,7 +1847,9 @@ impl ScanContext {
                 reply,
             }
         })
-        .await
+        .await?;
+        self.clear_scan_error(&path).await;
+        Ok(result)
     }
 
     fn tally(&mut self, result: &FileUpsertResult) {
@@ -1496,21 +1871,39 @@ fn prepare_new_item(
     path: PathBuf,
     last_modified: String,
     file_size: i64,
+    stat_size: i64,
     mime_type: String,
     md5: String,
     sha256: String,
     filter: Option<Arc<Match>>,
     timers: &ScanTimers,
 ) -> TaskOutcome {
+    // Every failure below is about this exact file, so they all carry the same
+    // ledger identity.
+    //
+    // The size is the walker's *stat* size, not the byte count the hasher
+    // actually read: the ledger's retry key is re-checked against a stat, so
+    // storing the read size would make every verdict written here look like a
+    // different file to the next scan (and to the continuous scan, which only
+    // ever has the stat), resetting `attempts` forever.
+    let failed = |path: PathBuf, error: FileProcessError| {
+        TaskOutcome::Failed(FailedFile {
+            path,
+            error,
+            stat: Some((last_modified.clone(), stat_size)),
+            mime_type: Some(mime_type.clone()),
+        })
+    };
+
     let metadata_span = timers.metadata.start();
+    // Step 7 moves this decode to the visuals phase (an undecodable image will
+    // then be indexed without visuals instead of not at all); until then it
+    // gates indexing and is classified where it sits.
     let preloaded_image = if mime_type.starts_with("image") {
-        match open_image(&path) {
+        match open_image_staged(&path) {
             Ok(image) => Some(image),
-            Err(err) => {
-                return TaskOutcome::Failed(FailedFile {
-                    path,
-                    error: FileProcessError::Unsupported(err.to_string()),
-                });
+            Err((stage, err)) => {
+                return failed(path, FileProcessError::from_image_error(stage, err));
             }
         }
     } else {
@@ -1520,7 +1913,7 @@ fn prepare_new_item(
         match extract_item_metadata_inner(&path, &mime_type, md5, preloaded_image.as_ref()) {
             Ok(metadata) => metadata,
             Err(error) => {
-                return TaskOutcome::Failed(FailedFile { path, error });
+                return failed(path, error);
             }
         };
     drop(metadata_span);
@@ -1535,10 +1928,7 @@ fn prepare_new_item(
         &sha256,
         &metadata,
     ) {
-        return TaskOutcome::Failed(FailedFile {
-            path,
-            error: FileProcessError::Filtered,
-        });
+        return failed(path, FileProcessError::Filtered);
     }
 
     let (thumbnails, frames, blurhash) =
@@ -1687,13 +2077,135 @@ pub(crate) async fn build_file_scan_data(
 pub(crate) enum FileProcessError {
     // The String payloads are only read through the derived Debug impl when
     // scan errors are logged, which the dead_code lint doesn't count.
+    /// A worker task died without producing an outcome. Transient.
     Worker(#[allow(dead_code)] String),
+    /// The gateway's own read/stat failed, or a tool that exited successfully
+    /// produced output the gateway could not use. Transient: never recorded,
+    /// the file simply fails this run and is retried untouched next scan.
     Io(#[allow(dead_code)] String),
-    Unsupported(#[allow(dead_code)] String),
+    /// A non-transient verdict on the *file*, which the `scan_errors` ledger
+    /// stores so the next scan does not repeat the work
+    /// (docs/failed-media-retry-design.md).
+    Classified(ScanFailure),
+    /// A visuals-grade failure (thumbnail, frames, blurhash, encode). Always
+    /// swallowed by the caller: the file is indexed without visuals and the
+    /// next scan retries. Recording these is the visuals negative cache's job
+    /// (`visual_attempts`), which ships as its own phase — deliberately *not*
+    /// this ledger, which is only about files that never reach an item.
+    Visuals(#[allow(dead_code)] String),
     /// The file was rejected by the user's filescan filter.
     Filtered,
     /// The file's mtime matches the DB record, so hashing was skipped.
     Unchanged,
+    /// The file has an active `scan_errors` verdict and its bytes have not
+    /// moved since, so nothing was attempted. Not an error of this run.
+    /// Produced by the continuous scan, which decides this per event; the
+    /// batch walker decides it from its preloaded map before a task is ever
+    /// dispatched, so it never travels as an outcome there.
+    KnownBad,
+}
+
+/// A non-transient scan verdict: everything `scan_errors` needs except the
+/// file's identity (path, mtime, size), which only the walker knows.
+#[derive(Debug, Clone)]
+pub(crate) struct ScanFailure {
+    /// [`STAGE_MIME`], [`STAGE_METADATA`] or [`STAGE_DECODE`].
+    pub(crate) stage: &'static str,
+    pub(crate) kind: ApiErrorKind,
+    /// The confirmation threshold this *site* earned, not the class's: an
+    /// `input` verdict from a decode of bytes the gateway already read is
+    /// settled at 1, the same class from a tool that did its own file I/O is
+    /// not. See [`SKIP_AFTER_AMBIGUOUS`].
+    pub(crate) skip_after: i64,
+    pub(crate) message: String,
+}
+
+impl ScanFailure {
+    /// The pipeline's own decoder rejected the payload, on bytes the gateway
+    /// had already read successfully. One failure settles it.
+    fn input(stage: &'static str, message: impl Into<String>) -> FileProcessError {
+        FileProcessError::Classified(Self {
+            stage,
+            kind: ApiErrorKind::Input,
+            skip_after: SKIP_AFTER_CONFIRMED,
+            message: message.into(),
+        })
+    }
+
+    /// An `input` verdict from a stage where an external tool did its own file
+    /// I/O, so a transient mount hiccup and a corrupt file are indistinguishable
+    /// and a single failure does not settle it.
+    fn input_unconfirmed(stage: &'static str, message: impl Into<String>) -> FileProcessError {
+        FileProcessError::Classified(Self {
+            stage,
+            kind: ApiErrorKind::Input,
+            skip_after: SKIP_AFTER_AMBIGUOUS,
+            message: message.into(),
+        })
+    }
+}
+
+impl FileProcessError {
+    /// Adopts an already-classified [`ApiError`] — the shape
+    /// [`crate::media_tools::spawn_error`] produces, which distinguishes "the
+    /// toolchain is missing" (`blocked`, recorded) from "this machine refused
+    /// to start it" (transient, not recorded).
+    fn from_api_error(stage: &'static str, err: ApiError) -> Self {
+        if err.persisted_class().is_none() {
+            return FileProcessError::Io(err.detail().to_string());
+        }
+        FileProcessError::Classified(ScanFailure {
+            stage,
+            kind: err.kind(),
+            skip_after: err.skip_after(),
+            message: err.detail().to_string(),
+        })
+    }
+
+    /// Classifies an image-crate failure by *where* it happened, not by which
+    /// variant it is.
+    ///
+    /// Opening and format-sniffing do their own file I/O and decode nothing,
+    /// so every failure there is this machine's problem and stays transient.
+    ///
+    /// Everything the decoder itself rejects is a verdict on the file —
+    /// including `IoError`, which is what a truncated PNG, BMP or TIFF
+    /// produces (the decoder asks for bytes that are not there and the short
+    /// read surfaces as I/O). Truncated files are the common case by orders of
+    /// magnitude; a mount dropping mid-decode after opening cleanly is not.
+    /// The threshold, not the class, is what covers that: these are recorded
+    /// [`SKIP_AFTER_AMBIGUOUS`], so a genuine mid-read drop has to repeat in a
+    /// *later* run before it suppresses anything.
+    ///
+    /// `Limits` is the configurable `image_decode_memory_limit_mb` ceiling — a
+    /// property of this machine's budget, not of the file — so it is
+    /// `resource`, settled at one attempt and clearable by a retry directive
+    /// after the limit is raised.
+    fn from_image_error(stage: ImageStage, err: image::ImageError) -> Self {
+        match (stage, err) {
+            (ImageStage::Open, err) => FileProcessError::Io(err.to_string()),
+            (ImageStage::Decode, image::ImageError::Limits(limit_err)) => {
+                FileProcessError::Classified(ScanFailure {
+                    stage: STAGE_DECODE,
+                    kind: ApiErrorKind::Resource,
+                    skip_after: SKIP_AFTER_CONFIRMED,
+                    message: limit_err.to_string(),
+                })
+            }
+            (ImageStage::Decode, err) => {
+                ScanFailure::input_unconfirmed(STAGE_DECODE, err.to_string())
+            }
+        }
+    }
+
+    /// The verdict to record, or `None` when this failure is transient and
+    /// must not be recorded at all.
+    pub(crate) fn classified(&self) -> Option<&ScanFailure> {
+        match self {
+            FileProcessError::Classified(failure) => Some(failure),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn process_file(
@@ -1831,11 +2343,14 @@ pub(crate) fn parse_filescan_filter(config: &SystemConfig) -> Option<Match> {
     config.filescan_filter.clone()
 }
 
-fn infer_mime_type(path: &Path) -> Result<String, FileProcessError> {
+pub(crate) fn infer_mime_type(path: &Path) -> Result<String, FileProcessError> {
     let guess = MimeGuess::from_path(path);
+    // A pure function of the file name — no I/O, nothing ambiguous — so one
+    // failure settles it. The path keeps its extension, so the verdict is
+    // stable until the file is renamed, which is a new path and a new row.
     let mime = guess
         .first()
-        .ok_or_else(|| FileProcessError::Unsupported("missing mime type".to_string()))?;
+        .ok_or_else(|| ScanFailure::input(STAGE_MIME, "missing mime type"))?;
     Ok(mime.essence_str().to_string())
 }
 
@@ -1846,9 +2361,34 @@ fn infer_mime_type(path: &Path) -> Result<String, FileProcessError> {
 /// Archives contain mis-named files (WebP saved as .png) and very large
 /// images (20k x 20k collages) that Python indexed fine.
 pub(crate) fn open_image(path: impl AsRef<Path>) -> image::ImageResult<DynamicImage> {
-    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    open_image_staged(path).map_err(|(_, err)| err)
+}
+
+/// Which half of [`open_image`] failed.
+///
+/// The distinction is the classification: the image crate reports a truncated
+/// file, a mid-read mount drop and a missing file all as
+/// `ImageError::IoError`, so the variant alone cannot say whether the bytes
+/// were the problem. Where it surfaced can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageStage {
+    /// Opening the file and sniffing its format — no payload was decoded, so
+    /// nothing here is ever a verdict on the file.
+    Open,
+    /// The decode itself, on a file that opened fine.
+    Decode,
+}
+
+/// [`open_image`] with the failing stage attached, for the scan's classifier.
+fn open_image_staged(
+    path: impl AsRef<Path>,
+) -> Result<DynamicImage, (ImageStage, image::ImageError)> {
+    let reader = image::ImageReader::open(path).map_err(|err| (ImageStage::Open, err.into()))?;
+    let mut reader = reader
+        .with_guessed_format()
+        .map_err(|err| (ImageStage::Open, err.into()))?;
     reader.limits(decode_limits());
-    reader.decode()
+    reader.decode().map_err(|err| (ImageStage::Decode, err))
 }
 
 /// In-memory counterpart of [`open_image`]: content-sniffed, same ceiling.
@@ -1895,8 +2435,8 @@ fn extract_item_metadata_inner(
     if mime_type.starts_with("image") {
         let (width, height) = match preloaded_image {
             Some(image) => image.dimensions(),
-            None => open_image(path)
-                .map_err(|err| FileProcessError::Unsupported(err.to_string()))?
+            None => open_image_staged(path)
+                .map_err(|(stage, err)| FileProcessError::from_image_error(stage, err))?
                 .dimensions(),
         };
         metadata.width = Some(width as i64);
@@ -1967,9 +2507,7 @@ fn generate_new_item_visuals(
     } else if mime_type.starts_with("image") {
         let image = match preloaded_image {
             Some(image) => image,
-            None => {
-                open_image(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?
-            }
+            None => open_image(path).map_err(|err| FileProcessError::Visuals(err.to_string()))?,
         };
         if let Some(thumb) = generate_thumbnail(path, &image)? {
             thumbnails.push(encode_image(0, &thumb)?);
@@ -2115,7 +2653,7 @@ fn build_backfill_thumbnails(
         // the blurhash fallback opens the image separately when needed.
         if file_size > SMALL_IMAGE_FILE_SIZE {
             let image =
-                open_image(path).map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
+                open_image(path).map_err(|err| FileProcessError::Visuals(err.to_string()))?;
             if let Some(thumb) = generate_thumbnail(path, &image)? {
                 thumbnails.push(encode_image(0, &thumb)?);
                 source = Some(thumb);
@@ -2142,7 +2680,7 @@ fn compute_blurhash(image: &DynamicImage) -> Result<String, FileProcessError> {
     let resized = resize_for_blurhash(image);
     let rgba = resized.to_rgba8();
     blurhash_encode(4, 4, rgba.width(), rgba.height(), rgba.as_raw())
-        .map_err(|err| FileProcessError::Unsupported(err.to_string()))
+        .map_err(|err| FileProcessError::Visuals(err.to_string()))
 }
 
 fn resize_for_blurhash(image: &DynamicImage) -> DynamicImage {
@@ -2194,7 +2732,7 @@ fn encode_image(idx: i64, image: &DynamicImage) -> Result<StoredImage, FileProce
     let mut encoder = JpegEncoder::new_with_quality(&mut buffer, 85);
     encoder
         .encode(&rgb, rgb.width(), rgb.height(), ColorType::Rgb8.into())
-        .map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
+        .map_err(|err| FileProcessError::Visuals(err.to_string()))?;
 
     Ok(StoredImage {
         idx,
@@ -2928,10 +3466,10 @@ fn extract_video_frames_into(
         .arg(&output_pattern)
         .stdout(std::process::Stdio::null())
         .output()
-        .map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
+        .map_err(|err| FileProcessError::Visuals(err.to_string()))?;
 
     if !output.status.success() {
-        return Err(FileProcessError::Unsupported(format!(
+        return Err(FileProcessError::Visuals(format!(
             "ffmpeg failed: {}",
             stderr_tail(&output.stderr)
         )));
@@ -3018,14 +3556,31 @@ fn extract_media_info(path: &Path) -> Result<MediaInfo, FileProcessError> {
         .arg("json")
         .arg(path)
         .output()
-        .map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
+        // Failing to *start* ffprobe is never a verdict on the media: a
+        // missing toolchain is `blocked` and self-heals when it appears,
+        // anything else about this machine stays transient.
+        .map_err(|err| {
+            FileProcessError::from_api_error(
+                STAGE_METADATA,
+                crate::media_tools::spawn_error("ffprobe", &err),
+            )
+        })?;
 
     if !output.status.success() {
-        return Err(FileProcessError::Unsupported("ffprobe failed".to_string()));
+        // ffprobe did its own file I/O, so a corrupt file and a transient
+        // mount hiccup exit identically: this needs a second failure in a
+        // later scan before it suppresses anything.
+        return Err(ScanFailure::input_unconfirmed(
+            STAGE_METADATA,
+            format!("ffprobe failed: {}", stderr_tail(&output.stderr)),
+        ));
     }
 
+    // Exit 0 with output the gateway cannot parse is not a verdict on the
+    // media — it is this build and that ffprobe disagreeing — so it stays
+    // transient rather than permanently suppressing a file ffprobe accepted.
     let data: FfprobeOutput = serde_json::from_slice(&output.stdout)
-        .map_err(|err| FileProcessError::Unsupported(err.to_string()))?;
+        .map_err(|err| FileProcessError::Io(format!("ffprobe produced unusable output: {err}")))?;
 
     let format_duration = data
         .format
@@ -3525,6 +4080,615 @@ LIMIT 1
         .fetch_one(conn)
         .await
         .unwrap()
+    }
+
+    /// (path, stage, error_class, attempts, skip_after, mime_type) per row.
+    async fn scan_error_rows(
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Vec<(String, String, String, i64, i64, Option<String>)> {
+        sqlx::query_as(
+            "SELECT path, stage, error_class, attempts, skip_after, mime_type \
+             FROM scan_errors ORDER BY path",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
+    }
+
+    // The end-to-end contract of the scan ledger: a file the scan cannot get
+    // an item out of is recorded once, skipped on every later scan without
+    // being hashed or decoded again, re-attempted the moment its bytes move,
+    // cleared when it finally works, and swept when it disappears.
+    //
+    // Before this, none of it happened: no `files` row meant no mtime
+    // shortcut, so every scan re-read and re-decoded every broken file
+    // forever, and the only trace was an integer in `file_scans.errors`.
+    #[tokio::test]
+    async fn rescan_records_skips_and_clears_a_broken_file() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        // Its own folder: `test_data_dir()` hands every test the same
+        // process-wide temp root (serialized by a mutex), so the shared
+        // `media` directory still carries whatever earlier scan tests left in
+        // it — and this test counts files.
+        let media_dir = root.join("ledger_media");
+        fs::create_dir_all(&media_dir).unwrap();
+        // A healthy neighbour, so every assertion below has to discriminate
+        // rather than merely observe an empty database.
+        image::RgbImage::new(8, 8)
+            .save(media_dir.join("good.png"))
+            .unwrap();
+        let broken = media_dir.join("broken.png");
+        fs::write(&broken, b"this claims to be a png and is not").unwrap();
+        let broken_path = broken.to_string_lossy().to_string();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+
+        // First pass: the folder update scans the new folder and the file
+        // fails there; the full rescan that follows re-attempts it, because a
+        // decode verdict is ambiguous (a truncated file and a mount that drops
+        // mid-read look identical) and needs a second *run* to confirm. That
+        // second run is what this same call provides.
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let rows = scan_error_rows(&mut conn).await;
+        assert_eq!(rows.len(), 1, "only the broken file owes a row: {rows:?}");
+        assert_eq!(
+            (
+                rows[0].0.as_str(),
+                rows[0].1.as_str(),
+                rows[0].2.as_str(),
+                rows[0].3,
+                rows[0].4,
+                rows[0].5.as_deref()
+            ),
+            (
+                broken_path.as_str(),
+                STAGE_DECODE,
+                "input",
+                2,
+                SKIP_AFTER_AMBIGUOUS,
+                Some("image/png")
+            ),
+            "a decode failure is an unconfirmed input verdict, recorded with its format"
+        );
+        // The retry key is the *stat* pair, not the byte count the hasher
+        // read: the continuous scan only ever has a stat, so a batch failure
+        // that stored the read size would look like a different file to it and
+        // the two writers would reset each other's attempts forever.
+        let stored_key: (String, i64) =
+            sqlx::query_as("SELECT last_modified, file_size FROM scan_errors WHERE path = ?")
+                .bind(&broken_path)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_key,
+            get_last_modified_time_and_size(&broken).unwrap(),
+            "the recorded retry key is what a stat produces"
+        );
+        let files: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(files.0, 1, "the broken file is still not indexed");
+        drop(conn);
+
+        // Now that it is confirmed, a later scan does not touch it at all —
+        // the attempt count is the proof: it would have gone up again if the
+        // file had been re-decoded.
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let rows = scan_error_rows(&mut conn).await;
+        assert_eq!((rows.len(), rows[0].3), (1, 2), "no re-attempt: {rows:?}");
+        let (_, _, _, errors, marked) = latest_scan_record(&mut conn).await;
+        assert_eq!(
+            (errors, marked),
+            (0, 0),
+            "a skipped file is neither an error nor unavailable"
+        );
+        drop(conn);
+
+        // Touching it (same garbage, new mtime) is a new verdict: the retry
+        // key moved, so the file is processed again and the count restarts.
+        let mtime = fs::metadata(&broken).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&broken)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_secs(10))
+            .unwrap();
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let (_, _, _, errors, _) = latest_scan_record(&mut conn).await;
+        assert_eq!(errors, 1, "a modified file is always re-attempted");
+        let rows = scan_error_rows(&mut conn).await;
+        assert_eq!(rows[0].3, 1, "the new bytes start their own count");
+        drop(conn);
+
+        // Repairing it clears the row and indexes the file.
+        image::RgbImage::new(4, 4).save(&broken).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&broken)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_secs(20))
+            .unwrap();
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        assert!(
+            scan_error_rows(&mut conn).await.is_empty(),
+            "a file that works owes no verdict"
+        );
+        let files: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(files.0, 2);
+        drop(conn);
+
+        // And the sweep: a row whose file the walk never reaches describes
+        // nothing, so it goes away rather than accumulating forever.
+        let vanishing = media_dir.join("vanishing.png");
+        fs::write(&vanishing, b"not a png either").unwrap();
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        assert_eq!(scan_error_rows(&mut conn).await.len(), 1);
+        drop(conn);
+        fs::remove_file(&vanishing).unwrap();
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        assert!(
+            scan_error_rows(&mut conn).await.is_empty(),
+            "the sweep clears rows for files that are gone"
+        );
+    }
+
+    // The classification is the whole taxonomy in one place: which failures
+    // are the file's fault (recorded), which are this machine's (retried),
+    // and which settle on the first failure.
+    #[test]
+    fn scan_failures_are_classified_by_what_actually_failed() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // A name no mime guess covers: a pure function of the file name, so
+        // one failure settles it.
+        let err = infer_mime_type(&dir.path().join("thing.notamimetype"))
+            .expect_err("an unguessable extension must fail");
+        let failure = err.classified().expect("a mime failure is recorded");
+        assert_eq!(failure.stage, STAGE_MIME);
+        assert_eq!(failure.kind, ApiErrorKind::Input);
+        assert_eq!(failure.skip_after, SKIP_AFTER_CONFIRMED);
+
+        // A decode that never got to decode anything: opening does its own
+        // file I/O, and an SMB blip must not become a permanent verdict on a
+        // file nobody could even read. The *stage* is what decides this, not
+        // the error variant.
+        let (stage, err) = open_image_staged(dir.path().join("absent.png"))
+            .err()
+            .expect("a missing file must fail");
+        assert_eq!(stage, ImageStage::Open);
+        let missing = FileProcessError::from_image_error(stage, err);
+        assert!(
+            missing.classified().is_none(),
+            "an open-stage failure is transient: {missing:?}"
+        );
+        assert!(matches!(missing, FileProcessError::Io(_)));
+
+        // Bytes that were read fine and are not an image: the decoder's own
+        // verdict on the payload.
+        let garbage = dir.path().join("garbage.png");
+        fs::write(&garbage, b"definitely not an image").unwrap();
+        let (stage, err) = open_image_staged(&garbage)
+            .err()
+            .expect("garbage must not decode");
+        assert_eq!(stage, ImageStage::Decode);
+        let err = FileProcessError::from_image_error(stage, err);
+        let failure = err.classified().expect("a decode failure is recorded");
+        assert_eq!(failure.stage, STAGE_DECODE);
+        assert_eq!(failure.kind, ApiErrorKind::Input);
+        assert_eq!(
+            failure.skip_after, SKIP_AFTER_AMBIGUOUS,
+            "a decoder that reads as it goes cannot settle a verdict alone"
+        );
+
+        // The decode memory ceiling is a property of this machine's budget,
+        // not of the file, so it is `resource` — clearable by a directive
+        // after the limit is raised, not by calling the image corrupt.
+        let limited = FileProcessError::from_image_error(
+            ImageStage::Decode,
+            image::ImageError::Limits(image::error::LimitError::from_kind(
+                image::error::LimitErrorKind::InsufficientMemory,
+            )),
+        );
+        let failure = limited.classified().expect("a limit failure is recorded");
+        assert_eq!(failure.kind, ApiErrorKind::Resource);
+        assert_eq!(failure.skip_after, SKIP_AFTER_CONFIRMED);
+
+        // A spawn failure is never a verdict on the media: a missing
+        // toolchain is `blocked` and self-heals, anything else stays
+        // transient.
+        let blocked = FileProcessError::from_api_error(
+            STAGE_METADATA,
+            crate::media_tools::spawn_error(
+                "ffprobe",
+                &io::Error::new(io::ErrorKind::NotFound, "no ffprobe"),
+            ),
+        );
+        let failure = blocked.classified().expect("a missing tool is recorded");
+        assert_eq!(
+            failure.kind,
+            ApiErrorKind::Blocked {
+                blocker: Blocker::Ffmpeg
+            }
+        );
+        let denied = FileProcessError::from_api_error(
+            STAGE_METADATA,
+            crate::media_tools::spawn_error(
+                "ffprobe",
+                &io::Error::new(io::ErrorKind::PermissionDenied, "nope"),
+            ),
+        );
+        assert!(
+            denied.classified().is_none(),
+            "a machine-local spawn failure stays transient: {denied:?}"
+        );
+    }
+
+    // The reason the decode stage classifies by *where* rather than by which
+    // variant: a truncated but otherwise real image opens fine, sniffs fine,
+    // and then fails the decode as `ImageError::IoError` — the decoder asked
+    // for bytes that are not there. Classifying `IoError` as transient (the
+    // obvious reading) would have left every half-copied file in the library
+    // re-hashed and re-decoded on every scan forever, which is the exact case
+    // the ledger exists for.
+    #[test]
+    fn a_truncated_image_is_a_decode_verdict_not_an_io_blip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let whole = dir.path().join("whole.png");
+        // Noise, not a flat colour: a PNG of one colour compresses to so few
+        // bytes that a 60% prefix can still hold the entire image data.
+        let mut image = image::RgbImage::new(64, 64);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x * 7 % 251) as u8,
+                (y * 13 % 241) as u8,
+                (x * y % 239) as u8,
+            ]);
+        }
+        image.save(&whole).unwrap();
+        let bytes = fs::read(&whole).unwrap();
+        assert!(bytes.len() > 100, "the fixture must be a real PNG");
+
+        let truncated = dir.path().join("truncated.png");
+        fs::write(&truncated, &bytes[..bytes.len() * 6 / 10]).unwrap();
+
+        let (stage, err) = open_image_staged(&truncated)
+            .err()
+            .expect("a truncated PNG must not decode");
+        assert_eq!(
+            stage,
+            ImageStage::Decode,
+            "the file opened and sniffed fine; only the decode failed"
+        );
+        // The premise, pinned: this is the variant that used to be read as
+        // "transient" wherever it appeared.
+        assert!(
+            matches!(err, image::ImageError::IoError(_)),
+            "a truncated PNG surfaces as an I/O error, not a decoding one: {err:?}"
+        );
+        let classified = FileProcessError::from_image_error(stage, err);
+        let failure = classified
+            .classified()
+            .expect("a truncated file is a recorded verdict, not a transient failure");
+        assert_eq!(failure.stage, STAGE_DECODE);
+        assert_eq!(failure.kind, ApiErrorKind::Input);
+        assert_eq!(
+            failure.skip_after, SKIP_AFTER_AMBIGUOUS,
+            "the threshold, not the class, is what covers a mid-read mount drop"
+        );
+    }
+
+    // ffprobe classification against the real toolchain: a file of garbage
+    // bytes claiming to be a video is an *unconfirmed* payload verdict,
+    // because ffprobe read the file itself and a corrupt file and a dropped
+    // mount exit identically.
+    #[test]
+    fn ffprobe_rejecting_a_file_is_an_unconfirmed_input_verdict() {
+        // `ffmpeg_available` probes both executables, which is what the
+        // auto-heal relies on and what this test needs.
+        if !crate::media_tools::ffmpeg_available() {
+            // No toolchain on this host; the classification is unobservable.
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let fake_video = dir.path().join("garbage.mp4");
+        fs::write(&fake_video, b"nothing here is a container").unwrap();
+
+        // `MediaInfo` is not Debug (its fields mirror the ffprobe JSON), so
+        // the success case is refuted by hand rather than with `expect_err`.
+        let Err(err) = extract_media_info(&fake_video) else {
+            panic!("ffprobe must reject a file that is not a container");
+        };
+        let failure = err.classified().expect("an ffprobe rejection is recorded");
+        assert_eq!(failure.stage, STAGE_METADATA);
+        assert_eq!(failure.kind, ApiErrorKind::Input);
+        assert_eq!(
+            failure.skip_after, SKIP_AFTER_AMBIGUOUS,
+            "a tool that did its own file I/O never settles a verdict alone"
+        );
+    }
+
+    // The auto-heal twin of the extraction ledger's: installing one dependency
+    // must free exactly the files waiting on it. The probe results are handed
+    // in because probing real binaries is what makes the caller untestable,
+    // and the clearing is what has to be right.
+    #[tokio::test]
+    async fn healing_clears_only_the_scan_dependencies_that_came_back() {
+        let _test_env = test_data_dir();
+        let index_db = "scan_heal_blocked";
+        migrate_databases_on_disk(Some(index_db), Some("scan_heal_blocked_user"))
+            .await
+            .expect("migrate test databases");
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+                .await
+                .unwrap();
+            for (path, blocker) in [
+                ("C:/data/1.pdf", Blocker::Pdfium),
+                ("C:/data/2.mp4", Blocker::Ffmpeg),
+            ] {
+                let record = ScanErrorRecord {
+                    path: path.to_string(),
+                    last_modified: "2026-01-01T00:00:00".to_string(),
+                    file_size: 10,
+                    stage: STAGE_METADATA.to_string(),
+                    kind: ApiErrorKind::Blocked { blocker },
+                    mime_type: None,
+                    error: "dependency missing".to_string(),
+                    skip_after: SKIP_AFTER_CONFIRMED,
+                };
+                crate::db::scan_errors::upsert_scan_error(&mut conn, &record, Some(1))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(
+            heal_blocked_scan(index_db, Vec::new()).await.unwrap(),
+            0,
+            "nothing probed present means no write at all"
+        );
+        assert_eq!(
+            heal_blocked_scan(index_db, vec![Blocker::Pdfium])
+                .await
+                .unwrap(),
+            1
+        );
+
+        let mut conn = open_index_db_read_no_user_data(index_db).await.unwrap();
+        assert_eq!(
+            list_distinct_scan_blockers(&mut conn).await.unwrap(),
+            vec![Blocker::Ffmpeg],
+            "the dependency that is still missing keeps its rows"
+        );
+    }
+
+    // The user-visible loop the auto-heal exists for: a video the scan could
+    // not probe because ffprobe was not installed is suppressed while that is
+    // true, and offered again — without the user touching the file, the
+    // config, or the ledger — once the toolchain is there. The verdict is
+    // built through the scan's own classification path, so a change that
+    // stopped recording spawn failures as `blocked` would fail here rather
+    // than silently turning the self-heal into a permanent suppression.
+    #[tokio::test]
+    async fn a_missing_ffmpeg_verdict_is_cleared_once_the_toolchain_is_back() {
+        let _test_env = test_data_dir();
+        let index_db = "scan_heal_ffmpeg";
+        migrate_databases_on_disk(Some(index_db), Some("scan_heal_ffmpeg_user"))
+            .await
+            .expect("migrate test databases");
+
+        let error = FileProcessError::from_api_error(
+            STAGE_METADATA,
+            crate::media_tools::spawn_error(
+                "ffprobe",
+                &io::Error::new(io::ErrorKind::NotFound, "no ffprobe"),
+            ),
+        );
+        let failure = error
+            .classified()
+            .expect("a missing toolchain is a recorded verdict");
+        let record = ScanErrorRecord {
+            path: r"C:\media\clip.mp4".to_string(),
+            last_modified: "2026-01-01T00:00:00".to_string(),
+            file_size: 4096,
+            stage: failure.stage.to_string(),
+            kind: failure.kind,
+            mime_type: Some("video/mp4".to_string()),
+            error: failure.message.clone(),
+            skip_after: failure.skip_after,
+        };
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+                .await
+                .unwrap();
+            crate::db::scan_errors::upsert_scan_error(&mut conn, &record, Some(1))
+                .await
+                .unwrap();
+        }
+
+        // While the dependency is missing the walk does not offer the file:
+        // the preloaded verdict suppresses it on the very first attempt.
+        let mut conn = open_index_db_read_no_user_data(index_db).await.unwrap();
+        let loaded = load_scan_errors_under(&mut conn, r"C:\media\")
+            .await
+            .unwrap();
+        assert!(
+            loaded[&fold_scan_path(&record.path)]
+                .suppresses(&record.last_modified, record.file_size),
+            "a blocked verdict suppresses from one attempt"
+        );
+        drop(conn);
+
+        // Installing ffmpeg clears it, and the walk offers the file again —
+        // there is nothing left to suppress it.
+        assert_eq!(
+            heal_blocked_scan(index_db, vec![Blocker::Ffmpeg])
+                .await
+                .unwrap(),
+            1
+        );
+        let mut conn = open_index_db_read_no_user_data(index_db).await.unwrap();
+        assert!(
+            load_scan_errors_under(&mut conn, r"C:\media\")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the healed file must be re-offered, not merely un-blocked"
+        );
+    }
+
+    // The sweep decides that a ledger row describes a file that is gone, from
+    // the fact that the walk never reached it. That inference is only sound
+    // when the walk saw the whole tree: an unreadable directory (a permission
+    // change, a dropped mount) makes every file under it look deleted, and
+    // clearing then hands the next scan all of that work back — the one
+    // failure mode a cache must not have.
+    #[test]
+    fn the_sweep_defers_when_the_walk_could_not_read_the_tree() {
+        let stored = [r"C:\M\Gone.png", r"C:\M\Here.png"];
+        let rows: HashMap<String, ScanErrorSkip> = stored
+            .iter()
+            .map(|path| {
+                (
+                    fold_scan_path(path),
+                    ScanErrorSkip {
+                        path: path.to_string(),
+                        last_modified: "2026-01-01T00:00:00".to_string(),
+                        file_size: 1,
+                        attempts: 1,
+                        skip_after: 1,
+                    },
+                )
+            })
+            .collect();
+        // The walker's own casing, which on Windows need not be the stored one.
+        let seen: HashSet<String> = [fold_scan_path(r"C:\m\here.png")].into_iter().collect();
+
+        // A clean walk sweeps exactly the row it never reached, by the path
+        // that is actually in the table.
+        assert_eq!(
+            sweepable_scan_errors(0, &rows, &seen),
+            vec![r"C:\M\Gone.png".to_string()]
+        );
+        // One walk error and nothing is swept until a clean walk.
+        assert!(sweepable_scan_errors(1, &rows, &seen).is_empty());
+        // The normal case — no rows at all — costs nothing either way.
+        assert!(sweepable_scan_errors(0, &HashMap::new(), &seen).is_empty());
+        assert!(sweepable_scan_errors(3, &HashMap::new(), &seen).is_empty());
+    }
+
+    // A file the walk reached but a *later* gate rejected — here the filescan
+    // filter — keeps its verdict. The row is marked seen before any gate runs,
+    // so the sweep leaves it alone.
+    //
+    // This is deliberate, not an oversight: such a row suppresses nothing that
+    // would otherwise be processed (the filter already excludes the file), and
+    // dropping it would mean a filter the user narrows and later widens again
+    // costs a full re-attempt of every broken file it had swept out. The row
+    // goes when the file goes, or when it finally succeeds.
+    #[tokio::test]
+    async fn a_filtered_out_file_keeps_its_recorded_verdict() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let media_dir = root.join("filtered_ledger_media");
+        fs::create_dir_all(&media_dir).unwrap();
+        image::RgbImage::new(8, 8)
+            .save(media_dir.join("good.png"))
+            .unwrap();
+        let rejected = media_dir.join("rejected.png");
+        fs::write(&rejected, b"this claims to be a png and is not").unwrap();
+        let rejected_path = rejected.to_string_lossy().to_string();
+
+        // Seed the verdict the way a previous scan would have left it.
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            let (last_modified, file_size) = get_last_modified_time_and_size(&rejected).unwrap();
+            crate::db::scan_errors::upsert_scan_error(
+                &mut conn,
+                &ScanErrorRecord {
+                    path: rejected_path.clone(),
+                    last_modified,
+                    file_size,
+                    stage: STAGE_DECODE.to_string(),
+                    kind: ApiErrorKind::Input,
+                    mime_type: Some("image/png".to_string()),
+                    error: "decode failed".to_string(),
+                    skip_after: SKIP_AFTER_CONFIRMED,
+                },
+                Some(1),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Now the user's filter rejects exactly that file, at stage 1 — before
+        // anything is hashed, and after the walk has reached it.
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        config.filescan_filter = Some(
+            serde_json::from_str(r#"{"match": {"eq": {"filename": "good.png"}}}"#)
+                .expect("the test filter must parse as PQL"),
+        );
+        store.save(&index_db, &config).unwrap();
+
+        FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        )
+        .rescan_folders()
+        .await
+        .unwrap();
+
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let rows = scan_error_rows(&mut conn).await;
+        assert_eq!(
+            rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            vec![rejected_path.as_str()],
+            "a filtered-out file keeps its verdict: {rows:?}"
+        );
+        let files: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(files.0, 1, "only the file the filter accepts is indexed");
     }
 
     // Unchanged files must be updated without reprocessing: a file whose

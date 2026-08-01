@@ -366,11 +366,17 @@ pub(crate) async fn mark_unavailable_files(
 
     // SQLite caps the number of bind variables; a scan with this many
     // failures should not be trusted to mark availability at all.
+    //
+    // The exclusion list also carries the paths the `scan_errors` ledger
+    // suppressed — files that were not attempted at all this run but still
+    // must not be marked gone — so a library with tens of thousands of
+    // recorded failures can reach the cap on a scan that looked clean.
     if excluded_paths.len() > 30_000 {
         tracing::warn!(
             scan_id,
             excluded = excluded_paths.len(),
-            "too many failed paths, skipping unavailable marking"
+            "too many failed paths, skipping unavailable marking; \
+             this count includes paths suppressed by recorded scan failures"
         );
         let available_files = count_available_files(conn, path_prefix).await?;
         return Ok((0, available_files));

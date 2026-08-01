@@ -16,14 +16,16 @@
 //! `input` on one pass and `resource` on the next would never reach
 //! `skip_after` and would be retried forever).
 
-use std::borrow::Cow;
-
 use sqlx::Row;
 
 use crate::api_error::{ApiError, ApiErrorKind, Blocker};
 use crate::db::extraction_write::current_iso_timestamp;
+use crate::db::ledger::{LedgerTable, delete_blocked_rows, list_distinct_blockers_in};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
+
+/// Which table the shared ledger helpers operate on for this half.
+const TABLE: LedgerTable = LedgerTable::ItemExtractionErrors;
 
 /// `stage` value for a failure raised while the gateway prepared the item's
 /// bytes (file read, decode, ffmpeg, pdfium, the HTML renderer).
@@ -31,26 +33,6 @@ pub(crate) const STAGE_PREPARE: &str = "prepare";
 
 /// `stage` value for a failure raised by the inference worker itself.
 pub(crate) const STAGE_INFERENCE: &str = "inference";
-
-/// `error_class` of the `blocked` rows, which the auto-heal probe clears once
-/// their dependency binds.
-pub(crate) const CLASS_BLOCKED: &str = "blocked";
-
-/// `error_class` of a payload the pipeline's own decoder rejected. Only a
-/// *reader* needs the constant (writers derive the class from the
-/// [`ApiErrorKind`]), so it stays unused until the failures API lands.
-#[allow(dead_code)]
-pub(crate) const CLASS_INPUT: &str = "input";
-
-/// `error_class` of an item that individually blew a resource limit. Reader
-/// only, like [`CLASS_INPUT`]; lands with the failures API.
-#[allow(dead_code)]
-pub(crate) const CLASS_RESOURCE: &str = "resource";
-
-/// The `error` column is an audit string, never matched on. A worker traceback
-/// can be megabytes, and the ledger is read whole by the audit list, so it is
-/// clamped at one choke point instead of at every classification site.
-const MAX_ERROR_BYTES: usize = 2000;
 
 /// One ledger write. Owned fields so the writer actor's message can carry it.
 #[derive(Debug, Clone)]
@@ -128,7 +110,7 @@ pub(crate) async fn upsert_extraction_error(
         return Err(ApiError::internal("transient failures are not persisted"));
     };
     let blocker = record.kind.blocker().map(|blocker| blocker.as_str());
-    let error = truncate_error(&record.error);
+    let error = crate::db::ledger::truncate_error(&record.error);
 
     let now = current_iso_timestamp();
     let result = sqlx::query(UPSERT_SQL)
@@ -187,68 +169,23 @@ pub(crate) async fn delete_extraction_error(
 }
 
 /// Auto-heal: clears the `blocked` rows of every dependency that now binds,
-/// across all setters, so those items become selectable in the same run.
+/// across all setters, so those items become selectable in the same run. The
+/// scan ledger has the same pair against its own table; both go through
+/// [`crate::db::ledger`].
 pub(crate) async fn delete_blocked_errors(
     conn: &mut sqlx::SqliteConnection,
     blockers: &[Blocker],
 ) -> ApiResult<u64> {
-    if blockers.is_empty() {
-        return Ok(0);
-    }
-
-    let placeholders = std::iter::repeat("?")
-        .take(blockers.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    // Mixing numbered and bare placeholders misbinds parameters under sqlx,
-    // so every placeholder here must stay unnumbered.
-    let sql = format!(
-        "DELETE FROM item_extraction_errors \
-         WHERE error_class = ? AND blocker IN ({placeholders})"
-    );
-
-    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(CLASS_BLOCKED);
-    for blocker in blockers {
-        query = query.bind(blocker.as_str());
-    }
-
-    let result = query.execute(&mut *conn).await.map_err(|err| {
-        tracing::error!(error = %err, "failed to clear blocked extraction errors");
-        ApiError::internal("Failed to clear blocked extraction failures")
-    })?;
-    Ok(result.rows_affected())
+    delete_blocked_rows(conn, TABLE, blockers).await
 }
 
 /// The dependencies the ledger is currently waiting on — usually none. Only
 /// these backends get probed at job start, so a run never loads a library it
-/// has no use for. A value this build no longer knows (a blocker retired since
-/// the row was written) is logged and skipped: probing is best-effort, and the
-/// row stays until a retry directive clears it.
+/// has no use for.
 pub(crate) async fn list_distinct_blockers(
     conn: &mut sqlx::SqliteConnection,
 ) -> ApiResult<Vec<Blocker>> {
-    let raw: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT blocker FROM item_extraction_errors \
-         WHERE error_class = ? AND blocker IS NOT NULL",
-    )
-    .bind(CLASS_BLOCKED)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to list extraction error blockers");
-        ApiError::internal("Failed to read extraction failures")
-    })?;
-
-    Ok(raw
-        .iter()
-        .filter_map(|value| match Blocker::parse(value) {
-            Some(blocker) => Some(blocker),
-            None => {
-                tracing::warn!(blocker = %value, "unknown blocker in the extraction ledger");
-                None
-            }
-        })
-        .collect())
+    list_distinct_blockers_in(conn, TABLE).await
 }
 
 /// Every item sha256 this setter currently has a ledger row for, active or
@@ -500,27 +437,11 @@ fn mime_prefix_upper_bound(prefix: &str) -> Option<String> {
     None
 }
 
-/// Clamps the audit message. Truncation happens on a char boundary, so the
-/// stored text is always valid UTF-8.
-fn truncate_error(error: &str) -> Cow<'_, str> {
-    if error.len() <= MAX_ERROR_BYTES {
-        return Cow::Borrowed(error);
-    }
-    // `str::floor_char_boundary` is still unstable, so walk back by hand.
-    let mut end = MAX_ERROR_BYTES;
-    while end > 0 && !error.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut truncated = String::with_capacity(end + '…'.len_utf8());
-    truncated.push_str(&error[..end]);
-    truncated.push('…');
-    Cow::Owned(truncated)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::extraction_write::delete_setter_by_name;
+    use crate::db::ledger::{CLASS_BLOCKED, CLASS_INPUT, CLASS_RESOURCE, MAX_ERROR_BYTES};
     use crate::db::migrations::{migrate_databases_on_disk, setup_test_databases};
     use crate::test_utils::test_data_dir;
 
