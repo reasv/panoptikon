@@ -16,11 +16,12 @@
 //! `input` on one pass and `resource` on the next would never reach
 //! `skip_after` and would be retried forever).
 
-use sqlx::Row;
-
 use crate::api_error::{ApiError, ApiErrorKind, Blocker};
 use crate::db::extraction_write::current_iso_timestamp;
-use crate::db::ledger::{LedgerTable, delete_blocked_rows, list_distinct_blockers_in};
+use crate::db::ledger::{
+    LedgerTable, audit_filter_sql, clamp_list_limit, delete_blocked_rows,
+    list_distinct_blockers_in, read_audit_column,
+};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -229,22 +230,11 @@ pub(crate) async fn list_error_sha256s_for_setter(
 }
 
 // Everything from here to the end of the module is the *audit half* — the
-// list query, its filters, its row type and their helpers. Nothing in the
-// pipeline consumes it; it lands with the failures API and these `allow`s go
-// with that phase. The pipeline half above stays lint-covered.
-
-/// Default page size when the caller does not ask for one.
-#[allow(dead_code)]
-const DEFAULT_LIST_LIMIT: i64 = 100;
-
-/// Hard cap on the page size: the audit list joins two tables per row and is
-/// served to a UI, so an unbounded page is never what the caller wanted.
-#[allow(dead_code)]
-const MAX_LIST_LIMIT: i64 = 1000;
+// list query, its count twin, their filters and their row type. It is what
+// `GET /api/jobs/data/failures` serves; the pipeline half above never reads it.
 
 /// Audit filters. Every field is independently optional, matching the retry
 /// directives' targeting (class, stage, mime prefix, setter).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExtractionErrorFilters {
     pub setter: Option<String>,
@@ -253,22 +243,27 @@ pub(crate) struct ExtractionErrorFilters {
     /// Matched as a prefix of `mime_type`, e.g. `image/`. An empty string is
     /// treated as no filter.
     pub mime_prefix: Option<String>,
-    /// Clamped to `1..=1000`; `None` means [`DEFAULT_LIST_LIMIT`]. The
-    /// clamping is why this is not a plain `i64`: a defaulted `0` would
-    /// silently return nothing.
+    /// Clamped by [`clamp_list_limit`]; `None` means its default. The clamping
+    /// is why this is not a plain `i64`: a defaulted `0` would silently return
+    /// nothing.
     pub limit: Option<i64>,
     /// Negative values are clamped to zero (SQLite treats a negative OFFSET as
     /// zero anyway, but the intent is explicit here).
     pub offset: i64,
 }
 
-/// One audit row: the ledger joined with its item.
-#[allow(dead_code)]
+/// One audit row: the ledger joined with its item and a representative file.
 #[derive(Debug, Clone)]
 pub(crate) struct ExtractionErrorRow {
     pub id: i64,
     pub item_sha256: String,
-    pub item_type: String,
+    /// One of the paths the item is stored under, or `None` for an item whose
+    /// files have all gone away. An item can have any number of `files` rows
+    /// (duplicates across folders) and the ledger keys on the *item*, so the
+    /// audit surface shows one representative: an available file if there is
+    /// one, then the lexicographically smallest path, so the choice is stable
+    /// between pages instead of depending on the plan.
+    pub path: Option<String>,
     pub setter_name: String,
     pub stage: String,
     pub error_class: String,
@@ -282,96 +277,133 @@ pub(crate) struct ExtractionErrorRow {
     pub last_seen: String,
 }
 
+/// The clause both audit reads share. The column names are literals from this
+/// module; only the bound values come from the request.
+fn audit_filters(filters: &ExtractionErrorFilters) -> (String, Vec<String>) {
+    audit_filter_sql(
+        &[
+            ("setters.name", filters.setter.as_deref()),
+            ("e.error_class", filters.error_class.as_deref()),
+            ("e.stage", filters.stage.as_deref()),
+        ],
+        "e.mime_type",
+        filters.mime_prefix.as_deref(),
+    )
+}
+
+/// How many failures match these filters, ignoring the page window — the
+/// denominator the paginated audit surface needs. Kept next to
+/// [`list_extraction_errors`] and sharing its `WHERE` builder, so the count
+/// can never describe a different set than the page it labels.
+pub(crate) async fn count_extraction_errors(
+    conn: &mut sqlx::SqliteConnection,
+    filters: &ExtractionErrorFilters,
+) -> ApiResult<i64> {
+    let (where_clause, binds) = audit_filters(filters);
+    // Both joins, so the `FROM` here is literally the list's: a count whose
+    // source differs from the page it labels is a bug waiting for the first
+    // join that stops being row-preserving.
+    let sql = format!(
+        "SELECT COUNT(*) FROM item_extraction_errors AS e \
+         JOIN items ON items.id = e.item_id \
+         JOIN setters ON setters.id = e.setter_id {where_clause}"
+    );
+    let mut query = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()));
+    for bind in &binds {
+        query = query.bind(bind);
+    }
+    query.fetch_one(&mut *conn).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to count extraction errors");
+        ApiError::internal("Failed to read extraction failures")
+    })
+}
+
+/// The list statement, built around `where_clause`. Split out from the query
+/// so its *shape* can be pinned by a test — the nesting below is the whole
+/// point of the statement and reads like a stylistic choice otherwise.
+///
+/// The ledger is paged in an inner subselect that touches nothing but the
+/// ledger and its setter join, and the item join plus the representative-path
+/// lookup happen *outside* it, over the page.
+///
+/// This is not cosmetic. The `ORDER BY` needs a sorter, and SQLite fills a
+/// sorter with whole result rows — every expression in the `SELECT` list is
+/// evaluated *before* the `LIMIT` applies. With the path subquery in the outer
+/// select list of a flat query it therefore ran once per *matching* row, not
+/// once per row served: 500 matching rows cost 500 file lookups to render a
+/// 50-row page. Nested, it runs at most `limit` times. The `LIMIT` inside the
+/// subselect also blocks the flattening optimizer from undoing this (a
+/// subquery with `LIMIT` cannot be flattened into a joining outer query).
+///
+/// The path stays a correlated subquery rather than a join for a separate
+/// reason: an item with three files must stay one audit row.
+///
+/// Mixing numbered and bare placeholders misbinds parameters under sqlx, so
+/// every placeholder here must stay unnumbered.
+fn list_sql(where_clause: &str) -> String {
+    format!(
+        r#"
+        SELECT
+            paged.id AS id,
+            items.sha256 AS item_sha256,
+            (
+                SELECT files.path FROM files
+                WHERE files.item_id = paged.item_id
+                ORDER BY files.available DESC, files.path
+                LIMIT 1
+            ) AS path,
+            paged.setter_name AS setter_name,
+            paged.stage AS stage,
+            paged.error_class AS error_class,
+            paged.blocker AS blocker,
+            paged.mime_type AS mime_type,
+            paged.error AS error,
+            paged.skip_after AS skip_after,
+            paged.attempts AS attempts,
+            paged.last_job_id AS last_job_id,
+            paged.first_seen AS first_seen,
+            paged.last_seen AS last_seen
+        FROM (
+            SELECT
+                e.id AS id,
+                e.item_id AS item_id,
+                setters.name AS setter_name,
+                e.stage AS stage,
+                e.error_class AS error_class,
+                e.blocker AS blocker,
+                e.mime_type AS mime_type,
+                e.error AS error,
+                e.skip_after AS skip_after,
+                e.attempts AS attempts,
+                e.last_job_id AS last_job_id,
+                e.first_seen AS first_seen,
+                e.last_seen AS last_seen
+            FROM item_extraction_errors AS e
+            JOIN setters ON setters.id = e.setter_id
+            {where_clause}
+            ORDER BY e.last_seen DESC, e.id DESC
+            LIMIT ? OFFSET ?
+        ) AS paged
+        JOIN items ON items.id = paged.item_id
+        ORDER BY paged.last_seen DESC, paged.id DESC
+        "#
+    )
+}
+
 /// Lists failures for the audit surface, newest first.
-#[allow(dead_code)]
 pub(crate) async fn list_extraction_errors(
     conn: &mut sqlx::SqliteConnection,
     filters: &ExtractionErrorFilters,
 ) -> ApiResult<Vec<ExtractionErrorRow>> {
-    // An empty prefix filters nothing; a prefix with no representable
-    // successor (all-0xFF) degrades to the lower bound alone.
-    let mime_range = filters
-        .mime_prefix
-        .as_deref()
-        .filter(|prefix| !prefix.is_empty())
-        .map(|prefix| (prefix.to_string(), mime_prefix_upper_bound(prefix)));
-
-    let mut conditions: Vec<&str> = Vec::new();
-    if filters.setter.is_some() {
-        conditions.push("setters.name = ?");
-    }
-    if filters.error_class.is_some() {
-        conditions.push("e.error_class = ?");
-    }
-    if filters.stage.is_some() {
-        conditions.push("e.stage = ?");
-    }
-    if let Some((_, upper)) = &mime_range {
-        // A range predicate, not `LIKE ? || '%'`. LIKE would only be indexable
-        // here because this repo sets `case_sensitive_like`; the range form is
-        // pragma-independent, needs no escaping of `%`/`_`, and is the house
-        // rule for prefix matching (see the sqlite-like-prefix-antipattern
-        // note).
-        conditions.push("e.mime_type >= ?");
-        if upper.is_some() {
-            conditions.push("e.mime_type < ?");
-        }
-    }
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-    // Mixing numbered and bare placeholders misbinds parameters under sqlx,
-    // so every placeholder here must stay unnumbered.
-    let sql = format!(
-        r#"
-        SELECT
-            e.id AS id,
-            items.sha256 AS item_sha256,
-            items.type AS item_type,
-            setters.name AS setter_name,
-            e.stage AS stage,
-            e.error_class AS error_class,
-            e.blocker AS blocker,
-            e.mime_type AS mime_type,
-            e.error AS error,
-            e.skip_after AS skip_after,
-            e.attempts AS attempts,
-            e.last_job_id AS last_job_id,
-            e.first_seen AS first_seen,
-            e.last_seen AS last_seen
-        FROM item_extraction_errors AS e
-        JOIN items ON items.id = e.item_id
-        JOIN setters ON setters.id = e.setter_id
-        {where_clause}
-        ORDER BY e.last_seen DESC, e.id DESC
-        LIMIT ? OFFSET ?
-        "#
-    );
+    let (where_clause, binds) = audit_filters(filters);
+    let sql = list_sql(&where_clause);
 
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-    if let Some(setter) = &filters.setter {
-        query = query.bind(setter);
+    for bind in &binds {
+        query = query.bind(bind);
     }
-    if let Some(error_class) = &filters.error_class {
-        query = query.bind(error_class);
-    }
-    if let Some(stage) = &filters.stage {
-        query = query.bind(stage);
-    }
-    if let Some((lower, upper)) = &mime_range {
-        query = query.bind(lower);
-        if let Some(upper) = upper {
-            query = query.bind(upper);
-        }
-    }
-    let limit = filters
-        .limit
-        .unwrap_or(DEFAULT_LIST_LIMIT)
-        .clamp(1, MAX_LIST_LIMIT);
     let rows = query
-        .bind(limit)
+        .bind(clamp_list_limit(filters.limit))
         .bind(filters.offset.max(0))
         .fetch_all(&mut *conn)
         .await
@@ -383,58 +415,23 @@ pub(crate) async fn list_extraction_errors(
     let mut results = Vec::with_capacity(rows.len());
     for row in rows {
         results.push(ExtractionErrorRow {
-            id: read_column(&row, "id")?,
-            item_sha256: read_column(&row, "item_sha256")?,
-            item_type: read_column(&row, "item_type")?,
-            setter_name: read_column(&row, "setter_name")?,
-            stage: read_column(&row, "stage")?,
-            error_class: read_column(&row, "error_class")?,
-            blocker: read_column(&row, "blocker")?,
-            mime_type: read_column(&row, "mime_type")?,
-            error: read_column(&row, "error")?,
-            skip_after: read_column(&row, "skip_after")?,
-            attempts: read_column(&row, "attempts")?,
-            last_job_id: read_column(&row, "last_job_id")?,
-            first_seen: read_column(&row, "first_seen")?,
-            last_seen: read_column(&row, "last_seen")?,
+            id: read_audit_column(&row, "id")?,
+            item_sha256: read_audit_column(&row, "item_sha256")?,
+            path: read_audit_column(&row, "path")?,
+            setter_name: read_audit_column(&row, "setter_name")?,
+            stage: read_audit_column(&row, "stage")?,
+            error_class: read_audit_column(&row, "error_class")?,
+            blocker: read_audit_column(&row, "blocker")?,
+            mime_type: read_audit_column(&row, "mime_type")?,
+            error: read_audit_column(&row, "error")?,
+            skip_after: read_audit_column(&row, "skip_after")?,
+            attempts: read_audit_column(&row, "attempts")?,
+            last_job_id: read_audit_column(&row, "last_job_id")?,
+            first_seen: read_audit_column(&row, "first_seen")?,
+            last_seen: read_audit_column(&row, "last_seen")?,
         });
     }
     Ok(results)
-}
-
-#[allow(dead_code)]
-fn read_column<'r, T>(row: &'r sqlx::sqlite::SqliteRow, column: &str) -> ApiResult<T>
-where
-    T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
-{
-    row.try_get(column).map_err(|err| {
-        tracing::error!(error = %err, column, "failed to read extraction error column");
-        ApiError::internal("Failed to read extraction failures")
-    })
-}
-
-/// The exclusive upper bound of a prefix range under SQLite's default BINARY
-/// collation: the prefix with its last byte incremented. Mime types are ASCII,
-/// so the fallbacks below (an all-`0xFF` prefix, or an increment that lands
-/// mid-UTF-8) are unreachable in practice; they degrade to "no upper bound"
-/// rather than to a wrong answer.
-#[allow(dead_code)]
-fn mime_prefix_upper_bound(prefix: &str) -> Option<String> {
-    let mut bytes = prefix.as_bytes().to_vec();
-    while let Some(last) = bytes.pop() {
-        if last == u8::MAX {
-            continue;
-        }
-        bytes.push(last + 1);
-        match String::from_utf8(bytes) {
-            Ok(upper) => return Some(upper),
-            Err(err) => {
-                bytes = err.into_bytes();
-                bytes.pop();
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -468,6 +465,31 @@ mod tests {
             .execute(&mut *conn)
             .await
             .unwrap();
+    }
+
+    /// Files for the seeded items. `sha_one` deliberately has three of them —
+    /// an unavailable copy, and two available ones — so the audit list has to
+    /// prove it still returns one row and picks the representative path
+    /// deterministically.
+    async fn seed_files(conn: &mut sqlx::SqliteConnection) {
+        sqlx::query(
+            "INSERT INTO file_scans (id, start_time, path) VALUES (1, '2026-01-01T00:00:00', 'C:/m')",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO files (id, sha256, item_id, path, filename, last_modified, scan_id, available)
+            VALUES
+                (1, 'sha_one', 1, 'C:/m/aaa.png', 'aaa.png', '2026-01-01T00:00:00', 1, 0),
+                (2, 'sha_one', 1, 'C:/m/zzz.png', 'zzz.png', '2026-01-01T00:00:00', 1, 1),
+                (3, 'sha_one', 1, 'C:/m/mmm.png', 'mmm.png', '2026-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
     }
 
     fn record(sha256: &str, kind: ApiErrorKind, job_id: Option<i64>) -> ExtractionErrorRecord {
@@ -946,7 +968,6 @@ mod tests {
         .unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].item_sha256, "sha_one");
-        assert_eq!(images[0].item_type, "image/png");
         assert_eq!(images[0].mime_type, "image/png");
         assert_eq!(images[0].setter_name, "test/clip");
         assert_eq!(images[0].attempts, 1);
@@ -1050,6 +1071,351 @@ mod tests {
         .unwrap();
         assert_eq!(videos.len(), 1);
         assert_eq!(videos[0].mime_type, "video/mp4");
+    }
+
+    // The ledger keys on the item, but the audit surface shows a path. An item
+    // with several files must therefore still be one row, with a stable
+    // representative path — and an item whose files are all gone must not
+    // disappear from the audit list entirely (the row is exactly what explains
+    // why nothing was extracted).
+    #[tokio::test]
+    async fn audit_list_picks_one_representative_path_per_item() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        seed_files(conn).await;
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        // sha_two has a ledger row but no files at all.
+        upsert_extraction_error(conn, &record("sha_two", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+
+        let rows = list_extraction_errors(conn, &ExtractionErrorFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "three files must not fan out into three rows"
+        );
+        let by_sha = |sha: &str| {
+            rows.iter()
+                .find(|row| row.item_sha256 == sha)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            by_sha("sha_one").path.as_deref(),
+            Some("C:/m/mmm.png"),
+            "an available file wins over the alphabetically first unavailable one"
+        );
+        assert_eq!(
+            by_sha("sha_two").path,
+            None,
+            "an item with no files still has to be auditable"
+        );
+
+        // The count is the page's denominator, so it has to see the same set:
+        // the join must not drop or multiply rows here either.
+        assert_eq!(
+            count_extraction_errors(conn, &ExtractionErrorFilters::default())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    // The statement's *shape*, pinned: the paging must stay inside the
+    // subselect and the path lookup outside it. A flat query put the path
+    // subquery in the select list of an ORDER BY that needs a sorter, and
+    // SQLite fills a sorter with whole result rows — so the lookup ran once
+    // per *matching* row (500 file lookups to render a 50-row page) instead of
+    // once per row served. Nothing about the returned rows changes when this
+    // regresses, which is why it is asserted on the SQL.
+    #[test]
+    fn audit_list_sql_pages_the_ledger_before_it_resolves_paths() {
+        let sql = list_sql("WHERE setters.name = ?");
+        let open = sql.find("FROM (").expect("the paged subselect must exist");
+        let close = sql.find(") AS paged").expect("the paged subselect must end");
+        let (outer_head, inner) = (&sql[..open], &sql[open..close]);
+        let outer_tail = &sql[close..];
+
+        assert!(
+            inner.contains("LIMIT ? OFFSET ?"),
+            "the page window must apply inside the subselect: {sql}"
+        );
+        assert!(
+            inner.contains("ORDER BY e.last_seen DESC, e.id DESC"),
+            "the subselect is what decides which rows the page holds: {sql}"
+        );
+        assert!(
+            inner.contains("WHERE setters.name = ?"),
+            "the filters must narrow the rows that get paged: {sql}"
+        );
+        assert!(
+            !inner.contains("files") && !inner.contains("JOIN items"),
+            "nothing but the ledger may be touched per matching row: {sql}"
+        );
+
+        assert!(
+            outer_head.contains("SELECT files.path FROM files"),
+            "the path is resolved over the paged rows: {sql}"
+        );
+        assert!(
+            outer_tail.contains("JOIN items ON items.id = paged.item_id"),
+            "the item join belongs outside the page window: {sql}"
+        );
+        assert!(
+            !outer_tail.contains("LIMIT") && !outer_head.contains("OFFSET"),
+            "a second page window outside the subselect would re-slice it: {sql}"
+        );
+    }
+
+    // The four extraction filters are independent, but only their conjunction
+    // exercises the bind ordering across both filter kinds: three equalities
+    // plus the mime range's two bounds is five binds ahead of the two page
+    // binds, and a single misplacement filters on the wrong column silently.
+    #[tokio::test]
+    async fn audit_list_applies_every_filter_at_once() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        // Each of these differs from the target row in exactly one filtered
+        // dimension, so a dropped or misbound predicate lets one through.
+        let mut wrong_stage = record("sha_one", ApiErrorKind::Input, Some(1));
+        wrong_stage.setter_name = "test/tagger".to_string();
+        wrong_stage.stage = STAGE_INFERENCE.to_string();
+        upsert_extraction_error(conn, &wrong_stage).await.unwrap();
+        let mut wrong_mime = record("sha_two", ApiErrorKind::Input, Some(1));
+        wrong_mime.setter_name = "test/tagger".to_string();
+        upsert_extraction_error(conn, &wrong_mime).await.unwrap();
+
+        let filters = ExtractionErrorFilters {
+            setter: Some("test/clip".to_string()),
+            error_class: Some(CLASS_INPUT.to_string()),
+            stage: Some(STAGE_PREPARE.to_string()),
+            mime_prefix: Some("image/".to_string()),
+            ..Default::default()
+        };
+        let (_, binds) = audit_filters(&filters);
+        assert_eq!(
+            binds.len(),
+            5,
+            "three equalities and both mime bounds: {binds:?}"
+        );
+
+        let rows = list_extraction_errors(conn, &filters).await.unwrap();
+        assert_eq!(rows.len(), 1, "every filter has to narrow: {rows:?}");
+        assert_eq!(rows[0].item_sha256, "sha_one");
+        assert_eq!(rows[0].setter_name, "test/clip");
+        assert_eq!(rows[0].stage, STAGE_PREPARE);
+        assert_eq!(rows[0].mime_type, "image/png");
+        assert_eq!(count_extraction_errors(conn, &filters).await.unwrap(), 1);
+
+        // Changing any one of the four to something nothing carries empties it.
+        for narrowed in [
+            ExtractionErrorFilters {
+                setter: Some("test/absent".to_string()),
+                ..filters.clone()
+            },
+            ExtractionErrorFilters {
+                error_class: Some(CLASS_RESOURCE.to_string()),
+                ..filters.clone()
+            },
+            ExtractionErrorFilters {
+                stage: Some(STAGE_INFERENCE.to_string()),
+                ..filters.clone()
+            },
+            ExtractionErrorFilters {
+                mime_prefix: Some("audio/".to_string()),
+                ..filters.clone()
+            },
+        ] {
+            assert!(
+                list_extraction_errors(conn, &narrowed)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the conjunction must hold for {narrowed:?}"
+            );
+        }
+    }
+
+    // Paging past the end is what the UI does the moment a filter narrows the
+    // set under the offset it is already on. It must be an empty page against
+    // an unchanged total, never an error and never a wrapped-around page.
+    #[tokio::test]
+    async fn audit_offset_past_the_total_is_an_empty_page() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        upsert_extraction_error(conn, &record("sha_two", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+
+        for offset in [2, 500] {
+            let filters = ExtractionErrorFilters {
+                offset,
+                ..Default::default()
+            };
+            assert!(
+                list_extraction_errors(conn, &filters)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "offset {offset} is past the end"
+            );
+            assert_eq!(
+                count_extraction_errors(conn, &filters).await.unwrap(),
+                2,
+                "the total is the filtered set, not the page"
+            );
+        }
+    }
+
+    // `last_job_id` is deliberately not a foreign key (job rows are deleted by
+    // the cleanup flows and the ledger has to outlive them), so nothing nulls
+    // it: the audit row keeps a stale id. The alternative — a real FK with
+    // SET NULL — would silently erase the only trace of *when* a failure was
+    // last seen by a run.
+    #[tokio::test]
+    async fn a_deleted_job_leaves_a_dangling_last_job_id() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        sqlx::query("INSERT INTO data_jobs (id, completed) VALUES (42, 1)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(42)))
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM data_jobs WHERE id = 42")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        let rows = list_extraction_errors(conn, &ExtractionErrorFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the ledger row must survive the job's row");
+        assert_eq!(
+            rows[0].last_job_id,
+            Some(42),
+            "the id dangles rather than being nulled"
+        );
+    }
+
+    // Every file of the item is unavailable — an unplugged drive, not a
+    // deletion. The representative still has to be a path (the audit row is
+    // useless without one), picked by the same deterministic tiebreak the
+    // available case uses, so it does not move between pages.
+    #[tokio::test]
+    async fn audit_path_falls_back_to_the_smallest_unavailable_path() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        sqlx::query(
+            "INSERT INTO file_scans (id, start_time, path) VALUES (1, '2026-01-01T00:00:00', 'C:/m')",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO files (id, sha256, item_id, path, filename, last_modified, scan_id, available)
+            VALUES
+                (1, 'sha_one', 1, 'C:/m/zzz.png', 'zzz.png', '2026-01-01T00:00:00', 1, 0),
+                (2, 'sha_one', 1, 'C:/m/aaa.png', 'aaa.png', '2026-01-01T00:00:00', 1, 0)
+            "#,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+
+        let rows = list_extraction_errors(conn, &ExtractionErrorFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].path.as_deref(),
+            Some("C:/m/aaa.png"),
+            "an all-unavailable item still names a path, the smallest one"
+        );
+    }
+
+    // The count is what the audit surface paginates against, so it has to
+    // answer for the *filters*, not for the page window.
+    #[tokio::test]
+    async fn audit_count_matches_the_filtered_set_not_the_page() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        let mut video = record("sha_two", FFMPEG, Some(1));
+        video.stage = STAGE_INFERENCE.to_string();
+        upsert_extraction_error(conn, &video).await.unwrap();
+        let mut tagger = record("sha_one", ApiErrorKind::Input, Some(1));
+        tagger.setter_name = "test/tagger".to_string();
+        upsert_extraction_error(conn, &tagger).await.unwrap();
+
+        assert_eq!(
+            count_extraction_errors(conn, &ExtractionErrorFilters::default())
+                .await
+                .unwrap(),
+            3
+        );
+        // A page window narrower than the set does not move the total.
+        let paged = ExtractionErrorFilters {
+            limit: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(list_extraction_errors(conn, &paged).await.unwrap().len(), 1);
+        assert_eq!(count_extraction_errors(conn, &paged).await.unwrap(), 3);
+
+        for filters in [
+            ExtractionErrorFilters {
+                setter: Some("test/clip".to_string()),
+                ..Default::default()
+            },
+            ExtractionErrorFilters {
+                error_class: Some(CLASS_BLOCKED.to_string()),
+                ..Default::default()
+            },
+            ExtractionErrorFilters {
+                stage: Some(STAGE_INFERENCE.to_string()),
+                ..Default::default()
+            },
+            ExtractionErrorFilters {
+                mime_prefix: Some("image/".to_string()),
+                ..Default::default()
+            },
+            ExtractionErrorFilters {
+                setter: Some("test/absent".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let listed = list_extraction_errors(conn, &filters).await.unwrap().len() as i64;
+            assert_eq!(
+                count_extraction_errors(conn, &filters).await.unwrap(),
+                listed,
+                "count and list must agree for {filters:?}"
+            );
+        }
     }
 
     // Newest first, and the pages partition the result set: the audit surface

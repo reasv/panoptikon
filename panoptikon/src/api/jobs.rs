@@ -9,9 +9,14 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::api::db_params::DbQueryParams;
 use crate::api_error::ApiError;
+use crate::db::extraction_errors::{
+    ExtractionErrorFilters, count_extraction_errors, list_extraction_errors,
+};
 use crate::db::extraction_log::{LogRecord, get_all_data_logs, get_setters_total_data};
 use crate::db::file_scans::get_all_file_scans;
 use crate::db::folders::get_folders_from_database;
+use crate::db::ledger::ERROR_CLASSES;
+use crate::db::scan_errors::{ScanErrorFilters, count_scan_errors, list_scan_errors};
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::db::{DbConnection, ReadOnly};
 use crate::jobs::continuous_scan;
@@ -608,6 +613,286 @@ pub(crate) async fn get_setter_data_count(
     }))
 }
 
+/// Filters for the extraction failure ledger. Every field is independently
+/// optional; the vocabularies are the ledger's own
+/// (docs/failed-media-retry-design.md).
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct ExtractionFailuresQuery {
+    /// Only failures recorded for this setter. Deliberately *not* validated
+    /// against the known setters: the vocabulary is free-form and depends on
+    /// which models the user has ever run, so there is no closed list to check
+    /// against. A typo therefore answers "no failures", which is acceptable
+    /// here — unlike `error_class`, whose vocabulary is closed and enforced,
+    /// because a mistyped class silently reading as "nothing is wrong" is
+    /// exactly what an audit surface must not do.
+    #[param(nullable)]
+    setter: Option<String>,
+    /// `input`, `blocked` or `resource`. Anything else is a 400.
+    #[param(nullable)]
+    error_class: Option<String>,
+    /// `prepare` (the gateway could not produce the model's input) or
+    /// `inference` (the worker rejected it).
+    #[param(nullable)]
+    stage: Option<String>,
+    /// Prefix of the recorded mime type, e.g. `image/`.
+    #[param(nullable)]
+    mime_prefix: Option<String>,
+    /// Page size. Defaults to 100; values outside 1..=1000 are clamped into
+    /// that range rather than rejected. Deliberately unconstrained in the
+    /// schema: a generated validating client must not refuse a request the
+    /// server accepts.
+    #[param(nullable)]
+    limit: Option<i64>,
+    /// Rows to skip. Values below 0 are clamped to 0 (start at the beginning),
+    /// not rejected — same reason as `limit`.
+    #[param(nullable)]
+    offset: Option<i64>,
+}
+
+/// Filters for the filescan failure ledger. Deliberately *not* the extraction
+/// query type: a scan failure predates every setter, so offering a `setter`
+/// filter here would document a parameter that can only ever answer "none".
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct ScanFailuresQuery {
+    /// `input`, `blocked` or `resource`. Anything else is a 400.
+    #[param(nullable)]
+    error_class: Option<String>,
+    /// `mime`, `metadata` or `decode`.
+    #[param(nullable)]
+    stage: Option<String>,
+    /// Prefix of the recorded mime type, e.g. `image/`. Rows whose mime guess
+    /// is what failed have no mime type and match no prefix.
+    #[param(nullable)]
+    mime_prefix: Option<String>,
+    /// Page size. Defaults to 100; values outside 1..=1000 are clamped into
+    /// that range rather than rejected. Deliberately unconstrained in the
+    /// schema: a generated validating client must not refuse a request the
+    /// server accepts.
+    #[param(nullable)]
+    limit: Option<i64>,
+    /// Rows to skip. Values below 0 are clamped to 0 (start at the beginning),
+    /// not rejected — same reason as `limit`.
+    #[param(nullable)]
+    offset: Option<i64>,
+}
+
+/// One recorded extraction failure, as served to the audit surface.
+#[derive(serde::Serialize, ToSchema)]
+pub(crate) struct ExtractionFailure {
+    /// Ledger row id. Stable for as long as the row lives, which is what the
+    /// UI keys rows on.
+    id: i64,
+    sha256: String,
+    /// One of the paths this item is stored under, chosen deterministically
+    /// (an available file first, then the lexicographically smallest path).
+    /// An item can have several files and the ledger keys on the item, so
+    /// this is a representative, not the whole story. Null when every file of
+    /// the item has gone away.
+    path: Option<String>,
+    /// The item's mime type as recorded when the failure happened.
+    mime_type: String,
+    setter_name: String,
+    /// `prepare` or `inference`.
+    stage: String,
+    /// `input`, `blocked` or `resource`.
+    error_class: String,
+    /// The missing dependency for a `blocked` row (`pdfium`, `html-renderer`
+    /// or `ffmpeg`), null otherwise.
+    blocker: Option<String>,
+    /// Human-readable message, clamped when it was recorded.
+    error: String,
+    /// Attempts needed before the verdict suppresses the item.
+    skip_after: i64,
+    attempts: i64,
+    /// `attempts >= skip_after`: the verdict is confirmed and the work query
+    /// is skipping this item. False means the verdict is recorded but
+    /// unconfirmed and will be retried.
+    active: bool,
+    /// The last job that saw this failure. Null only when it was recorded
+    /// outside a job. This is *not* a foreign key and nothing nulls it when
+    /// job rows are cleaned up, so the id may name a job that no longer
+    /// exists — the ledger has to outlive the job history it refers to.
+    last_job_id: Option<i64>,
+    first_seen: String,
+    last_seen: String,
+}
+
+/// One recorded filescan failure, as served to the audit surface.
+#[derive(serde::Serialize, ToSchema)]
+pub(crate) struct ScanFailure {
+    id: i64,
+    /// The path is the key of this ledger: these failures happen before an
+    /// item — or even a hash — exists.
+    path: String,
+    /// `mime`, `metadata` or `decode`.
+    stage: String,
+    /// `input`, `blocked` or `resource`.
+    error_class: String,
+    blocker: Option<String>,
+    /// The extension-based guess, or null when the guess is what failed.
+    mime_type: Option<String>,
+    error: String,
+    skip_after: i64,
+    attempts: i64,
+    /// `attempts >= skip_after`: the verdict is confirmed. Not the same as
+    /// "this path will be skipped": the walker also requires the file to still
+    /// have the `last_modified`/`file_size` the failure was recorded against,
+    /// so a file that has been repaired or otherwise modified since is
+    /// re-attempted on the next scan even though this reads true.
+    active: bool,
+    /// The last scan that saw this failure. Null only when it was recorded
+    /// outside a scan. This is *not* a foreign key and nothing nulls it when
+    /// `file_scans` rows are cleaned up, so the id may name a scan that no
+    /// longer exists.
+    last_scan_id: Option<i64>,
+    first_seen: String,
+    last_seen: String,
+}
+
+#[derive(serde::Serialize, ToSchema)]
+pub(crate) struct ExtractionFailuresResponse {
+    /// How many failures match the filters, ignoring the page window — the
+    /// denominator for `limit`/`offset` paging.
+    total: i64,
+    failures: Vec<ExtractionFailure>,
+}
+
+#[derive(serde::Serialize, ToSchema)]
+pub(crate) struct ScanFailuresResponse {
+    /// How many failures match the filters, ignoring the page window.
+    total: i64,
+    failures: Vec<ScanFailure>,
+}
+
+/// A class outside the vocabulary is a typo, and silently answering "no
+/// failures" to it is the one thing an audit surface must not do. Deliberately
+/// *not* applied to `stage`: the two ledgers have different stage vocabularies
+/// and new ones are expected to appear, so a stage filter that matches nothing
+/// is a legitimate answer.
+fn validate_error_class(error_class: Option<String>) -> Result<Option<String>, ApiError> {
+    if let Some(class) = &error_class {
+        if !ERROR_CLASSES.contains(&class.as_str()) {
+            return Err(ApiError::bad_request(format!(
+                "Unknown error_class {class:?}; expected one of {}",
+                ERROR_CLASSES.join(", ")
+            )));
+        }
+    }
+    Ok(error_class)
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "get_extraction_failures",
+    path = "/api/jobs/data/failures",
+    tag = "jobs",
+    summary = "List recorded data extraction failures",
+    description = "The extraction failure ledger: media a setter has already rejected, which the \
+        work query therefore skips. Read-only by design — a row is cleared when the file's \
+        content changes, when a missing dependency appears, or by a shipped retry directive, \
+        never by an API call. Newest first, paginated with limit/offset against `total`.",
+    params(DbQueryParams, ExtractionFailuresQuery),
+    responses(
+        (status = 200, description = "Recorded extraction failures", body = ExtractionFailuresResponse)
+    )
+)]
+pub(crate) async fn get_extraction_failures(
+    Query(query): Query<ExtractionFailuresQuery>,
+    mut conn: DbConnection<ReadOnly>,
+) -> Result<Json<ExtractionFailuresResponse>, ApiError> {
+    let filters = ExtractionErrorFilters {
+        setter: query.setter,
+        error_class: validate_error_class(query.error_class)?,
+        stage: query.stage,
+        mime_prefix: query.mime_prefix,
+        limit: query.limit,
+        offset: query.offset.unwrap_or(0),
+    };
+    // Count first, then the page: a row written between the two shows up as a
+    // total one larger than the page can explain, which is the harmless
+    // direction. The reverse would page past a total that no longer covers it.
+    let total = count_extraction_errors(&mut conn.conn, &filters).await?;
+    let rows = list_extraction_errors(&mut conn.conn, &filters).await?;
+    Ok(Json(ExtractionFailuresResponse {
+        total,
+        failures: rows
+            .into_iter()
+            .map(|row| ExtractionFailure {
+                id: row.id,
+                sha256: row.item_sha256,
+                path: row.path,
+                mime_type: row.mime_type,
+                setter_name: row.setter_name,
+                stage: row.stage,
+                error_class: row.error_class,
+                blocker: row.blocker,
+                error: row.error,
+                active: row.attempts >= row.skip_after,
+                skip_after: row.skip_after,
+                attempts: row.attempts,
+                last_job_id: row.last_job_id,
+                first_seen: row.first_seen,
+                last_seen: row.last_seen,
+            })
+            .collect(),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "get_scan_failures",
+    path = "/api/jobs/scan/failures",
+    tag = "jobs",
+    summary = "List recorded file scan failures",
+    description = "The filescan failure ledger: paths the scan could not get as far as an item \
+        for. A confirmed row (`active`) is skipped only while the file still has the mtime and \
+        size the failure was recorded against, so a repaired or modified file is re-attempted on \
+        the next scan regardless. Read-only by design — a row is cleared when the file's mtime or \
+        size changes, when the path stops being walked, when a missing dependency appears, or by \
+        a shipped retry directive. Newest first, paginated with limit/offset against `total`.",
+    params(DbQueryParams, ScanFailuresQuery),
+    responses(
+        (status = 200, description = "Recorded scan failures", body = ScanFailuresResponse)
+    )
+)]
+pub(crate) async fn get_scan_failures(
+    Query(query): Query<ScanFailuresQuery>,
+    mut conn: DbConnection<ReadOnly>,
+) -> Result<Json<ScanFailuresResponse>, ApiError> {
+    let filters = ScanErrorFilters {
+        error_class: validate_error_class(query.error_class)?,
+        stage: query.stage,
+        mime_prefix: query.mime_prefix,
+        limit: query.limit,
+        offset: query.offset.unwrap_or(0),
+    };
+    let total = count_scan_errors(&mut conn.conn, &filters).await?;
+    let rows = list_scan_errors(&mut conn.conn, &filters).await?;
+    Ok(Json(ScanFailuresResponse {
+        total,
+        failures: rows
+            .into_iter()
+            .map(|row| ScanFailure {
+                id: row.id,
+                path: row.path,
+                stage: row.stage,
+                error_class: row.error_class,
+                blocker: row.blocker,
+                mime_type: row.mime_type,
+                error: row.error,
+                active: row.attempts >= row.skip_after,
+                skip_after: row.skip_after,
+                attempts: row.attempts,
+                last_scan_id: row.last_scan_id,
+                first_seen: row.first_seen,
+                last_seen: row.last_seen,
+            })
+            .collect(),
+    }))
+}
+
 #[derive(Debug, serde::Serialize, ToSchema)]
 pub(crate) struct VectorQuantActionResponse {
     pub detail: String,
@@ -993,5 +1278,125 @@ mod tests {
         let uri: Uri = "/x?queue_ids=3".parse().unwrap();
         let Query(q) = Query::<QueueCancelQuery>::try_from_uri(&uri).unwrap();
         assert_eq!(q.queue_ids, vec![3]);
+    }
+
+    /// Every failures filter is optional, so a bare request must parse into
+    /// all-None rather than 400 — that is the request the UI opens the card
+    /// with.
+    #[test]
+    fn failures_query_filters_are_all_optional() {
+        let uri: Uri = "/api/jobs/data/failures".parse().unwrap();
+        let Query(q) = Query::<ExtractionFailuresQuery>::try_from_uri(&uri).unwrap();
+        assert!(q.setter.is_none() && q.error_class.is_none() && q.stage.is_none());
+        assert!(q.mime_prefix.is_none() && q.limit.is_none() && q.offset.is_none());
+
+        let uri: Uri = "/api/jobs/data/failures?setter=clip/ViT-H-14&error_class=blocked\
+            &stage=prepare&mime_prefix=image/&limit=25&offset=50"
+            .parse()
+            .unwrap();
+        let Query(q) = Query::<ExtractionFailuresQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.setter.as_deref(), Some("clip/ViT-H-14"));
+        assert_eq!(q.stage.as_deref(), Some("prepare"));
+        assert_eq!(q.mime_prefix.as_deref(), Some("image/"));
+        assert_eq!((q.limit, q.offset), (Some(25), Some(50)));
+        assert_eq!(
+            validate_error_class(q.error_class).unwrap().as_deref(),
+            Some("blocked")
+        );
+
+        // The scan ledger has its own query type on purpose: it predates every
+        // setter, so it must not document a `setter` filter it would ignore.
+        let uri: Uri = "/api/jobs/scan/failures?stage=decode&mime_prefix=video/&limit=10"
+            .parse()
+            .unwrap();
+        let Query(q) = Query::<ScanFailuresQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.stage.as_deref(), Some("decode"));
+        assert_eq!(q.mime_prefix.as_deref(), Some("video/"));
+        assert_eq!((q.limit, q.offset), (Some(10), None));
+    }
+
+    /// A mistyped class must not answer "no recorded failures" — on an audit
+    /// surface that reads as "nothing is wrong".
+    #[test]
+    fn an_unknown_error_class_is_rejected_not_silently_empty() {
+        assert!(validate_error_class(None).unwrap().is_none());
+        for class in ERROR_CLASSES {
+            assert_eq!(
+                validate_error_class(Some(class.to_string()))
+                    .unwrap()
+                    .as_deref(),
+                Some(class)
+            );
+        }
+        // Case-sensitive: the persisted values are data, not display strings.
+        let error = validate_error_class(Some("Input".to_string())).unwrap_err();
+        assert!(
+            error.detail().contains("Unknown error_class"),
+            "unexpected detail: {}",
+            error.detail()
+        );
+        assert!(validate_error_class(Some(String::new())).is_err());
+    }
+
+    /// What the caller actually receives for a mistyped class. There is no
+    /// handler harness here — both failure handlers take a `DbConnection`
+    /// extractor — so this pins the rejection at the only layer that decides
+    /// it: status 400 and the flat `{"detail": ...}` body every other endpoint
+    /// returns, which is what the UI's error path reads.
+    #[tokio::test]
+    async fn a_rejected_error_class_is_a_400_with_a_detail_body() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let response = validate_error_class(Some("Input".to_string()))
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&body).unwrap();
+        let detail = parsed
+            .get("detail")
+            .and_then(JsonValue::as_str)
+            .expect("the body must be {\"detail\": ...}");
+        assert!(
+            detail.contains("Unknown error_class") && detail.contains("\"Input\""),
+            "the message must name what was rejected: {detail}"
+        );
+        // The vocabulary is offered back, so the caller can fix the typo.
+        for class in ERROR_CLASSES {
+            assert!(detail.contains(class), "{class} missing from: {detail}");
+        }
+    }
+
+    /// An item whose files have all gone away still owes an audit row — the
+    /// row is exactly what explains why nothing was extracted — so `path` has
+    /// to serialize as an explicit JSON null rather than being skipped. A
+    /// missing key would make the generated client's `string | undefined`
+    /// disagree with the `string | null` the schema promises.
+    #[test]
+    fn a_fileless_item_serializes_an_explicit_null_path() {
+        let failure = ExtractionFailure {
+            id: 1,
+            sha256: "sha_one".to_string(),
+            path: None,
+            mime_type: "image/png".to_string(),
+            setter_name: "test/clip".to_string(),
+            stage: "prepare".to_string(),
+            error_class: "input".to_string(),
+            blocker: None,
+            error: "decode failed".to_string(),
+            skip_after: 1,
+            attempts: 1,
+            active: true,
+            last_job_id: None,
+            first_seen: "2026-01-01T00:00:00".to_string(),
+            last_seen: "2026-01-01T00:00:00".to_string(),
+        };
+        let json: JsonValue = serde_json::to_value(&failure).unwrap();
+        assert_eq!(json.get("path"), Some(&JsonValue::Null));
+        assert_eq!(json.get("blocker"), Some(&JsonValue::Null));
+        assert_eq!(json.get("last_job_id"), Some(&JsonValue::Null));
+        assert_eq!(json["sha256"], JsonValue::from("sha_one"));
     }
 }

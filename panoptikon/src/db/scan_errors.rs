@@ -22,7 +22,10 @@ use std::collections::HashMap;
 
 use crate::api_error::{ApiError, ApiErrorKind, Blocker};
 use crate::db::extraction_write::current_iso_timestamp;
-use crate::db::ledger::{LedgerTable, delete_blocked_rows, list_distinct_blockers_in};
+use crate::db::ledger::{
+    LedgerTable, audit_filter_sql, clamp_list_limit, delete_blocked_rows,
+    list_distinct_blockers_in, read_audit_column,
+};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -434,6 +437,143 @@ pub(crate) async fn list_distinct_scan_blockers(
     conn: &mut sqlx::SqliteConnection,
 ) -> ApiResult<Vec<Blocker>> {
     list_distinct_blockers_in(conn, TABLE).await
+}
+
+// Everything from here to the tests is the *audit half* — the list query, its
+// count twin, their filters and their row type. It is what
+// `GET /api/jobs/scan/failures` serves; the walker never reads it.
+//
+// Deliberately no [`fold_scan_path`] anywhere below: this half never matches
+// on a path, it only returns one. The folding exists so a case-drifted walk
+// finds its own rows; an audit list that shows every row has nothing to find.
+
+/// Audit filters, the twin of
+/// [`crate::db::extraction_errors::ExtractionErrorFilters`] minus `setter` —
+/// these failures happen before any setter is involved.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScanErrorFilters {
+    pub error_class: Option<String>,
+    pub stage: Option<String>,
+    /// Matched as a prefix of `mime_type`, e.g. `image/`. An empty string is
+    /// treated as no filter. Rows whose mime guess is what failed have a NULL
+    /// `mime_type` and are therefore excluded by any prefix, which is the
+    /// intended reading of "show me the image failures".
+    pub mime_prefix: Option<String>,
+    /// Clamped by [`clamp_list_limit`]; `None` means its default.
+    pub limit: Option<i64>,
+    /// Negative values are clamped to zero.
+    pub offset: i64,
+}
+
+/// One audit row. Unlike the extraction twin this needs no join at all: the
+/// path *is* the key, and there is no item to resolve.
+#[derive(Debug, Clone)]
+pub(crate) struct ScanErrorRow {
+    pub id: i64,
+    pub path: String,
+    pub stage: String,
+    pub error_class: String,
+    pub blocker: Option<String>,
+    /// `None` when the mime guess itself is what failed (stage `mime`).
+    pub mime_type: Option<String>,
+    pub error: String,
+    pub skip_after: i64,
+    pub attempts: i64,
+    pub last_scan_id: Option<i64>,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// The clause both audit reads share. The column names are literals from this
+/// module; only the bound values come from the request.
+fn audit_filters(filters: &ScanErrorFilters) -> (String, Vec<String>) {
+    audit_filter_sql(
+        &[
+            ("error_class", filters.error_class.as_deref()),
+            ("stage", filters.stage.as_deref()),
+        ],
+        "mime_type",
+        filters.mime_prefix.as_deref(),
+    )
+}
+
+/// How many failures match these filters, ignoring the page window — the
+/// denominator the paginated audit surface needs. Shares the `WHERE` builder
+/// with [`list_scan_errors`], so the count can never describe a different set
+/// than the page it labels.
+pub(crate) async fn count_scan_errors(
+    conn: &mut sqlx::SqliteConnection,
+    filters: &ScanErrorFilters,
+) -> ApiResult<i64> {
+    let (where_clause, binds) = audit_filters(filters);
+    let sql = format!("SELECT COUNT(*) FROM scan_errors {where_clause}");
+    let mut query = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()));
+    for bind in &binds {
+        query = query.bind(bind);
+    }
+    query.fetch_one(&mut *conn).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to count scan errors");
+        ApiError::internal("Failed to read scan failures")
+    })
+}
+
+/// Lists scan failures for the audit surface, newest first.
+///
+/// The `LIMIT` is not a concession to table size — the ledger is a handful of
+/// rows by design, and every other read here takes it whole — but to the page
+/// the API serves: the one pathological case (a NAS that vanished mid-scan)
+/// is exactly when a user opens this list.
+pub(crate) async fn list_scan_errors(
+    conn: &mut sqlx::SqliteConnection,
+    filters: &ScanErrorFilters,
+) -> ApiResult<Vec<ScanErrorRow>> {
+    let (where_clause, binds) = audit_filters(filters);
+    // Mixing numbered and bare placeholders misbinds parameters under sqlx,
+    // so every placeholder here must stay unnumbered.
+    let sql = format!(
+        r#"
+        SELECT
+            id, path, stage, error_class, blocker, mime_type, error,
+            skip_after, attempts, last_scan_id, first_seen, last_seen
+        FROM scan_errors
+        {where_clause}
+        ORDER BY last_seen DESC, id DESC
+        LIMIT ? OFFSET ?
+        "#
+    );
+
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+    for bind in &binds {
+        query = query.bind(bind);
+    }
+    let rows = query
+        .bind(clamp_list_limit(filters.limit))
+        .bind(filters.offset.max(0))
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to list scan errors");
+            ApiError::internal("Failed to read scan failures")
+        })?;
+
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        results.push(ScanErrorRow {
+            id: read_audit_column(&row, "id")?,
+            path: read_audit_column(&row, "path")?,
+            stage: read_audit_column(&row, "stage")?,
+            error_class: read_audit_column(&row, "error_class")?,
+            blocker: read_audit_column(&row, "blocker")?,
+            mime_type: read_audit_column(&row, "mime_type")?,
+            error: read_audit_column(&row, "error")?,
+            skip_after: read_audit_column(&row, "skip_after")?,
+            attempts: read_audit_column(&row, "attempts")?,
+            last_scan_id: read_audit_column(&row, "last_scan_id")?,
+            first_seen: read_audit_column(&row, "first_seen")?,
+            last_seen: read_audit_column(&row, "last_seen")?,
+        });
+    }
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -888,6 +1028,228 @@ mod tests {
         assert_eq!(swept, 2);
         assert_eq!(count(conn).await, 0);
         assert_eq!(delete_scan_errors(conn, &[]).await.unwrap(), 0);
+    }
+
+    // The audit list's filters, shaped after the extraction twin's. Each one
+    // has to discriminate rather than merely return the whole (tiny) table,
+    // and the count has to answer for the same set.
+    #[tokio::test]
+    async fn audit_list_filters_and_counts_the_same_set() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+
+        let mut video = record(r"C:\m\a.mp4", FFMPEG);
+        video.stage = STAGE_METADATA.to_string();
+        video.mime_type = Some("video/mp4".to_string());
+        upsert_scan_error(conn, &video, Some(1)).await.unwrap();
+        upsert_scan_error(conn, &record(r"C:\m\b.png", ApiErrorKind::Input), Some(1))
+            .await
+            .unwrap();
+        // The mime guess itself failed, so this row has no mime type at all.
+        let mut unguessable = record(r"C:\m\c.bin", ApiErrorKind::Input);
+        unguessable.stage = STAGE_MIME.to_string();
+        unguessable.mime_type = None;
+        upsert_scan_error(conn, &unguessable, Some(1))
+            .await
+            .unwrap();
+
+        let all = list_scan_errors(conn, &ScanErrorFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3, "no filters and no limit lists everything");
+        let bin = all.iter().find(|row| row.path.ends_with("c.bin")).unwrap();
+        assert_eq!(bin.mime_type, None);
+        assert_eq!(bin.stage, STAGE_MIME);
+        assert_eq!(bin.last_scan_id, Some(1));
+        assert_eq!((bin.attempts, bin.skip_after), (1, 1));
+
+        let blocked = list_scan_errors(
+            conn,
+            &ScanErrorFilters {
+                error_class: Some(CLASS_BLOCKED.to_string()),
+                stage: Some(STAGE_METADATA.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].blocker.as_deref(), Some("ffmpeg"));
+        assert_eq!(blocked[0].mime_type.as_deref(), Some("video/mp4"));
+
+        // The prefix is a range bound, not a pattern: wildcards are literal
+        // bytes, an empty prefix filters nothing, and a NULL mime type is
+        // outside every range.
+        let images = list_scan_errors(
+            conn,
+            &ScanErrorFilters {
+                mime_prefix: Some("image/".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].path, r"C:\m\b.png");
+
+        for filters in [
+            ScanErrorFilters::default(),
+            ScanErrorFilters {
+                error_class: Some(CLASS_INPUT.to_string()),
+                ..Default::default()
+            },
+            ScanErrorFilters {
+                stage: Some(STAGE_DECODE.to_string()),
+                ..Default::default()
+            },
+            ScanErrorFilters {
+                mime_prefix: Some("%".to_string()),
+                ..Default::default()
+            },
+            ScanErrorFilters {
+                mime_prefix: Some(String::new()),
+                ..Default::default()
+            },
+            ScanErrorFilters {
+                stage: Some("nonexistent".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let listed = list_scan_errors(conn, &filters).await.unwrap().len() as i64;
+            assert_eq!(
+                count_scan_errors(conn, &filters).await.unwrap(),
+                listed,
+                "count and list must agree for {filters:?}"
+            );
+        }
+        assert!(
+            list_scan_errors(
+                conn,
+                &ScanErrorFilters {
+                    mime_prefix: Some("%".to_string()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "'%' must not match every mime type"
+        );
+    }
+
+    // Newest first, and the pages partition the result set: the audit surface
+    // pages through this and a duplicated or dropped row would be invisible.
+    // The count stays the whole filtered set, which is what the page numbers
+    // are drawn against.
+    #[tokio::test]
+    async fn audit_list_orders_by_last_seen_and_pages_disjointly() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        for path in [r"C:\m\a.png", r"C:\m\b.png", r"C:\m\c.png"] {
+            upsert_scan_error(conn, &record(path, ApiErrorKind::Input), Some(1))
+                .await
+                .unwrap();
+        }
+        // Hand-set an older timestamp: the writes above share a clock tick.
+        sqlx::query("UPDATE scan_errors SET last_seen = '2000-01-01T00:00:00' WHERE path = ?")
+            .bind(r"C:\m\b.png")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        let all = list_scan_errors(conn, &ScanErrorFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all[2].path, r"C:\m\b.png",
+            "the oldest last_seen sorts last"
+        );
+        assert!(all[0].last_seen >= all[1].last_seen && all[1].last_seen >= all[2].last_seen);
+
+        let page = |offset: i64| ScanErrorFilters {
+            limit: Some(2),
+            offset,
+            ..Default::default()
+        };
+        let first_page = list_scan_errors(conn, &page(0)).await.unwrap();
+        let second_page = list_scan_errors(conn, &page(2)).await.unwrap();
+        assert_eq!((first_page.len(), second_page.len()), (2, 1));
+        let mut paged: Vec<i64> = first_page
+            .iter()
+            .chain(second_page.iter())
+            .map(|row| row.id)
+            .collect();
+        let seen = paged.len();
+        paged.sort_unstable();
+        paged.dedup();
+        assert_eq!(paged.len(), seen, "the pages must be disjoint");
+        let mut every: Vec<i64> = all.iter().map(|row| row.id).collect();
+        every.sort_unstable();
+        assert_eq!(paged, every, "the pages must cover every row");
+        assert_eq!(
+            count_scan_errors(conn, &page(0)).await.unwrap(),
+            3,
+            "the page window must not move the total"
+        );
+
+        // A caller-supplied page size can never turn into "no rows" or "every
+        // row": zero and negatives clamp up, absurd sizes clamp down, and a
+        // negative offset starts at the beginning.
+        for limit in [Some(0), Some(-1)] {
+            let rows = list_scan_errors(
+                conn,
+                &ScanErrorFilters {
+                    limit,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(rows.len(), 1, "a bad limit clamps to one row, not none");
+        }
+        let rows = list_scan_errors(
+            conn,
+            &ScanErrorFilters {
+                limit: Some(i64::MAX),
+                offset: -5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    // The twin of the extraction ledger's offset test. Paging past the end is
+    // what the UI does the moment a filter narrows the set under the offset it
+    // is already on: an empty page against an unchanged total, never an error
+    // and never a wrapped-around page.
+    #[tokio::test]
+    async fn audit_offset_past_the_total_is_an_empty_page() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        for path in [r"C:\m\a.png", r"C:\m\b.png"] {
+            upsert_scan_error(conn, &record(path, ApiErrorKind::Input), Some(1))
+                .await
+                .unwrap();
+        }
+
+        for offset in [2, 500] {
+            let filters = ScanErrorFilters {
+                offset,
+                ..Default::default()
+            };
+            assert!(
+                list_scan_errors(conn, &filters).await.unwrap().is_empty(),
+                "offset {offset} is past the end"
+            );
+            assert_eq!(
+                count_scan_errors(conn, &filters).await.unwrap(),
+                2,
+                "the total is the filtered set, not the page"
+            );
+        }
     }
 
     // Auto-heal is per dependency: installing ffmpeg must not resurrect the

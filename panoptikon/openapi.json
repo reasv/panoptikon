@@ -2583,6 +2583,128 @@
         }
       }
     },
+    "/api/jobs/data/failures": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "List recorded data extraction failures",
+        "description": "The extraction failure ledger: media a setter has already rejected, which the work query therefore skips. Read-only by design — a row is cleared when the file's content changes, when a missing dependency appears, or by a shipped retry directive, never by an API call. Newest first, paginated with limit/offset against `total`.",
+        "operationId": "get_extraction_failures",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "setter",
+            "in": "query",
+            "description": "Only failures recorded for this setter. Deliberately *not* validated\nagainst the known setters: the vocabulary is free-form and depends on\nwhich models the user has ever run, so there is no closed list to check\nagainst. A typo therefore answers \"no failures\", which is acceptable\nhere — unlike `error_class`, whose vocabulary is closed and enforced,\nbecause a mistyped class silently reading as \"nothing is wrong\" is\nexactly what an audit surface must not do.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "error_class",
+            "in": "query",
+            "description": "`input`, `blocked` or `resource`. Anything else is a 400.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "stage",
+            "in": "query",
+            "description": "`prepare` (the gateway could not produce the model's input) or\n`inference` (the worker rejected it).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "mime_prefix",
+            "in": "query",
+            "description": "Prefix of the recorded mime type, e.g. `image/`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size. Defaults to 100; values outside 1..=1000 are clamped into\nthat range rather than rejected. Deliberately unconstrained in the\nschema: a generated validating client must not refuse a request the\nserver accepts.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip. Values below 0 are clamped to 0 (start at the beginning),\nnot rejected — same reason as `limit`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recorded extraction failures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractionFailuresResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/jobs/data/history": {
       "get": {
         "tags": [
@@ -3261,6 +3383,116 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/QueueCancelResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/scan/failures": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "List recorded file scan failures",
+        "description": "The filescan failure ledger: paths the scan could not get as far as an item for. A confirmed row (`active`) is skipped only while the file still has the mtime and size the failure was recorded against, so a repaired or modified file is re-attempted on the next scan regardless. Read-only by design — a row is cleared when the file's mtime or size changes, when the path stops being walked, when a missing dependency appears, or by a shipped retry directive. Newest first, paginated with limit/offset against `total`.",
+        "operationId": "get_scan_failures",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "error_class",
+            "in": "query",
+            "description": "`input`, `blocked` or `resource`. Anything else is a 400.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "stage",
+            "in": "query",
+            "description": "`mime`, `metadata` or `decode`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "mime_prefix",
+            "in": "query",
+            "description": "Prefix of the recorded mime type, e.g. `image/`. Rows whose mime guess\nis what failed have no mime type and match no prefix.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size. Defaults to 100; values outside 1..=1000 are clamped into\nthat range rather than rejected. Deliberately unconstrained in the\nschema: a generated validating client must not refuse a request the\nserver accepts.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip. Values below 0 are clamped to 0 (start at the beginning),\nnot rejected — same reason as `limit`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recorded scan failures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanFailuresResponse"
                 }
               }
             }
@@ -5662,6 +5894,114 @@
           }
         }
       },
+      "ExtractionFailure": {
+        "type": "object",
+        "description": "One recorded extraction failure, as served to the audit surface.",
+        "required": [
+          "id",
+          "sha256",
+          "mime_type",
+          "setter_name",
+          "stage",
+          "error_class",
+          "error",
+          "skip_after",
+          "attempts",
+          "active",
+          "first_seen",
+          "last_seen"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "`attempts >= skip_after`: the verdict is confirmed and the work query\nis skipping this item. False means the verdict is recorded but\nunconfirmed and will be retried."
+          },
+          "attempts": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "blocker": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The missing dependency for a `blocked` row (`pdfium`, `html-renderer`\nor `ffmpeg`), null otherwise."
+          },
+          "error": {
+            "type": "string",
+            "description": "Human-readable message, clamped when it was recorded."
+          },
+          "error_class": {
+            "type": "string",
+            "description": "`input`, `blocked` or `resource`."
+          },
+          "first_seen": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ledger row id. Stable for as long as the row lives, which is what the\nUI keys rows on."
+          },
+          "last_job_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The last job that saw this failure. Null only when it was recorded\noutside a job. This is *not* a foreign key and nothing nulls it when\njob rows are cleaned up, so the id may name a job that no longer\nexists — the ledger has to outlive the job history it refers to."
+          },
+          "last_seen": {
+            "type": "string"
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "The item's mime type as recorded when the failure happened."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One of the paths this item is stored under, chosen deterministically\n(an available file first, then the lexicographically smallest path).\nAn item can have several files and the ledger keys on the item, so\nthis is a representative, not the whole story. Null when every file of\nthe item has gone away."
+          },
+          "setter_name": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "skip_after": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Attempts needed before the verdict suppresses the item."
+          },
+          "stage": {
+            "type": "string",
+            "description": "`prepare` or `inference`."
+          }
+        }
+      },
+      "ExtractionFailuresResponse": {
+        "type": "object",
+        "required": [
+          "total",
+          "failures"
+        ],
+        "properties": {
+          "failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExtractionFailure"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many failures match the filters, ignoring the page window — the\ndenominator for `limit`/`offset` paging."
+          }
+        }
+      },
       "FailedFor": {
         "type": "object",
         "required": [
@@ -6395,6 +6735,7 @@
           "other_files",
           "total_segments",
           "errors",
+          "input_errors",
           "total_remaining",
           "data_load_time",
           "inference_time",
@@ -6436,6 +6777,11 @@
           "inference_time": {
             "type": "number",
             "format": "double"
+          },
+          "input_errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of `errors` were verdicts about the media itself (the\n`input`/`blocked`/`resource` ledger classes) rather than systemic\nfailures. The remainder is what decides whether a job where everything\nfailed completes with a warning or hard-fails."
           },
           "items_in_db": {
             "type": "integer",
@@ -8264,6 +8610,102 @@
             "type": "string"
           }
         ]
+      },
+      "ScanFailure": {
+        "type": "object",
+        "description": "One recorded filescan failure, as served to the audit surface.",
+        "required": [
+          "id",
+          "path",
+          "stage",
+          "error_class",
+          "error",
+          "skip_after",
+          "attempts",
+          "active",
+          "first_seen",
+          "last_seen"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "`attempts >= skip_after`: the verdict is confirmed. Not the same as\n\"this path will be skipped\": the walker also requires the file to still\nhave the `last_modified`/`file_size` the failure was recorded against,\nso a file that has been repaired or otherwise modified since is\nre-attempted on the next scan even though this reads true."
+          },
+          "attempts": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "blocker": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": "string"
+          },
+          "error_class": {
+            "type": "string",
+            "description": "`input`, `blocked` or `resource`."
+          },
+          "first_seen": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_scan_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The last scan that saw this failure. Null only when it was recorded\noutside a scan. This is *not* a foreign key and nothing nulls it when\n`file_scans` rows are cleaned up, so the id may name a scan that no\nlonger exists."
+          },
+          "last_seen": {
+            "type": "string"
+          },
+          "mime_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The extension-based guess, or null when the guess is what failed."
+          },
+          "path": {
+            "type": "string",
+            "description": "The path is the key of this ledger: these failures happen before an\nitem — or even a hash — exists."
+          },
+          "skip_after": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "stage": {
+            "type": "string",
+            "description": "`mime`, `metadata` or `decode`."
+          }
+        }
+      },
+      "ScanFailuresResponse": {
+        "type": "object",
+        "required": [
+          "total",
+          "failures"
+        ],
+        "properties": {
+          "failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScanFailure"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many failures match the filters, ignoring the page window."
+          }
+        }
       },
       "SearchCacheDbGroup": {
         "type": "object",

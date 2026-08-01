@@ -541,6 +541,11 @@ async fn async_main() -> anyhow::Result<()> {
                 get(api::jobs::get_extraction_history).delete(api::jobs::delete_scan_data),
             )
             .route(
+                "/api/jobs/data/failures",
+                get(api::jobs::get_extraction_failures),
+            )
+            .route("/api/jobs/scan/failures", get(api::jobs::get_scan_failures))
+            .route(
                 "/api/jobs/config",
                 get(api::jobs::get_config).put(api::jobs::update_config),
             )
