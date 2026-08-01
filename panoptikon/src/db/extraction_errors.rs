@@ -1,0 +1,1224 @@
+//! The extraction failure ledger (`item_extraction_errors`).
+//!
+//! See docs/failed-media-retry-design.md. A row means "this setter has already
+//! rejected this item's media, and re-attempting it is wasted work" — never
+//! anything about search results or data reads. Losing a row costs one
+//! re-attempt, never correctness, so every writer here is advisory for
+//! correctness and authoritative only for scheduling.
+//!
+//! Transient failures never reach the table: the record carries an
+//! [`ApiErrorKind`], and the upsert refuses the one variant whose
+//! `persisted_class()` is `None`.
+//!
+//! `attempts` counts *runs that saw the failure*, not verdicts: a class change
+//! refreshes the classification but never resets the counter. Resetting would
+//! livelock a pair whose verdict alternates between runs (an item that fails
+//! `input` on one pass and `resource` on the next would never reach
+//! `skip_after` and would be retried forever).
+
+// The consumers — the extraction and scan pipelines, the blocked auto-heal
+// probe, and the failures API — are later phases of the same design, so for
+// now only the tests and the writer actor exercise this module. Remove with
+// the last of those phases.
+#![allow(dead_code)]
+
+use std::borrow::Cow;
+
+use sqlx::Row;
+
+use crate::api_error::{ApiError, ApiErrorKind, Blocker};
+use crate::db::extraction_write::current_iso_timestamp;
+
+type ApiResult<T> = std::result::Result<T, ApiError>;
+
+/// `stage` value for a failure raised while the gateway prepared the item's
+/// bytes (file read, decode, ffmpeg, pdfium, the HTML renderer).
+pub(crate) const STAGE_PREPARE: &str = "prepare";
+
+/// `stage` value for a failure raised by the inference worker itself.
+pub(crate) const STAGE_INFERENCE: &str = "inference";
+
+/// `error_class` of the `blocked` rows, which the auto-heal probe clears once
+/// their dependency binds.
+pub(crate) const CLASS_BLOCKED: &str = "blocked";
+
+/// `error_class` of a payload the pipeline's own decoder rejected.
+pub(crate) const CLASS_INPUT: &str = "input";
+
+/// `error_class` of an item that individually blew a resource limit.
+pub(crate) const CLASS_RESOURCE: &str = "resource";
+
+/// The `error` column is an audit string, never matched on. A worker traceback
+/// can be megabytes, and the ledger is read whole by the audit list, so it is
+/// clamped at one choke point instead of at every classification site.
+const MAX_ERROR_BYTES: usize = 2000;
+
+/// One ledger write. Owned fields so the writer actor's message can carry it.
+#[derive(Debug, Clone)]
+pub(crate) struct ExtractionErrorRecord {
+    pub item_sha256: String,
+    pub setter_name: String,
+    /// [`STAGE_PREPARE`] or [`STAGE_INFERENCE`].
+    pub stage: String,
+    /// The classification itself, not its persisted strings: `error_class` and
+    /// `blocker` are derived in [`upsert_extraction_error`], so an
+    /// inconsistent pair (a `blocked` row without a blocker) is
+    /// unrepresentable.
+    pub kind: ApiErrorKind,
+    pub error: String,
+    pub skip_after: i64,
+    /// The job that saw this failure, which is what dedups `attempts` (see
+    /// [`UPSERT_SQL`]). `None` is allowed but blunt: two consecutive job-less
+    /// writes are indistinguishable and increment only once, so a caller with
+    /// no job identity must use `skip_after = 1` or its rows will never reach
+    /// their threshold.
+    pub job_id: Option<i64>,
+    // `mime_type` is deliberately absent: the upsert reads `items.type` in the
+    // same statement, so the denormalized copy cannot drift from the item.
+}
+
+/// Resolves item and setter inside the statement (the `add_item_data`
+/// pattern), so a failure write costs exactly one roundtrip. `mime_type` is
+/// denormalized from the joined `items` row rather than passed in.
+///
+/// `attempts` increments only when the job changed: an item retried inside the
+/// same job — which the isolation retry does — must not burn its confirmation
+/// attempt twice. `IS NOT` is SQLite's null-safe inequality, so a row written
+/// by a job-less caller still increments once a real job touches it. A class
+/// change refreshes the verdict but does *not* reset the count; see the module
+/// doc for why.
+const UPSERT_SQL: &str = r#"
+    INSERT INTO item_extraction_errors (
+        item_id, setter_id, stage, error_class, blocker, mime_type, error,
+        skip_after, attempts, last_job_id, first_seen, last_seen
+    )
+    SELECT items.id, setters.id, ?, ?, ?, items.type, ?, ?, 1, ?, ?, ?
+    FROM items
+    JOIN setters ON setters.name = ?
+    WHERE items.sha256 = ?
+    ON CONFLICT(item_id, setter_id) DO UPDATE SET
+        attempts = CASE
+            WHEN item_extraction_errors.last_job_id IS NOT excluded.last_job_id
+                THEN item_extraction_errors.attempts + 1
+            ELSE item_extraction_errors.attempts
+        END,
+        stage = excluded.stage,
+        error_class = excluded.error_class,
+        blocker = excluded.blocker,
+        mime_type = excluded.mime_type,
+        error = excluded.error,
+        skip_after = excluded.skip_after,
+        last_job_id = excluded.last_job_id,
+        last_seen = excluded.last_seen
+"#;
+
+/// Records (or re-records) a failure. Returns an error when the item or the
+/// setter does not exist — the row would be silently dropped otherwise, and
+/// the caller counts a failed ledger write as systemic rather than
+/// soft-completing the job as "all corrupt media".
+pub(crate) async fn upsert_extraction_error(
+    conn: &mut sqlx::SqliteConnection,
+    record: &ExtractionErrorRecord,
+) -> ApiResult<()> {
+    let Some(class) = record.kind.persisted_class() else {
+        tracing::error!(
+            sha256 = %record.item_sha256,
+            setter = %record.setter_name,
+            "refused to persist a transient extraction failure"
+        );
+        return Err(ApiError::internal("transient failures are not persisted"));
+    };
+    let blocker = record.kind.blocker().map(|blocker| blocker.as_str());
+    let error = truncate_error(&record.error);
+
+    let now = current_iso_timestamp();
+    let result = sqlx::query(UPSERT_SQL)
+        .bind(&record.stage)
+        .bind(class)
+        .bind(blocker)
+        .bind(error.as_ref())
+        .bind(record.skip_after)
+        .bind(record.job_id)
+        .bind(&now)
+        .bind(&now)
+        .bind(&record.setter_name)
+        .bind(&record.item_sha256)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to upsert extraction error");
+            ApiError::internal("Failed to record extraction failure")
+        })?;
+
+    if result.rows_affected() == 0 {
+        tracing::error!(
+            sha256 = %record.item_sha256,
+            setter = %record.setter_name,
+            "extraction failure has no item or setter row to attach to"
+        );
+        return Err(ApiError::internal("Failed to record extraction failure"));
+    }
+    Ok(())
+}
+
+/// The success path: an item this setter can now process owes no ledger row.
+/// Returns how many rows went away (almost always zero, which is why callers
+/// gate this on the job having seen any rows for the setter at all).
+pub(crate) async fn delete_extraction_error(
+    conn: &mut sqlx::SqliteConnection,
+    item_sha256: &str,
+    setter_name: &str,
+) -> ApiResult<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM item_extraction_errors
+        WHERE item_id = (SELECT id FROM items WHERE sha256 = ?)
+          AND setter_id = (SELECT id FROM setters WHERE name = ?)
+        "#,
+    )
+    .bind(item_sha256)
+    .bind(setter_name)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to delete extraction error");
+        ApiError::internal("Failed to clear extraction failure")
+    })?;
+    Ok(result.rows_affected())
+}
+
+/// Auto-heal: clears the `blocked` rows of every dependency that now binds,
+/// across all setters, so those items become selectable in the same run.
+pub(crate) async fn delete_blocked_errors(
+    conn: &mut sqlx::SqliteConnection,
+    blockers: &[Blocker],
+) -> ApiResult<u64> {
+    if blockers.is_empty() {
+        return Ok(0);
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(blockers.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Mixing numbered and bare placeholders misbinds parameters under sqlx,
+    // so every placeholder here must stay unnumbered.
+    let sql = format!(
+        "DELETE FROM item_extraction_errors \
+         WHERE error_class = ? AND blocker IN ({placeholders})"
+    );
+
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(CLASS_BLOCKED);
+    for blocker in blockers {
+        query = query.bind(blocker.as_str());
+    }
+
+    let result = query.execute(&mut *conn).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to clear blocked extraction errors");
+        ApiError::internal("Failed to clear blocked extraction failures")
+    })?;
+    Ok(result.rows_affected())
+}
+
+/// The dependencies the ledger is currently waiting on — usually none. Only
+/// these backends get probed at job start, so a run never loads a library it
+/// has no use for. A value this build no longer knows (a blocker retired since
+/// the row was written) is logged and skipped: probing is best-effort, and the
+/// row stays until a retry directive clears it.
+pub(crate) async fn list_distinct_blockers(
+    conn: &mut sqlx::SqliteConnection,
+) -> ApiResult<Vec<Blocker>> {
+    let raw: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT blocker FROM item_extraction_errors \
+         WHERE error_class = ? AND blocker IS NOT NULL",
+    )
+    .bind(CLASS_BLOCKED)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to list extraction error blockers");
+        ApiError::internal("Failed to read extraction failures")
+    })?;
+
+    Ok(raw
+        .iter()
+        .filter_map(|value| match Blocker::parse(value) {
+            Some(blocker) => Some(blocker),
+            None => {
+                tracing::warn!(blocker = %value, "unknown blocker in the extraction ledger");
+                None
+            }
+        })
+        .collect())
+}
+
+/// How many of a setter's ledger rows are *active*, i.e. already suppress
+/// their item (`attempts >= skip_after`). Zero is the normal answer, and it is
+/// what lets the success path skip its delete entirely.
+pub(crate) async fn count_active_errors_for_setter(
+    conn: &mut sqlx::SqliteConnection,
+    setter_name: &str,
+) -> ApiResult<i64> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM item_extraction_errors
+        JOIN setters ON setters.id = item_extraction_errors.setter_id
+        WHERE setters.name = ?
+          AND item_extraction_errors.attempts >= item_extraction_errors.skip_after
+        "#,
+    )
+    .bind(setter_name)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to count extraction errors for setter");
+        ApiError::internal("Failed to read extraction failures")
+    })?;
+    Ok(count)
+}
+
+/// Default page size when the caller does not ask for one.
+const DEFAULT_LIST_LIMIT: i64 = 100;
+
+/// Hard cap on the page size: the audit list joins two tables per row and is
+/// served to a UI, so an unbounded page is never what the caller wanted.
+const MAX_LIST_LIMIT: i64 = 1000;
+
+/// Audit filters. Every field is independently optional, matching the retry
+/// directives' targeting (class, stage, mime prefix, setter).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExtractionErrorFilters {
+    pub setter: Option<String>,
+    pub error_class: Option<String>,
+    pub stage: Option<String>,
+    /// Matched as a prefix of `mime_type`, e.g. `image/`. An empty string is
+    /// treated as no filter.
+    pub mime_prefix: Option<String>,
+    /// Clamped to `1..=1000`; `None` means [`DEFAULT_LIST_LIMIT`]. The
+    /// clamping is why this is not a plain `i64`: a defaulted `0` would
+    /// silently return nothing.
+    pub limit: Option<i64>,
+    /// Negative values are clamped to zero (SQLite treats a negative OFFSET as
+    /// zero anyway, but the intent is explicit here).
+    pub offset: i64,
+}
+
+/// One audit row: the ledger joined with its item.
+#[derive(Debug, Clone)]
+pub(crate) struct ExtractionErrorRow {
+    pub id: i64,
+    pub item_sha256: String,
+    pub item_type: String,
+    pub setter_name: String,
+    pub stage: String,
+    pub error_class: String,
+    pub blocker: Option<String>,
+    pub mime_type: String,
+    pub error: String,
+    pub skip_after: i64,
+    pub attempts: i64,
+    pub last_job_id: Option<i64>,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// Lists failures for the audit surface, newest first.
+pub(crate) async fn list_extraction_errors(
+    conn: &mut sqlx::SqliteConnection,
+    filters: &ExtractionErrorFilters,
+) -> ApiResult<Vec<ExtractionErrorRow>> {
+    // An empty prefix filters nothing; a prefix with no representable
+    // successor (all-0xFF) degrades to the lower bound alone.
+    let mime_range = filters
+        .mime_prefix
+        .as_deref()
+        .filter(|prefix| !prefix.is_empty())
+        .map(|prefix| (prefix.to_string(), mime_prefix_upper_bound(prefix)));
+
+    let mut conditions: Vec<&str> = Vec::new();
+    if filters.setter.is_some() {
+        conditions.push("setters.name = ?");
+    }
+    if filters.error_class.is_some() {
+        conditions.push("e.error_class = ?");
+    }
+    if filters.stage.is_some() {
+        conditions.push("e.stage = ?");
+    }
+    if let Some((_, upper)) = &mime_range {
+        // A range predicate, not `LIKE ? || '%'`. LIKE would only be indexable
+        // here because this repo sets `case_sensitive_like`; the range form is
+        // pragma-independent, needs no escaping of `%`/`_`, and is the house
+        // rule for prefix matching (see the sqlite-like-prefix-antipattern
+        // note).
+        conditions.push("e.mime_type >= ?");
+        if upper.is_some() {
+            conditions.push("e.mime_type < ?");
+        }
+    }
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+    // Mixing numbered and bare placeholders misbinds parameters under sqlx,
+    // so every placeholder here must stay unnumbered.
+    let sql = format!(
+        r#"
+        SELECT
+            e.id AS id,
+            items.sha256 AS item_sha256,
+            items.type AS item_type,
+            setters.name AS setter_name,
+            e.stage AS stage,
+            e.error_class AS error_class,
+            e.blocker AS blocker,
+            e.mime_type AS mime_type,
+            e.error AS error,
+            e.skip_after AS skip_after,
+            e.attempts AS attempts,
+            e.last_job_id AS last_job_id,
+            e.first_seen AS first_seen,
+            e.last_seen AS last_seen
+        FROM item_extraction_errors AS e
+        JOIN items ON items.id = e.item_id
+        JOIN setters ON setters.id = e.setter_id
+        {where_clause}
+        ORDER BY e.last_seen DESC, e.id DESC
+        LIMIT ? OFFSET ?
+        "#
+    );
+
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(setter) = &filters.setter {
+        query = query.bind(setter);
+    }
+    if let Some(error_class) = &filters.error_class {
+        query = query.bind(error_class);
+    }
+    if let Some(stage) = &filters.stage {
+        query = query.bind(stage);
+    }
+    if let Some((lower, upper)) = &mime_range {
+        query = query.bind(lower);
+        if let Some(upper) = upper {
+            query = query.bind(upper);
+        }
+    }
+    let limit = filters
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT);
+    let rows = query
+        .bind(limit)
+        .bind(filters.offset.max(0))
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to list extraction errors");
+            ApiError::internal("Failed to read extraction failures")
+        })?;
+
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        results.push(ExtractionErrorRow {
+            id: read_column(&row, "id")?,
+            item_sha256: read_column(&row, "item_sha256")?,
+            item_type: read_column(&row, "item_type")?,
+            setter_name: read_column(&row, "setter_name")?,
+            stage: read_column(&row, "stage")?,
+            error_class: read_column(&row, "error_class")?,
+            blocker: read_column(&row, "blocker")?,
+            mime_type: read_column(&row, "mime_type")?,
+            error: read_column(&row, "error")?,
+            skip_after: read_column(&row, "skip_after")?,
+            attempts: read_column(&row, "attempts")?,
+            last_job_id: read_column(&row, "last_job_id")?,
+            first_seen: read_column(&row, "first_seen")?,
+            last_seen: read_column(&row, "last_seen")?,
+        });
+    }
+    Ok(results)
+}
+
+fn read_column<'r, T>(row: &'r sqlx::sqlite::SqliteRow, column: &str) -> ApiResult<T>
+where
+    T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
+{
+    row.try_get(column).map_err(|err| {
+        tracing::error!(error = %err, column, "failed to read extraction error column");
+        ApiError::internal("Failed to read extraction failures")
+    })
+}
+
+/// The exclusive upper bound of a prefix range under SQLite's default BINARY
+/// collation: the prefix with its last byte incremented. Mime types are ASCII,
+/// so the fallbacks below (an all-`0xFF` prefix, or an increment that lands
+/// mid-UTF-8) are unreachable in practice; they degrade to "no upper bound"
+/// rather than to a wrong answer.
+fn mime_prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.pop() {
+        if last == u8::MAX {
+            continue;
+        }
+        bytes.push(last + 1);
+        match String::from_utf8(bytes) {
+            Ok(upper) => return Some(upper),
+            Err(err) => {
+                bytes = err.into_bytes();
+                bytes.pop();
+            }
+        }
+    }
+    None
+}
+
+/// Clamps the audit message. Truncation happens on a char boundary, so the
+/// stored text is always valid UTF-8.
+fn truncate_error(error: &str) -> Cow<'_, str> {
+    if error.len() <= MAX_ERROR_BYTES {
+        return Cow::Borrowed(error);
+    }
+    // `str::floor_char_boundary` is still unstable, so walk back by hand.
+    let mut end = MAX_ERROR_BYTES;
+    while end > 0 && !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = String::with_capacity(end + '…'.len_utf8());
+    truncated.push_str(&error[..end]);
+    truncated.push('…');
+    Cow::Owned(truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::extraction_write::delete_setter_by_name;
+    use crate::db::migrations::{migrate_databases_on_disk, setup_test_databases};
+    use crate::test_utils::test_data_dir;
+
+    const FFMPEG: ApiErrorKind = ApiErrorKind::Blocked {
+        blocker: Blocker::Ffmpeg,
+    };
+    const PDFIUM: ApiErrorKind = ApiErrorKind::Blocked {
+        blocker: Blocker::Pdfium,
+    };
+
+    async fn seed(conn: &mut sqlx::SqliteConnection) {
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, time_added)
+            VALUES
+                (1, 'sha_one', 'md5_one', 'image/png', '2026-01-01T00:00:00'),
+                (2, 'sha_two', 'md5_two', 'video/mp4', '2026-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO setters (id, name) VALUES (1, 'test/clip'), (2, 'test/tagger')")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    fn record(sha256: &str, kind: ApiErrorKind, job_id: Option<i64>) -> ExtractionErrorRecord {
+        ExtractionErrorRecord {
+            item_sha256: sha256.to_string(),
+            setter_name: "test/clip".to_string(),
+            stage: STAGE_PREPARE.to_string(),
+            kind,
+            error: "decode failed".to_string(),
+            skip_after: 1,
+            job_id,
+        }
+    }
+
+    async fn row(conn: &mut sqlx::SqliteConnection, sha256: &str) -> (i64, String, String, String) {
+        sqlx::query_as(
+            r#"
+            SELECT e.attempts, e.error_class, e.first_seen, e.last_seen
+            FROM item_extraction_errors AS e
+            JOIN items ON items.id = e.item_id
+            WHERE items.sha256 = ?
+            "#,
+        )
+        .bind(sha256)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+    }
+
+    async fn count(conn: &mut sqlx::SqliteConnection) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_extraction_errors")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    // The migration has to land on a real file-backed database too: the
+    // in-memory harness the other tests use runs the same migrator, but only
+    // the on-disk path is what an upgrading user actually executes.
+    #[tokio::test]
+    async fn migration_creates_the_ledger_and_the_data_log_column() {
+        let _test_env = test_data_dir();
+        migrate_databases_on_disk(Some("ledger_migration"), Some("ledger_migration_user"))
+            .await
+            .expect("migrate test databases");
+        let mut conn = crate::db::open_index_db_write_no_user_data("ledger_migration")
+            .await
+            .unwrap();
+
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'item_extraction_errors' AND name IS NOT NULL \
+             ORDER BY name",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            indexes.contains(&"idx_item_extraction_errors_setter".to_string())
+                && indexes.contains(&"idx_item_extraction_errors_class".to_string()),
+            "both design indexes must exist: {indexes:?}"
+        );
+
+        let input_errors: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('data_log') WHERE name = 'input_errors'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(input_errors, 1, "data_log must carry the input split");
+    }
+
+    // The table's own guards: a `blocked` row without its dependency (or any
+    // other row carrying one) is a lie the auto-heal probe would act on, and a
+    // `skip_after` below 1 would suppress an item that never failed twice.
+    #[tokio::test]
+    async fn migration_check_constraints_reject_inconsistent_rows() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+
+        let insert = |class: &'static str, blocker: Option<&'static str>, skip_after: i64| {
+            sqlx::query(
+                "INSERT INTO item_extraction_errors (item_id, setter_id, stage, error_class, \
+                 blocker, mime_type, error, skip_after, attempts, first_seen, last_seen) \
+                 VALUES (1, 1, 'prepare', ?, ?, 'image/png', 'x', ?, 1, 'now', 'now')",
+            )
+            .bind(class)
+            .bind(blocker)
+            .bind(skip_after)
+        };
+
+        assert!(
+            insert(CLASS_BLOCKED, None, 1)
+                .execute(&mut *conn)
+                .await
+                .is_err(),
+            "a blocked row must name its dependency"
+        );
+        assert!(
+            insert(CLASS_INPUT, Some("ffmpeg"), 1)
+                .execute(&mut *conn)
+                .await
+                .is_err(),
+            "only blocked rows carry a blocker"
+        );
+        assert!(
+            insert(CLASS_INPUT, None, 0)
+                .execute(&mut *conn)
+                .await
+                .is_err(),
+            "skip_after must be at least one attempt"
+        );
+        assert!(
+            insert(CLASS_INPUT, None, 1)
+                .execute(&mut *conn)
+                .await
+                .is_ok()
+        );
+    }
+
+    // The attempt accounting is the whole confirmation-threshold mechanism:
+    // one increment per job at most, and `first_seen` records when the file
+    // first went bad.
+    #[tokio::test]
+    async fn upsert_counts_one_attempt_per_job() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(10)))
+            .await
+            .unwrap();
+        let (attempts, class, first_seen, _) = row(conn, "sha_one").await;
+        assert_eq!((attempts, class.as_str()), (1, CLASS_INPUT));
+
+        // Same job: the isolation retry re-attempts an item inside one job,
+        // and that must not consume its confirmation attempt.
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(10)))
+            .await
+            .unwrap();
+        let (attempts, _, _, _) = row(conn, "sha_one").await;
+        assert_eq!(
+            attempts, 1,
+            "a second failure in the same job is one attempt"
+        );
+
+        // A later job confirms it.
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(11)))
+            .await
+            .unwrap();
+        let (attempts, _, unchanged_first_seen, _) = row(conn, "sha_one").await;
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            unchanged_first_seen, first_seen,
+            "first_seen records when the file first failed"
+        );
+
+        // A different verdict refreshes the classification but keeps counting:
+        // a pair whose verdict alternates between runs must still reach its
+        // threshold instead of being retried forever.
+        let mut changed = record("sha_one", ApiErrorKind::Resource, Some(12));
+        changed.error = "batch-1 OOM".to_string();
+        upsert_extraction_error(conn, &changed).await.unwrap();
+        let (attempts, class, _, _) = row(conn, "sha_one").await;
+        assert_eq!((attempts, class.as_str()), (3, CLASS_RESOURCE));
+
+        // One row per (item, setter); a second setter gets its own attempt.
+        let mut other_setter = record("sha_one", ApiErrorKind::Input, Some(12));
+        other_setter.setter_name = "test/tagger".to_string();
+        upsert_extraction_error(conn, &other_setter).await.unwrap();
+        assert_eq!(count(conn).await, 2);
+    }
+
+    // `last_job_id` is nullable and the dedup comparison is `IS NOT`, SQLite's
+    // null-safe inequality: a plain `<>` yields NULL against a job-less row
+    // and would silently stop counting.
+    #[tokio::test]
+    async fn upsert_counts_across_a_null_job_id() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, None))
+            .await
+            .unwrap();
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(7)))
+            .await
+            .unwrap();
+        let (attempts, _, _, _) = row(conn, "sha_one").await;
+        assert_eq!(attempts, 2, "a real job after a job-less write counts");
+
+        // Two job-less writes in a row are indistinguishable, hence the
+        // skip_after = 1 requirement documented on the field.
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, None))
+            .await
+            .unwrap();
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, None))
+            .await
+            .unwrap();
+        let (attempts, _, _, _) = row(conn, "sha_one").await;
+        assert_eq!(attempts, 3, "consecutive job-less writes count once");
+    }
+
+    // `last_seen` moves with every write; the audit surface shows it, and the
+    // list is ordered by it. The denormalized `mime_type` and the `blocker`
+    // must follow the verdict too.
+    #[tokio::test]
+    async fn upsert_refreshes_the_mutable_columns() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE item_extraction_errors \
+             SET last_seen = '2000-01-01T00:00:00', mime_type = 'stale/type'",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        let mut updated = record("sha_one", PDFIUM, Some(2));
+        updated.stage = STAGE_INFERENCE.to_string();
+        updated.error = "worker rejected the payload".to_string();
+        updated.skip_after = 2;
+        upsert_extraction_error(conn, &updated).await.unwrap();
+
+        let (stage, error, skip_after, last_job_id, last_seen, mime_type, blocker): (
+            String,
+            String,
+            i64,
+            Option<i64>,
+            String,
+            String,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT stage, error, skip_after, last_job_id, last_seen, mime_type, blocker \
+             FROM item_extraction_errors",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(stage, STAGE_INFERENCE);
+        assert_eq!(error, "worker rejected the payload");
+        assert_eq!(skip_after, 2);
+        assert_eq!(last_job_id, Some(2));
+        assert_ne!(last_seen, "2000-01-01T00:00:00");
+        assert_eq!(
+            mime_type, "image/png",
+            "mime_type is re-derived from the item"
+        );
+        assert_eq!(blocker.as_deref(), Some("pdfium"));
+    }
+
+    // A transient failure has no ledger row by construction, and the type
+    // system cannot express "record this Generic error" without going through
+    // here, so this is the single guard.
+    #[tokio::test]
+    async fn upsert_refuses_a_transient_verdict() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+
+        assert!(
+            upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Generic, Some(1)))
+                .await
+                .is_err()
+        );
+        assert_eq!(count(conn).await, 0);
+    }
+
+    // The `error` column is audit text and a worker traceback can be huge, so
+    // it is clamped once, here, on a char boundary.
+    #[tokio::test]
+    async fn upsert_truncates_an_oversized_message() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+
+        // A multi-byte char straddling the cut proves the boundary walk.
+        let mut huge = record("sha_one", ApiErrorKind::Input, Some(1));
+        huge.error = "é".repeat(MAX_ERROR_BYTES);
+        upsert_extraction_error(conn, &huge).await.unwrap();
+
+        let stored: String = sqlx::query_scalar("SELECT error FROM item_extraction_errors")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert!(stored.ends_with('…'));
+        assert!(stored.len() <= MAX_ERROR_BYTES + '…'.len_utf8());
+        assert!(
+            stored.trim_end_matches('…').chars().all(|ch| ch == 'é'),
+            "the cut must land on a char boundary"
+        );
+
+        // A message that fits is stored verbatim.
+        upsert_extraction_error(conn, &record("sha_two", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        let stored: String = sqlx::query_scalar(
+            "SELECT e.error FROM item_extraction_errors AS e \
+             JOIN items ON items.id = e.item_id WHERE items.sha256 = 'sha_two'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(stored, "decode failed");
+    }
+
+    // A write that silently matched nothing would let a DB-level problem
+    // soft-complete a job as "all corrupt media", so it must be an error.
+    #[tokio::test]
+    async fn upsert_fails_when_the_item_or_setter_is_missing() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+
+        assert!(
+            upsert_extraction_error(conn, &record("sha_absent", ApiErrorKind::Input, Some(1)))
+                .await
+                .is_err(),
+            "an unknown item must not be recorded silently"
+        );
+
+        let mut unknown_setter = record("sha_one", ApiErrorKind::Input, Some(1));
+        unknown_setter.setter_name = "test/absent".to_string();
+        assert!(
+            upsert_extraction_error(conn, &unknown_setter)
+                .await
+                .is_err(),
+            "an unknown setter must not be recorded silently"
+        );
+        assert_eq!(count(conn).await, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_clears_only_the_pair_that_succeeded() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        let mut other_setter = record("sha_one", ApiErrorKind::Input, Some(1));
+        other_setter.setter_name = "test/tagger".to_string();
+        upsert_extraction_error(conn, &other_setter).await.unwrap();
+
+        let deleted = delete_extraction_error(conn, "sha_one", "test/clip")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(count(conn).await, 1, "the other setter keeps its verdict");
+
+        // The 99.99% case: nothing to clear, and no error.
+        let deleted = delete_extraction_error(conn, "sha_two", "test/clip")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    // Auto-heal is per dependency: installing ffmpeg must not resurrect the
+    // items that are waiting on pdfium, and must not touch input verdicts.
+    #[tokio::test]
+    async fn blocked_clearing_is_scoped_to_the_named_blockers() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+
+        upsert_extraction_error(conn, &record("sha_two", FFMPEG, Some(1)))
+            .await
+            .unwrap();
+        upsert_extraction_error(conn, &record("sha_one", PDFIUM, Some(1)))
+            .await
+            .unwrap();
+        let mut input = record("sha_one", ApiErrorKind::Input, Some(1));
+        input.setter_name = "test/tagger".to_string();
+        upsert_extraction_error(conn, &input).await.unwrap();
+
+        let mut blockers = list_distinct_blockers(conn).await.unwrap();
+        blockers.sort_by_key(|blocker| blocker.as_str());
+        assert_eq!(blockers, vec![Blocker::Ffmpeg, Blocker::Pdfium]);
+
+        assert_eq!(delete_blocked_errors(conn, &[]).await.unwrap(), 0);
+        let cleared = delete_blocked_errors(conn, &[Blocker::Ffmpeg])
+            .await
+            .unwrap();
+        assert_eq!(cleared, 1);
+        assert_eq!(
+            list_distinct_blockers(conn).await.unwrap(),
+            vec![Blocker::Pdfium]
+        );
+        assert_eq!(count(conn).await, 2, "the input verdict is untouched");
+    }
+
+    // Active = already suppressing its item. A `skip_after 2` row on its first
+    // attempt is recorded but not yet acting.
+    #[tokio::test]
+    async fn active_count_respects_the_confirmation_threshold() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+
+        let mut ambiguous = record("sha_two", ApiErrorKind::Input, Some(1));
+        ambiguous.skip_after = 2;
+        upsert_extraction_error(conn, &ambiguous).await.unwrap();
+        assert_eq!(
+            count_active_errors_for_setter(conn, "test/clip")
+                .await
+                .unwrap(),
+            0,
+            "one failure does not settle an ambiguous verdict"
+        );
+
+        ambiguous.job_id = Some(2);
+        upsert_extraction_error(conn, &ambiguous).await.unwrap();
+        assert_eq!(
+            count_active_errors_for_setter(conn, "test/clip")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            count_active_errors_for_setter(conn, "test/tagger")
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_list_filters_and_joins_the_item() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        let mut video = record("sha_two", FFMPEG, Some(1));
+        video.stage = STAGE_INFERENCE.to_string();
+        upsert_extraction_error(conn, &video).await.unwrap();
+        // A second setter, so every filter below has to discriminate rather
+        // than merely return the whole (tiny) table.
+        let mut tagger = record("sha_one", ApiErrorKind::Resource, Some(1));
+        tagger.setter_name = "test/tagger".to_string();
+        tagger.stage = STAGE_INFERENCE.to_string();
+        upsert_extraction_error(conn, &tagger).await.unwrap();
+
+        let all = list_extraction_errors(conn, &ExtractionErrorFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3, "no filters and no limit lists everything");
+
+        let images = list_extraction_errors(
+            conn,
+            &ExtractionErrorFilters {
+                mime_prefix: Some("image/".to_string()),
+                setter: Some("test/clip".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].item_sha256, "sha_one");
+        assert_eq!(images[0].item_type, "image/png");
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].setter_name, "test/clip");
+        assert_eq!(images[0].attempts, 1);
+        assert_eq!(images[0].last_job_id, Some(1));
+
+        // The setter filter discriminates in both directions.
+        let clip = list_extraction_errors(
+            conn,
+            &ExtractionErrorFilters {
+                setter: Some("test/clip".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(clip.len(), 2);
+        assert!(clip.iter().all(|row| row.setter_name == "test/clip"));
+        let tagger_rows = list_extraction_errors(
+            conn,
+            &ExtractionErrorFilters {
+                setter: Some("test/tagger".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(tagger_rows.len(), 1);
+        assert_eq!(tagger_rows[0].setter_name, "test/tagger");
+
+        // Stage alone, and class alone.
+        let inference = list_extraction_errors(
+            conn,
+            &ExtractionErrorFilters {
+                stage: Some(STAGE_INFERENCE.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(inference.len(), 2);
+        assert!(inference.iter().all(|row| row.stage == STAGE_INFERENCE));
+        let resources = list_extraction_errors(
+            conn,
+            &ExtractionErrorFilters {
+                error_class: Some(CLASS_RESOURCE.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].setter_name, "test/tagger");
+
+        let blocked = list_extraction_errors(
+            conn,
+            &ExtractionErrorFilters {
+                error_class: Some(CLASS_BLOCKED.to_string()),
+                stage: Some(STAGE_INFERENCE.to_string()),
+                setter: Some("test/clip".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].blocker.as_deref(), Some("ffmpeg"));
+        assert_eq!(blocked[0].mime_type, "video/mp4");
+
+        // The prefix is a range bound, not a pattern: wildcards are literal
+        // bytes and match nothing, and an empty prefix filters nothing.
+        let escaped = list_extraction_errors(
+            conn,
+            &ExtractionErrorFilters {
+                mime_prefix: Some("%".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(escaped.is_empty(), "'%' must not match every mime type");
+        let empty_prefix = list_extraction_errors(
+            conn,
+            &ExtractionErrorFilters {
+                mime_prefix: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty_prefix.len(), 3);
+        // The bound is exclusive at the *end* of the range, so a prefix that
+        // is a strict prefix of a longer mime still matches it.
+        let videos = list_extraction_errors(
+            conn,
+            &ExtractionErrorFilters {
+                mime_prefix: Some("video".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].mime_type, "video/mp4");
+    }
+
+    // Newest first, and the pages partition the result set: the audit surface
+    // pages through this and a duplicated or dropped row would be invisible.
+    #[tokio::test]
+    async fn audit_list_orders_by_last_seen_and_pages_disjointly() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        let mut second = record("sha_two", ApiErrorKind::Input, Some(1));
+        second.setter_name = "test/tagger".to_string();
+        upsert_extraction_error(conn, &second).await.unwrap();
+        let mut third = record("sha_one", ApiErrorKind::Input, Some(1));
+        third.setter_name = "test/tagger".to_string();
+        upsert_extraction_error(conn, &third).await.unwrap();
+
+        // Hand-set an older timestamp: the writes above share a clock tick.
+        sqlx::query(
+            "UPDATE item_extraction_errors SET last_seen = '2000-01-01T00:00:00' \
+             WHERE item_id = (SELECT id FROM items WHERE sha256 = 'sha_two')",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        let all = list_extraction_errors(conn, &ExtractionErrorFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all[2].item_sha256, "sha_two",
+            "the oldest last_seen sorts last"
+        );
+        assert!(
+            all[0].last_seen >= all[1].last_seen && all[1].last_seen >= all[2].last_seen,
+            "rows are ordered by last_seen DESC"
+        );
+
+        let page = |offset: i64| ExtractionErrorFilters {
+            limit: Some(2),
+            offset,
+            ..Default::default()
+        };
+        let first_page = list_extraction_errors(conn, &page(0)).await.unwrap();
+        let second_page = list_extraction_errors(conn, &page(2)).await.unwrap();
+        assert_eq!((first_page.len(), second_page.len()), (2, 1));
+        let mut paged: Vec<i64> = first_page
+            .iter()
+            .chain(second_page.iter())
+            .map(|row| row.id)
+            .collect();
+        let seen = paged.len();
+        paged.sort_unstable();
+        paged.dedup();
+        assert_eq!(paged.len(), seen, "the pages must be disjoint");
+        let mut every: Vec<i64> = all.iter().map(|row| row.id).collect();
+        every.sort_unstable();
+        assert_eq!(paged, every, "the pages must cover every row");
+    }
+
+    // A caller-supplied page size can never turn into "no rows" or "every
+    // row": zero and negatives clamp up, absurd sizes clamp down.
+    #[tokio::test]
+    async fn audit_list_clamps_the_page_window() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        upsert_extraction_error(conn, &record("sha_two", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+
+        for limit in [Some(0), Some(-1)] {
+            let rows = list_extraction_errors(
+                conn,
+                &ExtractionErrorFilters {
+                    limit,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(rows.len(), 1, "a bad limit clamps to one row, not none");
+        }
+
+        let rows = list_extraction_errors(
+            conn,
+            &ExtractionErrorFilters {
+                limit: Some(i64::MAX),
+                offset: -5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "a negative offset starts at the beginning");
+    }
+
+    // Lifecycle: the ledger shares it with the data it describes. A new sha256
+    // means a new item and the old row cascades away; deleting a setter (the
+    // manual "retry everything" gesture) clears its failure history too.
+    #[tokio::test]
+    async fn rows_cascade_with_their_item_and_setter() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        upsert_extraction_error(conn, &record("sha_one", ApiErrorKind::Input, Some(1)))
+            .await
+            .unwrap();
+        let mut second = record("sha_two", ApiErrorKind::Input, Some(1));
+        second.setter_name = "test/tagger".to_string();
+        upsert_extraction_error(conn, &second).await.unwrap();
+
+        sqlx::query("DELETE FROM items WHERE sha256 = 'sha_one'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(count(conn).await, 1, "the item's rows cascade away");
+
+        let deleted = delete_setter_by_name(conn, "test/tagger").await.unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(count(conn).await, 0, "the setter's rows cascade away");
+    }
+}

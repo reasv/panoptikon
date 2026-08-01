@@ -1,6 +1,7 @@
 pub(crate) mod bookmarks;
 mod connection;
 pub(crate) mod epochs;
+pub(crate) mod extraction_errors;
 pub(crate) mod extraction_log;
 pub(crate) mod extraction_write;
 pub(crate) mod file_scans;

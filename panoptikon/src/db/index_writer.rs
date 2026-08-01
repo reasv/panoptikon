@@ -11,9 +11,13 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use sqlx::SqliteConnection;
 use tokio::sync::{Mutex, oneshot};
 
-use crate::api_error::ApiError;
+use crate::api_error::{ApiError, Blocker};
 use crate::db::connection::index_storage_paths_unchecked;
 use crate::db::{
+    extraction_errors::{
+        ExtractionErrorRecord, delete_blocked_errors, delete_extraction_error,
+        upsert_extraction_error,
+    },
     extraction_log::delete_data_job_by_log_id,
     extraction_write::{
         DataLogUpdate, EmbeddingEntry, TagEntry, TagTextEntry, TextEntry, add_data_log,
@@ -188,6 +192,35 @@ pub(crate) enum IndexDbWriterMessage {
     UpsertSetter {
         setter_name: String,
         reply: Reply<i64>,
+    },
+    /// Records one non-transient extraction failure
+    /// (docs/failed-media-retry-design.md). The reply is what makes a failed
+    /// ledger write systemic rather than input-side: the item task returns
+    /// `Err`, so a DB outage can never soft-complete a job as "all corrupt
+    /// media".
+    // Sent by the extraction/scan pipelines, a later phase of the same
+    // design; until then only the tests construct it. The allow is
+    // per-variant on purpose, so the pre-existing variants stay lint-covered.
+    #[allow(dead_code)]
+    UpsertExtractionError {
+        record: ExtractionErrorRecord,
+        reply: Reply<()>,
+    },
+    /// Success path: the setter can process this item after all.
+    // See the note on `UpsertExtractionError`.
+    #[allow(dead_code)]
+    DeleteExtractionError {
+        item_sha256: String,
+        setter_name: String,
+        reply: Reply<u64>,
+    },
+    /// Auto-heal: clears the `blocked` rows of every dependency that now
+    /// binds, so those items become selectable in the same run.
+    // See the note on `UpsertExtractionError`.
+    #[allow(dead_code)]
+    ClearBlockedErrors {
+        blockers: Vec<Blocker>,
+        reply: Reply<u64>,
     },
     WriteTagsOutput {
         job_id: i64,
@@ -766,6 +799,36 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move { upsert_setter(conn, &setter_name).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::UpsertExtractionError { record, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { upsert_extraction_error(conn, &record).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteExtractionError {
+                item_sha256,
+                setter_name,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            delete_extraction_error(conn, &item_sha256, &setter_name).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::ClearBlockedErrors { blockers, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_blocked_errors(conn, &blockers).await })
                     })
                     .await;
                 let _ = reply.send(result);
@@ -1823,6 +1886,90 @@ mod tests {
             .await
             .unwrap();
         assert!(marker_is_set(&index_db).await);
+    }
+
+    // The extraction ledger's three writer messages, end to end: the
+    // pipelines that will send them reach the database only through here, so
+    // a mis-wired handler would surface as failures that are never recorded
+    // (and items retried forever) rather than as an error.
+    #[tokio::test]
+    async fn extraction_ledger_messages_round_trip_through_the_writer() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = marker_test_db(1).await;
+
+        let record = crate::db::extraction_errors::ExtractionErrorRecord {
+            item_sha256: "sha0".to_string(),
+            setter_name: "test/tagger".to_string(),
+            stage: crate::db::extraction_errors::STAGE_PREPARE.to_string(),
+            kind: crate::api_error::ApiErrorKind::Blocked {
+                blocker: Blocker::Pdfium,
+            },
+            error: "pdfium unavailable".to_string(),
+            skip_after: 1,
+            job_id: Some(job_id),
+        };
+        call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::UpsertExtractionError {
+                record: record.clone(),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+
+        let active = {
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
+            crate::db::extraction_errors::count_active_errors_for_setter(&mut conn, "test/tagger")
+                .await
+                .unwrap()
+        };
+        assert_eq!(active, 1, "a blocked verdict suppresses its item at once");
+
+        // A blocker that is still missing must not clear anything.
+        let cleared = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::ClearBlockedErrors {
+                blockers: vec![Blocker::Ffmpeg],
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(cleared, 0);
+
+        let cleared = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::ClearBlockedErrors {
+                blockers: vec![Blocker::Pdfium],
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cleared, 1,
+            "the dependency appeared; the item is selectable"
+        );
+
+        // And the success path removes what is left.
+        call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::UpsertExtractionError {
+                record: record.clone(),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        let deleted = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::DeleteExtractionError {
+                item_sha256: "sha0".to_string(),
+                setter_name: "test/tagger".to_string(),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(deleted, 1);
     }
 
     // Guards the property the constant's comment argues for: post-job

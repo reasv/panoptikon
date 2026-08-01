@@ -154,8 +154,11 @@ per-setter multiplication is noise; a new model legitimately gets its own
 attempt.
 
 Write is an upsert: same (item, setter) → `attempts + 1` (if
-`last_job_id` differs), refresh `stage/error_class/error/last_seen`; class
-change resets `attempts` to 1. Deleted on successful extraction of the item
+`last_job_id` differs), refresh `stage/error_class/error/last_seen`; a class
+change refreshes the classification but does **not** reset `attempts` — a
+pair whose verdict alternates between runs (`input` on one pass, `resource`
+on the next) would otherwise never reach `skip_after` and would be retried
+forever. Deleted on successful extraction of the item
 by that setter (one `DELETE` in the success path of `process_item` — a
 no-op for the 99.99% case; skip it unless the job saw the item come off a
 retry directive, tracked by a cheap "ledger had rows for this setter at job
