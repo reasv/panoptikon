@@ -670,6 +670,76 @@ mod tests {
         conn.close().await.unwrap();
     }
 
+    // The storage database's first-ever Rust migration on top of the init
+    // snapshot, against the case that only exists for upgrading users: a
+    // Python-created storage.db, baselined rather than created here.
+    //
+    // The baseline records *only* the init migration (so the existing
+    // thumbnail blobs survive untouched) and then everything after it runs
+    // normally. The mechanism is shared with the index DB, but it had never
+    // been exercised on this migrator, because storage.db had exactly one
+    // migration until `visual_attempts`.
+    #[tokio::test]
+    async fn storage_baseline_runs_migrations_added_after_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage.db");
+
+        // A Python-created storage.db at head, with a `thumbnails` table whose
+        // shape differs from the snapshot's: any accidental execution of
+        // init.sql fails loudly instead of passing silently.
+        {
+            let mut conn = connect(&path).await;
+            sqlx::query("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO alembic_version VALUES (?1)")
+                .bind(STORAGE_ALEMBIC_HEAD)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE thumbnails (fake_marker INTEGER PRIMARY KEY)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+        }
+
+        migrate_path(&path, &STORAGE_MIGRATOR, STORAGE_ALEMBIC_HEAD)
+            .await
+            .expect("an existing storage database must migrate, not be refused");
+
+        let mut conn = connect(&path).await;
+        let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("SELECT * FROM pragma_table_info('thumbnails')")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(cols.len(), 1, "init.sql must not have been executed");
+        // ...and the migration that came after it did run.
+        sqlx::query("SELECT COUNT(*) FROM visual_attempts")
+            .fetch_one(&mut conn)
+            .await
+            .expect("migrations after the snapshot must still apply");
+        let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied,
+            STORAGE_MIGRATOR
+                .iter()
+                .filter(|migration| !migration.migration_type.is_down_migration())
+                .count() as i64
+        );
+        conn.close().await.unwrap();
+
+        // Idempotent: a second start has nothing pending and must not fail.
+        migrate_path(&path, &STORAGE_MIGRATOR, STORAGE_ALEMBIC_HEAD)
+            .await
+            .expect("a migrated storage database must reopen cleanly");
+    }
+
     // A Python DB behind head must not be baselined — the init snapshot
     // assumes columns an older schema doesn't have.
     #[tokio::test]

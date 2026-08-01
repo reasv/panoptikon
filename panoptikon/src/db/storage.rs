@@ -1,4 +1,5 @@
 use crate::api_error::ApiError;
+use crate::db::visual_attempts::{VisualKind, delete_visual_attempt};
 use sqlx::Row;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -114,6 +115,14 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         })?;
     }
 
+    // In the caller's transaction, so the negative cache can never outlive the
+    // positive one: a marker surviving a successful store would suppress a
+    // regeneration the item no longer needs, and (worse) would still be there
+    // if the stored rows were later removed by a version-scoped delete.
+    // Unconditional and version-agnostic — a marker from *any* version is
+    // answered by these rows.
+    delete_visual_attempt(&mut *conn, sha256, VisualKind::Thumbnail).await?;
+
     Ok(())
 }
 
@@ -164,6 +173,9 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ApiError::internal("Failed to store frames")
         })?;
     }
+
+    // See `store_thumbnails`: same transaction, same reason.
+    delete_visual_attempt(&mut *conn, sha256, VisualKind::Frame).await?;
 
     Ok(())
 }
@@ -277,6 +289,39 @@ WHERE item_sha256 IN (
     Ok(result.rows_affected())
 }
 
+/// The negative cache's half of the orphan sweep, alongside the two positive
+/// ones: a marker for content that is no longer in the index describes
+/// nothing.
+///
+/// Its count is deliberately *not* part of the caller's "something was
+/// deleted" flag, which is what gates the post-job VACUUM. VACUUM is warranted
+/// by reclaiming blob pages; these rows carry no blobs, and letting them
+/// trigger a multi-minute rewrite of a multi-GB file would be a strictly worse
+/// trade than leaving their handful of pages on the freelist.
+pub(crate) async fn delete_orphaned_visual_attempts(
+    conn: &mut sqlx::SqliteConnection,
+) -> ApiResult<u64> {
+    let result = sqlx::query(
+        r#"
+DELETE FROM storage.visual_attempts
+WHERE item_sha256 IN (
+    SELECT storage.visual_attempts.item_sha256
+    FROM storage.visual_attempts
+    LEFT JOIN items ON storage.visual_attempts.item_sha256 = items.sha256
+    WHERE items.sha256 IS NULL
+)
+        "#,
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to delete orphaned visual attempts");
+        ApiError::internal("Failed to delete orphaned visuals attempts")
+    })?;
+
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +385,122 @@ VALUES
 
         let deleted = delete_orphaned_frames(&mut dbs.index_conn).await.unwrap();
         assert_eq!(deleted, 1);
+    }
+
+    // Storing visuals retires the negative cache marker for that kind, in the
+    // same statement sequence as the insert (the writer wraps both in one
+    // transaction). A marker that outlived a successful store would suppress a
+    // regeneration the item legitimately needs the next time the stored rows
+    // go away.
+    #[tokio::test]
+    async fn storing_visuals_clears_the_matching_marker() {
+        use crate::api_error::ApiErrorKind;
+        use crate::db::visual_attempts::{
+            VisualFailure, VisualVerdict, upsert_visual_attempts, visuals_suppressed,
+        };
+
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        upsert_visual_attempts(
+            conn,
+            &[
+                VisualVerdict::nothing(VisualKind::Thumbnail).into_record("sha_one", "video/mp4", 1),
+                VisualVerdict::failed(
+                    VisualKind::Frame,
+                    VisualFailure {
+                        kind: ApiErrorKind::Input,
+                        skip_after: 1,
+                        message: "ffmpeg failed".to_string(),
+                    },
+                )
+                .into_record("sha_one", "video/mp4", 1),
+                // A second item, so the deletes have to discriminate.
+                VisualVerdict::nothing(VisualKind::Thumbnail).into_record("sha_two", "video/mp4", 1),
+            ],
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+        let image = StoredImage {
+            idx: 0,
+            width: 10,
+            height: 10,
+            bytes: vec![0_u8],
+        };
+        store_thumbnails(
+            conn,
+            "sha_one",
+            "video/mp4",
+            1,
+            std::slice::from_ref(&image),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !visuals_suppressed(conn, "sha_one", VisualKind::Thumbnail, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            visuals_suppressed(conn, "sha_one", VisualKind::Frame, 1)
+                .await
+                .unwrap(),
+            "the other kind keeps its marker"
+        );
+        assert!(
+            visuals_suppressed(conn, "sha_two", VisualKind::Thumbnail, 1)
+                .await
+                .unwrap(),
+            "the other item keeps its marker"
+        );
+
+        store_frames(conn, "sha_one", "video/mp4", 1, &[image])
+            .await
+            .unwrap();
+        assert!(
+            !visuals_suppressed(conn, "sha_one", VisualKind::Frame, 1)
+                .await
+                .unwrap()
+        );
+    }
+
+    // Markers for content that left the index describe nothing, so the sweep
+    // takes them with the blobs.
+    #[tokio::test]
+    async fn delete_orphaned_visual_attempts_removes_missing_items() {
+        use crate::db::visual_attempts::{VisualVerdict, upsert_visual_attempts};
+
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, time_added)
+VALUES (1, 'sha_one', 'md5_one', 'image/png', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        upsert_visual_attempts(
+            &mut dbs.index_conn,
+            &[
+                VisualVerdict::nothing(VisualKind::Thumbnail).into_record("sha_one", "image/png", 1),
+                VisualVerdict::nothing(VisualKind::Thumbnail).into_record("sha_missing", "image/png", 1),
+                VisualVerdict::nothing(VisualKind::Frame).into_record("sha_missing", "image/png", 1),
+            ],
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+        let deleted = delete_orphaned_visual_attempts(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2, "every kind of the vanished item goes");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage.visual_attempts")
+            .fetch_one(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
     }
 }

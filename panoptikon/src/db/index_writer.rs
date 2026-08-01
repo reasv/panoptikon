@@ -44,8 +44,11 @@ use crate::db::{
         upsert_scan_error,
     },
     storage::{
-        StoredImage, delete_orphaned_frames, delete_orphaned_thumbnails, store_frames,
-        store_thumbnails,
+        StoredImage, delete_orphaned_frames, delete_orphaned_thumbnails,
+        delete_orphaned_visual_attempts, store_frames, store_thumbnails,
+    },
+    visual_attempts::{
+        VisualAttemptRecord, delete_blocked_visual_attempts, upsert_visual_attempts,
     },
 };
 
@@ -171,6 +174,28 @@ pub(crate) enum IndexDbWriterMessage {
         reply: Reply<u64>,
     },
     DeleteOrphanedThumbnails {
+        reply: Reply<u64>,
+    },
+    /// The negative cache's half of the orphan sweep. Its count is kept out of
+    /// the caller's deletion flag — see `delete_orphaned_visual_attempts`.
+    DeleteOrphanedVisualAttempts {
+        reply: Reply<u64>,
+    },
+    /// Records what a visuals generation pass concluded
+    /// (docs/failed-media-retry-design.md). One message per file: a single
+    /// pass can owe both a thumbnail and a frame marker, and they are one
+    /// conclusion, so they commit together and cost one search-cache epoch
+    /// bump instead of two. Advisory — a failed write costs one wasted
+    /// regeneration next scan, which is exactly today's behavior.
+    UpsertVisualAttempts {
+        records: Vec<VisualAttemptRecord>,
+        scan_id: Option<i64>,
+        reply: Reply<()>,
+    },
+    /// Auto-heal for the visuals cache, the twin of
+    /// [`Self::ClearBlockedScanErrors`] one database over.
+    ClearBlockedVisualAttempts {
+        blockers: Vec<Blocker>,
         reply: Reply<u64>,
     },
     DeleteJobData {
@@ -742,6 +767,38 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move { delete_orphaned_thumbnails(conn).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteOrphanedVisualAttempts { reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_orphaned_visual_attempts(conn).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::UpsertVisualAttempts {
+                records,
+                scan_id,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(
+                            async move { upsert_visual_attempts(conn, &records, scan_id).await },
+                        )
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::ClearBlockedVisualAttempts { blockers, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(
+                            async move { delete_blocked_visual_attempts(conn, &blockers).await },
+                        )
                     })
                     .await;
                 let _ = reply.send(result);

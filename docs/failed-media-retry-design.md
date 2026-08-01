@@ -226,6 +226,59 @@ with this design:
   directives + version bumps. ("Never permanent: decoders improve" is now
   serviced by directives, not timers.)
 
+*As implemented.* A rowid table (the `error` column is payload, and WITHOUT
+ROWID would spill every failed row to overflow pages), keyed
+`PRIMARY KEY (item_sha256, kind)` with one extra index on
+`(outcome, item_mime_type)` for the auto-heal probe and the retry directives.
+`outcome` is the coarse three-value vocabulary above: a `resource` verdict
+persists as `failed`, since the finer class is the two index-side ledgers'
+job. The `blocked` auto-heal is one pass over both scan-side tables, sharing
+the probe. Two paths deliberately write markers without consulting them,
+because the pass has already run by the time the content hash exists: new
+items (no marker can apply to a hash the index has never seen) and the
+continuous scan (an event fires only when a file's mtime moved — and its pass
+runs in a worker with no database handle, which is the real obstacle, not the
+key). Every path that re-attempts visuals for content the index already has
+goes through the batch scan's `maybe_dispatch_backfill`, which consults. The
+`image_is_served_directly` predicate stays the cache for images with no
+storable thumbnail — marking those would put a row in the table for the
+majority of a library.
+
+Three things the first implementation got wrong or left open, all settled in
+the same step:
+
+- **A suppressed image used to fall through to the blurhash.** Clearing
+  `needs_thumb` on an active marker is not the end of the dispatcher: an image
+  with no stored thumbnail and no blurhash still has work, and the blurhash's
+  only remaining source is a full decode of the original — the exact decode
+  the thumbnail marker's verdict already settled. The dispatcher now tracks
+  *why* `needs_thumb` is false (stored / served-directly / marker-suppressed)
+  and returns without dispatching when a marker-suppressed image's only
+  remaining work is that re-decode. The `visuals_suppressed` stat and its log
+  moved with it: they now count whole dispatches skipped, not marker hits.
+- **Frame markers are written but not yet consulted.** The dispatcher's only
+  questions are "is there a thumbnail" and "is there a blurhash", so a video
+  with both and no frames is invisible to it; no frames-only backfill exists
+  to consult `kind = 'frame'`. The markers are still written (they are what a
+  future frames-only pass would read, and what the orphan sweep and the
+  directives already act on), and the invariant is pinned by
+  `a_video_missing_only_frames_is_not_dispatched` so the consult arrives with
+  the pass that needs it.
+- **The backfill path records the no-video-track nothing too.** Its early
+  return decides "this video has no video track" from indexed metadata without
+  starting ffmpeg, and used to return without recording anything — so every
+  track-less video *already in an index* (which is every existing library:
+  those items never went through the new-item recording path) was re-decided
+  on every scan forever. It now writes the same `none` verdict for both kinds
+  that `build_new_item_thumbnails` writes, which is honest there because the
+  branch only runs when no frames are stored.
+- **One attempt token per run, not per root.** `attempts` counts runs that saw
+  the same conclusion and dedups on `last_scan_id`, but a run opens one
+  `file_scans` row per root while markers are keyed by content: identical
+  content under two roots was counted twice by a single run, confirming a
+  `skip_after = 2` verdict that had only failed once. Every `visual_attempts`
+  write of a run now carries the first root's scan id.
+
 ## Work-query integration (extraction)
 
 `build_job_pql` gains one internal filter alongside the existing

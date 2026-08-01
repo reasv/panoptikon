@@ -45,6 +45,10 @@ use crate::{
         },
         storage::{StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail},
         system_config::{SystemConfig, SystemConfigStore},
+        visual_attempts::{
+            VisualAttemptRecord, VisualFailure, VisualKind, VisualVerdict,
+            list_distinct_visual_blockers, visuals_suppressed,
+        },
     },
     jobs::queue::ChangeSummary,
     jobs::timing::PhaseTimer,
@@ -105,6 +109,10 @@ struct ScanTotals {
     /// it exists so the job summary can say the scan deliberately left files
     /// alone instead of silently doing less than the user expected.
     known_bad: i64,
+    /// Visuals generations skipped on an active `visual_attempts` marker. The
+    /// twin of `known_bad` one layer down: the file itself is processed
+    /// normally, only the regeneration of a known nothing is skipped.
+    visuals_suppressed: i64,
 }
 
 impl ScanTotals {
@@ -125,6 +133,7 @@ impl ScanTotals {
         self.marked_unavailable += stats.marked_unavailable;
         self.backfilled_visuals += stats.backfilled_visuals;
         self.known_bad += stats.known_bad;
+        self.visuals_suppressed += stats.visuals_suppressed;
     }
 }
 
@@ -215,6 +224,7 @@ impl FileScanService {
             IndexDbWriterMessage::DeleteOrphanedThumbnails { reply }
         })
         .await?;
+        sweep_orphaned_visual_attempts(&self.index_db).await;
 
         let deleted_data = unavailable_files_deleted > 0
             || rule_files_deleted > 0
@@ -363,6 +373,7 @@ impl FileScanService {
             IndexDbWriterMessage::DeleteOrphanedThumbnails { reply }
         })
         .await?;
+        sweep_orphaned_visual_attempts(&self.index_db).await;
 
         let deleted_data = unavailable_files_deleted > 0
             || excluded_folder_files_deleted > 0
@@ -591,6 +602,13 @@ async fn execute_folder_scan(
     let scan_time = current_iso_timestamp();
     let mut scan_ids = Vec::new();
     let mut totals = ScanTotals::default();
+    // One attempt token for the whole run. `visual_attempts.attempts` counts
+    // *runs* that saw the same conclusion and dedups on this value, but a run
+    // opens one `file_scans` row per root — so identical content indexed under
+    // two roots would be counted twice by a single run, confirming a
+    // `skip_after = 2` verdict the run only saw fail once. The first root's id
+    // is a token every root of this run shares and no later run reuses.
+    let mut visuals_scan_id: Option<i64> = None;
 
     for folder in starting_points {
         let scan_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddFileScan {
@@ -600,6 +618,7 @@ async fn execute_folder_scan(
         })
         .await?;
         scan_ids.push(scan_id);
+        let visuals_scan_id = *visuals_scan_id.get_or_insert(scan_id);
 
         let excluded_paths = excluded_folders
             .iter()
@@ -613,6 +632,7 @@ async fn execute_folder_scan(
             &folder,
             &excluded_paths,
             scan_id,
+            visuals_scan_id,
             &scan_time,
             options,
         )
@@ -652,23 +672,45 @@ async fn execute_folder_scan(
             "file scan skipped files with an active recorded scan failure"
         );
     }
+    // The visuals negative cache's payoff, and the only place it is visible:
+    // this is the count of thumbnail generations the scan did *not* run
+    // because it already knows they produce nothing — the 4m49s of thumbgen
+    // on a zero-new-file scan that the cache exists to remove.
+    if totals.visuals_suppressed > 0 {
+        tracing::info!(
+            visuals_suppressed = totals.visuals_suppressed,
+            roots = scan_ids.len(),
+            "file scan skipped visuals generation with an active recorded attempt"
+        );
+    }
 
     Ok((scan_ids, totals))
 }
 
-/// `blocked` auto-heal for the scan ledger (docs/failed-media-retry-design.md,
-/// req 10). The twin of the extraction job's `heal_blocked_errors`, and the
-/// same shape: read the dependencies the ledger is actually waiting on — the
-/// usual answer is none, one indexed query — probe only those, and clear the
-/// rows of the ones that now bind.
+/// `blocked` auto-heal for the scan-side markers
+/// (docs/failed-media-retry-design.md, req 10). The twin of the extraction
+/// job's `heal_blocked_errors`, and the same shape: read the dependencies the
+/// markers are actually waiting on — the usual answer is none, one indexed
+/// query each — probe only those, and clear the rows of the ones that now bind.
+///
+/// Two tables, one pass: the `scan_errors` ledger (a video ffprobe could not
+/// read at all) and the `visual_attempts` cache (a PDF pdfium was not there to
+/// render). They wait on the same set of backends, and probing is the
+/// expensive half, so splitting them would mean binding pdfium twice.
 ///
 /// The backends are cached in `OnceLock`s, so a dependency installed while the
-/// gateway runs is seen at the next restart; the ledger clears on the first
+/// gateway runs is seen at the next restart; the markers clear on the first
 /// scan after that.
 pub(crate) async fn heal_blocked_scan_errors(index_db: &str) -> ApiResult<()> {
     let waiting = {
         let mut conn = open_index_db_read_no_user_data(index_db).await?;
-        list_distinct_scan_blockers(&mut conn).await?
+        let mut waiting = list_distinct_scan_blockers(&mut conn).await?;
+        for blocker in list_distinct_visual_blockers(&mut conn).await? {
+            if !waiting.contains(&blocker) {
+                waiting.push(blocker);
+            }
+        }
+        waiting
     };
     if waiting.is_empty() {
         return Ok(());
@@ -688,6 +730,8 @@ pub(crate) async fn heal_blocked_scan_errors(index_db: &str) -> ApiResult<()> {
 
 /// The write half, with the probe results handed in: probing real binaries is
 /// what makes this untestable, and the clearing is what has to be right.
+///
+/// Returns the total rows cleared across both tables.
 async fn heal_blocked_scan(index_db: &str, present: Vec<Blocker>) -> ApiResult<u64> {
     if present.is_empty() {
         return Ok(0);
@@ -699,12 +743,45 @@ async fn heal_blocked_scan(index_db: &str, present: Vec<Blocker>) -> ApiResult<u
         }
     })
     .await?;
+    let visuals_cleared = call_index_db_writer(index_db, |reply| {
+        IndexDbWriterMessage::ClearBlockedVisualAttempts {
+            blockers: present.clone(),
+            reply,
+        }
+    })
+    .await?;
     tracing::info!(
         cleared,
+        visuals_cleared,
         blockers = ?present.iter().map(|blocker| blocker.as_str()).collect::<Vec<_>>(),
         "dependencies are available again; cleared their blocked scan failures"
     );
-    Ok(cleared)
+    Ok(cleared + visuals_cleared)
+}
+
+/// The negative cache's half of the orphan sweep, run right after the two
+/// positive ones.
+///
+/// Deliberately not folded into the caller's "something was deleted" flag: that
+/// flag gates the post-job VACUUM, and VACUUM is warranted by reclaiming blob
+/// pages. These rows carry no blobs, so letting a handful of them trigger a
+/// multi-minute rewrite of a multi-GB database would be a strictly worse trade
+/// than leaving their pages on the freelist for the next real deletion.
+/// Failures are logged, never propagated — a stale marker suppresses a
+/// regeneration for content that is no longer indexed, which costs nothing.
+async fn sweep_orphaned_visual_attempts(index_db: &str) {
+    match call_index_db_writer(index_db, |reply| {
+        IndexDbWriterMessage::DeleteOrphanedVisualAttempts { reply }
+    })
+    .await
+    {
+        Ok(0) => {}
+        Ok(deleted) => tracing::info!(
+            deleted,
+            "cleared visuals attempts for content that left the index"
+        ),
+        Err(err) => tracing::warn!(error = ?err, "failed to sweep visuals attempts"),
+    }
 }
 
 pub(crate) const THUMBNAIL_PROCESS_VERSION: i64 = 1;
@@ -734,6 +811,10 @@ struct FolderStats {
     /// `file_scans` has no column for them, and adding one would say a scan
     /// went worse than it did.
     known_bad: i64,
+    /// Visuals generations this folder scan did not run because the negative
+    /// cache already knows they produce nothing. Same reasoning as
+    /// `known_bad`: not an error, not a write, no column.
+    visuals_suppressed: i64,
     errors: i64,
     total_available: i64,
     false_changes: i64,
@@ -765,6 +846,7 @@ impl FolderStats {
             marked_unavailable: 0,
             backfilled_visuals: 0,
             known_bad: 0,
+            visuals_suppressed: 0,
             errors: 0,
             total_available: 0,
             false_changes: 0,
@@ -797,6 +879,9 @@ struct NewItemData {
     thumbnails: Vec<StoredImage>,
     frames: Vec<StoredImage>,
     blurhash: Option<String>,
+    /// What the visuals pass concluded about the kinds it produced nothing
+    /// for. Empty on the healthy path.
+    visual_verdicts: Vec<VisualVerdict>,
 }
 
 struct BackfillResult {
@@ -805,6 +890,8 @@ struct BackfillResult {
     thumbnails: Vec<StoredImage>,
     extracted_frames: Vec<StoredImage>,
     blurhash: Option<String>,
+    /// See [`NewItemData::visual_verdicts`].
+    visual_verdicts: Vec<VisualVerdict>,
 }
 
 struct FailedFile {
@@ -845,6 +932,10 @@ enum TaskOutcome {
 struct ScanContext {
     index_db: String,
     scan_id: i64,
+    /// The attempt token for every `visual_attempts` write of this *run*, which
+    /// is the first root's scan id — see [`execute_folder_scan`]. Equal to
+    /// `scan_id` for the first root, and for every single-root scan.
+    visuals_scan_id: i64,
     scan_time: String,
     filescan_filter: Option<Arc<Match>>,
     semaphore: Arc<Semaphore>,
@@ -888,6 +979,7 @@ async fn scan_single_folder(
     folder: &str,
     excluded_paths: &[PathBuf],
     scan_id: i64,
+    visuals_scan_id: i64,
     scan_time: &str,
     options: ScanOptions,
 ) -> ApiResult<FolderStats> {
@@ -907,6 +999,7 @@ async fn scan_single_folder(
     let mut ctx = ScanContext {
         index_db: index_db.to_string(),
         scan_id,
+        visuals_scan_id,
         scan_time: scan_time.to_string(),
         filescan_filter: parse_filescan_filter(config).map(Arc::new),
         semaphore: Arc::new(Semaphore::new(options.worker_count)),
@@ -1016,6 +1109,13 @@ async fn scan_single_folder(
             folder,
             known_bad = stats.known_bad,
             "skipped files with an active recorded scan failure"
+        );
+    }
+    if stats.visuals_suppressed > 0 {
+        tracing::info!(
+            folder,
+            visuals_suppressed = stats.visuals_suppressed,
+            "skipped visuals generation with an active recorded attempt"
         );
     }
     tracing::info!(
@@ -1494,6 +1594,13 @@ impl ScanContext {
             }
         }
 
+        // After the stores, so a marker can never be written for a kind this
+        // very pass just stored (the store's own delete runs in its
+        // transaction, but ordering the two makes that irrelevant rather than
+        // load-bearing).
+        self.record_visual_attempts(&item.visual_verdicts, &item.sha256, &item.mime_type)
+            .await;
+
         let data = FileScanData {
             sha256: item.sha256.clone(),
             last_modified: item.last_modified.clone(),
@@ -1506,6 +1613,59 @@ impl ScanContext {
         let result = self.update_file_data(data).await?;
         self.tally(&result);
         Ok(())
+    }
+
+    /// Counts (and logs) one whole dispatch the negative cache removed.
+    ///
+    /// Deliberately not called at the marker check itself: clearing
+    /// `needs_thumb` is not yet a saved generation — the file can still owe a
+    /// blurhash that only a dispatch can produce — and a stat that counted
+    /// those would claim work that was in fact still done.
+    fn note_suppressed_visuals(&mut self, path: &Path) {
+        tracing::debug!(
+            path = %path.display(),
+            "skipping visuals generation with an active recorded attempt"
+        );
+        self.stats.visuals_suppressed += 1;
+    }
+
+    /// Writes what a visuals pass concluded, so the next scan does not repeat
+    /// it. Never fails the file: a lost marker costs one regenerated nothing,
+    /// which is exactly the behaviour this whole cache replaces.
+    ///
+    /// Empty for every healthy file, and the emptiness is checked before the
+    /// writer is touched — a library with visuals pays nothing here, not even
+    /// a message.
+    async fn record_visual_attempts(
+        &mut self,
+        verdicts: &[VisualVerdict],
+        sha256: &str,
+        mime_type: &str,
+    ) {
+        if verdicts.is_empty() {
+            return;
+        }
+        let records = visual_attempt_records(verdicts, sha256, mime_type);
+        let scan_id = self.visuals_scan_id;
+        if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::UpsertVisualAttempts {
+                records: records.clone(),
+                // The run's token, not this root's scan row: markers are keyed
+                // by content, and content duplicated under two roots would
+                // otherwise be counted twice by a single run — confirming a
+                // `skip_after = 2` verdict that has only failed once.
+                scan_id: Some(scan_id),
+                reply,
+            }
+        })
+        .await
+        {
+            tracing::warn!(
+                error = ?err,
+                sha256,
+                "failed to record a visuals attempt; it will be regenerated next scan"
+            );
+        }
     }
 
     async fn handle_backfill(&mut self, backfill: BackfillResult) {
@@ -1577,6 +1737,13 @@ impl ScanContext {
             }
         }
 
+        self.record_visual_attempts(
+            &backfill.visual_verdicts,
+            &backfill.sha256,
+            &backfill.mime_type,
+        )
+        .await;
+
         if wrote_visuals {
             self.stats.backfilled_visuals += 1;
         }
@@ -1594,6 +1761,11 @@ impl ScanContext {
         let mut needs_thumb =
             !has_thumbnail(&mut self.conn, &sha256, THUMBNAIL_PROCESS_VERSION).await?;
         let needs_blurhash = !has_blurhash(&mut self.conn, &sha256).await?;
+        // *Why* a thumbnail is not needed decides what the rest of this
+        // function may still do: a stored or served-directly thumbnail says
+        // nothing about the blurhash, while a marker-suppressed one is a
+        // verdict on decoding this content at all.
+        let mut thumb_suppressed = false;
         if needs_thumb && mime_type.starts_with("image") {
             // Images served from the original file never get a stored
             // thumbnail, so `has_thumbnail` stays false for them forever.
@@ -1615,7 +1787,46 @@ impl ScanContext {
                 }
             };
         }
+        // Last, after the positive cache missed *and* the served-directly
+        // predicate said a thumbnail would be stored: the negative cache. This
+        // is the whole point of the table — a broken PDF, a video with no
+        // video track, a page no installed browser can render would otherwise
+        // be regenerated on every scan, forever.
+        //
+        // Only the thumbnail kind is consulted here because only the thumbnail
+        // is dispatched: video frames come out of the same pass, so suppressing
+        // the thumbnail suppresses their extraction too.
+        if needs_thumb {
+            // Markers are advisory: a read that fails costs one regenerated
+            // nothing, and must never abort the folder scan over a cache whose
+            // whole purpose is saving work.
+            let suppressed = match visuals_suppressed(
+                &mut self.conn,
+                &sha256,
+                VisualKind::Thumbnail,
+                THUMBNAIL_PROCESS_VERSION,
+            )
+            .await
+            {
+                Ok(suppressed) => suppressed,
+                Err(err) => {
+                    tracing::warn!(
+                        error = ?err,
+                        path = %path.display(),
+                        "failed to read the visuals negative cache; regenerating"
+                    );
+                    false
+                }
+            };
+            if suppressed {
+                needs_thumb = false;
+                thumb_suppressed = true;
+            }
+        }
         if !needs_thumb && !needs_blurhash {
+            if thumb_suppressed {
+                self.note_suppressed_visuals(&path);
+            }
             return Ok(());
         }
         // Identical content elsewhere in this scan already has a visuals task
@@ -1642,6 +1853,26 @@ impl ScanContext {
                             path = %path.display(),
                             "skipping video thumbnail generation due to missing video track"
                         );
+                        // The same conclusion `build_new_item_thumbnails`
+                        // records for this video, and the one that matters
+                        // most: an item indexed before this cache existed has
+                        // never been through the new-item path, so without
+                        // this write every track-less video in an existing
+                        // library is re-dispatched and re-decided on every
+                        // scan, forever. Both kinds, honestly — this branch is
+                        // inside `existing_frames.is_empty()`, so nothing is
+                        // stored for either, and the decision came from
+                        // indexed metadata that only a re-index (new content,
+                        // new key) or a generator bump can change.
+                        self.record_visual_attempts(
+                            &[
+                                VisualVerdict::nothing(VisualKind::Thumbnail),
+                                VisualVerdict::nothing(VisualKind::Frame),
+                            ],
+                            &sha256,
+                            &mime_type,
+                        )
+                        .await;
                         return Ok(());
                     }
                     video_duration = duration;
@@ -1654,12 +1885,20 @@ impl ScanContext {
             None
         };
         // A blurhash can only come from a stored thumbnail or the image itself.
-        if !needs_thumb
-            && needs_blurhash
-            && existing_thumb.is_none()
-            && !mime_type.starts_with("image")
-        {
-            return Ok(());
+        // With no stored thumbnail, a non-image has no second source at all —
+        // and neither, in practice, does a *suppressed* image: its only
+        // remaining source is a fresh full decode of the original, which is
+        // precisely the decode the thumbnail marker's verdict already settled.
+        // Falling through here would re-open and re-decode the file on every
+        // single scan, the exact waste this table exists to kill.
+        if !needs_thumb && needs_blurhash && existing_thumb.is_none() {
+            let no_source = !mime_type.starts_with("image") || thumb_suppressed;
+            if no_source {
+                if thumb_suppressed {
+                    self.note_suppressed_visuals(&path);
+                }
+                return Ok(());
+            }
         }
 
         let permit = self
@@ -1712,6 +1951,9 @@ impl ScanContext {
                         thumbnails: Vec::new(),
                         extracted_frames: Vec::new(),
                         blurhash: None,
+                        // A dead worker is no verdict on the content: the
+                        // generation is retried next scan, unmarked.
+                        visual_verdicts: Vec::new(),
                     })
                 }
             }
@@ -1931,14 +2173,7 @@ fn prepare_new_item(
         return failed(path, FileProcessError::Filtered);
     }
 
-    let (thumbnails, frames, blurhash) =
-        match generate_new_item_visuals(&path, &mime_type, &metadata, preloaded_image, timers) {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::error!(error = ?err, path = %path.display(), "failed to generate visuals");
-                (Vec::new(), Vec::new(), None)
-            }
-        };
+    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, preloaded_image, timers);
 
     TaskOutcome::NewItem(NewItemData {
         path,
@@ -1947,9 +2182,10 @@ fn prepare_new_item(
         sha256,
         mime_type,
         metadata,
-        thumbnails,
-        frames,
-        blurhash,
+        thumbnails: visuals.thumbnails,
+        frames: visuals.frames,
+        blurhash: visuals.blurhash,
+        visual_verdicts: visuals.verdicts,
     })
 }
 
@@ -1963,6 +2199,9 @@ pub(crate) struct PreparedFile {
     pub(crate) thumbnails: Vec<StoredImage>,
     pub(crate) frames: Vec<StoredImage>,
     pub(crate) blurhash: Option<String>,
+    /// What the visuals pass concluded about the kinds it produced nothing
+    /// for. Empty on the healthy path.
+    pub(crate) visual_verdicts: Vec<VisualVerdict>,
 }
 
 pub(crate) struct FileWriteData {
@@ -1974,6 +2213,8 @@ pub(crate) struct FileWriteData {
     pub(crate) thumbnails: Vec<StoredImage>,
     pub(crate) frames: Vec<StoredImage>,
     pub(crate) blurhash: Option<String>,
+    /// See [`PreparedFile::visual_verdicts`].
+    pub(crate) visual_verdicts: Vec<VisualVerdict>,
     pub(crate) time_added: String,
 }
 
@@ -1996,6 +2237,7 @@ impl FileWriteData {
             thumbnails: prepared.thumbnails,
             frames: prepared.frames,
             blurhash: prepared.blurhash,
+            visual_verdicts: prepared.visual_verdicts,
             time_added,
         }
     }
@@ -2087,12 +2329,13 @@ pub(crate) enum FileProcessError {
     /// stores so the next scan does not repeat the work
     /// (docs/failed-media-retry-design.md).
     Classified(ScanFailure),
-    /// A visuals-grade failure (thumbnail, frames, blurhash, encode). Always
-    /// swallowed by the caller: the file is indexed without visuals and the
-    /// next scan retries. Recording these is the visuals negative cache's job
-    /// (`visual_attempts`), which ships as its own phase — deliberately *not*
-    /// this ledger, which is only about files that never reach an item.
-    Visuals(#[allow(dead_code)] String),
+    /// A visuals-grade failure (thumbnail, frames, encode). Never fails the
+    /// file: it is indexed without visuals, exactly as before. What is new is
+    /// that the verdict is *kept* — it becomes a `visual_attempts` marker, so
+    /// the next scan does not regenerate the same nothing. Deliberately not
+    /// the `scan_errors` ledger, which is only about files that never reach an
+    /// item at all.
+    Visuals(VisualFailure),
     /// The file was rejected by the user's filescan filter.
     Filtered,
     /// The file's mtime matches the DB record, so hashing was skipped.
@@ -2206,6 +2449,129 @@ impl FileProcessError {
             _ => None,
         }
     }
+
+    /// The visuals verdict to mark, or `None` when this failure says nothing
+    /// about the content (a read that failed, a dead task) and the generation
+    /// must simply be retried next scan.
+    fn visual_failure(&self) -> Option<&VisualFailure> {
+        match self {
+            FileProcessError::Visuals(failure) => Some(failure),
+            _ => None,
+        }
+    }
+
+    /// The visuals-phase twin of [`Self::from_image_error`], with the same
+    /// stage-based reasoning: opening and format-sniffing decode nothing, so a
+    /// failure there is this machine's problem; the decode itself is a verdict
+    /// on the content, unconfirmed because a decoder that reads as it goes
+    /// cannot tell a truncated file from a mount that dropped mid-read; and
+    /// the configurable memory ceiling is a property of this machine's budget,
+    /// so it is `resource` and settles at one attempt.
+    fn visuals_from_image_error(stage: ImageStage, err: image::ImageError) -> Self {
+        match (stage, err) {
+            (ImageStage::Open, err) => FileProcessError::Io(err.to_string()),
+            (ImageStage::Decode, image::ImageError::Limits(limit_err)) => {
+                FileProcessError::Visuals(VisualFailure {
+                    kind: ApiErrorKind::Resource,
+                    skip_after: SKIP_AFTER_CONFIRMED,
+                    message: limit_err.to_string(),
+                })
+            }
+            (ImageStage::Decode, err) => visuals_input_unconfirmed(err.to_string()),
+        }
+    }
+
+    /// Adopts an already-classified [`ApiError`] on the visuals path — the
+    /// shape [`crate::media_tools::spawn_error`] produces, which distinguishes
+    /// "the toolchain is missing" (`blocked`, marked, self-healing) from "this
+    /// machine refused to start it" (transient, not marked).
+    fn visuals_from_api_error(err: ApiError) -> Self {
+        if err.persisted_class().is_none() {
+            return FileProcessError::Io(err.detail().to_string());
+        }
+        FileProcessError::Visuals(VisualFailure {
+            kind: err.kind(),
+            skip_after: err.skip_after(),
+            message: err.detail().to_string(),
+        })
+    }
+}
+
+/// A visuals failure the generator itself decided, on data it already held.
+/// One attempt settles it.
+fn visuals_input(message: impl Into<String>) -> FileProcessError {
+    FileProcessError::Visuals(VisualFailure {
+        kind: ApiErrorKind::Input,
+        skip_after: SKIP_AFTER_CONFIRMED,
+        message: message.into(),
+    })
+}
+
+/// A visuals failure from a stage where an external tool did its own file I/O
+/// (ffmpeg, pdfium, the headless browser), so a transient mount hiccup and
+/// broken content are indistinguishable and a single failure does not settle
+/// it. See [`SKIP_AFTER_AMBIGUOUS`].
+fn visuals_input_unconfirmed(message: impl Into<String>) -> FileProcessError {
+    FileProcessError::Visuals(VisualFailure {
+        kind: ApiErrorKind::Input,
+        skip_after: SKIP_AFTER_AMBIGUOUS,
+        message: message.into(),
+    })
+}
+
+/// A generator whose backend is not installed. Self-heals at the next scan
+/// after the dependency appears; never `input`.
+fn visuals_blocked(blocker: Blocker, message: impl Into<String>) -> FileProcessError {
+    FileProcessError::Visuals(VisualFailure {
+        kind: ApiErrorKind::Blocked { blocker },
+        skip_after: SKIP_AFTER_CONFIRMED,
+        message: message.into(),
+    })
+}
+
+/// The generator version a marker of this kind is stamped with, and compared
+/// against when it is consulted. Exhaustive on purpose: a new kind must fail to
+/// compile here rather than silently inherit the thumbnail generator's version,
+/// which would make every one of its markers expire on the wrong bump.
+fn visual_process_version(kind: VisualKind) -> i64 {
+    match kind {
+        VisualKind::Thumbnail => THUMBNAIL_PROCESS_VERSION,
+        VisualKind::Frame => FRAME_PROCESS_VERSION,
+    }
+}
+
+/// What one visuals generation pass produced, plus what the negative cache
+/// owes because of it.
+///
+/// Deliberately not a `Result`: a visuals failure never fails the file (the
+/// item is indexed without visuals, exactly as before), so the error half is
+/// not an error at this level — it is a verdict to remember.
+#[derive(Default)]
+pub(crate) struct GeneratedVisuals {
+    pub(crate) thumbnails: Vec<StoredImage>,
+    pub(crate) frames: Vec<StoredImage>,
+    pub(crate) blurhash: Option<String>,
+    /// Empty on the healthy path, which is what keeps this free: a pass that
+    /// stored something owes no marker, and the store clears any stale one.
+    pub(crate) verdicts: Vec<VisualVerdict>,
+}
+
+/// Turns a pass's verdicts into markers for one item. Each kind is stamped
+/// with its own generator version, so bumping one does not retire the other's
+/// markers.
+pub(crate) fn visual_attempt_records(
+    verdicts: &[VisualVerdict],
+    sha256: &str,
+    mime_type: &str,
+) -> Vec<VisualAttemptRecord> {
+    verdicts
+        .iter()
+        .map(|verdict| {
+            verdict
+                .clone()
+                .into_record(sha256, mime_type, visual_process_version(verdict.kind))
+        })
+        .collect()
 }
 
 pub(crate) fn process_file(
@@ -2254,14 +2620,7 @@ pub(crate) fn process_file(
         return Err(FileProcessError::Filtered);
     }
 
-    let (thumbnails, frames, blurhash) =
-        match generate_new_item_visuals(&path, &mime_type, &metadata, None, timers) {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::error!(error = ?err, path = %path.display(), "failed to generate visuals");
-                (Vec::new(), Vec::new(), None)
-            }
-        };
+    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, None, timers);
 
     Ok(PreparedFile {
         path,
@@ -2270,9 +2629,10 @@ pub(crate) fn process_file(
         sha256,
         mime_type,
         metadata,
-        thumbnails,
-        frames,
-        blurhash,
+        thumbnails: visuals.thumbnails,
+        frames: visuals.frames,
+        blurhash: visuals.blurhash,
+        visual_verdicts: visuals.verdicts,
     })
 }
 
@@ -2466,82 +2826,236 @@ fn extract_item_metadata_inner(
     Ok(metadata)
 }
 
+/// The thumbnail/frame half of a generation pass, before the blurhash.
+#[derive(Default)]
+struct ProducedVisuals {
+    thumbnails: Vec<StoredImage>,
+    frames: Vec<StoredImage>,
+    blurhash_source: Option<DynamicImage>,
+    /// Kinds the pass concluded about with nothing to blame: the generator ran
+    /// and this content genuinely has no such visual. Deliberately *not* set
+    /// for images served from their original file — the served-directly
+    /// predicate is already the cache for those, and marking them would put a
+    /// row in the table for the majority of every image library.
+    nothing: Vec<VisualKind>,
+}
+
+/// A failure that ended a generation pass, carrying the kinds it actually
+/// invalidates.
+///
+/// The kinds cannot be derived from the mime type alone: one video pass
+/// extracts frames *and* encodes a thumbnail grid out of them, so an encode
+/// that failed on the grid says nothing about the frames it was built from,
+/// and an encode that failed on a frame says nothing about the thumbnail that
+/// was already produced. Only the site that failed knows — so each `?` names
+/// its own scope, and the marker rows stay truthful for the mime/outcome
+/// targeted retry directives that read them.
+#[derive(Debug)]
+struct VisualsError {
+    kinds: &'static [VisualKind],
+    error: FileProcessError,
+}
+
+impl VisualsError {
+    /// The thumbnail is gone, whatever was or was not stored for frames.
+    fn thumbnail(error: FileProcessError) -> Self {
+        Self {
+            kinds: &[VisualKind::Thumbnail],
+            error,
+        }
+    }
+
+    /// Frame encoding failed after the frames themselves were extracted and
+    /// the thumbnail grid was built.
+    fn frame(error: FileProcessError) -> Self {
+        Self {
+            kinds: &[VisualKind::Frame],
+            error,
+        }
+    }
+
+    /// Nothing came out of the source both kinds are made from — for a video,
+    /// the frame extraction itself.
+    fn both(error: FileProcessError) -> Self {
+        Self {
+            kinds: &[VisualKind::Thumbnail, VisualKind::Frame],
+            error,
+        }
+    }
+}
+
+/// One verdict per kind the failure actually invalidates. A transient failure
+/// yields none at all: nothing is known about the content, so the generation is
+/// simply retried next scan.
+fn failure_verdicts(err: &VisualsError) -> Vec<VisualVerdict> {
+    let Some(failure) = err.error.visual_failure() else {
+        return Vec::new();
+    };
+    err.kinds
+        .iter()
+        .map(|kind| VisualVerdict::failed(*kind, failure.clone()))
+        .collect()
+}
+
 fn generate_new_item_visuals(
     path: &Path,
     mime_type: &str,
     metadata: &ItemScanMeta,
     preloaded_image: Option<DynamicImage>,
     timers: &ScanTimers,
-) -> Result<(Vec<StoredImage>, Vec<StoredImage>, Option<String>), FileProcessError> {
+) -> GeneratedVisuals {
     let thumb_span = timers.thumbgen.start();
-    let mut thumbnails = Vec::new();
-    let mut frames = Vec::new();
-    let mut blurhash_source: Option<DynamicImage> = None;
+    let attempt = build_new_item_thumbnails(path, mime_type, metadata, preloaded_image);
+    drop(thumb_span);
+
+    let mut visuals = GeneratedVisuals::default();
+    let blurhash_source = match attempt {
+        Ok(produced) => {
+            visuals.thumbnails = produced.thumbnails;
+            visuals.frames = produced.frames;
+            visuals.verdicts = produced
+                .nothing
+                .into_iter()
+                .map(VisualVerdict::nothing)
+                .collect();
+            produced.blurhash_source
+        }
+        Err(err) => {
+            // Unchanged behaviour: the item is indexed without visuals. What
+            // is new is that a verdict about the *content* is remembered, so
+            // the next scan does not repeat the work.
+            //
+            // Debug, not error: every generator that fails on the file itself
+            // (pdfium, the browser, ffmpeg) already logged the classified
+            // reason at its own site, and a second copy per file was the whole
+            // of what a broken-media library saw in its logs.
+            tracing::debug!(error = ?err, path = %path.display(), "failed to generate visuals");
+            visuals.verdicts = failure_verdicts(&err);
+            None
+        }
+    };
+
+    let blurhash_span = timers.blurhash.start();
+    visuals.blurhash = blurhash_source.and_then(|image| compute_blurhash(&image).ok());
+    drop(blurhash_span);
+
+    visuals
+}
+
+fn build_new_item_thumbnails(
+    path: &Path,
+    mime_type: &str,
+    metadata: &ItemScanMeta,
+    preloaded_image: Option<DynamicImage>,
+) -> Result<ProducedVisuals, VisualsError> {
+    let mut out = ProducedVisuals::default();
 
     if mime_type.starts_with("video") {
         let duration = metadata.duration.unwrap_or(0.0);
         if metadata.video_tracks.unwrap_or(0) > 0 && duration > 0.0 {
-            let extracted_frames = extract_video_frames(path, 4, duration)?;
-            if !extracted_frames.is_empty() {
+            // The one failure that really does invalidate both kinds: the
+            // thumbnail grid is built out of these frames.
+            let extracted_frames =
+                extract_video_frames(path, 4, duration).map_err(VisualsError::both)?;
+            if extracted_frames.is_empty() {
+                // ffmpeg ran and this file yields no frame to sample. Nothing
+                // about that will change until the generator does.
+                out.nothing
+                    .extend_from_slice(&[VisualKind::Thumbnail, VisualKind::Frame]);
+            } else {
                 let grid = overlay_mime_label(build_image_grid(&extracted_frames), mime_type);
-                thumbnails.push(encode_image(0, &grid)?);
+                out.thumbnails
+                    .push(encode_image(0, &grid).map_err(VisualsError::thumbnail)?);
                 let labeled_first = overlay_mime_label(extracted_frames[0].clone(), mime_type);
-                thumbnails.push(encode_image(1, &labeled_first)?);
-                frames = extracted_frames
+                out.thumbnails
+                    .push(encode_image(1, &labeled_first).map_err(VisualsError::thumbnail)?);
+                // Past the thumbnail: the frames were extracted and the grid
+                // encoded, so an encode failure here is the frames' verdict
+                // alone.
+                out.frames = extracted_frames
                     .iter()
                     .enumerate()
                     .map(|(idx, frame)| encode_image(idx as i64, frame))
-                    .collect::<Result<Vec<_>, _>>()?;
-                blurhash_source = Some(grid);
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(VisualsError::frame)?;
+                out.blurhash_source = Some(grid);
             }
         } else {
             tracing::debug!(
                 path = %path.display(),
                 "skipping video thumbnail generation due to missing video track"
             );
+            out.nothing
+                .extend_from_slice(&[VisualKind::Thumbnail, VisualKind::Frame]);
         }
     } else if mime_type.starts_with("audio") {
         let thumb = get_audio_thumbnail(path, mime_type);
-        thumbnails.push(encode_image(0, &thumb)?);
-        blurhash_source = Some(thumb);
+        out.thumbnails
+            .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
+        out.blurhash_source = Some(thumb);
     } else if mime_type.starts_with("image") {
         let image = match preloaded_image {
             Some(image) => image,
-            None => open_image(path).map_err(|err| FileProcessError::Visuals(err.to_string()))?,
+            None => open_image_staged(path).map_err(|(stage, err)| {
+                VisualsError::thumbnail(FileProcessError::visuals_from_image_error(stage, err))
+            })?,
         };
-        if let Some(thumb) = generate_thumbnail(path, &image)? {
-            thumbnails.push(encode_image(0, &thumb)?);
-            blurhash_source = Some(thumb);
+        if let Some(thumb) = generate_thumbnail(path, &image).map_err(VisualsError::thumbnail)? {
+            out.thumbnails
+                .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
+            out.blurhash_source = Some(thumb);
         } else {
-            blurhash_source = Some(image);
+            // Served from the original file. No marker: the served-directly
+            // predicate already answers this without decoding anything.
+            out.blurhash_source = Some(image);
         }
     } else if mime_type.starts_with("application/pdf") {
-        // Renders nothing when pdfium is unavailable or the PDF is broken;
-        // the item is then indexed without visuals, like any unsupported type.
-        if let Some(page) = render_pdf_first_page(path) {
-            thumbnails.push(encode_image(0, &page)?);
-            blurhash_source = Some(page);
-        }
+        // Still renders nothing when pdfium is unavailable or the PDF is
+        // broken — the item is indexed without visuals — but the two are no
+        // longer the same event: a missing library self-heals, a document
+        // pdfium refuses to parse does not.
+        let page = render_pdf_first_page(path)
+            .map_err(|err| VisualsError::thumbnail(pdf_visuals_failure(err)))?;
+        out.thumbnails
+            .push(encode_image(0, &page).map_err(VisualsError::thumbnail)?);
+        out.blurhash_source = Some(page);
     } else if mime_type.starts_with("text/html") {
-        // Renders nothing when no headless browser is installed or the page
-        // fails to render; the item is then indexed without visuals.
-        if let Some(shot) = render_html_screenshot(path) {
-            thumbnails.push(encode_image(0, &shot)?);
-            blurhash_source = Some(shot);
-        }
+        let shot = render_html_screenshot_classified(path)
+            .map_err(|err| VisualsError::thumbnail(html_visuals_failure(err)))?;
+        out.thumbnails
+            .push(encode_image(0, &shot).map_err(VisualsError::thumbnail)?);
+        out.blurhash_source = Some(shot);
+    } else {
+        // No generator for this type at all: a correct, permanent nothing.
+        out.nothing.push(VisualKind::Thumbnail);
     }
 
-    drop(thumb_span);
+    Ok(out)
+}
 
-    let blurhash_span = timers.blurhash.start();
-    let blurhash = if let Some(image) = blurhash_source {
-        compute_blurhash(&image).ok()
-    } else {
-        None
-    };
-    drop(blurhash_span);
+/// A missing pdfium is `blocked` and self-heals once the library appears; a
+/// document pdfium ran on and rejected is a verdict on the content — but an
+/// unconfirmed one, because pdfium read the file itself.
+fn pdf_visuals_failure(err: PdfRenderError) -> FileProcessError {
+    match err {
+        PdfRenderError::Unavailable => {
+            visuals_blocked(Blocker::Pdfium, "pdfium library not available")
+        }
+        PdfRenderError::Document(detail) => visuals_input_unconfirmed(detail),
+    }
+}
 
-    Ok((thumbnails, frames, blurhash))
+/// The same split for HTML: no browser is `blocked`, the gateway's own file
+/// handling around the render is transient, and a browser that ran and
+/// produced nothing usable is an unconfirmed verdict on the page.
+fn html_visuals_failure(err: HtmlRenderError) -> FileProcessError {
+    match err {
+        HtmlRenderError::NoBrowser => {
+            visuals_blocked(Blocker::HtmlRenderer, "no headless browser available")
+        }
+        HtmlRenderError::Io(detail) => FileProcessError::Io(detail),
+        HtmlRenderError::Render(detail) => visuals_input_unconfirmed(detail),
+    }
 }
 
 /// Regenerates only the visuals a file is missing. Never fails hard: partial
@@ -2563,16 +3077,27 @@ fn generate_backfill_visuals(
     let mut thumbnails = Vec::new();
     let mut extracted_frames = Vec::new();
     let mut blurhash_source: Option<DynamicImage> = None;
+    let mut verdicts = Vec::new();
 
     if needs_thumb {
         match build_backfill_thumbnails(path, mime_type, &existing_frames, video_duration) {
-            Ok((thumbs, extracted, source)) => {
-                thumbnails = thumbs;
-                extracted_frames = extracted;
-                blurhash_source = source;
+            Ok(produced) => {
+                thumbnails = produced.thumbnails;
+                extracted_frames = produced.frames;
+                blurhash_source = produced.blurhash_source;
+                verdicts = produced
+                    .nothing
+                    .into_iter()
+                    .map(VisualVerdict::nothing)
+                    .collect();
             }
             Err(err) => {
-                tracing::error!(error = ?err, path = %path.display(), "failed to generate thumbnails");
+                // The failing site named the kinds it invalidates — a pass
+                // that rebuilt its thumbnail from already-stored frames never
+                // reaches a frame-scoped one. Debug for the same reason as the
+                // new-item path: the classified log is the generator's.
+                tracing::debug!(error = ?err, path = %path.display(), "failed to generate thumbnails");
+                verdicts = failure_verdicts(&err);
             }
         }
     }
@@ -2603,6 +3128,7 @@ fn generate_backfill_visuals(
         thumbnails,
         extracted_frames,
         blurhash,
+        visual_verdicts: verdicts,
     }
 }
 
@@ -2611,10 +3137,8 @@ fn build_backfill_thumbnails(
     mime_type: &str,
     existing_frames: &[Vec<u8>],
     video_duration: f64,
-) -> Result<(Vec<StoredImage>, Vec<StoredImage>, Option<DynamicImage>), FileProcessError> {
-    let mut thumbnails = Vec::new();
-    let mut extracted = Vec::new();
-    let mut source = None;
+) -> Result<ProducedVisuals, VisualsError> {
+    let mut out = ProducedVisuals::default();
 
     if mime_type.starts_with("video") {
         // Reuse frames already stored in the database before re-running ffmpeg.
@@ -2624,63 +3148,102 @@ fn build_backfill_thumbnails(
             .collect();
         let mut fresh = false;
         if frames.is_empty() {
-            frames = extract_video_frames(path, 4, video_duration)?;
+            frames =
+                extract_video_frames(path, 4, video_duration).map_err(|err| {
+                    match existing_frames.is_empty() {
+                        // Nothing is stored, so this extraction was the frames'
+                        // only chance too.
+                        true => VisualsError::both(err),
+                        // Frames *are* stored, they just would not decode: the
+                        // re-extraction was a thumbnail rescue, and calling the
+                        // stored frames a failure would be a lie.
+                        false => VisualsError::thumbnail(err),
+                    }
+                })?;
             fresh = true;
         }
-        if !frames.is_empty() {
+        if frames.is_empty() {
+            out.nothing.push(VisualKind::Thumbnail);
+            // A frame verdict only when a fresh extraction genuinely had the
+            // inputs to run: with frames already stored (they merely failed to
+            // decode) or with no usable duration, ffmpeg concluded nothing
+            // about this content and a `none` here would suppress the frames
+            // of a video that has them.
+            if fresh && existing_frames.is_empty() && video_duration > 0.0 {
+                out.nothing.push(VisualKind::Frame);
+            }
+        } else {
             let grid = overlay_mime_label(build_image_grid(&frames), mime_type);
-            thumbnails.push(encode_image(0, &grid)?);
+            out.thumbnails
+                .push(encode_image(0, &grid).map_err(VisualsError::thumbnail)?);
             let labeled_first = overlay_mime_label(frames[0].clone(), mime_type);
-            thumbnails.push(encode_image(1, &labeled_first)?);
+            out.thumbnails
+                .push(encode_image(1, &labeled_first).map_err(VisualsError::thumbnail)?);
             if fresh {
-                extracted = frames
+                // The thumbnail is already built; only the frames are at stake
+                // from here.
+                out.frames = frames
                     .iter()
                     .enumerate()
                     .map(|(idx, frame)| encode_image(idx as i64, frame))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(VisualsError::frame)?;
             }
-            source = Some(grid);
+            out.blurhash_source = Some(grid);
         }
     } else if mime_type.starts_with("audio") {
         let thumb = get_audio_thumbnail(path, mime_type);
-        thumbnails.push(encode_image(0, &thumb)?);
-        source = Some(thumb);
+        out.thumbnails
+            .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
+        out.blurhash_source = Some(thumb);
     } else if mime_type.starts_with("image") {
         let file_size = fs::metadata(path)
-            .map_err(|err| FileProcessError::Io(err.to_string()))?
+            .map_err(|err| VisualsError::thumbnail(FileProcessError::Io(err.to_string())))?
             .len();
         // Only decode when the image is large enough to warrant a thumbnail;
-        // the blurhash fallback opens the image separately when needed.
+        // the blurhash fallback opens the image separately when needed. Both
+        // early exits here are the served-directly predicate, which needs no
+        // marker of its own.
         if file_size > SMALL_IMAGE_FILE_SIZE {
-            let image =
-                open_image(path).map_err(|err| FileProcessError::Visuals(err.to_string()))?;
-            if let Some(thumb) = generate_thumbnail(path, &image)? {
-                thumbnails.push(encode_image(0, &thumb)?);
-                source = Some(thumb);
+            let image = open_image_staged(path).map_err(|(stage, err)| {
+                VisualsError::thumbnail(FileProcessError::visuals_from_image_error(stage, err))
+            })?;
+            if let Some(thumb) = generate_thumbnail(path, &image).map_err(VisualsError::thumbnail)? {
+                out.thumbnails
+                    .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
+                out.blurhash_source = Some(thumb);
             } else {
-                source = Some(image);
+                out.blurhash_source = Some(image);
             }
         }
     } else if mime_type.starts_with("application/pdf") {
-        if let Some(page) = render_pdf_first_page(path) {
-            thumbnails.push(encode_image(0, &page)?);
-            source = Some(page);
-        }
+        let page = render_pdf_first_page(path)
+            .map_err(|err| VisualsError::thumbnail(pdf_visuals_failure(err)))?;
+        out.thumbnails
+            .push(encode_image(0, &page).map_err(VisualsError::thumbnail)?);
+        out.blurhash_source = Some(page);
     } else if mime_type.starts_with("text/html") {
-        if let Some(shot) = render_html_screenshot(path) {
-            thumbnails.push(encode_image(0, &shot)?);
-            source = Some(shot);
-        }
+        let shot = render_html_screenshot_classified(path)
+            .map_err(|err| VisualsError::thumbnail(html_visuals_failure(err)))?;
+        out.thumbnails
+            .push(encode_image(0, &shot).map_err(VisualsError::thumbnail)?);
+        out.blurhash_source = Some(shot);
+    } else {
+        out.nothing.push(VisualKind::Thumbnail);
     }
 
-    Ok((thumbnails, extracted, source))
+    Ok(out)
 }
 
+/// The blurhash is computed from an image already in memory, so a failure is
+/// deterministic. It has no marker kind of its own (the negative cache
+/// shadows the two stored caches, and a blurhash is neither), and every caller
+/// discards it with `.ok()`, so this classification only ever reaches a log.
 fn compute_blurhash(image: &DynamicImage) -> Result<String, FileProcessError> {
     let resized = resize_for_blurhash(image);
     let rgba = resized.to_rgba8();
     blurhash_encode(4, 4, rgba.width(), rgba.height(), rgba.as_raw())
-        .map_err(|err| FileProcessError::Visuals(err.to_string()))
+        .map_err(|err| visuals_input(err.to_string()))
 }
 
 fn resize_for_blurhash(image: &DynamicImage) -> DynamicImage {
@@ -2732,7 +3295,9 @@ fn encode_image(idx: i64, image: &DynamicImage) -> Result<StoredImage, FileProce
     let mut encoder = JpegEncoder::new_with_quality(&mut buffer, 85);
     encoder
         .encode(&rgb, rgb.width(), rgb.height(), ColorType::Rgb8.into())
-        .map_err(|err| FileProcessError::Visuals(err.to_string()))?;
+        // In-memory, on pixels already decoded: no file I/O to be ambiguous
+        // about, so one attempt settles it.
+        .map_err(|err| visuals_input(err.to_string()))?;
 
     Ok(StoredImage {
         idx,
@@ -2829,32 +3394,31 @@ fn pdfium() -> Option<&'static Pdfium> {
 
 /// Renders the first page of a PDF at 2x its point size, matching the Python
 /// pypdfium2 loader (`scale=2`, i.e. 144 dpi).
-fn render_pdf_first_page(path: &Path) -> Option<DynamicImage> {
-    let pdfium = pdfium()?;
+///
+/// The failure reason is kept rather than flattened to "no thumbnail": the
+/// scan still indexes the item without visuals either way, but a missing
+/// pdfium and an unparseable document are cleared by different events (a
+/// dependency probe versus a retry directive), so the negative cache has to be
+/// able to tell them apart.
+fn render_pdf_first_page(path: &Path) -> Result<DynamicImage, PdfRenderError> {
+    let pdfium = pdfium().ok_or(PdfRenderError::Unavailable)?;
     let _serialized = PDFIUM_CALL_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let document = match pdfium.load_pdf_from_file(path, None) {
-        Ok(document) => document,
-        Err(err) => {
-            tracing::error!(error = %err, path = %path.display(), "failed to load PDF");
-            return None;
-        }
-    };
-    let page = match document.pages().first() {
-        Ok(page) => page,
-        Err(err) => {
-            tracing::error!(error = %err, path = %path.display(), "PDF has no readable pages");
-            return None;
-        }
-    };
-    match page.render_with_config(&PdfRenderConfig::new().scale_page_by_factor(2.0)) {
-        Ok(bitmap) => Some(bitmap.as_image()),
-        Err(err) => {
+    let document = pdfium.load_pdf_from_file(path, None).map_err(|err| {
+        tracing::error!(error = %err, path = %path.display(), "failed to load PDF");
+        PdfRenderError::Document(format!("failed to load PDF: {err}"))
+    })?;
+    let page = document.pages().first().map_err(|err| {
+        tracing::error!(error = %err, path = %path.display(), "PDF has no readable pages");
+        PdfRenderError::Document(format!("PDF has no readable pages: {err}"))
+    })?;
+    page.render_with_config(&PdfRenderConfig::new().scale_page_by_factor(2.0))
+        .map(|bitmap| bitmap.as_image())
+        .map_err(|err| {
             tracing::error!(error = %err, path = %path.display(), "failed to render PDF page");
-            None
-        }
-    }
+            PdfRenderError::Document(format!("failed to render PDF page: {err}"))
+        })
 }
 
 /// Why a PDF render failed. The distinction is the whole point: a missing
@@ -3042,16 +3606,12 @@ impl std::fmt::Display for HtmlRenderError {
 
 /// Screenshots an HTML file with a locally installed headless browser. This
 /// intentionally replaces the Python weasyprint HTML->PDF pipeline with a
-/// browser viewport capture. Never fails hard: any error degrades to None.
-/// The scan's thumbnail path wants exactly that; extraction calls
-/// [`render_html_screenshot_classified`] instead, which keeps the reason.
-pub(crate) fn render_html_screenshot(path: &Path) -> Option<DynamicImage> {
-    render_html_screenshot_classified(path).ok()
-}
-
-/// The same render, with the failure reason preserved so the extraction
-/// ledger can tell "install a browser" apart from "this page cannot be
-/// rendered".
+/// browser viewport capture.
+///
+/// Never fails a file: both callers (extraction's ledger and the scan's
+/// visuals cache) turn the reason into a marker and carry on. The reason is
+/// what they need — "install a browser" and "this page cannot be rendered"
+/// are cleared by different events.
 pub(crate) fn render_html_screenshot_classified(
     path: &Path,
 ) -> Result<DynamicImage, HtmlRenderError> {
@@ -3466,13 +4026,29 @@ fn extract_video_frames_into(
         .arg(&output_pattern)
         .stdout(std::process::Stdio::null())
         .output()
-        .map_err(|err| FileProcessError::Visuals(err.to_string()))?;
+        // Failing to *start* ffmpeg is never a verdict on the media: a missing
+        // toolchain is `blocked` and self-heals when it appears, anything else
+        // about this machine stays transient and is retried next scan.
+        .map_err(|err| {
+            FileProcessError::visuals_from_api_error(crate::media_tools::spawn_error(
+                "ffmpeg", &err,
+            ))
+        })?;
 
     if !output.status.success() {
-        return Err(FileProcessError::Visuals(format!(
-            "ffmpeg failed: {}",
-            stderr_tail(&output.stderr)
-        )));
+        let detail = stderr_tail(&output.stderr);
+        // The generator's own classified line, the twin of pdfium's and the
+        // browser's: the callers log this at debug (one verdict, one log), so
+        // this is where a video that will not yield frames becomes visible.
+        tracing::error!(
+            path = %path.display(),
+            error = %detail,
+            "ffmpeg failed to extract frames"
+        );
+        // ffmpeg did its own file I/O, so a broken file and a transient mount
+        // hiccup exit identically: this needs a second failure in a later scan
+        // before it suppresses anything.
+        return Err(visuals_input_unconfirmed(format!("ffmpeg failed: {detail}")));
     }
 
     let mut frames = Vec::new();
@@ -4259,6 +4835,953 @@ LIMIT 1
         );
     }
 
+    /// (kind, outcome, attempts, skip_after, version) per marker, by kind.
+    async fn visual_attempt_rows(
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Vec<(String, String, i64, i64, i64)> {
+        sqlx::query_as(
+            "SELECT kind, outcome, attempts, skip_after, version \
+             FROM storage.visual_attempts ORDER BY kind",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
+    }
+
+    async fn thumbnail_count(conn: &mut sqlx::SqliteConnection) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM storage.thumbnails")
+            .fetch_one(conn)
+            .await
+            .unwrap()
+    }
+
+    // The end-to-end contract of the visuals negative cache, at the level the
+    // production symptom lives at: a scan that finds nothing new must not
+    // regenerate visuals it already knows produce nothing.
+    //
+    // Every gate is exercised in the order the dispatcher applies them — the
+    // confirmation threshold, then the marker itself, then the version stamp —
+    // and the run that finally succeeds proves the store retires the marker.
+    #[tokio::test]
+    async fn a_recorded_visuals_attempt_suppresses_the_next_generation() {
+        use crate::db::visual_attempts::{VisualFailure, upsert_visual_attempts};
+
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        // Its own folder: the temp root is shared by every test in the process.
+        let media_dir = root.join("media-visual-attempts");
+        fs::create_dir_all(&media_dir).unwrap();
+        // 4900x400 uncompressed = 5.88 MB: over the small-file cutoff *and*
+        // wider than the served-directly dimension limit, so this image really
+        // does get a stored thumbnail — which is what makes a missing one
+        // meaningful rather than the normal state of most images.
+        image::RgbImage::new(4900, 400)
+            .save(media_dir.join("large.bmp"))
+            .unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+
+        service.rescan_folders().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        assert_eq!(thumbnail_count(&mut conn).await, 1);
+        assert!(
+            visual_attempt_rows(&mut conn).await.is_empty(),
+            "a pass that stored something owes no marker"
+        );
+        let sha256: String = sqlx::query_scalar("SELECT sha256 FROM items")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Drop the stored thumbnail: from here on the positive cache misses
+        // and the negative one is the only thing that can answer.
+        let clear_thumbnails = || async {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM storage.thumbnails")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        };
+        let seed = |failure: Option<VisualFailure>| {
+            let sha256 = sha256.clone();
+            let index_db = index_db.clone();
+            async move {
+                let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                    .await
+                    .unwrap();
+                let verdict = match failure {
+                    None => VisualVerdict::nothing(VisualKind::Thumbnail),
+                    Some(failure) => VisualVerdict::failed(VisualKind::Thumbnail, failure),
+                };
+                upsert_visual_attempts(
+                    &mut conn,
+                    &[verdict.into_record(&sha256, "image/bmp", THUMBNAIL_PROCESS_VERSION)],
+                    Some(1),
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        // An *unconfirmed* verdict (an external tool that read the file
+        // itself, failing once) must not suppress anything yet: the whole
+        // point of the threshold is that one transient hiccup never becomes a
+        // permanent skip.
+        clear_thumbnails().await;
+        seed(Some(VisualFailure {
+            kind: ApiErrorKind::Input,
+            skip_after: SKIP_AFTER_AMBIGUOUS,
+            message: "ffmpeg failed".to_string(),
+        }))
+        .await;
+        let (_, totals) = execute_folder_scan(
+            &index_db,
+            &user_data_db,
+            &config,
+            &config.included_folders,
+            &[],
+            ScanOptions { worker_count: 2 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            totals.visuals_suppressed, 0,
+            "an unconfirmed verdict must be re-attempted"
+        );
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        assert_eq!(thumbnail_count(&mut conn).await, 1);
+        assert!(
+            visual_attempt_rows(&mut conn).await.is_empty(),
+            "storing the thumbnail retires the marker, in the same transaction"
+        );
+        drop(conn);
+
+        // A confirmed verdict does suppress: no dispatch, no decode, no
+        // thumbnail — and the marker survives, because nothing overwrote it.
+        clear_thumbnails().await;
+        seed(None).await;
+        let (_, totals) = execute_folder_scan(
+            &index_db,
+            &user_data_db,
+            &config,
+            &config.included_folders,
+            &[],
+            ScanOptions { worker_count: 2 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(totals.visuals_suppressed, 1);
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        assert_eq!(
+            thumbnail_count(&mut conn).await,
+            0,
+            "the generation must not have run"
+        );
+        let rows = visual_attempt_rows(&mut conn).await;
+        assert_eq!(
+            (
+                rows.len(),
+                rows[0].0.as_str(),
+                rows[0].1.as_str(),
+                rows[0].3
+            ),
+            (1, VisualKind::Thumbnail.as_str(), "none", 1)
+        );
+        drop(conn);
+
+        // A generator version bump retires every marker for free — the consult
+        // is `version >= ?`, so a marker stamped by an older generator is
+        // simply ignored. Simulated from the marker's side, which is exactly
+        // what raising the constant produces.
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE storage.visual_attempts SET version = ?")
+                .bind(THUMBNAIL_PROCESS_VERSION - 1)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        let (_, totals) = execute_folder_scan(
+            &index_db,
+            &user_data_db,
+            &config,
+            &config.included_folders,
+            &[],
+            ScanOptions { worker_count: 2 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            totals.visuals_suppressed, 0,
+            "a marker from an older generator must not suppress the new one"
+        );
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        assert_eq!(thumbnail_count(&mut conn).await, 1);
+        assert!(visual_attempt_rows(&mut conn).await.is_empty());
+    }
+
+    // Markers for content that left the index are swept with the blobs — but
+    // their count must stay out of the "something was deleted" flag, which is
+    // what gates the post-job VACUUM. A handful of marker rows must never
+    // trigger a multi-minute rewrite of a multi-GB database.
+    #[tokio::test]
+    async fn the_orphan_sweep_takes_markers_without_arming_the_vacuum_gate() {
+        use crate::db::visual_attempts::upsert_visual_attempts;
+
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let media_dir = root.join("media-visual-sweep");
+        fs::create_dir_all(&media_dir).unwrap();
+        image::RgbImage::new(8, 8)
+            .save(media_dir.join("small.png"))
+            .unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+        let service = FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        );
+        service.rescan_folders().await.unwrap();
+
+        // A marker for content that is not in the index, plus one for content
+        // that is: the sweep has to discriminate.
+        let indexed_sha: String = {
+            let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+            sqlx::query_scalar("SELECT sha256 FROM items")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap()
+        };
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            upsert_visual_attempts(
+                &mut conn,
+                &[
+                    VisualVerdict::nothing(VisualKind::Thumbnail).into_record(
+                        "sha_that_left",
+                        "video/mp4",
+                        THUMBNAIL_PROCESS_VERSION,
+                    ),
+                    VisualVerdict::nothing(VisualKind::Frame).into_record(
+                        "sha_that_left",
+                        "video/mp4",
+                        FRAME_PROCESS_VERSION,
+                    ),
+                    VisualVerdict::nothing(VisualKind::Thumbnail).into_record(
+                        &indexed_sha,
+                        "image/png",
+                        THUMBNAIL_PROCESS_VERSION,
+                    ),
+                ],
+                Some(1),
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = service.rescan_folders().await.unwrap();
+        assert!(
+            !result.summary.deleted_data,
+            "swept markers carry no blobs and must not arm the VACUUM gate"
+        );
+        assert!(
+            !result.summary.tags_changed,
+            "and must not arm the tag recount either — it is derived from the same flag"
+        );
+
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let rows = visual_attempt_rows(&mut conn).await;
+        assert_eq!(rows.len(), 1, "only the orphaned markers go: {rows:?}");
+        let remaining: String =
+            sqlx::query_scalar("SELECT item_sha256 FROM storage.visual_attempts")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(remaining, indexed_sha);
+    }
+
+    /// A migrated database pair plus one media folder per name — the temp root
+    /// is shared by every test in the process — with the config saved where
+    /// [`FileScanService`] will look for it.
+    struct VisualsEnv {
+        index_db: String,
+        user_data_db: String,
+        config: SystemConfig,
+        media_dirs: Vec<PathBuf>,
+        root: PathBuf,
+    }
+
+    impl VisualsEnv {
+        async fn scan(&self) -> (Vec<i64>, ScanTotals) {
+            execute_folder_scan(
+                &self.index_db,
+                &self.user_data_db,
+                &self.config,
+                &self.config.included_folders,
+                &[],
+                ScanOptions { worker_count: 2 },
+            )
+            .await
+            .unwrap()
+        }
+
+        fn service(&self) -> FileScanService {
+            FileScanService::new(
+                self.index_db.clone(),
+                self.user_data_db.clone(),
+                self.root.clone(),
+                ScanOptions { worker_count: 2 },
+            )
+        }
+
+        async fn read(&self) -> sqlx::SqliteConnection {
+            open_index_db_read(&self.index_db, &self.user_data_db)
+                .await
+                .unwrap()
+        }
+
+        async fn write(&self) -> sqlx::SqliteConnection {
+            crate::db::open_index_db_write_no_user_data(&self.index_db)
+                .await
+                .unwrap()
+        }
+    }
+
+    async fn visuals_env(root: &Path, folders: &[&str]) -> VisualsEnv {
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+        let media_dirs: Vec<PathBuf> = folders.iter().map(|name| root.join(name)).collect();
+        for dir in &media_dirs {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let mut config = SystemConfig::default();
+        // Off by default, and the only indexable type whose generator fails
+        // without a fixture the repository would have to carry.
+        config.scan_pdf = true;
+        config.included_folders = media_dirs
+            .iter()
+            .map(|dir| dir.to_string_lossy().to_string())
+            .collect();
+        SystemConfigStore::new(root.to_path_buf())
+            .save(&index_db, &config)
+            .unwrap();
+        VisualsEnv {
+            index_db,
+            user_data_db,
+            config,
+            media_dirs,
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// A PDF whose bytes no renderer will ever parse. `blocked` where pdfium
+    /// is missing, `failed` where it is present — either way a verdict about
+    /// content that a scan reaches through the ordinary walk.
+    const UNRENDERABLE_PDF: &[u8] = b"%PDF-1.7\nnothing in here parses\n";
+
+    /// One second of silent 16-bit mono PCM, written under an `.mp4` name on
+    /// purpose: the mime type is guessed from the extension, so the scan
+    /// treats it as a video, while ffprobe reports the truth — a container
+    /// with no video stream. That is the canonical `none`: the generator ran,
+    /// correctly produced nothing, and nothing will change until it does.
+    fn silent_wav_bytes() -> Vec<u8> {
+        let sample_rate: u32 = 8000;
+        let data_len: u32 = sample_rate * 2;
+        let mut out = Vec::with_capacity(44 + data_len as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // PCM header size
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // mono
+        out.extend_from_slice(&sample_rate.to_le_bytes());
+        out.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+        out.extend_from_slice(&2u16.to_le_bytes()); // block align
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(44 + data_len as usize, 0);
+        out
+    }
+
+    // A suppressed image must not fall through to the blurhash fallback. The
+    // fallback's only source for an image with no stored thumbnail is a full
+    // decode of the original — the exact decode the thumbnail marker's verdict
+    // already settled — so letting it through would re-open and re-decode the
+    // file on every single scan while the stat happily reported a skip.
+    #[tokio::test]
+    async fn a_suppressed_image_does_not_redecode_for_a_blurhash() {
+        use crate::db::visual_attempts::upsert_visual_attempts;
+
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-blurhash-suppressed"]).await;
+        image::RgbImage::new(4900, 400)
+            .save(env.media_dirs[0].join("large.bmp"))
+            .unwrap();
+
+        env.scan().await;
+        let mut conn = env.read().await;
+        assert_eq!(thumbnail_count(&mut conn).await, 1);
+        let sha256: String = sqlx::query_scalar("SELECT sha256 FROM items")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        // The state that makes the fallback dangerous: no stored thumbnail (so
+        // the positive cache misses), no blurhash (so there is still work to
+        // do), and a marker that settles the decode.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("DELETE FROM storage.thumbnails")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE items SET blurhash = NULL")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            upsert_visual_attempts(
+                &mut conn,
+                &[VisualVerdict::nothing(VisualKind::Thumbnail).into_record(
+                    &sha256,
+                    "image/bmp",
+                    THUMBNAIL_PROCESS_VERSION,
+                )],
+                Some(1),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.visuals_suppressed, 1,
+            "the whole dispatch is what the marker skipped"
+        );
+        let mut conn = env.read().await;
+        assert_eq!(thumbnail_count(&mut conn).await, 0);
+        let blurhash: Option<String> = sqlx::query_scalar("SELECT blurhash FROM items")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            blurhash.is_none(),
+            "a blurhash here could only have come from re-decoding the original"
+        );
+        let rows = visual_attempt_rows(&mut conn).await;
+        assert_eq!(
+            (rows.len(), rows[0].2),
+            (1, 1),
+            "no pass ran, so the marker learned nothing: {rows:?}"
+        );
+    }
+
+    // `attempts` counts *runs*, but a run opens one `file_scans` row per root.
+    // Markers are keyed by content, so the same file under two roots would be
+    // counted twice by one run — confirming a `skip_after = 2` verdict that has
+    // only failed once, which is precisely the transient-mount case the second
+    // attempt exists to survive.
+    //
+    #[tokio::test]
+    async fn duplicate_content_under_two_roots_counts_one_attempt() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-dup-a", "media-dup-b"]).await;
+        for dir in &env.media_dirs {
+            fs::write(dir.join("broken.pdf"), UNRENDERABLE_PDF).unwrap();
+        }
+        // A second, *distinct* unrenderable PDF under the second root only.
+        // Where pdfium is missing every verdict is `blocked` and settles at one
+        // attempt, so the duplicate above is suppressed under the second root
+        // and the token its second write would have carried is unobservable —
+        // this file's marker is necessarily written while the second root is
+        // walked, which is exactly where a per-root token would show through.
+        fs::write(
+            env.media_dirs[1].join("other.pdf"),
+            b"%PDF-1.4\nalso not a document\n",
+        )
+        .unwrap();
+
+        let (scan_ids, _) = env.scan().await;
+        assert_eq!(scan_ids.len(), 2, "one scan row per root is the premise");
+
+        let mut conn = env.read().await;
+        let markers: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT item_sha256, attempts, last_scan_id FROM storage.visual_attempts",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            markers.len(),
+            2,
+            "one marker per distinct content, not per file: {markers:?}"
+        );
+        for (sha256, attempts, token) in &markers {
+            assert_eq!(*attempts, 1, "one run, one attempt ({sha256})");
+            assert_eq!(
+                *token,
+                Some(scan_ids[0]),
+                "every write of this run shares its first root's scan id ({sha256})"
+            );
+        }
+    }
+
+    // The new-item write path, through the service entry point rather than a
+    // seeded verdict: a real generation pass that correctly produces nothing
+    // has to leave the marker behind, or the whole cache is unreachable in
+    // production.
+    #[tokio::test]
+    async fn a_real_generation_pass_records_its_marker() {
+        // ffprobe is what turns the container into "no video track"; without
+        // the toolchain the file never indexes at all.
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-no-video-track"]).await;
+        fs::write(
+            env.media_dirs[0].join("audio-only.mp4"),
+            silent_wav_bytes(),
+        )
+        .unwrap();
+
+        env.service().rescan_folders().await.unwrap();
+
+        let mut conn = env.read().await;
+        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(items, 1, "the file itself indexes fine; only visuals are nothing");
+        let rows = visual_attempt_rows(&mut conn).await;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.0.as_str(), row.1.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (VisualKind::Frame.as_str(), "none"),
+                (VisualKind::Thumbnail.as_str(), "none"),
+            ],
+            "both kinds concluded a permanent nothing: {rows:?}"
+        );
+        assert_eq!(thumbnail_count(&mut conn).await, 0);
+    }
+
+    // The backfill write path, which is a different record site from the
+    // new-item one: an already-indexed file whose visuals are missing is
+    // re-attempted by `maybe_dispatch_backfill`, and what *that* pass concludes
+    // has to be remembered too — otherwise the second scan re-attempts forever
+    // and the cache only ever covers files indexed after it shipped.
+    #[tokio::test]
+    async fn a_backfill_pass_records_its_marker() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-backfill-marker"]).await;
+        fs::write(env.media_dirs[0].join("broken.pdf"), UNRENDERABLE_PDF).unwrap();
+
+        env.scan().await;
+        // Drop what the new-item pass concluded. The file is unchanged from
+        // here on, so the only thing that can put a marker back is the backfill
+        // dispatcher's own record path.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("DELETE FROM storage.visual_attempts")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.unchanged_files, 1,
+            "the second run must reach the file as unchanged, not as new"
+        );
+        let mut conn = env.read().await;
+        let rows = visual_attempt_rows(&mut conn).await;
+        assert_eq!(
+            rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            vec![VisualKind::Thumbnail.as_str()],
+            "the backfill pass records what it concluded: {rows:?}"
+        );
+    }
+
+    // Frame markers are written but never consulted, because nothing ever asks
+    // for frames alone: the dispatcher's only questions are "is there a
+    // thumbnail" and "is there a blurhash". A video with both and no frames is
+    // therefore invisible to it — no work, and no marker read. This pins that
+    // invariant so the day a frames-only backfill appears, it arrives together
+    // with the consult its markers were written for.
+    #[tokio::test]
+    async fn a_video_missing_only_frames_is_not_dispatched() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-frames-only"]).await;
+        let clip = env.media_dirs[0].join("clip.mp4");
+        // Bytes no tool could read — which is the point: if anything dispatched
+        // a generation for this file, it would fail loudly and leave a marker.
+        fs::write(&clip, b"not a container, and never opened").unwrap();
+
+        let sha256 = "sha_frames_only";
+        seed_video_item(
+            &env,
+            &clip,
+            sha256,
+            1,
+            Some("LEHV6nWB2yk8pyo0adR*".to_string()),
+        )
+        .await;
+        let thumbnail = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+            .expect("an 8x8 image encodes");
+        call_index_db_writer(&env.index_db, |reply| {
+            IndexDbWriterMessage::StoreThumbnails {
+                sha256: sha256.to_string(),
+                mime_type: "video/mp4".to_string(),
+                process_version: THUMBNAIL_PROCESS_VERSION,
+                thumbnails: vec![thumbnail.clone()],
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.unchanged_files, 1, "the walk did reach the file");
+        assert_eq!(
+            (totals.backfilled_visuals, totals.visuals_suppressed),
+            (0, 0),
+            "the gap is invisible: not generated, and not suppressed either"
+        );
+        let mut conn = env.read().await;
+        let frames: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage.frames")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(frames, 0);
+        assert!(
+            visual_attempt_rows(&mut conn).await.is_empty(),
+            "no pass ran on this file, so nothing concluded anything about it"
+        );
+    }
+
+    /// Indexes a file as a video with the given track count, without touching
+    /// any toolchain: indexing a real video needs ffprobe, and what these tests
+    /// are about is the dispatcher's decision, not the probe.
+    async fn seed_video_item(
+        env: &VisualsEnv,
+        path: &Path,
+        sha256: &str,
+        video_tracks: i64,
+        blurhash: Option<String>,
+    ) {
+        let (last_modified, file_size) = get_last_modified_time_and_size(path).unwrap();
+        let scan_time = current_iso_timestamp();
+        let scan_id = call_index_db_writer(&env.index_db, |reply| {
+            IndexDbWriterMessage::AddFileScan {
+                scan_time: scan_time.clone(),
+                path: env.media_dirs[0].to_string_lossy().to_string(),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        call_index_db_writer(&env.index_db, |reply| IndexDbWriterMessage::UpdateFileData {
+            time_added: scan_time.clone(),
+            scan_id,
+            data: FileScanData {
+                sha256: sha256.to_string(),
+                last_modified: last_modified.clone(),
+                path: path.to_string_lossy().to_string(),
+                new_file_hash: true,
+                file_size: Some(file_size),
+                item_metadata: Some(ItemScanMeta {
+                    md5: "md5".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    width: Some(8),
+                    height: Some(8),
+                    duration: Some(10.0),
+                    audio_tracks: Some(1),
+                    video_tracks: Some(video_tracks),
+                    subtitle_tracks: Some(0),
+                }),
+                blurhash: blurhash.clone(),
+            },
+            reply,
+        })
+        .await
+        .unwrap();
+    }
+
+    // The case an existing library is made of: a video with no video track that
+    // was indexed *before* this cache existed, so the new-item path never
+    // recorded its nothing. The backfill dispatcher decides the same nothing
+    // from the same metadata on every scan — and used to return without
+    // recording it, which left exactly these items being re-decided forever.
+    // The first scan writes the verdict for both kinds; the second one reads it
+    // and does not dispatch at all.
+    #[tokio::test]
+    async fn a_track_less_video_already_in_the_index_is_recorded_then_suppressed() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-no-track-backfill"]).await;
+        let clip = env.media_dirs[0].join("clip.mp4");
+        // Never opened by anything: the verdict comes from indexed metadata.
+        fs::write(&clip, b"not a container, and never opened").unwrap();
+        // No blurhash either, which is the honest state for a video that never
+        // produced a visual — and what keeps the dispatcher interested in this
+        // file after the thumbnail question is settled.
+        seed_video_item(&env, &clip, "sha_no_track", 0, None).await;
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.unchanged_files, 1, "the walk did reach the file");
+        assert_eq!(
+            totals.visuals_suppressed, 0,
+            "the first scan is the one that decides; nothing to suppress yet"
+        );
+        let mut conn = env.read().await;
+        let rows = visual_attempt_rows(&mut conn).await;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.0.as_str(), row.1.as_str(), row.2))
+                .collect::<Vec<_>>(),
+            vec![
+                (VisualKind::Frame.as_str(), "none", 1),
+                (VisualKind::Thumbnail.as_str(), "none", 1),
+            ],
+            "the backfill pass owes the same verdict the new-item path writes: {rows:?}"
+        );
+        drop(conn);
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.visuals_suppressed, 1,
+            "the second scan reads the verdict instead of re-deciding it"
+        );
+        let mut conn = env.read().await;
+        assert_eq!(thumbnail_count(&mut conn).await, 0);
+        let rows = visual_attempt_rows(&mut conn).await;
+        assert_eq!(
+            rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            vec![1, 1],
+            "a suppressed scan runs no pass, so it confirms nothing: {rows:?}"
+        );
+    }
+
+    // What a pass may and may not conclude. The line that keeps this table
+    // small is the served-directly predicate: most images legitimately have no
+    // stored thumbnail, and marking every one of them would put a row in the
+    // negative cache for the majority of a library.
+    #[test]
+    fn only_a_real_nothing_earns_a_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let meta = |video_tracks: i64, duration: f64| ItemScanMeta {
+            md5: "md5".to_string(),
+            mime_type: "video/mp4".to_string(),
+            width: None,
+            height: None,
+            duration: Some(duration),
+            audio_tracks: Some(1),
+            video_tracks: Some(video_tracks),
+            subtitle_tracks: Some(0),
+        };
+
+        // A video with no video track: both kinds conclude a permanent
+        // nothing, without ffmpeg ever being started.
+        let produced = build_new_item_thumbnails(
+            &dir.path().join("audio-only.mp4"),
+            "video/mp4",
+            &meta(0, 10.0),
+            None,
+        )
+        .expect("a missing video track is not a failure");
+        assert_eq!(produced.nothing, vec![VisualKind::Thumbnail, VisualKind::Frame]);
+        assert!(produced.thumbnails.is_empty() && produced.frames.is_empty());
+
+        // A type with no generator at all: also a permanent nothing, but only
+        // for the kind that could have existed.
+        let plain = dir.path().join("notes.txt");
+        fs::write(&plain, b"hello").unwrap();
+        let produced = build_new_item_thumbnails(&plain, "text/plain", &meta(0, 0.0), None)
+            .expect("an unsupported type is not a failure");
+        assert_eq!(produced.nothing, vec![VisualKind::Thumbnail]);
+
+        // An image served from its original file: nothing stored, and no
+        // marker — the predicate already answers this without decoding.
+        let small = dir.path().join("small.png");
+        image::RgbImage::new(8, 8).save(&small).unwrap();
+        let produced = build_new_item_thumbnails(&small, "image/png", &meta(0, 0.0), None)
+            .expect("a small image is not a failure");
+        assert!(
+            produced.nothing.is_empty() && produced.thumbnails.is_empty(),
+            "the served-directly predicate is the cache for these"
+        );
+
+        // And an image that does get a thumbnail concludes nothing at all.
+        let large = dir.path().join("large.bmp");
+        image::RgbImage::new(4900, 400).save(&large).unwrap();
+        let produced = build_new_item_thumbnails(&large, "image/bmp", &meta(0, 0.0), None).unwrap();
+        assert!(produced.nothing.is_empty() && produced.thumbnails.len() == 1);
+    }
+
+    // The visuals half of the taxonomy, site by site: which failures are the
+    // content's fault (marked), which are a missing dependency (marked, and
+    // self-healing), which are this machine's (never marked), and which of
+    // them settle on a single failure.
+    #[test]
+    fn visuals_failures_are_classified_by_what_actually_failed() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let expect = |err: FileProcessError, kind: ApiErrorKind, skip_after: i64| {
+            let failure = err
+                .visual_failure()
+                .unwrap_or_else(|| panic!("must be marked: {err:?}"));
+            assert_eq!(failure.kind, kind, "{err:?}");
+            assert_eq!(failure.skip_after, skip_after, "{err:?}");
+        };
+
+        // A missing backend self-heals; a document or page the backend ran on
+        // and rejected does not — and is unconfirmed, because the backend did
+        // its own file I/O.
+        expect(
+            pdf_visuals_failure(PdfRenderError::Unavailable),
+            ApiErrorKind::Blocked {
+                blocker: Blocker::Pdfium,
+            },
+            SKIP_AFTER_CONFIRMED,
+        );
+        expect(
+            pdf_visuals_failure(PdfRenderError::Document("broken xref".to_string())),
+            ApiErrorKind::Input,
+            SKIP_AFTER_AMBIGUOUS,
+        );
+        expect(
+            html_visuals_failure(HtmlRenderError::NoBrowser),
+            ApiErrorKind::Blocked {
+                blocker: Blocker::HtmlRenderer,
+            },
+            SKIP_AFTER_CONFIRMED,
+        );
+        expect(
+            html_visuals_failure(HtmlRenderError::Render("exit 1".to_string())),
+            ApiErrorKind::Input,
+            SKIP_AFTER_AMBIGUOUS,
+        );
+        // The gateway's own file handling around a render says nothing about
+        // the page.
+        let io = html_visuals_failure(HtmlRenderError::Io("no temp dir".to_string()));
+        assert!(io.visual_failure().is_none(), "{io:?}");
+
+        // The image stages, with the same reasoning as the scan ledger's: an
+        // open that never decoded anything is this machine's problem, a decode
+        // is a verdict on the content, and the configurable memory ceiling is
+        // a budget rather than a property of the file.
+        let (stage, err) = open_image_staged(dir.path().join("absent.png"))
+            .err()
+            .expect("a missing file must fail");
+        let missing = FileProcessError::visuals_from_image_error(stage, err);
+        assert!(missing.visual_failure().is_none(), "{missing:?}");
+
+        let garbage = dir.path().join("garbage.png");
+        fs::write(&garbage, b"definitely not an image").unwrap();
+        let (stage, err) = open_image_staged(&garbage).err().expect("must not decode");
+        expect(
+            FileProcessError::visuals_from_image_error(stage, err),
+            ApiErrorKind::Input,
+            SKIP_AFTER_AMBIGUOUS,
+        );
+        expect(
+            FileProcessError::visuals_from_image_error(
+                ImageStage::Decode,
+                image::ImageError::Limits(image::error::LimitError::from_kind(
+                    image::error::LimitErrorKind::InsufficientMemory,
+                )),
+            ),
+            ApiErrorKind::Resource,
+            SKIP_AFTER_CONFIRMED,
+        );
+
+        // Spawning ffmpeg: a missing toolchain is a dependency the auto-heal
+        // can clear, anything else about this machine is transient.
+        expect(
+            FileProcessError::visuals_from_api_error(crate::media_tools::spawn_error(
+                "ffmpeg",
+                &io::Error::new(io::ErrorKind::NotFound, "no ffmpeg"),
+            )),
+            ApiErrorKind::Blocked {
+                blocker: Blocker::Ffmpeg,
+            },
+            SKIP_AFTER_CONFIRMED,
+        );
+        let denied = FileProcessError::visuals_from_api_error(crate::media_tools::spawn_error(
+            "ffmpeg",
+            &io::Error::new(io::ErrorKind::PermissionDenied, "nope"),
+        ));
+        assert!(denied.visual_failure().is_none(), "{denied:?}");
+
+        // A failure marks exactly the kinds it invalidates, and a transient one
+        // marks none — the difference between "we know" and "we did not get to
+        // find out". The scope is the failing *site*'s, not the mime type's: a
+        // video pass builds its thumbnail out of the frames it extracted, so
+        // the two are only both lost when the extraction itself was.
+        let failure = || visuals_input_unconfirmed("ffmpeg failed");
+        assert_eq!(failure_verdicts(&VisualsError::both(failure())).len(), 2);
+        assert_eq!(
+            failure_verdicts(&VisualsError::thumbnail(failure()))
+                .into_iter()
+                .map(|verdict| verdict.kind)
+                .collect::<Vec<_>>(),
+            vec![VisualKind::Thumbnail],
+            "an encode that failed on the grid says nothing about the frames"
+        );
+        assert_eq!(
+            failure_verdicts(&VisualsError::frame(failure()))
+                .into_iter()
+                .map(|verdict| verdict.kind)
+                .collect::<Vec<_>>(),
+            vec![VisualKind::Frame],
+            "and an encode that failed on a frame says nothing about the thumbnail"
+        );
+        assert!(
+            failure_verdicts(&VisualsError::both(FileProcessError::Io(
+                "mount went away".to_string()
+            )))
+            .is_empty()
+        );
+    }
+
     // The classification is the whole taxonomy in one place: which failures
     // are the file's fault (recorded), which are this machine's (retried),
     // and which settle on the first failure.
@@ -4438,8 +5961,18 @@ LIMIT 1
     // must free exactly the files waiting on it. The probe results are handed
     // in because probing real binaries is what makes the caller untestable,
     // and the clearing is what has to be right.
+    //
+    // Both scan-side tables heal in the same pass: the ledger (a file that
+    // could not be probed at all) and the visuals cache (a file that indexed
+    // fine but whose thumbnail needs a backend). They wait on the same
+    // dependencies, and a heal that only cleared one of them would leave the
+    // other permanently suppressed.
     #[tokio::test]
     async fn healing_clears_only_the_scan_dependencies_that_came_back() {
+        use crate::db::visual_attempts::{
+            VisualFailure, list_distinct_visual_blockers, upsert_visual_attempts,
+        };
+
         let _test_env = test_data_dir();
         let index_db = "scan_heal_blocked";
         migrate_databases_on_disk(Some(index_db), Some("scan_heal_blocked_user"))
@@ -4449,6 +5982,31 @@ LIMIT 1
             let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
                 .await
                 .unwrap();
+            // One marker per dependency, on the visuals side too.
+            for (sha256, blocker) in [
+                ("sha_pdf", Blocker::Pdfium),
+                ("sha_html", Blocker::HtmlRenderer),
+            ] {
+                upsert_visual_attempts(
+                    &mut conn,
+                    &[VisualVerdict::failed(
+                        VisualKind::Thumbnail,
+                        VisualFailure {
+                            kind: ApiErrorKind::Blocked { blocker },
+                            skip_after: SKIP_AFTER_CONFIRMED,
+                            message: "dependency missing".to_string(),
+                        },
+                    )
+                    .into_record(
+                        sha256,
+                        "application/pdf",
+                        THUMBNAIL_PROCESS_VERSION,
+                    )],
+                    Some(1),
+                )
+                .await
+                .unwrap();
+            }
             for (path, blocker) in [
                 ("C:/data/1.pdf", Blocker::Pdfium),
                 ("C:/data/2.mp4", Blocker::Ffmpeg),
@@ -4478,7 +6036,8 @@ LIMIT 1
             heal_blocked_scan(index_db, vec![Blocker::Pdfium])
                 .await
                 .unwrap(),
-            1
+            2,
+            "one row per table, cleared in the same pass"
         );
 
         let mut conn = open_index_db_read_no_user_data(index_db).await.unwrap();
@@ -4486,6 +6045,11 @@ LIMIT 1
             list_distinct_scan_blockers(&mut conn).await.unwrap(),
             vec![Blocker::Ffmpeg],
             "the dependency that is still missing keeps its rows"
+        );
+        assert_eq!(
+            list_distinct_visual_blockers(&mut conn).await.unwrap(),
+            vec![Blocker::HtmlRenderer],
+            "and so does the one only the visuals cache is waiting on"
         );
     }
 
@@ -5344,7 +6908,7 @@ LIMIT 1
         )
         .unwrap();
 
-        let shot = render_html_screenshot(&path).expect("screenshot should render");
+        let shot = render_html_screenshot_classified(&path).expect("screenshot should render");
         // --window-size fixes the viewport width; the height can vary.
         assert_eq!(shot.width(), 1280);
     }

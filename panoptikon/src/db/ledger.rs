@@ -48,6 +48,10 @@ pub(crate) const MAX_ERROR_BYTES: usize = 2000;
 pub(crate) enum LedgerTable {
     ItemExtractionErrors,
     ScanErrors,
+    /// The visuals negative cache. Schema-qualified because it lives in
+    /// storage.db; every connection that reaches it has that database
+    /// attached as `storage`.
+    VisualAttempts,
 }
 
 impl LedgerTable {
@@ -55,6 +59,19 @@ impl LedgerTable {
         match self {
             LedgerTable::ItemExtractionErrors => "item_extraction_errors",
             LedgerTable::ScanErrors => "scan_errors",
+            LedgerTable::VisualAttempts => "storage.visual_attempts",
+        }
+    }
+
+    /// The column carrying the `blocked` vocabulary. The two index-side
+    /// ledgers store the full taxonomy in `error_class`; the visuals cache
+    /// stores a coarser three-value `outcome` in which `blocked` means exactly
+    /// the same thing — which is why the auto-heal is one mechanism and not
+    /// three.
+    fn class_column(self) -> &'static str {
+        match self {
+            LedgerTable::ItemExtractionErrors | LedgerTable::ScanErrors => "error_class",
+            LedgerTable::VisualAttempts => "outcome",
         }
     }
 }
@@ -76,8 +93,9 @@ pub(crate) async fn delete_blocked_rows(
     // Mixing numbered and bare placeholders misbinds parameters under sqlx,
     // so every placeholder here must stay unnumbered.
     let sql = format!(
-        "DELETE FROM {} WHERE error_class = ? AND blocker IN ({placeholders})",
-        table.as_str()
+        "DELETE FROM {} WHERE {} = ? AND blocker IN ({placeholders})",
+        table.as_str(),
+        table.class_column()
     );
 
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(CLASS_BLOCKED);
@@ -102,8 +120,9 @@ pub(crate) async fn list_distinct_blockers_in(
     table: LedgerTable,
 ) -> ApiResult<Vec<Blocker>> {
     let sql = format!(
-        "SELECT DISTINCT blocker FROM {} WHERE error_class = ? AND blocker IS NOT NULL",
-        table.as_str()
+        "SELECT DISTINCT blocker FROM {} WHERE {} = ? AND blocker IS NOT NULL",
+        table.as_str(),
+        table.class_column()
     );
     let raw: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(CLASS_BLOCKED)
@@ -225,7 +244,9 @@ mod tests {
     use super::*;
 
     // The persisted table names are schema, not display strings: renaming one
-    // here silently points the auto-heal at a table that does not exist.
+    // here silently points the auto-heal at a table that does not exist. The
+    // visuals cache also needs its schema qualifier (it lives in storage.db)
+    // and its own class column, both of which are invisible at the call site.
     #[test]
     fn table_names_are_the_schema_names() {
         assert_eq!(
@@ -233,6 +254,12 @@ mod tests {
             "item_extraction_errors"
         );
         assert_eq!(LedgerTable::ScanErrors.as_str(), "scan_errors");
+        assert_eq!(
+            LedgerTable::VisualAttempts.as_str(),
+            "storage.visual_attempts"
+        );
+        assert_eq!(LedgerTable::ScanErrors.class_column(), "error_class");
+        assert_eq!(LedgerTable::VisualAttempts.class_column(), "outcome");
     }
 
     // A message that fits is borrowed untouched; one that does not is cut on a

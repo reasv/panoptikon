@@ -1471,6 +1471,52 @@ impl Actor for ContinuousScanActor {
                     }
                 }
 
+                // What that same pass concluded about the kinds it produced
+                // nothing for, so the next batch scan does not regenerate the
+                // same nothing. Empty for every healthy file, and checked
+                // before the writer is touched.
+                //
+                // This half writes but does not consult, unlike the batch
+                // walker. Not because the key is unavailable — `process_file`
+                // hashes before it generates — but because of where the
+                // generation happens: the whole pass runs inside one
+                // synchronous worker with no database handle, so a consult
+                // would mean either handing every worker a connection or
+                // splitting the pass in two around one. The cost of not doing
+                // it is bounded and small: an event fires only when a file's
+                // mtime moved, so this is one regeneration per file the user
+                // actually touched. Every path that re-attempts visuals for
+                // content the index already has goes through the batch scan's
+                // `maybe_dispatch_backfill`, which does consult.
+                if !file_data.visual_verdicts.is_empty() {
+                    let records = crate::jobs::files::visual_attempt_records(
+                        &file_data.visual_verdicts,
+                        &file_data.sha256,
+                        &file_data.mime_type,
+                    );
+                    // The continuous scan's own long-lived `file_scans` row,
+                    // which is what dedups `attempts`. A `skip_after = 2`
+                    // verdict written here is therefore normally confirmed by
+                    // the next batch scan rather than by a second event —
+                    // deliberately, for the same reason as the scan ledger.
+                    let scan_id = state.scan_id;
+                    if let Err(err) = call_index_db_writer(&state.index_db, |reply| {
+                        IndexDbWriterMessage::UpsertVisualAttempts {
+                            records: records.clone(),
+                            scan_id,
+                            reply,
+                        }
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            error = ?err,
+                            path = %path.display(),
+                            "failed to record a visuals attempt; it will be regenerated"
+                        );
+                    }
+                }
+
                 if let Some(blurhash) = &file_data.blurhash {
                     if let Ok(mut blur_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await
@@ -2186,6 +2232,89 @@ mod tests {
                 .unwrap();
         assert!(row.is_some());
         assert!(row.unwrap().0.is_some());
+    }
+
+    // The continuous scan's own visuals-marker write. It deliberately never
+    // *consults* the negative cache (the pass runs in a worker with no database
+    // handle), but it must still record what it concluded — otherwise a file
+    // the user touched arrives in the index with a nothing that the next batch
+    // scan has to rediscover the hard way.
+    #[tokio::test]
+    async fn the_continuous_scan_records_visual_attempts() {
+        let test_env = test_data_dir();
+        let root = test_env.path().to_path_buf();
+        let index_db = unique_db_name("cont-visuals");
+        migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
+
+        let watch_dir = root.join("watch-visuals");
+        fs::create_dir_all(&watch_dir).unwrap();
+        // A PDF nothing can render: `blocked` where pdfium is missing, `failed`
+        // where it is present — either way a verdict the pass owes a marker
+        // for, with no toolchain to depend on.
+        let file_path = watch_dir.join("broken.pdf");
+        fs::write(&file_path, b"%PDF-1.7\nnothing in here parses\n").unwrap();
+
+        let store = SystemConfigStore::new(root.clone());
+        let mut config = store.load(&index_db).unwrap();
+        config.continuous_filescan.enabled = true;
+        config.scan_pdf = true;
+        config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let (actor, _handle) = Actor::spawn(
+            None,
+            ContinuousScanActor,
+            ContinuousScanActorArgs {
+                index_db: index_db.clone(),
+                user_data_db: index_db.clone(),
+                data_dir: root.clone(),
+                enable_watcher: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let prepared = process_file(
+            file_path.clone(),
+            parse_filescan_filter(&config).map(Arc::new),
+            &ScanTimers::default(),
+        )
+        .unwrap();
+        assert!(
+            !prepared.visual_verdicts.is_empty(),
+            "the premise: this file's visuals are a verdict, not a success"
+        );
+        actor
+            .cast(ContinuousScanMessage::WorkerResult {
+                epoch: 0,
+                scan_time: current_iso_timestamp(),
+                path: file_path.clone(),
+                stat: None,
+                ledger_path: None,
+                result: Ok(prepared),
+            })
+            .unwrap();
+
+        let mut markers = 0;
+        for _ in 0..40 {
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
+            markers = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM storage.visual_attempts WHERE kind = 'thumbnail'",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            if markers > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        actor.stop(None);
+        assert_eq!(markers, 1, "the pass's conclusion must reach the cache");
     }
 
     #[tokio::test]
