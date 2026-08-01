@@ -185,7 +185,14 @@ Linux only:
      the VRAM rule, because amdgpu *does* publish `mem_info_vram_total` for
      iGPUs: the BIOS UMA carve-out, commonly 512 MB. Without the explicit
      test the host would be priced against the carve-out and every grant
-     would collapse to batch-1;
+     would collapse to batch-1. **Superseded 2026-08-01**: such a node is now
+     a *priced unified board* rather than a poison pill
+     (docs/unified-memory-admission.md, backend B) — the positive detection
+     stayed, what changed is what it decides. What still fails the probe is
+     an APU node whose extra identity facts cannot be read: its
+     `mem_info_gtt_total` (without which the board would be priced at the
+     carve-out — the batch-1 collapse this rule was written for) or
+     `/proc/meminfo`'s `MemTotal` (which is the board's name);
    - no usable `location_id`/`domain`, i.e. no derivable PCI address;
    - no readable, nonzero `mem_info_vram_total`;
    - an **undecodable `gfx_target_version`** (0, or a minor/stepping outside
@@ -507,7 +514,16 @@ unchanged, behind the existing `is_initialized` gates.
   reporter cannot inherit authority by string collision. This is
   device-wide (other processes included) and is the *same file* the
   orchestrator's refresh reads (D5), so the single-vocabulary rule holds
-  exactly.
+  exactly. **Extended 2026-08-01 (backend B):** on a unified board the pair
+  is joined by `mem_info_gtt_{total,used}` and a `MemAvailable` clamp — the
+  same formula the refresh applies to the same board, so the rule still
+  holds by construction, but only because both sides agree on *which* boards
+  are unified. That agreement is what `PANOPTIKON_UNIFIED_GPU` carries, and
+  it is a **BDF-gated** signal rather than a flag: the worker counts GTT only
+  when the address the spawner named is the address it resolved for itself,
+  so a mis-enumerated pin degrades to the discrete reading instead of
+  putting two currencies under one label
+  (docs/unified-memory-admission.md, backend B, DP-5).
   `torch.cuda.mem_get_info` remains the last-resort tier with its
   existing `"torch"` label (wrapped in try/except — it can raise on
   HIP in containers), and the ledger continues to treat `"torch"` as
@@ -516,7 +532,10 @@ unchanged, behind the existing `is_initialized` gates.
   clients from `/proc/self/fdinfo` whose `drm-pdev` equals the identity
   BDF (D3), deduplicated by `drm-client-id`, accepting both
   `drm-resident-vram` and the deprecated `drm-memory-vram` spellings
-  (review F6) — `base_method: "fdinfo"` (new provenance value; the
+  (review F6; **extended 2026-08-01** — on a verified unified board the sum
+  is VRAM + GTT, and the resident/deprecated preference is resolved once for
+  the whole record so the two vintages are never added together) —
+  `base_method: "fdinfo"` (new provenance value; the
   orchestrator and calibration store treat `base_method` as an opaque
   string, so this is additive). No amdsmi Python dependency (not on
   PyPI); no root; no PID-namespace caveat, because the worker reads
@@ -609,7 +628,12 @@ unchanged, behind the existing `is_initialized` gates.
   rejects a filled-in `-1`. A per-process figure that equals or exceeds the
   *device* is a parse or kernel-accounting artefact, not a footprint, and the
   floor cannot catch it because over-reporting is the direction the floor
-  treats as normal. Skipped when the total is unknown.
+  treats as normal. Skipped when the total is unknown. **Extended 2026-08-01
+  (backend B):** on a verified unified board the comparand is the board's
+  real capacity — carve-out + GTT, from the sysfs tier — rather than torch's
+  `total_memory`, which on an APU may be the 512 MB BIOS carve-out alone and
+  would reject every footprint worth measuring. The rule is unchanged; only
+  the number it measures against is.
 
 One deviation from the text above, in the safe direction: the **fdinfo base
 tier is gated on `torch.version.hip`** (the free/total sysfs tier is not).
@@ -640,6 +664,16 @@ reserved carve-outs that nvidia-smi's `memory.free` excludes, so ROCm
 free readings run ~100–500 MB optimistic; the ledger's default margin
 absorbs it, and the D3 tolerance already accounts for it on the total
 side.
+
+**Extended 2026-08-01 (backend B).** A board the probe flagged unified reads
+its GTT counters as well and clamps the unclaimed half by `MemAvailable`,
+because an APU's budget is carve-out + GTT and the pages behind unclaimed GTT
+have to come out of RAM that exists right now
+(docs/unified-memory-admission.md, backend B). Discrete rows read exactly the
+two files they always read, and a discrete host still never touches
+`/proc/meminfo`. The all-or-nothing rule extends with it: a unified board
+whose GTT counters or whose `MemAvailable` cannot be read makes the whole
+snapshot unknown rather than reporting the carve-out as the board.
 
 ### D6 (G6) — Calibration store keying
 
@@ -721,6 +755,44 @@ HIP still enumerates it, so excluding one row would shift every later row's
 device index. So the outcome the design always promised — an APU host is
 **unpriced**, i.e. exactly its pre-branch behaviour — is now what actually
 happens, rather than being an accident of a rule that did not apply.
+
+**APUs are priced (2026-08-01).** The decline above was a v1 safety measure
+and it is gone: `docs/unified-memory-admission.md` (backend B) makes such a
+node a **unified board** — total = carve-out + GTT, free = the carve-out's own
+free memory plus as much unclaimed GTT as `MemAvailable` says RAM can deliver,
+name `AMD gfx1151 APU (128 GB)` from physical RAM rather than the
+BIOS-configurable carve-out, and the `unified` flag that turns on the ledger's
+death-as-negative-sample (DP-2) and the worker's GTT-inclusive arithmetic
+(DP-5, `PANOPTIKON_UNIFIED_GPU=<the board's PCI address>`, which the worker
+only acts on when it is the address it resolved for itself). The positive KFD
+detection survived
+unchanged — it is the only signal an integrated part has — and so did the
+all-or-nothing rule: an APU node whose GTT total or whose `MemTotal` cannot be
+read still takes the whole probe unknown, because pricing such a board against
+its carve-out is precisely the batch-1 collapse the decline existed to
+prevent. Two consequences worth stating here rather than only in the other
+doc: a **dGPU+APU host is no longer sunk** (both boards become rows, and the
+row indices still cover the whole openable set, so they are still HIP device
+indices), and default placement compares the APU's *carve-out* (floored at an
+eighth of its unified budget) rather than its carve+GTT total, so the discrete
+board stays the default unless the operator gave the iGPU that memory outright
+in the BIOS.
+
+**One consequence of that worth naming, because it is a behaviour change on
+hardware nobody thought of as an APU host:** a desktop with an AMD dGPU and a
+Raphael/G-series iGPU used to be declined wholesale and ran its workers
+**unpinned**, and now gets two ledger rows and `HIP_VISIBLE_DEVICES=<row
+index>` pins. If the ROCm userspace does not enumerate the iGPU — an
+unsupported gfx target, a missing `HSA_OVERRIDE_GFX_VERSION` — an index that
+names a KFD node names no HIP device, and the impl's own device selection
+falls back to the **CPU** without complaint. The tripwire for that is
+worker-side: a replica **the orchestrator placed** (`PANOPTIKON_DEVICE_PIN`,
+written beside the visibility variable precisely so an operator's ambient
+restriction — which means the opposite — cannot be mistaken for our
+placement) that finds torch enumerating no devices at all fails its load with
+an actionable error naming the pin (`memory.py::pinned_device_missing`),
+which the orchestrator surfaces as a model-load failure like any other rather
+than serving twenty-times-slower results nothing in the logs explains.
 
 ## What this changed on CUDA hosts
 
@@ -846,6 +918,16 @@ mode degrades to unpriced + a diagnostic log):
   ordering assumption.
 - fdinfo `drm-resident-vram` magnitudes vs allocator expectations on
   ROCm-relevant kernels; HIP context size for the alloc-delta constant.
+- **On an APU (backend B):** what HIP reports as `total_memory` (the
+  either-of cross-check ships because that is unknown), the fdinfo GTT
+  counter names on the board's kernel, and the naming arithmetic on a board
+  whose memory is **driver-carved rather than BIOS-carved** — a BC-250's
+  16 GB of GDDR6 is the GPU's own memory, not system RAM held back from the
+  OS, so `MemTotal + carve-out` counts it twice and would overstate the
+  capacity in the board's name (and could move with the driver's memory
+  mode). Deterministic per machine either way, so nothing mis-prices; what a
+  field pass settles is whether the figure is absurd enough to need a
+  per-shape rule.
 - End-to-end grants/trim/knee on an AMD board (mirror of the CUDA
   dogfooding list).
 
@@ -882,9 +964,13 @@ whole host.
   It is the answer to "the ledger is simply not there and nothing said why".
 - The per-node refusals, each naming the node or board that tripped: the
   partitioned-board warning — *"this PCI device publishes several KFD
-  nodes"* — the APU line — *"reports both SIMDs and CPU cores"* — the absent
-  `simd_count`, unreadable-properties, undecodable-gfx-target, missing-BDF,
-  missing-VRAM-total and duplicate-`unique_id` lines (all WARN).
+  nodes"* — the absent `simd_count`, unreadable-properties,
+  undecodable-gfx-target, missing-BDF, missing-VRAM-total and
+  duplicate-`unique_id` lines (all WARN). Since 2026-08-01 the APU line is
+  no longer among them (such a node is priced, not declined); what remains
+  in its place are the two lines an APU the probe cannot *finish* identifying
+  produces — *"its mem_info_gtt_total is missing or zero"* and *"MemTotal
+  could not be read"*.
 - The ambient-restriction line — *"an ambient GPU visibility restriction is
   set"* (INFO). The whole host is deliberately unpriced; under a ROCR-only
   restriction a registry index pin is still written and selects *within* the

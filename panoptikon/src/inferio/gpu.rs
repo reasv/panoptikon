@@ -75,6 +75,46 @@ pub const CUDA_PIN_ENV_VAR: &str = "CUDA_VISIBLE_DEVICES";
 /// init when the ROCR form is set, which a user-managed venv can still be.
 pub const HIP_PIN_ENV_VAR: &str = "HIP_VISIBLE_DEVICES";
 
+/// Set on a worker pinned to a **unified** board, so its own memory
+/// arithmetic includes GTT (docs/unified-memory-admission.md, DP-5). The
+/// value is that board's **PCI address**, not a flag.
+///
+/// The address is what makes this self-validating rather than a belief. The
+/// spawner knows which board the pin *named*; it does not know which board
+/// the replica came up on, and the one load-bearing unverifiable of the ROCm
+/// design is precisely that the inventory's row order is HIP's device order
+/// (docs/rocm-batch-calibration-parity.md, D2). A bare flag on a
+/// mis-enumerated host would tell a worker that landed on a **dGPU** to add
+/// GTT to its free reading and report the sum under the authoritative
+/// `"amdgpu-sysfs"` label — phantom headroom, the one error direction the
+/// ledger cannot absorb — and would tell a worker that landed on the *APU*
+/// to price it at its 512 MB carve-out, collapsing it to batch-1. With the
+/// address, the worker compares it against the board it independently
+/// resolved (`memory.py::_identity_bdf`) and only counts GTT when the two
+/// agree; a mismatch, or a value it cannot parse, falls back to the discrete
+/// arithmetic, which is conservative in both directions.
+///
+/// Written for unified **ROCm** boards only. MPS's tiers are unified by
+/// construction (there is no other kind of board on a Mac, and the worker's
+/// own `torch.mps` tier is the only one that can answer there), so setting it
+/// on those workers would be inert noise in the one place a reader could
+/// mistake it for a signal.
+pub const UNIFIED_GPU_ENV_VAR: &str = "PANOPTIKON_UNIFIED_GPU";
+
+/// Written alongside the backend's visibility variable with the same
+/// resolved pin: *we* placed this replica, and on this device.
+///
+/// The visibility variables cannot say that. An operator's ambient
+/// `CUDA_VISIBLE_DEVICES` is indistinguishable from one of ours in the
+/// child's environment, and the two mean opposite things to the worker's
+/// pinned-but-invisible tripwire (`memory.py::pinned_device_missing`): a
+/// replica *we* pinned to a device the runtime does not enumerate has
+/// silently fallen back to the CPU and must fail its load, while a host
+/// whose operator hid every device meant exactly that and must keep
+/// working. So the tripwire keys off this marker instead, and fires only
+/// where the orchestrator made the placement.
+pub const DEVICE_PIN_MARKER_ENV_VAR: &str = "PANOPTIKON_DEVICE_PIN";
+
 /// Which variable a resolved pin is written to, decided by the **resolved
 /// accelerator** rather than by the inventory (docs/rocm-batch-calibration-parity.md,
 /// D2).
@@ -160,6 +200,20 @@ pub struct GpuInfo {
     /// the user, so it cannot bound anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified_ram_mb: Option<u64>,
+    /// The device-local VRAM carve-out of a unified **ROCm** board (an APU's
+    /// `mem_info_vram_total`), in MiB — the part of [`Self::total_mb`] that
+    /// is not GTT. `None` on every other board, including MPS, where no such
+    /// split exists.
+    ///
+    /// It is carried because the carve-out is a figure other components
+    /// legitimately mean by "this board's memory", and they must not be
+    /// refused for it. HIP's `total_memory` on an APU may report the
+    /// carve-out, the carve+GTT sum, or something else again — unverified
+    /// until a BC-250 field pass — so the registration cross-check accepts
+    /// **either**. It is also the placement rank
+    /// ([`Self::placement_total_mb`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_carveout_mb: Option<u64>,
 }
 
 impl GpuInfo {
@@ -167,6 +221,42 @@ impl GpuInfo {
     /// VRAM (see [`Self::unified_ram_mb`]).
     pub fn unified(&self) -> bool {
         self.unified_ram_mb.is_some()
+    }
+
+    /// The capacity figure default placement ranks boards by: the private
+    /// VRAM carve-out on a unified ROCm board, [`Self::total_mb`] on every
+    /// other.
+    ///
+    /// The two are unlike quantities and the tie-break has to compare like
+    /// with like. A dGPU's total is memory it owns outright; an APU's total
+    /// is carve-out + GTT, and the GTT half is borrowed from the RAM the OS
+    /// and every other process are using — nominally most of the machine, in
+    /// practice the first thing external pressure takes away. Ranking by it
+    /// would hand default placement to the *slower* board on essentially
+    /// every dGPU+APU host, since a Strix Halo's nominal budget dwarfs any
+    /// consumer card's VRAM, and an unpinned model would quietly run on the
+    /// iGPU.
+    ///
+    /// Ranking by the carve-out keeps the discrete board the default unless
+    /// the APU is *genuinely* bigger — which on an APU means the operator
+    /// went into the BIOS and gave the iGPU that memory outright, an explicit
+    /// statement about where they want work to land. Note this is placement
+    /// only: an APU that loses the tie-break is still fully priced, still
+    /// budgeted against carve+GTT, and still selectable with a `devices` pin.
+    ///
+    /// The carve-out alone is too harsh at the other end, though: a
+    /// 128 GB Strix Halo left at its 512 MB BIOS default would lose to a
+    /// 2 GB display card, which is not a board anyone wants a model on. So a
+    /// unified board ranks by `max(carve-out, total / 8)` — an eighth of the
+    /// unified budget is a deliberately pessimistic reading of memory that is
+    /// shared with the whole OS, and it is still enough to beat a token dGPU
+    /// while staying under any real one (a 64 GB budget ranks as 8 GB, below
+    /// every discrete card worth defaulting to).
+    pub fn placement_total_mb(&self) -> u64 {
+        match self.vram_carveout_mb {
+            Some(carveout) => carveout.max(self.total_mb / 8),
+            None => self.total_mb,
+        }
     }
 
     /// `major * 10 + minor`, the comparable form, or `None` for a board
@@ -212,6 +302,10 @@ enum MemoryBackend {
         /// identified from instead of re-deriving the production default —
         /// which is what makes the refresh path testable from a fixture.
         pci_devices: PathBuf,
+        /// `/proc/meminfo`, from the same probe roots and kept for the same
+        /// reason. Read only for **unified** boards, whose free reading
+        /// clamps unclaimed GTT to `MemAvailable`.
+        meminfo: PathBuf,
         /// Whether an ambient restriction at HIP's own layer
         /// (`HIP_VISIBLE_DEVICES`, its `CUDA_VISIBLE_DEVICES` alias, or
         /// `GPU_DEVICE_ORDINAL`) was in force when the probe ran
@@ -302,6 +396,7 @@ fn probe_rocm() -> HostGpus {
     };
     let backend = MemoryBackend::RocmSysfs {
         pci_devices: roots.pci_devices.clone(),
+        meminfo: roots.meminfo.clone(),
         ambient_hip_restriction,
     };
     let gpus = match inventory {
@@ -339,6 +434,8 @@ fn probe_rocm() -> HostGpus {
             name = %gpu.name,
             total_mb = gpu.total_mb,
             bdf = gpu.bdf.as_deref().unwrap_or("unknown"),
+            unified = gpu.unified(),
+            vram_carveout_mb = ?gpu.vram_carveout_mb,
             "detected GPU"
         );
     }
@@ -454,14 +551,17 @@ pub struct GpuMemory {
 /// Cheap to clone; the ROCm variant carries the board→BDF list because the
 /// sysfs counters are per-board files with no enumeration of their own.
 #[derive(Debug, Clone)]
-pub enum MemoryQuery {
+pub(super) enum MemoryQuery {
     /// One `nvidia-smi --query-gpu` call covering every visible board.
     NvidiaSmi,
-    /// amdgpu's `mem_info_vram_{total,used}`, one file pair per board.
+    /// amdgpu's `mem_info_vram_{total,used}`, one file pair per board — plus
+    /// the `mem_info_gtt_{total,used}` pair and `MemAvailable` for a board
+    /// the probe flagged unified (an APU, whose budget is carve-out + GTT).
     RocmSysfs {
         pci_devices: PathBuf,
-        /// `(board key, PCI address)`, in inventory order.
-        boards: Arc<[(String, String)]>,
+        meminfo: PathBuf,
+        /// Every board's key, address and unified flag, in inventory order.
+        boards: Arc<[rocm::BoardRef]>,
     },
     /// macOS RAM statistics for the one unified board (`mps.rs`): what the
     /// OS says it could deliver right now, which on a unified board is what
@@ -507,8 +607,9 @@ impl MemoryQuery {
             Self::NvidiaSmi => query_memory_nvidia_smi(),
             Self::RocmSysfs {
                 pci_devices,
+                meminfo,
                 boards,
-            } => rocm::query_memory(pci_devices, boards),
+            } => rocm::query_memory(pci_devices, meminfo, boards),
             Self::Mps { key, ram_mb } => mps::query_memory(key, *ram_mb),
             Self::Unavailable => None,
         }
@@ -729,6 +830,7 @@ impl GpuInventory {
             boards: (!gpus.is_empty()).then(|| gpus.into()),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: rocm::SysfsRoots::default().pci_devices,
+                meminfo: rocm::SysfsRoots::default().meminfo,
                 ambient_hip_restriction: false,
             },
         }
@@ -750,7 +852,7 @@ impl GpuInventory {
     /// rows that survived would leave the ledger pricing the rest off stale
     /// readings it believes are fresh. That is phantom headroom, so the
     /// whole refresh is withdrawn instead ([`MemoryQuery::Unavailable`]).
-    pub fn memory_query(&self) -> MemoryQuery {
+    pub(super) fn memory_query(&self) -> MemoryQuery {
         if matches!(self.backend, MemoryBackend::Mps) {
             // The RAM figure comes off the board itself: it is the same fact
             // that flags the board unified, so the refresh and the flag can
@@ -768,7 +870,12 @@ impl GpuInventory {
                 None => MemoryQuery::Unavailable,
             };
         }
-        let MemoryBackend::RocmSysfs { pci_devices, .. } = &self.backend else {
+        let MemoryBackend::RocmSysfs {
+            pci_devices,
+            meminfo,
+            ..
+        } = &self.backend
+        else {
             return MemoryQuery::NvidiaSmi;
         };
         let Some(boards) = self.gpus() else {
@@ -789,10 +896,15 @@ impl GpuInventory {
                 );
                 return MemoryQuery::Unavailable;
             };
-            keyed.push((gpu.uuid.clone(), bdf));
+            keyed.push(rocm::BoardRef {
+                key: gpu.uuid.clone(),
+                bdf,
+                unified: gpu.unified(),
+            });
         }
         MemoryQuery::RocmSysfs {
             pci_devices: pci_devices.clone(),
+            meminfo: meminfo.clone(),
             boards: keyed.into(),
         }
     }
@@ -807,7 +919,11 @@ impl GpuInventory {
     /// every board: without it a first-enumerated iGPU would out-rank the
     /// dGPU on any APU-plus-card host. On CUDA it only reorders equal-cap,
     /// unequal-VRAM hosts, where the bigger board is the strictly better
-    /// default anyway.
+    /// default anyway. The figure compared is
+    /// [`GpuInfo::placement_total_mb`], which on a unified board is the
+    /// private carve-out rather than the carve+GTT budget — see there for
+    /// why an APU's nominal capacity must not win this comparison by
+    /// default.
     ///
     /// This is rough parity with what an unpinned worker got before pinning
     /// existed: torch's default device order is CUDA's `FASTEST_FIRST`, so
@@ -916,7 +1032,7 @@ impl GpuInventory {
         self.boards.as_deref()?.iter().min_by_key(|gpu| {
             (
                 std::cmp::Reverse(gpu.cap_tenths()),
-                std::cmp::Reverse(gpu.total_mb),
+                std::cmp::Reverse(gpu.placement_total_mb()),
                 gpu.index,
             )
         })
@@ -1196,6 +1312,31 @@ impl GpuInventory {
         matches.next().is_none().then(|| first.uuid.clone())
     }
 
+    /// The **PCI address** of the board a registry `devices` entry names,
+    /// when that board is a unified one whose worker needs the GTT-inclusive
+    /// arithmetic (DP-5); `None` otherwise.
+    ///
+    /// Resolved from the same request and through the same resolver as the
+    /// pin and the board key, so the three can never disagree about which
+    /// board a replica is *meant* to land on — and the address is what lets
+    /// the worker check whether it actually did ([`UNIFIED_GPU_ENV_VAR`]).
+    ///
+    /// `None` for anything unresolvable, which is the safe direction: an
+    /// unrecognised pin means we do not know what this replica will land on,
+    /// and the discrete arithmetic is the reading that never over-counts.
+    /// `None` on MPS too, and on a unified board with no address — there
+    /// would be nothing for the worker to check the claim against.
+    pub fn unified_pin_bdf(&self, requested: Option<&str>) -> Option<String> {
+        if !self.pins_are_indices() {
+            return None;
+        }
+        let key = self.resolve_board_key(requested)?;
+        self.gpus()?
+            .iter()
+            .find(|gpu| gpu.uuid == key && gpu.unified())
+            .and_then(|gpu| gpu.bdf.clone())
+    }
+
     /// The ROCm arm of [`Self::resolve_pin`] (see its docs for the full
     /// vocabulary and the reasoning). Split out because HIP's rules diverge
     /// from CUDA's at every branch: the board key translates instead of
@@ -1384,6 +1525,7 @@ fn parse_row(line: &str) -> Option<GpuInfo> {
         bdf: None,
         gfx_target_version: None,
         unified_ram_mb: None,
+        vram_carveout_mb: None,
     })
 }
 
@@ -1405,6 +1547,7 @@ mod tests {
             bdf: None,
             gfx_target_version: None,
             unified_ram_mb: None,
+            vram_carveout_mb: None,
         }
     }
 
@@ -1424,16 +1567,28 @@ mod tests {
             bdf: Some(bdf.to_owned()),
             gfx_target_version: Some(110000),
             unified_ram_mb: None,
+            vram_carveout_mb: None,
         }
     }
 
     /// A known ROCm inventory reading from `pci_devices` — a fixture tree in
     /// tests, `/sys/bus/pci/devices` in production.
     fn rocm_inventory(pci_devices: PathBuf, gpus: Vec<GpuInfo>) -> GpuInventory {
+        rocm_inventory_with(pci_devices, rocm::SysfsRoots::default().meminfo, gpus)
+    }
+
+    /// The same, with `/proc/meminfo` injected too — the unified refresh is
+    /// the only reader of it, and the only test that needs a fixture there.
+    fn rocm_inventory_with(
+        pci_devices: PathBuf,
+        meminfo: PathBuf,
+        gpus: Vec<GpuInfo>,
+    ) -> GpuInventory {
         GpuInventory {
             boards: Some(gpus.into()),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices,
+                meminfo,
                 // A knowable inventory is proof there was no ambient
                 // restriction of any layer: the probe blanks it otherwise.
                 ambient_hip_restriction: false,
@@ -1454,6 +1609,23 @@ mod tests {
         }
     }
 
+    /// A ROCm-shaped **APU** row, as `rocm.rs` builds one: unified, budgeted
+    /// against carve-out + GTT, named by the machine's RAM, and carrying the
+    /// carve-out separately.
+    fn amd_apu(index: u32, bdf: &str, carveout_mb: u64, gtt_mb: u64, ram_mb: u64) -> GpuInfo {
+        GpuInfo {
+            index,
+            uuid: format!("GPU-BDF-{bdf}"),
+            name: format!("AMD gfx1151 APU ({} GB)", ram_mb / 1024),
+            total_mb: carveout_mb + gtt_mb,
+            compute_cap: None,
+            bdf: Some(bdf.to_owned()),
+            gfx_target_version: Some(110_501),
+            unified_ram_mb: Some(ram_mb),
+            vram_carveout_mb: Some(carveout_mb),
+        }
+    }
+
     /// A ROCm host with **no** boards — the ambient-restricted, probe-failed
     /// and non-Linux shape. It is still a ROCm host: the backend, and with it
     /// the pin vocabulary and the memory interface, is what `probe_rocm`
@@ -1463,6 +1635,7 @@ mod tests {
             boards: None,
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
+                meminfo: PathBuf::from("/proc/meminfo"),
                 ambient_hip_restriction,
             },
         }
@@ -1742,7 +1915,11 @@ mod tests {
         match query {
             MemoryQuery::RocmSysfs { boards, .. } => assert_eq!(
                 &*boards,
-                &[("GPU-BDF-0000:03:00.0".to_owned(), "0000:03:00.0".to_owned())]
+                &[rocm::BoardRef {
+                    key: "GPU-BDF-0000:03:00.0".to_owned(),
+                    bdf: "0000:03:00.0".to_owned(),
+                    unified: false,
+                }]
             ),
             other => panic!("expected the sysfs query, got {other:?}"),
         }
@@ -1759,6 +1936,128 @@ mod tests {
             assert_eq!(query.free_source(), "amdgpu-sysfs");
             assert!(query.run().is_none());
         }
+    }
+
+    /// The refresh carries each board's unified flag, because the extra
+    /// files (GTT, `MemAvailable`) are read for those rows and only those:
+    /// `mem_info_gtt_*` exists for discrete boards too, so its presence
+    /// could never be the test.
+    #[test]
+    fn the_rocm_memory_query_carries_the_unified_flag() {
+        let host = rocm_inventory_with(
+            PathBuf::from("/sys/bus/pci/devices"),
+            PathBuf::from("/proc/meminfo"),
+            vec![
+                amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024),
+                amd_gpu(1, "0000:0c:00.0", 24_576),
+            ],
+        );
+        match host.memory_query() {
+            MemoryQuery::RocmSysfs {
+                boards, meminfo, ..
+            } => {
+                assert_eq!(
+                    boards.iter().map(|b| b.unified).collect::<Vec<_>>(),
+                    vec![true, false]
+                );
+                assert_eq!(meminfo, PathBuf::from("/proc/meminfo"));
+            }
+            other => panic!("expected the sysfs query, got {other:?}"),
+        }
+        // The label is unchanged: both kinds of row are amdgpu's own
+        // counters, and the worker reports the same string for the same
+        // reading (GTT-inclusive on its side too, under the DP-5 flag).
+        assert_eq!(host.memory_query().free_source(), "amdgpu-sysfs");
+    }
+
+    /// Default placement on a dGPU+APU host. The APU's *budget* dwarfs the
+    /// card's VRAM — that is what makes it worth pricing — but the two are
+    /// unlike quantities, and ranking by it would put every unpinned model
+    /// on the slower board. The comparison is by carve-out, so the dGPU wins
+    /// unless the operator gave the iGPU that memory outright in the BIOS.
+    #[test]
+    fn default_placement_prefers_a_dgpu_over_an_apu_of_larger_budget() {
+        let dgpu_wins = GpuInventory::known_rocm(vec![
+            amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024),
+            amd_gpu(1, "0000:0c:00.0", 24_576),
+        ]);
+        assert_eq!(
+            dgpu_wins.default_board_name().as_deref(),
+            Some("AMD gfx1100 (24 GB)"),
+            "a 64.5 GB nominal APU budget must not out-rank 24 GB of VRAM"
+        );
+        assert_eq!(dgpu_wins.default_pin().as_deref(), Some("1"));
+        // …unless the APU genuinely owns more memory than the card does,
+        // which on an APU means someone set it that way.
+        let apu_wins = GpuInventory::known_rocm(vec![
+            amd_apu(0, "0000:03:00.0", 96 * 1024, 16 * 1024, 128 * 1024),
+            amd_gpu(1, "0000:0c:00.0", 24_576),
+        ]);
+        assert_eq!(
+            apu_wins.default_board_name().as_deref(),
+            Some("AMD gfx1151 APU (128 GB)")
+        );
+        assert_eq!(apu_wins.default_pin().as_deref(), Some("0"));
+        // …and the carve-out alone is not the whole rank either. A 2 GB
+        // display card next to a 128 GB Strix Halo left at its BIOS default
+        // is not a board anyone wants a model on: an eighth of the unified
+        // budget (a deliberately pessimistic reading of memory shared with
+        // the whole OS) is what the APU is credited with, which beats the
+        // token card and still loses to any real one.
+        let token_card = GpuInventory::known_rocm(vec![
+            amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024),
+            amd_gpu(1, "0000:0c:00.0", 2048),
+        ]);
+        assert_eq!(
+            token_card.default_board_name().as_deref(),
+            Some("AMD gfx1151 APU (128 GB)")
+        );
+        assert_eq!(token_card.default_pin().as_deref(), Some("0"));
+        // Nothing about the ranking changed for discrete boards.
+        assert_eq!(
+            GpuInventory::known(vec![
+                sized_gpu(0, "GPU-small", "12.0", 8192),
+                sized_gpu(1, "GPU-big", "12.0", 24_576),
+            ])
+            .default_pin()
+            .as_deref(),
+            Some("GPU-big")
+        );
+    }
+
+    /// DP-5's resolver: the **address** of the board a registry entry names,
+    /// when that board is unified — answered from the same request the pin
+    /// and the board key are, and an address rather than a flag so the
+    /// worker can check the claim against the board it actually came up on.
+    #[test]
+    fn a_unified_pin_resolves_to_its_boards_address() {
+        let host = GpuInventory::known_rocm(vec![
+            amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024),
+            amd_gpu(1, "0000:0c:00.0", 24_576),
+        ]);
+        let apu = Some("0000:03:00.0".to_owned());
+        assert_eq!(host.unified_pin_bdf(Some("0")), apu);
+        assert_eq!(host.unified_pin_bdf(Some("GPU-BDF-0000:03:00.0")), apu);
+        assert_eq!(host.unified_pin_bdf(Some("1")), None);
+        assert_eq!(
+            host.unified_pin_bdf(None),
+            None,
+            "an unpinned replica lands on the default board, which is the dGPU"
+        );
+        // A pin naming nothing this host enumerated: the discrete
+        // arithmetic is the reading that never over-counts, so unknown
+        // resolves to nothing rather than to a claim.
+        assert_eq!(host.unified_pin_bdf(Some("7")), None);
+        assert_eq!(host.unified_pin_bdf(Some("GPU-1a2b")), None);
+        // An APU-only host: the default board *is* the unified one.
+        let apu_only =
+            GpuInventory::known_rocm(vec![amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024)]);
+        assert_eq!(apu_only.unified_pin_bdf(None), apu);
+        // Never on the other backends: a CUDA board is not unified, and an
+        // MPS worker's tiers are unified by construction and read no flag.
+        assert_eq!(inventory().unified_pin_bdf(None), None);
+        assert_eq!(mps_inventory(128).unified_pin_bdf(None), None);
+        assert_eq!(uninventoried_rocm(false).unified_pin_bdf(Some("0")), None);
     }
 
     /// The refresh is total or withdrawn. A row without a PCI address
@@ -2287,6 +2586,7 @@ mod tests {
             boards: Some(vec![amd_gpu(0, "0000:03:00.0", 24576)].into()),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
+                meminfo: PathBuf::from("/proc/meminfo"),
                 ambient_hip_restriction: true,
             },
         };

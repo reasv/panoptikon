@@ -81,7 +81,7 @@
 //! deflation, ramp position, outstanding grants — is deliberately never
 //! persisted.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -112,6 +112,26 @@ pub const CONSERVATIVE_BASE_MB: u64 = 4096;
 /// and the amdgpu `total − used` skew all shave a little — and on a small
 /// board 5% is a couple of hundred MB, which is inside that noise.
 const TOTAL_MEMORY_TOLERANCE_MB: u64 = 512;
+
+/// How far a second source's total-memory reading may sit from a figure of
+/// `mb` and still be taken as describing it: 5%, floored at
+/// [`TOTAL_MEMORY_TOLERANCE_MB`] — but never more than a quarter of the
+/// figure itself.
+///
+/// The quarter is what keeps the absolute floor from swallowing small
+/// figures whole. It was written for board totals, where 512 MB is inside
+/// the noise; applied to an AMD APU's BIOS carve-out (512 MB is a common
+/// default) it would accept anything from 0 to 1 GB — a ±100% window, which
+/// is not a check. Nothing at dGPU scale moves: the 5% term wins above
+/// 10 GB, and the floor still wins between 2 and 10 GB exactly as before.
+fn total_tolerance_mb(mb: u64) -> u64 {
+    (mb / 20).max(TOTAL_MEMORY_TOLERANCE_MB.min(mb / 4))
+}
+
+/// Whether `reported` describes `figure` within [`total_tolerance_mb`].
+fn totals_agree(figure: u64, reported: u64) -> bool {
+    reported.abs_diff(figure) <= total_tolerance_mb(figure)
+}
 
 /// Pre-fit stand-in for "one seed batch" in MB. Before a fit there is no
 /// slope, so the contention floor cannot be priced; this is the flat floor
@@ -948,6 +968,14 @@ struct GpuLedger {
     /// board's memory is the machine's: DP-2's death-as-negative-sample, and
     /// DP-4's bound on the authoritative total below.
     unified_ram_mb: Option<u64>,
+    /// The device-local VRAM carve-out of a unified ROCm board
+    /// (`GpuInfo::vram_carveout_mb`); `None` everywhere else. The
+    /// registration cross-check accepts a worker total matching **either**
+    /// this or [`Self::total_mb`], because what HIP reports as an APU's
+    /// `total_memory` — the carve-out, the carve+GTT sum, or something else
+    /// again — is unverified until a BC-250 field pass, and a mismatch must
+    /// not refuse admission while the answer is unknown.
+    vram_carveout_mb: Option<u64>,
     /// This board's `total_mb` is the figure a worker reported rather than
     /// the probe's seed (DP-4). Once true it stays true: the first report
     /// wins, and a later replica's identical figure has nothing to add.
@@ -991,6 +1019,10 @@ struct LedgerState {
     /// route them to their dispatchers. The ledger cannot call a worker
     /// itself — dispatchers own workers — so this is a signal, not an action.
     pending_trims: Vec<TrimRequest>,
+    /// `(model, board key)` pairs whose free samples were already reported as
+    /// describing another board's memory — the once-per-replica guard on
+    /// that WARN (see [`VramLedger::record_free_locked`]).
+    free_total_mismatch_logged: HashSet<(String, String)>,
     next_id: u64,
     next_fit_version: u64,
 }
@@ -1048,6 +1080,11 @@ enum BoardLog {
         board: String,
         board_bdf: Option<String>,
         board_total_mb: u64,
+        /// The other figure a unified ROCm board's total was allowed to
+        /// match (its carve-out); `None` on every discrete board. Named in
+        /// the refusal so a field report shows both candidates rather than
+        /// leaving an APU mismatch looking like a single-figure disagreement.
+        board_carveout_mb: Option<u64>,
         worker_bdf: Option<String>,
         worker_uuid: Option<String>,
         worker_total_mb: Option<u64>,
@@ -1142,6 +1179,7 @@ impl BoardLog {
                 board,
                 board_bdf,
                 board_total_mb,
+                board_carveout_mb,
                 worker_bdf,
                 worker_uuid,
                 worker_total_mb,
@@ -1166,6 +1204,7 @@ impl BoardLog {
                     board = %board,
                     board_bdf = board_bdf.as_deref().unwrap_or("<none>"),
                     board_total_mb,
+                    board_carveout_mb = ?board_carveout_mb,
                     worker_bdf = worker_bdf.as_deref().unwrap_or("<none>"),
                     worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
                     worker_total_mb = ?worker_total_mb,
@@ -1307,6 +1346,7 @@ impl VramLedger {
                         name: gpu.name.clone(),
                         total_mb: gpu.total_mb,
                         unified_ram_mb: gpu.unified_ram_mb,
+                        vram_carveout_mb: gpu.vram_carveout_mb,
                         total_adopted: false,
                         bdf: gpu.bdf.as_deref().map(str::to_ascii_lowercase),
                         free: None,
@@ -1656,6 +1696,20 @@ impl VramLedger {
     /// non-UUID identification is the right board at all, so "unknown"
     /// cannot pass it; the cost of a false refusal is one unpriced replica,
     /// the cost of a false admission is every grant on that board.
+    ///
+    /// # Unified ROCm boards: either figure passes
+    ///
+    /// An APU's admission total is its BIOS carve-out **plus** GTT, and what
+    /// HIP reports as that device's `total_memory` is not known: it may be
+    /// the carve-out alone, the sum, or something else again, and no fixture
+    /// can settle it — only a BC-250 field pass can. So a report matching
+    /// *either* figure, each within its own tolerance, is accepted
+    /// (docs/unified-memory-admission.md, backend B). The alternative would
+    /// be refusing admission on every APU host over an unknown, which is the
+    /// unpriced path this whole backend exists to leave. It costs nothing on
+    /// a discrete board, where there is no second figure to match, and the
+    /// carve-out is far enough below the sum on any real APU that the two
+    /// tolerances cannot overlap into "anything passes".
     fn cross_check_total(
         state: &LedgerState,
         report: &LoadReport,
@@ -1664,9 +1718,14 @@ impl VramLedger {
         matched_by: &'static str,
         expected_board: Option<&str>,
     ) -> Option<BoardLog> {
-        let tolerance = (board.total_mb / 20).max(TOTAL_MEMORY_TOLERANCE_MB);
-        if let Some(total) = report.gpu_total_mb {
-            if total.abs_diff(board.total_mb) <= tolerance {
+        let tolerance = total_tolerance_mb(board.total_mb);
+        // A reported **zero** is refused on every board and never reaches the
+        // window arithmetic: it is the shape of a driver that answered
+        // without knowing, not of a board, and on a small enough figure a
+        // tolerance window would otherwise reach down to it.
+        if let Some(total) = report.gpu_total_mb.filter(|total| *total > 0) {
+            let agrees = |figure: u64| totals_agree(figure, total);
+            if agrees(board.total_mb) || board.vram_carveout_mb.is_some_and(agrees) {
                 return None;
             }
         }
@@ -1675,6 +1734,7 @@ impl VramLedger {
             board: key.to_owned(),
             board_bdf: board.bdf.clone(),
             board_total_mb: board.total_mb,
+            board_carveout_mb: board.vram_carveout_mb,
             worker_bdf: report.gpu_bdf.clone(),
             worker_uuid: report.gpu_uuid.clone(),
             worker_total_mb: report.gpu_total_mb,
@@ -1731,15 +1791,28 @@ impl VramLedger {
     /// load.
     ///
     /// Scoped as tightly as the facts allow: exactly one board in the
-    /// ledger, that board unified, and a report that names **no other board**
-    /// (no UUID, no PCI address). A report carrying positive evidence of some
-    /// other device is not this board's total, whatever else is true.
+    /// ledger, that board unified, that board carrying **no PCI address**,
+    /// and a report that names **no other board** (no UUID, no PCI address).
+    /// A report carrying positive evidence of some other device is not this
+    /// board's total, whatever else is true.
+    ///
+    /// The address condition is what keeps this an MPS mechanism. A unified
+    /// **ROCm** board (an APU) has an address, and its total is read from
+    /// amdgpu's own counters rather than being a policy number only the
+    /// worker can see — while what HIP reports for it may well be the BIOS
+    /// carve-out, a figure that passes the sanity bound and would replace a
+    /// 96 GB budget with 512 MB. Adoption is for the board whose real total
+    /// *nothing else can read*; the APU is instead cross-checked against
+    /// either figure (see [`Self::cross_check_total`]).
     fn adopt_unified_total_locked(state: &mut LedgerState, report: &LoadReport) -> Option<BoardLog> {
         let reported = report.gpu_total_mb?;
         if state.gpus.len() != 1 || report.gpu_uuid.is_some() || report.gpu_bdf.is_some() {
             return None;
         }
         let (key, board) = state.gpus.iter_mut().next().expect("length checked");
+        if board.bdf.is_some() {
+            return None;
+        }
         let ram_mb = board.unified_ram_mb?;
         let previous_total_mb = board.total_mb;
         if reported == 0 || reported > ram_mb {
@@ -1751,8 +1824,7 @@ impl VramLedger {
             });
         }
         if board.total_adopted {
-            let tolerance = (previous_total_mb / 20).max(TOTAL_MEMORY_TOLERANCE_MB);
-            if reported.abs_diff(previous_total_mb) <= tolerance {
+            if totals_agree(previous_total_mb, reported) {
                 return None;
             }
             board.total_mb = reported;
@@ -1867,7 +1939,15 @@ impl VramLedger {
         // else were on it — until the staleness refresh happens to land.
         if let Some(sample) = report.memory.as_ref() {
             if let (Some(free), Some(source)) = (sample.free_mb, sample.free_source.clone()) {
-                Self::record_free_locked(&mut state, &gpu, free, source, loaded_at);
+                Self::record_free_locked(
+                    &mut state,
+                    &gpu,
+                    free,
+                    source,
+                    loaded_at,
+                    sample.total_mb,
+                    Some(inference_id),
+                );
             }
         }
         Self::seed_calibration_locked(
@@ -2216,17 +2296,77 @@ impl VramLedger {
     /// Record a free-memory reading for a board, honouring the source
     /// precedence in [`free_source_is_authoritative`] and never going
     /// backwards in time.
+    ///
+    /// `reported_total_mb` is the **same sample's** total, when it carries
+    /// one, and it is a currency check: an authoritative free reading whose
+    /// own total disagrees with the board's is not a reading of this board's
+    /// memory at all, and `external = total − free − ours` would turn the
+    /// difference into phantom headroom (or phantom pressure). The case that
+    /// motivates it is a unified ROCm board: a worker that landed somewhere
+    /// other than the board its pin named, or one whose GTT-inclusive
+    /// arithmetic did not agree with the orchestrator's, reports free memory
+    /// in a different currency under the *same* authoritative
+    /// `"amdgpu-sysfs"` label. The worker-side BDF check (DP-5,
+    /// `gpu::UNIFIED_GPU_ENV_VAR`) is the primary guard; this is the one
+    /// that does not depend on the worker cooperating.
+    ///
+    /// `model` is for the log line only. The orchestrator's own staleness
+    /// refresh passes `None` for both: its totals are not worker claims, and
+    /// on MPS `mps::query_memory` deliberately reports *physical RAM* there
+    /// rather than the board's policy total, so checking it would drop every
+    /// refresh on that backend.
     fn record_free_locked(
         state: &mut LedgerState,
         gpu: &str,
         free_mb: u64,
         source: String,
         at: Instant,
+        reported_total_mb: Option<u64>,
+        model: Option<&str>,
     ) {
         let Some(board) = state.gpus.get_mut(gpu) else {
             return;
         };
         let authoritative = free_source_is_authoritative(&source);
+        if let Some(total) = reported_total_mb.filter(|_| authoritative) {
+            let key = || (model.unwrap_or("<unknown>").to_owned(), gpu.to_owned());
+            if totals_agree(board.total_mb, total) {
+                // Agreement clears the once-per-replica guard, so a *later*
+                // genuine mismatch is reported instead of being swallowed as
+                // a repeat. The two cases that make this reachable are both
+                // real: a unified board whose total was re-adopted under a
+                // running gateway (DP-4), and a replica whose first sample
+                // arrived while something else was still settling.
+                if !state.free_total_mismatch_logged.is_empty() {
+                    state.free_total_mismatch_logged.remove(&key());
+                }
+            } else {
+                if state.free_total_mismatch_logged.insert(key()) {
+                    // Emitted under the ledger lock, unlike the registration
+                    // alarms: this fires at most once per (model, board) and
+                    // only on a fault path, so it cannot become the log write
+                    // every concurrent grant request queues behind.
+                    tracing::warn!(
+                        model = model.unwrap_or("<unknown>"),
+                        board = gpu,
+                        source = %source,
+                        board_total_mb = board.total_mb,
+                        reported_total_mb = total,
+                        tolerance_mb = total_tolerance_mb(board.total_mb),
+                        mismatch = "free-sample total",
+                        "discarding this worker's free-memory samples for the \
+                         board it was admitted under: the sample's own total \
+                         does not describe that board, so its free figure is \
+                         in a different currency and the external-usage term \
+                         derived from it would be fiction. On ROCm this is \
+                         what a replica that came up on a board other than \
+                         the one its pin named looks like, or a unified board \
+                         whose worker-side GTT accounting did not engage"
+                    );
+                }
+                return;
+            }
+        }
         if !authoritative && board.seen_authoritative_free {
             // Still telemetry — the worker's own pool size from the same sample
             // is recorded by the caller — but it must not move the board's free
@@ -2971,7 +3111,19 @@ impl VramLedger {
             if let (Some(free), Some(source)) =
                 (stamped.value.free_mb, stamped.value.free_source.clone())
             {
-                Self::record_free_locked(state, &gpu, free, source, stamped.captured_at);
+                let model = state
+                    .workers
+                    .get(&worker)
+                    .map(|entry| entry.inference_id.clone());
+                Self::record_free_locked(
+                    state,
+                    &gpu,
+                    free,
+                    source,
+                    stamped.captured_at,
+                    stamped.value.total_mb,
+                    model.as_deref(),
+                );
             }
         }
 
@@ -3312,6 +3464,7 @@ impl VramLedger {
         let Some(entry) = state.workers.get(&worker) else {
             return;
         };
+        let model = entry.inference_id.clone();
         let gpu = entry.gpu.clone();
         let telemetry = Arc::clone(&entry.telemetry);
         let seen_at = entry.reserved_seen_at;
@@ -3335,7 +3488,15 @@ impl VramLedger {
         if let (Some(free), Some(source)) =
             (stamped.value.free_mb, stamped.value.free_source.clone())
         {
-            Self::record_free_locked(&mut state, &gpu, free, source, stamped.captured_at);
+            Self::record_free_locked(
+                &mut state,
+                &gpu,
+                free,
+                source,
+                stamped.captured_at,
+                stamped.value.total_mb,
+                Some(&model),
+            );
         }
     }
 
@@ -3397,7 +3558,21 @@ impl VramLedger {
                     if uuid == gpu {
                         answered = true;
                     }
-                    Self::record_free_locked(&mut state, &uuid, free_mb, source.to_owned(), at);
+                    // No total and no model: this is the orchestrator's own
+                    // driver reading, not a worker's claim about which board
+                    // it is on — and `MemoryQuery::Mps` deliberately reports
+                    // physical RAM in that field rather than the board's
+                    // policy total, so checking it would drop every refresh
+                    // on that backend.
+                    Self::record_free_locked(
+                        &mut state,
+                        &uuid,
+                        free_mb,
+                        source.to_owned(),
+                        at,
+                        None,
+                        None,
+                    );
                 }
             }
             // Only the board this refresh was started for clears its own
@@ -3583,6 +3758,7 @@ impl VramLedger {
                         name: (*name).to_owned(),
                         total_mb: *total_mb,
                         unified_ram_mb: None,
+                        vram_carveout_mb: None,
                         total_adopted: false,
                         bdf: bdf.map(str::to_ascii_lowercase),
                         free: None,
@@ -4292,12 +4468,28 @@ mod tests {
 
     /// Push a memory sample (our pool size + the board's free reading) the
     /// way a predict response does.
+    /// A device sample with **no** total. Deliberately: a sample's own total
+    /// is now a currency check on its free figure
+    /// ([`VramLedger::record_free_locked`]), so a fixture that hard-coded one
+    /// would silently be asserting that check rather than whatever the test
+    /// is about — and every board these tests build has a different total.
+    /// The check itself is covered by [`push_memory_with_total`].
     fn push_memory(handle: &TelemetryHandle, free_mb: u64, reserved_mb: u64) {
+        push_memory_with_total(handle, free_mb, reserved_mb, None, "nvml");
+    }
+
+    fn push_memory_with_total(
+        handle: &TelemetryHandle,
+        free_mb: u64,
+        reserved_mb: u64,
+        total_mb: Option<u64>,
+        source: &str,
+    ) {
         let mut telemetry = handle.lock().unwrap();
         telemetry.memory = Some(Timestamped::now(MemorySample {
             free_mb: Some(free_mb),
-            total_mb: Some(32_000),
-            free_source: Some("nvml".to_owned()),
+            total_mb,
+            free_source: Some(source.to_owned()),
             reserved_mb: Some(reserved_mb),
             allocated_mb: Some(reserved_mb),
         }));
@@ -6200,6 +6392,7 @@ mod tests {
             bdf: Some(bdf.to_owned()),
             gfx_target_version: Some(110_000),
             unified_ram_mb: None,
+            vram_carveout_mb: None,
         };
         let inventory =
             GpuInventory::known_rocm(vec![amd(0, "0000:03:00.0"), amd(1, "0000:0c:00.0")]);
@@ -6254,6 +6447,7 @@ mod tests {
             bdf: Some(bdf.to_owned()),
             gfx_target_version: Some(110_000),
             unified_ram_mb: None,
+            vram_carveout_mb: None,
         };
         let inventory = GpuInventory::known_rocm(vec![
             amd(0, "0000:03:00.0", 24_576),
@@ -6649,6 +6843,299 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Unified boards: AMD APUs (docs/unified-memory-admission.md, backend B)
+    // ------------------------------------------------------------------
+
+    /// The BIOS UMA carve-out amdgpu publishes as an APU's whole VRAM total.
+    const APU_CARVEOUT_MB: u64 = 512;
+    /// Carve-out + GTT: what admission actually budgets against.
+    const APU_TOTAL_MB: u64 = APU_CARVEOUT_MB + 64 * 1024;
+
+    /// An APU row as `rocm.rs` builds one, at `0000:03:00.0`.
+    fn apu_board(index: u32) -> crate::inferio::gpu::GpuInfo {
+        crate::inferio::gpu::GpuInfo {
+            index,
+            uuid: AMD_A.to_owned(),
+            name: "AMD gfx1151 APU (128 GB)".to_owned(),
+            total_mb: APU_TOTAL_MB,
+            compute_cap: None,
+            bdf: Some("0000:03:00.0".to_owned()),
+            gfx_target_version: Some(110_501),
+            unified_ram_mb: Some(128 * 1024),
+            vram_carveout_mb: Some(APU_CARVEOUT_MB),
+        }
+    }
+
+    fn apu_ledger(boards: Vec<crate::inferio::gpu::GpuInfo>) -> Arc<VramLedger> {
+        VramLedger::new(
+            &GpuInventory::known_rocm(boards),
+            VramBudget::default().into(),
+            None,
+        )
+    }
+
+    /// The either-of cross-check. What HIP reports as an APU's
+    /// `total_memory` is genuinely unknown until a BC-250 field pass — the
+    /// carve-out, the carve+GTT sum, or something else again — so **both**
+    /// plausible figures admit, and only a number that is neither is refused.
+    /// Refusing on the unknown would leave every APU host unpriced, which is
+    /// the state this backend exists to end.
+    #[test]
+    fn an_apu_replica_is_admitted_on_either_total() {
+        // Two boards, so the address is what identifies the replica and the
+        // cross-check is really gating a BDF match rather than the
+        // single-board fallback.
+        let dgpu = crate::inferio::gpu::GpuInfo {
+            index: 1,
+            uuid: AMD_B.to_owned(),
+            name: "AMD gfx1100 (24 GB)".to_owned(),
+            total_mb: 24_576,
+            compute_cap: None,
+            bdf: Some("0000:0c:00.0".to_owned()),
+            gfx_target_version: Some(110_000),
+            unified_ram_mb: None,
+            vram_carveout_mb: None,
+        };
+        for reported in [APU_CARVEOUT_MB, APU_TOTAL_MB] {
+            let ledger = apu_ledger(vec![apu_board(0), dgpu.clone()]);
+            let handle = loaded_rocm(Some("0000:03:00.0"), Some(reported));
+            let _admission = ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .unwrap_or_else(|| panic!("a HIP total of {reported} MiB must admit"));
+            assert_eq!(admitted_board(&ledger, 0).0, AMD_A);
+            let board = ledger
+                .health()
+                .into_iter()
+                .find(|board| board.gpu_uuid == AMD_A)
+                .expect("the APU");
+            assert_eq!(
+                board.total_mb, APU_TOTAL_MB,
+                "and the budget is the ledger's own figure either way — the \
+                 report identifies the board, it does not re-price it"
+            );
+        }
+        // A figure that is neither is still a refusal: the either-of rule
+        // widens the check by exactly one candidate, it does not remove it.
+        let ledger = apu_ledger(vec![apu_board(0), dgpu.clone()]);
+        assert!(
+            ledger
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &loaded_rocm(Some("0000:03:00.0"), Some(8192)),
+                    None
+                )
+                .is_none(),
+            "8 GB is neither the carve-out nor the unified total"
+        );
+        // And an absent total fails as everywhere else: this check is the
+        // only evidence a non-UUID match is the right board at all.
+        let ledger = apu_ledger(vec![apu_board(0), dgpu]);
+        assert!(
+            ledger
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &loaded_rocm(Some("0000:03:00.0"), None),
+                    None
+                )
+                .is_none()
+        );
+    }
+
+    /// The cross-check's window, at both edges and on both candidates. The
+    /// tolerance is 5% floored at 512 MB — but never more than a quarter of
+    /// the figure, or a 512 MB carve-out would accept anything from 0 to
+    /// 1 GB, which is not a check at all. And a reported **zero** is refused
+    /// on every board: it is the shape of a driver that answered without
+    /// knowing.
+    #[test]
+    fn the_either_of_window_is_bounded_at_both_candidates() {
+        let admits = |reported: u64| {
+            apu_ledger(vec![apu_board(0)])
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &loaded_rocm(Some("0000:03:00.0"), Some(reported)),
+                    None,
+                )
+                .is_some()
+        };
+        // The carve-out candidate: 512 MB, so the window is ±128 MB
+        // (a quarter), not ±512 MB.
+        assert_eq!(total_tolerance_mb(APU_CARVEOUT_MB), 128);
+        assert!(admits(APU_CARVEOUT_MB + 128));
+        assert!(admits(APU_CARVEOUT_MB - 128));
+        assert!(!admits(APU_CARVEOUT_MB + 129));
+        assert!(!admits(APU_CARVEOUT_MB - 129));
+        // The unified-total candidate: 5% of 66048 MB.
+        let tolerance = total_tolerance_mb(APU_TOTAL_MB);
+        assert_eq!(tolerance, APU_TOTAL_MB / 20);
+        assert!(admits(APU_TOTAL_MB + tolerance));
+        assert!(!admits(APU_TOTAL_MB + tolerance + 1));
+        assert!(!admits(0), "zero is not a board");
+        // Nothing moved at dGPU scale: 5% above 10 GB, the 512 MB floor
+        // between 2 and 10 GB, exactly as before.
+        assert_eq!(total_tolerance_mb(24_576), 1228);
+        assert_eq!(total_tolerance_mb(8192), 512);
+        assert_eq!(total_tolerance_mb(2048), 512);
+    }
+
+    /// FIX-1's second guard, and the one that does not depend on the worker
+    /// cooperating: a free sample whose **own total** does not describe the
+    /// board it was admitted under is dropped, because `external = total −
+    /// free − ours` would otherwise turn the currency difference into
+    /// headroom. The case that motivates it is a ROCm replica that came up on
+    /// a board other than the one its pin named, reporting GTT-inclusive
+    /// figures under the authoritative `"amdgpu-sysfs"` label.
+    #[test]
+    fn a_free_sample_whose_total_names_another_board_is_dropped() {
+        let ledger = apu_ledger(vec![apu_board(0)]);
+        let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        assert!(!ledger.health()[0].external_known, "no reading yet");
+
+        // A dGPU's-worth of free memory reported against the APU's board:
+        // 24 GB free of a 24 GB board, on a board the ledger knows as 64.5 GB.
+        // Taken at face value this would price 41 GB of external usage on an
+        // idle machine — or, with the mis-landing the other way round, hand
+        // out 64 GB of a 24 GB card.
+        push_memory_with_total(&handle, 24_000, 0, Some(24_576), "amdgpu-sysfs");
+        ledger.ingest_all_for_test();
+        assert!(
+            !ledger.health()[0].external_known,
+            "the sample is discarded, not averaged in"
+        );
+
+        assert_eq!(
+            ledger.lock().free_total_mismatch_logged.len(),
+            1,
+            "and it said so once"
+        );
+
+        // The same worker reporting this board's own currency lands.
+        push_memory_with_total(&handle, 60_000, 0, Some(APU_TOTAL_MB), "amdgpu-sysfs");
+        ledger.ingest_all_for_test();
+        let board = &ledger.health()[0];
+        assert!(board.external_known);
+        assert_eq!(board.external_mb, APU_TOTAL_MB - 60_000 - 1000);
+        // Agreement clears the once-per-replica log guard, so a *later*
+        // genuine mismatch is reported rather than swallowed as a repeat —
+        // a live re-adoption (DP-4) makes that sequence reachable.
+        assert!(ledger.lock().free_total_mismatch_logged.is_empty());
+    }
+
+    /// …and the guard is a no-op for every well-behaved worker on all three
+    /// backends: CUDA (NVML's total is the board's), MPS (the worker's
+    /// `recommended_max_memory` is the figure the board's total was adopted
+    /// *from*, and adoption runs first) and a flagged APU (carve+GTT on both
+    /// sides). A non-authoritative source is never checked at all — the
+    /// board's free reading does not move on one either.
+    #[test]
+    fn well_behaved_samples_still_land_on_every_backend() {
+        // CUDA.
+        let cuda = ledger(32_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let _admission = cuda
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory_with_total(&handle, 20_000, 0, Some(32_000), "nvml");
+        cuda.ingest_all_for_test();
+        assert_eq!(cuda.health()[0].external_mb, 32_000 - 20_000 - 1000);
+
+        // MPS: the load report adopts the board's total, and the sample that
+        // rides with that same report carries the very figure it adopted —
+        // so the ordering is what keeps this from dropping the first sample
+        // a Mac ever reports.
+        let mps = mps_ledger();
+        let raised = MAC_RAM_MB / 10 * 9;
+        let handle = loaded_mps(Some(raised));
+        {
+            let mut telemetry = handle.lock().unwrap();
+            let load = telemetry.load.as_mut().expect("the load report");
+            load.value.memory = Some(MemorySample {
+                free_mb: Some(raised / 2),
+                total_mb: Some(raised),
+                free_source: Some("mps".to_owned()),
+                reserved_mb: Some(0),
+                allocated_mb: Some(0),
+            });
+        }
+        let _admission = mps
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        let board = &mps.health()[0];
+        assert!(
+            board.external_known,
+            "the load-report sample landed against the adopted total"
+        );
+        assert_eq!(board.external_mb, raised - raised / 2 - 1000);
+
+        // A flagged APU worker: carve+GTT on both sides.
+        let apu = apu_ledger(vec![apu_board(0)]);
+        let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
+        let _admission = apu
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory_with_total(&handle, 60_000, 0, Some(APU_TOTAL_MB), "amdgpu-sysfs");
+        apu.ingest_all_for_test();
+        let board = &apu.health()[0];
+        assert!(board.external_known);
+        assert_eq!(board.external_mb, APU_TOTAL_MB - 60_000 - 1000);
+    }
+
+    /// DP-4's adoption is an **MPS** mechanism and must not touch an APU.
+    /// The APU's total comes from amdgpu's own counters, while HIP may well
+    /// report the BIOS carve-out for it — a figure inside the sanity bound
+    /// that would replace a 64 GB budget with 512 MB. The board carrying a
+    /// PCI address is what scopes it out.
+    #[test]
+    fn an_apus_total_is_never_adopted_from_a_worker() {
+        let ledger = apu_ledger(vec![apu_board(0)]);
+        // The shape that would otherwise adopt: one board, and a report with
+        // neither a UUID nor an address (an older ROCm torch whose fdinfo
+        // fallback found nothing either).
+        let handle = loaded_rocm(None, Some(APU_CARVEOUT_MB));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("the single-board fallback still admits it");
+        assert_eq!(
+            ledger.health()[0].total_mb,
+            APU_TOTAL_MB,
+            "the carve-out must not become this board's budget"
+        );
+    }
+
+    /// DP-2 is not MPS-specific: a replica that dies with a granted window
+    /// in flight on **any** unified board is a memory negative, and an APU's
+    /// memory is the machine's in exactly the way that makes the Linux OOM
+    /// killer the likely cause.
+    #[test]
+    fn a_death_mid_window_deflates_a_unified_rocm_board() {
+        let ledger = apu_ledger(vec![apu_board(0)]);
+        let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 60_000, 0);
+        measured_window(&handle, &admission, 16);
+        assert_eq!(ledger.health()[0].workers[0].max_units_measured, 16);
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::WorkerDied);
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.deflation, 1);
+        assert_eq!(
+            worker.max_units_measured, 8,
+            "the anchor is halved, and that is the part that outlives the \
+             replica the manager is about to respawn"
+        );
+    }
+
     /// The halving is **runtime-only**: it must never reach the calibration
     /// store, because a stored anchor is a claim about a batch size this
     /// machine once ran and no death unmeasures one. The write policy alone
@@ -7005,6 +7492,7 @@ mod tests {
         assert_eq!(
             GpuMemoryQuery::RocmSysfs {
                 pci_devices: std::path::PathBuf::from("/sys/bus/pci/devices"),
+                meminfo: std::path::PathBuf::from("/proc/meminfo"),
                 boards: Vec::new().into(),
             }
             .free_source(),
@@ -7053,6 +7541,7 @@ mod tests {
                 name: "TEST 9000".to_owned(),
                 total_mb: 10_000,
                 unified_ram_mb: None,
+                vram_carveout_mb: None,
                 total_adopted: false,
                 bdf: None,
                 free,

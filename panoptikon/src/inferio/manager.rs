@@ -1385,6 +1385,17 @@ impl ModelManager {
             .iter()
             .map(|pin| self.cfg.gpus.resolve_board_key(pin.as_deref()))
             .collect();
+        // And into the third thing one registry entry decides: the address of
+        // the board it names, when that board is a unified one whose worker
+        // has to count GTT as its own (DP-5). Resolved from the same entries
+        // as the other two so the three cannot disagree about which board a
+        // replica is meant to land on — and handed to the worker as an
+        // address rather than a flag, so it can tell whether it did.
+        let unified_boards: Vec<Option<String>> = spec
+            .device_pins
+            .iter()
+            .map(|pin| self.cfg.gpus.unified_pin_bdf(pin.as_deref()))
+            .collect();
         // A prewarmed process was spawned before this model's just-in-time
         // external inputs were resolved. Models with explicit worker env
         // must therefore use a fresh process.
@@ -1436,21 +1447,26 @@ impl ModelManager {
                 };
                 let spec = &spec;
                 let device = device.clone();
+                let unified = unified_boards[replica].clone();
                 async move {
+                    let spawn = self.cfg.spawn.for_unified_board(unified.as_deref());
                     let mut worker = match claimed {
                         Some(worker) => {
                             match self
-                                .configure_claimed(worker, inference_id, spec, device.clone())
+                                .configure_claimed(
+                                    worker,
+                                    inference_id,
+                                    spec,
+                                    device.clone(),
+                                    &spawn,
+                                )
                                 .await
                             {
                                 Ok(worker) => worker,
                                 Err(err) => return Err(err),
                             }
                         }
-                        None => {
-                            Worker::spawn_configured(&self.cfg.spawn, inference_id, spec, device)
-                                .await?
-                        }
+                        None => Worker::spawn_configured(&spawn, inference_id, spec, device).await?,
                     };
                     if let Err(err) = worker.load().await {
                         // A load `error` frame leaves the worker alive; kill it
@@ -1535,6 +1551,10 @@ impl ModelManager {
         inference_id: &str,
         spec: &SpawnSpec,
         device: Option<String>,
+        // The caller's per-replica spawn config (`for_unified_board`), so a
+        // respawn after a dead pooled worker gets the same environment the
+        // fresh path would have given it.
+        spawn: &WorkerSpawnConfig,
     ) -> Result<Worker> {
         match worker.configure(inference_id, &spec.config_kwargs).await {
             Ok(()) => Ok(worker),
@@ -1548,7 +1568,7 @@ impl ModelManager {
                     "claimed prewarmed worker died before configure; falling back to a fresh spawn: {err:#}"
                 );
                 // The fatal path already killed and reaped the child.
-                Worker::spawn_configured(&self.cfg.spawn, inference_id, spec, device).await
+                Worker::spawn_configured(spawn, inference_id, spec, device).await
             }
         }
     }
@@ -2930,6 +2950,7 @@ config.replicas = 2
                 bdf: None,
                 gfx_target_version: None,
                 unified_ram_mb: None,
+                vram_carveout_mb: None,
             },
             GpuInfo {
                 index: 3,
@@ -2940,6 +2961,7 @@ config.replicas = 2
                 bdf: None,
                 gfx_target_version: None,
                 unified_ram_mb: None,
+                vram_carveout_mb: None,
             },
         ])
     }
@@ -3058,6 +3080,7 @@ config.replicas = 2
             bdf: Some(bdf.to_owned()),
             gfx_target_version: Some(110_000),
             unified_ram_mb: None,
+            vram_carveout_mb: None,
         };
         GpuInventory::known_rocm(vec![board(3, "0000:03:00.0"), board(7, "0000:0c:00.0")])
     }

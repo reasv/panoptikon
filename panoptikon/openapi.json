@@ -6227,6 +6227,15 @@
           "uuid": {
             "type": "string",
             "description": "Board UUID (`GPU-…`), the budget/ledger key and the pin form CUDA\naccepts directly in `CUDA_VISIBLE_DEVICES`. On ROCm it is the fused\nKFD `unique_id` or a synthetic `GPU-BDF-…` (see `rocm.rs`) — an\nidentity, not a pin form, because HIP only accepts indices."
+          },
+          "vram_carveout_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The device-local VRAM carve-out of a unified **ROCm** board (an APU's\n`mem_info_vram_total`), in MiB — the part of [`Self::total_mb`] that\nis not GTT. `None` on every other board, including MPS, where no such\nsplit exists.\n\nIt is carried because the carve-out is a figure other components\nlegitimately mean by \"this board's memory\", and they must not be\nrefused for it. HIP's `total_memory` on an APU may report the\ncarve-out, the carve+GTT sum, or something else again — unverified\nuntil a BC-250 field pass — so the registration cross-check accepts\n**either**. It is also the placement rank\n([`Self::placement_total_mb`]).",
+            "minimum": 0
           }
         }
       },

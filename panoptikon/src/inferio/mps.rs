@@ -103,6 +103,9 @@ pub(super) fn board(facts: &HostFacts) -> GpuInfo {
         bdf: None,
         gfx_target_version: None,
         unified_ram_mb: Some(ram_mb),
+        // No carve-out/GTT split exists on Apple Silicon: the whole board is
+        // one pool, and the total above is the policy budget over it.
+        vram_carveout_mb: None,
     }
 }
 

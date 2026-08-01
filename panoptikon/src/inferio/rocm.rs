@@ -17,9 +17,16 @@
 //! - `/sys/bus/pci/devices/<bdf>/mem_info_vram_{total,used}` — amdgpu's own
 //!   per-board counters, and the *same files* the worker's free/total tier
 //!   reads (D4), which is what makes the ledger's one-memory-vocabulary
-//!   rule hold by construction rather than by matching two drivers.
+//!   rule hold by construction rather than by matching two drivers. On an
+//!   **APU** the `mem_info_gtt_{total,used}` pair beside them is read too,
+//!   because that is where ROCm allocations actually land once the BIOS
+//!   carve-out fills (docs/unified-memory-admission.md, backend B);
+//! - `/proc/meminfo` — `MemTotal` names an APU board (its capacity is the
+//!   machine's), and `MemAvailable` clamps the GTT half of its free reading
+//!   to RAM that exists right now, which is what makes external pressure on
+//!   a unified board visible at all.
 //!
-//! Everything is a pure function of three injectable roots so the whole
+//! Everything is a pure function of four injectable roots so the whole
 //! probe is testable from fixture directory trees on any platform; only
 //! `SysfsRoots::default()` and the caller's `cfg!(target_os = "linux")`
 //! gate know that these are Linux paths.
@@ -66,7 +73,7 @@ const HIP_LAYER_VISIBILITY_VARS: [&str; 3] = [
     "GPU_DEVICE_ORDINAL",
 ];
 
-/// The three filesystem roots the probe reads. Injectable so the parse and
+/// The four filesystem roots the probe reads. Injectable so the parse and
 /// build logic is exercised against fixture trees rather than hardware
 /// (and so those tests run on non-Linux dev machines).
 #[derive(Debug, Clone)]
@@ -77,6 +84,9 @@ pub(super) struct SysfsRoots {
     pub pci_devices: PathBuf,
     /// DRM device nodes; `renderD<minor>` is the per-board render node.
     pub dev_dri: PathBuf,
+    /// `/proc/meminfo`: `MemTotal` for an APU board's identity, `MemAvailable`
+    /// for the GTT clamp in its live free reading.
+    pub meminfo: PathBuf,
 }
 
 impl Default for SysfsRoots {
@@ -85,8 +95,27 @@ impl Default for SysfsRoots {
             kfd_nodes: PathBuf::from("/sys/class/kfd/kfd/topology/nodes"),
             pci_devices: PathBuf::from("/sys/bus/pci/devices"),
             dev_dri: PathBuf::from("/dev/dri"),
+            meminfo: PathBuf::from("/proc/meminfo"),
         }
     }
+}
+
+/// One board the live-memory refresh reads: where its counters are, and
+/// whether it is the unified kind whose total includes GTT.
+///
+/// The flag rides here rather than being re-derived from the filesystem
+/// because `mem_info_gtt_*` exists for **discrete** boards too (GTT is
+/// system memory any amdgpu board can map), so its presence is not the
+/// question — whether this board's *budget* is carve-out + GTT is, and only
+/// the probe's KFD classification answers that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BoardRef {
+    /// The ledger's board key.
+    pub key: String,
+    /// The PCI address amdgpu names this board's sysfs directory with.
+    pub bdf: String,
+    /// An APU: total and free include GTT (backend B).
+    pub unified: bool,
 }
 
 /// Why a probe produced no inventory, carried out of [`build`] so the
@@ -238,22 +267,53 @@ pub(super) fn build(
 /// `free = total - used` ignores firmware/kernel reserved carve-outs that
 /// nvidia-smi's `memory.free` excludes, so ROCm free readings run a few
 /// hundred MB optimistic; the ledger's default margin absorbs it.
+///
+/// # Unified boards (APUs)
+///
+/// A board the probe flagged unified is budgeted against carve-out **plus**
+/// GTT, because GTT is where its allocations land once the carve-out fills,
+/// and its free reading is
+/// `(vram_total − vram_used) + min(gtt_total − gtt_used, ram_available)`.
+/// The clamp is the whole point: unclaimed GTT is an address-space figure,
+/// and the pages behind it have to come out of RAM that exists *now*, so
+/// without it a machine whose browser is holding 40 GB would look idle
+/// (docs/unified-memory-admission.md, backend B). Discrete rows read exactly
+/// the two files they always read.
 pub(super) fn query_memory(
     pci_devices: &Path,
-    boards: &[(String, String)],
+    meminfo: &Path,
+    boards: &[BoardRef],
 ) -> Option<Vec<GpuMemory>> {
     if boards.is_empty() {
         return None;
     }
+    // Read once for the whole pass, and only if a unified board asks: every
+    // row in one snapshot must see the same instant, and a host of discrete
+    // boards must not acquire a dependency on /proc/meminfo being readable.
+    let mut ram_available_mb: Option<u64> = None;
     let mut out = Vec::with_capacity(boards.len());
-    for (uuid, bdf) in boards {
-        let dir = pci_device_dir(pci_devices, bdf);
-        let total_mb = read_mb(&dir.join("mem_info_vram_total"))?;
-        let used_mb = read_mb(&dir.join("mem_info_vram_used"))?;
+    for board in boards {
+        let dir = pci_device_dir(pci_devices, &board.bdf);
+        let vram_total_mb = read_mb(&dir.join("mem_info_vram_total"))?;
+        let vram_free_mb = vram_total_mb.saturating_sub(read_mb(&dir.join("mem_info_vram_used"))?);
+        if !board.unified {
+            out.push(GpuMemory {
+                uuid: board.key.clone(),
+                total_mb: vram_total_mb,
+                free_mb: vram_free_mb,
+            });
+            continue;
+        }
+        let gtt_total_mb = read_mb(&dir.join("mem_info_gtt_total"))?;
+        let gtt_free_mb = gtt_total_mb.saturating_sub(read_mb(&dir.join("mem_info_gtt_used"))?);
+        let available_mb = match ram_available_mb {
+            Some(mb) => mb,
+            None => *ram_available_mb.insert(meminfo_mb(meminfo, "MemAvailable")?),
+        };
         out.push(GpuMemory {
-            uuid: uuid.clone(),
-            total_mb,
-            free_mb: total_mb.saturating_sub(used_mb),
+            uuid: board.key.clone(),
+            total_mb: vram_total_mb + gtt_total_mb,
+            free_mb: vram_free_mb + gtt_free_mb.min(available_mb),
         });
     }
     Some(out)
@@ -415,35 +475,6 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
             );
             continue;
         }
-        // An **APU**: KFD models an integrated part as one node carrying
-        // both SIMDs and CPU cores, and that combination is the only
-        // positive signal there is. It has to be tested here, after the
-        // openability filter, because a cgroup-hidden APU is not one ROCr
-        // will offer either.
-        //
-        // The all-or-nothing VRAM rule in `identify` does *not* catch these:
-        // amdgpu registers `mem_info_vram_total` for iGPUs too, reporting
-        // the BIOS's UMA carve-out (512 MB is a common default). So the host
-        // would be priced against the carve-out rather than against the
-        // memory an APU can actually reach, every grant would collapse to
-        // batch-1, and nothing would say why. Declining to price the host is
-        // the design's promised outcome for an APU, so take it explicitly.
-        //
-        // The node is not *skipped*: HIP still enumerates it, so excluding
-        // one row would shift every later row's device index. The whole
-        // probe goes unknown instead.
-        if props.get("cpu_cores_count").copied().unwrap_or(0) > 0 {
-            tracing::warn!(
-                node,
-                gfx_target_version = props.get("gfx_target_version").copied().unwrap_or(0),
-                "this KFD node reports both SIMDs and CPU cores, i.e. an APU; \
-                 amdgpu publishes only the BIOS UMA carve-out as its VRAM \
-                 total, so pricing this host would budget every grant against \
-                 a few hundred MB — leaving the ROCm GPU inventory unknown \
-                 instead (an APU host is unpriced by design, not mis-priced)"
-            );
-            return Err(ProbeFailure::logged("APU node", gpu_nodes, out.len()));
-        }
         out.push((node, props));
     }
     Ok(OpenableNodes {
@@ -487,6 +518,23 @@ fn node_dirs(root: &Path) -> Vec<(u32, PathBuf)> {
 /// probe unknown. Board key, name and VRAM total are all identity: a row
 /// missing any of them could not key the ledger, the calibration profile
 /// or the config, and half-identified boards must never reach either.
+///
+/// # APUs
+///
+/// KFD models an integrated part as one node carrying both SIMDs **and** CPU
+/// cores, and that combination is the only positive signal there is. Such a
+/// node used to make the whole probe unknown, because amdgpu publishes
+/// `mem_info_vram_total` for iGPUs too — the BIOS UMA carve-out, commonly
+/// 512 MB — so admitting it on the ordinary rules would have budgeted the
+/// host against a few hundred MB and collapsed every grant to batch-1. It is
+/// now priced as a **unified board** instead
+/// (docs/unified-memory-admission.md, backend B): the total is carve-out +
+/// GTT, the name carries the machine's RAM rather than the BIOS-configurable
+/// carve-out (DP-6), and `unified_ram_mb` flags it for the ledger. The extra
+/// facts that pricing needs are part of the identity like every other one —
+/// a GTT total or a `MemTotal` we cannot read fails the probe rather than
+/// silently falling back to the carve-out, which is the exact mis-pricing
+/// the old decline existed to prevent.
 fn identify(
     roots: &SysfsRoots,
     node: u32,
@@ -506,20 +554,22 @@ fn identify(
         );
         return None;
     };
-    let vram_total = pci_device_dir(&roots.pci_devices, &bdf).join("mem_info_vram_total");
+    let device = pci_device_dir(&roots.pci_devices, &bdf);
     // A zero total is as unusable as an absent one *here*, in the identity
     // pass: it would name the board `… (1 GB)` (the profile keyspace), give
     // the ledger a board with no capacity, and make every grant on it a
     // division by a fiction. The live `query_memory` path stays tolerant of
     // zero on purpose — there it is a reading, not an identity.
-    let Some(total_mb) = read_mb(&vram_total).filter(|mb| *mb > 0) else {
+    let Some(vram_total_mb) = read_mb(&device.join("mem_info_vram_total")).filter(|mb| *mb > 0)
+    else {
         tracing::warn!(
             node,
             bdf = %bdf,
             "cannot read a nonzero mem_info_vram_total for this board (a \
              non-amdgpu node, or a container with a partial /sys, would look \
-             like this — an APU is caught earlier, by its own signal); \
-             leaving the ROCm GPU inventory unknown"
+             like this; on an APU this file is the BIOS carve-out, which is \
+             only part of the total — see below); leaving the ROCm GPU \
+             inventory unknown"
         );
         return None;
     };
@@ -539,13 +589,24 @@ fn identify(
         );
         return None;
     };
+    // An APU, per KFD's only positive signal: one node with both SIMDs and
+    // CPU cores. Discrete boards report an explicit 0 or omit the key.
+    let unified = props.get("cpu_cores_count").copied().unwrap_or(0) > 0;
+    let unified = match unified {
+        false => None,
+        true => Some(unified_facts(roots, node, &bdf, &device, vram_total_mb)?),
+    };
     let unique_id = props.get("unique_id").copied().filter(|id| *id != 0);
+    let (total_mb, name) = match &unified {
+        Some(facts) => (facts.total_mb, apu_board_name(&gfx, facts.ram_mb)),
+        None => (vram_total_mb, board_name(&gfx, vram_total_mb)),
+    };
     Some(GpuInfo {
         index,
         // Provisional: `demote_duplicate_ids` rewrites this if two boards
         // fused the same serial.
         uuid: board_key(unique_id, &bdf),
-        name: board_name(&gfx, total_mb),
+        name,
         total_mb,
         // HIP has no compute-capability analogue (D7). The per-row Option
         // already tolerates it; the host's capability view is unknown, so
@@ -553,7 +614,92 @@ fn identify(
         compute_cap: None,
         bdf: Some(bdf),
         gfx_target_version: Some(target),
-        unified_ram_mb: None,
+        unified_ram_mb: unified.as_ref().map(|facts| facts.ram_mb),
+        vram_carveout_mb: unified.as_ref().map(|_| vram_total_mb),
+    })
+}
+
+/// The three extra numbers an APU row needs, or `None` — which fails the
+/// whole probe — when any of them cannot be read.
+struct UnifiedFacts {
+    /// Carve-out + GTT: the board's admission budget.
+    total_mb: u64,
+    /// Physical RAM, which is what the board's name carries (DP-6).
+    ram_mb: u64,
+}
+
+/// Read them, warning about whichever one was missing.
+///
+/// Both reads are **required**, and that is the design decision rather than
+/// an implementation detail: falling back to the carve-out alone is exactly
+/// the batch-1 collapse the old all-or-nothing APU decline existed to
+/// prevent, and falling back to `MemTotal` alone would name the board by a
+/// figure that moves with the BIOS.
+fn unified_facts(
+    roots: &SysfsRoots,
+    node: u32,
+    bdf: &str,
+    device: &Path,
+    vram_total_mb: u64,
+) -> Option<UnifiedFacts> {
+    let Some(gtt_total_mb) = read_mb(&device.join("mem_info_gtt_total")).filter(|mb| *mb > 0) else {
+        tracing::warn!(
+            node,
+            bdf = %bdf,
+            vram_total_mb,
+            "this KFD node reports both SIMDs and CPU cores, i.e. an APU, but \
+             its mem_info_gtt_total is missing or zero; amdgpu publishes only \
+             the BIOS UMA carve-out as such a board's VRAM total, so pricing \
+             it on that alone would budget every grant against a few hundred \
+             MB — leaving the ROCm GPU inventory unknown instead"
+        );
+        return None;
+    };
+    let Some(mem_total_mb) = meminfo_mb(&roots.meminfo, "MemTotal") else {
+        tracing::warn!(
+            node,
+            bdf = %bdf,
+            meminfo = %roots.meminfo.display(),
+            "this KFD node is an APU but MemTotal could not be read; the \
+             machine's RAM is that board's capacity and its calibration name, \
+             so there is nothing to name it with — leaving the ROCm GPU \
+             inventory unknown"
+        );
+        return None;
+    };
+    Some(UnifiedFacts {
+        total_mb: vram_total_mb + gtt_total_mb,
+        // The carve-out is reserved by firmware *before* the kernel counts
+        // memory, so it is missing from `MemTotal` and adding it back is what
+        // makes this figure the machine's RAM rather than a reading of the
+        // BIOS setting. DP-6 keeps the carve-out out of the calibration name
+        // precisely so that changing it in the BIOS does not split a
+        // machine's profiles; taking `MemTotal` raw would embed it
+        // negatively and do exactly that. The result still lands a little
+        // under the sticker capacity (the kernel reserves a percent or so for
+        // itself before reporting `MemTotal`), which costs nothing: the name
+        // has to be *deterministic per machine*, not accurate to marketing.
+        ram_mb: mem_total_mb + vram_total_mb,
+    })
+}
+
+/// One `/proc/meminfo` row in whole MiB, or `None`.
+///
+/// Every memory row there is `"<Key>: <value> kB"` with the value in
+/// **kibibytes** despite the spelling (`fs/proc/meminfo.c` renders
+/// `pages << (PAGE_SHIFT - 10)`). A row without that unit is not a row this
+/// understands, and the honest answer to a file we do not understand is no
+/// reading at all.
+fn meminfo_mb(path: &Path, key: &str) -> Option<u64> {
+    let text = fs::read_to_string(path).ok()?;
+    text.lines().find_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        if name.trim() != key {
+            return None;
+        }
+        let mut fields = rest.split_whitespace();
+        let value = fields.next()?.parse::<u64>().ok()?;
+        (fields.next() == Some("kB")).then_some(value / 1024)
     })
 }
 
@@ -666,8 +812,45 @@ fn reject_partitioned_boards(rows: Vec<GpuInfo>) -> Option<Vec<GpuInfo>> {
 /// nearest keeps the displayed size honest rather than naming a 24 GB
 /// board 23 GB. Revisit only on field evidence of an actual boundary flip.
 fn board_name(gfx: &str, total_mb: u64) -> String {
-    let gb = ((total_mb + 512) / 1024).max(1);
-    format!("AMD {gfx} ({gb} GB)")
+    format!("AMD {gfx} ({} GB)", whole_gb(total_mb))
+}
+
+/// The same name for a **unified** board: `AMD gfx1151 APU (128 GB)`.
+///
+/// Three deliberate differences from the discrete form. The literal `APU`,
+/// because the same gfx target can appear on both shapes and they do not
+/// price alike. The capacity is the **machine's RAM**, never the BIOS UMA
+/// carve-out (DP-6): the carve-out is a setting — a user who moves it from
+/// 512 MB to 96 GB has the same silicon and the same admission behaviour,
+/// and would otherwise orphan every profile, ratchet anchor and knee the
+/// machine had written. And the rounding is **up to the nearest 4 GiB**
+/// rather than to the nearest GiB.
+///
+/// That last one is not cosmetic. Adding the carve-out back to `MemTotal`
+/// cancels the BIOS knob, but not the *other* reservations the kernel takes
+/// before reporting it — firmware/ACPI maps, the crashkernel region, kernel
+/// text — which come to something like 1.5–2 GiB on a real machine and are
+/// not constant across kernels, boot parameters or a `crashkernel=` change.
+/// Rounded to nearest, a 128 GiB box would name itself `(126 GB)` and could
+/// silently become `(127 GB)` after a kernel update, orphaning its profiles
+/// for the same reason DP-6 keeps the carve-out out. Rounding up to a 4 GiB
+/// grid swallows a couple of gigabytes of drift and lands on the capacity
+/// the machine is actually sold with, while still separating the sizes that
+/// matter (32 vs 64 vs 128 GB). Budgets are untouched — this is the name,
+/// i.e. the calibration key, and nothing else.
+fn apu_board_name(gfx: &str, ram_mb: u64) -> String {
+    format!("AMD {gfx} APU ({} GB)", capacity_gb_up_4(ram_mb))
+}
+
+/// MiB to whole GiB, rounded to nearest and never to zero.
+fn whole_gb(mb: u64) -> u64 {
+    ((mb + 512) / 1024).max(1)
+}
+
+/// MiB to GiB, rounded **up** to the next multiple of 4 and never to zero.
+fn capacity_gb_up_4(mb: u64) -> u64 {
+    const GRID_MB: u64 = 4 * 1024;
+    (mb.div_ceil(GRID_MB) * 4).max(4)
 }
 
 /// Decode `gfx_target_version` into the canonical ISA name.
@@ -794,11 +977,31 @@ mod tests {
                 kfd_nodes: dir.path().join("kfd/nodes"),
                 pci_devices: dir.path().join("pci"),
                 dev_dri: dir.path().join("dri"),
+                meminfo: dir.path().join("meminfo"),
             };
             fs::create_dir_all(&roots.kfd_nodes).unwrap();
             fs::create_dir_all(&roots.pci_devices).unwrap();
             fs::create_dir_all(&roots.dev_dri).unwrap();
-            Self { _dir: dir, roots }
+            let fixture = Self { _dir: dir, roots };
+            // A 128 GiB machine whose 512 MiB carve-out firmware already took
+            // out of MemTotal — the shape every APU case here starts from.
+            // Written by default so that a *discrete* host proves it never
+            // reads the file (its content is irrelevant there); the cases
+            // that care overwrite it.
+            fixture.meminfo(MEM_TOTAL_KB, MEM_TOTAL_KB / 2)
+        }
+
+        /// `/proc/meminfo`, in the kernel's own shape. Only two rows matter,
+        /// and the neighbours are here so the parser is exercised against a
+        /// file it has to search rather than a single line it could take on
+        /// trust.
+        fn meminfo(self, total_kb: u64, available_kb: u64) -> Self {
+            let body = format!(
+                "MemTotal:       {total_kb} kB\nMemFree:         1234567 kB\n\
+                 MemAvailable:   {available_kb} kB\nBuffers:           98765 kB\n"
+            );
+            fs::write(&self.roots.meminfo, body).unwrap();
+            self
         }
 
         fn node(&self, node: u32, props: &[(&str, u64)]) -> &Self {
@@ -844,6 +1047,17 @@ mod tests {
             self
         }
 
+        /// The GTT counters beside them. amdgpu publishes these for discrete
+        /// boards too — they are only ever *read* for a board KFD called an
+        /// APU, which is why the fixture may write them anywhere.
+        fn gtt(&self, bdf: &str, total_bytes: u64, used_bytes: u64) -> &Self {
+            let dir = pci_device_dir(&self.roots.pci_devices, bdf);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("mem_info_gtt_total"), format!("{total_bytes}\n")).unwrap();
+            fs::write(dir.join("mem_info_gtt_used"), format!("{used_bytes}\n")).unwrap();
+            self
+        }
+
         fn build(&self) -> Option<Vec<GpuInfo>> {
             build(&self.roots, [None; VISIBILITY_VARS.len()]).ok()
         }
@@ -859,6 +1073,19 @@ mod tests {
 
     const GB24: u64 = 24 * 1024 * 1024 * 1024;
     const GB16: u64 = 16 * 1024 * 1024 * 1024;
+    /// A common BIOS UMA carve-out: what amdgpu publishes as an APU's whole
+    /// VRAM total, and the number the old decline existed to keep out of the
+    /// ledger.
+    const CARVE_512M: u64 = 512 * 1024 * 1024;
+    /// `MemTotal` on a 128 GiB machine with that carve-out, in kB: firmware
+    /// reserves the carve-out before the kernel counts memory, so it is
+    /// *missing* from this figure — which is why the probe adds it back
+    /// (a real machine also loses a little more to kernel reservations; the
+    /// fixture idealizes that away, and the naming rule only needs to be
+    /// deterministic per machine, not accurate to the sticker).
+    const MEM_TOTAL_KB: u64 = (128 * 1024 - 512) * 1024;
+    /// The RAM figure both spellings of that machine must name.
+    const RAM_128_MB: u64 = 128 * 1024;
 
     /// `location_id` from a real gfx1100 node: bus 0x03, device 0x00,
     /// function 0 → `PCI_DEVID(3, 0) = 0x0300`.
@@ -883,6 +1110,14 @@ mod tests {
         if unique_id != 0 {
             props.push(("unique_id", unique_id));
         }
+        props
+    }
+
+    /// The APU shape: the same node, but KFD reports the host's CPU cores on
+    /// it, which is the only signal an integrated part has.
+    fn apu_props(location_id: u64, minor: u64, target: u64) -> Vec<(&'static str, u64)> {
+        let mut props = gpu_props(location_id, minor, 0, target);
+        props[0] = ("cpu_cores_count", 16);
         props
     }
 
@@ -1058,32 +1293,92 @@ mod tests {
         assert!(fixture.build().is_none());
     }
 
-    /// A node reporting both SIMDs and CPU cores is how KFD models an
-    /// **APU**, and that combination is the only positive signal there is.
-    /// The all-or-nothing VRAM rule does not catch it: amdgpu publishes a
-    /// `mem_info_vram_total` for iGPUs too — the BIOS UMA carve-out — so
-    /// without this the host would be priced against a few hundred MB and
-    /// every grant would collapse to batch-1. Unpriced is the promised
-    /// outcome for an APU, so it is taken deliberately.
+    /// An APU node — KFD's only positive signal being SIMDs *and* CPU cores
+    /// on one node — is a **priced unified board**, not a poison pill: total
+    /// = carve-out + GTT, name from the machine's RAM, and the unified flag
+    /// the ledger's DP-2/DP-5 machinery keys on
+    /// (docs/unified-memory-admission.md, backend B).
+    ///
+    /// The carve-out is what makes this worth a test of its own: amdgpu
+    /// publishes it as `mem_info_vram_total` for an iGPU, so a board admitted
+    /// on the discrete rules would be budgeted against 512 MB and collapse
+    /// every grant to batch-1 — which is why this used to fail the whole
+    /// probe instead.
     #[test]
-    fn an_apu_node_makes_the_probe_unknown() {
+    fn an_apu_node_is_a_priced_unified_board() {
         let fixture = Fixture::new();
         fixture
-            .node(1, &{
-                let mut props = gpu_props(LOC_03_00, 128, 0, 90012);
-                // KFD reports the host's cores on the APU's own node.
-                props[0] = ("cpu_cores_count", 16);
-                props
-            })
+            .node(1, &apu_props(LOC_03_00, 128, 110_501))
             .render(128)
-            // The carve-out: openable, identifiable, and a lie about
-            // capacity — which is exactly why the VRAM rule cannot see it.
-            .pci("0000:03:00.0", 512 * 1024 * 1024, 0);
-        assert!(
-            fixture.build().is_none(),
-            "an APU's UMA carve-out must not become this host's VRAM budget"
+            // The carve-out, and the GTT window the rest of the machine's
+            // memory is reachable through: 64 GiB.
+            .pci("0000:03:00.0", CARVE_512M, 0)
+            .gtt("0000:03:00.0", 64 * 1024 * 1024 * 1024, 0);
+        let rows = fixture.build().expect("an APU host is priced now");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].uuid, "GPU-BDF-0000:03:00.0");
+        assert_eq!(
+            rows[0].total_mb,
+            512 + 64 * 1024,
+            "the budget is the carve-out plus GTT, not the carve-out"
         );
-        assert_eq!(fixture.bucket(), Some("APU node"));
+        assert_eq!(
+            rows[0].name, "AMD gfx1151 APU (128 GB)",
+            "the machine's RAM, never the BIOS-configurable carve-out (DP-6)"
+        );
+        assert_eq!(
+            rows[0].unified_ram_mb,
+            Some(RAM_128_MB),
+            "MemTotal plus the carve-out firmware took out of it"
+        );
+        assert!(rows[0].unified());
+        assert_eq!(
+            rows[0].vram_carveout_mb,
+            Some(512),
+            "kept for the either-of registration cross-check"
+        );
+
+        // The same machine with the carve-out set to 96 GiB in the BIOS —
+        // the tuned Strix Halo shape. `MemTotal` collapses to 32 GiB because
+        // firmware took the rest, and the name must not move: DP-6 keeps the
+        // carve-out out of the calibration key precisely so that changing it
+        // does not orphan every profile, anchor and knee the machine wrote.
+        let tuned = Fixture::new().meminfo(32 * 1024 * 1024, 8 * 1024 * 1024);
+        tuned
+            .node(1, &apu_props(LOC_03_00, 128, 110_501))
+            .render(128)
+            .pci("0000:03:00.0", 96 * 1024 * 1024 * 1024, 0)
+            .gtt("0000:03:00.0", 16 * 1024 * 1024 * 1024, 0);
+        let tuned = tuned.build().expect("priced");
+        assert_eq!(tuned[0].name, "AMD gfx1151 APU (128 GB)");
+        assert_eq!(tuned[0].vram_carveout_mb, Some(96 * 1024));
+        assert_eq!(tuned[0].total_mb, 112 * 1024, "the carve-out plus GTT");
+
+        // Neither extra fact is optional. Without GTT the board would be
+        // priced at its carve-out — the batch-1 collapse — and without
+        // MemTotal it could not be named at all; both fail the whole probe,
+        // exactly as a missing VRAM total does on a discrete board.
+        let no_gtt = Fixture::new();
+        no_gtt
+            .node(1, &apu_props(LOC_03_00, 128, 110_501))
+            .render(128)
+            .pci("0000:03:00.0", CARVE_512M, 0);
+        assert!(no_gtt.build().is_none(), "no GTT total");
+        let zero_gtt = Fixture::new();
+        zero_gtt
+            .node(1, &apu_props(LOC_03_00, 128, 110_501))
+            .render(128)
+            .pci("0000:03:00.0", CARVE_512M, 0)
+            .gtt("0000:03:00.0", 0, 0);
+        assert!(zero_gtt.build().is_none(), "a zero GTT total is no GTT");
+        let no_meminfo = Fixture::new();
+        no_meminfo
+            .node(1, &apu_props(LOC_03_00, 128, 110_501))
+            .render(128)
+            .pci("0000:03:00.0", CARVE_512M, 0)
+            .gtt("0000:03:00.0", 64 * 1024 * 1024 * 1024, 0);
+        fs::remove_file(&no_meminfo.roots.meminfo).unwrap();
+        assert!(no_meminfo.build().is_none(), "no MemTotal");
 
         // And the normal dGPU shape is untouched, in both spellings: an
         // explicit `cpu_cores_count 0`, and the key absent altogether.
@@ -1389,10 +1684,15 @@ mod tests {
             .pci("0000:03:00.0", GB24, 4 * 1024 * 1024 * 1024)
             .pci("0000:0c:00.0", GB16, 0);
         let boards = vec![
-            ("GPU-a".to_owned(), "0000:03:00.0".to_owned()),
-            ("GPU-b".to_owned(), "0000:0c:00.0".to_owned()),
+            discrete("GPU-a", "0000:03:00.0"),
+            discrete("GPU-b", "0000:0c:00.0"),
         ];
-        let readings = query_memory(&fixture.roots.pci_devices, &boards).expect("read");
+        let readings = query_memory(
+            &fixture.roots.pci_devices,
+            &fixture.roots.meminfo,
+            &boards,
+        )
+        .expect("read");
         assert_eq!(
             readings,
             vec![
@@ -1411,10 +1711,246 @@ mod tests {
         // One unreadable board makes the whole snapshot unknown, or its
         // external usage would silently price as zero.
         let partial = vec![
-            ("GPU-a".to_owned(), "0000:03:00.0".to_owned()),
-            ("GPU-c".to_owned(), "0000:ff:00.0".to_owned()),
+            discrete("GPU-a", "0000:03:00.0"),
+            discrete("GPU-c", "0000:ff:00.0"),
         ];
-        assert!(query_memory(&fixture.roots.pci_devices, &partial).is_none());
-        assert!(query_memory(&fixture.roots.pci_devices, &[]).is_none());
+        let roots = &fixture.roots;
+        assert!(query_memory(&roots.pci_devices, &roots.meminfo, &partial).is_none());
+        assert!(query_memory(&roots.pci_devices, &roots.meminfo, &[]).is_none());
+    }
+
+    /// A discrete board the refresh reads today's two files for.
+    fn discrete(key: &str, bdf: &str) -> BoardRef {
+        BoardRef {
+            key: key.to_owned(),
+            bdf: bdf.to_owned(),
+            unified: false,
+        }
+    }
+
+    /// The unified refresh: total is carve-out + GTT, and free is the
+    /// carve-out's own free memory plus **as much GTT as RAM can actually
+    /// deliver right now**. The clamp is the whole reason `/proc/meminfo` is
+    /// read at all — unclaimed GTT is address space, and the pages behind it
+    /// have to come from somewhere.
+    #[test]
+    fn a_unified_boards_reading_clamps_gtt_by_available_ram() {
+        let gib = 1024 * 1024 * 1024;
+        let board = |unified| BoardRef {
+            key: "GPU-apu".to_owned(),
+            bdf: "0000:03:00.0".to_owned(),
+            unified,
+        };
+        // 512 MiB carve-out (half used), a 64 GiB GTT window with 4 GiB of it
+        // taken, and 8 GiB of RAM the OS says it could deliver.
+        let fixture = Fixture::new().meminfo(MEM_TOTAL_KB, 8 * 1024 * 1024);
+        fixture
+            .pci("0000:03:00.0", CARVE_512M, CARVE_512M / 2)
+            .gtt("0000:03:00.0", 64 * gib, 4 * gib);
+        let roots = &fixture.roots;
+        let read = |board: BoardRef| {
+            query_memory(&roots.pci_devices, &roots.meminfo, &[board]).map(|mut r| r.remove(0))
+        };
+        assert_eq!(
+            read(board(true)),
+            Some(GpuMemory {
+                uuid: "GPU-apu".to_owned(),
+                total_mb: 512 + 64 * 1024,
+                // 256 MiB of carve-out, plus 60 GiB of unclaimed GTT clamped
+                // to the 8 GiB the machine has.
+                free_mb: 256 + 8 * 1024,
+            })
+        );
+        // Plenty of RAM: the GTT term is the driver's own figure again.
+        let roomy = Fixture::new().meminfo(MEM_TOTAL_KB, 100 * 1024 * 1024);
+        roomy
+            .pci("0000:03:00.0", CARVE_512M, CARVE_512M / 2)
+            .gtt("0000:03:00.0", 64 * gib, 4 * gib);
+        assert_eq!(
+            query_memory(
+                &roomy.roots.pci_devices,
+                &roomy.roots.meminfo,
+                &[board(true)]
+            )
+            .map(|mut r| r.remove(0))
+            .map(|reading| reading.free_mb),
+            Some(256 + 60 * 1024)
+        );
+        // The same board read as discrete is byte-identical to today: the
+        // GTT files are there and are not consulted.
+        assert_eq!(
+            read(board(false)),
+            Some(GpuMemory {
+                uuid: "GPU-apu".to_owned(),
+                total_mb: 512,
+                free_mb: 256,
+            })
+        );
+        // All-or-nothing extends to the new files: a unified board whose GTT
+        // counters or whose MemAvailable cannot be read makes the whole
+        // snapshot unknown rather than reporting the carve-out as the board.
+        let no_gtt = Fixture::new();
+        no_gtt.pci("0000:03:00.0", CARVE_512M, 0);
+        assert!(
+            query_memory(
+                &no_gtt.roots.pci_devices,
+                &no_gtt.roots.meminfo,
+                &[board(true)]
+            )
+            .is_none()
+        );
+        let no_meminfo = Fixture::new();
+        no_meminfo
+            .pci("0000:03:00.0", CARVE_512M, 0)
+            .gtt("0000:03:00.0", 64 * gib, 0);
+        fs::remove_file(&no_meminfo.roots.meminfo).unwrap();
+        assert!(
+            query_memory(
+                &no_meminfo.roots.pci_devices,
+                &no_meminfo.roots.meminfo,
+                &[board(true)]
+            )
+            .is_none()
+        );
+        // …and a *discrete* host never acquires that dependency: no
+        // /proc/meminfo, no problem.
+        assert!(
+            query_memory(
+                &no_meminfo.roots.pci_devices,
+                &no_meminfo.roots.meminfo,
+                &[board(false)]
+            )
+            .is_some()
+        );
+    }
+
+    /// Only two rows of `/proc/meminfo` are ever read, and only in the shape
+    /// the kernel writes them: a value without the `kB` unit is a file we do
+    /// not understand, and the honest answer to that is no reading.
+    #[test]
+    fn parses_the_two_meminfo_rows() {
+        let fixture = Fixture::new().meminfo(MEM_TOTAL_KB, 8 * 1024 * 1024);
+        let path = &fixture.roots.meminfo;
+        assert_eq!(meminfo_mb(path, "MemTotal"), Some(128 * 1024 - 512));
+        assert_eq!(meminfo_mb(path, "MemAvailable"), Some(8 * 1024));
+        assert_eq!(meminfo_mb(path, "MemShrubbery"), None);
+        fs::write(path, "MemTotal:       131928204\nMemAvailable: 8 MB\n").unwrap();
+        assert_eq!(meminfo_mb(path, "MemTotal"), None, "no unit");
+        assert_eq!(meminfo_mb(path, "MemAvailable"), None, "wrong unit");
+        assert_eq!(
+            meminfo_mb(&path.join("absent"), "MemTotal"),
+            None,
+            "no file at all"
+        );
+    }
+
+    /// A dGPU **and** an APU on one host: two rows, indices covering the
+    /// whole openable set (which is what makes them HIP device indices), and
+    /// each priced in its own currency. This is the shape the old
+    /// all-or-nothing decline sank entirely.
+    #[test]
+    fn a_dgpu_and_an_apu_are_both_priced() {
+        let fixture = Fixture::new();
+        fixture
+            // KFD lists the APU's node first on such a machine, which is
+            // exactly why the decline could not simply skip it.
+            .node(1, &apu_props(LOC_03_00, 128, 110_501))
+            .node(2, &gpu_props(LOC_0C_00, 129, 0, 110_000))
+            .render(128)
+            .render(129)
+            .pci("0000:03:00.0", CARVE_512M, 0)
+            .gtt("0000:03:00.0", 64 * 1024 * 1024 * 1024, 0)
+            .pci("0000:0c:00.0", GB24, 0);
+        let rows = fixture.build().expect("both boards are priced");
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].index, rows[1].index), (0, 1));
+        assert!(rows[0].unified(), "the APU is row 0, as KFD listed it");
+        assert_eq!(rows[0].name, "AMD gfx1151 APU (128 GB)");
+        assert_eq!(rows[0].total_mb, 512 + 64 * 1024);
+        assert!(!rows[1].unified());
+        assert_eq!(rows[1].name, "AMD gfx1100 (24 GB)");
+        assert_eq!(rows[1].total_mb, 24 * 1024);
+        assert_eq!(rows[1].vram_carveout_mb, None);
+    }
+
+    /// The names, side by side: an APU carries the literal `APU` and the
+    /// machine's RAM on a 4 GiB grid, a discrete board carries its VRAM
+    /// rounded to the nearest GiB.
+    #[test]
+    fn apu_names_carry_the_machines_ram() {
+        assert_eq!(
+            apu_board_name("gfx1151", 128 * 1024),
+            "AMD gfx1151 APU (128 GB)"
+        );
+        assert_eq!(
+            apu_board_name("gfx1013", 16 * 1024),
+            "AMD gfx1013 APU (16 GB)"
+        );
+        // Rounds **up** to the 4 GiB grid, and never to zero: the grid is
+        // what absorbs the kernel's own reservations, which are neither
+        // small nor constant across kernels and boot parameters.
+        assert_eq!(
+            apu_board_name("gfx90c", 32 * 1024 - 8),
+            "AMD gfx90c APU (32 GB)"
+        );
+        assert_eq!(apu_board_name("gfx90c", 30 * 1024), "AMD gfx90c APU (32 GB)");
+        assert_eq!(apu_board_name("gfx90c", 0), "AMD gfx90c APU (4 GB)");
+        // Sizes that price differently still separate.
+        assert_eq!(capacity_gb_up_4(64 * 1024 - 1800), 64);
+        assert_eq!(capacity_gb_up_4(32 * 1024 - 1800), 32);
+    }
+
+    /// The rounding, end to end and for the reason it exists: a machine's
+    /// name must not move when its BIOS carve-out changes (DP-6) **or** when
+    /// the kernel's own reservations do. `MemTotal` misses both — firmware
+    /// takes the carve-out before the kernel counts memory, and the kernel
+    /// then holds back another 1.5–2 GiB for ACPI maps, the crashkernel
+    /// region and itself — so the probe adds the carve-out back and rounds
+    /// up to a 4 GiB grid.
+    #[test]
+    fn the_apu_name_survives_carve_out_and_kernel_reservation_changes() {
+        // A 128 GiB machine losing 1800 MiB to the kernel, at three BIOS
+        // carve-out settings covering the practical range.
+        let named = |carve_mb: u64, reserved_mb: u64| {
+            let mem_total_mb = 128 * 1024 - carve_mb - reserved_mb;
+            let fixture = Fixture::new().meminfo(mem_total_mb * 1024, 8 * 1024 * 1024);
+            fixture
+                .node(1, &apu_props(LOC_03_00, 128, 110_501))
+                .render(128)
+                .pci("0000:03:00.0", carve_mb * 1024 * 1024, 0)
+                .gtt("0000:03:00.0", 16 * 1024 * 1024 * 1024, 0);
+            fixture.build().expect("priced")[0].name.clone()
+        };
+        for carve_mb in [512, 4 * 1024, 8 * 1024] {
+            assert_eq!(
+                named(carve_mb, 1800),
+                "AMD gfx1151 APU (128 GB)",
+                "carve-out {carve_mb} MiB must not change the calibration key"
+            );
+            // A `crashkernel=1G` added on the next boot moves `MemTotal` by a
+            // gigabyte and must not orphan the machine's profiles either.
+            assert_eq!(named(carve_mb, 1800 + 1024), "AMD gfx1151 APU (128 GB)");
+        }
+    }
+
+    /// `/proc/meminfo` is read for **unified** boards only. A discrete host
+    /// must not acquire a dependency on it — a container with a partial
+    /// `/proc`, or any future platform where it is absent, still gets its
+    /// full inventory.
+    #[test]
+    fn a_discrete_host_needs_no_meminfo() {
+        let fixture = Fixture::new();
+        fixture
+            .node(1, &gpu_props(LOC_03_00, 128, 0, 110_000))
+            .node(2, &gpu_props(LOC_0C_00, 129, 0, 90402))
+            .render(128)
+            .render(129)
+            .pci("0000:03:00.0", GB24, 0)
+            .pci("0000:0c:00.0", GB16, 0);
+        fs::remove_file(&fixture.roots.meminfo).unwrap();
+        let rows = fixture.build().expect("no meminfo, no problem");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "AMD gfx1100 (24 GB)");
+        assert!(rows.iter().all(|row| !row.unified()));
     }
 }

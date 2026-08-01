@@ -31,6 +31,7 @@
 //!   `kill_on_drop`, so neither a drop path nor gateway death itself can
 //!   leak a worker tree.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::env;
 use std::fmt;
@@ -146,6 +147,38 @@ pub struct WorkerSpawnConfig {
     /// docs/rocm-batch-calibration-parity.md, D2). This layer only writes
     /// what it is handed.
     pub pin_env_var: &'static str,
+}
+
+impl WorkerSpawnConfig {
+    /// This config for a replica pinned to a **unified** board: the same
+    /// thing plus `PANOPTIKON_UNIFIED_GPU=<that board's PCI address>`
+    /// (DP-5), or the original untouched when the board is discrete.
+    ///
+    /// A per-replica question, which is why it is not part of the host-level
+    /// worker env (`accelerator_env::worker_env`): on a dGPU+APU host one
+    /// model's replicas can sit on both kinds of board, and this decides
+    /// whether that worker's own memory arithmetic counts GTT. It travels
+    /// through `env` rather than being written beside the pin in
+    /// [`worker_command`] so that both spawners — a fresh load and a pool
+    /// warm-up — get it from the one resolver that also produced the pin
+    /// (`GpuInventory::unified_pin_bdf`), and so a model's own `env` still
+    /// outranks it, as it outranks everything else here.
+    ///
+    /// The value is an address rather than a flag because the pin is a
+    /// *belief* about where the replica will land, and the worker can check
+    /// it against the board it actually came up on — see
+    /// [`gpu::UNIFIED_GPU_ENV_VAR`](super::gpu::UNIFIED_GPU_ENV_VAR).
+    pub fn for_unified_board(&self, bdf: Option<&str>) -> Cow<'_, Self> {
+        let Some(bdf) = bdf else {
+            return Cow::Borrowed(self);
+        };
+        let mut cfg = self.clone();
+        cfg.env.push((
+            super::gpu::UNIFIED_GPU_ENV_VAR.to_owned(),
+            bdf.to_ascii_lowercase(),
+        ));
+        Cow::Owned(cfg)
+    }
 }
 
 /// One entry of a `predict` request: JSON-like `data` and/or raw `file`
@@ -564,6 +597,10 @@ fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Comma
     }
     if let Some(device) = device {
         command.env(cfg.pin_env_var, device);
+        // The same value under a name only we write, so the worker can tell
+        // *our* placement from an operator's ambient visibility variable —
+        // see `gpu::DEVICE_PIN_MARKER_ENV_VAR`.
+        command.env(super::gpu::DEVICE_PIN_MARKER_ENV_VAR, device);
     }
     for (key, value) in &cfg.env {
         command.env(key, value);
@@ -1828,6 +1865,72 @@ mod tests {
         // worker inherits whatever the operator's environment says.
         assert!(pin_env(&config(CUDA_PIN_ENV_VAR), None).is_empty());
         assert!(pin_env(&config(HIP_PIN_ENV_VAR), None).is_empty());
+
+        // DP-5 rides alongside the pin: a replica on a **unified** board is
+        // told which board that is, because the worker has no inventory and
+        // its own memory arithmetic has to count GTT there — and because the
+        // pin is only a *belief* about where the replica lands, the value is
+        // the board's address so the worker can check it against the board it
+        // actually came up on. A replica on a discrete board sees no such
+        // variable at all, which is what keeps its numbers byte-identical to
+        // before this existed.
+        let unified_env = |cfg: &WorkerSpawnConfig, bdf: Option<&str>| {
+            let cfg = cfg.for_unified_board(bdf);
+            worker_command(&cfg, Some("0"))
+                .expect("the command composes")
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| key.to_string_lossy() == "PANOPTIKON_UNIFIED_GPU")
+                .map(|(_, value)| value.unwrap_or_default().to_string_lossy().into_owned())
+        };
+        let rocm = config(HIP_PIN_ENV_VAR);
+        assert_eq!(
+            unified_env(&rocm, Some("0000:03:00.0")).as_deref(),
+            Some("0000:03:00.0"),
+            "the board's PCI address, not a flag"
+        );
+        // Lower-cased on the way out, because that is the spelling the worker
+        // renders its own address in and the two are compared as strings.
+        assert_eq!(
+            unified_env(&rocm, Some("0000:0C:00.0")).as_deref(),
+            Some("0000:0c:00.0")
+        );
+        assert_eq!(unified_env(&rocm, None), None);
+        assert_eq!(unified_env(&config(CUDA_PIN_ENV_VAR), None), None);
+        // The pin itself is untouched by either answer.
+        assert_eq!(
+            pin_env(&rocm.for_unified_board(Some("0000:03:00.0")), Some("0")),
+            vec![("HIP_VISIBLE_DEVICES".to_owned(), "0".to_owned())]
+        );
+        // And the config a discrete replica spawns with is the caller's own,
+        // not a copy — the flag is the only reason to clone one.
+        assert!(matches!(
+            rocm.for_unified_board(None),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        // The placement marker: the same pin under a name only we write, so
+        // the worker's pinned-but-invisible tripwire can tell our placement
+        // from an operator's ambient visibility variable (which looks
+        // identical in the child's environment and means the opposite).
+        let marker = |cfg: &WorkerSpawnConfig, device: Option<&str>| {
+            worker_command(cfg, device)
+                .expect("the command composes")
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| key.to_string_lossy() == "PANOPTIKON_DEVICE_PIN")
+                .map(|(_, value)| value.unwrap_or_default().to_string_lossy().into_owned())
+        };
+        assert_eq!(marker(&rocm, Some("1")).as_deref(), Some("1"));
+        assert_eq!(
+            marker(&config(CUDA_PIN_ENV_VAR), Some("GPU-1a2b")).as_deref(),
+            Some("GPU-1a2b")
+        );
+        assert_eq!(
+            marker(&rocm, None),
+            None,
+            "no pin, no marker — an unpinned replica was placed by nobody"
+        );
     }
 
     /// Full happy path against a real worker subprocess: spawn+handshake

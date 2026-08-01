@@ -195,7 +195,13 @@ impl PrewarmPool {
         let weak = self.weak.get().cloned().expect("weak self is set in new()");
         let task = tokio::spawn(warm_worker_task(
             weak,
-            self.spawn.clone(),
+            // The pool's board is the default one, so the unified flag
+            // (DP-5) is resolved for that same board: a claim requires pin
+            // equality, so a claimed worker is always on the board this was
+            // decided for, and its memory arithmetic matches the replica's.
+            self.spawn
+                .for_unified_board(self.gpus.unified_pin_bdf(None).as_deref())
+                .into_owned(),
             impl_class.to_owned(),
             // Universal pinning: an unpinned replica resolves to this same
             // board, so a worker warmed here is claimable for it.
@@ -989,6 +995,7 @@ config.devices = ["3"]
                 bdf: None,
                 gfx_target_version: None,
                 unified_ram_mb: None,
+                vram_carveout_mb: None,
             },
             crate::inferio::gpu::GpuInfo {
                 index: 3,
@@ -999,6 +1006,7 @@ config.devices = ["3"]
                 bdf: None,
                 gfx_target_version: None,
                 unified_ram_mb: None,
+                vram_carveout_mb: None,
             },
         ])
     }

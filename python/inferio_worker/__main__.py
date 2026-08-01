@@ -255,6 +255,14 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 # Idempotency lives in the impl's own load() guard
                 # (InferenceModel implementations early-return when loaded).
                 instance.load()
+                # A pin that named nothing is a *silent* CPU fallback: the
+                # impl's own device selection falls back happily, the model
+                # runs twenty times slower, and nothing says why. Checked
+                # here rather than before the load because torch is only
+                # importable-and-imported once the impl has done it.
+                pin_problem = memory.pinned_device_missing()
+                if pin_problem is not None:
+                    raise RuntimeError(pin_problem)
                 loaded = True
                 _send_ok(
                     proto_out, req_id, **memory.finish_load(before, instance)

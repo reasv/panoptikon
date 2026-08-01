@@ -36,7 +36,11 @@ class FakeDtype:
 class FakeCuda:
     """Just enough of `torch.cuda` for the memory helpers."""
 
-    def __init__(self, free_mb=8000, total_mb=8192, initialized=True):
+    def __init__(self, free_mb=8000, total_mb=8192, initialized=True, device_count=1):
+        # How many devices the runtime enumerates. Zero is the shape a pin
+        # naming a board ROCm does not enumerate produces, and the only thing
+        # standing between that and a silent CPU fallback.
+        self.devices = device_count
         self.free = free_mb * MIB
         self.total = total_mb * MIB
         self.reserved = 0
@@ -57,6 +61,9 @@ class FakeCuda:
 
     def is_available(self):
         return True
+
+    def device_count(self):
+        return self.devices
 
     def is_initialized(self):
         return self.initialized
@@ -1075,6 +1082,20 @@ def write_board(root: str, bdf: str, total=None, used=None) -> str:
     return root
 
 
+def write_gtt(root: str, bdf: str, total=None, used=None) -> str:
+    """The GTT counters beside them, which a unified board is also budgeted
+    against (docs/unified-memory-admission.md, backend B). amdgpu publishes
+    these for discrete boards too — they are read only under the DP-5 flag,
+    which is what keeps a dGPU worker's numbers where they were."""
+    device = Path(memory._pci_device_dir(root, bdf))
+    device.mkdir(parents=True, exist_ok=True)
+    if total is not None:
+        (device / "mem_info_gtt_total").write_text(f"{total}\n", encoding="utf-8")
+    if used is not None:
+        (device / "mem_info_gtt_used").write_text(f"{used}\n", encoding="utf-8")
+    return root
+
+
 def _fresh(tmp_path, prefix: str) -> Path:
     """A directory no earlier call in this test has written to.
 
@@ -1416,6 +1437,401 @@ def test_the_fdinfo_base_tier_is_hip_only(tmp_path, monkeypatch) -> None:
         report = memory.finish_load(before, object())
     assert report["base_method"] == "free_delta", report
     assert report["base_mb"] == 200, report
+
+
+# ---------------------------------------------------------------------------
+# Unified boards: AMD APUs (docs/unified-memory-admission.md, backend B).
+# `PANOPTIKON_UNIFIED_GPU=<pci address>` is the spawner's statement about
+# which board this worker's replica was pinned to (DP-5) — acted on only when
+# the worker resolves that same address for itself. Absent, or naming another
+# board, every reading below is byte-identical to what a discrete board
+# reported before backend B existed.
+# ---------------------------------------------------------------------------
+
+# A BC-250/Strix-Halo-shaped board: a 512 MiB BIOS carve-out with a 64 GiB GTT
+# window, 4 GiB of GTT already taken, and 8 GiB of RAM the OS says it could
+# actually deliver.
+APU_CARVEOUT_MIB = 512
+APU_GTT_MIB = 64 * 1024
+
+
+@contextmanager
+def unified(ram_available_mb: int | None = 8 * 1024, bdf: str = "0000:03:00.0"):
+    """The DP-5 signal set to a board address, with the RAM reading stubbed —
+    for the duration of the block and not a line longer, because several
+    cases below assert its *absence* after asserting its presence.
+
+    The value is the board's PCI address, not a flag: the worker only counts
+    GTT when the address matches the board it independently resolved, so that
+    a mis-enumerated pin cannot make it price one board's memory as another's
+    (`gpu.rs::UNIFIED_GPU_ENV_VAR`). `0000:03:00.0` is what `FakeCuda`'s PCI
+    fields render to, i.e. the board the fixtures' worker is on.
+
+    psutil is stubbed rather than read: the clamp is the whole point of the
+    formula, and a test whose expected numbers came from the machine it runs
+    on would assert nothing.
+    """
+    real = memory._ram_available_bytes
+    memory._ram_available_bytes = (
+        lambda: None if ram_available_mb is None else ram_available_mb * MIB
+    )
+    os.environ["PANOPTIKON_UNIFIED_GPU"] = bdf
+    try:
+        yield
+    finally:
+        del os.environ["PANOPTIKON_UNIFIED_GPU"]
+        memory._ram_available_bytes = real
+
+
+def test_the_amdgpu_tier_is_gtt_inclusive_on_a_unified_board(
+    tmp_path, monkeypatch
+) -> None:
+    # Expected behavior: an APU is budgeted against carve-out + GTT, because
+    # that is where its allocations land once the carve-out fills, and its
+    # free reading clamps unclaimed GTT to the RAM that exists right now —
+    # the pages behind that address space come out of the same memory every
+    # other process is using. The orchestrator's refresh computes the
+    # identical formula from the identical files, so the two sides still
+    # speak one vocabulary under the one label.
+    root = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
+    write_gtt(root, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)
+    with isolated(fake_torch_module(FakeCuda(), hip="7.2.0")):
+        # Flag absent: exactly today's VRAM-only arithmetic, GTT files or no.
+        assert memory.amdgpu_free_total_mb(root) == (256, 512)
+        with unified():
+            assert memory.amdgpu_free_total_mb(root) == (
+                256 + 8 * 1024,
+                APU_CARVEOUT_MIB + APU_GTT_MIB,
+            )
+        # Plenty of RAM: the GTT term is the driver's own free figure again.
+        with unified(ram_available_mb=100 * 1024):
+            assert memory.amdgpu_free_total_mb(root) == (
+                256 + 60 * 1024,
+                APU_CARVEOUT_MIB + APU_GTT_MIB,
+            )
+        # Every term is required. A board whose GTT counters or whose RAM
+        # figure cannot be read is *no* reading — reporting the carve-out
+        # alone under a label that now means carve+GTT would hand the ledger
+        # two incompatible numbers in one field.
+        with unified(ram_available_mb=None):
+            assert memory.amdgpu_free_total_mb(root) == (None, None)
+        no_gtt = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 0)})
+        with unified():
+            assert memory.amdgpu_free_total_mb(no_gtt) == (None, None)
+        # …and a discrete worker never acquires that dependency.
+        assert memory.amdgpu_free_total_mb(no_gtt) == (512, 512)
+
+
+def test_the_unified_sample_keeps_the_amdgpu_sysfs_label(tmp_path, monkeypatch) -> None:
+    # Expected behavior: the label names the driver, not the arithmetic. Both
+    # sides of the ledger read the same files through the same flag, so the
+    # free-source consistency rule holds without a second label to keep in
+    # sync (and a new one would silently lose `amdgpu-sysfs`'s authority).
+    root = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
+    write_gtt(root, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)
+    with rocm_host(tmp_path, monkeypatch, pci=root):
+        with unified():
+            sample = memory.device_memory_sample()
+    assert sample["free_source"] == "amdgpu-sysfs"
+    assert (sample["free_mb"], sample["total_mb"]) == (
+        256 + 8 * 1024,
+        APU_CARVEOUT_MIB + APU_GTT_MIB,
+    )
+
+
+def test_the_fdinfo_tier_counts_gtt_on_a_unified_board(tmp_path, monkeypatch) -> None:
+    # Expected behavior: on an APU our own allocations are VRAM + GTT, and a
+    # VRAM-only figure would report a multi-gigabyte model as holding a few
+    # hundred MB — an under-measured base, which is headroom the ledger hands
+    # out twice. Both kernel spellings apply to the GTT keys as they do to
+    # the VRAM ones, and the deduplication by client id is unchanged.
+    texts = [
+        fdinfo("0000:03:00.0", 1, "256 MiB") + "drm-resident-gtt:\t2048 MiB\n",
+        fdinfo("0000:03:00.0", 1, "256 MiB") + "drm-resident-gtt:\t2048 MiB\n",
+        fdinfo("0000:03:00.0", 2, "128 MiB", key="drm-memory-vram")
+        + "drm-memory-gtt:\t512 MiB\n",
+        # A board we merely hold open: not ours to charge, either region.
+        fdinfo("0000:0c:00.0", 3, "8192 MiB") + "drm-resident-gtt:\t8192 MiB\n",
+    ]
+    with rocm_host(tmp_path, monkeypatch, fdinfo_texts=texts):
+        assert memory.fdinfo_own_vram_mb() == 384, "VRAM alone without the flag"
+        with unified():
+            assert memory.fdinfo_own_vram_mb() == 384 + 2560
+
+    # End to end, on the board shape that motivates it: HIP reports the
+    # 512 MiB carve-out as `total_memory`, and the tier's upper sanity bound
+    # is measured against **carve-out + GTT** instead — a footprint that
+    # includes GTT is legitimately larger than the carve-out, so bounding it
+    # by HIP's figure would lose the best tier this backend has on every
+    # model worth measuring.
+    board = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
+    write_gtt(board, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)
+    carveout = FakeCuda(total_mb=APU_CARVEOUT_MIB)
+    with rocm_host(
+        tmp_path, monkeypatch, pci=board, fdinfo_texts=texts, cuda=carveout
+    ):
+        with unified():
+            before = memory.begin_load()
+            carveout.allocate(2048, reserved_mb=2400)
+            report = memory.finish_load(before, object())
+    assert report["base_method"] == "fdinfo", report
+    assert report["base_mb"] == 384 + 2560, report
+
+
+def test_the_fdinfo_upper_bound_follows_the_unified_total(tmp_path, monkeypatch) -> None:
+    # Expected behavior: the bound is kept on a unified board, with the right
+    # comparand. A per-process figure at or above the *board's* whole capacity
+    # is a parse or kernel-accounting artefact, not a footprint — and the
+    # under-report floor cannot catch it, because over-reporting is the
+    # direction that floor treats as normal. On an APU the capacity is
+    # carve-out + GTT, which is what the sysfs tier already reads.
+    small_gtt_mib = 2048
+    board = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 0)})
+    write_gtt(board, "0000:03:00.0", small_gtt_mib * MIB, 0)
+    # 4 GiB claimed on a board whose whole capacity is 512 MiB + 2 GiB.
+    texts = [fdinfo("0000:03:00.0", 1, "1024 MiB") + "drm-resident-gtt:\t3072 MiB\n"]
+    cuda = FakeCuda(total_mb=APU_CARVEOUT_MIB)
+    with rocm_host(tmp_path, monkeypatch, pci=board, fdinfo_texts=texts, cuda=cuda):
+        with unified():
+            assert memory.fdinfo_own_vram_mb() == 4096, "the reader is neutral"
+            before = memory.begin_load()
+            cuda.allocate(1024, reserved_mb=1200)
+            report = memory.finish_load(before, object())
+    assert report["base_method"] != "fdinfo", report
+
+    # And the bound does not depend on psutil. The unified *free* formula
+    # needs a RAM figure; the capacity does not, and deriving one from the
+    # other would have made this guard vanish on a machine without psutil —
+    # the one way a missing dependency could produce an over-reported
+    # footprint instead of a missing one.
+    cuda = FakeCuda(total_mb=APU_CARVEOUT_MIB)
+    with rocm_host(tmp_path, monkeypatch, pci=board, fdinfo_texts=texts, cuda=cuda):
+        with unified(ram_available_mb=None):
+            assert memory.amdgpu_free_total_mb() == (None, None), "no RAM figure"
+            assert memory.amdgpu_board_total_mb() == APU_CARVEOUT_MIB + small_gtt_mib
+            before = memory.begin_load()
+            cuda.allocate(1024, reserved_mb=1200)
+            report = memory.finish_load(before, object())
+    assert report["base_method"] != "fdinfo", report
+
+    # Just under the capacity, the same reading is a footprint again.
+    texts = [fdinfo("0000:03:00.0", 1, "1024 MiB") + "drm-resident-gtt:\t1024 MiB\n"]
+    cuda = FakeCuda(total_mb=APU_CARVEOUT_MIB)
+    with rocm_host(tmp_path, monkeypatch, pci=board, fdinfo_texts=texts, cuda=cuda):
+        with unified():
+            before = memory.begin_load()
+            cuda.allocate(1024, reserved_mb=1200)
+            report = memory.finish_load(before, object())
+    assert (report["base_method"], report["base_mb"]) == ("fdinfo", 2048), report
+
+    # Without the flag the same worker's reading is below its own allocator
+    # pool *and* at the board's capacity, so it loses the tier — which is the
+    # pre-existing guard doing its job, and the symptom a missing flag would
+    # produce rather than a silently wrong number.
+    carveout = FakeCuda(total_mb=APU_CARVEOUT_MIB)
+    with rocm_host(tmp_path, monkeypatch, fdinfo_texts=texts, cuda=carveout):
+        before = memory.begin_load()
+        carveout.allocate(2048, reserved_mb=2400)
+        report = memory.finish_load(before, object())
+    assert report["base_method"] != "fdinfo", report
+
+
+def test_the_fdinfo_parser_sums_only_the_regions_it_is_asked_for() -> None:
+    # Expected behavior: the region set is a parameter, not a mode. The
+    # identity fallback's dominance rule keeps asking about VRAM alone (it
+    # ranks boards, and GTT is not a property of the board), while the
+    # per-process tier asks for both on a unified host. Absent is still 0 and
+    # unreadable is still None, per region.
+    text = fdinfo("0000:03:00.0", 7, "256 MiB") + "drm-resident-gtt:\t2048 MiB\n"
+    assert memory.parse_drm_fdinfo(text) == ("0000:03:00.0", 7, 256 * MIB)
+    assert memory.parse_drm_fdinfo(text, ("vram", "gtt")) == (
+        "0000:03:00.0",
+        7,
+        2304 * MIB,
+    )
+    # A record with no GTT line at all is a real record holding no GTT.
+    assert memory.parse_drm_fdinfo(fdinfo("0000:03:00.0", 7, "8 MiB"), ("vram", "gtt")) == (
+        "0000:03:00.0",
+        7,
+        8 * MIB,
+    )
+    # A GTT line in a unit the documented grammar does not define makes the
+    # whole record unreadable, exactly as the VRAM one does: reading it as 0
+    # would be inventing an observation.
+    broken = fdinfo("0000:03:00.0", 7, "256 MiB") + "drm-resident-gtt:\t2 GiB\n"
+    assert memory.parse_drm_fdinfo(broken, ("vram", "gtt")) is None
+    assert memory.parse_drm_fdinfo(broken) == ("0000:03:00.0", 7, 256 * MIB)
+
+
+def test_the_fdinfo_parser_never_mixes_the_two_key_vintages() -> None:
+    # Expected behavior: `drm-memory-*` is the deprecated alias for
+    # `drm-resident-*`, and the two are different vintages of the same
+    # accounting. A kernel printing resident VRAM but only legacy GTT (or the
+    # reverse) must not have the two added together — that sum is not a
+    # reading of anything. Resident wins for the WHOLE record when it appears
+    # at all, so the fallback is per-record, never per-region.
+    mixed = (
+        fdinfo("0000:03:00.0", 7, "256 MiB")  # drm-resident-vram
+        + "drm-memory-gtt:\t2048 MiB\n"
+    )
+    assert memory.parse_drm_fdinfo(mixed, ("vram", "gtt")) == (
+        "0000:03:00.0",
+        7,
+        256 * MIB,
+    ), "the legacy GTT line is ignored because a resident line exists"
+    # The all-legacy record is read in full, which is the case the fallback
+    # exists for (amdgpu is the only driver that prints the old spelling).
+    legacy = (
+        fdinfo("0000:03:00.0", 7, "256 MiB", key="drm-memory-vram")
+        + "drm-memory-gtt:\t2048 MiB\n"
+    )
+    assert memory.parse_drm_fdinfo(legacy, ("vram", "gtt")) == (
+        "0000:03:00.0",
+        7,
+        2304 * MIB,
+    )
+    # And a modern record that simply holds no GTT is still a full reading.
+    assert memory.parse_drm_fdinfo(
+        fdinfo("0000:03:00.0", 7, "256 MiB"), ("vram", "gtt")
+    ) == ("0000:03:00.0", 7, 256 * MIB)
+
+
+# ---------------------------------------------------------------------------
+# The pinned-but-invisible tripwire (docs/rocm-batch-calibration-parity.md):
+# backend B moved dGPU+iGPU desktops from "unpinned" to row-index pins, and a
+# pin naming a board HIP does not enumerate is a silent CPU fallback.
+# ---------------------------------------------------------------------------
+
+
+def test_a_pin_that_names_no_device_fails_the_load(monkeypatch) -> None:
+    # Expected behavior: pinned + zero enumerated devices = a load failure
+    # with an actionable message, not a model running twenty times slower on
+    # the CPU while the ledger prices it against a board.
+    with isolated(fake_torch_module(FakeCuda(device_count=0), hip="7.2.0")):
+        monkeypatch.setenv("PANOPTIKON_DEVICE_PIN", "1")
+        problem = memory.pinned_device_missing()
+    assert problem is not None
+    assert "'1'" in problem, "names the pin the orchestrator wrote"
+    assert "HSA_OVERRIDE_GFX_VERSION" in problem
+    assert "CPU" in problem
+
+
+def test_the_pin_tripwire_stays_quiet_when_it_cannot_be_sure(monkeypatch) -> None:
+    # Expected behavior: it reports only what it can positively call wrong.
+    # A device the runtime does enumerate, no pin at all, no torch, and the
+    # documented hide-everything idioms are all silence.
+    with isolated(fake_torch_module(FakeCuda(), hip="7.2.0")):
+        monkeypatch.setenv("PANOPTIKON_DEVICE_PIN", "0")
+        assert memory.pinned_device_missing() is None, "the device is there"
+    with isolated(fake_torch_module(FakeCuda(device_count=0), hip="7.2.0")):
+        monkeypatch.delenv("PANOPTIKON_DEVICE_PIN", raising=False)
+        assert memory.pinned_device_missing() is None, "nothing was pinned"
+        for blank in ("", " "):
+            monkeypatch.setenv("PANOPTIKON_DEVICE_PIN", blank)
+            assert memory.pinned_device_missing() is None, repr(blank)
+        # An operator hiding every device is NOT our placement, and the
+        # visibility variables alone cannot tell the two apart — which is why
+        # the marker exists. `CUDA_VISIBLE_DEVICES=-1` is the documented
+        # hide-everything idiom and must keep working.
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+        monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2")
+        assert memory.pinned_device_missing() is None, "ambient, not ours"
+        monkeypatch.setenv("PANOPTIKON_DEVICE_PIN", "2")
+        assert memory.pinned_device_missing() is not None, "ours"
+    # No torch in the process at all: a CPU impl on a pinned host reports
+    # nothing rather than a fault it has no evidence for.
+    with isolated():
+        monkeypatch.setenv("PANOPTIKON_DEVICE_PIN", "1")
+        assert memory.pinned_device_missing() is None
+
+
+def test_the_pin_tripwire_ignores_a_cpu_only_torch_build(monkeypatch) -> None:
+    # Expected behavior: a CPU-only wheel never enumerated a device to lose,
+    # so its empty device list is not a fault. This is the common shape, not a
+    # corner: pinning is universal, so every replica on a priced host carries
+    # the marker, and the probe prices `accelerator = "cpu"` hosts through
+    # nvidia-smi by design — a box with an NVIDIA card, the CPU wheels and
+    # `accelerator = "cpu"` is pinned, sees no devices, and is working exactly
+    # as configured. Without this it would fail every torch model's load.
+    cpu_build = fake_torch_module(FakeCuda(device_count=0))
+    cpu_build.version = SimpleNamespace(cuda=None, hip=None)
+    with isolated(cpu_build):
+        monkeypatch.setenv("PANOPTIKON_DEVICE_PIN", "GPU-1a2b")
+        assert memory.pinned_device_missing() is None
+    # The same build reporting a CUDA version is an accelerated one that lost
+    # its device, which is the fault this exists for.
+    with isolated(fake_torch_module(FakeCuda(device_count=0))):
+        monkeypatch.setenv("PANOPTIKON_DEVICE_PIN", "GPU-1a2b")
+        assert memory.pinned_device_missing() is not None
+
+
+def test_the_unified_signal_is_an_address_the_worker_verifies(
+    tmp_path, monkeypatch
+) -> None:
+    # Expected behavior: the orchestrator names the *board* it believes this
+    # replica is pinned to, and the worker only counts GTT when that is the
+    # board it independently resolved. The pin is a belief — KFD row order
+    # being HIP device order is the ROCm design's one load-bearing
+    # unverifiable — and a wrong belief is expensive in both directions: a
+    # worker that landed on a dGPU would report GTT-inflated free memory
+    # under the authoritative `amdgpu-sysfs` label (phantom headroom), and
+    # one that landed on the APU without the signal prices a 64 GB board at
+    # its 512 MB carve-out. So a bare flag is deliberately NOT accepted.
+    with rocm_host(tmp_path, monkeypatch):  # FakeCuda sits at 0000:03:00.0
+        assert memory._identity_bdf() == "0000:03:00.0"
+        cases = [
+            ("0000:03:00.0", True),
+            ("0000:03:00.0 ", True),
+            ("0000:03:00.0".upper(), True),  # rendered case must not matter
+            ("0000:0c:00.0", False),  # the replica landed elsewhere
+            ("1", False),  # a bare flag is not an address
+            ("", False),
+            ("yes", False),
+            ("0000:03:00", False),  # not a whole address
+        ]
+        for value, expected in cases:
+            os.environ["PANOPTIKON_UNIFIED_GPU"] = value
+            try:
+                assert memory._unified_gpu() is expected, value
+                assert memory._memory_regions() == (
+                    ("vram", "gtt") if expected else ("vram",)
+                )
+            finally:
+                del os.environ["PANOPTIKON_UNIFIED_GPU"]
+        assert memory._unified_gpu() is False, "absent is the default everywhere"
+
+    # And with no identity yet — the pre-load reading, before any impl has
+    # touched torch — a perfectly correct address still answers false: there
+    # is nothing to check it against, and the discrete arithmetic is the
+    # conservative reading in both directions.
+    with isolated():
+        os.environ["PANOPTIKON_UNIFIED_GPU"] = "0000:03:00.0"
+        try:
+            assert memory._unified_gpu() is False
+        finally:
+            del os.environ["PANOPTIKON_UNIFIED_GPU"]
+
+
+def test_a_mislanded_worker_reads_its_board_discretely(tmp_path, monkeypatch) -> None:
+    # Expected behavior: the whole point of the address. This worker is on
+    # 0000:03:00.0 and the orchestrator believed it was on the APU at
+    # 0000:0c:00.0 (a mis-ordered HIP enumeration). It must not add that
+    # board's GTT to its own free reading — the ledger treats `amdgpu-sysfs`
+    # as authoritative, so the inflated figure would become headroom nothing
+    # else could contradict.
+    root = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
+    write_gtt(root, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)
+    with isolated(fake_torch_module(FakeCuda(), hip="7.2.0")):
+        with unified(bdf="0000:0c:00.0"):
+            assert memory.amdgpu_free_total_mb(root) == (256, 512), (
+                "the sample stays in the discrete currency, which is the one "
+                "the orchestrator prices a dGPU row in"
+            )
+        with unified(bdf="0000:03:00.0"):
+            assert memory.amdgpu_free_total_mb(root) == (
+                256 + 8 * 1024,
+                APU_CARVEOUT_MIB + APU_GTT_MIB,
+            )
 
 
 def test_nvml_is_refused_outright_on_a_rocm_worker(tmp_path, monkeypatch) -> None:

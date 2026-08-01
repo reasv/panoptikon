@@ -437,6 +437,129 @@ def _hip_pinned() -> bool:
     return any(entry.strip() for entry in value.split(","))
 
 
+def _unified_gpu() -> bool:
+    """Whether this worker is **on** a unified-memory board (DP-5).
+
+    The worker has no inventory and no way to ask the driver what kind of
+    board it landed on — an APU's KFD node is the only thing that says so,
+    and reading KFD topology here would be a second, divergent probe of the
+    orchestrator's own question. So the spawner, which resolved the board to
+    write the pin, names it:
+    `PANOPTIKON_UNIFIED_GPU=<that board's PCI address>`
+    (`gpu.rs::UNIFIED_GPU_ENV_VAR`).
+
+    **The address is checked, not trusted.** The spawner knows which board
+    the pin *named*; whether the replica came up on it is the one
+    load-bearing unverifiable of the ROCm design (KFD row order = HIP device
+    order). A bare flag would therefore be a belief, and a wrong belief here
+    is expensive in both directions: a worker that landed on a **dGPU** would
+    add GTT to its free reading and report the sum under the authoritative
+    `"amdgpu-sysfs"` label — phantom headroom, the one error the ledger
+    cannot absorb — while a worker that landed on the **APU** without the
+    flag prices a 64 GB board at its 512 MB carve-out and collapses to
+    batch-1. So this answers true only when the named address is the one
+    [`_identity_bdf`] independently resolved for this process.
+
+    Everything else — a mismatch, an unparseable value, a legacy bare `1`,
+    or an identity that is not known yet (the pre-load reading, before any
+    impl has touched torch) — is the discrete arithmetic, which is
+    conservative in both directions.
+
+    Read on every call rather than memoized: it costs an environment lookup
+    plus the already-memoized identity, and the answer legitimately changes
+    from false to true the moment the device resolves.
+    """
+    claimed = (os.environ.get("PANOPTIKON_UNIFIED_GPU") or "").strip().lower()
+    if not _BDF_RE.fullmatch(claimed):
+        return False
+    return claimed == _identity_bdf()
+
+
+def _memory_regions() -> tuple[str, ...]:
+    """The DRM/amdgpu memory regions this worker's own usage is summed over.
+
+    On a unified board that is VRAM **plus GTT**: once the BIOS carve-out
+    fills, an APU's allocations land in GTT, so a VRAM-only figure would
+    report a multi-gigabyte model as holding a few hundred MB — an
+    under-measured base, which is headroom the ledger hands out twice.
+    """
+    return ("vram", "gtt") if _unified_gpu() else ("vram",)
+
+
+def pinned_device_missing() -> str | None:
+    """An actionable message when this worker was pinned to a device its own
+    runtime does not enumerate, or `None` when there is nothing to report.
+
+    The tripwire for the shape backend B newly puts on the pinned path
+    (docs/unified-memory-admission.md, backend B): a desktop with an AMD
+    dGPU *and* a Raphael/G-series iGPU used to be declined wholesale by the
+    probe and ran unpinned, and is now two ledger boards with
+    `HIP_VISIBLE_DEVICES=<row index>` pins. Those indices are positions in
+    the kernel's KFD topology, and if the ROCm userspace does not enumerate
+    the iGPU — an unsupported gfx target, a missing
+    `HSA_OVERRIDE_GFX_VERSION` — the index names nothing, torch sees no
+    device at all, and the impl quietly runs the model on the **CPU**: no
+    error, no admission, and a job that takes twenty times as long for
+    reasons nothing in the logs explains.
+
+    So it is made loud instead. Called after the impl's `load()`, because
+    torch is only in `sys.modules` once the impl has imported it, and it
+    answers `None` for everything it cannot positively call wrong: no pin, no
+    torch, or a runtime that would not say how many devices it has.
+
+    The pin it reads is `PANOPTIKON_DEVICE_PIN`, which the spawner writes
+    beside the visibility variable, and **not** the visibility variable
+    itself. The two are indistinguishable in this process's environment and
+    mean opposite things here: a device the *orchestrator* placed us on and
+    the runtime cannot see is the silent CPU fallback above, while
+    `CUDA_VISIBLE_DEVICES=-1` (or an empty value, or a scheduler's ambient
+    restriction) is an operator deliberately hiding every device — a host
+    that worked yesterday and must keep working. Keying off our own marker
+    fires exactly where we made the placement.
+    """
+    pin = (os.environ.get("PANOPTIKON_DEVICE_PIN") or "").strip()
+    if not pin:
+        return None
+    torch = _torch()
+    if torch is None:
+        return None
+    # A **CPU-only torch build** never enumerated a device to lose, so its
+    # empty device list is not a fault and must not fail a load. This is not
+    # a corner case: pinning is universal, so every replica on a priced host
+    # carries the marker, and `gpu::probe` prices `accelerator = "cpu"` and
+    # `auto` hosts through nvidia-smi *by design* (capability filtering must
+    # not depend on which wheels are installed). A box with an NVIDIA card,
+    # `accelerator = "cpu"` and the CPU wheels is therefore pinned, sees no
+    # devices, and is working exactly as configured. Both version fields are
+    # `None` on such a build and exactly one is set on any accelerated one.
+    try:
+        version = getattr(torch, "version", None)
+        accelerated = bool(getattr(version, "cuda", None)) or bool(
+            getattr(version, "hip", None)
+        )
+    except Exception:
+        return None
+    if not accelerated:
+        return None
+    try:
+        count = int(torch.cuda.device_count())
+    except Exception:
+        return None
+    if count != 0:
+        return None
+    return (
+        f"this worker was pinned to GPU device '{pin}' but the torch "
+        "runtime enumerates no devices at all, so the model would have run on "
+        "the CPU while being priced against a GPU. The likely causes are a "
+        "board the ROCm userspace does not enumerate (an unsupported gfx "
+        "target — an integrated GPU alongside a discrete one is the common "
+        "case, and HSA_OVERRIDE_GFX_VERSION is how such a part is usually "
+        "made usable) or a device index that does not exist in this "
+        "process's visible set. Pin this model to a board that works "
+        "(inference_local `devices`), or make the pinned one enumerable"
+    )
+
+
 def _device_props() -> Any | None:
     """`get_device_properties(0)` for the pinned device, or None.
 
@@ -637,8 +760,10 @@ def gpu_total_mb() -> int | None:
 # ---------------------------------------------------------------------------
 
 
-def parse_drm_fdinfo(text: str) -> tuple[str, int, int] | None:
-    """`(pdev, client_id, vram_bytes)` for one fdinfo file, or None.
+def parse_drm_fdinfo(
+    text: str, regions: tuple[str, ...] = ("vram",)
+) -> tuple[str, int, int] | None:
+    """`(pdev, client_id, bytes)` for one fdinfo file, or None.
 
     The DRM usage-stats format is one `key: value` per line
     (<https://docs.kernel.org/gpu/drm-usage-stats.html>); non-DRM fds carry
@@ -652,7 +777,12 @@ def parse_drm_fdinfo(text: str) -> tuple[str, int, int] | None:
     docs' deprecated alias for `drm-resident-<region>` and is "only printed
     by amdgpu" — exactly the driver this exists for — so a parser that knew
     only the modern spelling would read every AMD client as zero.
-    `drm-resident-vram` wins when a kernel prints both.
+    `drm-resident-*` wins when a kernel prints both, and it wins **for the
+    whole sum**: if any requested region has a resident line, every region is
+    read in that spelling and a deprecated line is ignored even where it is
+    the only one present. The two spellings are different vintages of the
+    same accounting, and mixing them within one figure would add a modern
+    region to a legacy one — a number that is not a reading of anything.
 
     **Absent and unreadable are different answers.** A DRM client with
     neither key is a real record with **no VRAM** — a board this process has
@@ -662,6 +792,14 @@ def parse_drm_fdinfo(text: str) -> tuple[str, int, int] | None:
     `None` instead: reading it as 0 would be inventing an observation, and
     the observation it would invent is the one that hands dominance — and
     with it this worker's board identity — to a different card.
+
+    `regions` is which memory regions the byte count sums. The default is
+    VRAM alone, which is every discrete board and the identity fallback's
+    dominance rule. A **unified** board adds `gtt`, because that is where an
+    APU's allocations land once the carve-out fills (DP-5); the same
+    spelling pair applies to it (`drm-resident-gtt`, and amdgpu's deprecated
+    `drm-memory-gtt` alias), so nothing about the parse changes but the set
+    of keys it looks for.
 
     The pdev is lower-cased so it compares directly against the addresses
     [`device_bdf`] and the orchestrator's inventory render.
@@ -682,15 +820,21 @@ def parse_drm_fdinfo(text: str) -> tuple[str, int, int] | None:
         client = int(client_id)
     except ValueError:
         return None
-    raw = fields.get("drm-resident-vram")
-    if raw is None:
-        raw = fields.get("drm-memory-vram")
-    if raw is None:
-        return (pdev.lower(), client, 0)
-    vram = _parse_drm_bytes(raw)
-    if vram is None:
-        return None
-    return (pdev.lower(), client, vram)
+    prefix = (
+        "drm-resident-"
+        if any(f"drm-resident-{region}" in fields for region in regions)
+        else "drm-memory-"
+    )
+    total = 0
+    for region in regions:
+        raw = fields.get(f"{prefix}{region}")
+        if raw is None:
+            continue
+        amount = _parse_drm_bytes(raw)
+        if amount is None:
+            return None
+        total += amount
+    return (pdev.lower(), client, total)
 
 
 def _parse_drm_bytes(value: str | None) -> int | None:
@@ -717,7 +861,9 @@ def _parse_drm_bytes(value: str | None) -> int | None:
     return amount * scale
 
 
-def fdinfo_vram_by_pdev(texts: Iterable[str]) -> dict[str, int]:
+def fdinfo_vram_by_pdev(
+    texts: Iterable[str], regions: tuple[str, ...] = ("vram",)
+) -> dict[str, int]:
     """Per-board VRAM this process holds, keyed by PCI address, in bytes.
 
     Pure over an iterable of fdinfo file contents so it is testable without
@@ -728,11 +874,14 @@ def fdinfo_vram_by_pdev(texts: Iterable[str]) -> dict[str, int]:
     Deduplicated by DRM client id: several fds of one client are one client.
     Records [`parse_drm_fdinfo`] rejected — a non-DRM fd, or a memory line it
     could not read — contribute nothing at all, not a zero.
+
+    `regions` is forwarded verbatim: VRAM alone by default, VRAM + GTT for a
+    unified board's own footprint (see [`parse_drm_fdinfo`]).
     """
     seen: set[tuple[str, int]] = set()
     totals: dict[str, int] = {}
     for text in texts:
-        record = parse_drm_fdinfo(text)
+        record = parse_drm_fdinfo(text, regions)
         if record is None:
             continue
         pdev, client, vram = record
@@ -829,12 +978,16 @@ def fdinfo_own_vram_mb(root: str | None = None) -> int | None:
     ROCR-visible board and the other boards' clients are not ours to charge.
     A board absent from the map, or present holding nothing, is no reading at
     all (None) rather than a zero — the never-invent-a-footprint rule.
+
+    On a **unified** board the sum is VRAM + GTT (DP-5, [`_memory_regions`]):
+    an APU's allocations spill into GTT as soon as the BIOS carve-out fills,
+    which on a 512 MB carve-out is immediately.
     """
     bdf = _identity_bdf()
     if bdf is None:
         return None
     texts = _fdinfo_texts(FDINFO_ROOT if root is None else root)
-    vram = fdinfo_vram_by_pdev(texts).get(bdf)
+    vram = fdinfo_vram_by_pdev(texts, _memory_regions()).get(bdf)
     # `vram <= 0` is redundant with the trailing falsy check (`_mb` clamps at
     # 0, so a non-positive byte count can only become 0, which is discarded
     # below) — deliberately kept: the two guards say different things. This
@@ -903,7 +1056,17 @@ def _fdinfo_base_mb(
     own = fdinfo_own_vram_mb(root)
     if own is None:
         return None
-    total_mb = gpu_total_mb()
+    # …and on a **unified** board the bound is the same rule against a
+    # different comparand, not a dropped rule. What HIP reports as an APU's
+    # `total_memory` may be the BIOS carve-out alone — 512 MB is a common
+    # default — while the reading legitimately includes GTT, so measuring
+    # against it would reject every model worth measuring. The board's real
+    # capacity there is carve-out + GTT, read from the same sysfs files but
+    # **without** the free half: a bound derived from the free reading would
+    # have inherited its psutil dependency and vanished silently on a machine
+    # without it — the one way a missing dependency could produce an
+    # over-reported footprint rather than a missing one.
+    total_mb = amdgpu_board_total_mb() if _unified_gpu() else gpu_total_mb()
     if total_mb is not None and total_mb > 0 and own >= total_mb:
         logger.debug(
             "DRM fdinfo reports this process holding %d MiB of a %d MiB board; "
@@ -957,6 +1120,21 @@ def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | Non
     One known optimism, accepted and documented in D5: `total - used` ignores
     the firmware/kernel carve-outs nvidia-smi's `memory.free` excludes, so
     these readings run a few hundred MB high. The ledger's margin absorbs it.
+
+    **On a verified unified board** (`PANOPTIKON_UNIFIED_GPU` naming the
+    address this worker resolved for itself, DP-5) the same files'
+    GTT neighbours join in, because an APU is budgeted against carve-out +
+    GTT: `total = vram_total + gtt_total`, and
+    `free = (vram_total - vram_used) + min(gtt_total - gtt_used,
+    ram_available)`. The RAM clamp is the load-bearing part — unclaimed GTT
+    is address space, and the pages behind it come out of the same RAM every
+    other process is using, so without it a machine under real memory
+    pressure would read as idle. The orchestrator's own refresh computes the
+    identical formula from the identical files
+    (`rocm.rs::query_memory`), which is what keeps the one-vocabulary rule
+    true on this backend too; every term is required, so a board whose GTT
+    counters or whose `MemAvailable` cannot be read is no reading at all
+    rather than a VRAM-only one under a label that now means something else.
     """
     bdf = _identity_bdf()
     if bdf is None:
@@ -966,6 +1144,14 @@ def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | Non
     used = _sysfs_bytes(os.path.join(device, "mem_info_vram_used"))
     if total is None or used is None:
         return (None, None)
+    if _unified_gpu():
+        gtt_total = _sysfs_bytes(os.path.join(device, "mem_info_gtt_total"))
+        gtt_used = _sysfs_bytes(os.path.join(device, "mem_info_gtt_used"))
+        available = _ram_available_bytes()
+        if gtt_total is None or gtt_used is None or available is None:
+            return (None, None)
+        free = max(total - used, 0) + min(max(gtt_total - gtt_used, 0), available)
+        return (_mb(free), _mb(total + gtt_total))
     # The `max(..., 0)` is redundant with `_mb`'s own clamp and is kept on
     # purpose: it states the *semantic* saturation (the driver updates the two
     # counters independently, so `used > total` is a real mid-update reading
@@ -973,6 +1159,34 @@ def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | Non
     # defensive floor on an arbitrary value. Removing it would leave the
     # subtraction looking like it can go negative.
     return (_mb(max(total - used, 0)), _mb(total))
+
+
+def amdgpu_board_total_mb(root: str | None = None) -> int | None:
+    """This worker's board **capacity** from amdgpu sysfs, or None.
+
+    The same figure [`amdgpu_free_total_mb`] reports as its total — VRAM
+    alone, plus GTT on a verified unified board — computed without the free
+    half. It exists so the capacity is knowable when the free reading is not:
+    the unified free formula needs `ram_available`, i.e. psutil, and psutil is
+    a dependency the worker's venv is *expected* to have but does not
+    *require* for a sanity bound to hold. Deriving the fdinfo tier's upper
+    bound from the free reading would have made that bound quietly vanish on
+    a machine without psutil, which is the one place a missing dependency
+    could turn into an over-reported footprint instead of a missing one.
+    """
+    bdf = _identity_bdf()
+    if bdf is None:
+        return None
+    device = _pci_device_dir(PCI_DEVICES_ROOT if root is None else root, bdf)
+    total = _sysfs_bytes(os.path.join(device, "mem_info_vram_total"))
+    if total is None:
+        return None
+    if _unified_gpu():
+        gtt_total = _sysfs_bytes(os.path.join(device, "mem_info_gtt_total"))
+        if gtt_total is None:
+            return None
+        total += gtt_total
+    return _mb(total)
 
 
 def _pci_device_dir(base: str, bdf: str) -> str:

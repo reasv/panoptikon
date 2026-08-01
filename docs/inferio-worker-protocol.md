@@ -223,6 +223,27 @@ sysfs-derived reporter cannot inherit that authority by string collision — and
 it is the same pair of files the orchestrator's own refresh reads, so both
 sides of the ledger speak one vocabulary by construction.
 
+**`"amdgpu-sysfs"` is GTT-inclusive on a verified unified board**
+(`PANOPTIKON_UNIFIED_GPU` naming the address the worker itself resolved)
+(docs/unified-memory-admission.md, backend B). On an AMD APU the label and the
+files are the same, but the arithmetic covers the whole board an APU actually
+has: `total = mem_info_vram_total + mem_info_gtt_total` (the BIOS UMA
+carve-out plus the GTT window its allocations spill into as soon as the
+carve-out fills), and `free = (vram_total - vram_used) + min(gtt_total -
+gtt_used, ram_available)`, with `ram_available` from
+`psutil.virtual_memory().available`. The clamp is the load-bearing part:
+unclaimed GTT is address space, and the pages behind it come out of the same
+RAM every other process is using, so without it a machine under real memory
+pressure would read as idle. Every term is required — a board whose GTT
+counters or whose RAM figure cannot be read reports *no* sample rather than a
+VRAM-only one under a label that now means something else. The orchestrator's
+refresh applies the identical formula to the identical files for the boards
+its own probe flagged unified, so the one-vocabulary rule holds here too; the
+env var exists because the worker has no inventory and cannot tell the two
+kinds of board apart (see "Environment" below). With the variable absent every
+reading is byte-identical to a discrete board's, which is what keeps every
+dGPU worker's numbers where they were.
+
 **`"mps"` is the unified-memory reading** (docs/unified-memory-admission.md,
 backend A). `total_mb` is Metal's `recommendedMaxWorkingSetSize`
 (`torch.mps.recommended_max_memory()`) — the policy budget for accelerator use
@@ -267,6 +288,15 @@ admitting them (±5% or ±512 MB). A match it cannot cross-check is refused, and
 a refused replica simply dispatches unpriced — the pre-calibration behaviour
 (`docs/rocm-batch-calibration-parity.md`, D3).
 
+On a **unified** ROCm board (an APU) that cross-check accepts **either** of
+two figures, each within the same tolerance: the board's admission total
+(carve-out + GTT) or the BIOS carve-out alone. Which of them HIP reports as
+`total_memory` there is genuinely unknown until the BC-250 field pass, and
+refusing on the unknown would leave every APU host unpriced — the state
+backend B exists to end. The either-of rule widens the check by exactly one
+candidate; a figure that is neither is still refused
+(docs/unified-memory-admission.md, backend B).
+
 `gpu_bdf` has one fallback source, used only on a ROCm build whose torch is
 too old to expose the PCI fields: the DRM client holding the most VRAM in
 `/proc/self/fdinfo` (`drm-pdev` + `drm-client-id`, with `drm-resident-vram` or
@@ -290,6 +320,16 @@ reports absolute whole-process VRAM, so the two only coincide on a process's
 every reload into an already-loaded worker. The windowed delta is the fallback
 for the one case that leaves the absolute figure unknown — the allocator could
 not be read after the load at all.
+
+On a verified unified board that footprint is VRAM **+ GTT**, for the same
+reason the sample above is, and the tier's *upper* sanity bound (a reading at
+or above the board's own capacity is a parse or accounting artefact, not a
+footprint) is measured against **carve-out + GTT** there rather than against
+what HIP reports as `total_memory` — which may be the BIOS carve-out alone,
+512 MB being a common default, a figure any GTT-inclusive footprint worth
+measuring exceeds. The bound is kept, with the comparand the sysfs tier
+already reads; the under-report floor is unchanged and is still the one that
+matters most, because too small is the direction the ledger cannot absorb.
 
 `predict` `ok` may additionally carry:
 
@@ -510,6 +550,35 @@ The orchestrator sets for every worker:
   the high pin into a hard startup failure. It is also the watermark the
   allocator garbage-collects cached buffers at, which is why the peak
   approximation above is biased near the ceiling.
+- `PANOPTIKON_DEVICE_PIN=<the same resolved pin>` — written beside the
+  visibility variable whenever one is written, and only then. It says *the
+  orchestrator placed this replica, on this device*, which the visibility
+  variable cannot: an operator's ambient `CUDA_VISIBLE_DEVICES` is
+  indistinguishable from ours in the child's environment and means the
+  opposite. The worker uses it for one check — a replica we pinned whose
+  runtime enumerates **no devices** has silently fallen back to the CPU, so
+  it fails its load with an actionable error instead of serving results
+  twenty times slower while being priced against a board. A host whose
+  operator hid every device (`CUDA_VISIBLE_DEVICES=-1`, a scheduler's
+  ambient restriction) carries no marker and is untouched.
+- `PANOPTIKON_UNIFIED_GPU=<pci address>` — replicas pinned to a
+  **unified-memory** board, which today means an AMD APU on ROCm
+  (docs/unified-memory-admission.md, DP-5). The value is that board's PCI
+  address in the same `dddd:bb:dd.f` lower-case form as `gpu_bdf`, and the
+  worker counts GTT **only when it matches the board it independently
+  resolved** for itself: the `"amdgpu-sysfs"` sample above, and the
+  `"fdinfo"` per-process base (`drm-resident-gtt` / the deprecated
+  `drm-memory-gtt` alias, alongside the VRAM pair). The address rather than a
+  flag, because a pin is a *belief* about where a replica lands and the ROCm
+  design's one load-bearing unverifiable is exactly that belief; a bare flag
+  on a mis-enumerated host would make a worker that came up on a dGPU report
+  GTT-inflated free memory under an authoritative label. Set **per replica**,
+  not per host — on a dGPU+APU machine one model's replicas can sit on both
+  kinds of board — and absent, never `0`, on a discrete board. A mismatch, an
+  unparseable value or a board the worker cannot yet identify all read as
+  absent, which is the discrete arithmetic and is conservative in both
+  directions. MPS workers do not get it: there is one kind of board on a Mac
+  and their tiers are unified by construction.
 - `INFERIO_WORKER=1` — marker for impl code that wants to know.
 - `PYTHONIOENCODING=utf-8` — keeps worker stderr valid UTF-8 (defense in
   depth; the orchestrator's stderr forwarder tolerates arbitrary bytes from
