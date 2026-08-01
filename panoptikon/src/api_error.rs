@@ -61,10 +61,10 @@ pub enum ApiErrorKind {
     Blocked {
         blocker: Blocker,
     },
-    /// Reserved for the classified batch-1 OOM path of the GPU-compat work
-    /// (the worker reports it as a plain message today); the ledger and the
-    /// audit surface already carry the class.
-    #[allow(dead_code)]
+    /// The item individually exceeds a limit of *this machine* — produced by
+    /// the image decode ceilings on both the scan and extraction sides. The
+    /// classified batch-1 OOM path of the GPU-compat work is still reserved
+    /// (the worker reports it as a plain message today).
     Resource,
 }
 
