@@ -210,6 +210,21 @@ Skipped-known-bad paths are added to the existing `error_paths`/
 `excluded_paths` mechanism so they are not marked unavailable. Continuous
 scan consults and writes the same table (it shares `process_file`).
 
+Traversal, as implemented: directories whose name starts with `.` or equals
+`__MACOSX` (case-insensitively) are never descended into **below a root** —
+by the batch walk, the directory poller, and the continuous scan's event
+admission alike. Everything under them is macOS sidecar litter under
+ordinary-looking names, which the file-name rules cannot see. Content
+previously indexed beneath such a directory is retired by the ordinary
+unavailable-file flow (the walk no longer reaches it, so the next scan marks
+it unavailable, and `remove_unavailable_files` deletes it if the user has
+that on), and its ledger rows go the same way as any vanished path, through
+the end-of-root sweep. Because that is a deletion the user never asked for
+directly, each root logs how many junk directories it pruned when the count
+is nonzero. A dot-named folder the user actually wants indexed is registered
+as an included root in its own right: the root itself is exempt, only what
+is *below* it is judged.
+
 `FileProcessError` mapping: `Io`/`Worker` → transient (never recorded);
 `Filtered`/`Unchanged` → unchanged behavior; `Unsupported` is **split** —
 it currently conflates "no mime type", "ffprobe failed", and "image decode
@@ -471,7 +486,8 @@ WHERE error_class = 'input'
   AND mime_type LIKE 'image/%';
 DELETE FROM scan_errors
 WHERE error_class = 'input'
-  AND stage IN ('header', 'decode');
+  AND stage IN ('header', 'decode')
+  AND mime_type LIKE 'image/%';
 ```
 
 (Both image stages, because a decoder upgrade can change either verdict; only
@@ -503,6 +519,35 @@ changed and why the retry is warranted, and **never** a blanket
 mime column exists for exactly this), on top of the coarser
 `*_PROCESS_VERSION` bump which remains the "the generator itself changed"
 lever.
+
+A directive targeting `header`, `metadata` or `decode` rows must **always**
+constrain on a mime family (`mime_type LIKE 'image/%'`), never on
+`stage`/`error_class` alone. The scan's post-failure content sniff records
+what a file's leading bytes actually are when they contradict its name —
+`application/applefile` for the AppleDouble resource forks macOS scatters
+over a share, `text/html` for an error page served in place of the file —
+and those rows sit in the same `(stage, error_class)` space as the honest
+failures: an AppleDouble named `.png` is an `input` verdict at stage
+`header`, exactly like a genuinely broken image. A predicate without the
+mime family therefore resurrects rows that no decoder and no tool upgrade
+can ever fix, and they fail again for the same reason they failed the first
+time. The mime family is what makes the directive say what it means.
+
+`stage = 'mime'` is the one exception, and it is structural: the guess
+itself is what failed there, so those rows carry `mime_type = NULL` and
+never a sniffed verdict either. A mime predicate would exclude every one of
+them forever, so they are targeted by stage alone — which is safe, since
+nothing else lands in that stage.
+
+The sniffed mime is authoritative only for rows written from the sniff
+onward. A row recorded before it existed still carries the extension guess,
+and the suppression gate means a confirmed row is never re-processed on its
+own, so it keeps that guess indefinitely. The correction rides on the
+directives themselves: if a mime-constrained directive resets such a row,
+its one re-attempt re-records it through the sniff and it is truthful from
+then on. That self-correcting path is the accepted cost — a one-shot
+backfill migration was considered and rejected, since no released build ever
+wrote pre-sniff rows at scale.
 
 The acknowledged inelegance — schema history interleaved with retry
 decisions — is cosmetic; the alternative machinery is real complexity.

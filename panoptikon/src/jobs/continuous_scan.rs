@@ -36,8 +36,8 @@ use crate::jobs::files::{
     ScanTimers, THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data,
     check_folder_validity, current_iso_timestamp, deduplicate_paths, folder_is_empty,
     format_system_time, get_last_modified_time_and_size, has_allowed_extension, infer_mime_type,
-    is_excluded, is_hidden_or_temp, normalize_path, parse_filescan_filter, process_file,
-    run_post_job_maintenance,
+    is_excluded, is_hidden_or_temp, is_under_junk_dir, normalize_path, override_mime_from_content,
+    parse_filescan_filter, process_file, run_post_job_maintenance,
 };
 use crate::pql::model::Match;
 
@@ -457,6 +457,40 @@ pub(crate) struct ContinuousScanState {
     /// every scan restart, so "attempts stays 1 per session" is unchanged.
     failed_stats: HashMap<PathBuf, (String, i64)>,
 }
+
+/// The admission test every candidate path passes, whatever produced it: the
+/// native watcher's events, the poller's settled changes, the rename handler
+/// and the removal handler all reach dispatch through
+/// [`ContinuousScanState::should_process_path`]. A free function so it can be
+/// exercised without an actor.
+fn path_passes_filters(
+    path: &Path,
+    roots: &[PathBuf],
+    excluded: &[PathBuf],
+    extensions: &HashSet<String>,
+) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    if is_hidden_or_temp(path) {
+        return false;
+    }
+    if !has_allowed_extension(path, extensions) {
+        return false;
+    }
+    let is_included = roots.iter().any(|root| path.starts_with(root));
+    if !is_included {
+        return false;
+    }
+    if is_excluded(path, excluded) {
+        return false;
+    }
+    // An event carries an absolute path rather than a traversal, so the
+    // directories it sits under are only ever judged here — the batch walk
+    // prunes the same directories on the way down.
+    !is_under_junk_dir(path, roots)
+}
+
 impl ContinuousScanState {
     fn reset_stats(&mut self) {
         self.stats = ScanStats::new();
@@ -613,7 +647,7 @@ impl ContinuousScanState {
         // process + upsert + epoch bump. See `failed_stats`.
         self.failed_stats
             .insert(path.to_path_buf(), (last_modified.clone(), file_size));
-        let record = ScanErrorRecord {
+        let mut record = ScanErrorRecord {
             path: path.to_string_lossy().to_string(),
             last_modified,
             file_size,
@@ -626,6 +660,9 @@ impl ContinuousScanState {
             error: failure.message.clone(),
             skip_after: failure.skip_after,
         };
+        // The guess above is the *name's*. Where the bytes can contradict it
+        // outright, ask the bytes — the batch walker records the same way.
+        override_mime_from_content(&mut record, path);
         let scan_id = self.scan_id;
         if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::UpsertScanError {
@@ -755,23 +792,12 @@ impl ContinuousScanState {
     }
 
     fn should_process_path(&self, path: &Path) -> bool {
-        if self.watch_roots.is_empty() {
-            return false;
-        }
-        if is_hidden_or_temp(path) {
-            return false;
-        }
-        if !has_allowed_extension(path, &self.allowed_extensions) {
-            return false;
-        }
-        let is_included = self.watch_roots.iter().any(|root| path.starts_with(root));
-        if !is_included {
-            return false;
-        }
-        if is_excluded(path, &self.excluded_roots) {
-            return false;
-        }
-        true
+        path_passes_filters(
+            path,
+            &self.watch_roots,
+            &self.excluded_roots,
+            &self.allowed_extensions,
+        )
     }
 
     async fn handle_remove(&mut self, path: PathBuf) -> ApiResult<()> {
@@ -3062,5 +3088,52 @@ mod tests {
         );
         assert!(gate.load(Ordering::SeqCst), "probe never re-opens the gate");
         actor.stop(None);
+    }
+
+    // Event paths arrive absolute, so the directories they sit under are only
+    // ever judged at admission — every dispatch route (native watcher, the
+    // poller's settled changes, renames, removals) passes through here. A
+    // junk directory below the root takes its whole subtree with it, while the
+    // root itself is exempt, exactly as in the batch walk.
+    #[test]
+    fn junk_directories_are_rejected_at_admission() {
+        let root = PathBuf::from(r"C:\watch");
+        let roots = vec![root.clone()];
+        let excluded = vec![root.join("excluded")];
+        let extensions = HashSet::from([".png".to_string()]);
+        let admits = |path: PathBuf| path_passes_filters(&path, &roots, &excluded, &extensions);
+
+        assert!(admits(root.join("a.png")));
+        assert!(admits(root.join("sub/a.png")));
+        assert!(!admits(root.join(".Trashes/a.png")));
+        assert!(!admits(root.join("__MACOSX/a.png")));
+        assert!(!admits(root.join("sub/__macosx/deep/a.png")));
+        // The pre-existing rules are unchanged by the new one.
+        assert!(!admits(root.join("._a.png")));
+        assert!(!admits(root.join("a.txt")));
+        assert!(!admits(root.join("excluded/a.png")));
+        assert!(!admits(PathBuf::from(r"C:\elsewhere\a.png")));
+        assert!(!path_passes_filters(
+            &root.join("a.png"),
+            &[],
+            &excluded,
+            &extensions
+        ));
+
+        // A dot-named watch root is watched: the exemption is the root's, not
+        // the name's.
+        let dot_root = PathBuf::from(r"C:\watch-dotted\.hidden");
+        assert!(path_passes_filters(
+            &dot_root.join("a.png"),
+            &[dot_root.clone()],
+            &[],
+            &extensions
+        ));
+        assert!(!path_passes_filters(
+            &dot_root.join(".Trashes/a.png"),
+            &[dot_root],
+            &[],
+            &extensions
+        ));
     }
 }

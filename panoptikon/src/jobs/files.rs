@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
     process::Command,
@@ -1039,10 +1041,32 @@ async fn scan_single_folder(
     // "the walk never reached this path" ambiguous, which is what the sweep
     // reads as "the file is gone" — see `sweepable_scan_errors`.
     let mut walk_errors: u64 = 0;
+    // Junk directories pruned below this root. Pruning one is how content
+    // indexed under it in an earlier run gets retired — the walk no longer
+    // reaches it, so it is marked unavailable and, if the user has that on,
+    // deleted with its tags — and that is not something to do silently.
+    let mut pruned_junk_dirs: u64 = 0;
     for entry in WalkDir::new(folder)
         .follow_links(true)
         .into_iter()
-        .filter_entry(|entry| !is_excluded(entry.path(), excluded_paths))
+        .filter_entry(|entry| {
+            if is_excluded(entry.path(), excluded_paths) {
+                return false;
+            }
+            // Junk directories are pruned here rather than skipped per file,
+            // so nothing under them is ever stat'd. Only directories are
+            // judged: the rules for a file's own name live in the loop below,
+            // and the root arrives at depth 0 exempt from both — a user who
+            // registered a dot-named folder as an included root still gets it
+            // scanned.
+            let junk = entry.depth() > 0
+                && entry.file_type().is_dir()
+                && is_junk_dir_name(entry.file_name());
+            if junk {
+                pruned_junk_dirs += 1;
+            }
+            !junk
+        })
     {
         // Drain finished work before taking on more, so completed results
         // are persisted as the walk progresses instead of piling up in memory.
@@ -1073,6 +1097,14 @@ async fn scan_single_folder(
 
         ctx.scan_path(path).await?;
         ctx.maybe_report_progress().await;
+    }
+
+    if pruned_junk_dirs > 0 {
+        tracing::info!(
+            folder,
+            pruned_dirs = pruned_junk_dirs,
+            "skipped junk directories; anything indexed under them becomes unavailable"
+        );
     }
 
     while let Some(joined) = ctx.tasks.join_next_with_id().await {
@@ -1466,7 +1498,7 @@ impl ScanContext {
         let (Some(failure), Some((last_modified, file_size))) = (classified, stat) else {
             return;
         };
-        let record = ScanErrorRecord {
+        let mut record = ScanErrorRecord {
             path: path_str,
             last_modified,
             file_size,
@@ -1476,6 +1508,9 @@ impl ScanContext {
             error: failure.message.clone(),
             skip_after: failure.skip_after,
         };
+        // The mime type recorded so far is the *name's* guess. Where the bytes
+        // can contradict it outright, ask the bytes.
+        override_mime_from_content(&mut record, &path);
         let scan_id = self.attempt_scan_id;
         if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::UpsertScanError {
@@ -4814,6 +4849,135 @@ pub(crate) fn is_excluded(path: &Path, excluded: &[PathBuf]) -> bool {
     excluded.iter().any(|prefix| path.starts_with(prefix))
 }
 
+/// Whether a *directory* name is filesystem junk nothing under it is worth
+/// looking at: the dot-directories macOS scatters over a share (`.Trashes`,
+/// `.TemporaryItems`, `.Spotlight-V100`, `.fseventsd`) and the `__MACOSX`
+/// directory a zip extraction leaves behind. What is inside them is sidecar
+/// and resource-fork litter under ordinary-looking names, which is precisely
+/// what [`is_hidden_or_temp`] — a check on the file's own name — cannot catch.
+///
+/// The `.` prefix only, deliberately not `~`: a `~`-prefixed *file* is an
+/// editor's temporary copy, but a `~`-prefixed *directory* is an ordinary
+/// folder name a user may well have chosen.
+///
+/// `__MACOSX` is matched case-insensitively because the extraction tools that
+/// create it do not agree on its casing, and Windows/SMB name lookup would
+/// resolve any of those spellings to the same directory anyway.
+pub(crate) fn is_junk_dir_name(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('.') || name.eq_ignore_ascii_case("__MACOSX")
+}
+
+/// Whether an absolute file path sits under a junk directory, for the callers
+/// that are handed a path instead of walking into it — watcher events and
+/// database rows, which never see the directories they passed through.
+///
+/// The final component is the file's own name, which [`is_hidden_or_temp`]
+/// answers for, and the root itself is exempt: a user who registered a
+/// dot-named folder as a root asked for that folder to be scanned. The longest
+/// matching root wins, so a root nested inside another is judged from its own
+/// perspective rather than its ancestor's — [`deduplicate_paths`] collapses
+/// nested roots before any caller gets here, so that is a property of this
+/// function rather than a case in flight today.
+pub(crate) fn is_under_junk_dir(path: &Path, roots: &[PathBuf]) -> bool {
+    let Some(root) = roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.as_os_str().len())
+    else {
+        return false;
+    };
+    let Ok(below_root) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut directories = below_root.components();
+    directories.next_back();
+    directories.any(|component| is_junk_dir_name(component.as_os_str()))
+}
+
+/// What a macOS AppleDouble sidecar or AppleSingle file is, whatever name it
+/// arrived under.
+pub(crate) const MIME_APPLEFILE: &str = "application/applefile";
+
+/// How many leading bytes the post-failure sniff reads. Every signature it
+/// knows sits in the first handful; the rest is slack for a byte-order mark
+/// and the whitespace an HTML document may start with.
+const SNIFF_BYTES: usize = 256;
+
+/// The content type a file's leading bytes claim, or `None` for anything the
+/// sniff does not recognise — which includes every file it could not read.
+///
+/// Runs on the failure path only, so a read error here is not a failure of its
+/// own: it simply leaves the name's guess in place.
+fn sniff_junk_mime(path: &Path) -> Option<&'static str> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut buffer = [0u8; SNIFF_BYTES];
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    sniff_junk_bytes(&buffer[..filled])
+}
+
+/// The signature half of [`sniff_junk_mime`], split out so it can be exercised
+/// on bytes rather than on files.
+fn sniff_junk_bytes(bytes: &[u8]) -> Option<&'static str> {
+    // AppleDouble (the `._name` sidecars, and the flattened copies a share
+    // hands back with the directory separators folded into the name) and
+    // AppleSingle differ only in the last magic byte.
+    if bytes.starts_with(&[0x00, 0x05, 0x16, 0x07]) || bytes.starts_with(&[0x00, 0x05, 0x16, 0x00])
+    {
+        return Some(MIME_APPLEFILE);
+    }
+    let text = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let text = text.trim_ascii_start();
+    [b"<!doctype".as_slice(), b"<html", b"<!--"]
+        .iter()
+        .any(|tag| {
+            text.get(..tag.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(tag))
+        })
+        .then_some("text/html")
+}
+
+/// Replaces a recorded failure's mime type with what the file's first bytes
+/// say, for the verdicts where the name's guess is the part most likely to be
+/// a lie.
+///
+/// The scope is deliberately narrow. An `input` verdict at the header or the
+/// metadata stage means a reader looked at real bytes and rejected them, and a
+/// mime-family retry directive — "re-attempt the images now that the decoder
+/// handles them" — is exactly what must never resurrect a file whose bytes are
+/// an AppleDouble resource fork wearing a `.png` name. A `mime` verdict has no
+/// guess to correct, a `decode` row is audit-only, and the other classes are
+/// verdicts on this machine rather than on the bytes.
+///
+/// A match also settles the verdict at one attempt: the ambiguity the header
+/// stage otherwise allows for is a file another process is still writing, and
+/// what the gateway just read is a complete signature for a format the name
+/// never promised.
+///
+/// `stage`, the class and the error message are left exactly as classified:
+/// the row still records the failure that actually happened.
+pub(crate) fn override_mime_from_content(record: &mut ScanErrorRecord, path: &Path) {
+    if record.stage != STAGE_HEADER && record.stage != STAGE_METADATA {
+        return;
+    }
+    if !matches!(record.kind, ApiErrorKind::Input) {
+        return;
+    }
+    let Some(mime) = sniff_junk_mime(path) else {
+        return;
+    };
+    record.mime_type = Some(mime.to_string());
+    record.skip_after = SKIP_AFTER_CONFIRMED;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5239,6 +5403,199 @@ LIMIT 1
         assert!(
             scan_error_rows(&mut conn).await.is_empty(),
             "the sweep clears rows for files that are gone"
+        );
+    }
+
+    /// Every indexed path, so a traversal test can say what was *not* reached.
+    async fn indexed_paths(conn: &mut sqlx::SqliteConnection) -> Vec<String> {
+        sqlx::query_scalar("SELECT path FROM files ORDER BY path")
+            .fetch_all(conn)
+            .await
+            .unwrap()
+    }
+
+    // macOS junk directories are pruned on the way down, not per file: the
+    // names *inside* `.Trashes` and `__MACOSX` are ordinary, so the file-name
+    // rules (`is_hidden_or_temp`) never saw them and every sidecar in there was
+    // scanned — and, being resource forks, failed.
+    //
+    // The root itself is exempt in the same walk: a user who registers a
+    // dot-named folder as an included root asked for that folder to be
+    // scanned, and WalkDir hands it over at depth 0 where the pruning does not
+    // apply.
+    #[tokio::test]
+    async fn a_scan_prunes_junk_directories_but_not_a_dot_named_root() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        // Its own folder: `test_data_dir()` hands every test the same
+        // process-wide temp root, and this test counts what was reached.
+        let media_dir = root.join("junk_dir_media");
+        // A dot-named *root*, deliberately outside the folder above so the
+        // exemption is tested as a root rather than as a subdirectory.
+        let dot_root = root.join(".dot_named_root");
+        for dir in [
+            media_dir.join("sub"),
+            media_dir.join(".Trashes"),
+            // A junk directory's whole subtree goes, not just its own entries.
+            media_dir.join("__MACOSX").join("deep"),
+            dot_root.clone(),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+        }
+        // Joined component by component: the stored path carries the platform
+        // separator, and this test compares stored paths.
+        let reachable = [
+            media_dir.join("good.png"),
+            media_dir.join("sub").join("nested.png"),
+        ];
+        let pruned = [
+            media_dir.join(".Trashes").join("trashed.png"),
+            media_dir.join("__MACOSX").join("resource.png"),
+            media_dir.join("__MACOSX").join("deep").join("deeper.png"),
+        ];
+        for path in reachable.iter().chain(pruned.iter()) {
+            image::RgbImage::new(8, 8).save(path).unwrap();
+        }
+        let in_dot_root = dot_root.join("inside.png");
+        image::RgbImage::new(8, 8).save(&in_dot_root).unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![
+            media_dir.to_string_lossy().to_string(),
+            dot_root.to_string_lossy().to_string(),
+        ];
+        store.save(&index_db, &config).unwrap();
+        execute_folder_scan(
+            &index_db,
+            &user_data_db,
+            &config,
+            &config.included_folders,
+            &[],
+            ScanOptions { worker_count: 2 },
+        )
+        .await
+        .unwrap();
+
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let mut expected: Vec<String> = reachable
+            .iter()
+            .chain(std::iter::once(&in_dot_root))
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            indexed_paths(&mut conn).await,
+            expected,
+            "everything under a junk directory must be unreachable, and a \
+             dot-named root must still be walked"
+        );
+    }
+
+    // The ledger half of the junk work: a file whose *name* says `.png` and
+    // whose *bytes* are an AppleDouble resource fork is recorded as what it
+    // is. Without this it lands in the ledger as `image/png`, and a retry
+    // directive aimed at the image failures ("the decoder handles them now")
+    // would resurrect a file no decoder will ever read.
+    //
+    // The threshold moves with it: the header stage is otherwise ambiguous
+    // because the walker may have read a file another process was still
+    // writing, and a complete AppleDouble signature is not a half-written PNG.
+    #[tokio::test]
+    async fn a_sniffed_junk_file_is_recorded_as_what_its_bytes_are() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let media_dir = root.join("sniff_media");
+        fs::create_dir_all(&media_dir).unwrap();
+        // The real shape of the observed rows: a share flattened the sidecar's
+        // directory into its name, so no path rule can help and only the bytes
+        // can say what this is.
+        let sidecar = media_dir.join("batch 01-._Boop.png");
+        let mut apple_double = vec![0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00];
+        apple_double.extend_from_slice(&[0u8; 64]);
+        fs::write(&sidecar, &apple_double).unwrap();
+        // The discriminator: a broken PNG whose bytes match nothing keeps the
+        // name's guess and the stage's own threshold.
+        let garbage = media_dir.join("garbage.png");
+        fs::write(&garbage, b"this claims to be a png and is not").unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+        execute_folder_scan(
+            &index_db,
+            &user_data_db,
+            &config,
+            &config.included_folders,
+            &[],
+            ScanOptions { worker_count: 2 },
+        )
+        .await
+        .unwrap();
+
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let rows = scan_error_rows(&mut conn).await;
+        assert_eq!(rows.len(), 2, "both files owe a row: {rows:?}");
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row.0.ends_with(name))
+                .unwrap_or_else(|| panic!("no row for {name}: {rows:?}"))
+                .clone()
+        };
+
+        let sniffed = row("._Boop.png");
+        assert_eq!(
+            (
+                sniffed.1.as_str(),
+                sniffed.2.as_str(),
+                sniffed.4,
+                sniffed.5.as_deref()
+            ),
+            (
+                STAGE_HEADER,
+                "input",
+                SKIP_AFTER_CONFIRMED,
+                Some(MIME_APPLEFILE)
+            ),
+            "the bytes name the format and settle the verdict: {sniffed:?}"
+        );
+        let honest = row("garbage.png");
+        assert_eq!(
+            (
+                honest.1.as_str(),
+                honest.2.as_str(),
+                honest.4,
+                honest.5.as_deref()
+            ),
+            (
+                STAGE_HEADER,
+                "input",
+                SKIP_AFTER_AMBIGUOUS,
+                Some("image/png")
+            ),
+            "an unrecognised failure is left exactly as classified: {honest:?}"
+        );
+        let error: String =
+            sqlx::query_scalar("SELECT error FROM scan_errors WHERE path LIKE '%Boop.png'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert!(
+            !error.is_empty() && !error.contains(MIME_APPLEFILE),
+            "the recorded error stays the real one: {error}"
         );
     }
 
@@ -7060,6 +7417,229 @@ LIMIT 1
         );
     }
 
+    // The name rules for a *directory*, which is the whole reason this exists
+    // separately from `is_hidden_or_temp`: junk is decided by the directory's
+    // own name, and everything below it goes with it.
+    #[test]
+    fn junk_directory_names_are_dot_prefixes_and_macosx() {
+        for name in [
+            ".Trashes",
+            ".TemporaryItems",
+            ".Spotlight-V100",
+            ".fseventsd",
+            ".",
+            "__MACOSX",
+            // The mounts this arrives from are case-insensitive, so the same
+            // directory shows up under either casing.
+            "__macosx",
+            "__MacOSX",
+        ] {
+            assert!(is_junk_dir_name(OsStr::new(name)), "{name} is junk");
+        }
+        for name in [
+            "photos",
+            "MACOSX",
+            "__MACOSX_backup",
+            "my.folder",
+            // Deliberately not extended to directories: `~` marks an editor's
+            // temporary *file*, and is an ordinary folder name otherwise.
+            "~drafts",
+        ] {
+            assert!(!is_junk_dir_name(OsStr::new(name)), "{name} is not junk");
+        }
+    }
+
+    // The path-shaped half, for the callers handed an absolute path instead of
+    // a traversal: only the components *between* the root and the file name
+    // decide, so the root is exempt and the file's own name is left to
+    // `is_hidden_or_temp`.
+    #[test]
+    fn junk_components_are_judged_between_the_root_and_the_file_name() {
+        let root = PathBuf::from(r"C:\media");
+        let roots = vec![root.clone()];
+
+        assert!(is_under_junk_dir(&root.join(".Trashes/x.png"), &roots));
+        assert!(is_under_junk_dir(&root.join("__MACOSX/deep/x.png"), &roots));
+        assert!(is_under_junk_dir(
+            &root.join("sub/.fseventsd/x.png"),
+            &roots
+        ));
+        assert!(!is_under_junk_dir(&root.join("sub/x.png"), &roots));
+        assert!(!is_under_junk_dir(&root.join("~drafts/x.png"), &roots));
+        // The file's own name is not a directory component.
+        assert!(!is_under_junk_dir(&root.join("._Boop.png"), &roots));
+        // A path belonging to no root is not this function's to judge.
+        assert!(!is_under_junk_dir(
+            Path::new(r"C:\other\.Trashes\x.png"),
+            &[]
+        ));
+
+        // A dot-named root judges itself: the junk component has to be *below*
+        // it. `deduplicate_paths` collapses the nested pair before any caller
+        // gets here, so this pins the rule rather than a reachable case.
+        let dot_root = PathBuf::from(r"C:\media\.bar");
+        let nested = vec![root, dot_root.clone()];
+        assert!(
+            !is_under_junk_dir(&dot_root.join("x.png"), &nested),
+            "the longest matching root wins, and a root is never its own junk"
+        );
+        assert!(is_under_junk_dir(&dot_root.join(".Trashes/x.png"), &nested));
+    }
+
+    // The signatures the post-failure sniff knows, and — just as important —
+    // everything it must stay silent about, since a verdict here rewrites what
+    // a retry directive can ever select.
+    #[test]
+    fn the_content_sniff_recognises_only_applefile_and_html() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sniff = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            sniff_junk_mime(&path)
+        };
+
+        assert_eq!(
+            sniff("double.png", &[0x00, 0x05, 0x16, 0x07, 0xFF, 0xFF]),
+            Some(MIME_APPLEFILE)
+        );
+        assert_eq!(
+            sniff("single.png", &[0x00, 0x05, 0x16, 0x00, 0xFF, 0xFF]),
+            Some(MIME_APPLEFILE)
+        );
+        for html in [
+            "<!DOCTYPE html><html></html>".as_bytes(),
+            b"<!doctype HTML>",
+            b"<html lang=\"en\">",
+            b"<HTML>",
+            b"<!-- an error page a share served instead of the file -->",
+            b"\r\n\t   <!DOCTYPE html>",
+        ] {
+            assert_eq!(sniff("page.png", html), Some("text/html"), "{html:?}");
+        }
+        // A byte-order mark, alone and with the whitespace behind it.
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice(b"  <html>");
+        assert_eq!(sniff("bom.png", &bom), Some("text/html"));
+
+        let mut png = Vec::new();
+        image::RgbImage::new(2, 2)
+            .write_to(&mut io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(sniff("real.png", &png), None, "a real image is not junk");
+        assert_eq!(sniff("empty.png", b""), None);
+        // Too short to hold any signature, including the AppleDouble magic
+        // whose first three bytes it does match.
+        assert_eq!(sniff("short.png", &[0x00, 0x05, 0x16]), None);
+        assert_eq!(sniff("bom_only.png", &[0xEF, 0xBB, 0xBF]), None);
+        assert_eq!(sniff("text.png", b"<not html>"), None);
+        // A file that cannot be read is not a verdict.
+        assert_eq!(sniff_junk_mime(&dir.path().join("missing.png")), None);
+
+        // And directly on bytes, which is what the split is for: the mark and
+        // whitespace are stripped in that order, and a prefix too short to
+        // hold a signature matches nothing even when it agrees as far as it
+        // goes.
+        let mut marked = vec![0xEF, 0xBB, 0xBF];
+        marked.extend_from_slice(b"\n  <!DOCTYPE html>");
+        assert_eq!(sniff_junk_bytes(&marked), Some("text/html"));
+        assert_eq!(sniff_junk_bytes(&[0x00, 0x05, 0x16]), None);
+        assert_eq!(sniff_junk_bytes(&[]), None);
+    }
+
+    // The override's scope, which is the part that has to be exactly right: it
+    // rewrites the recorded *format* and settles the threshold, and touches
+    // nothing else and no other kind of row.
+    #[test]
+    fn only_a_header_or_metadata_input_verdict_takes_the_sniffed_mime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A video sidecar, the ffprobe-side twin of the image case: same
+        // bytes, different name, and a stage where an external tool did the
+        // reading.
+        let sidecar = dir.path().join("_MACOSX_._uncenTL.mov");
+        fs::write(&sidecar, [0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00]).unwrap();
+        let base = ScanErrorRecord {
+            path: sidecar.to_string_lossy().to_string(),
+            last_modified: "2026-01-01T00:00:00".to_string(),
+            file_size: 8,
+            stage: STAGE_METADATA.to_string(),
+            kind: ApiErrorKind::Input,
+            mime_type: Some("video/quicktime".to_string()),
+            error: "ffprobe failed: moov atom not found".to_string(),
+            skip_after: SKIP_AFTER_AMBIGUOUS,
+        };
+
+        let mut sniffed = base.clone();
+        override_mime_from_content(&mut sniffed, &sidecar);
+        assert_eq!(sniffed.mime_type.as_deref(), Some(MIME_APPLEFILE));
+        assert_eq!(
+            sniffed.skip_after, SKIP_AFTER_CONFIRMED,
+            "the gateway read the magic itself, so one attempt settles it"
+        );
+        assert_eq!(
+            (sniffed.stage.as_str(), sniffed.error.as_str()),
+            (base.stage.as_str(), base.error.as_str()),
+            "the recorded failure stays the one that happened"
+        );
+        assert_eq!(sniffed.kind, base.kind);
+
+        let mut header = ScanErrorRecord {
+            stage: STAGE_HEADER.to_string(),
+            ..base.clone()
+        };
+        override_mime_from_content(&mut header, &sidecar);
+        assert_eq!(header.mime_type.as_deref(), Some(MIME_APPLEFILE));
+
+        // Everything outside the scope is left alone: a `mime` verdict has no
+        // guess to correct, a `decode` row is audit-only and belongs to an
+        // *indexed* file, and the non-input classes are verdicts on this
+        // machine rather than on the bytes.
+        for untouched in [
+            ScanErrorRecord {
+                stage: STAGE_MIME.to_string(),
+                mime_type: None,
+                ..base.clone()
+            },
+            ScanErrorRecord {
+                stage: STAGE_DECODE.to_string(),
+                ..base.clone()
+            },
+            ScanErrorRecord {
+                kind: ApiErrorKind::Resource,
+                ..base.clone()
+            },
+            ScanErrorRecord {
+                kind: ApiErrorKind::Blocked {
+                    blocker: Blocker::Ffmpeg,
+                },
+                ..base.clone()
+            },
+        ] {
+            let mut record = untouched.clone();
+            override_mime_from_content(&mut record, &sidecar);
+            assert_eq!(
+                (record.mime_type, record.skip_after),
+                (untouched.mime_type, untouched.skip_after),
+                "out of scope: {} / {:?}",
+                untouched.stage,
+                untouched.kind
+            );
+        }
+
+        // A file the sniff does not recognise keeps its name's guess whole.
+        let honest = dir.path().join("broken.mov");
+        fs::write(&honest, b"not a container and not junk either").unwrap();
+        let mut unchanged = ScanErrorRecord {
+            path: honest.to_string_lossy().to_string(),
+            ..base
+        };
+        let before = unchanged.clone();
+        override_mime_from_content(&mut unchanged, &honest);
+        assert_eq!(
+            (unchanged.mime_type, unchanged.skip_after),
+            (before.mime_type, before.skip_after)
+        );
+    }
+
     // ffprobe classification against the real toolchain: a file of garbage
     // bytes claiming to be a video is an *unconfirmed* payload verdict,
     // because ffprobe read the file itself and a corrupt file and a dropped
@@ -7087,6 +7667,48 @@ LIMIT 1
         assert_eq!(
             failure.skip_after, SKIP_AFTER_AMBIGUOUS,
             "a tool that did its own file I/O never settles a verdict alone"
+        );
+    }
+
+    // The video half joined up against the real toolchain: the AppleDouble
+    // sidecars the user's share hands back under `.mov` names fail *in
+    // ffprobe*, so the row they owe is the ambiguous metadata verdict — and
+    // that is exactly the row the sniff has to reach.
+    #[test]
+    fn an_applefile_named_mov_is_an_ffprobe_verdict_the_sniff_rewrites() {
+        if !crate::media_tools::ffmpeg_available() {
+            // No toolchain on this host; the classification is unobservable.
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let sidecar = dir.path().join("_MACOSX_._uncenTL.mov");
+        let mut apple_double = vec![0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00];
+        apple_double.extend_from_slice(&[0u8; 64]);
+        fs::write(&sidecar, &apple_double).unwrap();
+
+        let Err(err) = extract_media_info(&sidecar) else {
+            panic!("ffprobe must reject a resource fork");
+        };
+        let failure = err.classified().expect("an ffprobe rejection is recorded");
+        assert_eq!(
+            (failure.stage, failure.kind),
+            (STAGE_METADATA, ApiErrorKind::Input)
+        );
+
+        let mut record = ScanErrorRecord {
+            path: sidecar.to_string_lossy().to_string(),
+            last_modified: "2026-01-01T00:00:00".to_string(),
+            file_size: apple_double.len() as i64,
+            stage: failure.stage.to_string(),
+            kind: failure.kind,
+            mime_type: infer_mime_type(&sidecar).ok(),
+            error: failure.message.clone(),
+            skip_after: failure.skip_after,
+        };
+        override_mime_from_content(&mut record, &sidecar);
+        assert_eq!(
+            (record.mime_type.as_deref(), record.skip_after),
+            (Some(MIME_APPLEFILE), SKIP_AFTER_CONFIRMED)
         );
     }
 
