@@ -3,12 +3,16 @@
 //! Two independent facts:
 //!
 //! 1. **Backend** — which inference stack we use (`cpu` / `cuda` / `rocm`, …).
-//!    Always resolvable. Priority: managed-venv sentinel →
-//!    [`ACCELERATOR_ENV`] (Nix wrap) → config / `auto` host probes.
-//! 2. **Devices** — optional marketing names from pluggable **stack probes**
-//!    (NVIDIA, AMD/ROCm today). Append to [`GPU_STACK_PROBES`] for new stacks
-//!    (e.g. Intel XPU); add an [`Accelerator`] variant when the managed venv
-//!    gains a matching extra.
+//!    Always resolvable. Priority: managed-venv sentinel → config / `auto`
+//!    host probes. There is deliberately no separate env-var resolution path:
+//!    `PANOPTIKON_ACCELERATOR` (Nix wrap, packagers) reaches the config value
+//!    through the `${PANOPTIKON_ACCELERATOR:-auto}` template line in the
+//!    shipped TOML, like every other env-bridged setting.
+//! 2. **Devices** — optional marketing names (plus compute capability where
+//!    the vendor tool reports it) from pluggable **stack probes** (NVIDIA,
+//!    AMD/ROCm today). Append to [`GPU_STACK_PROBES`] for new stacks (e.g.
+//!    Intel XPU); add an [`Accelerator`] variant when the managed venv gains
+//!    a matching extra.
 //!
 //! **Warnings:** only when a *GPU* backend is selected but no device name is
 //! found. **CPU is never a warning** — it is reported as using CPU.
@@ -19,15 +23,25 @@ use std::process::Command;
 use crate::config::{Accelerator, Settings};
 use crate::setup::{installed_accelerator, resolve_accelerator};
 
-/// Env var set by the Nix package wrap (and optionally by operators).
-pub const ACCELERATOR_ENV: &str = "PANOPTIKON_ACCELERATOR";
-
 /// One named GPU/accelerator device from a hardware stack probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuDevice {
     /// Stack id (`nvidia`, `amd-rocm`, future `intel-xpu`, …).
     pub stack: &'static str,
     pub name: String,
+    /// CUDA compute capability (e.g. `12.0`) where the vendor tool reports
+    /// it; `None` for stacks without the concept or on old drivers.
+    pub compute_cap: Option<String>,
+}
+
+impl GpuDevice {
+    /// Name plus compute capability when known, for text and log output.
+    fn label(&self) -> String {
+        match &self.compute_cap {
+            Some(cc) => format!("{} (CC {cc})", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 /// Presence of one GPU software stack on the host.
@@ -45,9 +59,7 @@ pub struct GpuStackPresence {
 pub enum BackendSource {
     /// Setup sentinel `extra=` (installed torch wheels).
     InstalledVenv,
-    /// [`ACCELERATOR_ENV`] (e.g. Nix `-cuda` / `-rocm` wrap).
-    EnvPin,
-    /// Config / CLI (including `auto` after host probes).
+    /// Config (env bridges already expanded), including `auto` host probes.
     ConfigOrProbe { evidence: String },
 }
 
@@ -55,7 +67,6 @@ impl BackendSource {
     pub fn label(&self) -> String {
         match self {
             Self::InstalledVenv => "managed venv (setup sentinel)".into(),
-            Self::EnvPin => format!("{ACCELERATOR_ENV} environment pin"),
             Self::ConfigOrProbe { evidence } => evidence.clone(),
         }
     }
@@ -99,7 +110,7 @@ impl AcceleratorReport {
             } else {
                 lines.push("GPU devices:".into());
                 for d in devices {
-                    lines.push(format!("  - [{}] {}", d.stack, d.name));
+                    lines.push(format!("  - [{}] {}", d.stack, d.label()));
                 }
             }
         } else {
@@ -113,7 +124,7 @@ impl AcceleratorReport {
             if !other.is_empty() {
                 lines.push("GPU devices present on host (not selected):".into());
                 for d in other {
-                    lines.push(format!("  - [{}] {}", d.stack, d.name));
+                    lines.push(format!("  - [{}] {}", d.stack, d.label()));
                 }
             }
         }
@@ -152,44 +163,22 @@ pub fn accelerator_slug(a: Accelerator) -> &'static str {
     }
 }
 
-/// Parse wrap env / CLI-style names. Unknown → `None`.
-pub fn parse_accelerator_slug(s: &str) -> Option<Accelerator> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "cpu" => Some(Accelerator::Cpu),
-        "cuda" => Some(Accelerator::Cuda),
-        "rocm" => Some(Accelerator::Rocm),
-        // "xpu" => Some(Accelerator::Xpu),
-        "auto" => Some(Accelerator::Auto),
-        _ => None,
-    }
-}
-
 /// Resolve which backend we use (always concrete). Reads process state.
 pub fn resolve_backend(requested: Accelerator) -> (Accelerator, BackendSource) {
-    resolve_backend_from(
-        requested,
-        installed_accelerator(),
-        std::env::var(ACCELERATOR_ENV).ok().as_deref(),
-    )
+    resolve_backend_from(requested, installed_accelerator())
 }
 
 /// Pure resolver (unit-tested).
 ///
-/// Priority: installed venv → env pin → config/`auto` probes.
+/// Priority: installed venv → config/`auto` probes. `requested` is the
+/// config value with env bridges (`${PANOPTIKON_ACCELERATOR:-auto}`) already
+/// expanded — the env var has no resolution path of its own.
 pub fn resolve_backend_from(
     requested: Accelerator,
     installed: Option<Accelerator>,
-    env_pin: Option<&str>,
 ) -> (Accelerator, BackendSource) {
     if let Some(installed) = installed {
         return (installed, BackendSource::InstalledVenv);
-    }
-    if let Some(raw) = env_pin {
-        if let Some(parsed) = parse_accelerator_slug(raw) {
-            if parsed != Accelerator::Auto {
-                return (parsed, BackendSource::EnvPin);
-            }
-        }
     }
     match resolve_accelerator(requested) {
         Ok((backend, evidence)) => (backend, BackendSource::ConfigOrProbe { evidence }),
@@ -249,14 +238,14 @@ pub fn log_report(settings: &Settings) {
         report
             .selected_devices()
             .iter()
-            .map(|d| format!("{}:{}", d.stack, d.name))
+            .map(|d| format!("{}:{}", d.stack, d.label()))
             .collect()
     } else {
         report
             .stacks
             .iter()
             .flat_map(|s| s.devices.iter())
-            .map(|d| format!("{}:{}", d.stack, d.name))
+            .map(|d| format!("{}:{}", d.stack, d.label()))
             .collect()
     };
     let slug = accelerator_slug(report.backend);
@@ -316,13 +305,7 @@ fn probe_nvidia_stack() -> Option<GpuStackPresence> {
     Some(GpuStackPresence {
         stack: "nvidia",
         backend: Accelerator::Cuda,
-        devices: nvidia_device_names()
-            .into_iter()
-            .map(|name| GpuDevice {
-                stack: "nvidia",
-                name,
-            })
-            .collect(),
+        devices: nvidia_devices(),
         evidence: evidence.join("; "),
     })
 }
@@ -352,28 +335,60 @@ fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
             .map(|name| GpuDevice {
                 stack: "amd-rocm",
                 name,
+                compute_cap: None,
             })
             .collect(),
         evidence: evidence.join("; "),
     })
 }
 
-fn nvidia_device_names() -> Vec<String> {
+fn nvidia_devices() -> Vec<GpuDevice> {
     let Some(bin) = which("nvidia-smi") else {
         return Vec::new();
     };
-    let output = match Command::new(bin)
-        .args(["--query-gpu=name", "--format=csv,noheader"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
+    // `compute_cap` needs a reasonably recent driver (R470+); fall back to a
+    // name-only query rather than losing the device list on old drivers.
+    for fields in ["name,compute_cap", "name"] {
+        let query = format!("--query-gpu={fields}");
+        let output = match Command::new(&bin)
+            .args([query.as_str(), "--format=csv,noheader"])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+        let devices = parse_nvidia_query_lines(&String::from_utf8_lossy(&output.stdout));
+        if !devices.is_empty() {
+            return devices;
+        }
+    }
+    Vec::new()
+}
+
+/// Parse `nvidia-smi --query-gpu=name[,compute_cap] --format=csv,noheader`
+/// lines. The capability field is kept only when it looks numeric —
+/// nvidia-smi reports `[N/A]` / `[Not Supported]` shapes on odd setups.
+fn parse_nvidia_query_lines(text: &str) -> Vec<GpuDevice> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, cap) = match line.rsplit_once(',') {
+                Some((n, c)) => (n.trim(), c.trim()),
+                None => (line.trim(), ""),
+            };
+            if name.is_empty() {
+                return None;
+            }
+            let compute_cap = cap
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+                .then(|| cap.to_string());
+            Some(GpuDevice {
+                stack: "nvidia",
+                name: name.to_string(),
+                compute_cap,
+            })
+        })
         .collect()
 }
 
@@ -497,18 +512,18 @@ mod tests {
             devices: vec![GpuDevice {
                 stack: "nvidia",
                 name: "Test GPU".into(),
+                compute_cap: Some("8.6".into()),
             }],
             evidence: "test".into(),
         }]
     }
 
     #[test]
-    fn slug_and_parse_round_trip() {
-        for a in [Accelerator::Cpu, Accelerator::Cuda, Accelerator::Rocm] {
-            assert_eq!(parse_accelerator_slug(accelerator_slug(a)), Some(a));
-        }
-        assert_eq!(parse_accelerator_slug("CUDA"), Some(Accelerator::Cuda));
-        assert_eq!(parse_accelerator_slug("nope"), None);
+    fn slugs_are_stable() {
+        assert_eq!(accelerator_slug(Accelerator::Cpu), "cpu");
+        assert_eq!(accelerator_slug(Accelerator::Cuda), "cuda");
+        assert_eq!(accelerator_slug(Accelerator::Rocm), "rocm");
+        assert_eq!(accelerator_slug(Accelerator::Auto), "auto");
     }
 
     #[test]
@@ -533,11 +548,16 @@ mod tests {
 
     #[test]
     fn format_text_cuda_with_device() {
-        let report = assemble_report(Accelerator::Cuda, BackendSource::EnvPin, nvidia_named());
+        let report = assemble_report(
+            Accelerator::Cuda,
+            BackendSource::ConfigOrProbe {
+                evidence: "explicitly configured".into(),
+            },
+            nvidia_named(),
+        );
         let text = report.format_text();
         assert!(text.contains("backend: cuda"), "{text}");
-        assert!(text.contains(ACCELERATOR_ENV), "{text}");
-        assert!(text.contains("[nvidia] Test GPU"), "{text}");
+        assert!(text.contains("[nvidia] Test GPU (CC 8.6)"), "{text}");
         assert!(report.warnings.is_empty());
     }
 
@@ -550,6 +570,7 @@ mod tests {
                 devices: vec![GpuDevice {
                     stack: "amd-rocm",
                     name: "Radeon RX 7900 XTX".into(),
+                    compute_cap: None,
                 }],
                 evidence: "test".into(),
             },
@@ -560,11 +581,12 @@ mod tests {
                 devices: vec![GpuDevice {
                     stack: "nvidia",
                     name: "Should Not Appear".into(),
+                    compute_cap: None,
                 }],
                 evidence: "test".into(),
             },
         ];
-        let report = assemble_report(Accelerator::Rocm, BackendSource::EnvPin, stacks);
+        let report = assemble_report(Accelerator::Rocm, BackendSource::InstalledVenv, stacks);
         let text = report.format_text();
         assert!(text.contains("backend: rocm"), "{text}");
         assert!(text.contains("[amd-rocm] Radeon RX 7900 XTX"), "{text}");
@@ -575,7 +597,11 @@ mod tests {
 
     #[test]
     fn cuda_without_devices_warns() {
-        let report = assemble_report(Accelerator::Cuda, BackendSource::EnvPin, empty_stacks());
+        let report = assemble_report(
+            Accelerator::Cuda,
+            BackendSource::InstalledVenv,
+            empty_stacks(),
+        );
         assert_eq!(report.backend, Accelerator::Cuda);
         assert_eq!(report.warnings.len(), 1);
         assert!(report.warnings[0].contains("cuda"));
@@ -584,7 +610,11 @@ mod tests {
 
     #[test]
     fn rocm_without_devices_warns() {
-        let report = assemble_report(Accelerator::Rocm, BackendSource::EnvPin, empty_stacks());
+        let report = assemble_report(
+            Accelerator::Rocm,
+            BackendSource::InstalledVenv,
+            empty_stacks(),
+        );
         assert_eq!(report.backend, Accelerator::Rocm);
         assert!(report.warnings.iter().any(|w| w.contains("rocm")));
     }
@@ -607,18 +637,40 @@ mod tests {
     }
 
     #[test]
-    fn env_pin_overrides_config_when_no_sentinel() {
-        let (backend, source) = resolve_backend_from(Accelerator::Cpu, None, Some("cuda"));
-        assert_eq!(backend, Accelerator::Cuda);
-        assert_eq!(source, BackendSource::EnvPin);
+    fn installed_venv_wins_over_config() {
+        let (backend, source) =
+            resolve_backend_from(Accelerator::Cuda, Some(Accelerator::Rocm));
+        assert_eq!(backend, Accelerator::Rocm);
+        assert_eq!(source, BackendSource::InstalledVenv);
     }
 
     #[test]
-    fn installed_venv_wins_over_env_pin() {
-        let (backend, source) =
-            resolve_backend_from(Accelerator::Cuda, Some(Accelerator::Rocm), Some("cuda"));
-        assert_eq!(backend, Accelerator::Rocm);
-        assert_eq!(source, BackendSource::InstalledVenv);
+    fn explicit_config_used_when_no_sentinel() {
+        let (backend, source) = resolve_backend_from(Accelerator::Cpu, None);
+        assert_eq!(backend, Accelerator::Cpu);
+        assert!(matches!(source, BackendSource::ConfigOrProbe { .. }));
+    }
+
+    #[test]
+    fn nvidia_query_parses_name_and_compute_cap() {
+        let devices = parse_nvidia_query_lines(
+            "NVIDIA GeForce RTX 5090, 12.0\nNVIDIA GeForce GTX 1080, [N/A]\n",
+        );
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].name, "NVIDIA GeForce RTX 5090");
+        assert_eq!(devices[0].compute_cap.as_deref(), Some("12.0"));
+        assert_eq!(devices[0].label(), "NVIDIA GeForce RTX 5090 (CC 12.0)");
+        assert_eq!(devices[1].name, "NVIDIA GeForce GTX 1080");
+        assert_eq!(devices[1].compute_cap, None);
+        assert_eq!(devices[1].label(), "NVIDIA GeForce GTX 1080");
+    }
+
+    #[test]
+    fn nvidia_query_parses_name_only_fallback() {
+        let devices = parse_nvidia_query_lines("NVIDIA GeForce RTX 3060\n\n");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "NVIDIA GeForce RTX 3060");
+        assert_eq!(devices[0].compute_cap, None);
     }
 
     #[test]

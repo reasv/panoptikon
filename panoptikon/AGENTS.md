@@ -139,8 +139,12 @@ Behavior (important)
 - Accelerator report (`panoptikon/src/accelerator_report.rs`): at server and
   `inferio` startup (and via `panoptikon accelerator`) we always log the
   resolved inference **backend** (`cpu` / `cuda` / `rocm`, extensible) and any
-  detected GPU names. Backend priority: managed-venv sentinel →
-  `PANOPTIKON_ACCELERATOR` (Nix wrap) → config/`auto` host probes. GPU stacks
+  detected GPU names (with compute capability where nvidia-smi reports it).
+  Backend priority: managed-venv sentinel → config/`auto` host probes. There
+  is deliberately no separate env-var resolution path: `PANOPTIKON_ACCELERATOR`
+  (Nix wrap, packagers) reaches the config value through the
+  `${PANOPTIKON_ACCELERATOR:-auto}` template line in the shipped TOML, like
+  every other env-bridged setting. GPU stacks
   are pluggable probes (NVIDIA + AMD/ROCm today; add Intel XPU etc. later).
   ROCm device names prefer `rocm-smi`; fallback `rocminfo` keeps only agents
   with `Device Type: GPU` (CPU agents also have a Marketing Name and must not
