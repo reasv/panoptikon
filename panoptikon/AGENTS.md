@@ -141,6 +141,20 @@ Behavior (important)
   - `PUT /api/jobs/config` rejects unparseable `cron_schedule` strings with 400 (Python accepts them and fails silently in the ticker). `GET /api/jobs/cronjob/schedule` (additive, not in Python) reports enabled/valid/next_run/last_run.
   - Embedding-model preload (`preload_embedding_models`) runs on the same minute tick, mirroring Python: existing text-embedding/clip setters (excluding `tclip/`) are kept loaded under cache key `preload[<index_db>]` with 1h TTL and renewal ~2 minutes before expiry; disabling clears the inference cache once.
   - System config parses `job_filters` and `filescan_filter` as PQL objects; invalid PQL in config fails to load (mirrors Python).
+- Accelerator report (`panoptikon/src/accelerator_report.rs`): at server and
+  `inferio` startup (and via `panoptikon accelerator`) we always log the
+  resolved inference **backend** (`cpu` / `cuda` / `rocm`, extensible) and any
+  detected GPU names (with compute capability where nvidia-smi reports it).
+  Backend priority: managed-venv sentinel → config/`auto` host probes. There
+  is deliberately no separate env-var resolution path: `PANOPTIKON_ACCELERATOR`
+  (Nix wrap, packagers) reaches the config value through the
+  `${PANOPTIKON_ACCELERATOR:-auto}` template line in the shipped TOML, like
+  every other env-bridged setting. GPU stacks
+  are pluggable probes (NVIDIA + AMD/ROCm today; add Intel XPU etc. later).
+  ROCm device names prefer `rocm-smi`; fallback `rocminfo` keeps only agents
+  with `Device Type: GPU` (CPU agents also have a Marketing Name and must not
+  be listed as devices). **CPU** backend is logged as using CPU (no warning).
+  A **GPU** backend with no device name yields a **warning**, not a failure.
 - Accelerator env (`panoptikon/src/accelerator_env.rs`): workers get host
   HIP/HSA on `LD_LIBRARY_PATH` only when the **installed** accelerator is
   `rocm` — read from the setup sentinel's `extra=` line
