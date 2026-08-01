@@ -135,7 +135,13 @@ impl Worker for ContinuousWorker {
             match get_scan_error(&mut conn, &path_str).await {
                 Ok(Some(skip)) => {
                     let suppressed = skip.suppresses(disk_mtime, *file_size);
-                    ledger_path = Some(skip.path);
+                    // Only a row a success actually spends is handed on to be
+                    // cleared: an audit-only row (a visuals decode failure on a
+                    // file that indexes fine every time) survives its own
+                    // file's success and is cleared only once its bytes move.
+                    if skip.cleared_by_success(disk_mtime, *file_size) {
+                        ledger_path = Some(skip.path);
+                    }
                     if suppressed {
                         let _ = reply_to.cast(ContinuousScanMessage::WorkerResult {
                             epoch,
@@ -634,6 +640,33 @@ impl ContinuousScanState {
                 error = ?err,
                 path = %path.display(),
                 "failed to record a scan failure; it will be re-attempted"
+            );
+        }
+    }
+
+    /// Records the audit row an indexed-without-visuals image owes, so a
+    /// failure that no longer blocks anything stays visible in the failures
+    /// surface. The batch walker's twin, with the same rules: never fails the
+    /// file, never touched on the healthy path.
+    ///
+    /// Deliberately *not* also cached in `failed_stats`: the file is indexed,
+    /// so the next event for it must take the ordinary mtime shortcut, not a
+    /// failure shortcut.
+    async fn record_visuals_scan_error(&self, record: ScanErrorRecord) {
+        let scan_id = self.scan_id;
+        if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::UpsertScanError {
+                record: record.clone(),
+                scan_id,
+                reply,
+            }
+        })
+        .await
+        {
+            tracing::warn!(
+                error = ?err,
+                path = %record.path,
+                "failed to record a visuals decode failure for auditing"
             );
         }
     }
@@ -1572,6 +1605,13 @@ impl Actor for ContinuousScanActor {
                         if let Some(stored) = ledger_path {
                             state.clear_file_failure(stored).await;
                         }
+                        // After the clear, which is keyed by the same path:
+                        // this row describes the bytes that just went in, and
+                        // the one the clear spends described whatever was
+                        // there before.
+                        if let Some(record) = file_data.visuals_scan_error {
+                            state.record_visuals_scan_error(record).await;
+                        }
                     }
                     Err(err) => {
                         tracing::error!(error = ?err, "failed to update file data");
@@ -2317,6 +2357,111 @@ mod tests {
         assert_eq!(markers, 1, "the pass's conclusion must reach the cache");
     }
 
+    // Image parity with the batch walker, which matters because the two reach
+    // the same code by different routes: a file whose pixels do not decode is
+    // indexed from its header, with its real dimensions and no visuals, and
+    // the failure is both remembered (the marker) and auditable (the row).
+    // The continuous scan is the half that indexes a file the moment the user
+    // touches it, so a stricter gate here would keep it out of the index until
+    // the next batch scan disagreed.
+    #[tokio::test]
+    async fn the_continuous_scan_indexes_an_undecodable_image() {
+        let test_env = test_data_dir();
+        let root = test_env.path().to_path_buf();
+        let index_db = unique_db_name("cont-undecodable");
+        migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
+
+        let watch_dir = root.join("watch-undecodable");
+        fs::create_dir_all(&watch_dir).unwrap();
+        let file_path = watch_dir.join("truncated.png");
+        let mut noise = image::RgbImage::new(64, 64);
+        for (x, y, pixel) in noise.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x * 7 % 251) as u8,
+                (y * 13 % 241) as u8,
+                (x * y % 239) as u8,
+            ]);
+        }
+        noise.save(&file_path).unwrap();
+        let bytes = fs::read(&file_path).unwrap();
+        fs::write(&file_path, &bytes[..bytes.len() * 6 / 10]).unwrap();
+
+        let store = SystemConfigStore::new(root.clone());
+        let mut config = store.load(&index_db).unwrap();
+        config.continuous_filescan.enabled = true;
+        config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let (actor, _handle) = Actor::spawn(
+            None,
+            ContinuousScanActor,
+            ContinuousScanActorArgs {
+                index_db: index_db.clone(),
+                user_data_db: index_db.clone(),
+                data_dir: root.clone(),
+                enable_watcher: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The event path end to end, so the audit row's write site is covered
+        // and not just the worker's construction of it.
+        actor
+            .cast(ContinuousScanMessage::DispatchStable {
+                epoch: 0,
+                path: file_path.clone(),
+            })
+            .unwrap();
+
+        let mut indexed = None;
+        for _ in 0..120 {
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
+            let row: Option<(Option<i64>, Option<i64>, Option<String>)> =
+                sqlx::query_as("SELECT width, height, blurhash FROM items")
+                    .fetch_optional(&mut conn)
+                    .await
+                    .unwrap();
+            if row.is_some() {
+                indexed = row;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            indexed,
+            Some((Some(64), Some(64), None)),
+            "indexed with header dimensions and no blurhash"
+        );
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let markers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM storage.visual_attempts \
+             WHERE kind = 'thumbnail' AND outcome = 'failed'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(markers, 1, "the decode verdict is remembered");
+        let audit: Option<(String, String)> =
+            sqlx::query_as("SELECT stage, error_class FROM scan_errors")
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            audit,
+            Some(("decode".to_string(), "input".to_string())),
+            "and stays visible in the failures surface"
+        );
+        actor.stop(None);
+    }
+
     #[tokio::test]
     async fn epoch_gating_drops_results() {
         let test_env = test_data_dir();
@@ -2574,20 +2719,18 @@ mod tests {
         }
         assert_eq!(
             recorded,
-            Some(("decode".to_string(), "input".to_string(), 1, 2)),
-            "an undecodable image is an unconfirmed input verdict"
+            Some(("header".to_string(), "input".to_string(), 1, 1)),
+            "an image with no parseable header is a settled input verdict"
         );
 
         // A second event for the same unchanged file must not re-process it.
-        //
-        // The ledger cannot do this on its own here: the verdict is still
-        // unconfirmed (one attempt of two), and `attempts` dedups on the scan
-        // id, which for a continuous scan spans the whole session — so without
-        // the session cache this event would re-hash, re-decode and re-upsert
-        // the file, bumping the search-cache epoch, and would do it again for
-        // every event after that. The recorded row is unchanged either way;
-        // the scan's own error counter, asserted after the stop below, is what
-        // distinguishes "suppressed" from "silently redone".
+        // The session cache answers it before the ledger is even consulted (one
+        // stat, no query), which is what keeps an *unconfirmed* verdict from
+        // being re-hashed and re-upserted on every event: `attempts` dedups on
+        // the scan id, and a continuous scan's id spans the whole session, so
+        // the ledger alone could not stop that. The recorded row is unchanged
+        // either way; the scan's own error counter, asserted after the stop
+        // below, is what distinguishes "suppressed" from "silently redone".
         actor
             .cast(ContinuousScanMessage::DispatchStable {
                 epoch: 0,
@@ -2597,7 +2740,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
             row(&index_db).await,
-            Some(("decode".to_string(), "input".to_string(), 1, 2)),
+            Some(("header".to_string(), "input".to_string(), 1, 1)),
             "a suppressed file is not re-attempted"
         );
 

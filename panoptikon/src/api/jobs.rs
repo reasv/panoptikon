@@ -726,7 +726,7 @@ pub(crate) struct ScanFailure {
     /// The path is the key of this ledger: these failures happen before an
     /// item — or even a hash — exists.
     path: String,
-    /// `mime`, `metadata` or `decode`.
+    /// `mime`, `metadata`, `header` or `decode`.
     stage: String,
     /// `input`, `blocked` or `resource`.
     error_class: String,
@@ -741,6 +741,10 @@ pub(crate) struct ScanFailure {
     /// have the `last_modified`/`file_size` the failure was recorded against,
     /// so a file that has been repaired or otherwise modified since is
     /// re-attempted on the next scan even though this reads true.
+    ///
+    /// A `decode`-stage row never suppresses anything at any `attempts`: its
+    /// file *is* indexed (only the visuals failed), so the row is audit-only
+    /// and retry scheduling is the visuals cache's, not this ledger's.
     active: bool,
     /// The last scan that saw this failure. Null only when it was recorded
     /// outside a scan. This is *not* a foreign key and nothing nulls it when

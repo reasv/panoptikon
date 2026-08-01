@@ -1,6 +1,8 @@
 # Failed-media ledger and targeted retry
 
-Status: **designed 2026-08-01, not implemented.** Supersedes the mechanism in
+Status: **designed and implemented 2026-08-01** (all five phases; the
+*As implemented* notes throughout record where the code diverged from or
+settled something this document left open). Supersedes the mechanism in
 PR #25 (soft-fail corrupt media) while keeping its goals; incorporates the
 visuals negative-cache phase-2 design (2026-07-21) by reference.
 
@@ -177,7 +179,10 @@ CREATE TABLE scan_errors (
     path        TEXT NOT NULL UNIQUE,
     last_modified TEXT NOT NULL,  -- mtime at failure
     file_size   INTEGER NOT NULL, -- size at failure
-    stage       TEXT NOT NULL,    -- 'hash' | 'mime' | 'metadata' | 'decode'
+    -- as implemented: 'mime' | 'metadata' | 'header' | 'decode', and every
+    -- value but 'decode' blocks indexing and therefore suppresses — see the
+    -- scan-policy section.
+    stage       TEXT NOT NULL,
     error_class TEXT NOT NULL,    -- 'input' | 'blocked' | 'resource'
     blocker     TEXT,
     mime_type   TEXT,             -- best-effort (extension guess), may be NULL
@@ -453,8 +458,13 @@ WHERE error_class = 'input'
   AND mime_type LIKE 'image/%';
 DELETE FROM scan_errors
 WHERE error_class = 'input'
-  AND stage = 'decode';
+  AND stage IN ('header', 'decode');
 ```
+
+(Both image stages, because a decoder upgrade can change either verdict; only
+the `header` half actually un-blocks a file, the `decode` half clears audit
+rows whose files are already indexed. The first shipped directive,
+`20260801140000_retry_image_decode_unfused.sql`, is the un-fusing's own.)
 
 Why migrations and not new machinery:
 
@@ -533,6 +543,106 @@ This section is the only part of the design that changes what enters the
 index (images previously rejected at pixel-decode now index without
 visuals); it ships as its own phase.
 
+*As implemented.* The header parse is `ImageReader::open` +
+`with_guessed_format` + `into_dimensions` — the same check extraction makes
+before handing bytes to a worker (`ensure_image_readable`), with one
+difference: extraction sniffs a buffer, while the scan opens by path and so
+seeds the format from the extension before sniffing. A file whose bytes no
+sniff recognizes but whose extension is known therefore passes the scan gate
+and can still be rejected by extraction. That is the permissive direction —
+the file is indexed and the consumer decides — which is why the seed was left
+alone. No limits are set **by the header parse**, because reading a header
+allocates nothing worth a configurable ceiling; that is not the same as no
+limits at all, and the distinction matters (see below). Dimensions were the *only* thing the metadata
+phase ever took from the decoded image (no EXIF, no colour information), so
+nothing moved to the visuals phase and nothing was dropped; an image indexed
+through this path therefore always has width and height, and no nullable-dims
+work is owed. The un-fusing also removed the `preloaded_image` parameter that
+threaded the fused decode from `prepare_new_item` into the visuals generator,
+which is what made the batch walker and the continuous scan (`process_file`)
+two different code paths for images — they are now the same one, and the
+continuous scan stopped decoding twice per image.
+
+Three things this section did not anticipate:
+
+- **The header needs its own stage.** `scan_errors.stage` is the
+  discriminator for what a row *is*: `mime`, `metadata` and the new `header`
+  are failures that kept the file out of the index, so they suppress the next
+  scan's re-attempt; `decode` no longer is, so it is **audit-only** — it never
+  suppresses (`stage_blocks_indexing`), and it is not spent by its own file's
+  success either, since that file now succeeds on every scan. Only bytes that
+  moved retire it (plus the sweep and the directives). Suppressing on a
+  `decode` row would have been the real hazard: the walker's ledger check runs
+  before the mtime shortcut, so a confirmed row would have taken an *indexed*
+  file out of the walk for the rest of its life. Keeping both verdicts under
+  one stage was rejected for the same reason — a directive can still target
+  both with `stage IN ('header','decode')`, but the scheduler cannot. Rows
+  written by the fused gate are cleared by a retry directive
+  (`20260801140000_retry_image_decode_unfused.sql`), which is exactly the
+  mechanism this document proposes for the case.
+- **The blurhash re-decode escaped the marker.** Step 4's dispatcher consults
+  the thumbnail marker only when a thumbnail is *wanted*, which for the
+  majority of an image library it never is (served directly from the
+  original). Their blurhash still costs the same full decode, and before the
+  un-fusing that decode could not fail on an indexed file — so a corrupt
+  served-directly image would have been re-opened and re-decoded on every scan
+  forever, with nothing recording why. The dispatcher now consults the same
+  marker on the blurhash-only path, and the backfill's blurhash fallback
+  records its own decode failure as a thumbnail verdict (the decode *is* what
+  a thumbnail pass would have done). This is the only marker-consult a healthy
+  library ever pays for, and only for images that still owe a blurhash.
+- **A header parse can fail on limits.** Setting no limits means the image
+  crate's *defaults*, not none — including a 512 MiB allocation cap, which is
+  stricter than the configurable `image_decode_memory_limit_mb` the decode
+  runs under. A header declaring an absurd width (an IHDR of 200,000,000, and
+  a single row is enough) therefore fails `into_dimensions` with
+  `ImageError::Limits`, i.e. the metadata phase can reject a file over a
+  budget rather than over its content. Both classifiers map
+  `(Header, Limits)` to `resource`, the same as their decode arms: a verdict
+  on this machine, settled at one attempt and clearable by a directive once
+  the ceiling moves, never a claim that the file is corrupt.
+
+Both `visual_attempts` and `scan_errors` are written for a failed image
+decode, and they are not redundant: the marker is the **schedule** (it is what
+the next scan reads, and what confirms at `skip_after`), the row is the
+**audit record** (requirement 4 — the failures API and card read `scan_errors`
+and know nothing about markers). The asymmetry with the other visuals
+failures — a broken PDF gets a marker and no row — is deliberate: every other
+type has always been indexed without visuals, so none of them is news, while
+the image decode is the class this phase newly admits into the index. Widening
+the audit surface to all visuals failures is a separate, easy decision (a
+`visual_attempts` listing endpoint would cover all of them at once).
+
+The row is written by **both** decode sites — the new-item path (shared by the
+two walkers) and the backfill, whose thumbnail half and blurhash fallback are
+the only decodes an already-indexed file ever gets. Writing it in one place was
+the first attempt and was wrong in three ways: `attempts` would have frozen at
+1 while the marker counted to its threshold and suppressed, leaving the audit
+surface saying "1/2 · will retry" about a file nothing would retry; an image
+that was indexed decodable and then rotted in place would never have got a row
+at all, since it never revisits the new-item path; and neither would one whose
+marker a generator-version bump retired. Both sites write, so `attempts` moves
+in lockstep with the marker — 1 on the pass that indexed the file, 2 on the
+backfill that confirms it — and once the marker suppresses, nothing decodes and
+nothing writes. `skip_after` travels for the directives' benefit.
+
+Only an actual **decode** failure writes a row. An encode failure on pixels
+that decoded fine (the thumbnail encoder, on an image the crate read happily)
+is a generator problem, not a verdict on the file, so it gets the
+`visual_attempts` marker and nothing else — the same treatment as a PDF or an
+HTML page that fails to render. The failing site says which it was, exactly as
+it already names the kinds it invalidates; the mime type cannot tell them
+apart.
+
+Two more consequences worth stating: the thumbnail endpoint already serves any
+image with no stored thumbnail from its original file, with no size gate
+(`api/items.rs`, the `mime.starts_with("image")` fallback after the stored
+lookup), so an indexed-without-visuals image needs nothing from the API side —
+non-images keep the placeholder, which is the broken-PDF precedent. And the
+class of file this admits — image-crate-rejected but PIL-processable — now
+reaches extraction, where the header check and the PIL arbiter decide it as
+the arbiter principle intends.
+
 ## Audit surface (req 4)
 
 - **API**: `GET /api/jobs/data/failures` (extraction ledger joined with
@@ -590,6 +700,12 @@ The `ApiErrorKind` enum survives but grows the full taxonomy
    index).
 
 Phases 1 is prerequisite for the rest; 2–5 are independent of each other.
+
+*As implemented.* All five shipped on 2026-08-01, in that order, as seven
+commits (phase 1 split across three: taxonomy and tables, extraction, scan).
+Phase 5 turned out not to be independent of phase 4 after all — un-fusing the
+decode is what makes a decode failure possible on an *indexed* file, which is
+what exposed the blurhash hole in the phase-4 dispatcher (above).
 
 ## Non-goals
 

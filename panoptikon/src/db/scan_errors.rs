@@ -40,8 +40,36 @@ pub(crate) const STAGE_MIME: &str = "mime";
 /// tool did its own file I/O, so this is the ambiguous class.
 pub(crate) const STAGE_METADATA: &str = "metadata";
 
+/// `stage` value for an image whose *header* could not be parsed. Nothing was
+/// decoded — the bytes the gateway already read simply do not describe an
+/// image — so one failure settles it, and the file is not indexed (parity with
+/// PIL `verify()`, which accepts truncated pixel data but not an unparseable
+/// header).
+pub(crate) const STAGE_HEADER: &str = "header";
+
 /// `stage` value for an image the scan could not decode.
+///
+/// Audit-only since the decode was un-fused from the metadata phase
+/// (docs/failed-media-retry-design.md, "Scan policy for undecodable images"):
+/// a pixel-level decode failure no longer blocks indexing, so the row records
+/// *that it happened*, and scheduling is the `visual_attempts` marker's job.
+/// See [`stage_blocks_indexing`].
 pub(crate) const STAGE_DECODE: &str = "decode";
+
+/// Whether a row from this stage describes a failure that kept the file out of
+/// the index — the only kind that may suppress a re-attempt.
+///
+/// Every stage does except [`STAGE_DECODE`]: an image that fails the visuals
+/// decode is indexed anyway, so it gets past this stage on every scan and its
+/// row is an audit record, not a schedule. Letting such a row suppress would
+/// skip an *indexed* file for the rest of its life — no backfill, no mtime
+/// bookkeeping — over visuals that were never required.
+///
+/// Unknown stages count as blocking: the conservative direction, and the one
+/// that keeps a future stage from silently losing its suppression.
+pub(crate) fn stage_blocks_indexing(stage: &str) -> bool {
+    stage != STAGE_DECODE
+}
 
 /// SQLite caps the number of bind variables per statement; the sweep is
 /// normally a handful of paths, but chunking keeps a pathological ledger from
@@ -60,7 +88,8 @@ pub(crate) struct ScanErrorRecord {
     /// file whose either half moved is a new verdict, not a confirmation.
     pub last_modified: String,
     pub file_size: i64,
-    /// [`STAGE_MIME`], [`STAGE_METADATA`] or [`STAGE_DECODE`].
+    /// [`STAGE_MIME`], [`STAGE_METADATA`], [`STAGE_HEADER`] or
+    /// [`STAGE_DECODE`].
     pub stage: String,
     /// The classification itself, not its persisted strings: `error_class` and
     /// `blocker` are derived in [`upsert_scan_error`], so an inconsistent pair
@@ -87,6 +116,9 @@ pub(crate) struct ScanErrorSkip {
     pub file_size: i64,
     pub attempts: i64,
     pub skip_after: i64,
+    /// Which gate the file failed, which is what says whether this row is a
+    /// schedule or a record. See [`stage_blocks_indexing`].
+    pub stage: String,
 }
 
 impl ScanErrorSkip {
@@ -98,10 +130,28 @@ impl ScanErrorSkip {
     /// the confirmation threshold — an ambiguous verdict (an external tool
     /// that read the file itself) has to fail in two *different* runs before
     /// it counts.
+    ///
+    /// An audit-only row never suppresses, whatever its counters say: its file
+    /// is indexed, and skipping an indexed file is not a saving, it is a hole.
     pub fn suppresses(&self, last_modified: &str, file_size: i64) -> bool {
-        self.attempts >= self.skip_after
-            && self.last_modified == last_modified
-            && self.file_size == file_size
+        stage_blocks_indexing(&self.stage)
+            && self.attempts >= self.skip_after
+            && self.stat_matches(last_modified, file_size)
+    }
+
+    /// Whether a pass that got this file through the scan clears the row.
+    ///
+    /// For a blocking stage, any success is the re-attempt: the file got past
+    /// the gate it used to fail, so the verdict is spent. An audit-only row
+    /// belongs to a file that gets through on *every* scan, so a success says
+    /// nothing about it — only bytes that moved do, and then the row is stale
+    /// because it describes content that is gone.
+    pub fn cleared_by_success(&self, last_modified: &str, file_size: i64) -> bool {
+        stage_blocks_indexing(&self.stage) || !self.stat_matches(last_modified, file_size)
+    }
+
+    fn stat_matches(&self, last_modified: &str, file_size: i64) -> bool {
+        self.last_modified == last_modified && self.file_size == file_size
     }
 }
 
@@ -258,8 +308,8 @@ pub(crate) async fn load_scan_errors_under(
     // them, and the end-of-root sweep would then delete every row it failed to
     // see. The ledger holds one row per file the scan gave up on — a handful,
     // by design — so reading it whole costs far less than getting that wrong.
-    let rows = sqlx::query_as::<_, (String, String, i64, i64, i64)>(
-        "SELECT path, last_modified, file_size, attempts, skip_after FROM scan_errors",
+    let rows = sqlx::query_as::<_, (String, String, i64, i64, i64, String)>(
+        "SELECT path, last_modified, file_size, attempts, skip_after, stage FROM scan_errors",
     )
     .fetch_all(&mut *conn)
     .await
@@ -274,18 +324,21 @@ pub(crate) async fn load_scan_errors_under(
         // `D:\Photos\...`, which belongs to a different root and must not be
         // swept by this one, so the separator is checked too.
         .filter(|(path, ..)| path_is_under(root, path))
-        .map(|(path, last_modified, file_size, attempts, skip_after)| {
-            (
-                fold_scan_path(&path),
-                ScanErrorSkip {
-                    path,
-                    last_modified,
-                    file_size,
-                    attempts,
-                    skip_after,
-                },
-            )
-        })
+        .map(
+            |(path, last_modified, file_size, attempts, skip_after, stage)| {
+                (
+                    fold_scan_path(&path),
+                    ScanErrorSkip {
+                        path,
+                        last_modified,
+                        file_size,
+                        attempts,
+                        skip_after,
+                        stage,
+                    },
+                )
+            },
+        )
         .collect())
 }
 
@@ -300,8 +353,8 @@ pub(crate) async fn get_scan_error(
     conn: &mut sqlx::SqliteConnection,
     path: &str,
 ) -> ApiResult<Option<ScanErrorSkip>> {
-    let row: Option<(String, String, i64, i64, i64)> = sqlx::query_as(
-        "SELECT path, last_modified, file_size, attempts, skip_after \
+    let row: Option<(String, String, i64, i64, i64, String)> = sqlx::query_as(
+        "SELECT path, last_modified, file_size, attempts, skip_after, stage \
          FROM scan_errors WHERE path = ?",
     )
     .bind(path)
@@ -321,7 +374,7 @@ pub(crate) async fn get_scan_error(
         // event reporting a differently-cased path from re-processing (and
         // re-recording) a file that already has a verdict.
         None if cfg!(windows) => sqlx::query_as(
-            "SELECT path, last_modified, file_size, attempts, skip_after \
+            "SELECT path, last_modified, file_size, attempts, skip_after, stage \
              FROM scan_errors WHERE path = ? COLLATE NOCASE",
         )
         .bind(path)
@@ -335,12 +388,13 @@ pub(crate) async fn get_scan_error(
     };
 
     Ok(row.map(
-        |(path, last_modified, file_size, attempts, skip_after)| ScanErrorSkip {
+        |(path, last_modified, file_size, attempts, skip_after, stage)| ScanErrorSkip {
             path,
             last_modified,
             file_size,
             attempts,
             skip_after,
+            stage,
         },
     ))
 }
@@ -590,15 +644,19 @@ mod tests {
         blocker: Blocker::Pdfium,
     };
 
+    /// A blocking image verdict: the header would not parse, so the file was
+    /// never indexed. Deliberately not [`STAGE_DECODE`], which is audit-only
+    /// and suppresses nothing — the scheduling tests below need a row that
+    /// does.
     fn record(path: &str, kind: ApiErrorKind) -> ScanErrorRecord {
         ScanErrorRecord {
             path: path.to_string(),
             last_modified: "2026-01-01T00:00:00".to_string(),
             file_size: 100,
-            stage: STAGE_DECODE.to_string(),
+            stage: STAGE_HEADER.to_string(),
             kind,
             mime_type: Some("image/png".to_string()),
-            error: "decode failed".to_string(),
+            error: "unreadable header".to_string(),
             skip_after: 1,
         }
     }
@@ -876,6 +934,7 @@ mod tests {
                 file_size: 100,
                 attempts: 1,
                 skip_after: 1,
+                stage: STAGE_HEADER.to_string(),
             }
         );
         assert!(skip.suppresses("2026-01-01T00:00:00", 100));
@@ -896,8 +955,47 @@ mod tests {
             file_size: 100,
             attempts: 1,
             skip_after: 2,
+            stage: STAGE_HEADER.to_string(),
         };
         assert!(!unconfirmed.suppresses("2026-01-01T00:00:00", 100));
+    }
+
+    // The audit-only half of the ledger: a `decode` row belongs to a file that
+    // *is* indexed (the decode was un-fused from the metadata phase), so it
+    // must never skip that file — a confirmed one would take an indexed file
+    // out of the walk for the rest of its life — and a run that gets the file
+    // through is not evidence against it either, since every run does.
+    #[test]
+    fn an_audit_only_row_neither_suppresses_nor_is_spent_by_success() {
+        let audit = ScanErrorSkip {
+            path: r"C:\media\truncated.jpg".to_string(),
+            last_modified: "2026-01-01T00:00:00".to_string(),
+            file_size: 100,
+            // Confirmed several times over, and still inert.
+            attempts: 9,
+            skip_after: 1,
+            stage: STAGE_DECODE.to_string(),
+        };
+        assert!(!audit.suppresses("2026-01-01T00:00:00", 100));
+        assert!(!audit.cleared_by_success("2026-01-01T00:00:00", 100));
+        // Bytes that moved are the one thing that does spend it: the row
+        // describes content that is gone.
+        assert!(audit.cleared_by_success("2026-05-05T00:00:00", 100));
+        assert!(audit.cleared_by_success("2026-01-01T00:00:00", 101));
+
+        // A blocking row is the mirror image: any success spends it, because
+        // the success *is* the re-attempt of the gate it failed.
+        let blocking = ScanErrorSkip {
+            stage: STAGE_HEADER.to_string(),
+            ..audit
+        };
+        assert!(blocking.suppresses("2026-01-01T00:00:00", 100));
+        assert!(blocking.cleared_by_success("2026-01-01T00:00:00", 100));
+
+        assert!(stage_blocks_indexing(STAGE_MIME));
+        assert!(stage_blocks_indexing(STAGE_METADATA));
+        assert!(stage_blocks_indexing(STAGE_HEADER));
+        assert!(!stage_blocks_indexing(STAGE_DECODE));
     }
 
     // Forward slashes on the root and backslashes in the stored path are the

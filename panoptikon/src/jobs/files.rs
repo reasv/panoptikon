@@ -40,7 +40,7 @@ use crate::{
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
         open_index_db_read, open_index_db_read_no_user_data,
         scan_errors::{
-            STAGE_DECODE, STAGE_METADATA, STAGE_MIME, ScanErrorRecord, ScanErrorSkip,
+            STAGE_DECODE, STAGE_HEADER, STAGE_METADATA, STAGE_MIME, ScanErrorRecord, ScanErrorSkip,
             fold_scan_path, list_distinct_scan_blockers, load_scan_errors_under,
         },
         storage::{StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail},
@@ -882,6 +882,10 @@ struct NewItemData {
     /// What the visuals pass concluded about the kinds it produced nothing
     /// for. Empty on the healthy path.
     visual_verdicts: Vec<VisualVerdict>,
+    /// The audit row a visuals failure owes, for the one class of failure that
+    /// used to keep a file out of the index entirely. See
+    /// [`visuals_audit_failure`].
+    visuals_scan_error: Option<ScanErrorRecord>,
 }
 
 struct BackfillResult {
@@ -892,6 +896,10 @@ struct BackfillResult {
     blurhash: Option<String>,
     /// See [`NewItemData::visual_verdicts`].
     visual_verdicts: Vec<VisualVerdict>,
+    /// See [`NewItemData::visuals_scan_error`]. Written here too so the row's
+    /// `attempts` tracks the marker's instead of freezing at the new-item
+    /// pass's 1 — see [`backfill_scan_error`].
+    visuals_scan_error: Option<ScanErrorRecord>,
 }
 
 struct FailedFile {
@@ -962,6 +970,12 @@ struct ScanContext {
     /// difference against `scan_errors` is the end-of-root sweep, so the sweep
     /// is a set difference over ledger rows only — never over every file.
     seen_scan_errors: HashSet<String>,
+    /// Keys whose row this run must not clear even though the file processes
+    /// fine: an audit-only row (`decode`) whose bytes have not moved. Its file
+    /// is indexed on every scan, so "the file succeeded" is not evidence about
+    /// it — see [`ScanErrorSkip::cleared_by_success`]. Empty for every scan
+    /// that has no such row, which is nearly all of them.
+    pinned_scan_errors: HashSet<String>,
     conn: sqlx::SqliteConnection,
 }
 
@@ -1012,6 +1026,7 @@ async fn scan_single_folder(
         error_paths: Vec::new(),
         scan_errors,
         seen_scan_errors: HashSet::new(),
+        pinned_scan_errors: HashSet::new(),
         conn,
     };
 
@@ -1251,6 +1266,18 @@ impl ScanContext {
         // still has to stay out of unavailable-marking, exactly like a file
         // that failed, or a previously indexed copy of it would be marked gone
         // and then deleted.
+        // An audit-only row (a visuals decode failure on a file that *is*
+        // indexed) never suppresses, and a run that gets the file through is
+        // no evidence against it either — only bytes that moved are. Pin it so
+        // the success-path delete leaves it alone; a row whose bytes did move
+        // is left unpinned and cleared normally, because it describes content
+        // that no longer exists.
+        if let Some(skip) = &ledger_entry
+            && !skip.cleared_by_success(&last_modified, file_size)
+        {
+            self.pinned_scan_errors.insert(fold_scan_path(&path_str));
+        }
+
         let suppressed = ledger_entry
             .as_ref()
             .is_some_and(|skip| skip.suppresses(&last_modified, file_size));
@@ -1471,6 +1498,11 @@ impl ScanContext {
             return;
         }
         let key = fold_scan_path(path);
+        // Pinned by the walk: the row survives its own file's success (see
+        // `scan_path`).
+        if self.pinned_scan_errors.contains(&key) {
+            return;
+        }
         // The row is deleted by the path that is actually stored, which on
         // Windows need not be the casing the walk produced.
         let Some(stored) = self.scan_errors.get(&key).map(|entry| entry.path.clone()) else {
@@ -1612,7 +1644,71 @@ impl ScanContext {
         };
         let result = self.update_file_data(data).await?;
         self.tally(&result);
+        // Strictly after the file write, because that write clears this path's
+        // ledger row: the item indexed, so whatever verdict the path carried
+        // from a previous version of itself is spent — and the row this pass
+        // owes describes the bytes that just went in.
+        self.record_visuals_scan_error(item.visuals_scan_error)
+            .await;
         Ok(())
+    }
+
+    /// Records the audit row an indexed-without-visuals image owes, so a
+    /// failure that no longer blocks anything is still visible in the failures
+    /// surface (requirement 4) rather than only in a log line.
+    ///
+    /// Never fails the file — nothing about the item depends on it — and never
+    /// touched at all on the healthy path.
+    async fn record_visuals_scan_error(&mut self, record: Option<ScanErrorRecord>) {
+        let Some(record) = record else {
+            return;
+        };
+        let scan_id = self.scan_id;
+        if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::UpsertScanError {
+                record: record.clone(),
+                scan_id: Some(scan_id),
+                reply,
+            }
+        })
+        .await
+        {
+            tracing::warn!(
+                error = ?err,
+                path = %record.path,
+                "failed to record a visuals decode failure for auditing"
+            );
+        }
+    }
+
+    /// Whether an active marker settles the full decode of this content.
+    ///
+    /// The thumbnail kind is the one that answers "can this content be decoded
+    /// at all": the thumbnail, the frames and the blurhash all come out of the
+    /// same pass, so suppressing it suppresses them.
+    ///
+    /// Markers are advisory: a read that fails costs one regenerated nothing,
+    /// and must never abort the folder scan over a cache whose whole purpose
+    /// is saving work.
+    async fn thumbnail_marker_suppresses(&mut self, sha256: &str, path: &Path) -> bool {
+        match visuals_suppressed(
+            &mut self.conn,
+            sha256,
+            VisualKind::Thumbnail,
+            THUMBNAIL_PROCESS_VERSION,
+        )
+        .await
+        {
+            Ok(suppressed) => suppressed,
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to read the visuals negative cache; regenerating"
+                );
+                false
+            }
+        }
     }
 
     /// Counts (and logs) one whole dispatch the negative cache removed.
@@ -1743,6 +1839,12 @@ impl ScanContext {
             &backfill.mime_type,
         )
         .await;
+        // The confirmation half of the audit row the new-item pass opened. The
+        // path's ledger row is pinned by the walker before this point (an
+        // audit-only row is not spent by its file's success), so this upsert
+        // finds the row it means to increment rather than re-inserting one.
+        self.record_visuals_scan_error(backfill.visuals_scan_error)
+            .await;
 
         if wrote_visuals {
             self.stats.backfilled_visuals += 1;
@@ -1796,32 +1898,9 @@ impl ScanContext {
         // Only the thumbnail kind is consulted here because only the thumbnail
         // is dispatched: video frames come out of the same pass, so suppressing
         // the thumbnail suppresses their extraction too.
-        if needs_thumb {
-            // Markers are advisory: a read that fails costs one regenerated
-            // nothing, and must never abort the folder scan over a cache whose
-            // whole purpose is saving work.
-            let suppressed = match visuals_suppressed(
-                &mut self.conn,
-                &sha256,
-                VisualKind::Thumbnail,
-                THUMBNAIL_PROCESS_VERSION,
-            )
-            .await
-            {
-                Ok(suppressed) => suppressed,
-                Err(err) => {
-                    tracing::warn!(
-                        error = ?err,
-                        path = %path.display(),
-                        "failed to read the visuals negative cache; regenerating"
-                    );
-                    false
-                }
-            };
-            if suppressed {
-                needs_thumb = false;
-                thumb_suppressed = true;
-            }
+        if needs_thumb && self.thumbnail_marker_suppresses(&sha256, &path).await {
+            needs_thumb = false;
+            thumb_suppressed = true;
         }
         if !needs_thumb && !needs_blurhash {
             if thumb_suppressed {
@@ -1892,7 +1971,19 @@ impl ScanContext {
         // Falling through here would re-open and re-decode the file on every
         // single scan, the exact waste this table exists to kill.
         if !needs_thumb && needs_blurhash && existing_thumb.is_none() {
-            let no_source = !mime_type.starts_with("image") || thumb_suppressed;
+            let mut no_source = !mime_type.starts_with("image");
+            // Reaching here with an unsuppressed image means the marker was
+            // never consulted above, because the image would never store a
+            // thumbnail (it is served from its original file) — the majority
+            // of every image library. Its blurhash costs the same full decode
+            // all the same, and since undecodable images are indexed rather
+            // than rejected, that decode is exactly the one a marker can
+            // already have settled. One query, and only for an image that
+            // still owes a blurhash.
+            if !no_source && !thumb_suppressed {
+                thumb_suppressed = self.thumbnail_marker_suppresses(&sha256, &path).await;
+            }
+            no_source = no_source || thumb_suppressed;
             if no_source {
                 if thumb_suppressed {
                     self.note_suppressed_visuals(&path);
@@ -1952,8 +2043,10 @@ impl ScanContext {
                         extracted_frames: Vec::new(),
                         blurhash: None,
                         // A dead worker is no verdict on the content: the
-                        // generation is retried next scan, unmarked.
+                        // generation is retried next scan, unmarked and
+                        // unrecorded.
                         visual_verdicts: Vec::new(),
+                        visuals_scan_error: None,
                     })
                 }
             }
@@ -2138,26 +2231,15 @@ fn prepare_new_item(
     };
 
     let metadata_span = timers.metadata.start();
-    // Step 7 moves this decode to the visuals phase (an undecodable image will
-    // then be indexed without visuals instead of not at all); until then it
-    // gates indexing and is classified where it sits.
-    let preloaded_image = if mime_type.starts_with("image") {
-        match open_image_staged(&path) {
-            Ok(image) => Some(image),
-            Err((stage, err)) => {
-                return failed(path, FileProcessError::from_image_error(stage, err));
-            }
+    // The metadata phase reads an image's header and nothing more: whether the
+    // pixels decode is the visuals phase's question, and its answer no longer
+    // decides whether the file is indexed.
+    let metadata = match extract_item_metadata(&path, &mime_type, md5) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return failed(path, error);
         }
-    } else {
-        None
     };
-    let metadata =
-        match extract_item_metadata_inner(&path, &mime_type, md5, preloaded_image.as_ref()) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                return failed(path, error);
-            }
-        };
     drop(metadata_span);
 
     if !passes_filescan_filter_stage2(
@@ -2173,7 +2255,20 @@ fn prepare_new_item(
         return failed(path, FileProcessError::Filtered);
     }
 
-    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, preloaded_image, timers);
+    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, timers);
+    // Built here because this is the last place that holds the file's ledger
+    // identity — the same stat pair the `failed` closure above uses, for the
+    // same reason.
+    let visuals_scan_error = visuals.audit.map(|failure| ScanErrorRecord {
+        path: path.to_string_lossy().to_string(),
+        last_modified: last_modified.clone(),
+        file_size: stat_size,
+        stage: failure.stage.to_string(),
+        kind: failure.kind,
+        mime_type: Some(mime_type.clone()),
+        error: failure.message,
+        skip_after: failure.skip_after,
+    });
 
     TaskOutcome::NewItem(NewItemData {
         path,
@@ -2186,6 +2281,7 @@ fn prepare_new_item(
         frames: visuals.frames,
         blurhash: visuals.blurhash,
         visual_verdicts: visuals.verdicts,
+        visuals_scan_error,
     })
 }
 
@@ -2202,6 +2298,8 @@ pub(crate) struct PreparedFile {
     /// What the visuals pass concluded about the kinds it produced nothing
     /// for. Empty on the healthy path.
     pub(crate) visual_verdicts: Vec<VisualVerdict>,
+    /// See [`NewItemData::visuals_scan_error`].
+    pub(crate) visuals_scan_error: Option<ScanErrorRecord>,
 }
 
 pub(crate) struct FileWriteData {
@@ -2215,6 +2313,8 @@ pub(crate) struct FileWriteData {
     pub(crate) blurhash: Option<String>,
     /// See [`PreparedFile::visual_verdicts`].
     pub(crate) visual_verdicts: Vec<VisualVerdict>,
+    /// See [`NewItemData::visuals_scan_error`].
+    pub(crate) visuals_scan_error: Option<ScanErrorRecord>,
     pub(crate) time_added: String,
 }
 
@@ -2238,6 +2338,7 @@ impl FileWriteData {
             frames: prepared.frames,
             blurhash: prepared.blurhash,
             visual_verdicts: prepared.visual_verdicts,
+            visuals_scan_error: prepared.visuals_scan_error,
             time_added,
         }
     }
@@ -2352,7 +2453,8 @@ pub(crate) enum FileProcessError {
 /// file's identity (path, mtime, size), which only the walker knows.
 #[derive(Debug, Clone)]
 pub(crate) struct ScanFailure {
-    /// [`STAGE_MIME`], [`STAGE_METADATA`] or [`STAGE_DECODE`].
+    /// [`STAGE_MIME`], [`STAGE_METADATA`], [`STAGE_HEADER`] or
+    /// [`STAGE_DECODE`].
     pub(crate) stage: &'static str,
     pub(crate) kind: ApiErrorKind,
     /// The confirmation threshold this *site* earned, not the class's: an
@@ -2411,22 +2513,41 @@ impl FileProcessError {
     /// Opening and format-sniffing do their own file I/O and decode nothing,
     /// so every failure there is this machine's problem and stays transient.
     ///
-    /// Everything the decoder itself rejects is a verdict on the file —
-    /// including `IoError`, which is what a truncated PNG, BMP or TIFF
-    /// produces (the decoder asks for bytes that are not there and the short
-    /// read surfaces as I/O). Truncated files are the common case by orders of
-    /// magnitude; a mount dropping mid-decode after opening cleanly is not.
-    /// The threshold, not the class, is what covers that: these are recorded
-    /// [`SKIP_AFTER_AMBIGUOUS`], so a genuine mid-read drop has to repeat in a
-    /// *later* run before it suppresses anything.
+    /// A header the crate cannot parse is the metadata phase's own verdict on
+    /// bytes it read successfully: nothing about the file will change until
+    /// the file does, so it is `input`, settled at one attempt, and the file
+    /// is not indexed. (Truncation is *not* this case — a truncated JPEG's
+    /// header is intact; that failure surfaces one phase later, in the
+    /// visuals, and no longer blocks indexing.)
     ///
-    /// `Limits` is the configurable `image_decode_memory_limit_mb` ceiling — a
-    /// property of this machine's budget, not of the file — so it is
-    /// `resource`, settled at one attempt and clearable by a retry directive
-    /// after the limit is raised.
+    /// The decode arm survives for the ledger's benefit rather than the
+    /// metadata phase's: since the un-fusing, no caller reaches it from a
+    /// gate that blocks indexing (the visuals half has its own classifier,
+    /// [`Self::visuals_from_image_error`]), but a decode verdict that did
+    /// reach the ledger must still be the ambiguous class — a decoder that
+    /// reads as it goes cannot tell a truncated file from a mount that
+    /// dropped mid-read.
+    ///
+    /// `Limits` is a verdict on this machine's budget rather than on the file,
+    /// so it is `resource` at *either* stage — settled at one attempt and
+    /// clearable by a retry directive after the ceiling is raised. It reaches
+    /// the decode from the configurable `image_decode_memory_limit_mb`, and the
+    /// header parse from the image crate's own default 512 MiB allocation cap,
+    /// which that parse runs under untouched: setting no limits means the
+    /// crate's defaults, not none, and one row of a wide enough image is all it
+    /// takes to exceed them.
     fn from_image_error(stage: ImageStage, err: image::ImageError) -> Self {
         match (stage, err) {
             (ImageStage::Open, err) => FileProcessError::Io(err.to_string()),
+            (ImageStage::Header, image::ImageError::Limits(limit_err)) => {
+                FileProcessError::Classified(ScanFailure {
+                    stage: STAGE_HEADER,
+                    kind: ApiErrorKind::Resource,
+                    skip_after: SKIP_AFTER_CONFIRMED,
+                    message: limit_err.to_string(),
+                })
+            }
+            (ImageStage::Header, err) => ScanFailure::input(STAGE_HEADER, err.to_string()),
             (ImageStage::Decode, image::ImageError::Limits(limit_err)) => {
                 FileProcessError::Classified(ScanFailure {
                     stage: STAGE_DECODE,
@@ -2467,9 +2588,27 @@ impl FileProcessError {
     /// cannot tell a truncated file from a mount that dropped mid-read; and
     /// the configurable memory ceiling is a property of this machine's budget,
     /// so it is `resource` and settles at one attempt.
+    ///
+    /// A header failure cannot reach here in practice — the metadata phase
+    /// parses the header first and a file that fails it is never indexed, so
+    /// no visuals pass is ever run on one — but it is the *content's* verdict
+    /// wherever it surfaces, and one attempt settles it for the same reason it
+    /// does one phase earlier: nothing was decoded, so nothing is ambiguous.
+    /// Its `Limits` half is the budget verdict all the same, for the reason
+    /// spelled out on [`Self::from_image_error`]: the header parse runs under
+    /// the image crate's default 512 MiB cap, so a wide enough single row
+    /// exceeds it there too.
     fn visuals_from_image_error(stage: ImageStage, err: image::ImageError) -> Self {
         match (stage, err) {
             (ImageStage::Open, err) => FileProcessError::Io(err.to_string()),
+            (ImageStage::Header, image::ImageError::Limits(limit_err)) => {
+                FileProcessError::Visuals(VisualFailure {
+                    kind: ApiErrorKind::Resource,
+                    skip_after: SKIP_AFTER_CONFIRMED,
+                    message: limit_err.to_string(),
+                })
+            }
+            (ImageStage::Header, err) => visuals_input(err.to_string()),
             (ImageStage::Decode, image::ImageError::Limits(limit_err)) => {
                 FileProcessError::Visuals(VisualFailure {
                     kind: ApiErrorKind::Resource,
@@ -2554,6 +2693,9 @@ pub(crate) struct GeneratedVisuals {
     /// Empty on the healthy path, which is what keeps this free: a pass that
     /// stored something owes no marker, and the store clears any stale one.
     pub(crate) verdicts: Vec<VisualVerdict>,
+    /// The failure that also owes a `scan_errors` audit row. See
+    /// [`visuals_audit_failure`].
+    pub(crate) audit: Option<ScanFailure>,
 }
 
 /// Turns a pass's verdicts into markers for one item. Each kind is stamped
@@ -2601,6 +2743,10 @@ pub(crate) fn process_file(
     if real_size != file_size {
         tracing::warn!(path = %path.display(), real_size, file_size, "file size mismatch");
     }
+    // The stat pair is the ledger's retry key and must outlive the swap to the
+    // hasher's byte count below — see `prepare_new_item` for why the two must
+    // not be confused.
+    let stat_size = file_size;
     let file_size = real_size;
 
     let metadata_span = timers.metadata.start();
@@ -2620,7 +2766,17 @@ pub(crate) fn process_file(
         return Err(FileProcessError::Filtered);
     }
 
-    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, None, timers);
+    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, timers);
+    let visuals_scan_error = visuals.audit.map(|failure| ScanErrorRecord {
+        path: path.to_string_lossy().to_string(),
+        last_modified: last_modified.clone(),
+        file_size: stat_size,
+        stage: failure.stage.to_string(),
+        kind: failure.kind,
+        mime_type: Some(mime_type.clone()),
+        error: failure.message,
+        skip_after: failure.skip_after,
+    });
 
     Ok(PreparedFile {
         path,
@@ -2633,6 +2789,7 @@ pub(crate) fn process_file(
         frames: visuals.frames,
         blurhash: visuals.blurhash,
         visual_verdicts: visuals.verdicts,
+        visuals_scan_error,
     })
 }
 
@@ -2735,8 +2892,42 @@ pub(crate) enum ImageStage {
     /// Opening the file and sniffing its format — no payload was decoded, so
     /// nothing here is ever a verdict on the file.
     Open,
-    /// The decode itself, on a file that opened fine.
+    /// Parsing the header, on a file that opened fine: no pixel data is
+    /// touched, so a failure means the bytes do not describe an image at all.
+    Header,
+    /// The decode itself, on a file whose header parsed.
     Decode,
+}
+
+/// The metadata phase's whole contact with an image: the dimensions, straight
+/// out of the header.
+///
+/// Deliberately *not* a decode (docs/failed-media-retry-design.md, "Scan policy
+/// for undecodable images"): the metadata phase decides whether a file is
+/// indexed at all, and pixel-level damage is a visuals-grade problem. It is
+/// the same check extraction makes before handing bytes to a worker
+/// (`ensure_image_readable`) and the same one PIL's `verify()` makes, so the
+/// scan's indexing gate is no stricter than the consumer's — and marginally
+/// looser: opening by path seeds the format from the extension, where
+/// extraction sniffs a buffer with no such seed, so a file whose content is
+/// unrecognizable but whose extension is not can still pass here. That is the
+/// safe direction (the file is indexed and the consumer decides), which is why
+/// the seed is left alone.
+///
+/// No limits are set *by this function*, for the same parity reason: reading a
+/// header allocates nothing worth a configurable ceiling. That is not the same
+/// as no limits at all — the image crate applies its own defaults, including a
+/// 512 MiB allocation cap that a header declaring an absurd width exceeds, and
+/// [`FileProcessError::from_image_error`] classifies that as `resource`.
+fn image_header_dimensions(
+    path: impl AsRef<Path>,
+) -> Result<(u32, u32), (ImageStage, image::ImageError)> {
+    let reader = image::ImageReader::open(path).map_err(|err| (ImageStage::Open, err.into()))?;
+    reader
+        .with_guessed_format()
+        .map_err(|err| (ImageStage::Open, err.into()))?
+        .into_dimensions()
+        .map_err(|err| (ImageStage::Header, err))
 }
 
 /// [`open_image`] with the failing stage attached, for the scan's classifier.
@@ -2767,19 +2958,13 @@ fn decode_limits() -> image::Limits {
     limits
 }
 
+/// The metadata phase, which is also the indexing gate: a file this rejects is
+/// not indexed at all (docs/failed-media-retry-design.md, "Scan policy for
+/// undecodable images").
 fn extract_item_metadata(
     path: &Path,
     mime_type: &str,
     md5: String,
-) -> Result<ItemScanMeta, FileProcessError> {
-    extract_item_metadata_inner(path, mime_type, md5, None)
-}
-
-fn extract_item_metadata_inner(
-    path: &Path,
-    mime_type: &str,
-    md5: String,
-    preloaded_image: Option<&DynamicImage>,
 ) -> Result<ItemScanMeta, FileProcessError> {
     let mut metadata = ItemScanMeta {
         md5,
@@ -2793,12 +2978,12 @@ fn extract_item_metadata_inner(
     };
 
     if mime_type.starts_with("image") {
-        let (width, height) = match preloaded_image {
-            Some(image) => image.dimensions(),
-            None => open_image_staged(path)
-                .map_err(|(stage, err)| FileProcessError::from_image_error(stage, err))?
-                .dimensions(),
-        };
+        // Header only. The dimensions are all the metadata an image
+        // contributes, and they sit in the header of every format the crate
+        // reads — so an image indexed through this path always has them, and a
+        // file whose pixels are damaged is still indexed with its real size.
+        let (width, height) = image_header_dimensions(path)
+            .map_err(|(stage, err)| FileProcessError::from_image_error(stage, err))?;
         metadata.width = Some(width as i64);
         metadata.height = Some(height as i64);
         return Ok(metadata);
@@ -2854,6 +3039,17 @@ struct ProducedVisuals {
 struct VisualsError {
     kinds: &'static [VisualKind],
     error: FileProcessError,
+    /// The `scan_errors` stage this failure owes an audit row under, or `None`
+    /// when it owes none — which is every failure but the image decode itself.
+    ///
+    /// Named by the *site*, for the same reason `kinds` is: the mime type
+    /// cannot tell them apart. An image pass that decoded fine and then failed
+    /// to *encode* its thumbnail is a generator problem, not a verdict on the
+    /// file's pixels, and stamping it `decode` would put it under a retry
+    /// directive that targets decodes and make the audit surface claim the
+    /// image is undecodable. Those failures get the `visual_attempts` marker
+    /// only, exactly like a PDF or an HTML page that fails to render.
+    audit_stage: Option<&'static str>,
 }
 
 impl VisualsError {
@@ -2862,6 +3058,19 @@ impl VisualsError {
         Self {
             kinds: &[VisualKind::Thumbnail],
             error,
+            audit_stage: None,
+        }
+    }
+
+    /// The full decode of an image failed — the one visuals failure that also
+    /// owes a `scan_errors` audit row, and the only site allowed to say so.
+    /// Same scope as [`Self::thumbnail`]: the thumbnail, the frames and the
+    /// blurhash all come out of this decode, and images have no frames.
+    fn image_decode(error: FileProcessError) -> Self {
+        Self {
+            kinds: &[VisualKind::Thumbnail],
+            error,
+            audit_stage: Some(STAGE_DECODE),
         }
     }
 
@@ -2871,6 +3080,7 @@ impl VisualsError {
         Self {
             kinds: &[VisualKind::Frame],
             error,
+            audit_stage: None,
         }
     }
 
@@ -2880,6 +3090,7 @@ impl VisualsError {
         Self {
             kinds: &[VisualKind::Thumbnail, VisualKind::Frame],
             error,
+            audit_stage: None,
         }
     }
 }
@@ -2897,15 +3108,49 @@ fn failure_verdicts(err: &VisualsError) -> Vec<VisualVerdict> {
         .collect()
 }
 
+/// The `scan_errors` row a visuals failure owes, or `None` when it owes none.
+///
+/// Only the image decode does, and only the *site* knows that it was one — see
+/// [`VisualsError::audit_stage`], which is what an encode failure on a
+/// successfully decoded image is kept out by. Every other visuals failure has
+/// always left the item indexed without visuals, so none of them is *new*
+/// information for the audit surface; the image decode is the one this step
+/// newly admits into the index, and a class of failure that silently stopped
+/// being a failure would be exactly the invisibility requirement 4 exists
+/// against (docs/failed-media-retry-design.md).
+///
+/// The mime check is redundant with the stage today (only the image branches
+/// name one) and kept because the row *asserts* the mime type: a non-image
+/// path stamped `decode` would answer an `image/`-targeted retry directive.
+///
+/// The row is audit-only: it never suppresses anything (see
+/// [`crate::db::scan_errors::stage_blocks_indexing`]) — scheduling is the
+/// `visual_attempts` marker's job, and the marker is what the next scan reads.
+/// `attempts` tracks the marker's because both decode sites write it (see
+/// [`backfill_scan_error`]); `skip_after` travels with it for the retry
+/// directives' benefit.
+fn visuals_audit_failure(mime_type: &str, err: &VisualsError) -> Option<ScanFailure> {
+    let stage = err.audit_stage?;
+    if !mime_type.starts_with("image") {
+        return None;
+    }
+    let failure = err.error.visual_failure()?;
+    Some(ScanFailure {
+        stage,
+        kind: failure.kind,
+        skip_after: failure.skip_after,
+        message: failure.message.clone(),
+    })
+}
+
 fn generate_new_item_visuals(
     path: &Path,
     mime_type: &str,
     metadata: &ItemScanMeta,
-    preloaded_image: Option<DynamicImage>,
     timers: &ScanTimers,
 ) -> GeneratedVisuals {
     let thumb_span = timers.thumbgen.start();
-    let attempt = build_new_item_thumbnails(path, mime_type, metadata, preloaded_image);
+    let attempt = build_new_item_thumbnails(path, mime_type, metadata);
     drop(thumb_span);
 
     let mut visuals = GeneratedVisuals::default();
@@ -2931,6 +3176,7 @@ fn generate_new_item_visuals(
             // of what a broken-media library saw in its logs.
             tracing::debug!(error = ?err, path = %path.display(), "failed to generate visuals");
             visuals.verdicts = failure_verdicts(&err);
+            visuals.audit = visuals_audit_failure(mime_type, &err);
             None
         }
     };
@@ -2946,7 +3192,6 @@ fn build_new_item_thumbnails(
     path: &Path,
     mime_type: &str,
     metadata: &ItemScanMeta,
-    preloaded_image: Option<DynamicImage>,
 ) -> Result<ProducedVisuals, VisualsError> {
     let mut out = ProducedVisuals::default();
 
@@ -2994,12 +3239,15 @@ fn build_new_item_thumbnails(
             .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
         out.blurhash_source = Some(thumb);
     } else if mime_type.starts_with("image") {
-        let image = match preloaded_image {
-            Some(image) => image,
-            None => open_image_staged(path).map_err(|(stage, err)| {
-                VisualsError::thumbnail(FileProcessError::visuals_from_image_error(stage, err))
-            })?,
-        };
+        // The full decode lives here and only here: it is what the thumbnail
+        // and the blurhash are made of, and — since the un-fusing — nothing
+        // else depends on it. A file that fails it is indexed from its header
+        // with no visuals, exactly like a PDF pdfium cannot parse.
+        // Only this `?` is the decode: the encode below it runs on pixels that
+        // came out fine, so it owes a marker and no audit row.
+        let image = open_image_staged(path).map_err(|(stage, err)| {
+            VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
+        })?;
         if let Some(thumb) = generate_thumbnail(path, &image).map_err(VisualsError::thumbnail)? {
             out.thumbnails
                 .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
@@ -3079,6 +3327,13 @@ fn generate_backfill_visuals(
     let mut blurhash_source: Option<DynamicImage> = None;
     let mut verdicts = Vec::new();
 
+    // Whether the thumbnail half already tried — and failed — to decode this
+    // file, so the blurhash fallback below knows not to repeat it.
+    let mut decode_failed = false;
+    // The audit row this pass owes, if it turns out to be a decode failure on
+    // an image. At most one of the two sites below can produce one: the
+    // blurhash fallback only runs when the thumbnail half did not fail.
+    let mut audit: Option<ScanFailure> = None;
     if needs_thumb {
         match build_backfill_thumbnails(path, mime_type, &existing_frames, video_duration) {
             Ok(produced) => {
@@ -3098,6 +3353,8 @@ fn generate_backfill_visuals(
                 // new-item path: the classified log is the generator's.
                 tracing::debug!(error = ?err, path = %path.display(), "failed to generate thumbnails");
                 verdicts = failure_verdicts(&err);
+                audit = visuals_audit_failure(mime_type, &err);
+                decode_failed = true;
             }
         }
     }
@@ -3113,7 +3370,31 @@ fn generate_backfill_visuals(
         });
         let source = match source {
             Some(source) => Some(source),
-            None if mime_type.starts_with("image") => open_image(path).ok(),
+            // The last possible source: a full decode of the original. For an
+            // image served from its original file this is the *only* decode
+            // the backfill ever performs — no thumbnail is ever stored for it,
+            // so nothing else would ever record a verdict — and since a file
+            // whose pixels do not decode is now indexed rather than rejected,
+            // an unrecorded failure here would re-decode it on every scan
+            // forever.
+            None if mime_type.starts_with("image") && !decode_failed => {
+                match open_image_staged(path) {
+                    Ok(image) => Some(image),
+                    Err((stage, err)) => {
+                        let err = VisualsError::image_decode(
+                            FileProcessError::visuals_from_image_error(stage, err),
+                        );
+                        tracing::debug!(
+                            error = ?err,
+                            path = %path.display(),
+                            "failed to decode an image for its blurhash"
+                        );
+                        verdicts.extend(failure_verdicts(&err));
+                        audit = audit.or_else(|| visuals_audit_failure(mime_type, &err));
+                        None
+                    }
+                }
+            }
             None => None,
         };
         blurhash = source
@@ -3129,7 +3410,51 @@ fn generate_backfill_visuals(
         extracted_frames,
         blurhash,
         visual_verdicts: verdicts,
+        visuals_scan_error: audit.and_then(|failure| backfill_scan_error(path, mime_type, failure)),
     }
+}
+
+/// The audit row a *backfill's* image decode owes.
+///
+/// Without this the row would be written once, by the new-item path, and never
+/// again: every later confirmation of the same file arrives through the mtime
+/// shortcut and the backfill, so `attempts` would sit at 1 forever while the
+/// `visual_attempts` marker quietly reached its threshold and suppressed —
+/// the audit surface reading "1/2 · will retry" about a file nothing will
+/// retry. Writing here keeps the two counters in lockstep (1 on the new-item
+/// pass, 2 on the backfill that confirms it, nothing after the marker
+/// suppresses), and it is also the only writer for the two cases the new-item
+/// path cannot cover at all: a file that was indexed *decodable* and rotted in
+/// place, and one whose marker a generator-version bump retired.
+///
+/// The stat is taken here rather than threaded from the walker: the backfill is
+/// dispatched for content, not for a stat, and the pair only has to identify
+/// the bytes this decode just failed on. A stat that fails now means the file
+/// went away mid-scan — transient, and no row is owed.
+fn backfill_scan_error(
+    path: &Path,
+    mime_type: &str,
+    failure: ScanFailure,
+) -> Option<ScanErrorRecord> {
+    let (last_modified, file_size) = get_last_modified_time_and_size(path)
+        .map_err(|err| {
+            tracing::debug!(
+                error = %err,
+                path = %path.display(),
+                "could not stat a file to record its decode failure"
+            );
+        })
+        .ok()?;
+    Some(ScanErrorRecord {
+        path: path.to_string_lossy().to_string(),
+        last_modified,
+        file_size,
+        stage: failure.stage.to_string(),
+        kind: failure.kind,
+        mime_type: Some(mime_type.to_string()),
+        error: failure.message,
+        skip_after: failure.skip_after,
+    })
 }
 
 fn build_backfill_thumbnails(
@@ -3205,8 +3530,10 @@ fn build_backfill_thumbnails(
         // early exits here are the served-directly predicate, which needs no
         // marker of its own.
         if file_size > SMALL_IMAGE_FILE_SIZE {
+            // As in the new-item pass: the decode owes the audit row, the
+            // encode below it does not.
             let image = open_image_staged(path).map_err(|(stage, err)| {
-                VisualsError::thumbnail(FileProcessError::visuals_from_image_error(stage, err))
+                VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
             })?;
             if let Some(thumb) = generate_thumbnail(path, &image).map_err(VisualsError::thumbnail)? {
                 out.thumbnails
@@ -4700,6 +5027,10 @@ LIMIT 1
         image::RgbImage::new(8, 8)
             .save(media_dir.join("good.png"))
             .unwrap();
+        // Garbage, not a truncated image: the header is what fails here, which
+        // is the only image failure that still keeps a file out of the index.
+        // (A file whose header parses and whose pixels do not is indexed
+        // without visuals — `a_corrupt_image_is_indexed_without_visuals_once`.)
         let broken = media_dir.join("broken.png");
         fs::write(&broken, b"this claims to be a png and is not").unwrap();
         let broken_path = broken.to_string_lossy().to_string();
@@ -4716,10 +5047,10 @@ LIMIT 1
         );
 
         // First pass: the folder update scans the new folder and the file
-        // fails there; the full rescan that follows re-attempts it, because a
-        // decode verdict is ambiguous (a truncated file and a mount that drops
-        // mid-read look identical) and needs a second *run* to confirm. That
-        // second run is what this same call provides.
+        // fails there. A header verdict is settled by that one failure —
+        // nothing was decoded, so there is no mid-read mount drop to confuse
+        // it with — so the full rescan this same call performs afterwards
+        // already skips the file, and the count stays at one.
         service.rescan_folders().await.unwrap();
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let rows = scan_error_rows(&mut conn).await;
@@ -4735,13 +5066,13 @@ LIMIT 1
             ),
             (
                 broken_path.as_str(),
-                STAGE_DECODE,
+                STAGE_HEADER,
                 "input",
-                2,
-                SKIP_AFTER_AMBIGUOUS,
+                1,
+                SKIP_AFTER_CONFIRMED,
                 Some("image/png")
             ),
-            "a decode failure is an unconfirmed input verdict, recorded with its format"
+            "an unparseable header is a settled input verdict, recorded with its format"
         );
         // The retry key is the *stat* pair, not the byte count the hasher
         // read: the continuous scan only ever has a stat, so a batch failure
@@ -4771,7 +5102,7 @@ LIMIT 1
         service.rescan_folders().await.unwrap();
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let rows = scan_error_rows(&mut conn).await;
-        assert_eq!((rows.len(), rows[0].3), (1, 2), "no re-attempt: {rows:?}");
+        assert_eq!((rows.len(), rows[0].3), (1, 1), "no re-attempt: {rows:?}");
         let (_, _, _, errors, marked) = latest_scan_record(&mut conn).await;
         assert_eq!(
             (errors, marked),
@@ -5038,6 +5369,467 @@ LIMIT 1
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         assert_eq!(thumbnail_count(&mut conn).await, 1);
         assert!(visual_attempt_rows(&mut conn).await.is_empty());
+    }
+
+    /// (kind, outcome, attempts, skip_after) per marker, keyed by the content
+    /// it belongs to — two broken files in one folder need telling apart.
+    async fn markers_by_sha(
+        conn: &mut sqlx::SqliteConnection,
+        sha256: &str,
+    ) -> Vec<(String, String, i64, i64)> {
+        sqlx::query_as(
+            "SELECT kind, outcome, attempts, skip_after FROM storage.visual_attempts \
+             WHERE item_sha256 = ? ORDER BY kind",
+        )
+        .bind(sha256)
+        .fetch_all(conn)
+        .await
+        .unwrap()
+    }
+
+    // The whole point of un-fusing the image decode, end to end: an image whose
+    // pixels do not decode is *indexed* — with its real dimensions, from its
+    // header — and simply has no visuals, exactly like a PDF pdfium cannot
+    // parse. Before this it was rejected outright, silently, and re-decoded on
+    // every scan forever, because a file with no `files` row has no mtime
+    // shortcut to skip it.
+    //
+    // Then the chain that stops the work: the failed decode is remembered, the
+    // next run confirms it (the verdict is ambiguous — a decoder that reads as
+    // it goes cannot tell a truncated file from a mount that dropped), and the
+    // run after that does not open the file at all.
+    //
+    // Both halves of the image population are here, because they reach the
+    // decode by different routes: one large enough to warrant a stored
+    // thumbnail, and one served from its original file, whose only remaining
+    // decode is the blurhash's. The second used to escape the marker entirely.
+    #[tokio::test]
+    async fn a_corrupt_image_is_indexed_without_visuals_once() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        // Its own folder: the temp root is shared by every test in the process.
+        let media_dir = root.join("media-undecodable");
+        fs::create_dir_all(&media_dir).unwrap();
+
+        // 4900x400 uncompressed = 5.88 MB. Truncating 100 KB keeps it over the
+        // small-file cutoff and wider than the served-directly dimension
+        // limit, so this one really would get a stored thumbnail.
+        let large = media_dir.join("large.bmp");
+        image::RgbImage::new(4900, 400).save(&large).unwrap();
+        let full_len = fs::metadata(&large).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&large)
+            .unwrap()
+            .set_len(full_len - 100_000)
+            .unwrap();
+
+        // And a small one, which no thumbnail would ever be stored for. Noise,
+        // not a flat colour: a PNG of one colour compresses to so few bytes
+        // that a 60% prefix can still hold the whole image.
+        let small = media_dir.join("small.png");
+        let mut noise = image::RgbImage::new(64, 64);
+        for (x, y, pixel) in noise.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x * 7 % 251) as u8,
+                (y * 13 % 241) as u8,
+                (x * y % 239) as u8,
+            ]);
+        }
+        noise.save(&small).unwrap();
+        let bytes = fs::read(&small).unwrap();
+        fs::write(&small, &bytes[..bytes.len() * 6 / 10]).unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+        let scan = || {
+            execute_folder_scan(
+                &index_db,
+                &user_data_db,
+                &config,
+                &config.included_folders,
+                &[],
+                ScanOptions { worker_count: 2 },
+            )
+        };
+
+        // Run 1: both files enter the index.
+        let (_, totals) = scan().await.unwrap();
+        assert_eq!(totals.new_items, 2, "an undecodable image is still indexed");
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let indexed: Vec<(String, String, Option<i64>, Option<i64>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT files.path, items.sha256, items.width, items.height, items.blurhash \
+                 FROM items JOIN files ON files.item_id = items.id ORDER BY files.path",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(indexed.len(), 2);
+        let (large_sha, small_sha) = (indexed[0].1.clone(), indexed[1].1.clone());
+        assert_eq!(
+            (indexed[0].2, indexed[0].3, indexed[1].2, indexed[1].3),
+            (Some(4900), Some(400), Some(64), Some(64)),
+            "the dimensions come from the header, which truncation leaves intact"
+        );
+        assert!(
+            indexed.iter().all(|row| row.4.is_none()),
+            "no decode means no blurhash — cosmetic, and the item is indexed"
+        );
+        assert_eq!(
+            thumbnail_count(&mut conn).await,
+            0,
+            "and no visuals of any kind"
+        );
+
+        // The visuals verdict is remembered — once per content, unconfirmed —
+        // and the failure is visible in the audit surface even though it no
+        // longer blocks anything.
+        for sha in [&large_sha, &small_sha] {
+            assert_eq!(
+                markers_by_sha(&mut conn, sha).await,
+                vec![(
+                    VisualKind::Thumbnail.as_str().to_string(),
+                    "failed".to_string(),
+                    1,
+                    SKIP_AFTER_AMBIGUOUS
+                )],
+                "the decode is remembered for {sha}"
+            );
+        }
+        let rows = scan_error_rows(&mut conn).await;
+        assert_eq!(rows.len(), 2, "both failures are auditable: {rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| row.1 == STAGE_DECODE && row.2 == "input"),
+            "recorded as what they are: {rows:?}"
+        );
+        drop(conn);
+
+        // Run 2: still unconfirmed, so both are re-attempted exactly once more.
+        let (_, totals) = scan().await.unwrap();
+        assert_eq!(
+            (totals.visuals_suppressed, totals.known_bad),
+            (0, 0),
+            "an unconfirmed verdict is re-attempted, and an *indexed* file is \
+             never skipped by its own audit row"
+        );
+        assert_eq!(totals.unchanged_files, 2);
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        for sha in [&large_sha, &small_sha] {
+            assert_eq!(
+                markers_by_sha(&mut conn, sha).await[0].2,
+                2,
+                "the second run confirms the verdict for {sha}"
+            );
+        }
+        let rows = scan_error_rows(&mut conn).await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "a file that indexes fine every time does not spend its audit row"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| (row.3, row.4) == (2, SKIP_AFTER_AMBIGUOUS)),
+            "the row counts with the marker — the backfill decode confirms both \
+             halves or the audit surface says 'will retry' about a file nothing \
+             will retry: {rows:?}"
+        );
+        drop(conn);
+
+        // Run 3: confirmed. Nothing is opened, nothing is decoded, and the
+        // files stay in the index and stay available.
+        let (_, totals) = scan().await.unwrap();
+        assert_eq!(
+            (
+                totals.visuals_suppressed,
+                totals.known_bad,
+                totals.marked_unavailable,
+                totals.unchanged_files
+            ),
+            (2, 0, 0, 2)
+        );
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        for sha in [&large_sha, &small_sha] {
+            assert_eq!(
+                markers_by_sha(&mut conn, sha).await[0].2,
+                2,
+                "no further attempt was made for {sha}"
+            );
+        }
+        let available: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE available = 1")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(available, 2, "the files remain findable throughout");
+        let rows = scan_error_rows(&mut conn).await;
+        assert!(
+            rows.iter().all(|row| row.3 == 2),
+            "and once the marker suppresses, nothing decodes and nothing \
+             writes: {rows:?}"
+        );
+        drop(conn);
+
+        // Repairing one of them clears everything about it. Note *how*: the
+        // repair is new content under the same path, so it is a new sha256 —
+        // the old marker is not retired, it is orphaned (its content left the
+        // index) and belongs to the sweep, while the audit row is retired
+        // directly, by the moved bytes under the path that keys it. The mtime
+        // is set by hand because the walker's shortcut compares it and a
+        // rewrite inside the same clock tick would read as unchanged.
+        image::RgbImage::new(4900, 400).save(&large).unwrap();
+        let mtime = fs::metadata(&large).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&large)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_secs(10))
+            .unwrap();
+        // Through the service, not `scan()`: the orphan sweep runs in
+        // `rescan_folders`, after the scan and after the items without files
+        // are deleted, so the marker's disappearance is only observable from
+        // there.
+        FileScanService::new(
+            index_db.clone(),
+            user_data_db.clone(),
+            root.to_path_buf(),
+            ScanOptions { worker_count: 2 },
+        )
+        .rescan_folders()
+        .await
+        .unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        assert_eq!(thumbnail_count(&mut conn).await, 1);
+        let rows = scan_error_rows(&mut conn).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the still-broken file owes one: {rows:?}"
+        );
+        assert!(rows[0].0.ends_with("small.png"), "{rows:?}");
+        assert!(
+            markers_by_sha(&mut conn, &large_sha).await.is_empty(),
+            "the repaired file's old content left the index, so its marker is \
+             swept rather than kept for a sha256 nothing will ever ask about"
+        );
+        assert_eq!(
+            markers_by_sha(&mut conn, &small_sha).await.len(),
+            1,
+            "and the sweep discriminates: the file that is still broken keeps \
+             the marker that suppresses it"
+        );
+    }
+
+    /// A 64x64 PNG of noise truncated to `fraction` of its length: the header
+    /// survives (so the file is indexed with its real dimensions) and the pixel
+    /// data does not. Noise, not a flat colour, because a single-colour PNG
+    /// compresses to so few bytes that a prefix can still hold the whole image.
+    fn write_undecodable_png(path: &Path, fraction: f64) {
+        let mut noise = image::RgbImage::new(64, 64);
+        for (x, y, pixel) in noise.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x * 7 % 251) as u8,
+                (y * 13 % 241) as u8,
+                (x * y % 239) as u8,
+            ]);
+        }
+        noise.save(path).unwrap();
+        let bytes = fs::read(path).unwrap();
+        let keep = (bytes.len() as f64 * fraction) as usize;
+        fs::write(path, &bytes[..keep]).unwrap();
+    }
+
+    /// (path, attempts, last_modified, file_size) per ledger row.
+    async fn scan_error_keys(conn: &mut sqlx::SqliteConnection) -> Vec<(String, i64, String, i64)> {
+        sqlx::query_as(
+            "SELECT path, attempts, last_modified, file_size FROM scan_errors ORDER BY path",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
+    }
+
+    // The hazard an audit-only row exists to avoid, from the other side: the
+    // walker keeps every path it *failed* on out of unavailable-marking, or a
+    // file that is still on disk gets marked gone and then deleted. A `decode`
+    // row is not that kind of row — its file was walked, hashed and indexed
+    // like any other — so it must not put its path on the exclusion list, and
+    // above all must not make the scan treat the folder as partially seen.
+    //
+    // Asserted against a file that really did vanish in the same run, so the
+    // marking is proven to still work rather than merely to have been skipped.
+    #[tokio::test]
+    async fn an_audit_only_row_does_not_exclude_its_file_from_unavailable_marking() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        // Its own folder: the temp root is shared by every test in the process.
+        let media_dir = root.join("media-audit-unavailable");
+        fs::create_dir_all(&media_dir).unwrap();
+        let corrupt = media_dir.join("corrupt.png");
+        write_undecodable_png(&corrupt, 0.6);
+        let vanishing = media_dir.join("vanishing.png");
+        image::RgbImage::new(8, 8).save(&vanishing).unwrap();
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+        let scan = || {
+            execute_folder_scan(
+                &index_db,
+                &user_data_db,
+                &config,
+                &config.included_folders,
+                &[],
+                ScanOptions { worker_count: 2 },
+            )
+        };
+
+        let (_, totals) = scan().await.unwrap();
+        assert_eq!(totals.new_items, 2);
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let rows = scan_error_rows(&mut conn).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "one audit row, for the corrupt file: {rows:?}"
+        );
+        assert!(rows[0].0.ends_with("corrupt.png"), "{rows:?}");
+        drop(conn);
+
+        fs::remove_file(&vanishing).unwrap();
+        let (_, totals) = scan().await.unwrap();
+        assert_eq!(
+            (totals.marked_unavailable, totals.known_bad),
+            (1, 0),
+            "the file that is gone is marked, and the one with an audit row is \
+             walked normally rather than skipped"
+        );
+
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let files: Vec<(String, i64)> =
+            sqlx::query_as("SELECT path, available FROM files ORDER BY path")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(
+            files[0].0.ends_with("corrupt.png") && files[0].1 == 1,
+            "{files:?}"
+        );
+        assert!(
+            files[1].0.ends_with("vanishing.png") && files[1].1 == 0,
+            "{files:?}"
+        );
+        assert_eq!(
+            scan_error_rows(&mut conn).await.len(),
+            1,
+            "and the audit row is still there: nothing about the run spent it"
+        );
+    }
+
+    // The retry key does its job on an audit-only row too: the row describes
+    // *those* bytes, so a file whose content moved gets one row, not two, and
+    // its confirmations start over. Without the reset a file that is repeatedly
+    // re-saved and repeatedly broken would inherit a confirmation it never
+    // earned; without the single-row guarantee the ledger would grow a verdict
+    // per revision of every broken file.
+    #[tokio::test]
+    async fn a_changed_undecodable_image_replaces_its_audit_row() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        // Its own folder: the temp root is shared by every test in the process.
+        let media_dir = root.join("media-audit-rewritten");
+        fs::create_dir_all(&media_dir).unwrap();
+        let corrupt = media_dir.join("corrupt.png");
+        write_undecodable_png(&corrupt, 0.6);
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+        let scan = || {
+            execute_folder_scan(
+                &index_db,
+                &user_data_db,
+                &config,
+                &config.included_folders,
+                &[],
+                ScanOptions { worker_count: 2 },
+            )
+        };
+
+        scan().await.unwrap();
+        // Run 2 confirms it, so the reset below has something to undo.
+        scan().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let before = scan_error_keys(&mut conn).await;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1, 2, "confirmed against the original bytes");
+        drop(conn);
+
+        // Truncated further: still an undecodable image, but a different one.
+        // The mtime is set by hand because the walker's shortcut compares it
+        // and a rewrite inside the same clock tick would read as unchanged.
+        let bytes = fs::read(&corrupt).unwrap();
+        fs::write(&corrupt, &bytes[..bytes.len() * 8 / 10]).unwrap();
+        let mtime = fs::metadata(&corrupt).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&corrupt)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_secs(10))
+            .unwrap();
+        let (_, totals) = scan().await.unwrap();
+        assert_eq!(
+            (totals.modified_files, totals.known_bad),
+            (1, 0),
+            "moved bytes are re-attempted, whatever the row says"
+        );
+
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let after = scan_error_keys(&mut conn).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "one path still owes exactly one row: {after:?}"
+        );
+        assert_eq!(after[0].0, before[0].0);
+        assert_eq!(
+            after[0].1, 1,
+            "the confirmations were about bytes that are gone"
+        );
+        assert_eq!(
+            after[0].3,
+            fs::metadata(&corrupt).unwrap().len() as i64,
+            "and the row is keyed to what is on disk now"
+        );
+        assert_ne!(
+            (after[0].2.as_str(), after[0].3),
+            (before[0].2.as_str(), before[0].3),
+            "both halves of the retry key moved: {before:?} -> {after:?}"
+        );
     }
 
     // Markers for content that left the index are swept with the blobs — but
@@ -5624,7 +6416,6 @@ LIMIT 1
             &dir.path().join("audio-only.mp4"),
             "video/mp4",
             &meta(0, 10.0),
-            None,
         )
         .expect("a missing video track is not a failure");
         assert_eq!(produced.nothing, vec![VisualKind::Thumbnail, VisualKind::Frame]);
@@ -5634,7 +6425,7 @@ LIMIT 1
         // for the kind that could have existed.
         let plain = dir.path().join("notes.txt");
         fs::write(&plain, b"hello").unwrap();
-        let produced = build_new_item_thumbnails(&plain, "text/plain", &meta(0, 0.0), None)
+        let produced = build_new_item_thumbnails(&plain, "text/plain", &meta(0, 0.0))
             .expect("an unsupported type is not a failure");
         assert_eq!(produced.nothing, vec![VisualKind::Thumbnail]);
 
@@ -5642,7 +6433,7 @@ LIMIT 1
         // marker — the predicate already answers this without decoding.
         let small = dir.path().join("small.png");
         image::RgbImage::new(8, 8).save(&small).unwrap();
-        let produced = build_new_item_thumbnails(&small, "image/png", &meta(0, 0.0), None)
+        let produced = build_new_item_thumbnails(&small, "image/png", &meta(0, 0.0))
             .expect("a small image is not a failure");
         assert!(
             produced.nothing.is_empty() && produced.thumbnails.is_empty(),
@@ -5652,7 +6443,7 @@ LIMIT 1
         // And an image that does get a thumbnail concludes nothing at all.
         let large = dir.path().join("large.bmp");
         image::RgbImage::new(4900, 400).save(&large).unwrap();
-        let produced = build_new_item_thumbnails(&large, "image/bmp", &meta(0, 0.0), None).unwrap();
+        let produced = build_new_item_thumbnails(&large, "image/bmp", &meta(0, 0.0)).unwrap();
         assert!(produced.nothing.is_empty() && produced.thumbnails.len() == 1);
     }
 
@@ -5780,6 +6571,46 @@ LIMIT 1
             )))
             .is_empty()
         );
+
+        // The audit row on top of the marker, and only for the one class of
+        // visuals failure that used to keep a file out of the index: an image
+        // whose pixels do not decode. A PDF or a video failing the same way
+        // has always been indexed without visuals, so it is not news.
+        let audit = visuals_audit_failure("image/png", &VisualsError::image_decode(failure()))
+            .expect("an image decode failure owes an audit row");
+        assert_eq!(
+            (audit.stage, audit.kind, audit.skip_after),
+            (STAGE_DECODE, ApiErrorKind::Input, SKIP_AFTER_AMBIGUOUS)
+        );
+        assert!(
+            visuals_audit_failure("application/pdf", &VisualsError::image_decode(failure()))
+                .is_none(),
+            "the row asserts a mime type, so a non-image never gets one"
+        );
+        assert!(
+            visuals_audit_failure(
+                "image/png",
+                &VisualsError::image_decode(FileProcessError::Io("mount went away".to_string()))
+            )
+            .is_none(),
+            "a transient failure is no verdict to audit"
+        );
+        // And the distinction the *site* carries: an encode that failed on
+        // pixels which decoded fine is the generator's problem, not the file's.
+        // Sweeping it into a `decode` row would answer a decode-targeted retry
+        // directive and tell the audit surface the image is undecodable.
+        assert!(
+            visuals_audit_failure("image/png", &VisualsError::thumbnail(failure())).is_none(),
+            "an encode failure is marker-only, exactly like a PDF's"
+        );
+        assert_eq!(
+            failure_verdicts(&VisualsError::image_decode(failure()))
+                .into_iter()
+                .map(|verdict| verdict.kind)
+                .collect::<Vec<_>>(),
+            vec![VisualKind::Thumbnail],
+            "a decode failure still marks exactly what it invalidates"
+        );
     }
 
     // The classification is the whole taxonomy in one place: which failures
@@ -5813,10 +6644,26 @@ LIMIT 1
         );
         assert!(matches!(missing, FileProcessError::Io(_)));
 
-        // Bytes that were read fine and are not an image: the decoder's own
-        // verdict on the payload.
+        // Bytes that were read fine and describe no image at all: the metadata
+        // phase's own verdict on the payload, and the one image failure that
+        // still keeps a file out of the index. Settled at one attempt — no
+        // pixel data was touched, so there is nothing for a mid-read mount
+        // drop to be confused with.
         let garbage = dir.path().join("garbage.png");
         fs::write(&garbage, b"definitely not an image").unwrap();
+        let (stage, err) = image_header_dimensions(&garbage)
+            .err()
+            .expect("garbage has no parseable header");
+        assert_eq!(stage, ImageStage::Header);
+        let err = FileProcessError::from_image_error(stage, err);
+        let failure = err.classified().expect("a header failure is recorded");
+        assert_eq!(failure.stage, STAGE_HEADER);
+        assert_eq!(failure.kind, ApiErrorKind::Input);
+        assert_eq!(failure.skip_after, SKIP_AFTER_CONFIRMED);
+
+        // The decode stage still classifies as the ambiguous input class
+        // wherever it reaches the ledger: a decoder that reads as it goes
+        // cannot settle a verdict alone.
         let (stage, err) = open_image_staged(&garbage)
             .err()
             .expect("garbage must not decode");
@@ -5825,10 +6672,7 @@ LIMIT 1
         let failure = err.classified().expect("a decode failure is recorded");
         assert_eq!(failure.stage, STAGE_DECODE);
         assert_eq!(failure.kind, ApiErrorKind::Input);
-        assert_eq!(
-            failure.skip_after, SKIP_AFTER_AMBIGUOUS,
-            "a decoder that reads as it goes cannot settle a verdict alone"
-        );
+        assert_eq!(failure.skip_after, SKIP_AFTER_AMBIGUOUS);
 
         // The decode memory ceiling is a property of this machine's budget,
         // not of the file, so it is `resource` — clearable by a directive
@@ -5873,13 +6717,105 @@ LIMIT 1
         );
     }
 
-    // The reason the decode stage classifies by *where* rather than by which
-    // variant: a truncated but otherwise real image opens fine, sniffs fine,
-    // and then fails the decode as `ImageError::IoError` — the decoder asked
-    // for bytes that are not there. Classifying `IoError` as transient (the
-    // obvious reading) would have left every half-copied file in the library
-    // re-hashed and re-decoded on every scan forever, which is the exact case
-    // the ledger exists for.
+    // A PNG whose IHDR is well-formed and describes an image no machine will
+    // allocate. Only the header is written: nothing here ever gets as far as
+    // reading pixel data.
+    fn absurdly_wide_png(width: u32) -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for byte in bytes {
+                crc ^= *byte as u32;
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            png.extend_from_slice(&body);
+            png.extend_from_slice(&crc32(&body).to_be_bytes());
+        };
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&1u32.to_be_bytes());
+        // 8-bit RGB, no compression/filter/interlace variation: the smallest
+        // valid header the decoder will accept before it does the arithmetic.
+        header.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(b"IHDR", &header);
+        // The decoder reads on past IHDR before it answers, so the file has to
+        // be a whole (if contentless) PNG rather than a header alone, or it
+        // fails on EOF instead of on the arithmetic.
+        chunk(b"IDAT", &[]);
+        chunk(b"IEND", &[]);
+        png
+    }
+
+    // The header parse is not limit-free, whatever "no limits are set" suggests:
+    // not setting limits leaves the image crate's *defaults* in place, including
+    // a 512 MiB allocation cap — stricter than the configurable
+    // `image_decode_memory_limit_mb` the decode itself runs under. One row of a
+    // wide enough image exceeds it, so `into_dimensions` really can return
+    // `ImageError::Limits`.
+    //
+    // Which makes the classification load-bearing rather than theoretical: this
+    // is a verdict on *this machine's budget*, so it must be `resource` —
+    // clearable by a directive once the ceiling moves — and never `input`,
+    // which would file a perfectly good file under "corrupt" forever.
+    #[test]
+    fn a_header_limits_failure_is_a_resource_verdict() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let huge = dir.path().join("huge.png");
+        fs::write(&huge, absurdly_wide_png(200_000_000)).unwrap();
+
+        let (stage, err) = image_header_dimensions(&huge)
+            .err()
+            .expect("a 200-million-pixel row must not fit the default cap");
+        assert_eq!(stage, ImageStage::Header, "no pixel data was read: {err:?}");
+        assert!(
+            matches!(err, image::ImageError::Limits(_)),
+            "the header parse runs under the crate's default limits: {err:?}"
+        );
+        let failure = FileProcessError::from_image_error(stage, err)
+            .classified()
+            .cloned()
+            .expect("a limit failure is recorded");
+        assert_eq!(failure.stage, STAGE_HEADER);
+        assert_eq!(failure.kind, ApiErrorKind::Resource);
+        assert_eq!(failure.skip_after, SKIP_AFTER_CONFIRMED);
+
+        // The visuals twin classifies it the same way. It is unreachable in
+        // practice (a file that fails the header is never indexed, so no
+        // visuals pass runs on it), but the two classifiers are read as a pair
+        // and a silent divergence here is how the next stage split goes wrong.
+        let (stage, err) = image_header_dimensions(&huge).err().unwrap();
+        let visuals = FileProcessError::visuals_from_image_error(stage, err);
+        let failure = visuals
+            .visual_failure()
+            .expect("a limit failure is a verdict to mark");
+        assert_eq!(failure.kind, ApiErrorKind::Resource);
+        assert_eq!(failure.skip_after, SKIP_AFTER_CONFIRMED);
+    }
+
+    // The premise the whole un-fusing rests on: a truncated image's *header*
+    // is intact. It parses, it yields the real dimensions, and only the decode
+    // fails — so a file like this is indexed with its true size and simply has
+    // no visuals, instead of being rejected outright the way the fused decode
+    // rejected it (docs/failed-media-retry-design.md, "Scan policy for
+    // undecodable images"). This is also PIL's split, which is what makes the
+    // scan's gate no stricter than the pipeline's consumer.
+    //
+    // And the reason the decode stage classifies by *where* rather than by
+    // which variant: the failure surfaces as `ImageError::IoError` — the
+    // decoder asked for bytes that are not there. Reading that as transient
+    // (the obvious reading) would leave every half-copied file in the library
+    // re-decoded on every scan forever.
     #[test]
     fn a_truncated_image_is_a_decode_verdict_not_an_io_blip() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5900,6 +6836,13 @@ LIMIT 1
 
         let truncated = dir.path().join("truncated.png");
         fs::write(&truncated, &bytes[..bytes.len() * 6 / 10]).unwrap();
+
+        assert_eq!(
+            image_header_dimensions(&truncated).ok(),
+            Some((64, 64)),
+            "the header of a truncated file is intact, so the metadata phase \
+             indexes it with its real dimensions"
+        );
 
         let (stage, err) = open_image_staged(&truncated)
             .err()
@@ -6148,6 +7091,7 @@ LIMIT 1
                         file_size: 1,
                         attempts: 1,
                         skip_after: 1,
+                        stage: STAGE_HEADER.to_string(),
                     },
                 )
             })

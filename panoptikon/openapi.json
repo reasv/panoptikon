@@ -8629,7 +8629,7 @@
         "properties": {
           "active": {
             "type": "boolean",
-            "description": "`attempts >= skip_after`: the verdict is confirmed. Not the same as\n\"this path will be skipped\": the walker also requires the file to still\nhave the `last_modified`/`file_size` the failure was recorded against,\nso a file that has been repaired or otherwise modified since is\nre-attempted on the next scan even though this reads true."
+            "description": "`attempts >= skip_after`: the verdict is confirmed. Not the same as\n\"this path will be skipped\": the walker also requires the file to still\nhave the `last_modified`/`file_size` the failure was recorded against,\nso a file that has been repaired or otherwise modified since is\nre-attempted on the next scan even though this reads true.\n\nA `decode`-stage row never suppresses anything at any `attempts`: its\nfile *is* indexed (only the visuals failed), so the row is audit-only\nand retry scheduling is the visuals cache's, not this ledger's."
           },
           "attempts": {
             "type": "integer",
@@ -8683,7 +8683,7 @@
           },
           "stage": {
             "type": "string",
-            "description": "`mime`, `metadata` or `decode`."
+            "description": "`mime`, `metadata`, `header` or `decode`."
           }
         }
       },
