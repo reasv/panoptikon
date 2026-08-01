@@ -9,19 +9,15 @@ use serde::Serialize;
 /// (docs/failed-media-retry-design.md). The string form is persisted in the
 /// extraction/scan ledgers and appears in logs, so it is stable data rather
 /// than a display detail.
-// The classification sites live in the extraction and scan pipelines, which
-// land as later phases of the design; until then only the tests and the
-// ledger's own round-trip exercise the taxonomy. Every `allow(dead_code)` in
-// this file goes away with those phases.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Ord` so a job can aggregate the distinct blockers it hit in a `BTreeSet`
+/// and report them in a stable order; the ordering itself carries no meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Blocker {
     Pdfium,
     HtmlRenderer,
     Ffmpeg,
 }
 
-#[allow(dead_code)]
 impl Blocker {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -57,7 +53,6 @@ impl std::fmt::Display for Blocker {
 /// three explicit classes are the ones the ledgers store; unclassified always
 /// means transient, so the pipeline can never be stricter than the consumer
 /// that produced the verdict.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApiErrorKind {
     #[default]
@@ -66,10 +61,13 @@ pub enum ApiErrorKind {
     Blocked {
         blocker: Blocker,
     },
+    /// Constructed by the classified batch-1 OOM path of the GPU-compat work,
+    /// which lands with the worker-protocol phase; the ledger and the audit
+    /// surface already carry it.
+    #[allow(dead_code)]
     Resource,
 }
 
-#[allow(dead_code)]
 impl ApiErrorKind {
     /// The `error_class` value stored in the ledgers, or `None` for the
     /// transient class, which is never persisted.
@@ -99,21 +97,18 @@ pub const SKIP_AFTER_CONFIRMED: i64 = 1;
 /// own file I/O (ffmpeg/ffprobe/pdfium/the HTML renderer), where a corrupt
 /// file and a transient mount hiccup surface identically. Such a row needs a
 /// second failure, in a *later* run, before it suppresses anything.
-#[allow(dead_code)]
 pub const SKIP_AFTER_AMBIGUOUS: i64 = 2;
 
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     detail: String,
-    #[allow(dead_code)]
     kind: ApiErrorKind,
     /// Only meaningful for the persisted classes; see the two constants
     /// above. Carried on the error rather than derived from `kind` because
     /// the threshold is a property of the *classification site*, not of the
     /// class: an `input` verdict from an in-memory decode is confirmed at 1,
     /// the same class from an external tool's own read is not.
-    #[allow(dead_code)]
     skip_after: i64,
 }
 
@@ -147,7 +142,6 @@ impl ApiError {
 /// The classified half of the constructor set, kept in its own block so the
 /// `allow` covering the not-yet-wired phases cannot mask a genuinely dead
 /// constructor above.
-#[allow(dead_code)]
 impl ApiError {
     /// The pipeline's own decoder or tool rejected the payload. Defaults to
     /// the confirmed threshold, which is right for a decode of bytes the
@@ -171,24 +165,6 @@ impl ApiError {
             SKIP_AFTER_CONFIRMED,
             detail,
         )
-    }
-
-    /// The item individually exceeds a resource limit (classified batch-1
-    /// OOM, decode memory limit).
-    pub fn resource(detail: impl Into<String>) -> Self {
-        Self::classified(ApiErrorKind::Resource, SKIP_AFTER_CONFIRMED, detail)
-    }
-
-    /// Overrides the confirmation threshold of an already-classified error.
-    /// A threshold on a transient error is a caller bug: nothing persists it,
-    /// so the tuning silently does nothing.
-    pub fn with_skip_after(mut self, skip_after: i64) -> Self {
-        debug_assert!(
-            self.kind.persisted_class().is_some(),
-            "skip_after is meaningless on a transient error"
-        );
-        self.skip_after = skip_after;
-        self
     }
 
     pub fn kind(&self) -> ApiErrorKind {
@@ -223,6 +199,32 @@ impl ApiError {
             kind,
             skip_after,
         }
+    }
+}
+
+/// The two classification tools no gateway-native stage produces yet: the
+/// `resource` verdict comes from the GPU-compat batch-1 OOM path and
+/// `with_skip_after` from a site that needs a threshold its constructor does
+/// not imply. Both land with the worker-protocol phase; kept behind their own
+/// `allow` so the wired constructors above stay lint-covered.
+#[allow(dead_code)]
+impl ApiError {
+    /// The item individually exceeds a resource limit (classified batch-1
+    /// OOM, decode memory limit).
+    pub fn resource(detail: impl Into<String>) -> Self {
+        Self::classified(ApiErrorKind::Resource, SKIP_AFTER_CONFIRMED, detail)
+    }
+
+    /// Overrides the confirmation threshold of an already-classified error.
+    /// A threshold on a transient error is a caller bug: nothing persists it,
+    /// so the tuning silently does nothing.
+    pub fn with_skip_after(mut self, skip_after: i64) -> Self {
+        debug_assert!(
+            self.kind.persisted_class().is_some(),
+            "skip_after is meaningless on a transient error"
+        );
+        self.skip_after = skip_after;
+        self
     }
 }
 

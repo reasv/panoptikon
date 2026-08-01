@@ -198,17 +198,11 @@ pub(crate) enum IndexDbWriterMessage {
     /// ledger write systemic rather than input-side: the item task returns
     /// `Err`, so a DB outage can never soft-complete a job as "all corrupt
     /// media".
-    // Sent by the extraction/scan pipelines, a later phase of the same
-    // design; until then only the tests construct it. The allow is
-    // per-variant on purpose, so the pre-existing variants stay lint-covered.
-    #[allow(dead_code)]
     UpsertExtractionError {
         record: ExtractionErrorRecord,
         reply: Reply<()>,
     },
     /// Success path: the setter can process this item after all.
-    // See the note on `UpsertExtractionError`.
-    #[allow(dead_code)]
     DeleteExtractionError {
         item_sha256: String,
         setter_name: String,
@@ -216,8 +210,6 @@ pub(crate) enum IndexDbWriterMessage {
     },
     /// Auto-heal: clears the `blocked` rows of every dependency that now
     /// binds, so those items become selectable in the same run.
-    // See the note on `UpsertExtractionError`.
-    #[allow(dead_code)]
     ClearBlockedErrors {
         blockers: Vec<Blocker>,
         reply: Reply<u64>,
@@ -1917,15 +1909,16 @@ mod tests {
         .await
         .unwrap();
 
-        let active = {
+        let recorded = {
             let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
                 .await
                 .unwrap();
-            crate::db::extraction_errors::count_active_errors_for_setter(&mut conn, "test/tagger")
+            crate::db::extraction_errors::list_error_sha256s_for_setter(&mut conn, "test/tagger")
                 .await
                 .unwrap()
+                .len()
         };
-        assert_eq!(active, 1, "a blocked verdict suppresses its item at once");
+        assert_eq!(recorded, 1, "the writer's upsert reached the ledger");
 
         // A blocker that is still missing must not clear anything.
         let cleared = call_index_db_writer(&index_db, |reply| {

@@ -12,6 +12,11 @@ pub(crate) struct DataLogUpdate {
     pub other_files: i64,
     pub total_segments: i64,
     pub errors: i64,
+    /// The subset of `errors` the item's own media caused, each backed by an
+    /// `item_extraction_errors` row. The remainder is systemic, which is what
+    /// decides whether an all-failed job completes with a warning or hard
+    /// fails on the inference server.
+    pub input_errors: i64,
     pub total_remaining: i64,
     pub data_load_time: f64,
     pub inference_time: f64,
@@ -163,6 +168,7 @@ pub(crate) async fn update_data_log(
             other_files = ?,
             total_segments = ?,
             errors = ?,
+            input_errors = ?,
             total_remaining = ?,
             data_load_time = ?,
             inference_time = ?,
@@ -176,6 +182,7 @@ pub(crate) async fn update_data_log(
     .bind(update.other_files)
     .bind(update.total_segments)
     .bind(update.errors)
+    .bind(update.input_errors)
     .bind(update.total_remaining)
     .bind(update.data_load_time)
     .bind(update.inference_time)

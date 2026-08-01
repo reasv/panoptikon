@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use crate::api_error::ApiError;
 use crate::inferio_client::{InferenceFile, InferenceInput};
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
+use crate::jobs::files::stderr_tail;
 
 pub(super) async fn build_audio_tracks_inputs(
     item: &JobInputData,
@@ -102,10 +103,16 @@ fn load_audio_single(path: &str, sample_rate: u32) -> ApiResult<Vec<Vec<f32>>> {
             if !has_audio_stream(path)? {
                 return Ok(Vec::new());
             }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(ApiError::internal(format!("ffmpeg failed: {stderr}")))
+            // ffmpeg opened the file itself, so a corrupt track and a
+            // transient mount hiccup are indistinguishable: an unconfirmed
+            // payload verdict, which needs a second failing run to settle.
+            let stderr = stderr_tail(&output.stderr);
+            Err(ApiError::input_unconfirmed(format!(
+                "ffmpeg failed to decode audio from {path}: {stderr}"
+            )))
         }
-        Err(err) => Err(ApiError::internal(format!("ffmpeg failed: {err}"))),
+        // A spawn failure is never a verdict on the media.
+        Err(err) => Err(crate::media_tools::spawn_error("ffmpeg", &err)),
     }
 }
 
@@ -119,16 +126,26 @@ fn has_audio_stream(path: &str) -> ApiResult<bool> {
         .arg("json")
         .arg(path)
         .output()
-        .map_err(|err| ApiError::internal(format!("ffprobe failed: {err}")))?;
+        .map_err(|err| crate::media_tools::spawn_error("ffprobe", &err))?;
     // ffprobe failing is not the same as "no audio stream": a corrupt file or
     // a transient read error (e.g. an SMB hiccup) must fail the item so it is
-    // retried, not permanently marked processed with a placeholder.
+    // retried, not permanently marked processed with a placeholder. Which of
+    // the two it was cannot be told apart here, hence the unconfirmed
+    // threshold rather than a class.
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ApiError::internal(format!("ffprobe failed: {stderr}")));
+        let stderr = stderr_tail(&output.stderr);
+        return Err(ApiError::input_unconfirmed(format!(
+            "ffprobe failed on {path}: {stderr}"
+        )));
     }
-    let value: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| ApiError::internal(format!("ffprobe output unparseable: {err}")))?;
+    // Exit 0 with stdout we cannot parse is not a verdict about the file:
+    // ffprobe read it fine and something on *our* side of the pipe went wrong
+    // (a truncated read, a version whose `-of json` shape we do not
+    // understand). Transient, so the item is retried rather than suppressed.
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|err| {
+        tracing::error!(error = %err, path, "ffprobe output is unparseable");
+        ApiError::internal(format!("ffprobe output for {path} is unparseable: {err}"))
+    })?;
     let streams = value
         .get("streams")
         .and_then(Value::as_array)

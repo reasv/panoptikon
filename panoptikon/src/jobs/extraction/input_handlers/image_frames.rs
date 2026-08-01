@@ -5,7 +5,7 @@ use image::codecs::gif::GifDecoder;
 use image::{DynamicImage, GenericImageView};
 use serde_json::{Value, json};
 
-use crate::api_error::ApiError;
+use crate::api_error::{ApiError, Blocker};
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::open_index_db_read_no_user_data;
 use crate::db::storage::{StoredImage, get_frames_bytes};
@@ -122,13 +122,25 @@ pub(super) async fn load_base_frames(
         if !cached.is_empty() {
             return Ok(cached.into_iter().map(BaseFrame::sized_by_item).collect());
         }
-        if item.duration.unwrap_or(0.0) > 0.0 && item.video_tracks.unwrap_or(0) > 0 {
+        let duration = item.duration.unwrap_or(0.0);
+        if duration > 0.0 && item.video_tracks.unwrap_or(0) > 0 {
             let extracted = tokio::task::spawn_blocking({
                 let path = item.path.clone();
-                move || extract_video_frames(&path, 4)
+                move || extract_video_frames(&path, 4, duration)
             })
             .await
             .map_err(|_| ApiError::internal("Failed to extract frames"))??;
+            // No frames to store: skip straight to the empty-inputs
+            // placeholder rather than calling the writer. Storing an empty set
+            // is not *wrong* (`store_frames` deletes and inserts nothing, and
+            // the read side treats zero rows as "not cached"), but it costs a
+            // writer transaction that unconditionally bumps the search-cache
+            // epoch, and its DELETE (`WHERE item_sha256 = ? AND version <= ?`)
+            // could race a concurrent scan that just stored real frames for
+            // this item.
+            if extracted.is_empty() {
+                return Ok(Vec::new());
+            }
             let frames = extracted
                 .iter()
                 .map(encode_jpeg)
@@ -169,17 +181,23 @@ pub(super) async fn load_base_frames(
 /// header cannot even be parsed, without decoding pixel data. Without this,
 /// a corrupt file reaches the inference server where it can fail an entire
 /// coalesced GPU batch instead of just this item.
+///
+/// The bytes were read successfully by the gateway, so a parse failure here
+/// is unambiguously a verdict on the payload (`input`, confirmed at one
+/// attempt). Deliberately still *only* a header parse: fully decoding a still
+/// image would make the gateway stricter than the PIL consumer that actually
+/// arbitrates it (docs/failed-media-retry-design.md, arbiter principle).
 fn ensure_image_readable(buffer: &[u8], path: &str) -> ApiResult<()> {
     image::ImageReader::new(std::io::Cursor::new(buffer))
         .with_guessed_format()
         .map_err(|err| {
             tracing::error!(error = %err, path, "image format detection failed");
-            ApiError::internal(format!("Image {path} is not readable"))
+            ApiError::input(format!("Image {path} has an unrecognizable format: {err}"))
         })?
         .into_dimensions()
         .map_err(|err| {
             tracing::error!(error = %err, path, "image is not readable");
-            ApiError::internal(format!("Image {path} is not readable"))
+            ApiError::input(format!("Image {path} has an unreadable header: {err}"))
         })?;
     Ok(())
 }
@@ -418,27 +436,32 @@ fn encode_jpeg(image: &DynamicImage) -> ApiResult<Vec<u8>> {
 }
 
 fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
+    // The read itself is the gateway's own I/O: a vanished file or an SMB
+    // hiccup says nothing about the payload, so it stays transient.
     let buffer = std::fs::read(path).map_err(|err| {
-        tracing::error!(error = %err, "failed to open gif");
-        ApiError::internal("Failed to open gif")
+        tracing::error!(error = %err, path, "failed to open gif");
+        ApiError::internal(format!("Failed to open gif {path}: {err}"))
     })?;
+    // Everything below decodes bytes already in memory, so every failure is a
+    // confirmed verdict on the payload.
+    //
     // Files are routed here by extension-derived mime type; a mis-named
     // non-GIF (which PIL decoded regardless of extension) is handled as a
     // single still frame instead of failing the item.
     if !matches!(image::guess_format(&buffer), Ok(image::ImageFormat::Gif)) {
         let image = crate::jobs::files::decode_image_bytes(&buffer).map_err(|err| {
             tracing::error!(error = %err, path, "failed to decode mis-named gif");
-            ApiError::internal("Failed to decode gif")
+            ApiError::input(format!("Failed to decode mis-named gif {path}: {err}"))
         })?;
         return Ok(vec![BaseFrame::sized_by_item(encode_jpeg(&image)?)]);
     }
     let decoder = GifDecoder::new(std::io::Cursor::new(&buffer)).map_err(|err| {
-        tracing::error!(error = %err, "failed to decode gif");
-        ApiError::internal("Failed to decode gif")
+        tracing::error!(error = %err, path, "failed to decode gif");
+        ApiError::input(format!("Failed to decode gif {path}: {err}"))
     })?;
     let frames = decoder.into_frames().collect_frames().map_err(|err| {
-        tracing::error!(error = %err, "failed to collect gif frames");
-        ApiError::internal("Failed to decode gif")
+        tracing::error!(error = %err, path, "failed to collect gif frames");
+        ApiError::input(format!("Failed to collect gif frames of {path}: {err}"))
     })?;
     if frames.is_empty() {
         return Ok(Vec::new());
@@ -459,13 +482,19 @@ fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     Ok(output)
 }
 
-fn extract_video_frames(path: &str, num_frames: usize) -> ApiResult<Vec<DynamicImage>> {
-    let duration = probe_duration(path)?;
-    // The caller already checked the DB-recorded duration; a zero here means
-    // the file on disk disagrees (truncated or corrupt). Fail the item so it
-    // is retried instead of being permanently marked processed as "no data".
+/// `duration` comes from the item's own `items` row, exactly like the
+/// scan-side extractor (`jobs::files::extract_video_frames`) takes it. It
+/// cannot be stale: any change to the file's content yields a new sha256 and
+/// therefore a new item, so re-probing it here would only buy an extra ffprobe
+/// spawn per uncached video. The caller already gates on a positive duration;
+/// the guard below mirrors the scan side rather than relying on that.
+fn extract_video_frames(
+    path: &str,
+    num_frames: usize,
+    duration: f64,
+) -> ApiResult<Vec<DynamicImage>> {
     if duration <= 0.0 {
-        return Err(ApiError::internal("Video has no probeable duration"));
+        return Ok(Vec::new());
     }
     let interval = duration / num_frames as f64;
     let temp_dir = temp_dir_path();
@@ -501,16 +530,18 @@ fn extract_video_frames_into(
         .stdout(std::process::Stdio::null())
         .output()
         .map_err(|err| {
-            tracing::error!(error = %err, "ffmpeg failed");
-            ApiError::internal("Failed to extract frames")
+            tracing::error!(error = %err, path, "ffmpeg failed to start");
+            crate::media_tools::spawn_error("ffmpeg", &err)
         })?;
     if !output.status.success() {
-        tracing::error!(
-            path,
-            stderr = %stderr_tail(&output.stderr),
-            "ffmpeg failed to extract frames"
-        );
-        return Err(ApiError::internal("ffmpeg failed to extract frames"));
+        let stderr = stderr_tail(&output.stderr);
+        tracing::error!(path, stderr = %stderr, "ffmpeg failed to extract frames");
+        // ffmpeg opened the file itself, so a corrupt video and a transient
+        // mount hiccup look identical here; the ambiguous threshold is what
+        // keeps a single NAS blip from suppressing a healthy file.
+        return Err(ApiError::input_unconfirmed(format!(
+            "ffmpeg failed to extract frames from {path}: {stderr}"
+        )));
     }
     let mut paths = std::fs::read_dir(temp_dir)
         .map_err(|err| ApiError::internal(format!("Failed to read frames: {err}")))?
@@ -529,30 +560,6 @@ fn extract_video_frames_into(
         frames.push(image);
     }
     Ok(frames)
-}
-
-fn probe_duration(path: &str) -> ApiResult<f64> {
-    let output = std::process::Command::new(crate::media_tools::ffprobe())
-        .arg("-v")
-        .arg("error")
-        .arg("-show_entries")
-        .arg("format=duration")
-        .arg("-of")
-        .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(path)
-        .output()
-        .map_err(|err| {
-            tracing::error!(error = %err, "ffprobe failed");
-            ApiError::internal("Failed to probe video")
-        })?;
-    if !output.status.success() {
-        return Err(ApiError::internal("ffprobe failed"));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.trim().parse::<f64>().map_err(|err| {
-        tracing::error!(error = %err, "failed to parse duration");
-        ApiError::internal("Failed to probe video")
-    })
 }
 
 fn temp_dir_path() -> PathBuf {
@@ -574,9 +581,10 @@ fn temp_dir_path() -> PathBuf {
 }
 
 /// Renders every PDF page natively via the shared pdfium binding (same
-/// library the scan pipeline uses for thumbnails). Any failure — including
-/// pdfium not being installed — is an error so the item is recorded as
-/// failed and retried on the next run, never silently marked processed.
+/// library the scan pipeline uses for thumbnails). Both failure modes are
+/// classified: a missing pdfium blocks the item until the library appears,
+/// and a document pdfium rejects is a payload verdict — unconfirmed, because
+/// pdfium read the file itself.
 async fn render_pdf_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     let owned = path.to_string();
     let pages = tokio::task::spawn_blocking(move || {
@@ -586,7 +594,15 @@ async fn render_pdf_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     .map_err(|_| ApiError::internal("PDF render task failed"))?
     .map_err(|err| {
         tracing::error!(error = %err, path, "failed to render PDF");
-        ApiError::internal("Failed to render PDF")
+        match err {
+            crate::jobs::files::PdfRenderError::Unavailable => ApiError::blocked(
+                Blocker::Pdfium,
+                format!("pdfium is not available to render {path}"),
+            ),
+            crate::jobs::files::PdfRenderError::Document(detail) => {
+                ApiError::input_unconfirmed(format!("Failed to render PDF {path}: {detail}"))
+            }
+        }
     })?;
     let mut frames = Vec::with_capacity(pages.len());
     for page in pages {
@@ -601,18 +617,30 @@ async fn render_pdf_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
 
 /// Renders an HTML file via the shared headless-browser screenshot path used
 /// by the scan pipeline (replacing the Python weasyprint HTML->PDF chain).
-/// Failure — including no browser being installed — is an error so the item
-/// is recorded as failed and retried, never silently marked processed.
+/// Uses the classified variant: no browser blocks the item until one is
+/// installed, a render failure is an unconfirmed payload verdict, and the
+/// gateway's own I/O around the render stays transient.
 async fn render_html_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     let owned = path.to_string();
     let shot = tokio::task::spawn_blocking(move || {
-        crate::jobs::files::render_html_screenshot(std::path::Path::new(&owned))
+        crate::jobs::files::render_html_screenshot_classified(std::path::Path::new(&owned))
     })
     .await
     .map_err(|_| ApiError::internal("HTML render task failed"))?
-    .ok_or_else(|| {
-        tracing::error!(path, "failed to render HTML page");
-        ApiError::internal("Failed to render HTML page")
+    .map_err(|err| {
+        tracing::error!(error = %err, path, "failed to render HTML page");
+        match err {
+            crate::jobs::files::HtmlRenderError::NoBrowser => ApiError::blocked(
+                Blocker::HtmlRenderer,
+                format!("no headless browser is available to render {path}"),
+            ),
+            crate::jobs::files::HtmlRenderError::Io(detail) => {
+                ApiError::internal(format!("Failed to render HTML page {path}: {detail}"))
+            }
+            crate::jobs::files::HtmlRenderError::Render(detail) => {
+                ApiError::input_unconfirmed(format!("Failed to render HTML page {path}: {detail}"))
+            }
+        }
     })?;
     Ok(vec![BaseFrame {
         width: Some(shot.width() as i64),

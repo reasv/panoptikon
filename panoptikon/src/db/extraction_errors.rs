@@ -16,12 +16,6 @@
 //! `input` on one pass and `resource` on the next would never reach
 //! `skip_after` and would be retried forever).
 
-// The consumers — the extraction and scan pipelines, the blocked auto-heal
-// probe, and the failures API — are later phases of the same design, so for
-// now only the tests and the writer actor exercise this module. Remove with
-// the last of those phases.
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 
 use sqlx::Row;
@@ -42,10 +36,15 @@ pub(crate) const STAGE_INFERENCE: &str = "inference";
 /// their dependency binds.
 pub(crate) const CLASS_BLOCKED: &str = "blocked";
 
-/// `error_class` of a payload the pipeline's own decoder rejected.
+/// `error_class` of a payload the pipeline's own decoder rejected. Only a
+/// *reader* needs the constant (writers derive the class from the
+/// [`ApiErrorKind`]), so it stays unused until the failures API lands.
+#[allow(dead_code)]
 pub(crate) const CLASS_INPUT: &str = "input";
 
-/// `error_class` of an item that individually blew a resource limit.
+/// `error_class` of an item that individually blew a resource limit. Reader
+/// only, like [`CLASS_INPUT`]; lands with the failures API.
+#[allow(dead_code)]
 pub(crate) const CLASS_RESOURCE: &str = "resource";
 
 /// The `error` column is an audit string, never matched on. A worker traceback
@@ -252,41 +251,63 @@ pub(crate) async fn list_distinct_blockers(
         .collect())
 }
 
-/// How many of a setter's ledger rows are *active*, i.e. already suppress
-/// their item (`attempts >= skip_after`). Zero is the normal answer, and it is
-/// what lets the success path skip its delete entirely.
-pub(crate) async fn count_active_errors_for_setter(
+/// Every item sha256 this setter currently has a ledger row for, active or
+/// not. Read once at job start; the success path then deletes only for the
+/// items actually in the set, so a healthy library pays no writer round-trip
+/// (and no search-cache epoch bump) per successful item.
+///
+/// Normally tiny — the empty set is the common answer, and even a bad library
+/// has orders of magnitude fewer failures than items — so materializing it is
+/// cheaper than the per-item delete a plain "are there any rows?" boolean
+/// would force onto every success as soon as one sub-threshold row exists.
+///
+/// Deliberately not restricted to active rows (`attempts >= skip_after`): the
+/// work query already excludes every item whose verdict is active, so the only
+/// rows a successful item can ever own are the sub-threshold ones — exactly
+/// the rows an active-only query ignores. Gating the success-path delete on an
+/// active set would leave an unconfirmed row (one transient SMB blip) in place
+/// forever, and a second blip months later would suppress a healthy file
+/// permanently.
+pub(crate) async fn list_error_sha256s_for_setter(
     conn: &mut sqlx::SqliteConnection,
     setter_name: &str,
-) -> ApiResult<i64> {
-    let count: i64 = sqlx::query_scalar(
+) -> ApiResult<std::collections::HashSet<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
         r#"
-        SELECT COUNT(*)
+        SELECT items.sha256
         FROM item_extraction_errors
         JOIN setters ON setters.id = item_extraction_errors.setter_id
+        JOIN items ON items.id = item_extraction_errors.item_id
         WHERE setters.name = ?
-          AND item_extraction_errors.attempts >= item_extraction_errors.skip_after
         "#,
     )
     .bind(setter_name)
-    .fetch_one(&mut *conn)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|err| {
-        tracing::error!(error = %err, "failed to count extraction errors for setter");
+        tracing::error!(error = %err, "failed to list extraction errors for setter");
         ApiError::internal("Failed to read extraction failures")
     })?;
-    Ok(count)
+    Ok(rows.into_iter().collect())
 }
 
+// Everything from here to the end of the module is the *audit half* — the
+// list query, its filters, its row type and their helpers. Nothing in the
+// pipeline consumes it; it lands with the failures API and these `allow`s go
+// with that phase. The pipeline half above stays lint-covered.
+
 /// Default page size when the caller does not ask for one.
+#[allow(dead_code)]
 const DEFAULT_LIST_LIMIT: i64 = 100;
 
 /// Hard cap on the page size: the audit list joins two tables per row and is
 /// served to a UI, so an unbounded page is never what the caller wanted.
+#[allow(dead_code)]
 const MAX_LIST_LIMIT: i64 = 1000;
 
 /// Audit filters. Every field is independently optional, matching the retry
 /// directives' targeting (class, stage, mime prefix, setter).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExtractionErrorFilters {
     pub setter: Option<String>,
@@ -305,6 +326,7 @@ pub(crate) struct ExtractionErrorFilters {
 }
 
 /// One audit row: the ledger joined with its item.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct ExtractionErrorRow {
     pub id: i64,
@@ -324,6 +346,7 @@ pub(crate) struct ExtractionErrorRow {
 }
 
 /// Lists failures for the audit surface, newest first.
+#[allow(dead_code)]
 pub(crate) async fn list_extraction_errors(
     conn: &mut sqlx::SqliteConnection,
     filters: &ExtractionErrorFilters,
@@ -442,6 +465,7 @@ pub(crate) async fn list_extraction_errors(
     Ok(results)
 }
 
+#[allow(dead_code)]
 fn read_column<'r, T>(row: &'r sqlx::sqlite::SqliteRow, column: &str) -> ApiResult<T>
 where
     T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
@@ -457,6 +481,7 @@ where
 /// so the fallbacks below (an all-`0xFF` prefix, or an increment that lands
 /// mid-UTF-8) are unreachable in practice; they degrade to "no upper bound"
 /// rather than to a wrong answer.
+#[allow(dead_code)]
 fn mime_prefix_upper_bound(prefix: &str) -> Option<String> {
     let mut bytes = prefix.as_bytes().to_vec();
     while let Some(last) = bytes.pop() {
@@ -919,10 +944,14 @@ mod tests {
         assert_eq!(count(conn).await, 2, "the input verdict is untouched");
     }
 
-    // Active = already suppressing its item. A `skip_after 2` row on its first
-    // attempt is recorded but not yet acting.
+    // The success-path gate lists *every* row of the setter, not the active
+    // ones. Items with an active row are already excluded from the work query
+    // and can never reach the success path, so an active-only query would be
+    // blind to exactly the rows a success is able to clear: the sub-threshold
+    // one an SMB blip left behind. The set is per-sha256 so a success only
+    // pays for a delete when its own item owes a row.
     #[tokio::test]
-    async fn active_count_respects_the_confirmation_threshold() {
+    async fn error_sha_set_includes_the_rows_that_do_not_suppress_yet() {
         let mut dbs = setup_test_databases().await;
         let conn = &mut dbs.index_conn;
         seed(conn).await;
@@ -930,27 +959,34 @@ mod tests {
         let mut ambiguous = record("sha_two", ApiErrorKind::Input, Some(1));
         ambiguous.skip_after = 2;
         upsert_extraction_error(conn, &ambiguous).await.unwrap();
-        assert_eq!(
-            count_active_errors_for_setter(conn, "test/clip")
-                .await
-                .unwrap(),
-            0,
-            "one failure does not settle an ambiguous verdict"
+        let shas = list_error_sha256s_for_setter(conn, "test/clip")
+            .await
+            .unwrap();
+        assert!(
+            shas.contains("sha_two"),
+            "an unconfirmed row still has to be clearable on success"
         );
+        assert!(
+            !shas.contains("sha_one"),
+            "an item with no row must not trigger a delete"
+        );
+        assert_eq!(shas.len(), 1);
 
+        // Confirming it changes nothing about the set.
         ambiguous.job_id = Some(2);
         upsert_extraction_error(conn, &ambiguous).await.unwrap();
-        assert_eq!(
-            count_active_errors_for_setter(conn, "test/clip")
+        let shas = list_error_sha256s_for_setter(conn, "test/clip")
+            .await
+            .unwrap();
+        assert_eq!(shas.len(), 1);
+        assert!(shas.contains("sha_two"));
+
+        // Still scoped to the setter.
+        assert!(
+            list_error_sha256s_for_setter(conn, "test/tagger")
                 .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            count_active_errors_for_setter(conn, "test/tagger")
-                .await
-                .unwrap(),
-            0
+                .unwrap()
+                .is_empty()
         );
     }
 

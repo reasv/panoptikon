@@ -2319,26 +2319,60 @@ fn render_pdf_first_page(path: &Path) -> Option<DynamicImage> {
     }
 }
 
+/// Why a PDF render failed. The distinction is the whole point: a missing
+/// pdfium is a `blocked` verdict that self-heals once the library appears,
+/// while a document pdfium refuses to parse is an `input` verdict on the file
+/// (docs/failed-media-retry-design.md). Callers classify by variant — never
+/// by matching the message.
+#[derive(Debug)]
+pub(crate) enum PdfRenderError {
+    /// The pdfium library is not installed (or could not be bound).
+    Unavailable,
+    /// pdfium ran and rejected the document.
+    Document(String),
+}
+
+impl std::fmt::Display for PdfRenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PdfRenderError::Unavailable => f.write_str("pdfium library not available"),
+            PdfRenderError::Document(detail) => f.write_str(detail),
+        }
+    }
+}
+
 /// Renders every page of a PDF at 2x its point size (144 dpi), matching the
 /// Python pypdfium2 loader used by data extraction (`scale=2`). Unlike
 /// thumbnail generation this fails hard: extraction must record the item as
-/// failed (and retry it next run) rather than mark it processed.
-pub(crate) fn render_pdf_pages(path: &Path) -> Result<Vec<DynamicImage>, String> {
-    let pdfium = pdfium().ok_or_else(|| "pdfium library not available".to_string())?;
+/// failed rather than mark it processed.
+pub(crate) fn render_pdf_pages(path: &Path) -> Result<Vec<DynamicImage>, PdfRenderError> {
+    let pdfium = pdfium().ok_or(PdfRenderError::Unavailable)?;
     let _serialized = PDFIUM_CALL_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let document = pdfium
         .load_pdf_from_file(path, None)
-        .map_err(|err| format!("failed to load PDF: {err}"))?;
+        .map_err(|err| PdfRenderError::Document(format!("failed to load PDF: {err}")))?;
     let mut pages = Vec::new();
     for page in document.pages().iter() {
         let bitmap = page
             .render_with_config(&PdfRenderConfig::new().scale_page_by_factor(2.0))
-            .map_err(|err| format!("failed to render PDF page: {err}"))?;
+            .map_err(|err| PdfRenderError::Document(format!("failed to render PDF page: {err}")))?;
         pages.push(bitmap.as_image());
     }
     Ok(pages)
+}
+
+/// Whether a dependency the extraction/scan ledger is waiting on now binds.
+/// Only the blockers with rows in the ledger are probed, so a run never loads
+/// a library it has no use for. The backends are cached in `OnceLock`s, so a
+/// dependency installed while the gateway runs is seen at the next restart.
+pub(crate) fn probe_blocker(blocker: crate::api_error::Blocker) -> bool {
+    match blocker {
+        crate::api_error::Blocker::Pdfium => pdfium().is_some(),
+        crate::api_error::Blocker::HtmlRenderer => html_renderer().is_some(),
+        crate::api_error::Blocker::Ffmpeg => crate::media_tools::ffmpeg_available(),
+    }
 }
 
 static HTML_RENDERER: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -2445,13 +2479,48 @@ impl Drop for BlockingSemaphoreGuard<'_> {
     }
 }
 
+/// Why an HTML screenshot failed, for callers that classify. Same split as
+/// [`PdfRenderError`]: a missing browser is `blocked` and self-heals, a
+/// browser that ran and produced nothing usable is an `input` verdict on the
+/// page, and the gateway's own I/O around the render is transient.
+#[derive(Debug)]
+pub(crate) enum HtmlRenderError {
+    /// No headless browser is installed (or the configured one is gone).
+    NoBrowser,
+    /// The gateway's own file handling failed (canonicalize, temp dir).
+    Io(String),
+    /// The browser ran and did not produce a usable screenshot.
+    Render(String),
+}
+
+impl std::fmt::Display for HtmlRenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HtmlRenderError::NoBrowser => f.write_str("no headless browser available"),
+            HtmlRenderError::Io(detail) | HtmlRenderError::Render(detail) => f.write_str(detail),
+        }
+    }
+}
+
 /// Screenshots an HTML file with a locally installed headless browser. This
 /// intentionally replaces the Python weasyprint HTML->PDF pipeline with a
 /// browser viewport capture. Never fails hard: any error degrades to None.
-/// (Extraction callers treat None as an item failure so the item is retried.)
+/// The scan's thumbnail path wants exactly that; extraction calls
+/// [`render_html_screenshot_classified`] instead, which keeps the reason.
 pub(crate) fn render_html_screenshot(path: &Path) -> Option<DynamicImage> {
-    let browser = html_renderer()?;
-    let url = html_file_url(path)?;
+    render_html_screenshot_classified(path).ok()
+}
+
+/// The same render, with the failure reason preserved so the extraction
+/// ledger can tell "install a browser" apart from "this page cannot be
+/// rendered".
+pub(crate) fn render_html_screenshot_classified(
+    path: &Path,
+) -> Result<DynamicImage, HtmlRenderError> {
+    let browser = html_renderer().ok_or(HtmlRenderError::NoBrowser)?;
+    let url = html_file_url(path).ok_or_else(|| {
+        HtmlRenderError::Io(format!("failed to build a file URL for {}", path.display()))
+    })?;
     let _slot = BROWSER_SLOTS.acquire();
     let temp_dir = temp_dir_path();
     // The browser resolves its path arguments itself, so they must not
@@ -2459,14 +2528,18 @@ pub(crate) fn render_html_screenshot(path: &Path) -> Option<DynamicImage> {
     let temp_dir = if temp_dir.is_absolute() {
         temp_dir
     } else {
-        env::current_dir().ok()?.join(temp_dir)
+        env::current_dir()
+            .map_err(|err| HtmlRenderError::Io(format!("no working directory: {err}")))?
+            .join(temp_dir)
     };
     // Headless browsers refuse to share a live profile; give each render its
     // own throwaway --user-data-dir.
     let profile_dir = temp_dir.join("profile");
     if let Err(err) = fs::create_dir_all(&profile_dir) {
         tracing::error!(error = %err, path = %profile_dir.display(), "failed to create temp screenshot dir");
-        return None;
+        return Err(HtmlRenderError::Io(format!(
+            "failed to create the temp screenshot dir: {err}"
+        )));
     }
     let screenshot = temp_dir.join("shot.png");
     // A leftover file here (crashed previous run, reused directory) would
@@ -2486,7 +2559,7 @@ fn run_html_screenshot(
     profile_dir: &Path,
     screenshot: &Path,
     path: &Path,
-) -> Option<DynamicImage> {
+) -> Result<DynamicImage, HtmlRenderError> {
     // Scanned HTML lives in user-approved folders, but a saved page can still
     // carry live script and remote references, so all network traffic
     // (including localhost, via the <-loopback> bypass override) is routed
@@ -2519,7 +2592,13 @@ fn run_html_screenshot(
         Ok(child) => child,
         Err(err) => {
             tracing::error!(error = %err, browser = %browser.display(), "failed to launch headless browser");
-            return None;
+            // A browser that resolved at discovery time but is gone at spawn
+            // time is the dependency being missing, not a bad page.
+            return Err(if err.kind() == std::io::ErrorKind::NotFound {
+                HtmlRenderError::NoBrowser
+            } else {
+                HtmlRenderError::Render(format!("failed to launch the headless browser: {err}"))
+            });
         }
     };
     // Chromium is a process tree, and on Windows msedge.exe is a launcher
@@ -2539,19 +2618,25 @@ fn run_html_screenshot(
                     let _ = child.kill();
                     let _ = child.wait();
                     tracing::error!(path = %path.display(), "headless browser timed out rendering HTML");
-                    return None;
+                    return Err(HtmlRenderError::Render(
+                        "the headless browser timed out rendering the page".to_string(),
+                    ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(err) => {
                 tracing::error!(error = %err, path = %path.display(), "failed to wait for headless browser");
-                return None;
+                return Err(HtmlRenderError::Render(format!(
+                    "failed to wait for the headless browser: {err}"
+                )));
             }
         }
     };
     if !status.success() {
         tracing::error!(status = %status, path = %path.display(), "headless browser exited with an error");
-        return None;
+        return Err(HtmlRenderError::Render(format!(
+            "the headless browser exited with {status}"
+        )));
     }
     // On Windows the spawned executable can be a launcher that exits at once
     // while a detached browser process writes the screenshot, so poll until
@@ -2560,13 +2645,16 @@ fn run_html_screenshot(
     let mut last_err = None;
     while Instant::now() < deadline {
         match open_image(screenshot) {
-            Ok(image) => return Some(image),
+            Ok(image) => return Ok(image),
             Err(err) => last_err = Some(err),
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     tracing::error!(error = ?last_err, path = %path.display(), "failed to read HTML screenshot");
-    None
+    Err(HtmlRenderError::Render(match last_err {
+        Some(err) => format!("the headless browser produced no readable screenshot: {err}"),
+        None => "the headless browser produced no screenshot".to_string(),
+    }))
 }
 
 static LABEL_FONT: OnceLock<Option<FontVec>> = OnceLock::new();

@@ -217,6 +217,7 @@ impl Modify for JsonValueSchema {
             crate::pql::model::InBookmarks,
             crate::pql::model::InBookmarksArgs,
             crate::pql::model::ProcessedBy,
+            crate::pql::model::FailedFor,
             crate::pql::model::HasUnprocessedData,
             crate::pql::model::DerivedDataArgs,
             crate::pql::model::SemanticTextSearch,

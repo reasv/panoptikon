@@ -10,23 +10,26 @@ use sqlx::{
 };
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::api_error::ApiError;
+use crate::api_error::{ApiError, Blocker};
+use crate::db::extraction_errors::{
+    ExtractionErrorRecord, list_distinct_blockers, list_error_sha256s_for_setter,
+};
 use crate::db::extraction_write::{DataLogUpdate, get_setter_data_types};
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::items::get_existing_file_for_item_id;
-use crate::db::open_index_db_read;
 use crate::db::pql::run_compiled_count;
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
+use crate::db::{open_index_db_read, open_index_db_read_no_user_data};
 use crate::inferio_client::{InferenceFile, InferenceInput, PredictOutput};
 use crate::jobs::continuous_scan;
 use crate::jobs::files::{FileScanService, is_resync_needed};
-use crate::jobs::queue::ChangeSummary;
 use crate::jobs::inference_pool::{InferencePool, job_inference_context};
+use crate::jobs::queue::ChangeSummary;
 use crate::jobs::timing::PhaseTimer;
 use crate::pql::builder::filters::OneOrMany;
 use crate::pql::model::{
-    AndOperator, Column, EntityType, Match, MatchOps, MatchValues, Matches, NotOperator, PqlQuery,
-    ProcessedBy, QueryElement,
+    AndOperator, Column, EntityType, FailedFor, Match, MatchOps, MatchValues, Matches, NotOperator,
+    PqlQuery, ProcessedBy, QueryElement,
 };
 use crate::pql::{build_query_preprocessed, preprocess_query_async};
 
@@ -160,8 +163,62 @@ struct JobCounters {
     other_files: i64,
     total_segments: i64,
     errors: i64,
+    /// The subset of `errors` that the item's own media caused and that has a
+    /// ledger row to prove it. A job where every attempted item failed this
+    /// way completes with a warning instead of being reported as an inference
+    /// outage (docs/failed-media-retry-design.md).
+    input_errors: i64,
+    /// The subset of `input_errors` whose cause was a missing dependency, and
+    /// the distinct dependencies themselves. `blocked` rows are input-side —
+    /// they must not fail the job — but they are also the one input-side class
+    /// the *user* can fix, so the job must say so instead of soft-completing
+    /// in silence.
+    blocked_errors: i64,
+    blocked: std::collections::BTreeSet<Blocker>,
     data_load_time: PhaseTimer,
     inference_time: PhaseTimer,
+}
+
+/// What an item task concluded, for the counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemOutcome {
+    /// Processed successfully; counted under its media type.
+    Processed,
+    /// Failed transiently or systemically: counted, still selectable next run.
+    Failed,
+    /// Failed on the item's own media, with a ledger row recording why.
+    /// Carries the dependency when the verdict was `blocked`, so the job can
+    /// name what has to be installed instead of completing quietly.
+    InputFailed { blocker: Option<Blocker> },
+}
+
+/// The three ways an extraction job can end once every item has been
+/// attempted. Pure, so the decision is unit-testable rather than inferred
+/// from counters at the one call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobFailure {
+    /// Something succeeded (or nothing was attempted): normal completion.
+    None,
+    /// Every attempted item failed, and every failure was the item's own
+    /// media: the job completes with a warning, having done all it could.
+    InputMediaOnly,
+    /// Every attempted item failed and at least one failure was not
+    /// input-side: a systemic cause (inference server down, model broken).
+    Systemic,
+}
+
+/// `errors`/`input_errors` are the job's own counters, so `input_errors >
+/// errors` cannot happen; if it ever does, the run is treated as systemic
+/// rather than soft-completed on a count nobody can explain.
+fn classify_extraction_job_failure(processed: i64, errors: i64, input_errors: i64) -> JobFailure {
+    if processed <= 0 || errors < processed {
+        return JobFailure::None;
+    }
+    if input_errors == errors {
+        JobFailure::InputMediaOnly
+    } else {
+        JobFailure::Systemic
+    }
 }
 
 /// What an extraction job reports back to the queue: whether it changed the
@@ -289,6 +346,25 @@ async fn run_extraction_job_inner(
         ));
     }
 
+    // Before the work query: a dependency that has appeared since the rows
+    // were written must make its items selectable in *this* run.
+    if let Err(err) = heal_blocked_errors(&job.index_db).await {
+        tracing::warn!(error = ?err, "failed to re-probe blocked extraction failures");
+    }
+    // One read, once per job: the exact set of items that owe this setter a
+    // ledger row, so a successful item pays a writer round-trip (and a
+    // search-cache epoch bump) only when it is one of them. A plain "any rows
+    // at all?" boolean would put that cost on *every* success as soon as a
+    // single sub-threshold row existed anywhere for the setter. Read after
+    // the heal above so cleared `blocked` rows are already gone, and covering
+    // *all* rows, not just the active ones — an item with an active row is not
+    // in the work query at all, so the only rows a success can clear are the
+    // sub-threshold ones (see `list_error_sha256s_for_setter`).
+    let ledger_shas = {
+        let mut conn = open_index_db_read_no_user_data(&job.index_db).await?;
+        Arc::new(list_error_sha256s_for_setter(&mut conn, &model.setter_name).await?)
+    };
+
     let mut query = build_job_pql(&config, &model)?;
     if let Some(root) = query.query.take() {
         let preprocessed = preprocess_query_async(
@@ -412,10 +488,14 @@ async fn run_extraction_job_inner(
             let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
             let mut query = sqlx::query(sqlx::AssertSqlSafe(chunk_sql.as_str()));
             query = bind_params(query, &compiled.params)?;
-            query.bind(cursor).fetch_all(&mut conn).await.map_err(|err| {
-                tracing::error!(error = %err, "failed to fetch extraction rows");
-                ApiError::internal("Failed to execute extraction query")
-            })?
+            query
+                .bind(cursor)
+                .fetch_all(&mut conn)
+                .await
+                .map_err(|err| {
+                    tracing::error!(error = %err, "failed to fetch extraction rows");
+                    ApiError::internal("Failed to execute extraction query")
+                })?
         };
         let fetched = rows.len();
         for row in &rows {
@@ -442,6 +522,7 @@ async fn run_extraction_job_inner(
             let threshold = defaults.threshold;
             let unit_slots = Arc::clone(&unit_slots);
             let budget_slots = Arc::clone(&budget_slots);
+            let ledger_shas = Arc::clone(&ledger_shas);
             tasks.spawn(async move {
                 let result = process_item(
                     &index_db,
@@ -457,6 +538,7 @@ async fn run_extraction_job_inner(
                     unit_capacity,
                     counters,
                     total_remaining,
+                    &ledger_shas,
                 )
                 .await;
                 if let Err(err) = result {
@@ -480,23 +562,52 @@ async fn run_extraction_job_inner(
         remaining
     };
 
-    let (final_update, total_failure, processed_data) = {
+    let (final_update, failure, processed_data) = {
         let guard = counters.lock().await;
-        // Every attempted item failing means a systemic cause (inference
-        // server down, model broken), not per-item bad data: surface it as a
-        // job failure instead of a "completed" job that did nothing. The
-        // log row is left unfinished so the cleanup pass marks it incomplete.
-        let total_failure = guard.processed > 0 && guard.errors >= guard.processed;
+        // Every attempted item failing on a cause that is *not* the item's
+        // own media means a systemic problem (inference server down, model
+        // broken): surface it as a job failure instead of a "completed" job
+        // that did nothing, and leave the log row unfinished so the cleanup
+        // pass marks it incomplete. A run where every failure was input-side
+        // did all it could and completes.
+        let failure =
+            classify_extraction_job_failure(guard.processed, guard.errors, guard.input_errors);
+        // A `blocked` verdict is input-side (it must not fail the job) but it
+        // is also the one input-side class the user can act on, so it is never
+        // allowed to soft-complete silently — on *either* completion path.
+        let blocked: Vec<&'static str> = guard.blocked.iter().map(|b| b.as_str()).collect();
+        if failure == JobFailure::InputMediaOnly {
+            // No blocked-count clause here: the warn below already names the
+            // blockers with their count, on both completion paths.
+            tracing::warn!(
+                items = guard.errors,
+                setter = %model.setter_name,
+                "{} items failed on input media; not an inference outage",
+                guard.errors
+            );
+        }
+        if !blocked.is_empty() {
+            tracing::warn!(
+                items = guard.blocked_errors,
+                setter = %model.setter_name,
+                blockers = ?blocked,
+                "{} items are blocked on missing dependencies: {} — install them \
+                 and restart the gateway",
+                guard.blocked_errors,
+                blocked.join(", ")
+            );
+        }
         let update = DataLogUpdate {
             image_files: guard.image_files,
             video_files: guard.video_files,
             other_files: guard.other_files,
             total_segments: guard.total_segments,
             errors: guard.errors,
+            input_errors: guard.input_errors,
             total_remaining: remaining_after,
             data_load_time: guard.data_load_time.busy_secs(),
             inference_time: guard.inference_time.busy_secs(),
-            finished: !total_failure,
+            finished: failure != JobFailure::Systemic,
         };
         // The stored times are phase wall-clock (busy); aggregate worker time
         // only goes to the log, where work / busy reads as average parallelism.
@@ -507,7 +618,7 @@ async fn run_extraction_job_inner(
             inference_work_secs = guard.inference_time.work_secs(),
             "extraction job phase timing"
         );
-        (update, total_failure, guard.processed - guard.errors > 0)
+        (update, failure, guard.processed - guard.errors > 0)
     };
     let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
         job_id,
@@ -521,7 +632,7 @@ async fn run_extraction_job_inner(
     // instead of reloading (design §B). Every path that loses the boundary's
     // unload still falls back to the inferio TTL sweep, as it always did.
 
-    if total_failure {
+    if failure == JobFailure::Systemic {
         return Err(ApiError::internal(format!(
             "All {} attempted items failed; check the inference server",
             final_update.errors
@@ -542,6 +653,52 @@ async fn run_extraction_job_inner(
         summary,
         loaded_model: Some(model.setter_name.clone()),
     })
+}
+
+/// Blocked auto-heal (docs/failed-media-retry-design.md req 10): the ledger's
+/// items waiting on a dependency become selectable again as soon as it
+/// appears. Costs one indexed query on the normal path, where nothing is
+/// blocked and nothing is probed — probing eagerly would load libraries the
+/// run has no use for.
+async fn heal_blocked_errors(index_db: &str) -> ApiResult<()> {
+    let waiting = {
+        let mut conn = open_index_db_read_no_user_data(index_db).await?;
+        list_distinct_blockers(&mut conn).await?
+    };
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    // Binding pdfium and spawning ffmpeg both block; the probes run off the
+    // async runtime.
+    let present = tokio::task::spawn_blocking(move || {
+        waiting
+            .into_iter()
+            .filter(|blocker| crate::jobs::files::probe_blocker(*blocker))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| ApiError::internal("Blocker probe task failed"))?;
+    heal_blocked(index_db, present).await.map(|_| ())
+}
+
+/// The write half, with the probe results handed in: probing real binaries is
+/// what makes this untestable, and the clearing is what has to be right.
+async fn heal_blocked(index_db: &str, present: Vec<Blocker>) -> ApiResult<u64> {
+    if present.is_empty() {
+        return Ok(0);
+    }
+    let cleared =
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::ClearBlockedErrors {
+            blockers: present.clone(),
+            reply,
+        })
+        .await?;
+    tracing::info!(
+        cleared,
+        blockers = ?present.iter().map(|blocker| blocker.as_str()).collect::<Vec<_>>(),
+        "dependencies are available again; cleared their blocked extraction failures"
+    );
+    Ok(cleared)
 }
 
 pub(crate) async fn run_data_deletion_job(
@@ -604,39 +761,55 @@ async fn process_item(
     unit_capacity: usize,
     counters: Arc<Mutex<JobCounters>>,
     total_remaining: i64,
+    ledger_shas: &std::collections::HashSet<String>,
 ) -> ApiResult<()> {
     let item_type = item.item_type.clone();
+    let sha256 = item.sha256.clone();
+    let path = item.path.clone();
     let load_span = counters.lock().await.data_load_time.start();
     let prepare_result = input_handlers::prepare_item(index_db, model, item).await;
     drop(load_span);
     let prepared = match prepare_result {
         Ok(prepared) => prepared,
         Err(err) => {
+            let (outcome, returned) =
+                record_prepare_failure(index_db, model, job_id, &sha256, &path, err).await;
             finalize_item(
                 index_db,
                 job_id,
                 &item_type,
                 0,
-                false,
-                true,
+                outcome,
                 counters,
                 total_remaining,
             )
             .await;
-            return Err(err);
+            return match returned {
+                Some(err) => Err(err),
+                // Already logged with its path, sha256, stage and class, and
+                // recorded in the ledger: the item is done for this job and
+                // the job continues.
+                None => Ok(()),
+            };
         }
     };
 
     if prepared.inputs.is_empty() {
         let result =
             output_handlers::write_placeholder(index_db, model, job_id, &prepared.item).await;
+        if result.is_ok() {
+            clear_ledger_row(index_db, model, &prepared.item.sha256, ledger_shas).await;
+        }
         finalize_item(
             index_db,
             job_id,
             &prepared.item.item_type,
             0,
-            result.is_ok(),
-            result.is_err(),
+            if result.is_ok() {
+                ItemOutcome::Processed
+            } else {
+                ItemOutcome::Failed
+            },
             counters,
             total_remaining,
         )
@@ -679,14 +852,25 @@ async fn process_item(
     {
         Ok(outputs) => outputs,
         Err(err) => {
+            // Inference failures stay transient: only the worker itself can
+            // call an item's payload bad, and it has no way to say so yet
+            // (the per-item error slots are their own phase). Unclassified
+            // means retried, never suppressed.
+            tracing::error!(
+                path = %prepared.item.path,
+                sha256 = %prepared.item.sha256,
+                stage = crate::db::extraction_errors::STAGE_INFERENCE,
+                error_class = "transient",
+                error = %err,
+                "extraction item failed"
+            );
             let api_err = ApiError::internal(format!("Inference failed: {err}"));
             finalize_item(
                 index_db,
                 job_id,
                 &prepared.item.item_type,
                 segments,
-                false,
-                true,
+                ItemOutcome::Failed,
                 counters,
                 total_remaining,
             )
@@ -698,18 +882,155 @@ async fn process_item(
     let result =
         output_handlers::handle_outputs(index_db, model, job_id, prepared.item.clone(), outputs)
             .await;
+    if let Err(err) = &result {
+        // Storing the output is the gateway's own DB work: never a verdict on
+        // the media, so it is counted and retried like any other transient.
+        tracing::error!(
+            path = %prepared.item.path,
+            sha256 = %prepared.item.sha256,
+            stage = "output",
+            error_class = "transient",
+            error = %err.detail(),
+            "extraction item failed"
+        );
+    }
+    if result.is_ok() {
+        clear_ledger_row(index_db, model, &prepared.item.sha256, ledger_shas).await;
+    }
     finalize_item(
         index_db,
         job_id,
         &prepared.item.item_type,
         segments,
-        result.is_ok(),
-        result.is_err(),
+        if result.is_ok() {
+            ItemOutcome::Processed
+        } else {
+            ItemOutcome::Failed
+        },
         counters,
         total_remaining,
     )
     .await;
     result.map(|_| ())
+}
+
+/// Logs a prepare failure and, when its class is one the ledger stores,
+/// records it. Returns the outcome to count and the error the item task
+/// should return, if any.
+///
+/// A failed *ledger write* is counted systemic and returned as an error: a DB
+/// outage must never soft-complete a job as "all corrupt media".
+async fn record_prepare_failure(
+    index_db: &str,
+    model: &ModelMetadata,
+    job_id: i64,
+    sha256: &str,
+    path: &str,
+    err: ApiError,
+) -> (ItemOutcome, Option<ApiError>) {
+    let class = err.persisted_class();
+    tracing::error!(
+        path,
+        sha256,
+        stage = crate::db::extraction_errors::STAGE_PREPARE,
+        error_class = class.unwrap_or("transient"),
+        blocker = err.blocker().map(Blocker::as_str).unwrap_or("none"),
+        skip_after = err.skip_after(),
+        error = %err.detail(),
+        "extraction item failed"
+    );
+    if class.is_none() {
+        return (ItemOutcome::Failed, Some(err));
+    }
+
+    let record = prepare_failure_record(model, job_id, sha256, &err);
+    match call_index_db_writer(index_db, |reply| {
+        IndexDbWriterMessage::UpsertExtractionError {
+            record: record.clone(),
+            reply,
+        }
+    })
+    .await
+    {
+        Ok(()) => (
+            ItemOutcome::InputFailed {
+                blocker: err.blocker(),
+            },
+            None,
+        ),
+        Err(write_err) => {
+            tracing::error!(
+                path,
+                sha256,
+                error = ?write_err,
+                "failed to record an extraction failure; counting it as systemic"
+            );
+            (ItemOutcome::Failed, Some(write_err))
+        }
+    }
+}
+
+/// The ledger row a classified prepare failure owes. Split out so the job
+/// path and its tests build the same record.
+fn prepare_failure_record(
+    model: &ModelMetadata,
+    job_id: i64,
+    sha256: &str,
+    err: &ApiError,
+) -> ExtractionErrorRecord {
+    ExtractionErrorRecord {
+        item_sha256: sha256.to_string(),
+        setter_name: model.setter_name.clone(),
+        stage: crate::db::extraction_errors::STAGE_PREPARE.to_string(),
+        kind: err.kind(),
+        error: err.detail().to_string(),
+        skip_after: err.skip_after(),
+        // Always the real job: `attempts` dedups on it, and a job-less write
+        // would stop counting across consecutive runs.
+        job_id: Some(job_id),
+    }
+}
+
+/// Success path: an item this setter can now process owes no ledger row —
+/// *any* row, not just an active one. An item whose verdict is already active
+/// is excluded by the work query and can never reach this path, so the only
+/// rows a success is ever in a position to clear are the sub-threshold ones a
+/// single transient blip left behind. Leaving those would let a second blip,
+/// months later, confirm a verdict on a file that has succeeded in between.
+///
+/// Gated on the *per-item* set the job read at start, so only the items that
+/// actually owe a row pay for the delete — it is a write transaction (and a
+/// search-cache epoch bump) each. A row written *during* this job is not in
+/// the set, but the item that wrote it failed and a failed item never reaches
+/// this path; and missing a delete is advisory anyway — it costs one wasted
+/// re-attempt in a later run, never correctness.
+async fn clear_ledger_row(
+    index_db: &str,
+    model: &ModelMetadata,
+    sha256: &str,
+    ledger_shas: &std::collections::HashSet<String>,
+) {
+    if !ledger_shas.contains(sha256) {
+        return;
+    }
+    let result = call_index_db_writer(index_db, |reply| {
+        IndexDbWriterMessage::DeleteExtractionError {
+            item_sha256: sha256.to_string(),
+            setter_name: model.setter_name.clone(),
+            reply,
+        }
+    })
+    .await;
+    // Advisory: a lost delete costs one wasted re-attempt after the item has
+    // already succeeded, never correctness.
+    if let Err(err) = result {
+        tracing::warn!(
+            sha256,
+            setter = %model.setter_name,
+            error = ?err,
+            "failed to clear an extraction failure after a successful item"
+        );
+    }
 }
 
 /// In-memory footprint of an item's prepared inputs, in KiB (rounded up).
@@ -796,8 +1117,7 @@ async fn finalize_item(
     job_id: i64,
     item_type: &str,
     segments: i64,
-    count_file: bool,
-    is_error: bool,
+    outcome: ItemOutcome,
     counters: Arc<Mutex<JobCounters>>,
     total_remaining: i64,
 ) {
@@ -806,16 +1126,25 @@ async fn finalize_item(
         guard.processed += 1;
         guard.total_segments += segments;
 
-        if count_file {
-            if item_type.starts_with("video") {
-                guard.video_files += 1;
-            } else if item_type.starts_with("image") {
-                guard.image_files += 1;
-            } else {
-                guard.other_files += 1;
+        match outcome {
+            ItemOutcome::Processed => {
+                if item_type.starts_with("video") {
+                    guard.video_files += 1;
+                } else if item_type.starts_with("image") {
+                    guard.image_files += 1;
+                } else {
+                    guard.other_files += 1;
+                }
             }
-        } else if is_error {
-            guard.errors += 1;
+            ItemOutcome::Failed => guard.errors += 1,
+            ItemOutcome::InputFailed { blocker } => {
+                guard.errors += 1;
+                guard.input_errors += 1;
+                if let Some(blocker) = blocker {
+                    guard.blocked_errors += 1;
+                    guard.blocked.insert(blocker);
+                }
+            }
         }
 
         let remaining = total_remaining.saturating_sub(guard.processed);
@@ -825,6 +1154,7 @@ async fn finalize_item(
             other_files: guard.other_files,
             total_segments: guard.total_segments,
             errors: guard.errors,
+            input_errors: guard.input_errors,
             total_remaining: remaining,
             data_load_time: guard.data_load_time.busy_secs(),
             inference_time: guard.inference_time.busy_secs(),
@@ -917,6 +1247,15 @@ fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQ
             })),
         }));
     }
+
+    // Items this setter has already rejected (and whose verdict is confirmed)
+    // are wasted work every run. Unconditional: a model that reprocesses
+    // everything still has nothing to gain from an item it cannot decode.
+    filters.push(QueryElement::Not(NotOperator {
+        not_: Box::new(QueryElement::FailedFor(FailedFor {
+            failed_for: model.setter_name.clone(),
+        })),
+    }));
 
     let mut user_filters = Vec::new();
     for filter in &config.job_filters {
@@ -1426,6 +1765,9 @@ fn bind_param<'q>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_error::{ApiErrorKind, SKIP_AFTER_AMBIGUOUS, SKIP_AFTER_CONFIRMED};
+    use crate::db::extraction_errors::{STAGE_PREPARE, upsert_extraction_error};
+    use crate::test_utils::test_data_dir;
 
     // The guard that keeps a boundary unload from landing on a model a newer
     // job has already loaded: a load bumps the generation under the slot, and
@@ -1627,6 +1969,644 @@ mod tests {
             },
             vec![1, 2, 3, 4, 5],
             "every matching item exactly once; the video item filtered out"
+        );
+    }
+
+    // The completion decision, exhaustively. It is what stands between "12
+    // corrupt files" and a job history full of phantom inference outages, and
+    // between a real outage and a job that quietly reports success.
+    #[test]
+    fn job_failure_classifier_covers_every_combination() {
+        use JobFailure::*;
+        // (processed, errors, input_errors, expected)
+        let cases = [
+            // Nothing attempted: never a failure, whatever the counters say.
+            (0, 0, 0, None),
+            (0, 3, 3, None),
+            // Something succeeded.
+            (5, 0, 0, None),
+            (5, 2, 2, None),
+            (5, 4, 0, None),
+            // Everything failed, every failure the item's own media.
+            (1, 1, 1, InputMediaOnly),
+            (5, 5, 5, InputMediaOnly),
+            // Everything failed, at least one failure not input-side: the
+            // ledger-write failure path lands here on purpose.
+            (5, 5, 4, Systemic),
+            (5, 5, 0, Systemic),
+            (1, 1, 0, Systemic),
+            // Impossible counts (input_errors is a subset of errors) are
+            // treated as systemic rather than soft-completed.
+            (5, 5, 6, Systemic),
+        ];
+        for (processed, errors, input_errors, expected) in cases {
+            assert_eq!(
+                classify_extraction_job_failure(processed, errors, input_errors),
+                expected,
+                "processed={processed} errors={errors} input_errors={input_errors}"
+            );
+        }
+    }
+
+    fn image_model() -> ModelMetadata {
+        let mut model = test_model("items", true);
+        model.setter_name = "test/clip".to_string();
+        model
+    }
+
+    async fn seed_ledger_fixture(conn: &mut sqlx::SqliteConnection, files: &[(i64, &str, &str)]) {
+        sqlx::query(
+            "INSERT INTO file_scans (id, start_time, path) \
+             VALUES (1, '2026-01-01T00:00:00', 'C:/data')",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        for (id, sha256, path) in files {
+            sqlx::query(
+                "INSERT INTO items (id, sha256, md5, type, time_added) \
+                 VALUES (?, ?, ?, 'image/png', '2026-01-01T00:00:00')",
+            )
+            .bind(id)
+            .bind(sha256)
+            .bind(format!("md5_{sha256}"))
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO files (id, sha256, item_id, path, filename, last_modified, \
+                 scan_id, available) VALUES (?, ?, ?, ?, 'f.png', '2026-01-01T00:00:00', 1, 1)",
+            )
+            .bind(id)
+            .bind(sha256)
+            .bind(id)
+            .bind(path)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO setters (id, name) VALUES (1, 'test/clip')")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+    }
+
+    /// The item ids the model's work query currently selects.
+    async fn work_query_items(
+        conn: &mut sqlx::SqliteConnection,
+        model: &ModelMetadata,
+    ) -> Vec<i64> {
+        work_query_column(conn, model, "item_id").await
+    }
+
+    /// One key column of everything the model's work query currently selects.
+    async fn work_query_column(
+        conn: &mut sqlx::SqliteConnection,
+        model: &ModelMetadata,
+        column: &str,
+    ) -> Vec<i64> {
+        let pql = build_job_pql(&SystemConfig::default(), model).unwrap();
+        let compiled = compile_pql_select(pql).unwrap();
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(compiled.sql.as_str()));
+        query = bind_params(query, &compiled.params).unwrap();
+        let rows = query
+            .fetch_all(&mut *conn)
+            .await
+            .expect("the work query must be valid SQLite");
+        let mut ids: Vec<i64> = rows
+            .iter()
+            .map(|row| row.try_get::<i64, _>(column).unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A migrated on-disk index database, which is what the writer actor (and
+    /// therefore every ledger write path) needs.
+    async fn ledger_test_db(name: &'static str) -> &'static str {
+        let user_db = format!("{name}_user");
+        crate::db::migrations::migrate_databases_on_disk(Some(name), Some(&user_db))
+            .await
+            .expect("migrate test databases");
+        name
+    }
+
+    fn image_item(item_id: i64, sha256: &str, path: &str) -> JobInputData {
+        JobInputData {
+            file_id: item_id,
+            item_id,
+            path: path.to_string(),
+            sha256: sha256.to_string(),
+            md5: format!("md5_{sha256}"),
+            last_modified: "2026-01-01T00:00:00".to_string(),
+            item_type: "image/png".to_string(),
+            duration: None,
+            audio_tracks: None,
+            video_tracks: None,
+            subtitle_tracks: None,
+            width: None,
+            height: None,
+            data_id: None,
+            text: None,
+        }
+    }
+
+    // End to end for the confirmed verdict: a file whose header cannot be
+    // parsed is `input`, the record it owes lands in the ledger with the
+    // item's mime type, and the work query stops offering it — which is the
+    // entire point of the ledger.
+    #[tokio::test]
+    async fn a_corrupt_image_lands_in_the_ledger_and_leaves_the_work_query() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let corrupt = dir.path().join("corrupt.png");
+        std::fs::write(&corrupt, b"this is definitely not a PNG").unwrap();
+        let healthy = dir.path().join("healthy.png");
+        std::fs::write(&healthy, b"also not a PNG, but never attempted").unwrap();
+
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed_ledger_fixture(
+            conn,
+            &[
+                (1, "sha_corrupt", corrupt.to_string_lossy().as_ref()),
+                (2, "sha_other", healthy.to_string_lossy().as_ref()),
+            ],
+        )
+        .await;
+
+        let model = image_model();
+        assert_eq!(
+            work_query_items(conn, &model).await,
+            vec![1, 2],
+            "both items are work before anything failed"
+        );
+
+        let err = input_handlers::prepare_item(
+            "unused",
+            &model,
+            image_item(1, "sha_corrupt", corrupt.to_string_lossy().as_ref()),
+        )
+        .await
+        .expect_err("an unparseable header must fail the item");
+        assert_eq!(err.kind(), ApiErrorKind::Input);
+        assert_eq!(err.skip_after(), SKIP_AFTER_CONFIRMED);
+
+        let record = prepare_failure_record(&model, 7, "sha_corrupt", &err);
+        upsert_extraction_error(conn, &record).await.unwrap();
+
+        let (stage, class, attempts, mime, job): (String, String, i64, String, Option<i64>) =
+            sqlx::query_as(
+                "SELECT stage, error_class, attempts, mime_type, last_job_id \
+                 FROM item_extraction_errors",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            (stage.as_str(), class.as_str(), attempts, mime.as_str(), job),
+            (STAGE_PREPARE, "input", 1, "image/png", Some(7))
+        );
+
+        assert_eq!(
+            work_query_items(conn, &model).await,
+            vec![2],
+            "a confirmed verdict takes the item out of the work query"
+        );
+    }
+
+    // The ambiguous threshold: a verdict from a tool that did its own file
+    // I/O must cost exactly one confirmation re-attempt, in a later run,
+    // before it suppresses anything.
+    #[tokio::test]
+    async fn an_unconfirmed_verdict_keeps_the_item_for_one_more_run() {
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed_ledger_fixture(conn, &[(1, "sha_one", "C:/data/1.png")]).await;
+        let model = image_model();
+
+        let err = ApiError::input_unconfirmed("ffmpeg exited 1");
+        assert_eq!(err.skip_after(), SKIP_AFTER_AMBIGUOUS);
+        let mut record = prepare_failure_record(&model, 1, "sha_one", &err);
+        upsert_extraction_error(conn, &record).await.unwrap();
+        assert_eq!(
+            work_query_items(conn, &model).await,
+            vec![1],
+            "one failure does not settle an ambiguous verdict"
+        );
+
+        // A *later* job confirms it; a second failure inside the same job
+        // would not (the upsert dedups on last_job_id).
+        record.job_id = Some(1);
+        upsert_extraction_error(conn, &record).await.unwrap();
+        assert_eq!(
+            work_query_items(conn, &model).await,
+            vec![1],
+            "the same job cannot confirm its own verdict"
+        );
+        record.job_id = Some(2);
+        upsert_extraction_error(conn, &record).await.unwrap();
+        assert!(
+            work_query_items(conn, &model).await.is_empty(),
+            "the second run confirms the verdict"
+        );
+    }
+
+    // Parity guard: the gateway's own I/O failing says nothing about the
+    // media, so nothing is recorded and the item stays selectable. A missing
+    // file is the cheapest way to provoke exactly that.
+    #[tokio::test]
+    async fn a_missing_file_is_transient_and_records_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("gone.png");
+        let missing_gif = dir.path().join("gone.gif");
+        let model = image_model();
+
+        for (path, mime) in [
+            (missing.to_string_lossy().to_string(), "image/png"),
+            (missing_gif.to_string_lossy().to_string(), "image/gif"),
+        ] {
+            let mut item = image_item(1, "sha_one", &path);
+            item.item_type = mime.to_string();
+            let err = input_handlers::prepare_item("unused", &model, item)
+                .await
+                .expect_err("a missing file must fail the item");
+            assert_eq!(
+                err.persisted_class(),
+                Option::None,
+                "{mime}: a read failure is transient and must never be recorded"
+            );
+        }
+    }
+
+    // The setter predicate inside the FailedFor CTE, which nothing else
+    // covers: a verdict belongs to one (item, setter) pair, so a tagger that
+    // cannot read a file must never take that file away from CLIP.
+    #[tokio::test]
+    async fn a_different_setters_verdict_does_not_hide_the_item() {
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed_ledger_fixture(conn, &[(1, "sha_one", "C:/data/1.png")]).await;
+        sqlx::query("INSERT INTO setters (id, name) VALUES (2, 'test/tagger')")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        // A confirmed verdict, recorded by the *other* setter.
+        let mut tagger = image_model();
+        tagger.setter_name = "test/tagger".to_string();
+        let record = prepare_failure_record(&tagger, 1, "sha_one", &ApiError::input("corrupt"));
+        upsert_extraction_error(conn, &record).await.unwrap();
+        assert!(
+            work_query_items(conn, &tagger).await.is_empty(),
+            "the setter that recorded the verdict does stop seeing the item"
+        );
+
+        assert_eq!(
+            work_query_items(conn, &image_model()).await,
+            vec![1],
+            "another setter's verdict says nothing about this one's work"
+        );
+    }
+
+    // The ledger keys on the item, but the work query of a file-target model
+    // yields file rows: a verdict has to take *every* file of that item out,
+    // or the item comes back through its second path and fails again.
+    #[tokio::test]
+    async fn a_verdict_removes_every_file_of_a_multi_file_item() {
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed_ledger_fixture(
+            conn,
+            &[
+                (1, "sha_one", "C:/data/1.png"),
+                (2, "sha_two", "C:/data/2.png"),
+            ],
+        )
+        .await;
+        // A second path for the same item (a hardlink or a copy).
+        sqlx::query(
+            "INSERT INTO files (id, sha256, item_id, path, filename, last_modified, \
+             scan_id, available) \
+             VALUES (3, 'sha_one', 1, 'C:/data/1-copy.png', 'f.png', '2026-01-01T00:00:00', 1, 1)",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        let mut model = image_model();
+        model.target_entities = vec!["files".to_string()];
+        assert_eq!(
+            work_query_column(conn, &model, "file_id").await,
+            vec![1, 2, 3],
+            "every file row is work before anything failed"
+        );
+
+        let record = prepare_failure_record(&model, 1, "sha_one", &ApiError::input("corrupt"));
+        upsert_extraction_error(conn, &record).await.unwrap();
+        assert_eq!(
+            work_query_column(conn, &model, "file_id").await,
+            vec![2],
+            "one item-keyed verdict removes both of that item's file rows, \
+             and only that item's"
+        );
+    }
+
+    // The success-path delete gate. An item with an *active* row is not in the
+    // work query at all, so the only row a success can ever clear is the
+    // sub-threshold one a transient blip left behind — which is exactly why
+    // the gate lists all rows rather than the active ones. Without this, that
+    // row survives, and a second blip months later suppresses a healthy file.
+    // The gate is per-sha256: an item that owes nothing must not pay for a
+    // writer round-trip just because some *other* item has a row.
+    #[tokio::test]
+    async fn a_successful_item_clears_its_unconfirmed_row() {
+        let _test_env = test_data_dir();
+        let index_db = ledger_test_db("extraction_clear_unconfirmed").await;
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+                .await
+                .unwrap();
+            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.png")]).await;
+            // One ambiguous failure: attempts = 1, skip_after = 2.
+            let record = prepare_failure_record(
+                &image_model(),
+                1,
+                "sha_one",
+                &ApiError::input_unconfirmed("an SMB blip looks like this"),
+            );
+            upsert_extraction_error(&mut conn, &record).await.unwrap();
+        }
+
+        let model = image_model();
+        // Computed exactly as the job start does it.
+        let ledger_shas = {
+            let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+                .await
+                .unwrap();
+            assert_eq!(
+                work_query_items(&mut conn, &model).await,
+                vec![1],
+                "an unconfirmed verdict leaves the item selectable, which is \
+                 how it can succeed at all"
+            );
+            list_error_sha256s_for_setter(&mut conn, &model.setter_name)
+                .await
+                .unwrap()
+        };
+        assert!(
+            ledger_shas.contains("sha_one"),
+            "the gate must see the sub-threshold row; an active-only query \
+             would return nothing here and skip the delete forever"
+        );
+
+        // An item outside the set never reaches the writer at all.
+        clear_ledger_row(index_db, &model, "sha_absent", &ledger_shas).await;
+        clear_ledger_row(index_db, &model, "sha_one", &ledger_shas).await;
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        assert!(
+            list_error_sha256s_for_setter(&mut conn, &model.setter_name)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a success wipes the item's slate"
+        );
+    }
+
+    // A ledger write that fails is a database problem, never a verdict: it
+    // must count systemic and return the error, or a DB outage soft-completes
+    // the job as "all corrupt media".
+    #[tokio::test]
+    async fn a_ledger_write_failure_is_systemic() {
+        let _test_env = test_data_dir();
+        let index_db = ledger_test_db("extraction_ledger_write_fails").await;
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+                .await
+                .unwrap();
+            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.png")]).await;
+        }
+
+        // No `setters` row for this name, so the upsert matches nothing.
+        let mut model = image_model();
+        model.setter_name = "test/never-registered".to_string();
+        let (outcome, returned) = record_prepare_failure(
+            index_db,
+            &model,
+            1,
+            "sha_one",
+            "C:/data/1.png",
+            ApiError::input("corrupt"),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ItemOutcome::Failed,
+            "an unrecorded failure is not an input verdict"
+        );
+        assert!(
+            returned.is_some(),
+            "the item task must propagate the write failure"
+        );
+    }
+
+    // A missing dependency is input-side (it must not fail the job) but it is
+    // also the one input-side class the user can fix, so the blocker has to
+    // survive into the counters — a job that completes without naming it is a
+    // silent no-op the user cannot diagnose.
+    #[tokio::test]
+    async fn a_blocked_prepare_failure_counts_input_side() {
+        let _test_env = test_data_dir();
+        let index_db = ledger_test_db("extraction_blocked_counts").await;
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+                .await
+                .unwrap();
+            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.pdf")]).await;
+        }
+        let model = image_model();
+        let job_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddDataLog {
+            scan_time: crate::db::extraction_write::current_iso_timestamp(),
+            threshold: None,
+            types: vec![model.output_type.clone()],
+            setter: model.setter_name.clone(),
+            batch_size: 4,
+            reply,
+        })
+        .await
+        .unwrap();
+
+        let (outcome, returned) = record_prepare_failure(
+            index_db,
+            &model,
+            job_id,
+            "sha_one",
+            "C:/data/1.pdf",
+            ApiError::blocked(Blocker::Pdfium, "pdfium is not available"),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ItemOutcome::InputFailed {
+                blocker: Some(Blocker::Pdfium)
+            },
+            "a blocked verdict is input-side and carries its dependency"
+        );
+        assert!(returned.is_none(), "the job continues past a blocked item");
+
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        finalize_item(
+            index_db,
+            job_id,
+            "application/pdf",
+            0,
+            outcome,
+            Arc::clone(&counters),
+            1,
+        )
+        .await;
+
+        {
+            let guard = counters.lock().await;
+            assert_eq!((guard.errors, guard.input_errors), (1, 1));
+            assert_eq!(guard.blocked_errors, 1);
+            assert_eq!(
+                guard.blocked.iter().copied().collect::<Vec<_>>(),
+                vec![Blocker::Pdfium],
+                "the job must be able to name what has to be installed"
+            );
+        }
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        let (errors, input_errors): (i64, i64) =
+            sqlx::query_as("SELECT errors, input_errors FROM data_log WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            (errors, input_errors),
+            (1, 1),
+            "job history shows the split without a join"
+        );
+    }
+
+    // The anti-join shape the work query depends on: the failure CTE is
+    // LEFT JOINed and required to be NULL, and it selects only rows whose
+    // verdict is already active.
+    #[test]
+    fn the_work_query_anti_joins_the_active_ledger_rows() {
+        let model = image_model();
+        let pql = build_job_pql(&SystemConfig::default(), &model).unwrap();
+        let sql = compile_pql_select(pql).unwrap().sql;
+        assert!(sql.contains("item_extraction_errors"), "{sql}");
+        assert!(
+            sql.contains(r#""attempts" >= "item_extraction_errors"."skip_after""#),
+            "the threshold must be part of the filter: {sql}"
+        );
+        assert!(sql.contains("_FailedFor"), "{sql}");
+        assert!(
+            sql.contains("LEFT JOIN") && sql.contains("IS NULL"),
+            "the filter must be composed as an anti-join: {sql}"
+        );
+    }
+
+    // Auto-heal, minus the probe: installing the dependency clears exactly
+    // its rows and nothing else. The probe half is a real binding/spawn,
+    // which is why the clearing takes its results as an argument.
+    #[tokio::test]
+    async fn healing_clears_only_the_dependencies_that_came_back() {
+        let _test_env = test_data_dir();
+        let index_db = "extraction_heal_blocked";
+        crate::db::migrations::migrate_databases_on_disk(
+            Some(index_db),
+            Some("extraction_heal_blocked_user"),
+        )
+        .await
+        .expect("migrate test databases");
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+                .await
+                .unwrap();
+            seed_ledger_fixture(
+                &mut conn,
+                &[
+                    (1, "sha_pdf", "C:/data/1.pdf"),
+                    (2, "sha_vid", "C:/data/2.mp4"),
+                ],
+            )
+            .await;
+            for (sha256, blocker) in [("sha_pdf", Blocker::Pdfium), ("sha_vid", Blocker::Ffmpeg)] {
+                let err = ApiError::blocked(blocker, "dependency missing");
+                let record = prepare_failure_record(&image_model(), 1, sha256, &err);
+                upsert_extraction_error(&mut conn, &record).await.unwrap();
+            }
+        }
+
+        assert_eq!(
+            heal_blocked(index_db, Vec::new()).await.unwrap(),
+            0,
+            "nothing probed present means no write at all"
+        );
+        assert_eq!(
+            heal_blocked(index_db, vec![Blocker::Pdfium]).await.unwrap(),
+            1
+        );
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_distinct_blockers(&mut conn).await.unwrap(),
+            vec![Blocker::Ffmpeg],
+            "the dependency that is still missing keeps its rows"
+        );
+    }
+
+    // ffmpeg classification against the real toolchain: a file of garbage
+    // bytes claiming to be a video is an *unconfirmed* payload verdict, never
+    // `blocked` — that distinction is what keeps a missing codec from being
+    // mistaken for a missing install. Only ffmpeg runs on this path now: the
+    // frame extractor takes the item's stored duration instead of re-probing
+    // it, so a non-zero ffmpeg exit is the whole classification.
+    #[tokio::test]
+    async fn ffmpeg_rejecting_a_file_is_an_unconfirmed_input_verdict() {
+        // `ffmpeg_available` probes both executables, which is what the
+        // auto-heal relies on and what this test needs.
+        if !crate::media_tools::ffmpeg_available() {
+            // No toolchain on this host; the classification is unobservable.
+            return;
+        }
+        let _test_env = test_data_dir();
+        let index_db = "extraction_ffmpeg_classify";
+        crate::db::migrations::migrate_databases_on_disk(
+            Some(index_db),
+            Some("extraction_ffmpeg_classify_user"),
+        )
+        .await
+        .expect("migrate test databases");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let fake_video = dir.path().join("garbage.mp4");
+        std::fs::write(&fake_video, b"nothing here is a container").unwrap();
+
+        let mut item = image_item(1, "sha_vid", fake_video.to_string_lossy().as_ref());
+        item.item_type = "video/mp4".to_string();
+        item.duration = Some(10.0);
+        item.video_tracks = Some(1);
+
+        let err = input_handlers::prepare_item(index_db, &image_model(), item)
+            .await
+            .expect_err("ffmpeg must reject a file that is not a container");
+        assert_eq!(err.kind(), ApiErrorKind::Input);
+        assert_eq!(
+            err.skip_after(),
+            SKIP_AFTER_AMBIGUOUS,
+            "a tool that did its own file I/O never settles a verdict alone"
         );
     }
 }

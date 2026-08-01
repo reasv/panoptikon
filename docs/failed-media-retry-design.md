@@ -288,6 +288,18 @@ arbiter, satisfying parity by construction. Worker impls that decode
 somewhere other than the shared helper need a one-time audit; any that
 slip through are covered by layer 2.
 
+**Granularity caveat — text-entity models.** For a text-entity model a
+per-item worker verdict is really a verdict on one *data row* (one extracted
+text segment), while both the ledger and the `failed_for` anti-join key on
+`item_id` and therefore suppress at (item, setter) granularity. Persisting a
+worker-reported `input` verdict for such a model would take every one of that
+item's segments out of the work query because a single segment was bad, which
+is not acceptable. So worker-reported input errors for text-entity models
+stay **transient** (counted, retried, never persisted) unless and until the
+ledger gains a nullable `data_id` and the anti-join learns to match on it.
+Item-keyed suppression remains correct for the prepare stage, where the
+failure is the item's media and there are no data rows to key on anyway.
+
 **Layer 2 — isolation retry (the fallback).** When a whole batch predict
 fails and the batch had more than one item, re-submit the items
 individually, once. Healthy items complete (req 3); the item that fails
@@ -496,6 +508,10 @@ Phases 1 is prerequisite for the rest; 2–5 are independent of each other.
   triggered by content change, dependency appearance, or a shipped
   directive.
 - Changing `is_placeholder` semantics or the `item_data` schema.
+- **Per-data-row (segment) failure granularity.** The ledger keys on
+  (item, setter); a nullable `data_id` and a data-keyed anti-join are out of
+  scope, which is why worker-reported input errors for text-entity models
+  stay transient (see "Granularity caveat — text-entity models").
 - ANN/vector-index work and the model-identity redesign (orthogonal; the
   ledger keys on `setters.id`, which survives that redesign's setter-string
   changes as long as setter rows keep existing).

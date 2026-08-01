@@ -519,6 +519,7 @@ fn process_query_element(
         QueryElement::MatchTags(filter) => filter.build(context, state),
         QueryElement::InBookmarks(filter) => filter.build(context, state),
         QueryElement::ProcessedBy(filter) => filter.build(context, state),
+        QueryElement::FailedFor(filter) => filter.build(context, state),
         QueryElement::HasUnprocessedData(filter) => filter.build(context, state),
     }
 }
@@ -1658,6 +1659,17 @@ enum Setters {
     Table,
     Id,
     Name,
+}
+
+/// The extraction failure ledger (docs/failed-media-retry-design.md). Only
+/// the columns the work-query anti-join needs.
+#[derive(sea_query::Iden)]
+enum ItemExtractionErrors {
+    Table,
+    ItemId,
+    SetterId,
+    Attempts,
+    SkipAfter,
 }
 
 #[derive(sea_query::Iden)]

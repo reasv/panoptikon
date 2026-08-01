@@ -1,8 +1,8 @@
 use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictOutput};
 use crate::pql::embedding_utils::{embedding_from_npy_bytes, extract_embeddings, serialize_f32};
 use crate::pql::model::{
-    DistanceFunction, EmbedArgs, HasUnprocessedData, InBookmarks, IndexMode, Match, MatchAnd,
-    MatchOps, MatchOr, MatchPath, MatchTags, MatchText, MatchValue, MatchValues, Matches,
+    DistanceFunction, EmbedArgs, FailedFor, HasUnprocessedData, InBookmarks, IndexMode, Match,
+    MatchAnd, MatchOps, MatchOr, MatchPath, MatchTags, MatchText, MatchValue, MatchValues, Matches,
     ProcessedBy, QuantResolved, QueryElement, SemanticImageSearch, SemanticTextSearch, SimilarTo,
 };
 use crate::pql::utils::parse_and_escape_query;
@@ -244,6 +244,7 @@ pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>,
         QueryElement::HasUnprocessedData(filter) => {
             Ok(filter.validate().map(QueryElement::HasUnprocessedData))
         }
+        QueryElement::FailedFor(filter) => Ok(filter.validate().map(QueryElement::FailedFor)),
     }
 }
 
@@ -534,6 +535,7 @@ fn preprocess_query_async_inner<'a, 'b>(
             QueryElement::HasUnprocessedData(filter) => {
                 Ok(filter.validate().map(QueryElement::HasUnprocessedData))
             }
+            QueryElement::FailedFor(filter) => Ok(filter.validate().map(QueryElement::FailedFor)),
         }
     })
 }
@@ -604,6 +606,16 @@ impl InBookmarks {
 impl ProcessedBy {
     fn validate(self) -> Option<Self> {
         if self.processed_by.trim().is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
+impl FailedFor {
+    fn validate(self) -> Option<Self> {
+        if self.failed_for.trim().is_empty() {
             None
         } else {
             Some(self)

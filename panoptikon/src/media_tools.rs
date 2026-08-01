@@ -34,6 +34,46 @@ pub(crate) fn ffprobe() -> &'static OsStr {
     resolved().1.as_os_str()
 }
 
+/// Classifies a failure to *start* ffmpeg/ffprobe, which is never a verdict
+/// on the media (docs/failed-media-retry-design.md: "Spawn errors are
+/// `blocked`, never `input`"). Only `NotFound` means the toolchain is
+/// missing; a permission or resource failure is this machine's problem and
+/// stays transient, so the item is retried untouched.
+pub(crate) fn spawn_error(tool: &str, err: &std::io::Error) -> crate::api_error::ApiError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return crate::api_error::ApiError::blocked(
+            crate::api_error::Blocker::Ffmpeg,
+            format!("{tool} is not installed: {err}"),
+        );
+    }
+    crate::api_error::ApiError::internal(format!("{tool} failed to start: {err}"))
+}
+
+/// Whether the resolved toolchain can actually be started, for the ledger's
+/// blocked auto-heal. `host_paths::can_spawn` insists on a real file, but the
+/// resolver legitimately hands back a bare name for PATH lookup at spawn
+/// time, so the probe has to be a spawn.
+///
+/// *Both* executables are probed: they are resolved independently (config
+/// override, venv, PATH) and both classification sites record the same
+/// `Blocker::Ffmpeg`. Healing on ffmpeg alone would clear rows that ffprobe
+/// is still blocking, and every job would re-heal, re-fail, and bump the
+/// search-cache epoch for nothing.
+pub(crate) fn ffmpeg_available() -> bool {
+    can_run(ffmpeg()) && can_run(ffprobe())
+}
+
+fn can_run(exe: &OsStr) -> bool {
+    std::process::Command::new(exe)
+        .arg("-version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn resolved() -> &'static (PathBuf, PathBuf) {
     static RESOLVED: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     RESOLVED.get_or_init(|| {
