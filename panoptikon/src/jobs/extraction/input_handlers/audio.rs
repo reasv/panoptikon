@@ -18,8 +18,9 @@ pub(super) async fn build_audio_tracks_inputs(
         .and_then(Value::as_i64)
         .unwrap_or(16000) as u32;
     let max_tracks = opts.get("max_tracks").and_then(Value::as_i64).unwrap_or(4) as usize;
+    let max_duration = opts.get("max_duration").and_then(Value::as_f64);
 
-    let audio = load_audio_single(&item.path, sample_rate)?;
+    let audio = load_audio_single(&item.path, sample_rate, max_duration)?;
     let mut outputs = Vec::new();
     for track in audio.into_iter().take(max_tracks) {
         let bytes = serialize_npy_f32(&track);
@@ -44,8 +45,9 @@ pub(super) async fn build_audio_files_inputs(
         .and_then(Value::as_i64)
         .unwrap_or(48000) as u32;
     let max_tracks = opts.get("max_tracks").and_then(Value::as_i64).unwrap_or(4) as usize;
+    let max_duration = opts.get("max_duration").and_then(Value::as_f64);
 
-    let audio = load_audio_single(&item.path, sample_rate)?;
+    let audio = load_audio_single(&item.path, sample_rate, max_duration)?;
     let mut outputs = Vec::new();
     for track in audio.into_iter().take(max_tracks) {
         let wav_bytes = audio_to_wav_bytes(&track, sample_rate);
@@ -76,8 +78,19 @@ fn serialize_npy_f32(values: &[f32]) -> Vec<u8> {
     out
 }
 
-fn load_audio_single(path: &str, sample_rate: u32) -> ApiResult<Vec<Vec<f32>>> {
-    let output = std::process::Command::new(crate::media_tools::ffmpeg())
+/// Decode the audio track to mono PCM at `sample_rate`, optionally capped
+/// to the first `max_duration` seconds (`-t` as an ffmpeg output option, so
+/// decoding stops at the cap instead of decoding everything and trimming).
+/// The cap is a per-model registry opt: embedding models whose receptive
+/// field is seconds long gain nothing past it, while transcription models
+/// must keep the whole track and simply do not set it.
+fn load_audio_single(
+    path: &str,
+    sample_rate: u32,
+    max_duration: Option<f64>,
+) -> ApiResult<Vec<Vec<f32>>> {
+    let mut command = std::process::Command::new(crate::media_tools::ffmpeg());
+    command
         .arg("-nostdin")
         .arg("-threads")
         .arg("0")
@@ -90,9 +103,11 @@ fn load_audio_single(path: &str, sample_rate: u32) -> ApiResult<Vec<Vec<f32>>> {
         .arg("-acodec")
         .arg("pcm_s16le")
         .arg("-ar")
-        .arg(sample_rate.to_string())
-        .arg("-")
-        .output();
+        .arg(sample_rate.to_string());
+    if let Some(seconds) = max_duration.filter(|seconds| *seconds > 0.0) {
+        command.arg("-t").arg(seconds.to_string());
+    }
+    let output = command.arg("-").output();
 
     match output {
         Ok(output) => {

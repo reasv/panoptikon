@@ -54,9 +54,33 @@ use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_p
 /// else in the handshake are killed.
 const PROTOCOL_VERSION: u64 = 2;
 
-/// Max frame size (512 MiB). Either side treats a larger declared length as
-/// a fatal protocol error.
-const MAX_FRAME_BYTES: usize = 0x2000_0000;
+/// Max frame size (2 GiB; must stay below the u32 length-prefix ceiling).
+/// Either side treats a larger declared length as a fatal protocol error.
+/// Sized for whole-track audio payloads (a raw f32 mono track at 16 kHz is
+/// ~230 MiB/hour); both sides buffer a full frame, so the limit is a memory
+/// bound, not a correctness one.
+pub(crate) const MAX_FRAME_BYTES: usize = 0x8000_0000;
+
+/// Payload budget for the *inputs* of one predict frame: the frame limit
+/// minus headroom for the envelope (type/id/keys) and the msgpack encoding
+/// overhead of the inputs themselves, so admission arithmetic done on
+/// estimated input sizes can never build a frame `encode_frame` refuses.
+pub(crate) const FRAME_INPUT_BYTES_BUDGET: usize = MAX_FRAME_BYTES - 8 * 1024 * 1024;
+
+/// Estimated wire size of one predict input: file bytes dominate; JSON data
+/// is bounded by its serialized length (msgpack strings/maps are never
+/// larger than the JSON text), plus a small per-input framing allowance.
+/// Used for byte-aware batch admission — an estimate, which is why
+/// [`FRAME_INPUT_BYTES_BUDGET`] keeps a margin under the hard limit.
+pub(crate) fn estimate_input_bytes(input: &WorkerInput) -> usize {
+    let data = input
+        .data
+        .as_ref()
+        .map(|value| value.to_string().len())
+        .unwrap_or(0);
+    let file = input.file.as_ref().map(Vec::len).unwrap_or(0);
+    data + file + 64
+}
 
 /// Bounds for the per-worker stderr tail ring buffer kept for error reports.
 const STDERR_TAIL_MAX_LINES: usize = 50;
@@ -679,9 +703,19 @@ impl Worker {
         ];
         frame.append(&mut fields);
         // Serialize fully before sending: an over-limit or unencodable frame
-        // fails here without a byte hitting the stream, so it is a plain
-        // error, not a protocol desync.
-        let bytes = encode_frame(&Value::Map(frame))?;
+        // fails here without a byte hitting the stream — no protocol desync,
+        // the worker is still serviceable. Surfaced as a WorkerError so the
+        // dispatcher fails this request alone instead of killing the model.
+        let bytes = match encode_frame(&Value::Map(frame)) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Err(anyhow::Error::new(WorkerError {
+                    message: format!("request refused before send: {err:#}"),
+                    traceback: String::new(),
+                    stderr_tail: String::new(),
+                }));
+            }
+        };
 
         self.in_flight = true;
         let stdin = &mut self.stdin;
@@ -857,8 +891,8 @@ async fn forward_stderr(stderr: ChildStderr, inference_id: String, tail: Arc<Mut
     }
 }
 
-/// Serialize one frame payload, enforcing the 512 MiB limit before any byte
-/// is written (a failure here never corrupts the stream).
+/// Serialize one frame payload, enforcing [`MAX_FRAME_BYTES`] before any
+/// byte is written (a failure here never corrupts the stream).
 fn encode_frame(value: &Value) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     rmpv::encode::write_value(&mut payload, value).context("failed to encode frame payload")?;

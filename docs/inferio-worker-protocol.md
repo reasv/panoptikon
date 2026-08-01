@@ -25,9 +25,13 @@ first if the protocol needs to change.
   its own logging with a per-worker prefix. Tracebacks belong on stderr (and
   in `error` frames), never on stdout.
 - **Frame** = 4-byte **little-endian u32** payload length, then exactly that
-  many bytes of a single msgpack-encoded map. Max frame size 512 MiB
-  (`0x2000_0000`); either side treats a larger declared length as a fatal
-  protocol error (kill/exit).
+  many bytes of a single msgpack-encoded map. Max frame size 2 GiB
+  (`0x8000_0000`); either side treats a larger declared *length* as a fatal
+  protocol error (kill/exit). The orchestrator refuses to *send* an
+  over-limit frame before any byte hits the stream — that refusal is a
+  per-request failure (the worker stays alive), not a protocol error, and
+  the dispatcher's byte-aware batch admission exists to make it unreachable
+  in practice.
 - One request at a time: the orchestrator MUST NOT send a new request before
   receiving the response to the previous one (`ping` included). The worker
   processes frames strictly sequentially. Request ids exist for sanity

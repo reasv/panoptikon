@@ -4,9 +4,10 @@
 //! predict requests. Whenever a worker replica is free, the task drains the
 //! queue into a window, computes the effective batch cap for that window
 //! (the stateless `max()`-over-explicit-caps rule), takes a FIFO prefix of
-//! requests whose total work units fit the cap, and sends them to the
-//! worker as one merged `predict`. Outputs are split back per request by
-//! input counts, so FIFO order is preserved end to end.
+//! requests whose total work units fit the cap *and* whose estimated
+//! payload fits one worker frame, and sends them to the worker as one
+//! merged `predict`. Outputs are split back per request by input counts,
+//! so FIFO order is preserved end to end.
 //!
 //! Cap rule (design §6, ported exactly):
 //! - effective cap = max over the *explicit* `max_batch` values among the
@@ -73,7 +74,9 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use super::manager::ModelManager;
-use super::worker::{Worker, WorkerError, WorkerInput, WorkerOutput};
+use super::worker::{
+    FRAME_INPUT_BYTES_BUDGET, Worker, WorkerError, WorkerInput, WorkerOutput, estimate_input_bytes,
+};
 
 /// Lightweight per-model dispatcher statistics for `GET /health` (design
 /// §7). One `Arc` is shared between the dispatcher task (sole writer) and
@@ -110,6 +113,10 @@ pub(crate) struct ModelStats {
 pub(crate) struct DispatchRequest {
     pub inputs: Vec<WorkerInput>,
     pub max_batch: Option<u32>,
+    /// Estimated wire size of `inputs` (sum of [`estimate_input_bytes`]),
+    /// computed once at enqueue so window formation does not rescan
+    /// payloads on every drain.
+    pub payload_bytes: usize,
     pub reply: oneshot::Sender<Result<Vec<WorkerOutput>>>,
 }
 
@@ -165,37 +172,68 @@ pub(crate) fn effective_cap(
 
 /// How many requests the FIFO prefix of the window contributes to one
 /// merged batch: take requests in order while the running total of work
-/// units stays <= cap, but always take at least the first request (an
+/// units stays <= cap *and* the running payload estimate stays within the
+/// frame byte budget, but always take at least the first request (an
 /// oversized first request is taken alone and split by the caller).
 ///
-/// Each request is `(unit_count, explicit_cap)`. A request's own cap is a
-/// promise about the merged batch it may ride in, so admission also respects
-/// the *smallest* explicit cap among the members and the candidate — the
-/// window-wide `cap` is the max over the queue (see [`effective_cap`]) and
-/// would otherwise let a large request's opinion override a small one's.
-/// This is what makes an isolation retry's `max_batch = 1` actually isolate:
-/// queued behind (or ahead of) a job chunk advertising the job's batch size,
-/// the retry is never merged into that chunk's GPU batch. Cap-less requests
-/// contribute no opinion, exactly as in [`effective_cap`].
-pub(crate) fn window_take_count(requests: &[(usize, Option<u32>)], cap: usize) -> usize {
+/// Each request is `(unit_count, payload_bytes, explicit_cap)`. A request's
+/// own cap is a promise about the merged batch it may ride in, so admission
+/// also respects the *smallest* explicit cap among the members and the
+/// candidate — the window-wide `cap` is the max over the queue (see
+/// [`effective_cap`]) and would otherwise let a large request's opinion
+/// override a small one's. This is what makes an isolation retry's
+/// `max_batch = 1` actually isolate: queued behind (or ahead of) a job
+/// chunk advertising the job's batch size, the retry is never merged into
+/// that chunk's GPU batch. Cap-less requests contribute no opinion, exactly
+/// as in [`effective_cap`].
+///
+/// The byte bound is what keeps a merged window encodable as one worker
+/// frame: unit counts say nothing about payload size (one audio track can
+/// be hundreds of MiB), so admission is bounded by both.
+pub(crate) fn window_take_count(
+    requests: &[(usize, usize, Option<u32>)],
+    cap: usize,
+    byte_budget: usize,
+) -> usize {
     let mut taken = 0usize;
     let mut units = 0usize;
+    let mut bytes = 0usize;
     let mut member_cap = cap;
-    for &(count, explicit) in requests {
+    for &(count, size, explicit) in requests {
         let admit_cap = match explicit {
             // Non-positive caps carry no opinion, as in `effective_cap`.
             Some(request_cap) if request_cap > 0 => member_cap.min(request_cap as usize),
             _ => member_cap,
         };
-        if taken == 0 || units + count <= admit_cap {
+        if taken == 0 || (units + count <= admit_cap && bytes + size <= byte_budget) {
             taken += 1;
             units += count;
+            bytes += size;
             member_cap = admit_cap;
         } else {
             break;
         }
     }
     taken
+}
+
+/// Length of the next sub-batch when one request alone must be split: as
+/// many inputs as fit both the unit cap and the frame byte budget, but
+/// always at least one — a single input over the budget is sent alone, and
+/// the transport refuses it as a per-request failure rather than a worker
+/// death (extraction classifies that case as `resource` before it ever
+/// gets here; this is the backstop for other callers).
+fn sub_batch_len(inputs: &[WorkerInput], cap: usize, byte_budget: usize) -> usize {
+    let mut bytes = 0usize;
+    let mut taken = 0usize;
+    for input in inputs.iter().take(cap.max(1)) {
+        bytes += estimate_input_bytes(input);
+        if taken > 0 && bytes > byte_budget {
+            break;
+        }
+        taken += 1;
+    }
+    taken.max(1)
 }
 
 /// Why the dispatcher loop ended.
@@ -244,11 +282,11 @@ pub(crate) async fn run_dispatcher(
                 ctx.registry_default_batch,
                 ctx.server_default_batch,
             );
-            let unit_counts: Vec<(usize, Option<u32>)> = queue
+            let unit_counts: Vec<(usize, usize, Option<u32>)> = queue
                 .iter()
-                .map(|request| (request.inputs.len(), request.max_batch))
+                .map(|request| (request.inputs.len(), request.payload_bytes, request.max_batch))
                 .collect();
-            let take = window_take_count(&unit_counts, cap);
+            let take = window_take_count(&unit_counts, cap, FRAME_INPUT_BYTES_BUDGET);
             let window: Vec<DispatchRequest> = queue.drain(..take).collect();
             let worker = free.pop().expect("checked non-empty");
             // Health counters (Relaxed stores; see ModelStats docs).
@@ -490,18 +528,19 @@ async fn run_batch_inner(
 }
 
 /// Dispatch a lone request, splitting it into sequential sub-batches of
-/// <= cap when it alone exceeds the cap (the worker never sees an oversized
-/// batch; outputs are reassembled in order). A [`WorkerError`] on any
-/// sub-batch fails the whole request (no fallback: there is nothing smaller
-/// than one request's sub-batch to fall back to, matching Python where an
-/// oversized message was processed individually and its error was final).
+/// <= cap units and <= the frame byte budget when it alone exceeds either
+/// (the worker never sees an oversized batch; outputs are reassembled in
+/// order). A [`WorkerError`] on any sub-batch fails the whole request (no
+/// fallback: there is nothing smaller than one request's sub-batch to fall
+/// back to, matching Python where an oversized message was processed
+/// individually and its error was final).
 async fn run_single(
     inference_id: &str,
     worker: &mut Worker,
     request: DispatchRequest,
     cap: usize,
 ) -> BatchOutcome {
-    if request.inputs.len() <= cap {
+    if request.inputs.len() <= cap && request.payload_bytes <= FRAME_INPUT_BYTES_BUDGET {
         return match worker.predict(&request.inputs).await {
             Ok(outputs) => {
                 let _ = request.reply.send(Ok(outputs));
@@ -522,11 +561,16 @@ async fn run_single(
 
     tracing::debug!(
         model = %inference_id,
-        "splitting a {}-unit request into sub-batches of <= {cap}",
-        request.inputs.len()
+        "splitting a {}-unit ({}-byte) request into sub-batches of <= {cap} units within the frame budget",
+        request.inputs.len(),
+        request.payload_bytes
     );
     let mut outputs = Vec::with_capacity(request.inputs.len());
-    for chunk in request.inputs.chunks(cap) {
+    let mut rest: &[WorkerInput] = &request.inputs;
+    while !rest.is_empty() {
+        let take = sub_batch_len(rest, cap, FRAME_INPUT_BYTES_BUDGET);
+        let (chunk, remainder) = rest.split_at(take);
+        rest = remainder;
         match worker.predict(chunk).await {
             Ok(mut chunk_outputs) => outputs.append(&mut chunk_outputs),
             Err(err) => {
@@ -638,17 +682,17 @@ mod tests {
     fn window_take_is_fifo_prefix_only() {
         // cap 8: 3 + 4 fit (7), the next 2 would exceed -> take 2, even
         // though the trailing 1-unit request would still fit.
-        assert_eq!(window_take_count(&capless(&[3, 4, 2, 1]), 8), 2);
+        assert_eq!(window_take_count(&capless(&[3, 4, 2, 1]), 8, usize::MAX), 2);
         // All fit exactly.
-        assert_eq!(window_take_count(&capless(&[2, 3, 3]), 8), 3);
+        assert_eq!(window_take_count(&capless(&[2, 3, 3]), 8, usize::MAX), 3);
     }
 
     /// At-least-one guarantee: a first request larger than the cap is taken
     /// alone (the dispatcher splits it into sub-batches); it never starves.
     #[test]
     fn oversized_first_request_taken_alone() {
-        assert_eq!(window_take_count(&capless(&[100, 1]), 8), 1);
-        assert_eq!(window_take_count(&capless(&[100]), 8), 1);
+        assert_eq!(window_take_count(&capless(&[100, 1]), 8, usize::MAX), 1);
+        assert_eq!(window_take_count(&capless(&[100]), 8, usize::MAX), 1);
     }
 
     /// Zero-unit requests merge trivially and an empty window takes
@@ -656,12 +700,51 @@ mod tests {
     /// function must not panic or loop).
     #[test]
     fn window_take_edge_cases() {
-        assert_eq!(window_take_count(&capless(&[]), 8), 0);
-        assert_eq!(window_take_count(&capless(&[0, 0, 3]), 3), 3);
+        assert_eq!(window_take_count(&capless(&[]), 8, usize::MAX), 0);
+        assert_eq!(window_take_count(&capless(&[0, 0, 3]), 3, usize::MAX), 3);
     }
 
-    fn capless(unit_counts: &[usize]) -> Vec<(usize, Option<u32>)> {
-        unit_counts.iter().map(|&count| (count, None)).collect()
+    /// The frame byte budget bounds admission independently of unit counts:
+    /// three 1-unit requests fit the cap, but the third would push the
+    /// payload estimate over the budget, so the window closes at two. A
+    /// first request alone over the budget is still taken (and split, or
+    /// refused per-request by the transport) — it must never starve.
+    #[test]
+    fn byte_budget_bounds_admission() {
+        let sized = |sizes: &[usize]| -> Vec<(usize, usize, Option<u32>)> {
+            sizes.iter().map(|&bytes| (1, bytes, None)).collect()
+        };
+        // 400 + 500 fit a 1000 budget; +200 would exceed.
+        assert_eq!(window_take_count(&sized(&[400, 500, 200]), 8, 1000), 2);
+        // An over-budget first request is taken alone.
+        assert_eq!(window_take_count(&sized(&[5000, 1]), 8, 1000), 1);
+        // The byte bound and the unit bound both apply: units would allow
+        // all three, bytes stop at two; and vice versa.
+        assert_eq!(window_take_count(&sized(&[400, 500, 50]), 2, 1000), 2);
+    }
+
+    /// `sub_batch_len` mirrors the admission rule for splitting one request:
+    /// bounded by units and bytes, never zero.
+    #[test]
+    fn sub_batch_len_bounds_units_and_bytes() {
+        let input = |bytes: usize| WorkerInput {
+            data: None,
+            file: Some(vec![0u8; bytes]),
+        };
+        let per_input_overhead = estimate_input_bytes(&input(0));
+        let inputs: Vec<WorkerInput> = (0..4).map(|_| input(300)).collect();
+        // Unit cap bounds the chunk.
+        assert_eq!(sub_batch_len(&inputs, 2, usize::MAX), 2);
+        // Byte budget bounds the chunk: two 300-byte payloads fit 700
+        // (plus overhead), the third does not.
+        let budget = 2 * (300 + per_input_overhead) + 10;
+        assert_eq!(sub_batch_len(&inputs, 8, budget), 2);
+        // A single over-budget input is still taken alone.
+        assert_eq!(sub_batch_len(&inputs, 8, 1), 1);
+    }
+
+    fn capless(unit_counts: &[usize]) -> Vec<(usize, usize, Option<u32>)> {
+        unit_counts.iter().map(|&count| (count, 0, None)).collect()
     }
 
     /// A request's own `max_batch` is a promise about the merged batch it may
@@ -674,18 +757,36 @@ mod tests {
     fn a_capped_request_is_never_merged_beyond_its_own_cap() {
         // The isolated unit queued behind a chunk: the chunk is taken, the
         // unit waits for its own window.
-        assert_eq!(window_take_count(&[(7, Some(8)), (1, Some(1))], 8), 1);
+        assert_eq!(
+            window_take_count(&[(7, 0, Some(8)), (1, 0, Some(1))], 8, usize::MAX),
+            1
+        );
         // And queued ahead of one: taken alone, the chunk must not join it.
-        assert_eq!(window_take_count(&[(1, Some(1)), (7, Some(8))], 8), 1);
+        assert_eq!(
+            window_take_count(&[(1, 0, Some(1)), (7, 0, Some(8))], 8, usize::MAX),
+            1
+        );
         // Two isolated units do not merge with each other either.
-        assert_eq!(window_take_count(&[(1, Some(1)), (1, Some(1))], 8), 1);
+        assert_eq!(
+            window_take_count(&[(1, 0, Some(1)), (1, 0, Some(1))], 8, usize::MAX),
+            1
+        );
         // Same-cap chunks still merge as before.
-        assert_eq!(window_take_count(&[(3, Some(8)), (4, Some(8))], 8), 2);
+        assert_eq!(
+            window_take_count(&[(3, 0, Some(8)), (4, 0, Some(8))], 8, usize::MAX),
+            2
+        );
         // A cap-less request (a search single) carries no opinion, but the
         // capped member's promise still bounds the merge.
-        assert_eq!(window_take_count(&[(1, Some(1)), (1, None)], 8), 1);
+        assert_eq!(
+            window_take_count(&[(1, 0, Some(1)), (1, 0, None)], 8, usize::MAX),
+            1
+        );
         // Non-positive caps carry no opinion, mirroring `effective_cap`.
-        assert_eq!(window_take_count(&[(2, Some(0)), (3, None)], 8), 2);
+        assert_eq!(
+            window_take_count(&[(2, 0, Some(0)), (3, 0, None)], 8, usize::MAX),
+            2
+        );
     }
 
     /// Splitting a merged window's outputs stays aligned when some slots are

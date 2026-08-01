@@ -1132,6 +1132,11 @@ input_mime_types     = ["video/", "audio/"]
 
 [group.clap.metadata.input_spec]
 handler = "audio_tracks"
+# CLAP's feature extractor only ever consumes ~10 s of audio per embedding,
+# so decoding whole multi-hour tracks is pure transport/decode waste (a raw
+# f32 mono track at 16 kHz is ~230 MiB/hour). Cap the decode at 10 minutes;
+# models that need the full track (e.g. whisper) simply do not set this.
+opts.max_duration = 600
 
 # --- Inference IDs for CLAP Audio Embeddings ---
 

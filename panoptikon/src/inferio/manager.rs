@@ -616,9 +616,11 @@ impl ModelManager {
             .await?
             .expect("ensure_loaded returns a sender when pinning");
         let (reply_tx, reply_rx) = oneshot::channel();
+        let payload_bytes = inputs.iter().map(super::worker::estimate_input_bytes).sum();
         let request = DispatchRequest {
             inputs,
             max_batch,
+            payload_bytes,
             reply: reply_tx,
         };
         let result = if tx.send(DispatchMsg::Predict(request)).is_err() {

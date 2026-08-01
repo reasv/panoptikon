@@ -422,7 +422,20 @@ Gateway-native prepare stages classify directly (they are the pipeline):
 | HTML screenshot | launch/timeout/exit | input | 2 |
 | worker typed error slot | per-item decode | input | 1 |
 | batch-1 classified OOM (GPU-compat) | resource limit | resource | 1 |
+| single input over the transport frame budget (pre-send) | resource limit | resource | 1 |
 | anything unclassified | — | transient | — |
+
+The frame-budget row (added 2026-08-01, from the CLAP whole-track field
+failure): one input is the smallest unit a predict can be split into, so a
+single input over `FRAME_INPUT_BYTES_BUDGET` can never be inferred on this
+machine no matter how it is batched — a deterministic per-machine verdict,
+settled in `prepare_item` before any predict is attempted. Without it the
+refusal surfaced as a generic predict 500 (typing lost over the HTTP hop),
+classified transient, and re-failed the job on every run. The same change
+made the transport refusal itself non-fatal (WorkerError, worker stays
+alive), raised the frame limit to 2 GiB, and made dispatcher batch
+admission and sub-batch splitting byte-aware so merged windows can never
+assemble an unencodable frame.
 
 Note the reclassification of pdfium/browser-missing from today's
 "hard-fail, retry every run forever" to `blocked`: with the ledger, a

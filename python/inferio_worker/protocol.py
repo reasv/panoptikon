@@ -12,8 +12,10 @@ from typing import Any, BinaryIO
 import msgpack
 
 PROTOCOL_VERSION = 2
-# Max frame size 512 MiB; a larger declared length is a fatal protocol error.
-MAX_FRAME_BYTES = 0x2000_0000
+# Max frame size 2 GiB (must stay below the u32 length-prefix ceiling);
+# a larger declared length is a fatal protocol error. Mirrors
+# MAX_FRAME_BYTES in panoptikon/src/inferio/worker.rs.
+MAX_FRAME_BYTES = 0x8000_0000
 
 
 class ProtocolError(Exception):
