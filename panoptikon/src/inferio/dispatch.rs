@@ -29,8 +29,8 @@
 //!   a lone over-budget request is split across frames ([`frame_chunks`]). When
 //!   the requests carry a user cap the window is additionally bounded in items,
 //!   to the same batch depth the unit budget uses ([`priced_item_bound`]).
-//! - **Unpriced path** (`none`-class models, CPU/MPS hosts, any host with no
-//!   GPU inventory, a board outside the enumeration): there is no worker-side
+//! - **Unpriced path** (`none`-class models, any host with no inventory, a
+//!   board outside the enumeration): there is no worker-side
 //!   packer, so the frame the worker receives *is* the GPU batch. Every frame is
 //!   bounded in **items** by `min(user cap, ctx.unpriced_window_items)` —
 //!   including a merged window's, not just an oversized lone request's — minus

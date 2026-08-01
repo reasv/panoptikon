@@ -62,11 +62,17 @@
 //! `GPU-…`/`MIG-…` UUID in `devices` bypasses the mapping and is passed to
 //! `CUDA_VISIBLE_DEVICES` verbatim, which is the unambiguous form to write
 //! (on ROCm the same string is a board *key* and is translated, never
-//! written — see below). When the GPU inventory is unknown (no nvidia-smi:
-//! CPU/MPS hosts, or an ambient visibility restriction that names indices)
-//! the string is passed through raw exactly as it was before pinning
-//! existed — no mapping, no new environment variables, no behaviour change
-//! on those hosts.
+//! written — see below). When the GPU inventory is unknown (no nvidia-smi, or
+//! an ambient visibility restriction that names indices) the string is passed
+//! through raw exactly as it was before pinning existed — no mapping, no new
+//! environment variables, no behaviour change on those hosts. **MPS and CPU
+//! hosts are a different answer, not that one**: they have a known inventory
+//! and no pin vocabulary at all — one Metal device with no variable that
+//! names it, or no device — so a `devices` entry there is *dropped* with a
+//! warning rather than passed through, since anything written into a
+//! visibility variable could only hide something. Their board keys still
+//! resolve, so per-board budgets and load reservations work as anywhere else
+//! (docs/unified-memory-admission.md).
 //!
 //! On a ROCm host the vocabulary flips (docs/rocm-batch-calibration-parity.md,
 //! D2): the pin is written to `HIP_VISIBLE_DEVICES`, which accepts **device

@@ -85,9 +85,12 @@ pub struct ManagerConfig {
     /// How worker processes are spawned (python, impl dirs, env, deadlines).
     pub spawn: WorkerSpawnConfig,
     /// Fixed batch size for the **unpriced** dispatch path (`none`-class
-    /// models, CPU/MPS hosts, hosts with no GPU inventory), used when the
-    /// registry declares no `default_batch_size`. Priced models are sized by
-    /// the VRAM ledger instead — this is no longer a safety cap.
+    /// models, hosts with no inventory at all), used when the registry
+    /// declares no `default_batch_size`. Priced models are sized by the VRAM
+    /// ledger instead — this is no longer a safety cap. Note the path is
+    /// narrower than it once was: MPS and CPU hosts have admission boards of
+    /// their own (docs/unified-memory-admission.md), so a host reaches this
+    /// only when its inventory could not be built.
     pub default_max_batch: u32,
     /// TTL sweeper period (Python: 10 s).
     pub sweep_interval: Duration,
@@ -212,8 +215,10 @@ impl From<CostDimension> for CostHealth {
 }
 
 /// Per-replica GPU placement plus its freshest memory report. Every field
-/// after `gpu` is `null` until the worker reports it (no torch, CPU/MPS
-/// host, or no predict yet).
+/// after `gpu` is `null` until the worker reports it (no torch, a remote-API
+/// impl, or no predict yet). A CPU or MPS host does report: its figures are
+/// denominated in system RAM and Metal's budget respectively, not in VRAM
+/// (docs/unified-memory-admission.md).
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ReplicaTelemetryHealth {
     /// Resolved device pin the worker was *spawned* with — a board UUID on a

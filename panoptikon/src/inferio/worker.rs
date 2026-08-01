@@ -608,7 +608,6 @@ fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Comma
     for key in &cfg.env_remove {
         command.env_remove(key);
     }
-    warn_on_visibility_overrides(cfg, device);
     if let Some(cwd) = &cfg.cwd {
         command.current_dir(cwd);
     }
@@ -624,11 +623,11 @@ fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Comma
     Ok(command)
 }
 
-/// One line when a worker's own env config touches a GPU-visibility
-/// variable, because that config is applied *after* the pin and therefore
-/// silently outranks it.
+/// One line when a worker's own env config touches a variable that decides
+/// *where the model runs*, because that config is applied last and therefore
+/// silently outranks what the orchestrator wrote.
 ///
-/// Two shapes of collision, both worth the same warning. An entry for the
+/// Three shapes of collision, all worth the same warning. An entry for the
 /// variable the pin was written to replaces the pin outright (or, via
 /// `env_remove`, deletes it, leaving the worker whatever the gateway
 /// inherited). An entry for a *different* visibility variable does not
@@ -636,24 +635,28 @@ fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Comma
 /// precedence — `HIP_VISIBLE_DEVICES` over its `CUDA_VISIBLE_DEVICES` alias,
 /// both indexing into whatever `ROCR_VISIBLE_DEVICES` already filtered — so
 /// the boards the worker ends up on are not necessarily the ones the pin
-/// named. Neither case is an error: an operator may well mean it. It is
-/// simply the one env interaction whose symptom (a model running on the
-/// wrong board, or on the CPU) points nowhere near its cause.
+/// named. And an entry for [`DEVICE_ENV_VAR`] moves the device coherence
+/// marker itself (docs/unified-memory-admission.md, backend C): it is what
+/// `get_device()` honours and what the worker measures its memory currency
+/// from, so a model config that sets or deletes it can put the impl on a
+/// device the ledger is not pricing — on a CPU-priced host, the exact hole
+/// the marker exists to close. Neither case is an error: an operator may well
+/// mean it. It is simply the one env interaction whose symptom (a model
+/// running on the wrong board, or on the CPU) points nowhere near its cause.
 ///
 /// One line per spawn, listing every colliding variable, and only when there
-/// is a collision to report.
-fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, device: Option<&str>) {
-    let overrides: Vec<&str> = super::rocm::VISIBILITY_VARS
-        .into_iter()
-        .filter(|var| {
-            let set = cfg.env.iter().any(|(key, _)| key.eq_ignore_ascii_case(var));
-            let removed = cfg
-                .env_remove
-                .iter()
-                .any(|key| key.eq_ignore_ascii_case(var));
-            set || removed
-        })
-        .collect();
+/// is a collision to report. Called from [`Worker::spawn_configured`] rather
+/// than from [`worker_command`], because that is the only place the *model's*
+/// own entries are still distinguishable from the orchestrator's — see
+/// [`colliding_device_variables`]. A pooled worker
+/// ([`Worker::spawn`], `prewarm.rs`) is spawned by impl class with no model
+/// env at all, so there is nothing there for this to report.
+fn warn_on_visibility_overrides(
+    cfg: &WorkerSpawnConfig,
+    spec: &SpawnSpec,
+    device: Option<&str>,
+) {
+    let overrides = colliding_device_variables(cfg, spec);
     if overrides.is_empty() {
         return;
     }
@@ -665,17 +668,19 @@ fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, device: Option<&str>) {
     // exactly the state that makes a later "why is this model on the wrong
     // card" impossible to trace.
     let message = if device.is_some() {
-        "this worker's env config sets or removes a GPU-visibility variable; \
-         it is applied after the device pin, so an entry naming the pin's own \
+        "this worker's env config sets or removes a device-selection variable \
+         (a GPU-visibility one, or the INFERIO_DEVICE coherence marker); it is \
+         applied after the device pin, so an entry naming the pin's own \
          variable replaces (or deletes) the pin, and an entry naming another \
          one is resolved against it by the runtime's own precedence — either \
          way the worker may not end up on the board it was pinned to"
     } else {
-        "this worker's env config sets or removes a GPU-visibility variable \
-         while no device pin was written for this replica; the entry alone \
-         therefore decides which boards the worker can see, and the \
-         orchestrator's ledger is pricing it against whatever board it \
-         reports rather than one it placed it on"
+        "this worker's env config sets or removes a device-selection variable \
+         (a GPU-visibility one, or the INFERIO_DEVICE coherence marker) while \
+         no device pin was written for this replica; the entry alone \
+         therefore decides where the model runs, and the orchestrator's \
+         ledger is pricing it against the board it believes rather than one \
+         it placed it on"
     };
     tracing::warn!(
         variables = overrides.join(", "),
@@ -683,6 +688,42 @@ fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, device: Option<&str>) {
         pin = device.unwrap_or("(none)"),
         "{message}"
     );
+}
+
+/// The device-selection variables this spawn's *model configuration* touches,
+/// in a fixed order. Pure, so the decision is testable without a subscriber.
+///
+/// The two families are read from different places, and that asymmetry is the
+/// whole point of splitting this out:
+///
+/// - the **visibility** variables are read from the merged spawn env
+///   (`cfg`), which is where they have always been read from. Nothing the
+///   orchestrator writes is one of them — `accelerator_env::worker_env`
+///   emits HIP/MIOpen paths, the MPS watermarks and the device marker, and
+///   `for_unified_board` emits a PCI address — so every hit there is the
+///   model's anyway, and reading the merged view additionally catches one
+///   arriving by some future route;
+/// - [`DEVICE_ENV_VAR`](crate::accelerator_env::DEVICE_ENV_VAR) is read from
+///   the **model spec alone**, because the orchestrator writes it itself on
+///   every worker of a CPU-priced host. Filtering the merged env for it would
+///   fire on every single spawn on such a host and blame the operator's model
+///   config for the orchestrator's own entry — a warning that is not merely
+///   noise but actively misleading, since it names the one variable whose
+///   whole purpose is that the orchestrator controls it.
+fn colliding_device_variables(cfg: &WorkerSpawnConfig, spec: &SpawnSpec) -> Vec<&'static str> {
+    let touched = |env: &[(String, String)], removed: &[String], var: &str| {
+        env.iter().any(|(key, _)| key.eq_ignore_ascii_case(var))
+            || removed.iter().any(|key| key.eq_ignore_ascii_case(var))
+    };
+    let mut overrides: Vec<&'static str> = super::rocm::VISIBILITY_VARS
+        .into_iter()
+        .filter(|var| touched(&cfg.env, &cfg.env_remove, var))
+        .collect();
+    let marker = crate::accelerator_env::DEVICE_ENV_VAR;
+    if touched(&spec.env, &spec.env_remove, marker) {
+        overrides.push(marker);
+    }
+    overrides
 }
 
 impl Worker {
@@ -797,6 +838,11 @@ impl Worker {
         let mut spawn_cfg = cfg.clone();
         spawn_cfg.env.extend(spec.env.clone());
         spawn_cfg.env_remove.extend(spec.env_remove.clone());
+        // Before the merge is out of sight: this is the only place the
+        // model's own entries are still separable from the orchestrator's,
+        // which one of the two families the warning covers depends on
+        // ([`colliding_device_variables`]).
+        warn_on_visibility_overrides(&spawn_cfg, spec, device.as_deref());
         let mut worker = Self::spawn(&spawn_cfg, &spec.impl_class, device)
             .await
             .with_context(|| format!("failed to spawn inferio worker for {inference_id}"))?;
@@ -857,8 +903,10 @@ impl Worker {
     /// The response may carry the base measurement and a memory sample
     /// (protocol doc, "Memory sensing"); both are recorded in the shared
     /// [`WorkerTelemetry`] and acted on by nobody yet. A worker that reports
-    /// nothing (no torch, CPU/MPS host, remote-API impl) leaves the
-    /// telemetry untouched.
+    /// nothing (no torch, a remote-API impl) leaves the telemetry untouched —
+    /// which no longer includes CPU and MPS hosts, whose workers report in
+    /// system-RAM and Metal-budget currency respectively
+    /// (docs/unified-memory-admission.md).
     pub async fn load(&mut self) -> Result<()> {
         let deadline = self.deadlines.load;
         let payload = self
@@ -921,10 +969,11 @@ impl Worker {
     /// With one, the worker's packing harness splits the inputs into several
     /// GPU batches within the budget and reports one measurement per batch;
     /// without one, the whole array goes to a single `instance.predict` call,
-    /// which is the permanent compatibility path for `none`-class models,
-    /// CPU/MPS hosts and any host with no GPU inventory. `fit` rides along
-    /// only when the fitted cost model moved since the last frame to this
-    /// worker.
+    /// which is the permanent compatibility path for `none`-class models and
+    /// any host with no inventory at all (CPU and MPS hosts have admission
+    /// boards of their own and do get grants —
+    /// docs/unified-memory-admission.md). `fit` rides along only when the
+    /// fitted cost model moved since the last frame to this worker.
     pub async fn predict(
         &mut self,
         inputs: &[WorkerInput],
@@ -1930,6 +1979,106 @@ mod tests {
             marker(&rocm, None),
             None,
             "no pin, no marker — an unpinned replica was placed by nobody"
+        );
+    }
+
+    /// The device-override warning fires on the **model's** configuration and
+    /// never on the orchestrator's own entries.
+    ///
+    /// The regression this pins down: `INFERIO_DEVICE` is written by
+    /// `accelerator_env::worker_env` on every worker of a CPU-priced host and
+    /// then merged with the model's env before the spawn, so a check against
+    /// the merged view warned on *every single spawn* on such a host — and
+    /// blamed the operator's model config for the one variable the
+    /// orchestrator is supposed to own.
+    #[test]
+    fn the_device_override_warning_reads_the_models_own_env() {
+        use crate::accelerator_env::DEVICE_ENV_VAR;
+        use crate::inferio::gpu::CUDA_PIN_ENV_VAR;
+
+        /// A spawn config as `http.rs` builds one, plus the model's entries
+        /// merged on top exactly as `spawn_configured` merges them.
+        fn merged(host_env: Vec<(String, String)>, spec: &SpawnSpec) -> WorkerSpawnConfig {
+            let mut cfg = WorkerSpawnConfig {
+                python: PathBuf::from("python"),
+                impl_dirs: Vec::new(),
+                pythonpath: Vec::new(),
+                env: host_env,
+                env_remove: Vec::new(),
+                cwd: None,
+                deadlines: WorkerDeadlines::default(),
+                pin_env_var: CUDA_PIN_ENV_VAR,
+            };
+            cfg.env.extend(spec.env.clone());
+            cfg.env_remove.extend(spec.env_remove.clone());
+            cfg
+        }
+
+        let cpu_host = || vec![(DEVICE_ENV_VAR.to_owned(), "cpu".to_owned())];
+
+        // (a) A CPU host and a model that configures nothing: the marker in
+        // the merged env is ours, so there is nothing to report.
+        let plain = spec("echo_test");
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &plain), &plain),
+            Vec::<&str>::new(),
+            "the orchestrator's own marker must not warn about itself"
+        );
+
+        // (b) The model setting it *is* the collision, on any host — with or
+        // without the orchestrator's entry underneath.
+        let mut overriding = spec("echo_test");
+        overriding
+            .env
+            .push((DEVICE_ENV_VAR.to_owned(), "cuda".to_owned()));
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &overriding), &overriding),
+            vec![DEVICE_ENV_VAR]
+        );
+        assert_eq!(
+            colliding_device_variables(&merged(Vec::new(), &overriding), &overriding),
+            vec![DEVICE_ENV_VAR]
+        );
+        // Deleting it is the same collision: the worker then probes the
+        // hardware and can land off the board it is priced against.
+        let mut deleting = spec("echo_test");
+        deleting.env_remove.push(DEVICE_ENV_VAR.to_owned());
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &deleting), &deleting),
+            vec![DEVICE_ENV_VAR]
+        );
+        // Matched case-insensitively, like every other env comparison here.
+        let mut lower = spec("echo_test");
+        lower.env.push(("inferio_device".to_owned(), "cuda".to_owned()));
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &lower), &lower),
+            vec![DEVICE_ENV_VAR]
+        );
+
+        // (c) The visibility arm is unchanged: still read from the merged
+        // env, still every variant, still in `VISIBILITY_VARS` order — and it
+        // is never the orchestrator's, which writes no visibility variable
+        // through `env` at all.
+        let mut visible = spec("echo_test");
+        visible
+            .env
+            .push(("CUDA_VISIBLE_DEVICES".to_owned(), "0".to_owned()));
+        visible.env_remove.push("ROCR_VISIBLE_DEVICES".to_owned());
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &visible), &visible),
+            vec!["ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"],
+        );
+        // Both families at once, marker last.
+        let mut both = visible.clone();
+        both.env
+            .push((DEVICE_ENV_VAR.to_owned(), "cuda".to_owned()));
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &both), &both),
+            vec![
+                "ROCR_VISIBLE_DEVICES",
+                "CUDA_VISIBLE_DEVICES",
+                DEVICE_ENV_VAR
+            ]
         );
     }
 

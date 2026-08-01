@@ -145,12 +145,15 @@ libc = "0.2"
 # console signal path (CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW).
 # Win32_Storage_FileSystem + Win32_System_IO: LockFileEx for the advisory
 # lock serializing concurrent setup runs (setup.rs).
+# Win32_System_SystemInformation: GlobalMemoryStatusEx, the host's RAM total
+# and availability for the CPU admission board (inferio/cpu.rs).
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 # Extraction of the pinned uv standalone build (setup.rs): zip on Windows.

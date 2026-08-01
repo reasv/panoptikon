@@ -47,8 +47,11 @@
 //! charging `base` alone would hand a resident's retained pool out to
 //! neighbours, since releasing a grant returns nothing physically until
 //! `empty_cache()`. A worker with no reported base — CTranslate2, remote
-//! APIs, CPU hosts — contributes only pool growth, which for those is zero,
-//! and its real VRAM lands in `external` by design.
+//! APIs — contributes only pool growth, which for those is zero, and its real
+//! VRAM lands in `external` by design. (A **CPU** host is not in that list
+//! any more: since backend C its workers report `base_method: "rss"` and a
+//! pool of their own, both denominated in resident memory rather than VRAM —
+//! docs/unified-memory-admission.md.)
 //!
 //! **Growth is never extrapolation.** A grant's unit budget is bounded by
 //! the geometric ramp (`seed × 2^k`, one doubling per clean window) *and* by
@@ -390,6 +393,48 @@ impl From<VramBudget> for VramBudgets {
     fn from(budget: VramBudget) -> Self {
         Self::uniform(budget)
     }
+}
+
+/// Apply the **shipped** per-board defaults this inventory implies, leaving
+/// every configured value alone.
+///
+/// One rule today (DP-8): a **CPU board ships with `cap_fraction = 0.75`**
+/// where every other board ships with the cap off. The lever is not new and
+/// nothing about how it composes changes; what is new is that one kind of
+/// board has a non-`None` default for it, because running the machine out of
+/// RAM is answered by the OS killing a process — a SIGKILL nothing can catch,
+/// which DP-2 can only record after the fact, and which may not even land on
+/// the replica that caused it. Margin alone prices *other* processes; this
+/// keeps a quarter of the machine out of the budget regardless.
+///
+/// "Leaving configured values alone" is the whole of the override rule: the
+/// default is applied only where the resolved `cap_fraction` is `None`, so
+/// both `[inference_local.vram] cap_fraction` and
+/// `[inference_local.vram.gpu."CPU"] cap_fraction` win — and on a CPU host
+/// they are the same statement anyway, since the CPU board is the only board.
+/// Absence tracking the constant is what makes this a serde-defaults-layer
+/// change rather than a line frozen into every user's shipped TOML.
+fn with_shipped_board_defaults(
+    inventory: &GpuInventory,
+    mut budgets: VramBudgets,
+) -> VramBudgets {
+    if !inventory.prices_host_ram() {
+        return budgets;
+    }
+    for gpu in inventory.gpus().unwrap_or(&[]) {
+        let configured = budgets.for_board(&gpu.uuid);
+        if configured.cap_fraction.is_some() {
+            continue;
+        }
+        budgets = budgets.with_board(
+            gpu.uuid.clone(),
+            VramBudget {
+                cap_fraction: Some(super::cpu::DEFAULT_CAP_FRACTION),
+                ..configured
+            },
+        );
+    }
+    budgets
 }
 
 /// One high-water fit sample: batch units against the driver-currency pool
@@ -954,8 +999,15 @@ struct FreeSample {
 /// the worker's sample read the same statistics under the same label, so the
 /// consistency rule holds there as it does on ROCm
 /// (docs/unified-memory-admission.md, backend A).
+/// `"ram"` is the same thing again on a host with no accelerator at all
+/// (backend C), where the machine's RAM statistics are not merely the best
+/// whole-device reading but the *only* one there is: `pool_free` does not
+/// exist, so `free = ram_available` and both sides read it from the OS.
 fn free_source_is_authoritative(source: &str) -> bool {
-    matches!(source, "nvml" | "nvidia-smi" | "amdgpu-sysfs" | "mps")
+    matches!(
+        source,
+        "nvml" | "nvidia-smi" | "amdgpu-sysfs" | "mps" | "ram"
+    )
 }
 
 struct GpuLedger {
@@ -1003,6 +1055,11 @@ struct GpuLedger {
 
 #[derive(Default)]
 struct LedgerState {
+    /// Whether a worker's own total-memory report may replace this host's
+    /// board total (DP-4), from `GpuInventory::adopts_worker_total` — i.e.
+    /// MPS and nothing else. A host fact rather than a per-board one, because
+    /// it is a property of *which interface read the total*, not of a board.
+    adopts_worker_total: bool,
     gpus: HashMap<String, GpuLedger>,
     workers: HashMap<WorkerId, WorkerEntry>,
     calibration: HashMap<(String, String), ModelCalibration>,
@@ -1335,6 +1392,7 @@ impl VramLedger {
         budgets: VramBudgets,
         profiles: Option<Arc<dyn CalibrationProfiles>>,
     ) -> Arc<Self> {
+        let budgets = with_shipped_board_defaults(inventory, budgets);
         let gpus = inventory
             .gpus()
             .unwrap_or(&[])
@@ -1362,6 +1420,7 @@ impl VramLedger {
             budgets,
             profiles,
             state: StdMutex::new(LedgerState {
+                adopts_worker_total: inventory.adopts_worker_total(),
                 gpus,
                 ..LedgerState::default()
             }),
@@ -1796,15 +1855,24 @@ impl VramLedger {
     /// A report carrying positive evidence of some other device is not this
     /// board's total, whatever else is true.
     ///
-    /// The address condition is what keeps this an MPS mechanism. A unified
-    /// **ROCm** board (an APU) has an address, and its total is read from
-    /// amdgpu's own counters rather than being a policy number only the
-    /// worker can see — while what HIP reports for it may well be the BIOS
-    /// carve-out, a figure that passes the sanity bound and would replace a
-    /// 96 GB budget with 512 MB. Adoption is for the board whose real total
-    /// *nothing else can read*; the APU is instead cross-checked against
-    /// either figure (see [`Self::cross_check_total`]).
+    /// The backend condition is what keeps this an MPS mechanism, and the
+    /// address condition backs it up. A unified **ROCm** board (an APU) has
+    /// an address, and its total is read from amdgpu's own counters rather
+    /// than being a policy number only the worker can see — while what HIP
+    /// reports for it may well be the BIOS carve-out, a figure that passes
+    /// the sanity bound and would replace a 96 GB budget with 512 MB. A
+    /// **CPU** board matches every structural condition here — one board, no
+    /// address, a worker reporting neither UUID nor BDF — and must still not
+    /// adopt: its total is physical RAM, read from the kernel at probe time,
+    /// and the worker's psutil figure is a second reading of that same fact
+    /// rather than new information (`GpuInventory::adopts_worker_total`).
+    /// Adoption is for the board whose real total *nothing else can read*;
+    /// the APU is instead cross-checked against either figure (see
+    /// [`Self::cross_check_total`]), and the CPU board against the one.
     fn adopt_unified_total_locked(state: &mut LedgerState, report: &LoadReport) -> Option<BoardLog> {
+        if !state.adopts_worker_total {
+            return None;
+        }
         let reported = report.gpu_total_mb?;
         if state.gpus.len() != 1 || report.gpu_uuid.is_some() || report.gpu_bdf.is_some() {
             return None;
@@ -3774,6 +3842,14 @@ impl VramLedger {
             budgets: budgets.into(),
             profiles,
             state: StdMutex::new(LedgerState {
+                // The MPS fixtures below build their unified board through
+                // this constructor, so adoption has to be on by default here;
+                // it is inert on every other test board (a discrete one
+                // carries no `unified_ram_mb` for the adoption path to read).
+                // The CPU board's exclusion is tested through
+                // `VramLedger::new` over a real CPU inventory, which is where
+                // production sets this.
+                adopts_worker_total: true,
                 gpus,
                 ..LedgerState::default()
             }),
@@ -7309,6 +7385,199 @@ mod tests {
         let worker = &unified.health()[0].workers[0];
         assert_eq!(worker.deflation, 0, "an abort is not a death");
         assert_eq!(worker.max_units_measured, 16);
+    }
+
+    // ------------------------------------------------------------------
+    // Unified boards: CPU-only hosts (docs/unified-memory-admission.md,
+    // backend C — DP-7 and DP-8)
+    // ------------------------------------------------------------------
+
+    /// A 64 GiB box as its kernel counts it.
+    const CPU_RAM_MB: u64 = 64 * 1024 - 700;
+
+    /// The ledger a CPU-only host gets, built through the production
+    /// constructor over a real CPU inventory — which is the point: the cap
+    /// default and the adoption scope are both things `VramLedger::new`
+    /// derives from the inventory, so a hand-built fixture would test
+    /// neither.
+    fn cpu_ledger(budgets: impl Into<VramBudgets>) -> Arc<VramLedger> {
+        VramLedger::new(
+            &crate::inferio::gpu::GpuInventory::known_cpu(CPU_RAM_MB),
+            budgets.into(),
+            None,
+        )
+    }
+
+    /// A CPU worker's load report: no UUID and no PCI address (there is no
+    /// board), `psutil`'s RAM total as `gpu_total_mb`, and the RSS-derived
+    /// base.
+    fn loaded_cpu(total_mb: Option<u64>) -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("rss".to_owned()),
+            reserved_at_load_mb: Some(0),
+            gpu_name: Some("CPU (64 GB)".to_owned()),
+            gpu_total_mb: total_mb,
+            torch_version: Some("2.7.1".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    /// DP-8: the CPU board ships with a hard ceiling at 75 % of RAM, where
+    /// every other board ships with the cap off. Running the machine out of
+    /// RAM is an OS process kill, not a catchable allocation failure, so
+    /// margin alone — which prices only what *other* processes hold — is not
+    /// the whole answer.
+    #[test]
+    fn the_cpu_board_ships_with_a_default_ceiling() {
+        let cpu = cpu_ledger(no_margin());
+        let board = &cpu.health()[0];
+        assert_eq!(board.gpu_uuid, "CPU");
+        assert_eq!(board.gpu_name, "CPU (64 GB)");
+        assert_eq!(board.total_mb, CPU_RAM_MB, "the total is RAM itself");
+        assert_eq!(board.cap_fraction, Some(0.75));
+        assert_eq!(
+            board.limit_mb,
+            (CPU_RAM_MB as f64 * 0.75).floor() as u64,
+            "with no external usage the cap is what binds"
+        );
+
+        // A discrete board is untouched: the default is per-backend, not a
+        // new global.
+        assert_eq!(ledger(100_000, no_margin()).health()[0].cap_fraction, None);
+    }
+
+    /// …and it is a *default*, so a configured value wins — from the
+    /// per-board override and from the section-wide one alike, which on a CPU
+    /// host are the same statement because the CPU board is the only board.
+    #[test]
+    fn a_configured_ceiling_overrides_the_cpu_default() {
+        let per_board = cpu_ledger(VramBudgets::uniform(VramBudget {
+            margin: 0.0,
+            cap_fraction: None,
+        })
+        .with_board(
+            "CPU",
+            VramBudget {
+                margin: 0.0,
+                cap_fraction: Some(0.5),
+            },
+        ));
+        assert_eq!(per_board.health()[0].cap_fraction, Some(0.5));
+
+        let section_wide = cpu_ledger(VramBudget {
+            margin: 0.0,
+            cap_fraction: Some(1.0),
+        });
+        assert_eq!(
+            section_wide.health()[0].cap_fraction,
+            Some(1.0),
+            "a user who asked for the whole machine gets the whole machine"
+        );
+        assert_eq!(section_wide.health()[0].limit_mb, CPU_RAM_MB);
+    }
+
+    /// The registration join on a CPU host is the single-board fallback, and
+    /// the cross-check it runs is against physical RAM — which is what
+    /// `psutil.virtual_memory().total` reports on every platform we ship to
+    /// (it reads `MemTotal` on Linux and `GlobalMemoryStatusEx`'s
+    /// `ullTotalPhys` on Windows, i.e. the orchestrator's own sources), so
+    /// the two agree exactly and the tolerance is slack rather than load-
+    /// bearing.
+    #[test]
+    fn a_cpu_worker_registers_against_the_ram_board() {
+        let ledger = cpu_ledger(no_margin());
+        let handle = loaded_cpu(Some(CPU_RAM_MB));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted under the only board there is");
+        assert_eq!(admitted_board(&ledger, 0), ("CPU".to_owned(), "g/a".to_owned()));
+
+        // A report describing some *other* machine's memory is refused, as on
+        // every other backend.
+        let foreign = cpu_ledger(no_margin());
+        assert!(
+            foreign
+                .register_worker("g/a", item_cost(4), &loaded_cpu(Some(8192)), None)
+                .is_none(),
+            "8 GB is not this 64 GB machine"
+        );
+    }
+
+    /// DP-4's adoption is an **MPS** mechanism, and a CPU board matches every
+    /// structural condition it has — one board, unified, no PCI address, and
+    /// a worker reporting neither UUID nor address. What keeps it out is the
+    /// backend: this total came from the kernel at probe time, so a worker's
+    /// psutil figure is a second reading of a settled fact, not the only
+    /// reading there is.
+    #[test]
+    fn a_cpu_boards_total_is_never_adopted_from_a_worker() {
+        let ledger = cpu_ledger(no_margin());
+        // Inside the sanity bound `(0, RAM]`, and far outside the cross-check
+        // tolerance — the exact shape that re-adopts on MPS.
+        let handle = loaded_cpu(Some(CPU_RAM_MB / 2));
+        assert!(
+            ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .is_none(),
+            "a report that disagrees with the board is refused, not adopted"
+        );
+        assert_eq!(
+            ledger.health()[0].total_mb,
+            CPU_RAM_MB,
+            "the machine's RAM is not a number a worker gets to move"
+        );
+    }
+
+    /// DP-2 on the board it was really written for: an OOM-killed worker is a
+    /// SIGKILL nothing in-process can catch, so a death with a granted window
+    /// in flight is the only memory signal a CPU host has.
+    #[test]
+    fn a_death_mid_window_deflates_the_cpu_board() {
+        let ledger = cpu_ledger(no_margin());
+        let handle = loaded_cpu(Some(CPU_RAM_MB));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
+        measured_window(&handle, &admission, 16);
+        assert_eq!(ledger.health()[0].workers[0].max_units_measured, 16);
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::WorkerDied);
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.deflation, 1, "the dying replica is deflated");
+        assert_eq!(
+            worker.max_units_measured, 8,
+            "and the halved anchor outlives it, which is what the respawned \
+             replica is floored at"
+        );
+    }
+
+    /// The worker's `"ram"` samples are **authoritative**: they are the OS's
+    /// own whole-machine statistics, and on this backend they are the only
+    /// reading there is, so external pressure has to be derived from them.
+    #[test]
+    fn a_ram_sample_prices_external_pressure() {
+        let ledger = cpu_ledger(no_margin());
+        let handle = loaded_cpu(Some(CPU_RAM_MB));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        // A browser eating most of the machine shows up exactly the way a
+        // game eating VRAM does on a dGPU.
+        push_memory_with_total(&handle, 8_192, 0, Some(CPU_RAM_MB), "ram");
+        ledger.ingest_all_for_test();
+        let board = &ledger.health()[0];
+        assert!(board.external_known);
+        assert_eq!(
+            board.external_mb,
+            CPU_RAM_MB - 8_192 - 1000,
+            "total − free − our own base"
+        );
     }
 
     /// A grant and the pool growth it produces are the **same memory**: a

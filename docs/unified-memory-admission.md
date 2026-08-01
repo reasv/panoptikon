@@ -1,19 +1,26 @@
 # Unified-memory admission: MPS, AMD APUs, CPU
 
-**Status: DECIDED 2026-08-01. Step 1 (backend A: MPS) implemented the same
-day** — the accelerator identity and resolution, the synthetic unified board
+**Status: IMPLEMENTED 2026-08-01, all three backends.** Step 1 (backend A:
+MPS) — the accelerator identity and resolution, the synthetic unified board
 and its refresh, the worker's MPS memory tiers, DP-2, DP-3, DP-4, the
 spawner's watermark, the widened OOM classifier and the trim extension.
-**Step 2 (backend B: AMD APUs) implemented 2026-08-01** — the probe's APU
+Step 2 (backend B: AMD APUs) — the probe's APU
 decline replaced by a priced unified board, the GTT-inclusive total/free
 readings on both sides, DP-5's spawner signal (an address the worker
 verifies, not a flag it trusts), DP-6's name and the either-of registration
 cross-check (see "As implemented" under backend B for the decisions this doc
-did not pin down). Backend C (CPU) is not implemented, and
-neither is the README support-matrix table under "What stays unpriced".
+did not pin down). Step 3 (backend C: CPU) — the constant-keyed RAM board and
+its per-platform readers, DP-7, DP-8's default ceiling, the worker's
+`"ram"`/`"rss"` tiers, and the `INFERIO_DEVICE` device-coherence marker (see
+"As implemented" under backend C, above all for *when* the CPU board exists).
+The README support-matrix table under "What stays unpriced" now exists too,
+in `panoptikon/README.md` beside the VRAM-budget reference.
 Everything MPS-specific is covered by fixtures only: no Apple hardware exists
 on the dev box and CI has no Macs yet, so the field-pass list at the end
 stands in full — and the same is true of every APU claim, for the same reason.
+The CPU backend is the one that *is* exercised on real hardware, on every
+platform CI runs, since every developer box qualifies as a CPU host the moment
+its configured accelerator resolves to `cpu`.
 Extends
 `docs/batch-calibration-design.md` (the ledger/grant/calibration
 machinery) and `docs/rocm-batch-calibration-parity.md` (the sysfs-first
@@ -452,6 +459,122 @@ carrying a footnote forever, and the footnote is the whole complaint.
   and `get_device()` honours it first. This closes the same hole for
   "CPU host that happens to have an NVIDIA card".
 
+### As implemented (2026-08-01)
+
+- **When the CPU board exists: exactly when the resolved accelerator is
+  `cpu`.** This is the decision the section above leaves open, and it is
+  stronger than it looks because of what `http.rs` resolves that accelerator
+  *from* — the setup sentinel's `extra=` line, i.e. which torch wheels are
+  actually installed, falling back to config resolution only for a
+  user-managed interpreter. So `Cpu` at the probe means either the user asked
+  for CPU and got the CPU wheels, or `auto` found no NVIDIA and no ROCm
+  evidence at all (`setup::decide_accelerator`) — and in both cases torch has
+  no accelerator to use. Nothing else produces the board: an
+  `Accelerator::Cuda` host whose nvidia-smi is missing, wedged or unparseable
+  keeps today's *unknown-inventory* behaviour (unpriced, plus the startup
+  WARN) rather than becoming CPU-priced, because a CUDA torch is what is
+  installed there and its workers do run on the GPU. Pricing them against RAM
+  would budget the wrong memory entirely, which is worse than not budgeting.
+- **…which supersedes "an explicit `cpu` host with an NVIDIA card keeps
+  nvidia-smi's capability filtering"** (the rule `gpu.rs::probe` carried since
+  Package 1). Such a host now takes the CPU board *and* has its workers pinned
+  to the CPU device, so the overlay it loses was gating models on a board its
+  CPU-only torch cannot address; the capability view degrades to the same
+  "unknown" every other non-CUDA host already has, where the Python impls'
+  load-time guard is the backstop. The test that encoded the old rule
+  (`the_probe_dispatches_on_the_resolved_accelerator`) was updated and now
+  states the new one.
+- **The worker's signal is the marker, never the absence of an accelerator.**
+  `INFERIO_DEVICE=cpu` does both jobs — `get_device()` honours it, and
+  `memory.py` reads it as "this replica's currency is RAM" — and the tempting
+  second condition ("no CUDA, no HIP, no MPS facts") was rejected. That shape
+  also describes a remote-API impl, a `none`-class model and any pre-load
+  reading on a *CUDA* host, all of which would then report host RAM under a
+  label consumers treat as authoritative against a board whose total is a
+  card's VRAM. How a host was priced is a fact only the orchestrator has. The
+  corollary is that the `"ram"` tier is tried **first** rather than last: on a
+  host the orchestrator has priced as CPU, an NVML that happens to work must
+  not answer for a board nothing is running on.
+- **Base is the load *window*'s RSS growth, not growth since spawn.** The
+  section above says "RSS at load end minus RSS at spawn". There is no spawn
+  baseline: `memory.py` may not import psutil at module import (its
+  stdlib-only rule), and more importantly a spawn baseline would charge a
+  worker's *second* load the first model's residency — the absolute-versus-
+  windowed confusion the fdinfo tier already documents. `begin_load` is where
+  every other tier's "before" is taken, so this measures the same window. Both
+  ends of that delta are the **live** resident set, not the high-water (the
+  worker's "peak allocated" slot is the live figure on this backend, as it is
+  on MPS), so a resident set that *fell* between loads — an unload that really
+  did return pages — lowers both ends equally and cannot leak into the next
+  load's base. The lifetime high-water is the *pool* baseline
+  (`reserved_at_load_mb`), which is the reading a returned page does make
+  stale; what that costs is analysed in the peak-as-pool bullet below, and it
+  is a property of the fit rather than of the base.
+- **The OS high-water is reported as the *pool*, not as a per-batch peak.**
+  `VmHWM` / `peak_wset` / `ru_maxrss` are real peaks — the kernel records them
+  as they happen, so unlike MPS nothing is lost between samples — but no
+  platform offers a reset, so they are monotone for the process's whole life.
+  That is exactly the CUDA caching allocator pool's shape, so mapping them
+  onto `reserved`/`peak_reserved` (with live RSS as `allocated`) keeps
+  `peak > before` meaning "this batch grew the envelope", and with it the
+  cost fit's `peak_reserved − reserved_at_load`, the knee's warm/high-water
+  split and the WDDM comparator. The alternative — RSS as the pool, high-water
+  as the peak — would have made every batch look pool-growing (a high-water is
+  never below a live reading) and starved the knee of samples entirely. Units
+  differ per platform and are normalised at the reader (`ru_maxrss` is bytes
+  on macOS, KiB elsewhere).
+
+  **What the monotone pool actually costs, stated properly.** It is *not*
+  simply "an over-statement, which is the safe direction" — that was wrong.
+  `reserved_at_load` is the lifetime high-water at load end, which includes
+  the load's own transient (weight files, a temporary buffer), so it sits
+  above what the process settles at. Two regimes follow. While a batch stays
+  under that mark it sets no new high-water at all: it reads as *warm*, so it
+  contributes no fit sample and no ratchet anchor, and a model whose whole
+  working set fits under its load transient can therefore stay on the
+  unconfirmed-margin bonus indefinitely — conservative, but by never learning
+  rather than by measuring high. Once a batch does exceed it, every sample
+  carries a constant **negative** intercept of roughly the load overshoot:
+  `peak − reserved_at_load` under-prices each batch by that amount. That is
+  under-pricing, bounded (by the overshoot, which does not grow) and
+  self-correcting, because the geometric ramp keeps raising the high-water
+  until the samples dominate the offset. The residue lands in `external` via
+  the RAM free reading, where the margin prices it. This is the same shape
+  `ledger.rs`'s fit already documents for CUDA (the "a load whose pool
+  overshot its weights leaves `reserved_at_load` above what the pool settles
+  at" note beside `FitSample`), just systematic here rather than occasional.
+  The obvious alternative — making `reserved_at_load` the *settled* RSS
+  instead of the high-water — was considered and **rejected**: it makes every
+  early sample a flat constant (`peak` is pinned at the load transient until a
+  batch exceeds it), which fits a zero slope and under-prices far worse than a
+  bounded intercept does.
+- **DP-4 adoption is scoped by the backend, not only by the absent address.**
+  A CPU board matches every structural condition the adoption path had — one
+  board, unified, no PCI address, and a worker reporting neither UUID nor
+  address — so the ledger now carries `adopts_worker_total`, set from
+  `GpuInventory::adopts_worker_total()` and true on MPS alone. A CPU board's
+  total is physical RAM, read from the kernel at probe time; the worker's
+  psutil figure is a second reading of a settled fact, and letting it adopt
+  would log a re-adoption every time the two rounded differently.
+- **DP-8's ceiling is a shipped board default, applied in the ledger.**
+  `VramLedger::new` fills `cap_fraction = 0.75` for the CPU board when — and
+  only when — the resolved configuration leaves it `None`, so both
+  `[inference_local.vram] cap_fraction` and
+  `[inference_local.vram.gpu."CPU"] cap_fraction` win (on a CPU host they are
+  the same statement anyway, the CPU board being the only board). No shipped
+  TOML line, so absence keeps tracking the constant.
+- **`windows-sys` gained one feature, and no new crate.**
+  `Win32_System_SystemInformation` for `GlobalMemoryStatusEx`; the crate was
+  already a direct Windows dependency for job objects and `LockFileEx`.
+- **The board name rounds up to a 4 GiB grid**, reusing `rocm.rs`'s
+  `capacity_gb_up_4` rather than the nearest-GiB rule MPS uses. What every OS
+  calls "total RAM" is what it could count after firmware reservations —
+  1.5–2 GiB on a real machine, and not constant across a kernel update or a
+  `crashkernel=` change — so a finer grid would rename a 64 GiB box `(63 GB)`
+  today and `(64 GB)` tomorrow and orphan its profiles. Budgets are untouched;
+  this is the calibration key only. (MPS keeps nearest-GiB because `hw.memsize`
+  is the hardware figure, not a post-reservation count.)
+
 ## Calibration keying summary
 
 | Host | `platform` | `backend` | `gpu` (profile key) | Board key (budgets) |
@@ -486,6 +609,14 @@ remote-API impls, `none`-class models, Intel Macs, Jetson, DirectML.
 The README gains a short support-matrix table — *calibrated* /
 *backstopped only* / *out of scope* — so the coherence claim is explicit
 and its boundary is a documented decision instead of an emergent one.
+
+**As implemented (2026-08-01)**: the table lives in `panoptikon/README.md`
+under "Where automatic batch sizing applies", immediately after the
+`[inference_local.vram]` reference it qualifies, rather than in the root
+README — that is where the budgets, the board keys and the ROCm caveats
+already are, and the table has to be read against them. Adding it also
+retired the ROCm section's now-false "APUs and iGPUs are not priced at all"
+bullet, which backend B superseded without updating the prose.
 
 ## Testing and validation
 
@@ -551,6 +682,19 @@ and its boundary is a documented decision instead of an emergent one.
   macOS (compressor inflates "available") is optimistic — if it is, the
   margin lever and the collapse detector are the containment, same as
   the ROCm free-reading optimism already accepted in D5.
+- **Honest limit added by backend C: Windows `peak_wset`.** The peak *working
+  set* is not the peak commit. Windows trims a process's working set under
+  system memory pressure, and the high-water is of the trimmed series, so on a
+  loaded machine the figure can sit below what the process actually held —
+  under-stating cost, which is the direction that matters. `max(peak, rss)`
+  bounds it from below and no further. `psutil.memory_full_info()`'s
+  `peak_pagefile` (peak commit charge) is the alternative and would not have
+  that failure mode, at the cost of a heavier call per batch and a second
+  quantity to reconcile with Linux's `VmHWM`. **Field-pass item**: on a
+  Windows box, run a large batch while another process forces working-set
+  trimming and compare `peak_wset` against `peak_pagefile` across the batch.
+  If they diverge materially, switch the Windows reader — the mapping in
+  `ram_pool_mb` is the only thing that changes.
 
 ## Rollout
 
@@ -562,8 +706,11 @@ and its boundary is a documented decision instead of an emergent one.
    sysfs files, fdinfo GTT, spawner flag); validation on the BC-250 is still
    outstanding, and every claim about what HIP reports there remains a
    fixture-level claim.
-3. **CPU** — the degenerate instantiation, plus `INFERIO_DEVICE`
-   coherence; by now it is mostly configuration of existing parts.
+3. ✅ **CPU** — the degenerate instantiation, plus `INFERIO_DEVICE`
+   coherence; by now it is mostly configuration of existing parts. It is also
+   the only one of the three that runs on hardware anyone has: every dev box
+   and every CI runner is a CPU host the moment its accelerator resolves to
+   `cpu`.
 
 Each step is independently shippable; no config or DB migration is
 needed at any step (new backends only add keys and enum variants; absent

@@ -133,6 +133,18 @@ _DRM_UNITS = {
 # `drm-pdev` line (see `device_bdf`).
 _BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 
+# The device the orchestrator priced this worker against, written by the
+# spawner on a CPU-priced host and read by `inferio.impl.utils.get_device`
+# (docs/unified-memory-admission.md, backend C, "Device coherence"). Here it
+# is the positive signal that this worker's memory currency is host RAM: the
+# machine may well have an NVIDIA card in it, and the orchestrator has said
+# that card is not what this replica is budgeted against.
+DEVICE_ENV_VAR = "INFERIO_DEVICE"
+
+# Where Linux publishes this process's peak resident set. Absent everywhere
+# else, which is what the platform branch in [`_peak_rss_bytes`] is for.
+PROC_STATUS = "/proc/self/status"
+
 
 # ---------------------------------------------------------------------------
 # torch, but only if the impl already brought it *and* already used the GPU
@@ -524,14 +536,16 @@ def pinned_device_missing() -> str | None:
     if torch is None:
         return None
     # A **CPU-only torch build** never enumerated a device to lose, so its
-    # empty device list is not a fault and must not fail a load. This is not
-    # a corner case: pinning is universal, so every replica on a priced host
-    # carries the marker, and `gpu::probe` prices `accelerator = "cpu"` and
-    # `auto` hosts through nvidia-smi *by design* (capability filtering must
-    # not depend on which wheels are installed). A box with an NVIDIA card,
-    # `accelerator = "cpu"` and the CPU wheels is therefore pinned, sees no
-    # devices, and is working exactly as configured. Both version fields are
-    # `None` on such a build and exactly one is set on any accelerated one.
+    # empty device list is not a fault and must not fail a load. Backend C
+    # narrowed how this arises without removing it: a host whose installed
+    # wheels are the CPU ones now takes the CPU admission board and gets no
+    # pin at all (`GpuInventory::pins_are_absent`), so the marker is absent
+    # and this function has already returned above. What is left is the
+    # genuinely mixed case — a CUDA/ROCm-priced host on which *this* replica's
+    # venv or impl ended up without a device — where the check still has to
+    # tell "the orchestrator placed us nowhere" from "there was never a
+    # device". Both version fields are `None` on a CPU-only build and exactly
+    # one is set on any accelerated one.
     try:
         version = getattr(torch, "version", None)
         accelerated = bool(getattr(version, "cuda", None)) or bool(
@@ -616,12 +630,22 @@ def device_identity() -> tuple[str | None, str | None]:
     The *name* is kept — it is informational only; the profile keyspace is
     the orchestrator's own inventory name.
     """
+    # A CPU-priced host is answered **before** torch is consulted at all, not
+    # inside the no-device-struct branch below. One statement decides this
+    # replica's whole currency, so a process that happens to hold a live CUDA
+    # context — an impl that ignored `get_device()`, a library that
+    # initialized one on import — must not put a board UUID on a report whose
+    # free/total/base are all RAM figures. The ledger would then have a report
+    # naming a card, priced against the machine's memory.
+    if _ram_currency():
+        return (None, ram_gpu_name())
     props = _device_props()
     if props is None:
         # MPS has no UUID and no board struct — one device per host, keyed by
         # a constant. The name is still worth reporting, and is derived from
         # the same two sysctls (and the same rounding) the orchestrator uses,
-        # so the two spellings of this host cannot drift apart.
+        # so the two spellings of this host cannot drift apart. A CPU-priced
+        # host is the same shape again, keyed by the constant `CPU`.
         return (None, mps_gpu_name() if _torch_mps() is not None else None)
     uuid = _prop(props, "uuid")
     name = _prop(props, "name")
@@ -680,7 +704,14 @@ def device_bdf() -> str | None:
     source 2 is HIP-only, and no `gpu_bdf` is emitted there at all — this
     becomes live on CUDA when that pin moves to >= 2.8. The `rocm` extra pins
     2.11, so the identity chain this feeds is load-bearing on ROCm alone.
+
+    `None` outright on a CPU-priced host, for the reason [`device_identity`]
+    documents: the address is a *board* identity, it is the ledger's ROCm join
+    key and the amdgpu tiers' filter, and none of those describe a replica
+    whose memory is the machine's RAM.
     """
+    if _ram_currency():
+        return None
     props = _device_props()
     if props is None:
         return None
@@ -748,7 +779,22 @@ def gpu_total_mb() -> int | None:
     all but the **authoritative** figure: the orchestrator's own total there
     is a seeded fraction of RAM, while this is the number the allocator's
     ceiling is actually set from (docs/unified-memory-admission.md, DP-4).
+
+    On a CPU-priced host it is physical RAM, and it is a cross-check again —
+    the strictest one in the design, because both sides read the same kernel
+    fact and are expected to agree exactly. It is also what makes such a
+    worker *identifiable* at all: registration's single-board fallback needs
+    a report that claims a board, and RAM is the only thing this one has to
+    claim. Its total is emphatically **not** adopted (backend C's "As
+    implemented"): the orchestrator already read this number at probe time.
     """
+    # First, and before torch is asked anything, for the reason
+    # [`device_identity`] documents: one statement decides the currency, and a
+    # VRAM total on a report whose free reading is the machine's RAM is the
+    # mismatch the ledger's own total check is there to refuse.
+    if _ram_currency():
+        _, total_mb = ram_free_total_mb()
+        return total_mb
     props = _device_props()
     if props is None:
         return _mb(_mps_call("recommended_max_memory"))
@@ -1339,20 +1385,35 @@ def mps_free_total_mb() -> tuple[int | None, int | None]:
     return (_mb(min(total, available)), _mb(total))
 
 
-def _ram_available_bytes() -> int | None:
-    """RAM the OS says it could deliver right now, per psutil, or None.
+def _virtual_memory() -> Any | None:
+    """psutil's whole-machine memory statistics, or None.
 
-    psutil is a base dependency (not a torch-sized import), and
-    `virtual_memory().available` is the figure that already accounts for
-    reclaimable pages on each platform — the same question the
-    orchestrator's own refresh asks `host_statistics64`.
+    psutil is a base dependency (not a torch-sized import), imported lazily
+    like everything else here (module docstring: stdlib only at import time).
     """
     try:
         import psutil
     except Exception:
         return None
     try:
-        return int(psutil.virtual_memory().available)
+        return psutil.virtual_memory()
+    except Exception:
+        return None
+
+
+def _ram_available_bytes() -> int | None:
+    """RAM the OS says it could deliver right now, per psutil, or None.
+
+    `virtual_memory().available` is the figure that already accounts for
+    reclaimable pages on each platform — the same question the orchestrator's
+    own refresh asks `host_statistics64` (macOS), `MemAvailable` (Linux) and
+    `GlobalMemoryStatusEx` (Windows).
+    """
+    memory = _virtual_memory()
+    if memory is None:
+        return None
+    try:
+        return int(memory.available)
     except Exception:
         return None
 
@@ -1420,6 +1481,213 @@ def _sysctl_u64(name: str) -> int | None:
     if raw is None or len(raw) != 8:
         return None
     return int.from_bytes(raw, sys.byteorder)
+
+
+# ---------------------------------------------------------------------------
+# CPU-only hosts: host RAM as the memory currency
+# ---------------------------------------------------------------------------
+
+
+def _ram_currency() -> bool:
+    """Whether this worker's memory is the machine's RAM (backend C).
+
+    Exactly when the orchestrator **said so**. `INFERIO_DEVICE=cpu` is written
+    on every worker of a host whose admission board is system RAM
+    (`accelerator_env::worker_env`) and on no other, and it is the same marker
+    `inferio.impl.utils.get_device` honours before probing for a device — so
+    the host is priced against RAM, the impl runs on the CPU, and this module
+    measures in RSS, all off one statement.
+
+    Deliberately **not** inferred from the absence of accelerator facts, which
+    is the obvious alternative. "No CUDA, no HIP, no MPS" is a fact about the
+    machine at the moment it is asked; how the host was priced is a fact only
+    the orchestrator has. A worker with no torch on a *CUDA* host — a
+    remote-API impl, a `none`-class model, a load that has not happened yet —
+    matches "no accelerator facts" perfectly, and would start reporting host
+    RAM under a label the ledger treats as authoritative against a board whose
+    total is a card's VRAM. That is the different-currency failure the
+    ledger's own total check exists to catch, and it is not worth risking to
+    guess at something we are told.
+
+    Only `cpu` is defined; any other value is not this statement. `get_device`
+    warns about an unrecognised one and probes, so it degrades to "nothing was
+    said" on both sides rather than to two different wrong answers.
+    """
+    return (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower() == "cpu"
+
+
+def ram_free_total_mb() -> tuple[int | None, int | None]:
+    """`(free_mb, total_mb)` for a CPU-priced host, or `(None, None)`.
+
+    The degenerate unified board (docs/unified-memory-admission.md, backend
+    C): there is no accelerator pool to intersect with, so the design's
+    `free = max(0, min(total, pool_free, ram_available))` collapses to
+    `ram_available` alone, and `total` is the RAM the machine has.
+
+    Both figures come from `psutil.virtual_memory()`, which reads exactly the
+    sources the orchestrator's own refresh reads — `MemTotal`/`MemAvailable`
+    on Linux, `GlobalMemoryStatusEx` on Windows, free+inactive pages on macOS
+    (`panoptikon/src/inferio/cpu.rs`) — so the two sides of the ledger agree
+    by construction rather than by two libraries happening to round alike.
+    """
+    memory = _virtual_memory()
+    if memory is None:
+        return (None, None)
+    try:
+        total = int(memory.total)
+        available = int(memory.available)
+    except Exception:
+        return (None, None)
+    if total <= 0:
+        return (None, None)
+    return (_mb(min(total, available)), _mb(total))
+
+
+def ram_gpu_name() -> str | None:
+    """`CPU (64 GB)` — this machine's capacity, or None.
+
+    **Diagnostic only**, exactly like [`mps_gpu_name`]: nothing downstream
+    keys on it (the calibration profile key is the name the orchestrator's own
+    probe derived). It is still derived rather than left blank because it is
+    byte-identical to that name — same source, same round-up-to-4-GiB rule
+    (`panoptikon/src/inferio/cpu.rs::board_name`) — which makes it a free
+    cross-check on two derivations that could otherwise drift apart unnoticed.
+    """
+    memory = _virtual_memory()
+    if memory is None:
+        return None
+    try:
+        total_mb = int(memory.total) // _MIB
+    except Exception:
+        return None
+    if total_mb <= 0:
+        return None
+    # Up to the next multiple of 4 GiB, never below it: what any OS calls
+    # "total RAM" is what it could count after firmware reservations, and that
+    # figure moves with a kernel update or a BIOS setting.
+    grid = 4 * 1024
+    return f"CPU ({max(-(-total_mb // grid) * 4, 4)} GB)"
+
+
+def _rss_bytes() -> int | None:
+    """This process's resident set right now, or None.
+
+    The CPU analogue of the caching allocator's `memory_allocated`: what we
+    are actually holding. Pool-like in the way the fit machinery expects —
+    allocators rarely return pages to the OS — but *not* monotone, which is
+    why the peak below is a separate reading rather than a max of this one.
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        return None
+
+
+def parse_vm_high_water(text: str) -> int | None:
+    """`VmHWM` out of `/proc/self/status`, in **bytes**, or None.
+
+    Linux renders it as `VmHWM:\t   12345 kB` — kibibytes despite the
+    spelling, like every other memory row it prints. A row without that unit
+    is not a row this understands, and the honest answer to a file we do not
+    understand is no reading at all (the same rule `rocm.rs::meminfo_mb` and
+    [`parse_drm_fdinfo`] follow).
+    """
+    for line in text.splitlines():
+        key, separator, rest = line.partition(":")
+        if not separator or key.strip() != "VmHWM":
+            continue
+        fields = rest.split()
+        if len(fields) != 2 or fields[1] != "kB":
+            return None
+        try:
+            return int(fields[0]) * 1024
+        except ValueError:
+            return None
+    return None
+
+
+def _rusage_peak_bytes() -> int | None:
+    """`ru_maxrss` in bytes, or None.
+
+    **The unit is platform-specific and getting it wrong is a factor of
+    1024**: macOS reports bytes, every other Unix kibibytes. This is only
+    reached on macOS and on Unixes that are neither Linux nor Windows, where
+    the KiB reading is the documented one.
+    """
+    try:
+        import resource
+    except Exception:
+        return None
+    try:
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        return None
+    if peak <= 0:
+        return None
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
+def _peak_rss_bytes() -> int | None:
+    """The OS's high-water mark for this process's resident set, or None.
+
+    Unlike MPS's post-batch pool reading, this is a **real** peak — the
+    kernel records it as it happens, so a spike between two samples is not
+    lost. What it is not is *resettable*: there is no `reset_peak` for RSS on
+    any platform, so the figure is the high-water of the process's whole
+    life, and this is what the module reports as the pool ("reserved") rather
+    than as a per-batch peak. That mapping is the point: a monotone
+    lifetime high-water behaves exactly like the CUDA caching allocator's
+    pool, which never shrinks either, so "did this batch grow the pool"
+    becomes "did this batch set a new high-water" and the fit, the knee's
+    warm/high-water split and the WDDM comparator all keep their meanings.
+    The cost is that a batch cannot be measured *below* an earlier larger
+    one, which errs toward over-stating cost — the safe direction.
+
+    Never below the current RSS: the two come from different interfaces, and a
+    "peak" under the live reading would be a reading of nothing.
+
+    One known Windows caveat (docs/unified-memory-admission.md, honest
+    limits): `peak_wset` is the peak *working set*, and Windows trims a
+    process's working set under system memory pressure, so on a loaded machine
+    the high-water can sit below what we actually held. The `max(peak, rss)`
+    floor bounds that from below and no further; `memory_full_info()`'s
+    `peak_pagefile` is the heavier alternative if a field pass shows the two
+    diverge.
+    """
+    peak: int | None = None
+    if sys.platform.startswith("linux"):
+        try:
+            with open(PROC_STATUS, encoding="utf-8", errors="replace") as status:
+                peak = parse_vm_high_water(status.read())
+        except Exception:
+            peak = None
+    elif sys.platform == "win32":
+        try:
+            import psutil
+
+            peak = int(getattr(psutil.Process().memory_info(), "peak_wset", 0)) or None
+        except Exception:
+            peak = None
+    else:
+        peak = _rusage_peak_bytes()
+    rss = _rss_bytes()
+    if peak is None:
+        return rss
+    return peak if rss is None else max(peak, rss)
+
+
+def ram_pool_mb() -> tuple[int | None, int | None]:
+    """`(pool_mb, resident_mb)` for a CPU-priced host, or `(None, None)`.
+
+    The `mps_pool_mb` shape for backend C: the OS high-water stands in for the
+    allocator pool (see [`_peak_rss_bytes`] for why that is the right mapping
+    rather than an approximation), and the live RSS for `allocated`.
+    """
+    return (_mb(_peak_rss_bytes()), _mb(_rss_bytes()))
 
 
 def torch_version() -> str | None:
@@ -1498,7 +1766,20 @@ def empty_cache() -> bool:
     would create the 300-600 MB context this module exists to avoid creating.
     False therefore means "nothing of ours is on the device", which is also the
     correct answer to "was there a pool to release".
+
+    **On a CPU-priced host this is a no-op and returns False**, which is the
+    decided behaviour rather than a gap (docs/unified-memory-admission.md,
+    "Trim"): there is no allocator pool to hand back. Python frees to the
+    glibc/CRT allocator, which keeps its arenas; `malloc_trim` exists only on
+    glibc, only returns the top of the main arena, and would need a ctypes
+    platform branch to reach — for a release the ledger already accounts for,
+    since RSS is what the footprint is measured in either way. The gate is the
+    marker rather than the absence of a CUDA context, so an impl that ignored
+    `get_device()` cannot make a trim on a RAM-priced replica report a release
+    the ledger measures in RSS and would never see.
     """
+    if _ram_currency():
+        return False
     torch = _torch_cuda()
     if torch is None:
         return _mps_empty_cache()
@@ -1549,7 +1830,18 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
     On MPS the two "peaks" are the live figures: torch.mps exposes no peak
     counters, and the pool is monotone between `empty_cache()` calls, so the
     post-batch reading is the batch's high-water mark (see [`mps_pool_mb`]).
+
+    On a CPU-priced host the "pool" is the OS high-water mark for this
+    process's resident set and "allocated" is the live RSS ([`ram_pool_mb`]).
+    The high-water is a true peak but is never resettable, i.e. monotone for
+    the process's whole life — which is exactly the CUDA pool's own shape, so
+    reporting it as the pool (rather than as a per-batch peak against a live
+    RSS "before") is what keeps `peak > before` meaning "this batch grew the
+    envelope" on this backend as on every other.
     """
+    if _ram_currency():
+        pool, resident = ram_pool_mb()
+        return (pool, resident, pool, resident)
     torch = _torch_cuda()
     if torch is None:
         reserved, allocated = mps_pool_mb()
@@ -1568,7 +1860,7 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
 def _free_total_mb(
     source: str | None = None,
 ) -> tuple[int | None, int | None, str | None]:
-    """`(free_mb, total_mb, source)`: `nvml`|`amdgpu-sysfs`|`mps`|`torch`.
+    """`(free_mb, total_mb, source)`: `ram`|`nvml`|`amdgpu-sysfs`|`mps`|`torch`.
 
     The one place free/total memory is read, so every consumer (the base
     measurement's deltas and the wire sample) sees the same currency.
@@ -1594,7 +1886,22 @@ def _free_total_mb(
     Both numbers always come from whichever source answered — never one from
     each, and a pinned source that cannot answer yields nothing rather than
     silently sliding down the chain.
+
+    The `"ram"` tier is checked **first** and is gated rather than ordered
+    ([`_ram_currency`]): on a host priced against system RAM no accelerator
+    tier may answer at all, even one that could — a box with an NVIDIA card
+    and the CPU wheels has a perfectly working NVML that describes a board
+    nothing is running on. On every accelerator host the gate is false and
+    this line is a no-op, so the chain below is byte-identical to what it was.
     """
+    if source in (None, "ram") and _ram_currency():
+        # Byte-identical to the orchestrator's label for the same reading
+        # (`gpu.rs::free_source`): both sides read the machine's RAM, and on a
+        # host with no accelerator that is the whole memory picture.
+        free, total = ram_free_total_mb()
+        if free is not None:
+            return (free, total, "ram")
+        return (None, None, None)
     if source in (None, "nvml"):
         free, total = _nvml_memory()
         if free is not None:
@@ -1824,6 +2131,38 @@ def _resolve_base(
     """
     if not touched_gpu:
         return (None, None)
+    # Backend C's tier, and the only one that can apply on a CPU-priced host:
+    # the growth of this process's resident set across the load window
+    # (`base_method: "rss"`). `alloc_floor` already *is* that number here —
+    # it is `peak_allocated - allocated_before`, and both terms are RSS on
+    # this backend (see [`_allocator_stats`]) — so nothing extra is measured
+    # for it.
+    #
+    # A **window** delta rather than growth since process start, deliberately.
+    # The module may not import psutil at import time (stdlib-only rule), so
+    # there is no spawn baseline to difference against; and there should not
+    # be one, because a worker that loads a second model would then charge the
+    # first model's residency to it — the same absolute-vs-windowed confusion
+    # `_fdinfo_base_mb` documents. `begin_load` is where every other tier's
+    # "before" is taken, so this measures the same window they do.
+    #
+    # Note which of the two RSS readings this is: `alloc_floor` differences
+    # `peak_allocated` against `allocated_mb`, and on this backend *both* of
+    # those are the **live** resident set ([`_allocator_stats`] returns
+    # `(pool, resident, pool, resident)`, so the "peak allocated" slot is the
+    # live figure, exactly as it is on MPS). So the base is a plain
+    # `rss_after - rss_before` over the load window and is unaffected by a
+    # resident set that fell between loads — an unload that genuinely returns
+    # pages lowers both ends equally and cannot leak into the next load's
+    # base.
+    #
+    # The lifetime high-water is the *pool* baseline, `reserved_at_load_mb`,
+    # and that is the reading a returned page really does make stale. What
+    # that costs the fit is analysed where it belongs, beside the peak-as-pool
+    # mapping (docs/unified-memory-admission.md, backend C "As implemented";
+    # [`_peak_rss_bytes`]) — it is not a property of the base.
+    if _ram_currency():
+        return (alloc_floor, "rss") if alloc_floor else (None, None)
     own = _nvml_own_process_mb(holding_mb=reserved_mb)
     if own is not None and own > 0:
         return (own, "nvml")

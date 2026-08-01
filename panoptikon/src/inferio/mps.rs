@@ -169,6 +169,33 @@ fn free_mb(ram_mb: u64, ram_available_mb: u64) -> u64 {
     ram_available_mb.min(ram_mb)
 }
 
+/// This Mac's physical RAM in MiB, or `None` off macOS.
+///
+/// Shared with `cpu.rs`: an Apple Silicon host configured for
+/// `accelerator = "cpu"` (DP-3's one and only unaccelerated path) is priced
+/// as a CPU board, and its capacity is the same `hw.memsize` this module
+/// already reads. Deliberately **not** the MPS board's total, which is a
+/// policy figure over this one.
+///
+/// `cpu.rs` is the only caller and reaches it from its own macOS arm, so off
+/// macOS this is unreachable; kept here (answering `None`) rather than
+/// `cfg`-ed away so the module's "every reading degrades to None" shape holds
+/// uniformly, with the same `allow` the HIP helpers in `accelerator_env` use
+/// for the same reason.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn physical_ram_mb() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        sysctl_u64("hw.memsize")
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| bytes / MIB)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// RAM the OS says it could deliver right now, in MiB. `None` off macOS.
 ///
 /// Deliberately conservative about what counts as available: free and

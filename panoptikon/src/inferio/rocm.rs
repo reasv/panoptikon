@@ -690,7 +690,11 @@ fn unified_facts(
 /// `pages << (PAGE_SHIFT - 10)`). A row without that unit is not a row this
 /// understands, and the honest answer to a file we do not understand is no
 /// reading at all.
-fn meminfo_mb(path: &Path, key: &str) -> Option<u64> {
+/// Shared with `cpu.rs`, whose whole board is `MemTotal`/`MemAvailable`: the
+/// two backends must read the same rows the same way, or one host's free
+/// figure would be in a different currency depending on which module produced
+/// it.
+pub(super) fn meminfo_mb(path: &Path, key: &str) -> Option<u64> {
     let text = fs::read_to_string(path).ok()?;
     text.lines().find_map(|line| {
         let (name, rest) = line.split_once(':')?;
@@ -848,7 +852,13 @@ fn whole_gb(mb: u64) -> u64 {
 }
 
 /// MiB to GiB, rounded **up** to the next multiple of 4 and never to zero.
-fn capacity_gb_up_4(mb: u64) -> u64 {
+///
+/// Shared with `cpu.rs`, which names its board by the same rule for the same
+/// reason (see [`apu_board_name`]): what the kernel counts as total RAM sits
+/// a gigabyte or two under the sticker capacity and moves with kernel
+/// reservations, so a finer grid would split one machine's calibration
+/// profiles across a kernel update.
+pub(super) fn capacity_gb_up_4(mb: u64) -> u64 {
     const GRID_MB: u64 = 4 * 1024;
     (mb.div_ceil(GRID_MB) * 4).max(4)
 }

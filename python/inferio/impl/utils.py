@@ -11,13 +11,58 @@ import PIL.Image
 from io import BytesIO
 from typing import Optional
 
+# The device the orchestrator priced this worker against, written by the
+# spawner on a host whose admission board is system RAM
+# (`panoptikon/src/accelerator_env.rs`, docs/unified-memory-admission.md
+# backend C). `cpu` is the only value defined today.
+DEVICE_ENV_VAR = "INFERIO_DEVICE"
+_FORCED_DEVICES = frozenset({"cpu"})
+
+
+def forced_device() -> Optional[str]:
+    """The device the orchestrator requires, or None when it said nothing.
+
+    This exists because the probe below and the orchestrator answer different
+    questions about the same host. `get_device` asks the *machine* what it
+    has; the orchestrator's pricing follows which torch wheels are actually
+    installed and what the user configured. On a host where those diverge —
+    an `accelerator = "cpu"` Mac, or a box with an NVIDIA card whose venv
+    holds the CPU wheels — the model would otherwise run on a device nothing
+    budgeted a batch against, which is the incoherence the design's
+    device-coherence item closes.
+
+    An unrecognised value is treated as unset, with a warning: a newer
+    orchestrator naming a device this worker does not know must degrade to
+    probing rather than fail every load.
+    """
+    value = (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower()
+    if not value:
+        return None
+    if value not in _FORCED_DEVICES:
+        logging.getLogger(__name__).warning(
+            "%s=%r is not a device this worker understands (expected one of "
+            "%s); falling back to probing the hardware",
+            DEVICE_ENV_VAR,
+            value,
+            ", ".join(sorted(_FORCED_DEVICES)),
+        )
+        return None
+    return value
+
+
 def get_device():
     import torch
 
     """
     Returns the appropriate torch device based on the available hardware.
     Supports CUDA, ROCm, MPS (Apple Silicon), and CPU.
+
+    The orchestrator's own answer wins when it gave one (`INFERIO_DEVICE`,
+    see `forced_device`); only then does this probe the hardware.
     """
+    forced = forced_device()
+    if forced is not None:
+        return [torch.device(forced)]
     if torch.cuda.is_available():  # This covers both CUDA and ROCm
         num_gpus = torch.cuda.device_count()
         if num_gpus > 1:
@@ -227,6 +272,7 @@ def select_ct2_compute_type(
     preferred: str = "float16",
     explicit: str | None = None,
     logger: logging.Logger | None = None,
+    device_kind: str | None = None,
 ) -> str:
     """Pick a CTranslate2 compute type the device actually supports.
 
@@ -236,6 +282,14 @@ def select_ct2_compute_type(
     Any probe failure falls back to float32, which is always supported —
     this also covers ROCm, where torch reports CUDA available but CT2 has
     no HIP backend.
+
+    `device_kind` (`"cuda"`/`"cpu"`) is the device the *caller* resolved, and
+    it wins when given. Probing `torch.cuda.is_available()` here asks about
+    the machine, which is the wrong question on a host the orchestrator priced
+    against system RAM (`INFERIO_DEVICE=cpu`): the model runs on the CPU, so
+    the compute type has to be one the CPU supports
+    (docs/unified-memory-admission.md, backend C). Omitted, the probe is kept
+    for callers that have not resolved a device of their own.
     """
     log = logger or logging.getLogger(__name__)
     if explicit is not None:
@@ -244,7 +298,10 @@ def select_ct2_compute_type(
         import ctranslate2
         import torch
 
-        kind = "cuda" if torch.cuda.is_available() else "cpu"
+        if device_kind is not None:
+            kind = "cuda" if device_kind == "cuda" else "cpu"
+        else:
+            kind = "cuda" if torch.cuda.is_available() else "cpu"
         supported = set(ctranslate2.get_supported_compute_types(kind))
     except Exception as err:
         log.warning(

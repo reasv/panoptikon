@@ -15,10 +15,10 @@
 //! Probing reuses the Package-1 philosophy from `capability.rs`: one short
 //! `nvidia-smi` call with a timeout, and any unparseable *identity* makes
 //! the whole result unknown. Unknown never changes behaviour — pins pass
-//! through exactly as they did before this existed (raw index strings, or
-//! no pin at all), which is what keeps CPU/MPS hosts and hosts without
-//! nvidia-smi on today's code path. (ROCm hosts take the sysfs probe
-//! below instead of falling through here, and Apple Silicon takes `mps.rs`.)
+//! through exactly as they did before this existed (raw index strings, or no
+//! pin at all), which is what keeps a CUDA host without a working nvidia-smi
+//! on today's code path. That is the *only* thing left on it: each of the
+//! other three backends has an inventory of its own (see [`probe`]).
 //!
 //! The `compute_cap` column is the one exception, because it is the one
 //! field that is *separably* useless: vGPU slices and a few datacenter SKUs
@@ -35,16 +35,24 @@
 //! instead of two. Rows are matched positionally, so an inventory index and
 //! a capability always describe the same physical board.
 //!
-//! [`probe`] takes the **resolved** accelerator (the setup sentinel's, not
-//! a re-probe of the hardware) and dispatches on it: ROCm hosts get the
-//! kernel-sysfs inventory in `rocm.rs` instead, with an always-unknown
-//! capability view because HIP has no compute-capability analogue
-//! (docs/rocm-batch-calibration-parity.md, D1/D7), and Apple Silicon gets
-//! the single synthetic unified-memory board in `mps.rs`
-//! (docs/unified-memory-admission.md). Every other accelerator
-//! — including a `cpu` host that happens to have an NVIDIA card — keeps the
-//! nvidia-smi path exactly as it was, so capability filtering never depends
-//! on which wheels are installed.
+//! [`probe`] takes the **resolved** accelerator (the setup sentinel's, not a
+//! re-probe of the hardware) and dispatches four ways on it:
+//!
+//! - `Rocm` → the kernel-sysfs inventory in `rocm.rs`
+//!   (docs/rocm-batch-calibration-parity.md, D1/D7);
+//! - `Mps` → the single synthetic unified-memory board in `mps.rs`
+//!   (docs/unified-memory-admission.md, backend A);
+//! - `Cpu` → the single synthetic system-RAM board in `cpu.rs` (backend C),
+//!   whose workers are additionally pinned to the CPU *device*;
+//! - `Cuda` / `Auto` → the nvidia-smi path below.
+//!
+//! The first three carry an always-unknown capability view: HIP, Metal and a
+//! CPU have no compute-capability analogue between them, and every shipped
+//! floor is CUDA-specific. That includes the `cpu` host with an NVIDIA card
+//! in it, which used to be routed here precisely so it kept nvidia-smi's
+//! filtering — superseded by backend C, because such a host now runs its
+//! impls on the CPU by construction and the filter was gating models on a
+//! board its CPU-only torch cannot address (see [`probe`]).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -56,6 +64,7 @@ use serde::{Deserialize, Serialize};
 use super::capability::{
     HostComputeCaps, find_nvidia_smi, output_with_timeout, parse_compute_cap,
 };
+use super::cpu;
 use super::mps;
 use super::rocm;
 use crate::config::Accelerator;
@@ -138,11 +147,11 @@ pub fn pin_env_var(accelerator: Accelerator) -> &'static str {
         Accelerator::Rocm => HIP_PIN_ENV_VAR,
         // Including `Auto`, which only reaches here unresolved from a caller
         // that has no sentinel to resolve with — the CUDA form is what those
-        // hosts wrote before this dispatch existed. And including `Mps`,
-        // where the answer is arbitrary because there is nothing to write:
-        // one Metal device per host, no visibility variable that selects it,
-        // and `GpuInventory::resolve_pin` therefore never yields a pin at all
-        // (docs/unified-memory-admission.md, backend A).
+        // hosts wrote before this dispatch existed. And including `Mps` and
+        // `Cpu`, where the answer is arbitrary because there is nothing to
+        // write: one device (or none), no visibility variable that selects
+        // it, and `GpuInventory::resolve_pin` therefore never yields a pin at
+        // all on either (docs/unified-memory-admission.md, backends A and C).
         Accelerator::Cuda | Accelerator::Cpu | Accelerator::Mps | Accelerator::Auto => {
             CUDA_PIN_ENV_VAR
         }
@@ -326,6 +335,17 @@ enum MemoryBackend {
     /// accelerator counter. No pin vocabulary at all — there is one device
     /// and no variable that selects it.
     Mps,
+    /// A host with no accelerator at all: one synthetic board over the
+    /// machine's own RAM (`cpu.rs`, docs/unified-memory-admission.md backend
+    /// C). No pin vocabulary either, and for a stronger reason than MPS's —
+    /// there is no device, so any value written into a visibility variable
+    /// could only hide one from a worker that was never going to use it.
+    Cpu {
+        /// `/proc/meminfo`, from the same roots the probe read the board's
+        /// total through, kept so the refresh reads the same file (the same
+        /// reason the ROCm variant carries it).
+        meminfo: PathBuf,
+    },
 }
 
 /// Everything one `nvidia-smi` call tells us about this host's boards.
@@ -343,16 +363,51 @@ pub struct HostGpus {
 /// leaving the capabilities perfectly knowable (see [`build`]).
 ///
 /// `accelerator` is the **resolved** one (the setup sentinel's answer, which
-/// `http.rs` computes before building the spawn config). Only `Rocm` takes
-/// the sysfs path: an explicit `cpu` host with an NVIDIA card must keep
-/// nvidia-smi's capability filtering, which is what it had before this
-/// dispatch existed.
+/// `http.rs` computes before building the spawn config), and it is the *whole*
+/// of the dispatch: each backend gets its own inventory, and `Cuda`/`Auto`
+/// keep the nvidia-smi path they always had.
+///
+/// # When the CPU board exists (docs/unified-memory-admission.md, backend C)
+///
+/// Exactly when the resolved accelerator is [`Accelerator::Cpu`], and that is
+/// a stronger statement than it looks, because of what `http.rs` resolves it
+/// from: the setup sentinel's `extra=` line, i.e. **which torch wheels are
+/// actually installed**, falling back to config resolution (which probes the
+/// hardware) only for a user-managed interpreter. So `Cpu` here means one of
+///
+/// - the user wrote `accelerator = "cpu"` and the CPU wheels are what got
+///   installed;
+/// - `auto` found no NVIDIA and no ROCm evidence on this machine
+///   (`setup::decide_accelerator`), which is the CPU-only host this backend
+///   exists for;
+///
+/// and in every one of them torch has no accelerator to use. This
+/// **supersedes** the older rule that "an explicit `cpu` host with an NVIDIA
+/// card must keep nvidia-smi's capability filtering": pricing a host as CPU
+/// and running its workers somewhere else is the incoherence the design's
+/// device-coherence item closes, and the spawner now forces
+/// `INFERIO_DEVICE=cpu` on exactly this set
+/// (`accelerator_env::worker_env`). The capability overlay such a host loses
+/// was filtering models by a GPU its CPU-only torch cannot address, and it
+/// degrades to the "unknown" every other non-CUDA host already has — where
+/// the Python impls' own load-time guard is the backstop.
+///
+/// What deliberately does **not** produce a CPU board is a *broken* CUDA
+/// host: `Accelerator::Cuda` with no nvidia-smi, a timeout, or an
+/// unparseable inventory keeps today's unknown-inventory behaviour (unpriced,
+/// plus the WARN in [`query`]). There is a working CUDA torch on that box —
+/// that is what `Cuda` means here — so its workers run on the GPU, and
+/// pricing them against RAM would budget the wrong memory entirely.
 pub fn probe(accelerator: Accelerator) -> HostGpus {
-    if accelerator == Accelerator::Rocm {
-        return probe_rocm();
-    }
-    if accelerator == Accelerator::Mps {
-        return probe_mps();
+    match accelerator {
+        Accelerator::Rocm => return probe_rocm(),
+        Accelerator::Mps => return probe_mps(),
+        Accelerator::Cpu => return probe_cpu(),
+        // `Auto` only reaches here from a caller that could not resolve at
+        // all (`effective_accelerator` returns the request on a validation
+        // failure, which today can only happen for an explicit `rocm`/`mps`
+        // on the wrong platform — so this arm is effectively `Cuda`).
+        Accelerator::Cuda | Accelerator::Auto => {}
     }
     // The ambient value matters: nvidia-smi *ignores* CUDA_VISIBLE_DEVICES
     // and reports every board, so an operator who launched the gateway with
@@ -490,6 +545,55 @@ fn probe_mps() -> HostGpus {
     inventory(Some(vec![board].into()))
 }
 
+/// One synthetic board over the host's own RAM (`cpu.rs`). The capability
+/// view is always unknown, as on ROCm and MPS: there is no GPU here to filter
+/// with, and a model with a compute-capability floor is gated by the Python
+/// impl's own load-time guard instead.
+///
+/// "Unknown" again means *no boards*, never *not a CPU host*: the backend
+/// stays [`MemoryBackend::Cpu`] on every path out of here, so a machine whose
+/// RAM statistics could not be read keeps its own (empty) memory refresh and
+/// its own no-pin rule rather than silently inheriting CUDA's and shelling
+/// out to a binary it does not have.
+fn probe_cpu() -> HostGpus {
+    let roots = cpu::MemRoots::default();
+    let inventory = |boards: Option<Arc<[GpuInfo]>>| HostGpus {
+        caps: HostComputeCaps::unknown(),
+        inventory: GpuInventory {
+            boards,
+            backend: MemoryBackend::Cpu {
+                meminfo: roots.meminfo.clone(),
+            },
+        },
+    };
+    let Some(ram_mb) = cpu::probe(&roots) else {
+        tracing::warn!(
+            "this host has no accelerator and its total RAM could not be \
+             read, so it gets no memory ledger, no grants and no calibration \
+             — dispatch takes the unpriced path (your cap, then the registry \
+             default, then default_max_batch)"
+        );
+        return inventory(None);
+    };
+    let board = cpu::board(ram_mb);
+    tracing::info!(
+        index = board.index,
+        uuid = %board.uuid,
+        name = %board.name,
+        total_mb = board.total_mb,
+        // The *shipped* default, not necessarily what binds: a
+        // `[inference_local.vram]` (or per-board) `cap_fraction` replaces it,
+        // and that resolution happens later, in the ledger. `/health` prints
+        // the figure actually in force.
+        default_cap_fraction = cpu::DEFAULT_CAP_FRACTION,
+        unified = board.unified(),
+        "no accelerator on this host; admitting batches against system RAM \
+         (running out of it is an OS process kill rather than a catchable \
+         allocation failure, so the board ships with a default ceiling)"
+    );
+    inventory(Some(vec![board].into()))
+}
+
 /// Run the single query. `None` on any failure — no nvidia-smi, timeout,
 /// non-zero exit — and every failure is logged, at WARN when the host is
 /// positively configured for CUDA. The ROCm probe already names every path
@@ -572,6 +676,17 @@ pub(super) enum MemoryQuery {
         /// admission total (see `mps::query_memory`).
         ram_mb: u64,
     },
+    /// The host's own RAM statistics for the one CPU board (`cpu.rs`), which
+    /// on a machine with no accelerator is the entire memory picture: there
+    /// is no pool counter to intersect with, so `free` is `ram_available`
+    /// alone.
+    Cpu {
+        key: String,
+        /// Physical RAM in MiB — here both the bound on the reading and the
+        /// board's total, which on this backend are the same fact.
+        ram_mb: u64,
+        meminfo: PathBuf,
+    },
     /// The inventory cannot be turned into a total set of per-board reads,
     /// so this host has no refresh at all: [`Self::run`] always answers
     /// `None` and the ledger keeps whatever it already had.
@@ -611,6 +726,17 @@ impl MemoryQuery {
                 boards,
             } => rocm::query_memory(pci_devices, meminfo, boards),
             Self::Mps { key, ram_mb } => mps::query_memory(key, *ram_mb),
+            Self::Cpu {
+                key,
+                ram_mb,
+                meminfo,
+            } => cpu::query_memory(
+                key,
+                *ram_mb,
+                &cpu::MemRoots {
+                    meminfo: meminfo.clone(),
+                },
+            ),
             Self::Unavailable => None,
         }
     }
@@ -631,9 +757,14 @@ impl MemoryQuery {
             // free + inactive pages, the same terms psutil's macOS
             // `available` sums — and both call that `"mps"`.
             Self::Mps { .. } => "mps",
+            // Likewise byte-identical to the worker's own label for the same
+            // reading (`inferio_worker/memory.py`'s psutil tier): on a host
+            // with no accelerator both sides read the machine's RAM, and both
+            // call that `"ram"`.
+            Self::Cpu { .. } => "ram",
             // Including `Unavailable`, which never records anything anyway
-            // (it is what a backend with no boards resolves to, on either of
-            // the two that can be in that state).
+            // (it is what a backend with no boards resolves to, on any of the
+            // three that can be in that state).
             Self::RocmSysfs { .. } | Self::Unavailable => "amdgpu-sysfs",
         }
     }
@@ -820,6 +951,22 @@ impl GpuInventory {
         }
     }
 
+    /// [`Self::known`]'s CPU twin: the one synthetic RAM board, no pins, the
+    /// `"ram"` memory backend. Takes the host's RAM in MiB rather than a
+    /// board list, because there is exactly one board and `cpu::board`
+    /// derives all of it from that number — a test that could build a
+    /// *different* CPU board would be testing a shape production cannot
+    /// produce.
+    #[cfg(test)]
+    pub fn known_cpu(ram_mb: u64) -> Self {
+        Self {
+            boards: Some(vec![cpu::board(ram_mb)].into()),
+            backend: MemoryBackend::Cpu {
+                meminfo: cpu::MemRoots::default().meminfo,
+            },
+        }
+    }
+
     /// [`Self::known`]'s ROCm twin: index pins, amdgpu memory backend, no
     /// ambient restriction. The PCI root is the production one because the
     /// callers of this are pin/key/ledger tests that never read a file; the
@@ -853,6 +1000,23 @@ impl GpuInventory {
     /// readings it believes are fresh. That is phantom headroom, so the
     /// whole refresh is withdrawn instead ([`MemoryQuery::Unavailable`]).
     pub(super) fn memory_query(&self) -> MemoryQuery {
+        if let MemoryBackend::Cpu { meminfo } = &self.backend {
+            // As on MPS, the RAM figure comes off the board itself: it is the
+            // same fact that flags the board unified, so the refresh and the
+            // flag can never disagree about which memory this board is made
+            // of.
+            return match self.gpus().and_then(<[GpuInfo]>::first) {
+                Some(board) => match board.unified_ram_mb {
+                    Some(ram_mb) => MemoryQuery::Cpu {
+                        key: board.uuid.clone(),
+                        ram_mb,
+                        meminfo: meminfo.clone(),
+                    },
+                    None => MemoryQuery::Unavailable,
+                },
+                None => MemoryQuery::Unavailable,
+            };
+        }
         if matches!(self.backend, MemoryBackend::Mps) {
             // The RAM figure comes off the board itself: it is the same fact
             // that flags the board unified, so the refresh and the flag can
@@ -999,10 +1163,39 @@ impl GpuInventory {
     }
 
     /// Whether this host has no pin vocabulary at all — MPS, where there is
-    /// one device and nothing to name it with. Every pin request is dropped
-    /// (a value written into either visibility variable could only *hide*
-    /// the device), while board keys keep resolving as everywhere else.
+    /// one device and nothing to name it with, and CPU, where there is no
+    /// device. Every pin request is dropped (a value written into either
+    /// visibility variable could only *hide* something), while board keys
+    /// keep resolving as everywhere else.
     fn pins_are_absent(&self) -> bool {
+        matches!(
+            self.backend,
+            MemoryBackend::Mps | MemoryBackend::Cpu { .. }
+        )
+    }
+
+    /// Whether this host's boards are priced against system RAM because it
+    /// has no accelerator at all (docs/unified-memory-admission.md, backend
+    /// C). True on every path out of [`probe_cpu`], including the one where
+    /// no board could be built.
+    pub(super) fn prices_host_ram(&self) -> bool {
+        matches!(self.backend, MemoryBackend::Cpu { .. })
+    }
+
+    /// Whether a worker's own total-memory report may **replace** this
+    /// host's board total (DP-4).
+    ///
+    /// MPS and nothing else. Adoption exists for a board whose real total
+    /// nothing but the worker can read — Metal's
+    /// `recommendedMaxWorkingSetSize`, a live policy figure the user can move
+    /// with a sysctl. Every other backend reads its total from the kernel or
+    /// the driver: an APU's comes from amdgpu's own counters (and is
+    /// additionally kept out by the no-PCI-address condition), and a **CPU
+    /// board's is physical RAM**, known exactly at probe time. Letting a
+    /// worker's psutil figure re-adopt it would be a second opinion on a
+    /// settled fact, and would log a re-adoption on every load where the two
+    /// rounded differently.
+    pub(super) fn adopts_worker_total(&self) -> bool {
         matches!(self.backend, MemoryBackend::Mps)
     }
 
@@ -1146,10 +1339,11 @@ impl GpuInventory {
             if let Some(requested) = requested.map(str::trim).filter(|pin| !pin.is_empty()) {
                 tracing::warn!(
                     pin = %requested,
-                    "ignoring this device pin: an Apple Silicon host has exactly \
-                     one Metal device and no visibility variable that selects \
-                     it, so there is nothing to pin to — the model runs on that \
-                     device either way, and is priced against it"
+                    "ignoring this device pin: this host has no device to \
+                     select — an Apple Silicon host has exactly one Metal \
+                     device and no visibility variable that names it, and a \
+                     CPU host has none at all — so the model runs where it was \
+                     always going to and is priced against that"
                 );
             }
             return None;
@@ -2136,9 +2330,16 @@ mod tests {
 
     /// The dispatch itself. ROCm off Linux is unconditionally unknown (the
     /// `rocm` torch extra is Linux-only and the sysfs roots do not exist),
-    /// and every other accelerator keeps the nvidia-smi path whatever this
-    /// host happens to have installed — the CUDA arm can never produce a
-    /// sysfs-backed inventory.
+    /// and the CUDA arm keeps the nvidia-smi path whatever this host happens
+    /// to have installed — it can never produce a sysfs-backed inventory.
+    ///
+    /// `Accelerator::Cpu` used to be on this list, on the rule that "an
+    /// explicit `cpu` host with an NVIDIA card must keep nvidia-smi's
+    /// capability filtering". Backend C supersedes that: such a host is now
+    /// priced against system RAM *and* has its workers pinned to the CPU
+    /// device (`accelerator_env::worker_env`), so filtering models by a GPU
+    /// its CPU-only torch cannot address was gating on a device nothing would
+    /// have used — see `only_a_resolved_cpu_accelerator_gets_the_cpu_board`.
     #[test]
     fn the_probe_dispatches_on_the_resolved_accelerator() {
         #[cfg(not(target_os = "linux"))]
@@ -2152,7 +2353,7 @@ mod tests {
                  NVIDIA binary about AMD boards"
             );
         }
-        for accelerator in [Accelerator::Cuda, Accelerator::Cpu] {
+        for accelerator in [Accelerator::Cuda, Accelerator::Auto] {
             let host = probe(accelerator);
             assert!(
                 matches!(host.inventory.memory_query(), MemoryQuery::NvidiaSmi),
@@ -2279,7 +2480,138 @@ mod tests {
         for accelerator in [Accelerator::Cuda, Accelerator::Cpu] {
             assert!(
                 !matches!(probe(accelerator).inventory.backend, MemoryBackend::Mps),
-                "{accelerator:?} must keep the nvidia-smi path"
+                "{accelerator:?} has its own backend and must not borrow MPS's"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // CPU-only hosts (docs/unified-memory-admission.md, backend C)
+    // ------------------------------------------------------------------
+
+    /// A CPU inventory: one constant-keyed board over the machine's RAM, no
+    /// pin in any vocabulary, and a board key that still resolves — the same
+    /// pin/key split MPS has, for the stronger reason that there is no device
+    /// here at all.
+    #[test]
+    fn a_cpu_inventory_has_a_board_key_but_never_a_pin() {
+        let host = GpuInventory::known_cpu(64 * 1024 - 700);
+        let boards = host.gpus().expect("known");
+        assert_eq!(boards.len(), 1);
+        assert_eq!(boards[0].uuid, "CPU");
+        assert!(boards[0].unified());
+        assert!(host.prices_host_ram());
+        assert!(
+            !host.adopts_worker_total(),
+            "a CPU board's total is physical RAM, read at probe time — there \
+             is nothing for a worker to adopt it from (DP-4 is MPS-only)"
+        );
+        assert_eq!(
+            host.default_board_name().as_deref(),
+            Some("CPU (64 GB)"),
+            "the calibration keyspace"
+        );
+        assert_eq!(host.default_pin(), None);
+        for requested in [None, Some("CPU"), Some("0"), Some("cpu"), Some("")] {
+            assert_eq!(
+                host.resolve_pin(requested),
+                None,
+                "{requested:?} must not reach a visibility variable on a host \
+                 with no device to hide"
+            );
+        }
+        assert_eq!(
+            host.resolve_board_key(None),
+            Some("CPU".to_string()),
+            "universal placement still names the board"
+        );
+        assert_eq!(host.resolve_board_key(Some("cpu")), Some("CPU".to_string()));
+        assert_eq!(host.resolve_board_key(Some("GPU-1a2b")), None);
+        assert_eq!(host.unified_pin_bdf(None), None, "no address to verify");
+    }
+
+    /// The refresh follows the backend here too: a CPU host reads the
+    /// machine's RAM statistics under the `"ram"` label the worker's own
+    /// psutil tier uses, never nvidia-smi — including when no board was built
+    /// at all.
+    #[test]
+    fn the_cpu_memory_query_follows_the_inventory_backend() {
+        let host = GpuInventory::known_cpu(64 * 1024);
+        let query = host.memory_query();
+        assert_eq!(query.free_source(), "ram");
+        match &query {
+            MemoryQuery::Cpu { key, ram_mb, .. } => {
+                assert_eq!(key, "CPU");
+                assert_eq!(*ram_mb, 64 * 1024);
+            }
+            other => panic!("expected the CPU query, got {other:?}"),
+        }
+
+        let unprobed = GpuInventory {
+            boards: None,
+            backend: MemoryBackend::Cpu {
+                meminfo: super::cpu::MemRoots::default().meminfo,
+            },
+        };
+        assert!(
+            matches!(unprobed.memory_query(), MemoryQuery::Unavailable),
+            "a CPU host with no readable RAM must not fall back to nvidia-smi"
+        );
+        assert!(
+            unprobed.prices_host_ram(),
+            "it is still a CPU host: the backend is set on every path out of \
+             the probe, exactly as ROCm's and MPS's are"
+        );
+        assert_eq!(unprobed.resolve_pin(Some("0")), None);
+        assert_eq!(unprobed.default_pin(), None);
+        assert_eq!(unprobed.resolve_board_key(None), None);
+    }
+
+    /// The existence rule (docs/unified-memory-admission.md, backend C): the
+    /// CPU board appears on `Accelerator::Cpu` and on no other resolved
+    /// accelerator.
+    ///
+    /// The negative half is the load-bearing one. `Cuda` reaching the probe
+    /// means a CUDA torch is what is installed, so a host whose nvidia-smi is
+    /// missing, wedged or unparseable stays *unknown* — unpriced, plus the
+    /// startup WARN — rather than becoming CPU-priced, because its workers do
+    /// run on the GPU and budgeting them against RAM would price the wrong
+    /// memory entirely. This holds whatever the machine running the test has
+    /// installed, which is why it is asserted as "no CPU board" rather than
+    /// against a particular inventory.
+    #[test]
+    fn only_a_resolved_cpu_accelerator_gets_the_cpu_board() {
+        let host = probe(Accelerator::Cpu);
+        assert!(host.inventory.prices_host_ram());
+        assert_eq!(
+            host.caps.meets_floor(8.0),
+            None,
+            "a CPU host filters no model by a GPU capability: its workers are \
+             pinned to the CPU device, and the impls' own load-time guard is \
+             the backstop"
+        );
+        assert_eq!(host.inventory.resolve_pin(Some("0")), None);
+        // Every platform this ships to has a RAM reader, so the board is
+        // real here rather than fixture-shaped.
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        {
+            let board = host.inventory.gpus().expect("a host with RAM")[0].clone();
+            assert_eq!(board.uuid, "CPU");
+            assert!(board.unified() && board.total_mb > 0);
+            assert!(board.name.starts_with("CPU ("), "name: {}", board.name);
+            assert_eq!(host.inventory.memory_query().free_source(), "ram");
+        }
+
+        for accelerator in [
+            Accelerator::Cuda,
+            Accelerator::Rocm,
+            Accelerator::Mps,
+            Accelerator::Auto,
+        ] {
+            assert!(
+                !probe(accelerator).inventory.prices_host_ram(),
+                "{accelerator:?} must never be priced against system RAM — an \
+                 accelerator host whose probe came back unknown stays unknown"
             );
         }
     }

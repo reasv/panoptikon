@@ -147,7 +147,11 @@ def isolated(torch_module=None):
     is dropped for the same reason: it is the module's pre-torch-import
     signal that this worker is on a HIP device (`_hip_pinned`), so a value
     inherited from the developer's shell would silently switch NVML off in
-    every CUDA-path test.
+    every CUDA-path test. `INFERIO_DEVICE` is dropped with it, and is the
+    stronger hazard of the two: it does not merely disable a tier, it
+    re-denominates *every* reading this module produces (`_ram_currency`), so
+    an inherited value would turn each of these cases into a CPU-priced host
+    without changing a line of the test.
     """
     with (
         mock.patch.dict(sys.modules, {}, clear=False),
@@ -155,6 +159,7 @@ def isolated(torch_module=None):
     ):
         sys.modules.pop("inferio.impl.utils", None)
         os.environ.pop("HIP_VISIBLE_DEVICES", None)
+        os.environ.pop("INFERIO_DEVICE", None)
         if torch_module is None:
             sys.modules.pop("torch", None)
         else:
@@ -2264,3 +2269,339 @@ def test_the_mps_board_name_is_derived_from_the_same_facts_as_the_probe() -> Non
         assert memory.mps_gpu_name() is None
         with mps_host(available_mb=40 * 1024):
             assert memory.device_identity() == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# CPU-only hosts: host RAM as the memory currency
+# ---------------------------------------------------------------------------
+
+
+class FakeRam:
+    """The machine's RAM and this process's share of it.
+
+    `peak` is deliberately monotone and has no reset: that is what the OS
+    high-water mark actually is on every platform, and the whole reason this
+    backend maps it onto the *pool* rather than onto a per-batch peak.
+    """
+
+    def __init__(
+        self,
+        total_mb: int = 64 * 1024,
+        available_mb: int = 40 * 1024,
+        rss_mb: int = 200,
+    ) -> None:
+        self.total_mb = total_mb
+        self.available_mb = available_mb
+        self.rss_mb = rss_mb
+        self.peak_mb = rss_mb
+
+    def grow(self, mb: int) -> None:
+        self.rss_mb += mb
+        self.peak_mb = max(self.peak_mb, self.rss_mb)
+        self.available_mb -= mb
+
+    def release(self, mb: int) -> None:
+        """Free tensors: the resident set drops, the high-water does not."""
+        self.rss_mb -= mb
+        self.available_mb += mb
+
+
+@contextmanager
+def cpu_host(ram: FakeRam | None = None, torch_module=None, pinned: bool = True):
+    """A worker on a host priced against system RAM.
+
+    `pinned` writes the spawner's `INFERIO_DEVICE=cpu`, which is the whole of
+    the signal. With it off nothing has been claimed at all — the negative
+    half of `_ram_currency`, where a worker with no accelerator facts stays
+    silent rather than guessing that RAM is its currency.
+    """
+    ram = ram if ram is not None else FakeRam()
+    with isolated(torch_module):
+        os.environ.pop("PANOPTIKON_DEVICE_PIN", None)
+        os.environ.pop("INFERIO_DEVICE", None)
+        if pinned:
+            os.environ["INFERIO_DEVICE"] = "cpu"
+        with (
+            mock.patch(
+                "psutil.virtual_memory",
+                side_effect=lambda: SimpleNamespace(
+                    total=ram.total_mb * MIB, available=ram.available_mb * MIB
+                ),
+            ),
+            mock.patch.object(memory, "_rss_bytes", lambda: ram.rss_mb * MIB),
+            mock.patch.object(memory, "_peak_rss_bytes", lambda: ram.peak_mb * MIB),
+        ):
+            yield ram
+
+
+def test_the_cpu_sample_reports_ram_and_the_process_high_water() -> None:
+    # The degenerate unified reading: there is no accelerator pool to
+    # intersect with, so `free` is what the OS says it could deliver and
+    # `total` is the RAM the machine has. The pool figures are this process's
+    # own residency — the high-water as the pool, the live RSS as allocated.
+    with cpu_host() as ram:
+        ram.grow(1300)
+        ram.release(300)
+        assert memory.device_memory_sample() == {
+            "free_mb": 40 * 1024 - 1000,
+            "total_mb": 64 * 1024,
+            "free_source": "ram",
+            "reserved_mb": 1500,
+            "allocated_mb": 1200,
+        }
+
+
+def test_the_cpu_tier_is_the_orchestrators_statement_not_a_guess() -> None:
+    # A worker with no accelerator facts is *not* enough. That shape also
+    # covers a remote-API impl and a `none`-class model on a CUDA host, which
+    # would then report host RAM under a label the ledger treats as
+    # authoritative against a board whose total is a card's VRAM. How the host
+    # was priced is a fact only the orchestrator has, so it says it.
+    with cpu_host(pinned=False):
+        assert memory._ram_currency() is False
+        assert memory.free_total_mb() == (None, None, None)
+        assert memory.device_memory_sample() is None
+        assert memory.finish_load(memory.begin_load(), object()) == {}
+
+
+def test_the_cpu_tier_is_gated_off_on_every_accelerator_host(fake_torch) -> None:
+    # A CUDA worker's readings must be byte-identical to what they were
+    # before this tier existed.
+    assert memory._ram_currency() is False
+    assert memory.free_total_mb() == (8000, 8192, "torch")
+    assert memory.device_memory_sample()["free_source"] == "torch"
+
+    # An MPS worker is on Metal, not on RAM, even though its free reading is
+    # also derived from RAM statistics — the two are different currencies
+    # (`recommended_max_memory` against physical RAM).
+    with mps_host(available_mb=40 * 1024):
+        assert memory._ram_currency() is False
+        assert memory.free_total_mb()[2] == "mps"
+
+
+def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:
+    # `base_method: "rss"`. A **window** delta, not growth since spawn: a
+    # worker that loads a second model must not be charged the first model's
+    # residency (the absolute-against-windowed confusion `_fdinfo_base_mb`
+    # documents).
+    with cpu_host() as ram:
+        before = memory.begin_load()
+        ram.grow(2048)
+        report = memory.finish_load(before, object())
+    assert report["base_mb"] == 2048
+    assert report["base_method"] == "rss"
+    assert report["reserved_at_load_mb"] == 2248, "the high-water at load end"
+    assert report["gpu_name"] == "CPU (64 GB)"
+    assert report["gpu_total_mb"] == 64 * 1024, "physical RAM, the cross-check"
+    assert report["memory"]["free_source"] == "ram"
+    assert "gpu_uuid" not in report, "a CPU host has no board to identify"
+    assert "gpu_bdf" not in report
+
+
+def test_a_second_cpu_load_is_charged_only_its_own_window() -> None:
+    with cpu_host() as ram:
+        first = memory.begin_load()
+        ram.grow(2048)
+        assert memory.finish_load(first, object())["base_mb"] == 2048
+        second = memory.begin_load()
+        ram.grow(512)
+        assert memory.finish_load(second, object())["base_mb"] == 512
+
+
+def test_pages_returned_between_loads_do_not_reach_the_next_base() -> None:
+    # Allocators normally keep their arenas, but if an unload really does hand
+    # pages back, the base must not inherit the drop. It cannot: both ends of
+    # the window delta are the *live* resident set (the worker's "peak
+    # allocated" slot is the live figure on this backend), so a fall lowers
+    # both equally. The stale quantity is the *pool* baseline
+    # `reserved_at_load_mb`, which is the lifetime high-water — asserted here
+    # too, because that is where the effect actually lands.
+    with cpu_host() as ram:
+        first = memory.begin_load()
+        ram.grow(2048)
+        first_report = memory.finish_load(first, object())
+        assert first_report["base_mb"] == 2048
+        assert first_report["reserved_at_load_mb"] == 2248
+
+        ram.release(1024)  # an unload that genuinely gave pages back
+        second = memory.begin_load()
+        ram.grow(512)
+        second_report = memory.finish_load(second, object())
+    assert second_report["base_mb"] == 512, "this load's own growth, and only it"
+    assert second_report["reserved_at_load_mb"] == 2248, (
+        "the high-water is monotone and has no reset, so the pool baseline "
+        "still carries the freed pages — the fit prices batches against it "
+        "until one exceeds it again"
+    )
+
+
+def test_a_cpu_load_that_allocates_nothing_reports_no_base() -> None:
+    # The never-invent-a-footprint rule, unchanged on this backend: a remote
+    # API wrapper that holds nothing reports nothing rather than 0.
+    with cpu_host():
+        report = memory.finish_load(memory.begin_load(), object())
+    assert "base_mb" not in report
+    assert "base_method" not in report
+
+
+def test_a_cpu_batch_measurement_reports_the_high_water_as_its_peak() -> None:
+    # The high-water is a *real* peak (the kernel records it as it happens),
+    # unlike the MPS approximation — but it is never resettable, so it is
+    # reported as the pool. A batch that sets a new high-water reads as
+    # pool-growing, which is what the cost fit regresses on...
+    with cpu_host() as ram:
+        ram.grow(1000)
+        state = memory.begin_batch()
+        ram.grow(500)
+        ram.release(300)
+        growing = memory.finish_batch(state, items=4)["measurements"][0]
+    assert growing["reserved_before_mb"] == 1200
+    assert growing["peak_reserved_mb"] == 1700
+    assert growing["allocated_before_mb"] == 1200
+    assert growing["peak_allocated_mb"] == 1400
+
+    # ...and a smaller repeat does not, which is what fills the throughput
+    # knee's warm-pool ring. Without the high-water-as-pool mapping every
+    # batch would look pool-growing and the knee would never get a sample.
+    with cpu_host() as ram:
+        ram.grow(1000)  # a big batch already reached 1200 MiB…
+        ram.release(500)
+        state = memory.begin_batch()
+        ram.grow(200)  # …so this smaller one sets no new high-water
+        ram.release(200)
+        warm = memory.finish_batch(state, items=4)["measurements"][0]
+    assert warm["peak_reserved_mb"] == warm["reserved_before_mb"] == 1200
+    assert warm["allocated_before_mb"] == 700, "the live residency did move"
+
+
+def test_the_cpu_trim_is_a_no_op() -> None:
+    # Decided, not missing (docs/unified-memory-admission.md, "Trim"): there
+    # is no allocator pool to release, and the arenas Python frees into do
+    # not go back to the OS.
+    with cpu_host() as ram:
+        ram.grow(1024)
+        assert memory.empty_cache() is False
+        assert memory.pool_stats_mb() == (1224, 1224)
+
+
+def test_the_cpu_board_name_is_derived_from_the_same_fact_as_the_probe() -> None:
+    # Physical RAM rounded *up* to a 4 GiB grid — the same rule and the same
+    # source `cpu.rs::board_name` uses, so the informational `gpu_name` on the
+    # wire cannot drift from the board name profiles are keyed by. The grid is
+    # what stops a kernel update (which moves what the OS can count) from
+    # renaming the machine and orphaning its profiles.
+    for total_mb, expected in (
+        (64 * 1024 - 700, "CPU (64 GB)"),
+        (64 * 1024, "CPU (64 GB)"),
+        (16 * 1024 - 400, "CPU (16 GB)"),
+        (65 * 1024, "CPU (68 GB)"),
+        (1, "CPU (4 GB)"),
+    ):
+        with cpu_host(FakeRam(total_mb=total_mb, available_mb=1)):
+            assert memory.ram_gpu_name() == expected
+    with isolated():
+        with mock.patch.object(memory, "_virtual_memory", return_value=None):
+            assert memory.ram_gpu_name() is None
+            assert memory.ram_free_total_mb() == (None, None)
+
+
+def test_the_process_high_water_is_read_in_the_right_unit() -> None:
+    # Two readers, two units, and getting either wrong is a factor of 1024.
+    assert memory.parse_vm_high_water("VmRSS:\t 100 kB\nVmHWM:\t   2048 kB\n") == (
+        2048 * 1024
+    )
+    assert memory.parse_vm_high_water("VmHWM:\t 2048 MB\n") is None, (
+        "an undocumented unit is not a reading"
+    )
+    assert memory.parse_vm_high_water("VmRSS:\t 100 kB\n") is None
+
+    # `resource` does not exist on Windows, so the module is injected rather
+    # than patched — which is also the only way this reader is reachable from
+    # a Windows test run at all.
+    with fake_resource(ru_maxrss=4096):
+        with mock.patch.object(sys, "platform", "darwin"):
+            assert memory._rusage_peak_bytes() == 4096, "macOS reports bytes"
+        with mock.patch.object(sys, "platform", "linux"):
+            assert memory._rusage_peak_bytes() == 4096 * 1024, "elsewhere, KiB"
+
+
+@contextmanager
+def fake_resource(ru_maxrss: int | None):
+    """A stand-in `resource` module; `None` makes `getrusage` fail."""
+
+    def getrusage(_who):
+        if ru_maxrss is None:
+            raise OSError("no rusage here")
+        return SimpleNamespace(ru_maxrss=ru_maxrss)
+
+    module = SimpleNamespace(RUSAGE_SELF=0, getrusage=getrusage)
+    with mock.patch.dict(sys.modules, {"resource": module}, clear=False):
+        yield
+
+
+def test_the_high_water_is_never_below_the_live_residency() -> None:
+    # The two come from different interfaces; a "peak" under the live reading
+    # would be a reading of nothing.
+    with isolated():
+        with (
+            mock.patch.object(memory, "_rss_bytes", lambda: 900 * MIB),
+            mock.patch.object(sys, "platform", "sunos5"),
+        ):
+            with fake_resource(ru_maxrss=None):
+                assert memory._peak_rss_bytes() == 900 * MIB, "no peak reader"
+            with fake_resource(ru_maxrss=100 * 1024):
+                assert memory._peak_rss_bytes() == 900 * MIB, "a peak under it"
+            with fake_resource(ru_maxrss=2000 * 1024):
+                assert memory._peak_rss_bytes() == 2000 * MIB
+
+
+def test_a_cpu_priced_host_reports_one_currency_even_with_a_live_gpu() -> None:
+    # The currency-salad guard. `INFERIO_DEVICE=cpu` is what `get_device()`
+    # honours, but an impl that ignores it — or a library that initializes a
+    # context on import — can still leave this process holding a live CUDA
+    # device. Every reading has to come from the *one* statement about how
+    # this host was priced, or the report names a card while its free, total
+    # and base figures are all the machine's RAM, and the ledger has no way
+    # to tell.
+    cuda = FakeCuda()
+    cuda.reserved = 4096 * MIB
+    cuda.allocated = 3000 * MIB
+    with cpu_host(torch_module=fake_torch_module(cuda)) as ram:
+        assert memory._ram_currency() is True
+        before = memory.begin_load()
+        ram.grow(2048)
+        report = memory.finish_load(before, object())
+
+    assert report["base_method"] == "rss"
+    assert report["base_mb"] == 2048
+    assert report["gpu_total_mb"] == 64 * 1024, "RAM, not the card's VRAM"
+    assert report["gpu_name"] == "CPU (64 GB)"
+    assert "gpu_uuid" not in report, "no board identity on a RAM-priced report"
+    assert "gpu_bdf" not in report
+    assert report["memory"] == {
+        "free_mb": 40 * 1024 - 2048,
+        "total_mb": 64 * 1024,
+        "free_source": "ram",
+        "reserved_mb": 2248,
+        "allocated_mb": 2248,
+    }, "no allocator statistics from a device this host is not priced against"
+    # And the trim path releases nothing rather than shrinking a pool the
+    # ledger measures in RSS and would never see move.
+    with cpu_host(torch_module=fake_torch_module(cuda)):
+        assert memory.empty_cache() is False
+    assert cuda.empty_cache_calls == 0
+
+
+def test_a_cpu_priced_mac_reports_ram_and_not_metal() -> None:
+    # DP-3's one unaccelerated path: an `accelerator = "cpu"` Mac has a
+    # perfectly available Metal backend *and* is priced as a CPU board, so
+    # every reading has to be the RAM one — including the informational name,
+    # which would otherwise put the chip on the wire for a board keyed `CPU`.
+    ram = FakeRam(total_mb=128 * 1024, available_mb=90 * 1024)
+    with cpu_host(ram, torch_module=fake_mps_torch_module(FakeMpsAllocator())):
+        assert memory._ram_currency() is True
+        assert memory.free_total_mb() == (90 * 1024, 128 * 1024, "ram")
+        assert memory.device_identity() == (None, "CPU (128 GB)")
+        assert memory.gpu_total_mb() == 128 * 1024, "RAM, not recommended-max"
+        ram.grow(1500)
+        assert memory.pool_stats_mb() == (1700, 1700)

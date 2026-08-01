@@ -409,7 +409,11 @@ set, the admission budget is the smaller:
   costs nothing.
 - **`cap_fraction`** (default off) — a hard ceiling as a fraction of the
   board's total VRAM. This is the server lever, for partitioning one card
-  between services. If you set it, leave `margin` alone.
+  between services. If you set it, leave `margin` alone. One board ships with
+  it **on**: the `CPU` board (see the table below) defaults to `0.75`, because
+  running the machine out of RAM is an OS process kill rather than a catchable
+  allocation failure. Setting it — here or under
+  `[inference_local.vram.gpu."CPU"]` — replaces that default.
 
 Overrides are per **GPU instance**, keyed by board UUID (`nvidia-smi -L`
 prints them; ROCm keys its boards differently — see below), not by card model
@@ -422,6 +426,43 @@ its twin. An omitted key in an override inherits the section default.
 `GET /api/inference/health` reports each board's `margin`, `cap_fraction`,
 `limit_mb` and `headroom_mb`, which is the fastest way to check that an
 override was picked up.
+
+#### Where automatic batch sizing applies
+
+Automatic sizing replaced the manual batch-size setting, so where it does not
+apply is a decision rather than an omission. *Calibrated* means a real
+admission budget, per-model cost fits and stored profiles; *backstopped only*
+means the unpriced path (your cap, then the registry default, then
+`default_max_batch`) with the impls' OOM-retry halving underneath; *out of
+scope* means we do not ship a torch build for it at all.
+
+| Host | Status | Board key |
+|---|---|---|
+| NVIDIA CUDA (Linux, Windows) | calibrated | `GPU-<uuid>` |
+| AMD discrete GPU, ROCm (Linux) | calibrated | `GPU-<unique_id>` / `GPU-BDF-…` |
+| AMD APU / iGPU, ROCm (Linux) | calibrated (carve-out + GTT) | `GPU-<unique_id>` / `GPU-BDF-…` |
+| Apple Silicon, MPS | calibrated | `GPU-MPS` |
+| No accelerator (CPU) | calibrated (system RAM, default `cap_fraction = 0.75`) | `CPU` |
+| Ambient `*_VISIBLE_DEVICES` restriction, Slurm-managed hosts | backstopped only | — |
+| Partitioned boards (MI300-class CPX/NPS) | backstopped only | — |
+| Unknown inventory (no/failed `nvidia-smi`, unreadable sysfs, or a CPU host whose total RAM could not be read) | backstopped only | — |
+| Remote inference upstreams, `none`-class models † | backstopped only | — |
+| DirectML (incl. Windows APUs), Intel XPU, Jetson, Intel Macs | out of scope | — |
+
+† A model whose memory never passes through an accelerator allocator is
+unpriced on a GPU host by design — its real VRAM is accounted for in the
+board's *external* term instead. On a **CPU** host there is no such gap: its
+resident memory is the same memory the board is made of, so it is measured
+(`base_method: "rss"`) and priced like any other model. `none`-class models
+stay unpriced everywhere, since they declare that nothing about them scales
+with batch size.
+
+The three unified-memory rows — APU, Apple Silicon and CPU — are budgeted
+against memory the whole machine shares, so their free reading is clamped by
+what the OS says it can actually deliver and a worker killed by the OS
+mid-batch is itself recorded as a negative sample
+(`docs/unified-memory-admission.md`). MPS and APU pricing is fixture-verified
+only: no Apple Silicon or AMD hardware was available when it was written.
 
 #### Windows note: the driver's sysmem fallback
 
@@ -490,15 +531,6 @@ Deliberately not at parity:
 - **ROCm on Windows/WSL is out of scope.** The `rocm` extra carries
   `sys_platform == 'linux'` markers, so no managed install puts ROCm torch on
   Windows.
-- **APUs and iGPUs are not priced at all.** An integrated part's "VRAM
-  total" is the BIOS UMA carve-out — often a few hundred MB — and has little
-  to do with the memory it can actually reach, so budgeting against it would
-  collapse every grant to a batch of one. The probe recognises such a node
-  (the kernel reports both compute units and CPU cores on it) and declines
-  to price the whole host, which is the pre-feature behaviour rather than a
-  regression. A host with an APU *and* a discrete card is declined too: the
-  discrete board's row index only means anything to HIP if the rows cover
-  every board HIP enumerates, and the APU is one of them.
 - **Partitioned boards (MI300-class CPX/NPS) are unpriced.** amdgpu reports
   VRAM per PCI device, not per partition, so pricing each partition against
   the whole board's memory would over-admit it N-fold; the probe declines
@@ -527,7 +559,7 @@ the reason and how many KFD GPU nodes were found and openable.
 ### The managed Python environment (`panoptikon setup`)
 
 ```bash
-panoptikon setup [--accelerator auto|cuda|rocm|cpu] [--force]
+panoptikon setup [--accelerator auto|cuda|rocm|mps|cpu] [--force]
 ```
 
 Creates or updates the managed inference venv at **`python/.venv`** (fixed

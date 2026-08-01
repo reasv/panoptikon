@@ -259,3 +259,25 @@ class TestSelectCt2ComputeType:
         # No fake module injected: explicit must return before any import.
         with mock.patch.dict(sys.modules, {"ctranslate2": None}):
             assert select_ct2_compute_type(explicit="int8") == "int8"
+
+    def test_the_callers_device_kind_wins_over_the_probe(self):
+        # A host the orchestrator priced against system RAM has its impls
+        # pinned to the CPU (`INFERIO_DEVICE=cpu`), and the machine may still
+        # have a CUDA device — so `torch.cuda.is_available()` is the wrong
+        # question and the caller's resolved device is the right one
+        # (docs/unified-memory-admission.md, backend C).
+        with _patch_ct2({"cpu": {"float32", "int8"}, "cuda": {"float16"}}):
+            with _patch_cuda_available(True):
+                assert (
+                    select_ct2_compute_type(device_kind="cpu") == "float32"
+                )
+        # Anything that is not CUDA is CPU: CTranslate2 has no Metal backend,
+        # so a device kind it has never heard of must not be asked about.
+        with _patch_ct2({"cpu": {"float32"}}):
+            with _patch_cuda_available(False):
+                assert select_ct2_compute_type(device_kind="mps") == "float32"
+        # And the kind still only chooses which set is queried — the probe's
+        # answer decides the type, as before.
+        with _patch_ct2({"cuda": {"float16", "float32"}}):
+            with _patch_cuda_available(False):
+                assert select_ct2_compute_type(device_kind="cuda") == "float16"

@@ -19,6 +19,11 @@
 pub mod calibration;
 pub mod capability;
 pub mod cost;
+/// The CPU half of `gpu`: one synthetic unified-memory board over the host's
+/// own RAM, for a machine with no accelerator at all. Private for the same
+/// reason `mps` and `rocm` are — `gpu` is the only entry point any backend is
+/// reached through.
+mod cpu;
 pub mod dispatch;
 pub mod gpu;
 pub mod http;

@@ -11,7 +11,14 @@
 //! compute-capability analogue, so every row's `compute_cap` is `None`, the
 //! host view collapses to unknown, and the `/metadata` overlay stays absent
 //! (docs/rocm-batch-calibration-parity.md D7 — the rows do carry
-//! `gfx_target_version` for a future gfx-arch allowlist).
+//! `gfx_target_version` for a future gfx-arch allowlist). On **CPU** it
+//! became one too: a host whose resolved accelerator is `cpu` used to be
+//! routed through the nvidia-smi probe precisely so a card it happened to
+//! have still filtered models, and backend C stopped doing that
+//! (docs/unified-memory-admission.md). Such a host now runs its impls on the
+//! CPU device by construction, so the floors were gating on a board its
+//! CPU-only torch cannot address; the impls' own load-time guard is what
+//! remains, as on every other unknown host.
 //!
 //! The probe itself lives in `gpu.rs`: on CUDA, capabilities and board
 //! identities come out of **one** `nvidia-smi --query-gpu` call,

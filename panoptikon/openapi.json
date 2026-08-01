@@ -8626,7 +8626,7 @@
       },
       "ReplicaTelemetryHealth": {
         "type": "object",
-        "description": "Per-replica GPU placement plus its freshest memory report. Every field\nafter `gpu` is `null` until the worker reports it (no torch, CPU/MPS\nhost, or no predict yet).",
+        "description": "Per-replica GPU placement plus its freshest memory report. Every field\nafter `gpu` is `null` until the worker reports it (no torch, a remote-API\nimpl, or no predict yet). A CPU or MPS host does report: its figures are\ndenominated in system RAM and Metal's budget respectively, not in VRAM\n(docs/unified-memory-admission.md).",
         "required": [
           "measurements_recorded",
           "recent_batches"
