@@ -2929,6 +2929,7 @@ config.replicas = 2
                 compute_cap: Some("12.0".into()),
                 bdf: None,
                 gfx_target_version: None,
+                unified_ram_mb: None,
             },
             GpuInfo {
                 index: 3,
@@ -2938,6 +2939,7 @@ config.replicas = 2
                 compute_cap: Some("12.0".into()),
                 bdf: None,
                 gfx_target_version: None,
+                unified_ram_mb: None,
             },
         ])
     }
@@ -3055,6 +3057,7 @@ config.replicas = 2
             compute_cap: None,
             bdf: Some(bdf.to_owned()),
             gfx_target_version: Some(110_000),
+            unified_ram_mb: None,
         };
         GpuInventory::known_rocm(vec![board(3, "0000:03:00.0"), board(7, "0000:0c:00.0")])
     }

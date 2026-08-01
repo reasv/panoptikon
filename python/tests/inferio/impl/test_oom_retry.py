@@ -79,6 +79,60 @@ def test_non_oom_exception_propagates_untouched():
         run_with_oom_retry(process, [1, 2], oom_exceptions=(FakeOOM,))
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        # The CPU backend's two forms: the builtin, and torch's own allocator
+        # message — which never says "out of memory" and is why the
+        # classifier carries the explicit spelling.
+        MemoryError(),
+        RuntimeError(
+            "[enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: can't "
+            "allocate memory: you tried to allocate 12884901888 bytes."
+        ),
+        # MPS's, which the generic substring already covers.
+        RuntimeError(
+            "MPS backend out of memory (MPS allocated: 18.09 GB, other "
+            "allocations: 384.00 KB, max allowed: 18.13 GB)."
+        ),
+    ],
+    ids=["memory-error", "cpu-allocator", "mps"],
+)
+def test_backends_without_a_cuda_oom_type_still_halve(failure):
+    """The negative-signal widening (docs/unified-memory-admission.md).
+
+    None of these is a `torch.cuda.OutOfMemoryError`, and on the platforms
+    that raise them the halving loop is the *only* backstop there is — the
+    orchestrator's admission is what keeps batches inside the budget, and
+    this is what catches the case where it was wrong.
+    """
+    calls = []
+
+    def process(chunk):
+        calls.append(len(chunk))
+        if len(chunk) > 1:
+            raise failure
+        return list(chunk)
+
+    result, cache = _retry(process, [1, 2])
+    assert result == [1, 2]
+    assert calls == [2, 1, 1], "halved to one item, then ran the rest"
+    assert cache.call_count == 1
+
+
+def test_a_plain_runtime_error_is_not_treated_as_an_oom():
+    """The widening is text-classified, so it has to be conservative: a
+    generic `RuntimeError` that says nothing about memory must propagate
+    rather than be retried at half the batch size, or every impl bug becomes
+    a silent halving loop."""
+
+    def process(chunk):
+        raise RuntimeError("shape mismatch in forward()")
+
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        run_with_oom_retry(process, [1, 2], oom_exceptions=(FakeOOM,))
+
+
 def test_initial_chunk_size_is_respected():
     calls = []
 

@@ -15,6 +15,12 @@ worker ignores the request fields and omits the response ones, an older
 orchestrator sends neither and ignores whatever comes back — so the version
 stays 2.
 
+2026-08-01: MPS (Apple Silicon) reports memory like every other backend —
+`free_source: "mps"`, `base_method: "mps"`, an authoritative `gpu_total_mb`,
+and spawn-env lines for the allocator watermarks
+(docs/unified-memory-admission.md, backend A). Additive values in existing
+fields only, so the version stays 2.
+
 2026-07-30 (step 2): the `trim` request type (see "Trim" below) and the
 optional `trimmed` flag on a measurement. Also additive: an older worker
 answers an unknown `type` with a per-request `error` and stays alive, which
@@ -75,7 +81,7 @@ continues (does not exit).
 | `configure` | `inference_id` (str, "group/name", for logs), `config` (map — resolved kwargs for the impl `__init__`) | Instantiates `impl_class(**config)`. Exactly once per worker, before `load`; a second `configure`, or `load`/`predict` before it, is a per-request `error`. |
 | `load` | — | Calls `instance.load()`. Requires prior `configure`. Idempotent (repeat → `ok` without reloading, matching today's `InferenceModel.load()` guard semantics). |
 | `predict` | `inputs`: array of maps `{ "data": <any msgpack value or nil>, "file": <bin or nil> }`, plus the optional `grant`/`fit` maps below | Calls `instance.predict(...)` with the inputs converted to `PredictionInput(data, file)` equivalents, in order. Requires a prior successful `load`; without one, reply `error` (the orchestrator always loads first — this is a sanity check, not a feature). **Without a `grant`** the whole `inputs` array goes to one `instance.predict` call, which is the pre-1b behaviour and the permanent compatibility path. **With a `grant`** the worker's packing harness splits `inputs` into several GPU batches within the granted budget and reports one measurement per batch. |
-| `trim` | — | Release the caching allocator's **unused pool** (`torch.cuda.empty_cache()`), keeping weights, live tensors and the CUDA context. Valid in every state; a worker with no live CUDA does nothing and still replies `ok`. Reply carries a fresh memory sample (below). Never an error path: a trim that could not measure anything is still an `ok`. |
+| `trim` | — | Release the caching allocator's **unused pool** (`torch.cuda.empty_cache()`, or `torch.mps.empty_cache()` on Apple Silicon), keeping weights, live tensors and the CUDA context. Valid in every state; a worker with no live CUDA does nothing and still replies `ok`. Reply carries a fresh memory sample (below). Never an error path: a trim that could not measure anything is still an `ok`. |
 | `unload` | — | Calls `instance.unload()` if an instance was configured+loaded, replies `ok`, flushes, then exits 0. Valid in every state (a parked prewarmed worker is dismissed the same way). |
 | `ping` | — | Liveness. Reply `ok`. |
 
@@ -193,7 +199,7 @@ state at one instant, each key present but possibly nil:
 |---|---|
 | `free_mb` | driver-reported free memory on the worker's GPU |
 | `total_mb` | driver-reported total memory on the worker's GPU |
-| `free_source` | which driver told us: `"nvml"`, `"amdgpu-sysfs"` (amdgpu's `mem_info_vram_total - mem_info_vram_used` for the worker's own board) or `"torch"` (`mem_get_info`). Absent/nil when none could answer |
+| `free_source` | which driver told us: `"nvml"`, `"amdgpu-sysfs"` (amdgpu's `mem_info_vram_total - mem_info_vram_used` for the worker's own board), `"mps"` (Metal's `recommended_max_memory` bounded by the OS's available-RAM figure — see below) or `"torch"` (`mem_get_info`). Absent/nil when none could answer |
 | `reserved_mb` | torch caching-allocator pool size (`memory_reserved`) |
 | `allocated_mb` | live tensor bytes (`memory_allocated`) |
 
@@ -217,18 +223,34 @@ sysfs-derived reporter cannot inherit that authority by string collision — and
 it is the same pair of files the orchestrator's own refresh reads, so both
 sides of the ledger speak one vocabulary by construction.
 
+**`"mps"` is the unified-memory reading** (docs/unified-memory-admission.md,
+backend A). `total_mb` is Metal's `recommendedMaxWorkingSetSize`
+(`torch.mps.recommended_max_memory()`) — the policy budget for accelerator use
+of the machine's RAM, which is what allocations are actually judged against and
+is *not* a constant: raising the GPU wired limit moves it. `free_mb` is
+`max(0, min(total, ram_available))`, with `ram_available` from
+`psutil.virtual_memory().available`. The RAM term is the load-bearing part: the
+memory is the whole machine's, so external pressure has to be read from the OS
+— there is no accelerator-level free counter on that board at all — and a
+browser eating 40 GB then shows up exactly the way a game eating VRAM does on a
+dGPU. It is treated as authoritative (whole-machine by construction), and the
+orchestrator's own refresh reads the same statistics under the same label:
+psutil's macOS `available` is free + inactive pages, and the orchestrator's
+`host_statistics64` read sums exactly those two terms and no others, so
+neither side is systematically the looser of the two.
+
 `load` `ok` may additionally carry:
 
 | field | meaning |
 |---|---|
 | `base_mb` | the worker's whole-**process** device footprint after load (CUDA context + workspaces + weights), not just its allocator footprint. Absent — never zero — when the process demonstrably never touched the GPU (no torch, CPU/MPS host, remote API, or a torch-importing engine like CTranslate2 whose VRAM the allocator never sees) |
-| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own board per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"free_delta"` (driver free-memory delta across the load), or `"alloc_delta"` (allocator peak delta plus a fixed context allowance — the floor). Always names the term that actually produced the reported number |
+| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own board per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"mps"` (`torch.mps.driver_allocated_memory()` at load end — per-process *by construction*, since each process owns its Metal heap, so it is the same rank as the other two and needs neither a PID lookup nor a plausibility floor), `"free_delta"` (driver free-memory delta across the load), or `"alloc_delta"` (allocator peak delta plus a fixed context allowance — the floor). Always names the term that actually produced the reported number |
 | `reserved_at_load_mb` | allocator pool size right after load; the orchestrator prices later pool growth against this |
 | `dtype` | the negotiated load precision, one of `"fp16"`, `"bf16"`, `"fp32"` (part of the calibration profile key). Absent when the impl does not negotiate one (CPU impls, remote APIs) |
 | `gpu_uuid` | the board the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the device-visibility variable the orchestrator spawned it with (`CUDA_VISIBLE_DEVICES`, or a bare device index in `HIP_VISIBLE_DEVICES` on ROCm) — is the authoritative GPU identity for the calibration ledger. Absent when the worker has no initialized CUDA device, **and always absent on a ROCm (HIP) build** — see below |
-| `gpu_name` | that board's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), informational. The calibration profile key uses the orchestrator's own inventory name for the board, not this |
+| `gpu_name` | that board's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), informational. The calibration profile key uses the orchestrator's own inventory name for the board, not this. On MPS torch has no board struct to ask, so the worker derives `"Apple M3 Max (128 GB)"` from the same two sysctls (`machdep.cpu.brand_string`, `hw.memsize`) and the same rounding the orchestrator's probe uses — deliberately identical, so the one field that could silently drift from the profile key does not |
 | `gpu_bdf` | the board's PCI address as the worker read it from `get_device_properties(0)`'s `pci_domain_id`/`pci_bus_id`/`pci_device_id`, rendered `"dddd:bb:dd.0"` in lower-case hex. The function digit is always `.0`: the GPU function of an amdgpu device is 0 (the HDMI/DP audio controller is `.1` of the *same device*), which is how the orchestrator's own probe renders it too, so the two sides join. Reported on CUDA hosts as well — additive, and harmless where the UUID already identifies the board. Absent on a torch build that exposes no PCI fields, unless the fdinfo fallback below answered — which today means absent on the shipped CUDA build, whose venv pins torch 2.7.1 (`_CudaDeviceProperties` grew the PCI fields in 2.8, and the fdinfo fallback is HIP-only): this field goes live on CUDA when that pin moves to >= 2.8, and until then the identity chain it feeds is load-bearing on ROCm alone (the `rocm` extra pins torch 2.11) |
-| `gpu_total_mb` | that board's total VRAM per torch (`get_device_properties(0).total_memory`), in MiB. Deliberately a *second* source for a number the orchestrator can also read from the driver: it is what a non-UUID board match is cross-checked against |
+| `gpu_total_mb` | that board's total VRAM per torch (`get_device_properties(0).total_memory`), in MiB. Deliberately a *second* source for a number the orchestrator can also read from the driver: it is what a non-UUID board match is cross-checked against. **On MPS it is `recommended_max_memory()` and it is not a cross-check but the authoritative figure**: the orchestrator seeds that board's total at ≈75 % of RAM (Metal's default) and adopts the reported number on the first load report, sanity-bounded by physical RAM alone — a raised GPU wired limit legitimately puts the real figure 20 % away from the seed (docs/unified-memory-admission.md, DP-4) |
 | `torch_version` | `torch.__version__` (e.g. `"2.7.1+cu128"`), part of the calibration profile key. Only the worker knows which torch its venv holds. Absent when the impl never imported torch |
 | `memory` | a memory sample taken right after load |
 
@@ -334,6 +356,26 @@ own per-item unit pricing (image-header reads, byte counts) happens **before**
 the timed section, deliberately, so the throughput-collapse comparator sees
 GPU throughput rather than CPU decode noise. Decode *inside* the impl is
 still inside the timing; nothing outside the impl can separate it.
+
+**On MPS the peaks are an approximation, and a documented one.** torch.mps
+exposes no peak counters and no reset, so `peak_reserved_mb` /
+`peak_allocated_mb` are `driver_allocated_memory()` / `current_allocated_memory()`
+read *after* the batch. The caching pool is *usually* monotone between
+`empty_cache()` calls — the same property the CUDA pool has — so the
+post-batch driver allocation is normally the batch's high-water reserved size;
+the orchestrator's own reactive shrink runs strictly between windows and so
+never releases the pool mid-batch. **The exception is the ceiling itself**:
+the MPS allocator garbage-collects cached buffers when an allocation would
+cross the low watermark, so on a batch that ran close to the budget the
+post-batch figure can sit *below* the true peak. The bias is therefore toward
+under-stating cost exactly where cost matters most, which is why the spawn env
+pins both watermarks to 1.0 (below) and why the collapse detector and the
+death-as-negative signal (DP-2) carry the near-ceiling regime rather than the
+peak arithmetic. Verifying the size of the effect is an M3 Max field-pass item.
+The allocated figure is the weaker of the two: it is live tensors at
+the end of the call rather than at their peak, so it understates a transient.
+Nothing in admission regresses against it — the fit uses reserved growth — and
+it stays in the sample as the diagnostic it is elsewhere.
 
 The worker resets torch's peak counters before each measured batch, so peaks
 are per-batch rather than cumulative. A worker that packs one request frame
@@ -455,6 +497,19 @@ The orchestrator sets for every worker:
 
   Exactly one is written, and only when a pin resolved; a worker is never
   handed both.
+- `PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0` and
+  `PYTORCH_MPS_LOW_WATERMARK_RATIO=1.0` — MPS hosts only. The high one pins
+  torch's MPS allocator ceiling to Metal's `recommendedMaxWorkingSetSize`,
+  which is the figure the ledger budgets that board against, so the hard error
+  fires at the boundary admission assumes instead of wherever the build's
+  default sits (it has drifted across torch versions and can sit *above* 1.0,
+  i.e. inside macOS's compression/swap regime, where nothing raises at all).
+  The resulting error is a `RuntimeError` the OOM classifier recognises by
+  text. The low one is pinned **with** it because torch asserts `high >= low`
+  when the allocator initializes: an ambient user-set low above 1.0 would turn
+  the high pin into a hard startup failure. It is also the watermark the
+  allocator garbage-collects cached buffers at, which is why the peak
+  approximation above is biased near the ceiling.
 - `INFERIO_WORKER=1` — marker for impl code that wants to know.
 - `PYTHONIOENCODING=utf-8` — keeps worker stderr valid UTF-8 (defense in
   depth; the orchestrator's stderr forwarder tolerates arbitrary bytes from

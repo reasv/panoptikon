@@ -329,6 +329,38 @@ def last_oom_retry():
     return _last_oom_retry
 
 
+def looks_like_oom(exc: BaseException) -> bool:
+    """Whether an exception is an out-of-memory condition by its *text*.
+
+    The backstop for backends whose out-of-memory error is not a type we can
+    name (docs/unified-memory-admission.md, "Negative signals"): MPS raises
+    `RuntimeError("MPS backend out of memory (…)")` and CPU torch raises
+    `RuntimeError("… DefaultCPUAllocator: can't allocate memory …")`, neither
+    of which is a `torch.cuda.OutOfMemoryError` and only one of which even
+    says "out of memory".
+
+    Deliberately conservative: a generic exception is treated as an OOM only
+    when one of these forms matches, so an assertion or a bad input still
+    propagates untouched instead of being retried at half the batch size.
+
+    A near-twin of the worker harness's own `_looks_like_oom`
+    (`inferio_worker/packing.py`) — the two cannot share code, because the
+    harness must never import this package (it only observes it when an impl
+    already has) and this module must not import the harness. They classify
+    the same strings and must be changed together.
+    """
+    for error in (exc, exc.__cause__, exc.__context__):
+        if error is None:
+            continue
+        text = str(error)
+        lowered = text.lower()
+        if "out of memory" in lowered or "INFERENCE_OOM" in text:
+            return True
+        if "defaultcpuallocator" in lowered and "allocate memory" in lowered:
+            return True
+    return False
+
+
 def run_with_oom_retry(
     process_chunk,
     items,
@@ -337,7 +369,7 @@ def run_with_oom_retry(
     oom_exceptions=None,
     logger: logging.Logger | None = None,
 ) -> list:
-    """Run `process_chunk` over `items`, halving the chunk size on CUDA OOM.
+    """Run `process_chunk` over `items`, halving the chunk size on OOM.
 
     `process_chunk(chunk)` must return exactly len(chunk) results; results
     are concatenated in input order. On OOM the torch cache is cleared and
@@ -345,6 +377,37 @@ def run_with_oom_retry(
     a call, since the dispatcher forms fresh full batches on the next
     request anyway. An OOM with a single item raises InferenceOOMError;
     any other exception propagates untouched.
+
+    **What counts as an OOM** is three things, not one: the CUDA/HIP
+    exception type (`torch.cuda.OutOfMemoryError`, or whatever
+    `oom_exceptions` overrides it with), a plain `MemoryError` — host RAM
+    exhaustion, which is a *builtin* and so no type torch could hand us —
+    and any exception whose text [`looks_like_oom`] recognises, which is how
+    MPS's and CPU torch's untyped `RuntimeError`s are caught. Before this
+    widened, a too-big batch on any backend but CUDA/HIP was an uncaught
+    error or a dead worker rather than a halved retry, on exactly the
+    platforms where the halving is the only backstop there is
+    (docs/unified-memory-admission.md).
+
+    Two consequences of that widening are worth stating, because both are
+    deliberate and neither is obvious:
+
+    - a **nested** `InferenceOOMError` — an inner `run_with_oom_retry`
+      giving up at a single item, inside an impl whose outer chunk is still
+      several items — is now *absorbed* and the outer chunk retried at half
+      size, where it used to propagate on the first hit. Its
+      `INFERENCE_OOM` text is what [`looks_like_oom`] matches. This is the
+      right direction (the outer loop has smaller batches left to try, and
+      the prefix still reaches the orchestrator if the halving runs out),
+      but it does mean the batch-1 error is no longer terminal for callers
+      that nest;
+    - the scan covers `__cause__` and `__context__` as well as the
+      exception itself, so an OOM re-raised inside an `except` block is
+      still recognised. That deliberately **errs toward** classifying as
+      OOM: a chained non-memory error that merely happened during an OOM
+      cleanup is retried at half size, costing one wasted attempt, which is
+      cheaper than the alternative of a missed backstop on the backends
+      that have no other one.
 
     Every call records what it actually executed for `last_oom_retry` — the
     largest chunk that ran and how many halvings it took to get there. The
@@ -369,6 +432,8 @@ def run_with_oom_retry(
         # Canonical spelling: torch.cuda.OutOfMemoryError; it is the same
         # class as torch.OutOfMemoryError in both shipped torch generations.
         oom_exceptions = (torch.cuda.OutOfMemoryError,)
+    elif not isinstance(oom_exceptions, tuple):
+        oom_exceptions = (oom_exceptions,)
 
     items = list(items)
     if not items:
@@ -380,7 +445,21 @@ def run_with_oom_retry(
         chunk = items[pos : pos + chunk_size]
         try:
             out = list(process_chunk(chunk))
-        except oom_exceptions as err:
+        except Exception as err:
+            # `MemoryError` is tested outside `oom_exceptions` on purpose: it
+            # is a builtin rather than a torch type, it is the *only* form a
+            # host-RAM exhaustion takes, and it is unambiguous — so it must
+            # hold even where a caller narrowed the device exception type.
+            if not (
+                isinstance(err, oom_exceptions)
+                or isinstance(err, MemoryError)
+                or looks_like_oom(err)
+            ):
+                # Not an out-of-memory condition: an assertion, a bad input, a
+                # processor that rejected something. Halving would run it
+                # again at half the size and fail again, hiding the real
+                # error behind a retry loop.
+                raise
             clear_cache()
             if len(chunk) == 1:
                 raise InferenceOOMError(

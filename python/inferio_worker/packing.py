@@ -474,16 +474,34 @@ def _looks_like_oom(exc: BaseException) -> bool:
     """Whether an exception from `instance.predict` is an out-of-memory one.
 
     Covers the impl's own `InferenceOOMError` (batch-1, already prefixed),
-    torch's `OutOfMemoryError` by class name (no torch import here), and the
-    bare driver message for anything that re-raised untyped.
+    torch's `OutOfMemoryError` and the interpreter's own `MemoryError` by
+    class name (no torch import here), and the bare allocator message for
+    anything that re-raised untyped.
+
+    Two of those messages are the only signal their backend has
+    (docs/unified-memory-admission.md, "Negative signals"). MPS raises
+    `RuntimeError("MPS backend out of memory (…)")`, which the generic
+    substring already catches; CPU torch raises
+    `RuntimeError("… DefaultCPUAllocator: can't allocate memory …")`, whose
+    text says nothing about being out of memory, hence the explicit form.
+    The classifier is data — extending it is how a new backend's spelling is
+    learned — and it is deliberately the *only* way an untyped exception is
+    treated as an out-of-memory condition.
     """
     for error in (exc, exc.__cause__, exc.__context__):
         if error is None:
             continue
-        if type(error).__name__ in ("OutOfMemoryError", "InferenceOOMError"):
+        if type(error).__name__ in (
+            "OutOfMemoryError",
+            "InferenceOOMError",
+            "MemoryError",
+        ):
             return True
         text = str(error)
-        if "out of memory" in text.lower() or "INFERENCE_OOM" in text:
+        lowered = text.lower()
+        if "out of memory" in lowered or "INFERENCE_OOM" in text:
+            return True
+        if "defaultcpuallocator" in lowered and "allocate memory" in lowered:
             return True
     return False
 

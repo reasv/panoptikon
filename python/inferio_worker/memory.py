@@ -495,7 +495,11 @@ def device_identity() -> tuple[str | None, str | None]:
     """
     props = _device_props()
     if props is None:
-        return (None, None)
+        # MPS has no UUID and no board struct — one device per host, keyed by
+        # a constant. The name is still worth reporting, and is derived from
+        # the same two sysctls (and the same rounding) the orchestrator uses,
+        # so the two spellings of this host cannot drift apart.
+        return (None, mps_gpu_name() if _torch_mps() is not None else None)
     uuid = _prop(props, "uuid")
     name = _prop(props, "name")
     if uuid is not None and _is_hip(_torch()):
@@ -616,10 +620,15 @@ def gpu_total_mb() -> int | None:
     inventory's total came from amdgpu's `mem_info_vram_total` sysfs file,
     this one from HIP, so agreement is evidence rather than a file compared
     with itself (docs/rocm-batch-calibration-parity.md, D3/F4).
+
+    On MPS it is `recommended_max_memory()` and it is not a cross-check at
+    all but the **authoritative** figure: the orchestrator's own total there
+    is a seeded fraction of RAM, while this is the number the allocator's
+    ceiling is actually set from (docs/unified-memory-admission.md, DP-4).
     """
     props = _device_props()
     if props is None:
-        return None
+        return _mb(_mps_call("recommended_max_memory"))
     return _mb(_prop(props, "total_memory"))
 
 
@@ -1007,6 +1016,198 @@ def _sysfs_bytes(path: str) -> int | None:
     return value if value >= 0 else None
 
 
+# ---------------------------------------------------------------------------
+# MPS (Apple Silicon): a unified-memory board
+# ---------------------------------------------------------------------------
+
+
+def _torch_mps() -> Any | None:
+    """The already-imported torch module iff **MPS** is this worker's device.
+
+    The same contract `_torch_cuda` has, for the other backend: torch must be
+    in `sys.modules` already (this module never imports it) and its Metal
+    backend must be available. `_torch_cuda` is checked first and wins — a
+    torch build can report both on a machine that has both, and everything
+    downstream keys one worker to one device.
+
+    Every attribute is `getattr`-guarded: `torch.mps` and
+    `torch.backends.mps` do not exist on every build we might be running
+    under (nor on the fakes the tests inject), and an `AttributeError` here
+    would take down the whole load report.
+
+    There is no `is_initialized()` analogue to gate on, and none is needed:
+    the MPS allocator has no context to create — `is_available()` answers
+    from the OS and the build, and the driver-allocated figure is 0 until
+    something allocates. So the "never initialize the device" rule this
+    module lives by is satisfied by construction rather than by a guard.
+    """
+    if _torch_cuda() is not None:
+        return None
+    torch = _torch()
+    if torch is None:
+        return None
+    try:
+        backends = getattr(torch, "backends", None)
+        mps = getattr(backends, "mps", None)
+        available = getattr(mps, "is_available", None)
+        if available is None or not available():
+            return None
+        if getattr(torch, "mps", None) is None:
+            return None
+    except Exception:
+        return None
+    return torch
+
+
+def _mps_call(name: str) -> int | None:
+    """One `torch.mps.<name>()` byte count, or None if it cannot be read."""
+    torch = _torch_mps()
+    if torch is None:
+        return None
+    try:
+        call = getattr(torch.mps, name, None)
+        if call is None:
+            return None
+        return int(call())
+    except Exception:
+        return None
+
+
+def mps_pool_mb() -> tuple[int | None, int | None]:
+    """`(reserved_mb, allocated_mb)` for the MPS allocator, or `(None, None)`.
+
+    `driver_allocated_memory()` is the reserved-pool analogue — total GPU
+    memory allocated by the Metal driver on our behalf, which is what an
+    `empty_cache()` shrinks — and `current_allocated_memory()` is the live
+    tensor bytes.
+
+    torch.mps has **no peak or reset APIs at all**, so the peaks reported per
+    batch are these same figures read afterwards. That is a real
+    approximation and it is accepted deliberately: the pool is monotone
+    absent an `empty_cache()`, exactly as the CUDA caching allocator's is, so
+    post-batch `driver_allocated` *is* the window's high-water reserved size
+    unless something released the pool mid-batch — which nothing does
+    (docs/inferio-worker-protocol.md, "Memory sensing").
+    """
+    return (
+        _mb(_mps_call("driver_allocated_memory")),
+        _mb(_mps_call("current_allocated_memory")),
+    )
+
+
+def mps_free_total_mb() -> tuple[int | None, int | None]:
+    """`(free_mb, total_mb)` for a unified-memory board, or `(None, None)`.
+
+    `total` is `recommended_max_memory()` — Metal's
+    `recommendedMaxWorkingSetSize`, the figure our allocations are actually
+    judged against and the one the orchestrator adopts as this board's
+    authoritative total (docs/unified-memory-admission.md, DP-4). It is
+    ≈75 % of RAM by default but moves with the GPU wired limit, so it is read
+    rather than assumed.
+
+    `free` is the unified formula: `max(0, min(total, ram_available))`. The
+    RAM term is what makes external pressure visible at all here — the memory
+    is the machine's, so a browser eating 40 GB has to show up the way a game
+    eating VRAM shows up on a dGPU — and there is no accelerator-level
+    counter that would ever say so.
+
+    Without a RAM reading there is no sample: a bare `total` with no free
+    figure would tell the ledger a board exists and nothing about its
+    pressure, and `free_total_mb`'s contract is that both numbers come from
+    the same source or neither does.
+    """
+    total = _mps_call("recommended_max_memory")
+    if not total:
+        return (None, None)
+    available = _ram_available_bytes()
+    if available is None:
+        return (None, None)
+    return (_mb(min(total, available)), _mb(total))
+
+
+def _ram_available_bytes() -> int | None:
+    """RAM the OS says it could deliver right now, per psutil, or None.
+
+    psutil is a base dependency (not a torch-sized import), and
+    `virtual_memory().available` is the figure that already accounts for
+    reclaimable pages on each platform — the same question the
+    orchestrator's own refresh asks `host_statistics64`.
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def mps_gpu_name() -> str | None:
+    """`Apple M3 Max (128 GB)` — this Mac's chip and capacity, or None.
+
+    **Diagnostic only.** Nothing downstream keys on it: the registration
+    join is backend + single-board inventory, and the calibration profile
+    key is the name the orchestrator's own probe derived, never this field
+    (docs/inferio-worker-protocol.md, `gpu_name`). Dropping it would cost a
+    log line and nothing else.
+
+    It is still derived rather than left blank because it is byte-identical
+    to the orchestrator's name for the same host
+    (`panoptikon/src/inferio/mps.rs::board_name`), from the same two sysctls
+    and the same rounding — which makes it a free cross-check on two
+    derivations that would otherwise be able to drift apart unnoticed.
+
+    ctypes rather than a subprocess: the worker must not fork `sysctl` on a
+    load path, and `platform` exposes neither of these values.
+    """
+    chip = _sysctl_string("machdep.cpu.brand_string")
+    ram = _sysctl_u64("hw.memsize")
+    if chip is None or not ram:
+        return None
+    gib = 1024 * 1024 * 1024
+    return f"{chip} ({max((ram + gib // 2) // gib, 1)} GB)"
+
+
+def _sysctl(name: str, size: int) -> bytes | None:
+    """`sysctlbyname(name)` as raw bytes, or None off macOS / on any error."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        buffer = ctypes.create_string_buffer(size)
+        length = ctypes.c_size_t(size)
+        if libc.sysctlbyname(
+            name.encode("ascii"),
+            buffer,
+            ctypes.byref(length),
+            None,
+            ctypes.c_size_t(0),
+        ) != 0:
+            return None
+        return buffer.raw[: length.value]
+    except Exception:
+        return None
+
+
+def _sysctl_string(name: str) -> str | None:
+    raw = _sysctl(name, 512)
+    if not raw:
+        return None
+    text = raw.split(b"\0", 1)[0].decode("utf-8", "replace").strip()
+    return text or None
+
+
+def _sysctl_u64(name: str) -> int | None:
+    raw = _sysctl(name, 8)
+    if raw is None or len(raw) != 8:
+        return None
+    return int.from_bytes(raw, sys.byteorder)
+
+
 def torch_version() -> str | None:
     """`torch.__version__`, or None when the impl never imported torch.
 
@@ -1037,14 +1238,7 @@ def device_memory_sample() -> dict[str, Any] | None:
     the same field on the same host, and step 1b derives *other processes'*
     usage from this field — the skew would land straight in its margin.
     """
-    reserved_mb = allocated_mb = None
-    torch = _torch_cuda()
-    if torch is not None:
-        try:
-            reserved_mb = _mb(torch.cuda.memory_reserved())
-            allocated_mb = _mb(torch.cuda.memory_allocated())
-        except Exception:
-            pass
+    reserved_mb, allocated_mb, _, _ = _allocator_stats()
     free_mb, total_mb, free_source = _free_total_mb()
     sample: dict[str, Any] = {
         "free_mb": free_mb,
@@ -1093,11 +1287,34 @@ def empty_cache() -> bool:
     """
     torch = _torch_cuda()
     if torch is None:
-        return False
+        return _mps_empty_cache()
     try:
         torch.cuda.empty_cache()
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("empty_cache failed: %s", exc)
+        return False
+    return True
+
+
+def _mps_empty_cache() -> bool:
+    """The MPS arm of [`empty_cache`] — `torch.mps.empty_cache()`.
+
+    The trim path is the orchestrator's hygiene message *and* the worker's
+    own reactive shrink, and both end here, so this is the one place the MPS
+    pool can ever be released. (`inferio.impl.utils.clear_cache` has known
+    about MPS since long before this, but nothing on the worker's trim path
+    goes through it.)
+    """
+    torch = _torch_mps()
+    if torch is None:
+        return False
+    try:
+        release = getattr(torch.mps, "empty_cache", None)
+        if release is None:
+            return False
+        release()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("mps empty_cache failed: %s", exc)
         return False
     return True
 
@@ -1113,10 +1330,16 @@ def _reset_peaks() -> None:
 
 
 def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
-    """`(reserved, allocated, peak_reserved, peak_allocated)` in MiB."""
+    """`(reserved, allocated, peak_reserved, peak_allocated)` in MiB.
+
+    On MPS the two "peaks" are the live figures: torch.mps exposes no peak
+    counters, and the pool is monotone between `empty_cache()` calls, so the
+    post-batch reading is the batch's high-water mark (see [`mps_pool_mb`]).
+    """
     torch = _torch_cuda()
     if torch is None:
-        return (None, None, None, None)
+        reserved, allocated = mps_pool_mb()
+        return (reserved, allocated, reserved, allocated)
     try:
         return (
             _mb(torch.cuda.memory_reserved()),
@@ -1131,7 +1354,7 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
 def _free_total_mb(
     source: str | None = None,
 ) -> tuple[int | None, int | None, str | None]:
-    """`(free_mb, total_mb, source)`, source `nvml` | `amdgpu-sysfs` | `torch`.
+    """`(free_mb, total_mb, source)`: `nvml`|`amdgpu-sysfs`|`mps`|`torch`.
 
     The one place free/total memory is read, so every consumer (the base
     measurement's deltas and the wire sample) sees the same currency.
@@ -1182,6 +1405,17 @@ def _free_total_mb(
         # Belt and braces, as above: unreachable as behaviour, load-bearing
         # as a statement of the contract.
         if source == "amdgpu-sysfs":
+            return (None, None, None)
+    if source in (None, "mps"):
+        # Byte-identical to the orchestrator's label for the same reading
+        # (`gpu.rs::free_source`), which both sides derive from the OS's RAM
+        # statistics — the only whole-machine view a unified board has.
+        # Availability is the platform test again: `torch.backends.mps` is
+        # unavailable everywhere else.
+        free, total = mps_free_total_mb()
+        if free is not None:
+            return (free, total, "mps")
+        if source == "mps":
             return (None, None, None)
     if source in (None, "torch"):
         torch = _torch_cuda()
@@ -1350,7 +1584,10 @@ def _resolve_base(
        twin, DRM fdinfo's per-process VRAM on this worker's own board
        (`base_method: "fdinfo"`), is the same kind of reading and takes the
        same rank: NVML is asked first and dies naturally on a ROCm host, so on
-       any one host exactly one of the two can answer.
+       any one host exactly one of the two can answer. MPS's
+       `driver_allocated_memory()` (`base_method: "mps"`) joins them at that
+       rank for the same reason — it is per-process by construction, so it
+       needs neither a PID lookup nor a plausibility floor.
     3. Otherwise the driver's free-memory delta is used *if usable*:
        present, positive, and not implausibly larger than what we could
        plausibly hold outside the allocator (reserved delta + context +
@@ -1379,6 +1616,14 @@ def _resolve_base(
     own = _fdinfo_base_mb(reserved_mb, reserved_delta)
     if own is not None and own > 0:
         return (own, "fdinfo")
+    # MPS's own tier-1: `driver_allocated_memory()` after the load is this
+    # process's whole Metal footprint **by construction** — each process owns
+    # its heap and the figure counts what the driver allocated for us, not
+    # just what our allocator handed out — so it is the same quality of
+    # reading NVML's own-PID figure is, without a PID lookup to get wrong.
+    own = _mb(_mps_call("driver_allocated_memory"))
+    if own is not None and own > 0:
+        return (own, "mps")
 
     floor = alloc_floor or 0
     free_delta = _free_delta(before.get("free_mb"), free_after)

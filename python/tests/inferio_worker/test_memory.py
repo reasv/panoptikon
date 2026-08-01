@@ -1674,3 +1674,177 @@ def test_the_bdf_reaches_sysfs_verbatim_off_windows(monkeypatch) -> None:
     assert memory._pci_device_dir("C:/fixtures", "0000:03:00.0").endswith(
         "0000-03-00.0"
     )
+
+
+# ---------------------------------------------------------------------------
+# MPS (Apple Silicon): a unified-memory board
+# ---------------------------------------------------------------------------
+
+
+class FakeMpsAllocator:
+    """Just enough of `torch.mps` for the memory helpers.
+
+    Deliberately *without* peak/reset APIs, because torch.mps has none: the
+    reported peaks are the post-batch live figures, which is exactly the
+    approximation the protocol doc records.
+    """
+
+    def __init__(self, recommended_mb: int = 96 * 1024) -> None:
+        self.recommended = recommended_mb * MIB
+        self.driver = 0
+        self.allocated = 0
+        self.empty_cache_calls = 0
+
+    def recommended_max_memory(self) -> int:
+        return self.recommended
+
+    def driver_allocated_memory(self) -> int:
+        return self.driver
+
+    def current_allocated_memory(self) -> int:
+        return self.allocated
+
+    def empty_cache(self) -> None:
+        self.empty_cache_calls += 1
+        self.driver = self.allocated
+
+    # Test helper: pretend a load or a batch allocated `mb`.
+    def allocate(self, mb: int, driver_mb: int | None = None) -> None:
+        self.allocated += mb * MIB
+        self.driver += (driver_mb if driver_mb is not None else mb) * MIB
+
+
+def fake_mps_torch_module(mps: object | None, available: bool = True) -> SimpleNamespace:
+    """A torch stand-in for an Apple Silicon host: a Metal backend, and no
+    `torch.cuda` at all (reading it raises `AttributeError`, which every
+    guarded reader here has to survive)."""
+    module = SimpleNamespace(
+        backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: available)),
+        dtype=FakeDtype,
+        version=SimpleNamespace(hip=None, cuda=None),
+        __version__="2.7.1",
+    )
+    if mps is not None:
+        module.mps = mps
+    return module
+
+
+@contextmanager
+def mps_host(available_mb: int, mps: FakeMpsAllocator | None = None):
+    """An MPS worker with `available_mb` of RAM the OS says it could deliver."""
+    mps = mps if mps is not None else FakeMpsAllocator()
+    memory_info = SimpleNamespace(available=available_mb * MIB)
+    with isolated(fake_mps_torch_module(mps)):
+        with mock.patch("psutil.virtual_memory", return_value=memory_info):
+            yield mps
+
+
+def test_the_mps_sample_reports_the_pool_and_ram_clamped_free() -> None:
+    # The unified reading: `total` is Metal's recommended-max (what our
+    # allocations are judged against), `free` is what the OS says it could
+    # actually deliver — which is the only way external pressure on a shared
+    # pool is visible at all. The pool figures are the driver's allocation
+    # (the reserved analogue) and the live tensors.
+    with mps_host(available_mb=40 * 1024) as mps:
+        mps.allocate(1024, driver_mb=1200)
+        assert memory.device_memory_sample() == {
+            "free_mb": 40 * 1024,
+            "total_mb": 96 * 1024,
+            "free_source": "mps",
+            "reserved_mb": 1200,
+            "allocated_mb": 1024,
+        }
+
+
+def test_mps_free_is_clamped_by_both_terms() -> None:
+    # An idle 128 GB Mac can report more available RAM than the accelerator is
+    # allowed to use; the budget is the recommended-max either way.
+    with mps_host(available_mb=120 * 1024):
+        assert memory.free_total_mb() == (96 * 1024, 96 * 1024, "mps")
+    # Under real pressure the RAM term is what binds, and that is the whole
+    # point of it.
+    with mps_host(available_mb=3 * 1024):
+        assert memory.free_total_mb() == (3 * 1024, 96 * 1024, "mps")
+
+
+def test_mps_base_is_the_driver_allocation_at_load_end() -> None:
+    # `driver_allocated_memory()` is per-process by construction (each process
+    # owns its Metal heap), so it is a tier-1 reading like NVML's own-PID
+    # figure — no delta, no context estimate, no plausibility floor.
+    with mps_host(available_mb=40 * 1024) as mps:
+        before = memory.begin_load()
+        mps.allocate(2048, driver_mb=2560)
+        report = memory.finish_load(before, object())
+    assert report["base_mb"] == 2560
+    assert report["base_method"] == "mps"
+    assert report["reserved_at_load_mb"] == 2560
+    assert report["gpu_total_mb"] == 96 * 1024, "the authoritative total (DP-4)"
+    assert report["memory"]["free_source"] == "mps"
+    assert "gpu_uuid" not in report, "Apple Silicon has one device and no UUID"
+    assert "gpu_bdf" not in report, "and no PCI address"
+
+
+def test_an_mps_batch_measurement_reports_the_pool_as_its_peak() -> None:
+    # torch.mps has no peak counters. The pool is monotone absent an
+    # `empty_cache()`, so the post-batch driver allocation is the batch's
+    # high-water reserved size — the accepted approximation.
+    with mps_host(available_mb=40 * 1024) as mps:
+        mps.allocate(1000, driver_mb=1000)
+        state = memory.begin_batch()
+        mps.allocate(500, driver_mb=800)
+        payload = memory.finish_batch(state, items=4)
+    batch = payload["measurements"][0]
+    assert batch["reserved_before_mb"] == 1000
+    assert batch["peak_reserved_mb"] == 1800
+    assert batch["allocated_before_mb"] == 1000
+    assert batch["peak_allocated_mb"] == 1500
+
+
+def test_trim_releases_the_mps_pool() -> None:
+    # The worker's trim path was CUDA-only; on a unified board the retained
+    # pool squeezes the whole machine rather than one card.
+    with mps_host(available_mb=40 * 1024) as mps:
+        mps.allocate(1024, driver_mb=4096)
+        assert memory.empty_cache() is True
+        assert mps.empty_cache_calls == 1
+        assert memory.pool_stats_mb() == (1024, 1024), "only the slack went back"
+
+
+def test_the_mps_tier_survives_a_torch_without_it() -> None:
+    # Every reader is getattr-guarded: `torch.mps` and `torch.backends.mps`
+    # are not on every build, and an AttributeError here would take down the
+    # whole load report over a memory reading nothing depended on.
+    for module in (
+        fake_mps_torch_module(None),  # backends.mps says yes, torch.mps absent
+        fake_mps_torch_module(FakeMpsAllocator(), available=False),
+        SimpleNamespace(__version__="2.7.1"),  # no backends at all
+    ):
+        with isolated(module):
+            assert memory.device_memory_sample() is None
+            assert memory.free_total_mb() == (None, None, None)
+            assert memory.pool_stats_mb() == (None, None)
+            assert memory.empty_cache() is False
+            assert memory.device_identity() == (None, None)
+            assert memory.gpu_total_mb() is None
+            assert memory.finish_load(memory.begin_load(), object()) == {
+                "torch_version": "2.7.1"
+            }
+
+
+def test_the_mps_board_name_is_derived_from_the_same_facts_as_the_probe() -> None:
+    # The name is `machdep.cpu.brand_string` plus `hw.memsize` rounded to the
+    # nearest GiB — the same two sysctls and the same rounding the
+    # orchestrator's `mps.rs::board_name` uses, so the informational
+    # `gpu_name` on the wire cannot drift from the board name profiles are
+    # keyed by. Off macOS the sysctls answer nothing and the field is simply
+    # absent, which is what this box asserts.
+    with mock.patch.object(memory, "_sysctl_string", return_value="Apple M3 Max"):
+        with mock.patch.object(memory, "_sysctl_u64", return_value=128 * 1024 * MIB):
+            assert memory.mps_gpu_name() == "Apple M3 Max (128 GB)"
+        with mock.patch.object(memory, "_sysctl_u64", return_value=0):
+            assert memory.mps_gpu_name() is None
+    if sys.platform != "darwin":
+        assert memory._sysctl_string("machdep.cpu.brand_string") is None
+        assert memory.mps_gpu_name() is None
+        with mps_host(available_mb=40 * 1024):
+            assert memory.device_identity() == (None, None)

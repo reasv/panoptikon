@@ -24,6 +24,10 @@ pub mod gpu;
 pub mod http;
 pub mod ledger;
 pub mod manager;
+/// The MPS half of `gpu`: one synthetic unified-memory board from macOS
+/// kernel facts. Private for the same reason `rocm` is — `gpu` is the only
+/// entry point any backend is reached through.
+mod mps;
 pub mod prewarm;
 pub mod registry;
 /// The ROCm half of `gpu`: KFD/amdgpu sysfs instead of nvidia-smi. Private

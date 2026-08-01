@@ -6215,6 +6215,15 @@
             "format": "int64",
             "minimum": 0
           },
+          "unified_ram_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Host RAM this board's memory is carved out of, in MiB — present\nexactly on **unified** boards (Apple Silicon today; AMD APUs when\nbackend B lands), absent on a discrete board with private VRAM. Its\npresence *is* the unified flag ([`GpuInfo::unified`]), because the two\nfacts are one: a board is unified precisely when its memory is the\nhost's.\n\nTwo things downstream read it. The ledger records a synthetic negative\nsample when a replica dies mid-window on such a board (DP-2: on a\ndGPU a mid-window death has too many non-memory causes, on a unified\nboard it is overwhelmingly the OS memory killer), and it is the only\nsanity bound on the authoritative total a worker reports back (DP-4)\n— the board's own `total_mb` is a *policy* number there, tunable by\nthe user, so it cannot bound anything.",
+            "minimum": 0
+          },
           "uuid": {
             "type": "string",
             "description": "Board UUID (`GPU-…`), the budget/ledger key and the pin form CUDA\naccepts directly in `CUDA_VISIBLE_DEVICES`. On ROCm it is the fused\nKFD `unique_id` or a synthetic `GPU-BDF-…` (see `rocm.rs`) — an\nidentity, not a pin form, because HIP only accepts indices."

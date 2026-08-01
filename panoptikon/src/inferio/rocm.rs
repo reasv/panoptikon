@@ -553,6 +553,7 @@ fn identify(
         compute_cap: None,
         bdf: Some(bdf),
         gfx_target_version: Some(target),
+        unified_ram_mb: None,
     })
 }
 

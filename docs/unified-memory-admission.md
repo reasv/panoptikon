@@ -1,6 +1,13 @@
 # Unified-memory admission: MPS, AMD APUs, CPU
 
-**Status: DECIDED 2026-08-01, not yet implemented.** Extends
+**Status: DECIDED 2026-08-01. Step 1 (backend A: MPS) implemented the same
+day** — the accelerator identity and resolution, the synthetic unified board
+and its refresh, the worker's MPS memory tiers, DP-2, DP-3, DP-4, the
+spawner's watermark, the widened OOM classifier and the trim extension.
+Backends B (APU) and C (CPU) are not implemented, and neither is the README
+support-matrix table under "What stays unpriced". Everything MPS-specific is
+covered by fixtures only: no Apple hardware exists on the dev box and CI has
+no Macs yet, so the field-pass list at the end stands in full. Extends
 `docs/batch-calibration-design.md` (the ledger/grant/calibration
 machinery) and `docs/rocm-batch-calibration-parity.md` (the sysfs-first
 ROCm probe). Decision points are marked **DP-n** inline; the table at the
@@ -96,7 +103,12 @@ the orchestrator's staleness refresh).
 (psutil is already a base dependency); orchestrator-side
 `host_statistics64` via `libc` on macOS, `sysinfo`-free reads of
 `/proc/meminfo` (`MemAvailable`) on Linux, `GlobalMemoryStatusEx` via
-`windows-sys` on Windows. No new crates.
+`windows-sys` on Windows. No new crates. The two producers must sum the
+**same terms** — on macOS that is free + inactive pages, which is what
+psutil's `available` is; counting anything more on the orchestrator side
+(purgeable, compressed) would make its refresh the looser of the two and
+systematically understate external pressure, the one error direction the
+ledger cannot absorb.
 
 Everything else is inherited:
 
@@ -200,7 +212,14 @@ Single synthetic board:
   window around the seed**, because a raised wired limit legitimately
   puts the real figure 20 %+ away from it, and rejecting exactly the
   tuned machines would be backwards. The seed exists only so budgets are
-  defined between startup and the first load. (The rejected alternative:
+  defined between startup and the first load. **The adoption is not
+  one-shot**: the wired limit is a live sysctl, so a later report that is
+  still inside the sanity bound but outside the registration cross-check's
+  tolerance *re-adopts* rather than being refused — otherwise raising the
+  limit under a running gateway would leave the host unpriced until a
+  restart. Reports inside the tolerance change nothing (the two sources
+  round the same pool differently, and a total that drifted on every load
+  would re-price every outstanding grant). (The rejected alternative:
   reading Metal directly from Rust via `objc2-metal` / hand-rolled objc
   externs — a new dependency to learn a number the worker already knows,
   and the worker's torch-reported figure is the one allocations are
@@ -224,8 +243,12 @@ New tier alongside the CUDA/HIP ones, gated on
   reserved-pool analogue, `current_allocated_memory()` as allocated.
   torch.mps has **no peak/reset APIs**; the pool is monotone absent
   `empty_cache`, so post-batch `driver_allocated` ≈ peak reserved — the
-  same property the CUDA pool has. Accepted approximation; noted in the
-  protocol doc.
+  same property the CUDA pool has. One documented exception: the MPS
+  allocator garbage-collects cached buffers when an allocation crosses the
+  *low* watermark, so a batch that ran close to the budget can read back
+  below its true peak. The bias is toward under-stating cost exactly at
+  the ceiling; the collapse detector and DP-2 carry that regime. Accepted
+  approximation; noted in the protocol doc, sized on the M3 Max.
 - **Base** (`base_method: "mps"`): `driver_allocated_memory()` at load
   end. Per-process *by construction* (each process owns its Metal heap),
   so this is tier-1 quality — no free-delta fallback needed on the happy
@@ -237,14 +260,19 @@ New tier alongside the CUDA/HIP ones, gated on
   single-board inventory + a `gpu_total_mb` cross-check with the ROCm
   tolerance (`max(total/20, 512 MB)`). A report with no MPS facts (no
   torch, remote impl) stays unregistered, exactly as today.
-- **Watermark**: the spawner sets `PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0`
+- **Watermarks**: the spawner sets `PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0`
   on MPS workers so torch's hard error fires at the recommended-max
   boundary instead of whatever the build's default permits (the default
   has drifted across torch versions and can sit above 1.0, i.e. inside
-  the swap regime). **Verify the exact env semantics on real hardware
-  before shipping** — this is the MPS analogue of the ROCm doc's
-  "first number to measure" items. The error is a `RuntimeError` the
-  widened classifier already catches.
+  the swap regime), and pins `PYTORCH_MPS_LOW_WATERMARK_RATIO=1.0` with
+  it — torch asserts `high >= low` at allocator init, so an ambient
+  user-set low above 1.0 would turn the high pin into a startup failure.
+  **Verify the exact env semantics on real hardware before shipping** —
+  this is the MPS analogue of the ROCm doc's "first number to measure"
+  items. The error is a `RuntimeError` the widened classifier already
+  catches. The low watermark is also where the allocator garbage-collects
+  cached buffers, which is what biases the peak approximation above
+  downward near the ceiling.
 
 ## Backend B: AMD APUs (ROCm)
 
@@ -391,9 +419,21 @@ and its boundary is a documented decision instead of an emergent one.
   had; use it.
 - **Field passes** (the two machines that motivated this doc):
   - *M3 Max 128 GB*: watermark env semantics and default value on the
-    shipped torch; recommended-max adoption on a machine with a raised
-    wired limit (this one runs ≈90 %, so the seed is ~15 points low and
-    the adoption path is exercised for real); end-to-end
+    shipped torch — **both** ratios, since the spawner now pins the low
+    one alongside the high one (torch asserts `high >= low` at allocator
+    init, so an ambient user-set low above 1.0 would hard-fail every
+    worker; confirm the assertion's form and that 1.0/1.0 is accepted);
+    how much the near-ceiling **GC bias** costs — the MPS allocator
+    releases cached buffers when an allocation crosses the low watermark,
+    so `driver_allocated_memory()` read after a batch that ran close to
+    the budget can sit below the true peak, which is the one place the
+    monotone-pool approximation understates cost (measure a deliberate
+    near-budget batch against a small one); recommended-max adoption on a
+    machine with a raised wired limit (this one runs ≈90 %, so the seed is
+    ~15 points low and the adoption path is exercised for real), plus
+    *re-adoption*: raise `iogpu.wired_limit_mb` with the gateway running
+    and confirm the next load re-adopts instead of being refused;
+    end-to-end
     grants/ratchet/knee on CLIP + mpnet; jetsam behaviour
     under deliberate over-budget (does DP-2's death-negative fire);
     compression-regime collapse detection (over-allocate, watch for the
@@ -434,7 +474,7 @@ recommendation (amended in review).
 | 1 | Unified-specific default margin? | No — shipped defaults + RAM-clamped free |
 | 2 | Worker death mid-window = negative sample? | Yes, unified boards only |
 | 3 | When does Apple Silicon run on CPU? | **Only** on explicit `accelerator = "cpu"`; everything else (auto, `extra=cpu` sentinel, missing sentinel, explicit `cuda`) resolves to MPS |
-| 4 | Orchestrator source for MPS total | Seed `hw.memsize × 0.75`; worker's `recommended_max_memory` figure is **authoritative** on first report, sanity-bounded by `(0, hw.memsize]` only — no proximity window (raised wired limits are legitimate and common) |
+| 4 | Orchestrator source for MPS total | Seed `hw.memsize × 0.75`; worker's `recommended_max_memory` figure is **authoritative** on first report, sanity-bounded by `(0, hw.memsize]` only — no proximity window (raised wired limits are legitimate and common). A later sane figure outside the cross-check tolerance re-adopts rather than refusing the replica |
 | 5 | Worker's unified-board signal | Spawner env `PANOPTIKON_UNIFIED_GPU=1` |
 | 6 | RAM capacity in APU calibration name | Yes — `AMD gfx1151 APU (128 GB)` |
 | 7 | Price CPU at all | Yes, last |

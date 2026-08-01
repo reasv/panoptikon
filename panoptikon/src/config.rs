@@ -195,8 +195,8 @@ pub struct InferenceLocalConfig {
 /// never touched (setup refuses to operate on any other path).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PythonEnvConfig {
-    /// Accelerator variant for the locked sync: "auto" (detect CUDA/ROCm at
-    /// setup time), "cuda", "rocm", or "cpu". Default: "auto".
+    /// Accelerator variant for the locked sync: "auto" (detect CUDA/ROCm/MPS
+    /// at setup time), "cuda", "rocm", "mps", or "cpu". Default: "auto".
     #[serde(default)]
     pub accelerator: Accelerator,
     /// Run `panoptikon setup` automatically at startup (gateway and
@@ -223,13 +223,19 @@ impl Default for PythonEnvConfig {
 #[serde(rename_all = "lowercase")]
 pub enum Accelerator {
     /// Detect at setup time: CUDA if an NVIDIA driver is present, ROCm on
-    /// Linux with a ROCm install, otherwise CPU (macOS always uses the
-    /// default PyPI wheels, which include MPS on Apple Silicon).
+    /// Linux with a ROCm install, MPS on Apple Silicon, otherwise CPU.
     #[default]
     Auto,
     Cuda,
     Rocm,
     Cpu,
+    /// Apple Silicon's Metal backend. The wheels are the default-PyPI ones
+    /// `cpu` installs on macOS — this is a label, not a different torch
+    /// build — but it is a *different accelerator*: it has its own
+    /// calibration keyspace and its own (unified-memory) admission
+    /// (docs/unified-memory-admission.md, backend A). Explicit `cpu` on an
+    /// Apple Silicon host is the one way to run unaccelerated there.
+    Mps,
 }
 
 /// `[inference_local.prewarm]` (design §8, policy decided 2026-07-05).

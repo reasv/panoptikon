@@ -484,6 +484,40 @@ pub struct Worker {
     in_flight: bool,
     /// Poisoned by any fatal error; every further call fails fast.
     dead: bool,
+    /// The worker **stopped answering** — see [`Worker::is_dead`]. A strict
+    /// subset of `dead`: every fatal error poisons the worker, but only some
+    /// of them mean the process went away on its own.
+    unreachable: bool,
+}
+
+/// Why a fatal teardown happened.
+///
+/// The distinction only exists because the ledger reads it: DP-2 turns a
+/// mid-window *death* on a unified board into a synthetic negative sample
+/// (docs/unified-memory-admission.md), and the whole point of that signal is
+/// that an out-of-memory kill there arrives as a SIGKILL nothing in-process
+/// can catch. A stream we tore down ourselves because the protocol state was
+/// unrecoverable is not evidence about memory, so it must not settle as a
+/// death.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FatalCause {
+    /// The worker stopped answering: EOF on stdout, a broken pipe, an
+    /// undecodable frame, a deadline that expired. These are the shapes a
+    /// SIGKILL takes from this side of the pipe.
+    ///
+    /// Counting an expired **deadline** as a death is only safe because
+    /// `predict` carries `deadline: None` (see [`Worker::predict`]): every
+    /// request that can time out — handshake, configure, prewarm, load,
+    /// trim, ping — runs outside any grant, so a timeout can never settle a
+    /// window at all. Putting a deadline on `predict` would make a
+    /// wedged-but-alive worker a memory negative on unified boards, and this
+    /// variant would have to split.
+    Unreachable,
+    /// The exchange itself was fine — the worker was alive and talking — and
+    /// we killed it because the stream can no longer be trusted: a request
+    /// future was dropped mid-flight (what a user cancel produces), or a
+    /// frame answered the wrong id.
+    Desync,
 }
 
 /// The fully environment-shaped child command for one worker, per the
@@ -669,6 +703,7 @@ impl Worker {
             next_id: 1,
             in_flight: false,
             dead: false,
+            unreachable: false,
         };
 
         let impl_dirs = cfg
@@ -700,9 +735,12 @@ impl Worker {
         let version = map_get(&payload, "protocol_version").and_then(Value::as_u64);
         if version != Some(PROTOCOL_VERSION) {
             return Err(worker
-                .fatal(format!(
-                    "worker answered handshake with protocol_version {version:?}, expected {PROTOCOL_VERSION}"
-                ))
+                .fatal(
+                    format!(
+                        "worker answered handshake with protocol_version {version:?}, expected {PROTOCOL_VERSION}"
+                    ),
+                    FatalCause::Desync,
+                )
                 .await);
         }
         Ok(worker)
@@ -890,9 +928,10 @@ impl Worker {
             Some(Value::Array(outputs)) => outputs,
             other => {
                 return Err(self
-                    .fatal(format!(
-                        "predict ok frame without a valid outputs array: {other:?}"
-                    ))
+                    .fatal(
+                        format!("predict ok frame without a valid outputs array: {other:?}"),
+                        FatalCause::Desync,
+                    )
                     .await);
             }
         };
@@ -902,11 +941,14 @@ impl Worker {
         // trusted after it.
         if outputs.len() != inputs.len() {
             return Err(self
-                .fatal(format!(
-                    "worker returned {} outputs for {} inputs",
-                    outputs.len(),
-                    inputs.len()
-                ))
+                .fatal(
+                    format!(
+                        "worker returned {} outputs for {} inputs",
+                        outputs.len(),
+                        inputs.len()
+                    ),
+                    FatalCause::Desync,
+                )
                 .await);
         }
         outputs
@@ -1087,11 +1129,19 @@ impl Worker {
             );
         }
         if self.in_flight {
+            // Classified `Desync` even though the process may in fact be gone:
+            // a stranded stream is discovered here rather than where it
+            // happened, so if the OS killed the worker *after* a cancel
+            // stranded it, this request sees the desync first and DP-2 misses
+            // a real memory negative. A deliberate under-report — the
+            // conservative direction is to lose a negative sample, not to
+            // invent one out of a user pressing cancel.
             return Err(self
                 .fatal_request(
                     request_type,
                     "a previous request future was dropped mid-flight; the stream is desynchronized"
                         .to_owned(),
+                    FatalCause::Desync,
                 )
                 .await);
         }
@@ -1128,6 +1178,7 @@ impl Worker {
                     .fatal_request(
                         request_type,
                         format!("{request_type} request failed: {err:#}"),
+                        FatalCause::Unreachable,
                     )
                     .await);
             }
@@ -1136,7 +1187,11 @@ impl Worker {
             Value::Map(map) => map,
             other => {
                 return Err(self
-                    .fatal_request(request_type, format!("response frame is not a map: {other}"))
+                    .fatal_request(
+                        request_type,
+                        format!("response frame is not a map: {other}"),
+                        FatalCause::Desync,
+                    )
                     .await);
             }
         };
@@ -1149,6 +1204,7 @@ impl Worker {
                 .fatal_request(
                     request_type,
                     format!("response id {resp_id:?} does not match request id {id}"),
+                    FatalCause::Desync,
                 )
                 .await);
         }
@@ -1183,6 +1239,7 @@ impl Worker {
                 .fatal_request(
                     request_type,
                     format!("unexpected response frame type {other:?}"),
+                    FatalCause::Desync,
                 )
                 .await),
         }
@@ -1198,7 +1255,12 @@ impl Worker {
     /// without this line an operator sees a model die with no request of
     /// theirs anywhere near it. Logged before the teardown so it precedes the
     /// death, whatever the reap does to ordering.
-    async fn fatal_request(&mut self, request_type: &str, why: String) -> anyhow::Error {
+    async fn fatal_request(
+        &mut self,
+        request_type: &str,
+        why: String,
+        cause: FatalCause,
+    ) -> anyhow::Error {
         if request_type == "trim" {
             tracing::warn!(
                 worker = %self.label,
@@ -1207,13 +1269,14 @@ impl Worker {
                  will have to be reloaded. Cause: {why}"
             );
         }
-        self.fatal(why).await
+        self.fatal(why, cause).await
     }
 
     /// Poison the worker after an unrecoverable failure: kill, reap, drain
     /// stderr, and build the error carrying exit status + stderr tail.
-    async fn fatal(&mut self, why: String) -> anyhow::Error {
+    async fn fatal(&mut self, why: String, cause: FatalCause) -> anyhow::Error {
         self.dead = true;
+        self.unreachable = matches!(cause, FatalCause::Unreachable);
         self.in_flight = false;
         kill_process_group(&self.child);
         let _ = self.child.start_kill();
@@ -1234,6 +1297,32 @@ impl Worker {
         )
     }
 
+    /// Did this worker *die*, as opposed to being poisoned by a desync we
+    /// killed it for — and if so, **claim** that fact.
+    ///
+    /// Deliberately narrower than "unusable": a worker whose stream we tore
+    /// down ourselves ([`FatalCause::Desync`]) — the dropped-future path a
+    /// user cancel produces, a frame answering the wrong id — is just as
+    /// unusable, but it is the *dispatcher's* doing and says nothing about
+    /// memory. The ledger blames a batch size for a death (DP-2's synthetic
+    /// negative on unified boards), so only a worker that stopped answering
+    /// on its own may settle a window as `WorkerDied`. An error that never
+    /// reached [`Self::fatal`] at all — an oversized frame rejected by
+    /// `encode_frame` before a byte hit the wire — leaves this `false`
+    /// alongside a worker that is still perfectly alive.
+    ///
+    /// **Taking** rather than reading is the one-shot guard: one death may
+    /// produce at most one negative sample. Today the dispatcher tears the
+    /// model down on the first fatal error so a second granted window on a
+    /// dead replica is unreachable, but nothing in the type system says so,
+    /// and a future change that made it reachable would halve the model's
+    /// ratchet anchor once per window instead of once per death. Every
+    /// further call answers `false`, which settles as an abort — the correct
+    /// reading, since the death was already accounted.
+    pub(crate) fn take_death(&mut self) -> bool {
+        std::mem::take(&mut self.unreachable)
+    }
+
     fn stderr_tail_snapshot(&self) -> String {
         self.stderr
             .lock()
@@ -1249,6 +1338,14 @@ impl Worker {
     pub(crate) async fn kill_child_externally_for_test(&mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
+    }
+
+    /// Test hook: leave the stream in the state a request future dropped
+    /// mid-flight leaves it, without having to race a real cancel. The next
+    /// request desynchronizes and kills a worker that is still alive.
+    #[cfg(test)]
+    pub(crate) fn strand_in_flight_for_test(&mut self) {
+        self.in_flight = true;
     }
 }
 

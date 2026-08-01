@@ -447,6 +447,47 @@ def test_a_non_oom_failure_is_not_flagged(fake_torch):
     assert caught.value.measurements[0].get("oom") is None
 
 
+def test_the_oom_classifier_covers_the_non_cuda_backends(fake_torch):
+    """The negative-signal widening (docs/unified-memory-admission.md).
+
+    On MPS and on CPU the out-of-memory condition arrives as an untyped
+    `RuntimeError` — or as the interpreter's own `MemoryError` — and the
+    orchestrator's deflation path only ever hears about it through this
+    flag, so the classifier is the whole signal. It stays conservative:
+    a `RuntimeError` that says nothing about memory is not one.
+    """
+    failures = {
+        "mps": RuntimeError(
+            "MPS backend out of memory (MPS allocated: 18.09 GB, max allowed: "
+            "18.13 GB)."
+        ),
+        "cpu-allocator": RuntimeError(
+            "[enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: can't "
+            "allocate memory: you tried to allocate 12884901888 bytes."
+        ),
+        "memory-error": MemoryError(),
+    }
+    for name, failure in failures.items():
+
+        class Failing:
+            def predict(self, inputs):
+                raise failure
+
+        with pytest.raises(packing.WindowFailure) as caught:
+            packing.run_window(Failing(), items(2), grant(unit_budget=2))
+        assert caught.value.measurements[0]["oom"] is True, name
+        assert packing.OOM_WINDOW_PREFIX in str(caught.value), name
+
+    class Buggy:
+        def predict(self, inputs):
+            raise RuntimeError("shape mismatch in forward()")
+
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(Buggy(), items(2), grant(unit_budget=2))
+    assert caught.value.measurements[0].get("oom") is None
+    assert packing.OOM_WINDOW_PREFIX not in str(caught.value)
+
+
 def test_a_wrong_output_count_fails_the_window(fake_torch):
     with pytest.raises(packing.WindowFailure) as caught:
         packing.run_window(Recorder(wrong_count=True), items(2), grant(unit_budget=2))

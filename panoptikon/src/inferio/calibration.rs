@@ -1776,6 +1776,75 @@ sample_reserved_mb = [80, 160]
         );
     }
 
+    /// The MPS keyspace, which the store needed no change to support: an
+    /// Apple Silicon host is `backend = "mps"` + `platform = "macos"` + the
+    /// derived `Apple M3 Max (128 GB)` board name, and its profiles are
+    /// invisible to a `cpu` host and vice versa.
+    ///
+    /// That last part is the point of splitting the backend label out of
+    /// `cpu` at all (docs/unified-memory-admission.md, "Calibration keying
+    /// summary"): the two run the *same wheels* on macOS, so nothing else in
+    /// the key would tell a Metal measurement from a CPU one.
+    #[test]
+    fn an_mps_profile_round_trips_and_never_crosses_backends() {
+        const MPS_GPU: &str = "Apple M3 Max (128 GB)";
+        let root = tempfile::tempdir().unwrap();
+        let mps_env = || StoreEnv {
+            platform: "macos".to_owned(),
+            backend: "mps".to_owned(),
+            generator: "panoptikon test".to_owned(),
+        };
+        let mps_query = |torch: Option<&'static str>| ProfileQuery {
+            gpu_name: MPS_GPU,
+            ..query("clip/vit", torch, Some("fp32"))
+        };
+
+        let store = store_with_env(root.path(), mps_env());
+        store.record(ProfileUpdate {
+            gpu_name: MPS_GPU.to_owned(),
+            torch: "2.7.1".to_owned(),
+            // Neither NVML nor fdinfo answers on a Mac; the Metal driver's
+            // own per-process figure is the rank-equal third.
+            base_method: Some("mps".to_owned()),
+            ..update("clip/vit", "fp32", 0.42)
+        });
+        let reread = store_with_env(root.path(), mps_env());
+        let seed = reread
+            .lookup(&mps_query(Some("2.7.1")))
+            .expect("round trips");
+        assert!(seed.local && seed.exact_torch);
+        assert!((seed.slope_mb_per_unit - 0.42).abs() < 1e-9);
+        let body = fs::read_to_string(root.path().join("data/inferio/calibration.toml")).unwrap();
+        assert!(body.contains("backend = \"mps\""), "{body}");
+        assert!(body.contains("platform = \"macos\""), "{body}");
+        assert!(body.contains(&format!("gpu = \"{MPS_GPU}\"")), "{body}");
+
+        // A CPU host on the same platform — the collision this label split
+        // exists to prevent — sees nothing of it, in either direction.
+        let cpu_host = store_with_env(
+            root.path(),
+            StoreEnv {
+                backend: "cpu".to_owned(),
+                ..mps_env()
+            },
+        );
+        assert!(cpu_host.lookup(&mps_query(Some("2.7.1"))).is_none());
+        cpu_host.record(ProfileUpdate {
+            gpu_name: MPS_GPU.to_owned(),
+            torch: "2.7.1".to_owned(),
+            ..update("cpu/only", "fp32", 0.11)
+        });
+        assert!(
+            store_with_env(root.path(), mps_env())
+                .lookup(&ProfileQuery {
+                    inference_id: "cpu/only",
+                    ..mps_query(Some("2.7.1"))
+                })
+                .is_none(),
+            "and a cpu-keyed entry never answers an mps query"
+        );
+    }
+
     /// A stale epoch is ignored, not deleted — and the entry comes back the
     /// moment the model's epoch matches again.
     #[test]

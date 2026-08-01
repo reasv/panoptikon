@@ -71,7 +71,9 @@
 //! Every exit path settles the window's grant: a response (success or a
 //! per-request error) counts as a real window and feeds the ledger's ramp,
 //! deflation and cost fit; a fatal error or an aborted task settles as
-//! `Aborted`, which teaches the ledger nothing. The `Drop` on
+//! `Aborted`, which teaches the ledger nothing — except when the replica
+//! itself stopped answering, which settles as `WorkerDied` and is a memory
+//! signal on unified boards ([`fatal_settlement`]). The `Drop` on
 //! [`GrantToken`] is the backstop for the abort paths that never run code
 //! (`JoinSet::shutdown`).
 //!
@@ -901,7 +903,7 @@ async fn run_batch_inner(
             // failed but the worker is alive — retry each request
             // individually so one poisoned input only fails its own
             // request.
-            let mut oom = message_reports_oom(&format!("{err:#}"));
+            let mut oom = error_reports_oom(&err);
             tracing::warn!(
                 model = %inference_id,
                 oom,
@@ -930,12 +932,16 @@ async fn run_batch_inner(
                     }
                     Err(individual_err) => {
                         let fatal = individual_err.downcast_ref::<WorkerError>().is_none();
+                        // Read while the error is fresh: what settles the
+                        // window is whether the *worker* went away, not
+                        // whether this call failed.
+                        let settle = fatal_settlement(worker);
+                        oom = oom || error_reports_oom(&individual_err);
                         let message = format!("{individual_err:#}");
-                        oom = oom || message_reports_oom(&message);
                         let _ = request.reply.send(Err(individual_err));
                         if fatal {
                             fail_requests(remaining.map(|(request, _)| request), &message);
-                            return (BatchOutcome::Fatal(message), WindowOutcome::Aborted);
+                            return (BatchOutcome::Fatal(message), settle);
                         }
                     }
                 }
@@ -943,12 +949,59 @@ async fn run_batch_inner(
             (BatchOutcome::Continue, WindowOutcome::Responded { oom })
         }
         Err(err) => {
-            // Fatal: the worker is gone. Every request in the window gets
-            // the error; the caller fails the rest of the queue.
+            // Fatal: the model is going down either way. Whether the *worker*
+            // died is a separate question — see [`fatal_settlement`].
+            let settle = fatal_settlement(worker);
             let message = format!("{err:#}");
             fail_requests(window.into_iter(), &message);
-            (BatchOutcome::Fatal(message), WindowOutcome::Aborted)
+            (BatchOutcome::Fatal(message), settle)
         }
+    }
+}
+
+/// Whether a dispatch error reports an out-of-memory condition.
+///
+/// Deliberately narrower than [`message_reports_oom`] over the error's whole
+/// `Display`. A [`WorkerError`] renders its **stderr tail** as well as its
+/// message and traceback, and that tail is a ring of whatever the worker
+/// logged over its recent life — including an out-of-memory it caught, halved
+/// and recovered from several requests ago. Classifying it would let a stale
+/// line flip an unrelated later failure into a negative sample, deflating a
+/// model and halving its grants over a batch that never failed. Only the two
+/// fields that describe *this* failure are read.
+///
+/// Anything that is not a `WorkerError` carries no such envelope — it is a
+/// supervision error the orchestrator itself formatted — so its full
+/// rendering is the message.
+fn error_reports_oom(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<WorkerError>() {
+        Some(worker) => {
+            message_reports_oom(&worker.message) || message_reports_oom(&worker.traceback)
+        }
+        None => message_reports_oom(&format!("{err:#}")),
+    }
+}
+
+/// How a fatal dispatch failure settles with the ledger.
+///
+/// "Not a [`WorkerError`]" means the model is going down; it does **not**
+/// mean the replica died. The frame can have been rejected by `encode_frame`
+/// before a byte hit the wire, or the stream can have been torn down for a
+/// desync the dispatcher itself caused by dropping a request future — the
+/// path a user cancel produces — and in both cases the process was alive and
+/// answering. [`WindowOutcome::WorkerDied`] is read as evidence about memory
+/// on unified boards (DP-2's synthetic negative sample), so it is reserved
+/// for a worker that actually stopped answering; everything else is an
+/// abort, which teaches the ledger nothing.
+///
+/// The death is **claimed**, not read ([`Worker::take_death`]): one death may
+/// settle at most one window as one, however many windows a future dispatcher
+/// change might route to an already-dead replica.
+fn fatal_settlement(worker: &mut Worker) -> WindowOutcome {
+    if worker.take_death() {
+        WindowOutcome::WorkerDied
+    } else {
+        WindowOutcome::Aborted
     }
 }
 
@@ -985,11 +1038,12 @@ async fn run_single(
         }
         Err(err) => {
             let fatal = err.downcast_ref::<WorkerError>().is_none();
+            let settle = fatal_settlement(worker);
+            let oom = error_reports_oom(&err);
             let message = format!("{err:#}");
-            let oom = message_reports_oom(&message);
             let _ = request.reply.send(Err(err));
             if fatal {
-                (BatchOutcome::Fatal(message), WindowOutcome::Aborted)
+                (BatchOutcome::Fatal(message), settle)
             } else {
                 (BatchOutcome::Continue, WindowOutcome::Responded { oom })
             }
@@ -1448,6 +1502,56 @@ mod tests {
         assert!(halved_for_retry(None).is_none());
     }
 
+    /// A worker's stderr tail is a ring of everything it logged recently, not
+    /// a description of the failure it is attached to. An out-of-memory it
+    /// caught, halved and recovered from three requests ago is still sitting
+    /// in there, and classifying it would deflate the model and halve its
+    /// grants over a batch that never failed.
+    #[test]
+    fn a_stale_oom_in_the_stderr_tail_is_not_this_errors_oom() {
+        let worker_error = |message: &str, traceback: &str, stderr_tail: &str| {
+            anyhow::Error::new(WorkerError {
+                message: message.to_owned(),
+                traceback: traceback.to_owned(),
+                stderr_tail: stderr_tail.to_owned(),
+            })
+        };
+
+        let stale = worker_error(
+            "ValueError: expected an image, got None",
+            "Traceback (most recent call last):\n  File \"impl.py\", line 12",
+            "WARNING GPU OOM on a chunk of 32 inputs; retrying at 16.\n\
+             RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB\n\
+             INFO recovered, continuing",
+        );
+        assert!(
+            format!("{stale:#}").contains("out of memory"),
+            "the whole rendering does say it — which is exactly the trap"
+        );
+        assert!(
+            !error_reports_oom(&stale),
+            "but this failure is a bad input, and deflating for it would be wrong"
+        );
+
+        // The fields that do describe this failure are still read, in both
+        // places the worker can put the text.
+        assert!(error_reports_oom(&worker_error(
+            "INFERENCE_OOM_WINDOW: batch of 32 failed",
+            "",
+            ""
+        )));
+        assert!(error_reports_oom(&worker_error(
+            "RuntimeError",
+            "  File \"impl.py\", line 12\nRuntimeError: MPS backend out of memory",
+            ""
+        )));
+        // A supervision error has no envelope to strip: it is all message.
+        assert!(error_reports_oom(&anyhow!(
+            "predict failed: CUDA out of memory"
+        )));
+        assert!(!error_reports_oom(&anyhow!("no response within 30s")));
+    }
+
     // ------------------------------------------------------------------
     // Integration: the dispatcher, a live ledger, and a real worker
     // ------------------------------------------------------------------
@@ -1851,5 +1955,86 @@ mod tests {
 
         tx.send(DispatchMsg::Shutdown).expect("shutdown");
         dispatcher.await.expect("dispatcher exits");
+    }
+
+    async fn echo_worker() -> Worker {
+        let cfg = super::super::worker::testing::test_spawn_config();
+        let mut worker = Worker::spawn_configured(
+            &cfg,
+            "test/echo",
+            &super::super::worker::testing::spec("echo_test"),
+            None,
+        )
+        .await
+        .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+        worker
+    }
+
+    fn lone_request() -> (DispatchRequest, oneshot::Receiver<Result<Vec<WorkerOutput>>>) {
+        let (reply, answer) = oneshot::channel();
+        (
+            DispatchRequest {
+                inputs: vec![WorkerInput {
+                    data: Some(json!(1)),
+                    file: None,
+                }],
+                max_batch: None,
+                reply,
+            },
+            answer,
+        )
+    }
+
+    /// A request future dropped mid-flight desynchronizes the stream, and the
+    /// **next** request kills the worker for it. That kill is our own doing —
+    /// the path a user cancel produces — and the process was alive and
+    /// answering right up to it, so the window settles as an abort. On a
+    /// unified board the difference is load-bearing: `WorkerDied` there is
+    /// DP-2's synthetic negative sample, and blaming a batch size for a cancel
+    /// would halve the model's ratchet anchor for nothing.
+    #[tokio::test]
+    async fn a_desync_after_a_dropped_future_settles_as_an_abort() {
+        let mut worker = echo_worker().await;
+        worker.strand_in_flight_for_test();
+        let (request, answer) = lone_request();
+
+        let (batch, window) = run_single("test/echo", &mut worker, request, None, None, None).await;
+        assert!(
+            matches!(batch, BatchOutcome::Fatal(_)),
+            "the model still goes down: the stream cannot be resynchronized"
+        );
+        assert_eq!(
+            window,
+            WindowOutcome::Aborted,
+            "but nothing was learned about memory"
+        );
+        assert!(
+            answer.await.expect("the caller was answered").is_err(),
+            "the request itself still fails"
+        );
+    }
+
+    /// The other half: a replica killed out from under the supervisor — the
+    /// shape a jetsam or OOM-killer SIGKILL takes from this side of the pipe —
+    /// really is a death, and settles as one.
+    #[tokio::test]
+    async fn a_worker_that_stopped_answering_settles_as_a_death() {
+        let mut worker = echo_worker().await;
+        worker.kill_child_externally_for_test().await;
+        let (request, answer) = lone_request();
+
+        let (batch, window) = run_single("test/echo", &mut worker, request, None, None, None).await;
+        assert!(matches!(batch, BatchOutcome::Fatal(_)));
+        assert_eq!(window, WindowOutcome::WorkerDied);
+        assert!(answer.await.expect("the caller was answered").is_err());
+
+        // And only once: the death is claimed, so a second window routed to
+        // the same corpse — unreachable today, but nothing in the types says
+        // so — cannot halve the ratchet anchor a second time for it.
+        let (request, answer) = lone_request();
+        let (_, window) = run_single("test/echo", &mut worker, request, None, None, None).await;
+        assert_eq!(window, WindowOutcome::Aborted);
+        assert!(answer.await.expect("the caller was answered").is_err());
     }
 }

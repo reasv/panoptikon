@@ -422,10 +422,22 @@ pub enum WindowOutcome {
     /// survived): ingest the measurements and count the window clean unless
     /// it — or the error message — reported an out-of-memory condition.
     Responded { oom: bool },
-    /// The window was aborted: fatal worker error, dispatcher teardown, a
-    /// dropped task. Nothing was measured, so nothing is learned — no ramp
-    /// progress and no deflation.
+    /// The window was aborted: dispatcher teardown, a dropped task, a
+    /// neighbour's death taking the model down. Nothing was measured, so
+    /// nothing is learned — no ramp progress and no deflation.
     Aborted,
+    /// The replica running this window **died**: the worker process is gone
+    /// (a protocol-level failure, not a per-request error it survived).
+    ///
+    /// Accounted exactly like [`Self::Aborted`] on a board with private
+    /// VRAM, where a mid-window death has too many non-memory causes to
+    /// blame on the batch size. On a **unified** board it is additionally a
+    /// synthetic negative sample (DP-2): an out-of-memory kill there arrives
+    /// as a SIGKILL from the OS — macOS jetsam, Linux's OOM killer — which no
+    /// in-process handler can catch and no measurement can describe, and a
+    /// death mid-batch on memory the whole machine shares is overwhelmingly
+    /// that.
+    WorkerDied,
 }
 
 /// Opaque worker identity inside the ledger.
@@ -733,6 +745,43 @@ fn admitted_units(entry: &WorkerEntry, anchor: u64, knee: Option<u64>) -> u64 {
     (bounded >> entry.deflation.min(63)).max(1)
 }
 
+/// What settling one window produced for the caller to do *outside* the
+/// ledger lock: a store write, and the unified-board death alarm.
+#[derive(Default)]
+struct Settled {
+    update: Option<ProfileUpdate>,
+    death: Option<DeathNegative>,
+}
+
+/// A replica died mid-window on a unified board and the ledger halved its
+/// model's budget for it (DP-2). Owns its strings so the line is formatted
+/// after the lock is dropped.
+struct DeathNegative {
+    inference_id: String,
+    gpu: String,
+    ram_mb: u64,
+    anchor_before: u64,
+    anchor_after: u64,
+}
+
+impl DeathNegative {
+    fn emit(self) {
+        tracing::warn!(
+            model = %self.inference_id,
+            gpu = %self.gpu,
+            unified_ram_mb = self.ram_mb,
+            anchor_units_before = self.anchor_before,
+            anchor_units_after = self.anchor_after,
+            negative_sample = "unified-board worker death",
+            "this replica died while running a granted window on a board whose \
+             memory is the machine's own; recording it as a memory negative \
+             (an out-of-memory kill there is a signal from the OS, which no \
+             in-process handler can catch) and halving the batch size the next \
+             replica of this model is admitted for"
+        );
+    }
+}
+
 /// What one telemetry ingest found.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Ingested {
@@ -878,13 +927,31 @@ struct FreeSample {
 /// future generic sysfs-derived reporter cannot inherit authority here by
 /// string collision. `"torch"` stays non-authoritative everywhere — doubly
 /// so on HIP, where `hipMemGetInfo`'s "free" was historically process-local.
+/// `"mps"` is the unified-memory equivalent: the host's RAM statistics, which
+/// see every process on the machine by construction and are the *only*
+/// reading on that board with any claim to whole-device authority (Metal
+/// exposes no free-memory counter of its own). The orchestrator's refresh and
+/// the worker's sample read the same statistics under the same label, so the
+/// consistency rule holds there as it does on ROCm
+/// (docs/unified-memory-admission.md, backend A).
 fn free_source_is_authoritative(source: &str) -> bool {
-    matches!(source, "nvml" | "nvidia-smi" | "amdgpu-sysfs")
+    matches!(source, "nvml" | "nvidia-smi" | "amdgpu-sysfs" | "mps")
 }
 
 struct GpuLedger {
     name: String,
     total_mb: u64,
+    /// Host RAM this board is carved out of, in MiB, on a **unified** board
+    /// (`GpuInfo::unified_ram_mb`); `None` on a board with private VRAM.
+    ///
+    /// Two things read it, both of them things that are only true when the
+    /// board's memory is the machine's: DP-2's death-as-negative-sample, and
+    /// DP-4's bound on the authoritative total below.
+    unified_ram_mb: Option<u64>,
+    /// This board's `total_mb` is the figure a worker reported rather than
+    /// the probe's seed (DP-4). Once true it stays true: the first report
+    /// wins, and a later replica's identical figure has nothing to add.
+    total_adopted: bool,
     /// The board's PCI address, lower-cased, when the inventory carries one
     /// (ROCm only today). It is the fallback registration join for a worker
     /// that cannot report a UUID the inventory would recognise — every ROCm
@@ -1004,6 +1071,32 @@ enum BoardLog {
         worker_bdf: Option<String>,
         boards: usize,
     },
+    /// A unified board's admission total was replaced by the figure the
+    /// worker's own runtime reports (DP-4).
+    UnifiedTotalAdopted {
+        board: String,
+        seed_total_mb: u64,
+        reported_total_mb: u64,
+        ram_mb: u64,
+    },
+    /// A later replica reported a *different* — and sane — total for an
+    /// already-adopted unified board: the GPU memory limit moved under a
+    /// running gateway. The new figure wins, rather than the cross-check
+    /// refusing every replica until a restart.
+    UnifiedTotalReadopted {
+        board: String,
+        previous_total_mb: u64,
+        reported_total_mb: u64,
+        ram_mb: u64,
+    },
+    /// The same report, refused: outside `(0, host RAM]`, so it describes
+    /// something other than this board's budget. The total in force stands.
+    UnifiedTotalRejected {
+        board: String,
+        seed_total_mb: u64,
+        reported_total_mb: u64,
+        ram_mb: u64,
+    },
     /// The replica was admitted, but under a **different** board than the one
     /// the orchestrator's pin believed it had placed it on (review F1): the
     /// enumeration-order diagnostic. Not a refusal — the replica is
@@ -1094,6 +1187,57 @@ impl BoardLog {
                 "the worker reports no board this GPU inventory lists; \
                  dispatching this model without VRAM admission"
             ),
+            Self::UnifiedTotalAdopted {
+                board,
+                seed_total_mb,
+                reported_total_mb,
+                ram_mb,
+            } => tracing::info!(
+                model = %inference_id,
+                board = %board,
+                seed_total_mb,
+                reported_total_mb,
+                ram_mb,
+                "this unified board's admission total is now the figure the \
+                 worker's own runtime reports, which is what its allocations \
+                 are actually judged against; the probe's seed was a default \
+                 fraction of host RAM and a raised GPU memory limit moves the \
+                 real figure well away from it"
+            ),
+            Self::UnifiedTotalReadopted {
+                board,
+                previous_total_mb,
+                reported_total_mb,
+                ram_mb,
+            } => tracing::info!(
+                model = %inference_id,
+                board = %board,
+                previous_total_mb,
+                reported_total_mb,
+                ram_mb,
+                "unified total re-adopted: this worker reports a different \
+                 figure than the one already in force, which is what raising \
+                 (or lowering) the GPU memory limit under a running gateway \
+                 looks like. Taking the new figure — refusing the replica for \
+                 disagreeing would leave a tuned machine unpriced until a \
+                 restart"
+            ),
+            Self::UnifiedTotalRejected {
+                board,
+                seed_total_mb,
+                reported_total_mb,
+                ram_mb,
+            } => tracing::warn!(
+                model = %inference_id,
+                board = %board,
+                total_mb = seed_total_mb,
+                reported_total_mb,
+                ram_mb,
+                "ignoring this worker's total-memory report for a unified \
+                 board: it is not inside (0, host RAM], so it cannot be this \
+                 board's share of the machine's memory — keeping the total \
+                 already in force"
+            ),
             Self::PinDiverged {
                 expected,
                 expected_bdf,
@@ -1162,6 +1306,8 @@ impl VramLedger {
                     GpuLedger {
                         name: gpu.name.clone(),
                         total_mb: gpu.total_mb,
+                        unified_ram_mb: gpu.unified_ram_mb,
+                        total_adopted: false,
                         bdf: gpu.bdf.as_deref().map(str::to_ascii_lowercase),
                         free: None,
                         seen_authoritative_free: false,
@@ -1549,6 +1695,84 @@ impl VramLedger {
         state.gpus.get(key?).and_then(|board| board.bdf.clone())
     }
 
+    /// Adopt a unified board's **authoritative** total from the first load
+    /// report that carries one (DP-4), and say so.
+    ///
+    /// On a unified board `total` is a *policy* number, not a device fact:
+    /// on Apple Silicon it is Metal's `recommendedMaxWorkingSetSize`, which
+    /// defaults to ≈75 % of RAM — the probe's seed — but moves when the user
+    /// raises the GPU wired limit, a standard tweak on Macs used for local
+    /// ML. The moved figure is precisely the one admission has to budget
+    /// against, and only the worker can read it (it is what torch reports
+    /// and what the allocator's own ceiling is set from), so the worker's
+    /// number wins outright.
+    ///
+    /// The check is a **sanity bound and nothing else**: `0 < reported ≤
+    /// host RAM`. There is deliberately no proximity window around the seed
+    /// — a raised limit legitimately puts the real figure 20 % away from it,
+    /// and rejecting exactly the tuned machines would be backwards.
+    ///
+    /// It runs **before** [`Self::resolve_board`], and that ordering is the
+    /// whole reason this is a separate step: the same report is then
+    /// cross-checked against the total it just supplied, so the registration
+    /// join cannot refuse a legitimate figure for disagreeing with a seed it
+    /// has already replaced.
+    ///
+    /// **Re-adoption.** The same argument outlives the first report. The
+    /// wired limit is a live sysctl: a user who raises it and restarts a
+    /// model — the tuned machines this exists for — produces replicas whose
+    /// figure disagrees with the adopted one by far more than
+    /// [`Self::cross_check_total`]'s tolerance, and refusing them would leave
+    /// the host unpriced until the gateway is restarted. So a *sane* figure
+    /// (still `0 < reported ≤ host RAM`) that is out of tolerance replaces the
+    /// adopted one and says so; one inside tolerance changes nothing, because
+    /// the two sources shave slightly different amounts off the same pool and
+    /// re-adopting on that noise would rewrite the board's total on every
+    /// load.
+    ///
+    /// Scoped as tightly as the facts allow: exactly one board in the
+    /// ledger, that board unified, and a report that names **no other board**
+    /// (no UUID, no PCI address). A report carrying positive evidence of some
+    /// other device is not this board's total, whatever else is true.
+    fn adopt_unified_total_locked(state: &mut LedgerState, report: &LoadReport) -> Option<BoardLog> {
+        let reported = report.gpu_total_mb?;
+        if state.gpus.len() != 1 || report.gpu_uuid.is_some() || report.gpu_bdf.is_some() {
+            return None;
+        }
+        let (key, board) = state.gpus.iter_mut().next().expect("length checked");
+        let ram_mb = board.unified_ram_mb?;
+        let previous_total_mb = board.total_mb;
+        if reported == 0 || reported > ram_mb {
+            return Some(BoardLog::UnifiedTotalRejected {
+                board: key.clone(),
+                seed_total_mb: previous_total_mb,
+                reported_total_mb: reported,
+                ram_mb,
+            });
+        }
+        if board.total_adopted {
+            let tolerance = (previous_total_mb / 20).max(TOTAL_MEMORY_TOLERANCE_MB);
+            if reported.abs_diff(previous_total_mb) <= tolerance {
+                return None;
+            }
+            board.total_mb = reported;
+            return Some(BoardLog::UnifiedTotalReadopted {
+                board: key.clone(),
+                previous_total_mb,
+                reported_total_mb: reported,
+                ram_mb,
+            });
+        }
+        board.total_mb = reported;
+        board.total_adopted = true;
+        Some(BoardLog::UnifiedTotalAdopted {
+            board: key.clone(),
+            seed_total_mb: previous_total_mb,
+            reported_total_mb: reported,
+            ram_mb,
+        })
+    }
+
     /// Register a freshly loaded replica and return its admission handle, or
     /// `None` when the replica is not admissible: a `none`-class model, a
     /// worker that reported no GPU at all (no torch, CPU/MPS, remote API), or
@@ -1589,15 +1813,19 @@ impl VramLedger {
         // name is taken from the inventory rather than from the worker's
         // `gpu_name`, so every profile this host writes is keyed by the same
         // string the probe derived, whatever torch calls the card.
-        let resolution = {
-            let state = self.lock();
-            Self::resolve_board(&state, &report, expected_board)
+        let (adoption, resolution) = {
+            let mut state = self.lock();
+            // Before the join, not after: on a unified board the total the
+            // join cross-checks against is the one this call adopts (DP-4).
+            let adoption = Self::adopt_unified_total_locked(&mut state, &report);
+            let resolution = Self::resolve_board(&state, &report, expected_board);
+            (adoption, resolution)
         };
         // Emitted with the lock **dropped**: formatting a `tracing` event
         // under the ledger mutex would put every concurrent grant request
         // behind a log write (review F8). It happens before the `?` below so
         // a refusal still says why.
-        if let Some(log) = resolution.log {
+        for log in adoption.into_iter().chain(resolution.log) {
             log.emit(inference_id);
         }
         let (gpu, board_name) = resolution.admit?;
@@ -1916,7 +2144,19 @@ impl VramLedger {
         }) {
             return None;
         }
-        cal.persisted = Some(current);
+        // The **persisted** anchor only ever moves forward, which the
+        // suppression predicate above cannot achieve on its own: it is a
+        // conjunction, so a fit or knee change riding along with a *lowered*
+        // anchor writes the lowered figure. `max_units_measured` does go down
+        // within a run — DP-2 halves it when a replica dies mid-window on a
+        // unified board — and a stored anchor is a claim about a batch size
+        // this machine once ran, which no death unmeasures. The halving is
+        // runtime correction, like the deflation counter beside it, and it
+        // stays runtime-only.
+        let max_units_measured = cal
+            .persisted
+            .map_or(current.0, |persisted| persisted.0.max(current.0));
+        cal.persisted = Some((max_units_measured, current.1, current.2));
         // Only a locally derived fit travels; see the note above.
         let fit = cal.fit.filter(|_| cal.fit_is_local);
         Some(ProfileUpdate {
@@ -1933,7 +2173,7 @@ impl VramLedger {
             residual_mb: fit.map(|fit| fit.residual_mb).unwrap_or(0.0),
             samples: fit.map(|fit| fit.samples).unwrap_or(0),
             knee_units: knee,
-            max_units_measured: cal.max_units_measured,
+            max_units_measured,
             local_samples: cal.local_samples,
             ring: cal.samples.iter().copied().collect(),
         })
@@ -2478,24 +2718,23 @@ impl VramLedger {
     /// advances either way, the fit and the ratchet take the samples (they are
     /// real measurements), and the clean/negative bookkeeping is skipped.
     fn settle(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) {
-        let update = self.settle_locked(worker, grant_id, outcome);
-        // Handed over **after** the ledger lock is released: the store takes
-        // its own lock and may schedule a write, and no ledger operation
-        // should ever wait behind either.
-        if let (Some(update), Some(profiles)) = (update, self.profiles.as_ref()) {
+        let settled = self.settle_locked(worker, grant_id, outcome);
+        // Both handed over **after** the ledger lock is released: the store
+        // takes its own lock and may schedule a write, and formatting a
+        // `tracing` event under the ledger mutex puts every concurrent grant
+        // request behind a log write (review F8).
+        if let Some(death) = settled.death {
+            death.emit();
+        }
+        if let (Some(update), Some(profiles)) = (settled.update, self.profiles.as_ref()) {
             profiles.record(update);
         }
     }
 
-    fn settle_locked(
-        &self,
-        worker: WorkerId,
-        grant_id: u64,
-        outcome: WindowOutcome,
-    ) -> Option<ProfileUpdate> {
+    fn settle_locked(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) -> Settled {
         let mut state = self.lock();
         let Some(entry) = state.workers.get_mut(&worker) else {
-            return None;
+            return Settled::default();
         };
         // Demand: this window's own requests are done with, whatever happened
         // to them. Without this a busy replica's demand signal stays frozen at
@@ -2541,15 +2780,97 @@ impl VramLedger {
                 }
             }
         }
+        let death = matches!(outcome, WindowOutcome::WorkerDied)
+            .then(|| Self::note_unified_death_locked(&mut state, worker, charge.is_some()))
+            .flatten();
         Self::refit_locked(&mut state, worker);
         Self::refit_knee_locked(&mut state, worker);
         // No store, no write policy: without a store there is nothing to hand
         // an update to, and evaluating it anyway would move `cal.persisted`
         // to describe a write that can never happen.
-        if self.profiles.is_none() {
+        let update = self
+            .profiles
+            .is_some()
+            .then(|| Self::pending_update_locked(&mut state, worker))
+            .flatten();
+        Settled { update, death }
+    }
+
+    /// DP-2: a replica that died with a granted window in flight, on a board
+    /// whose memory is the machine's, is one synthetic negative sample.
+    ///
+    /// `None` — nothing recorded — on a discrete board (a mid-window death
+    /// there has too many non-memory causes to blame on the batch size), on a
+    /// window that held no grant, and on a replica the ledger has already
+    /// forgotten.
+    ///
+    /// What "a negative sample" means here has to survive the replica, which
+    /// is what makes this more than the deflation counter the OOM path uses:
+    ///
+    /// - the dying entry is deflated, for the vanishing case where it is
+    ///   still handed a window before its `Admission` drops, and because a
+    ///   negative sample deflating nothing would be a lie about what was
+    ///   recorded;
+    /// - the (model, board) **ratchet anchor is halved**, and that is the
+    ///   part that does the work. Deflation is per-replica runtime state and
+    ///   dies with the process; the anchor does not, and the anchor is a
+    ///   *floor* on the next replica's budget. Without this, a model killed
+    ///   by the OS at batch N is respawned by the manager and immediately
+    ///   admitted for batch N again — the same batch, on the same board, with
+    ///   nothing learned. Halving is the same correction the deflation path
+    ///   applies, moved to the only state that outlives the death.
+    ///
+    /// Nothing reaches the fit: no sample is recorded and the slope is
+    /// untouched. A death produced no measurement — there is no peak to
+    /// regress — and an anchor is evidence about what *ran*, which this is
+    /// evidence against.
+    ///
+    /// Nothing reaches the calibration *store* either, because
+    /// [`Self::pending_update_locked`] persists the anchor **monotonically**:
+    /// a write triggered by anything else — a refit, a knee moving — carries
+    /// the highest anchor ever persisted, never the halved one. (The write
+    /// policy alone would not do it: its suppression test is a conjunction, so
+    /// a halving arriving in the same settle as a refit used to travel.) A
+    /// restart restores the persisted anchor, so the correction is scoped to
+    /// this run — the same lifetime the deflation counter has.
+    fn note_unified_death_locked(
+        state: &mut LedgerState,
+        worker: WorkerId,
+        held_grant: bool,
+    ) -> Option<DeathNegative> {
+        if !held_grant {
             return None;
         }
-        Self::pending_update_locked(&mut state, worker)
+        let entry = state.workers.get(&worker)?;
+        let key = (entry.inference_id.clone(), entry.gpu.clone());
+        let ram_mb = state.gpus.get(&key.1)?.unified_ram_mb?;
+        let anchor_before = Self::anchor_locked(state, entry);
+        if let Some(entry) = state.workers.get_mut(&worker) {
+            entry.note_negative_sample();
+        }
+        // Floored at one unit, because zero is not "a very small anchor" — it
+        // is the sentinel for *no local measurement at all*, and
+        // [`admitted_units`] turns the ×2 ratchet ceiling **off** when it sees
+        // one. Without the floor the fifth consecutive death would loosen
+        // admission back to the bare geometric ramp, which is the opposite of
+        // what a death means. A board that never measured anything keeps its
+        // zero: there is nothing to halve, and inventing an anchor of 1 would
+        // clamp a fresh model to a single unit forever.
+        let anchor_after = if anchor_before > 0 {
+            (anchor_before / 2).max(1)
+        } else {
+            0
+        };
+        if let Some(cal) = state.calibration.get_mut(&key) {
+            cal.max_units_measured = anchor_after;
+        }
+        Some(DeathNegative {
+            inference_id: key.0,
+            gpu: key.1,
+            ram_mb,
+            anchor_before,
+            anchor_after,
+        })
     }
 
     /// Drain this worker's new telemetry into the ledger by watermark.
@@ -3261,6 +3582,8 @@ impl VramLedger {
                     GpuLedger {
                         name: (*name).to_owned(),
                         total_mb: *total_mb,
+                        unified_ram_mb: None,
+                        total_adopted: false,
                         bdf: bdf.map(str::to_ascii_lowercase),
                         free: None,
                         seen_authoritative_free: false,
@@ -3526,11 +3849,38 @@ impl Drop for Admission {
 /// Both prefixes are contract (docs/inferio-worker-protocol.md); the bare
 /// substrings catch a torch OOM that reached the error frame unwrapped, which
 /// is a real path for impls that do not route through `run_with_oom_retry`.
+///
+/// Kept in step with the worker's own `packing._looks_like_oom`, which is the
+/// classifier every unified backend's negative signal goes through
+/// (docs/unified-memory-admission.md, "Negative signals"): a case-insensitive
+/// `out of memory` covers MPS's `RuntimeError("MPS backend out of memory
+/// (…)")` and whatever spelling an APU's HSA layer turns out to use, and the
+/// `DefaultCPUAllocator` pair covers CPU torch, whose text never says "out of
+/// memory" at all. The two must agree — the worker classifies the exception it
+/// caught, this classifies the message that reached the error frame, and a
+/// message only one of them recognises produces a deflation on one side of the
+/// wire and not the other.
+///
+/// **What is handed to this matters as much as what it matches.** A `message`
+/// is one failure's own text, never a log excerpt: the dispatcher reads a
+/// `WorkerError`'s message and traceback and deliberately *not* its stderr
+/// tail (`dispatch::error_reports_oom`). The two-substring CPU form is tested
+/// **per line** for the same reason — across a multi-line blob its two halves
+/// could land in unrelated lines and match something that is not an allocator
+/// failure at all.
 pub fn message_reports_oom(message: &str) -> bool {
-    message.contains("INFERENCE_OOM_BATCH_SIZE_1:")
+    if message.contains("INFERENCE_OOM_BATCH_SIZE_1:")
         || message.contains("INFERENCE_OOM_WINDOW:")
         || message.contains("CUDA out of memory")
         || message.contains("HIP out of memory")
+    {
+        return true;
+    }
+    message.lines().any(|line| {
+        let lowered = line.to_ascii_lowercase();
+        lowered.contains("out of memory")
+            || (lowered.contains("defaultcpuallocator") && lowered.contains("allocate memory"))
+    })
 }
 
 /// Robust two-parameter fit of `delta_mb ≈ intercept + slope × units` over
@@ -5849,6 +6199,7 @@ mod tests {
             compute_cap: None,
             bdf: Some(bdf.to_owned()),
             gfx_target_version: Some(110_000),
+            unified_ram_mb: None,
         };
         let inventory =
             GpuInventory::known_rocm(vec![amd(0, "0000:03:00.0"), amd(1, "0000:0c:00.0")]);
@@ -5902,6 +6253,7 @@ mod tests {
             compute_cap: None,
             bdf: Some(bdf.to_owned()),
             gfx_target_version: Some(110_000),
+            unified_ram_mb: None,
         };
         let inventory = GpuInventory::known_rocm(vec![
             amd(0, "0000:03:00.0", 24_576),
@@ -6064,6 +6416,412 @@ mod tests {
             .register_worker("g/a", item_cost(4), &bare(None), None)
             .expect("the same report with no identity claim does fall back");
         assert_eq!(admitted_board(&single, 0).0, BOARD);
+    }
+
+    // ------------------------------------------------------------------
+    // Unified boards: MPS (docs/unified-memory-admission.md, DP-2/DP-4)
+    // ------------------------------------------------------------------
+
+    const MPS_BOARD: &str = "GPU-MPS";
+    /// A 128 GiB Mac, in MiB.
+    const MAC_RAM_MB: u64 = 128 * 1024;
+
+    /// The one-board unified ledger a Mac gets: the probe's 75 % seed, with
+    /// the host's RAM recorded as the DP-4 bound and the DP-2 flag.
+    fn mps_ledger() -> Arc<VramLedger> {
+        let ledger = VramLedger::for_test_boards(
+            &[(
+                MPS_BOARD,
+                "Apple M3 Max (128 GB)",
+                MAC_RAM_MB / 4 * 3,
+                None,
+            )],
+            no_margin(),
+            None,
+        );
+        ledger
+            .lock()
+            .gpus
+            .get_mut(MPS_BOARD)
+            .expect("the board")
+            .unified_ram_mb = Some(MAC_RAM_MB);
+        ledger
+    }
+
+    /// An MPS worker's load report: no UUID and no PCI address (there is
+    /// neither on Apple Silicon), and torch's `recommended_max_memory` as the
+    /// total.
+    fn loaded_mps(total_mb: Option<u64>) -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("mps".to_owned()),
+            reserved_at_load_mb: Some(0),
+            gpu_name: Some("Apple M3 Max (128 GB)".to_owned()),
+            gpu_total_mb: total_mb,
+            torch_version: Some("2.7.1".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    fn board_total_mb(ledger: &Arc<VramLedger>) -> u64 {
+        ledger.health()[0].total_mb
+    }
+
+    /// DP-4: the worker's `recommended_max_memory` is **authoritative**, and
+    /// the join that follows is cross-checked against the figure it just
+    /// supplied rather than against the seed it replaced.
+    ///
+    /// The reference machine is exactly the case a proximity window would
+    /// have broken: its GPU wired limit is raised to ≈90 % of RAM, so the
+    /// real total is 20 % above the probe's 75 % seed — well outside any
+    /// tolerance the registration cross-check would apply.
+    #[test]
+    fn a_unified_boards_total_is_adopted_from_the_first_worker() {
+        let ledger = mps_ledger();
+        let raised = MAC_RAM_MB / 10 * 9;
+        assert_eq!(board_total_mb(&ledger), MAC_RAM_MB / 4 * 3, "the seed");
+        let handle = loaded_mps(Some(raised));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted: the cross-check runs against the adopted total");
+        assert_eq!(
+            board_total_mb(&ledger),
+            raised,
+            "the figure allocations are actually judged against wins"
+        );
+        assert_eq!(admitted_board(&ledger, 0), (MPS_BOARD.to_owned(), "g/a".to_owned()));
+    }
+
+    /// The adoption's only test is a sanity bound, `0 < reported ≤ host RAM`.
+    /// Outside it the seed stands — and the report is then a report that
+    /// disagrees with the board, so the replica is refused and dispatches
+    /// unpriced, which is the same answer every other backend gives.
+    #[test]
+    fn an_implausible_unified_total_is_ignored() {
+        for reported in [0, MAC_RAM_MB + 1] {
+            let ledger = mps_ledger();
+            let handle = loaded_mps(Some(reported));
+            assert!(
+                ledger
+                    .register_worker("g/a", item_cost(4), &handle, None)
+                    .is_none(),
+                "a total of {reported} MiB on a {MAC_RAM_MB} MiB machine is \
+                 not this board's budget"
+            );
+            assert_eq!(
+                board_total_mb(&ledger),
+                MAC_RAM_MB / 4 * 3,
+                "the seed is what keeps budgets defined; a bad report cannot \
+                 move it"
+            );
+        }
+    }
+
+    /// A second replica agreeing with the adopted figure is not a second
+    /// opinion to average in: within the cross-check tolerance the two
+    /// sources are measuring the same thing with different rounding, and a
+    /// board whose total drifted on every load would re-price every
+    /// outstanding grant for nothing.
+    #[test]
+    fn an_agreeing_second_report_does_not_move_the_unified_total() {
+        let ledger = mps_ledger();
+        let adopted = MAC_RAM_MB / 10 * 9;
+        let first = loaded_mps(Some(adopted));
+        let _first = ledger
+            .register_worker("g/a", item_cost(4), &first, None)
+            .expect("admitted");
+        // Within the cross-check tolerance of the adopted figure, so this
+        // replica is admitted too — it simply does not move the total.
+        let second = loaded_mps(Some(adopted - 100));
+        let _second = ledger
+            .register_worker("g/b", item_cost(4), &second, None)
+            .expect("admitted");
+        assert_eq!(board_total_mb(&ledger), adopted);
+    }
+
+    /// The wired limit is a live sysctl, so the adopted figure is not final:
+    /// a user who raises `iogpu.wired_limit_mb` and reloads a model produces
+    /// replicas whose total is 20 % away from the adopted one — far outside
+    /// the cross-check tolerance. Refusing them would leave exactly the tuned
+    /// machines DP-4 exists for unpriced until the gateway restarts, so a
+    /// sane out-of-tolerance figure is **re-adopted** instead.
+    #[test]
+    fn a_raised_memory_limit_re_adopts_the_unified_total() {
+        let ledger = mps_ledger();
+        let seeded = MAC_RAM_MB / 4 * 3;
+        let first = loaded_mps(Some(seeded));
+        let _first = ledger
+            .register_worker("g/a", item_cost(4), &first, None)
+            .expect("admitted");
+        assert_eq!(board_total_mb(&ledger), seeded);
+
+        let raised = MAC_RAM_MB / 10 * 9;
+        let second = loaded_mps(Some(raised));
+        let _second = ledger
+            .register_worker("g/b", item_cost(4), &second, None)
+            .expect("admitted: the cross-check runs against the re-adopted total");
+        assert_eq!(
+            board_total_mb(&ledger),
+            raised,
+            "the figure this replica's allocations are judged against wins, \
+             exactly as the first report's did"
+        );
+    }
+
+    /// Re-adoption is still only a sanity bound: a figure above physical RAM
+    /// describes something other than this board's share of the machine, and
+    /// it is refused after adoption exactly as before it.
+    #[test]
+    fn an_impossible_report_is_refused_after_adoption_too() {
+        let ledger = mps_ledger();
+        let adopted = MAC_RAM_MB / 4 * 3;
+        let _first = ledger
+            .register_worker("g/a", item_cost(4), &loaded_mps(Some(adopted)), None)
+            .expect("admitted");
+        assert!(
+            ledger
+                .register_worker("g/b", item_cost(4), &loaded_mps(Some(MAC_RAM_MB + 1)), None)
+                .is_none(),
+            "more than the machine has is not this board's budget"
+        );
+        assert_eq!(
+            board_total_mb(&ledger),
+            adopted,
+            "and the total in force is untouched"
+        );
+    }
+
+    /// A report with no MPS facts at all — no torch, a remote-API impl —
+    /// stays unregistered, exactly as on every other backend, and adopts
+    /// nothing.
+    #[test]
+    fn a_report_without_mps_facts_registers_nothing() {
+        let ledger = mps_ledger();
+        let handle = loaded_mps(None);
+        assert!(
+            ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .is_none()
+        );
+        assert_eq!(board_total_mb(&ledger), MAC_RAM_MB / 4 * 3);
+    }
+
+    /// DP-2: a replica that dies with a granted window in flight on a
+    /// unified board is a memory negative — the OS's out-of-memory kill is a
+    /// SIGKILL no in-process handler can catch, so it is the only signal
+    /// there is. The correction has to outlive the dead replica, because the
+    /// manager respawns the model and the ratchet anchor is a *floor* on the
+    /// new replica's budget.
+    #[test]
+    fn a_death_mid_window_deflates_a_unified_board() {
+        let ledger = mps_ledger();
+        let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 60_000, 0);
+        // A measured window moves the anchor to 16 units: the batch size the
+        // next replica would otherwise be handed straight away.
+        measured_window(&handle, &admission, 16);
+        assert_eq!(ledger.health()[0].workers[0].max_units_measured, 16);
+
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::WorkerDied);
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.deflation, 1, "the dying replica is deflated");
+        assert_eq!(
+            worker.max_units_measured, 8,
+            "and the halving survives it: the anchor is what the respawned \
+             replica is floored at"
+        );
+        // Never fed to the fit: a death produced no measurement, so there is
+        // no peak to regress.
+        assert_eq!(
+            ledger
+                .calibration_state("g/a", MPS_BOARD)
+                .map(|state| state.samples.len()),
+            Some(1),
+            "only the one real measurement"
+        );
+    }
+
+    /// The halving is **runtime-only**: it must never reach the calibration
+    /// store, because a stored anchor is a claim about a batch size this
+    /// machine once ran and no death unmeasures one. The write policy alone
+    /// does not achieve that — its suppression test is a conjunction, so a
+    /// refit arriving after a death used to carry the halved figure to disk —
+    /// hence the monotone floor in `pending_update_locked`.
+    ///
+    /// The existing death test runs with no store at all, so this path was
+    /// never exercised there.
+    #[test]
+    fn a_deaths_halved_anchor_never_reaches_the_store() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = VramLedger::for_test_boards(
+            &[(MPS_BOARD, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
+            no_margin(),
+            Some(Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>),
+        );
+        ledger
+            .lock()
+            .gpus
+            .get_mut(MPS_BOARD)
+            .expect("the board")
+            .unified_ram_mb = Some(MAC_RAM_MB);
+
+        // The MPS load report a store write needs: the profile key is
+        // (torch, dtype) as well as the board name.
+        let handle = {
+            let mut telemetry = WorkerTelemetry::default();
+            telemetry.load = Some(Timestamped::now(LoadReport {
+                base_mb: Some(1000),
+                base_method: Some("mps".to_owned()),
+                reserved_at_load_mb: Some(0),
+                gpu_name: Some("Apple M3 Max (128 GB)".to_owned()),
+                gpu_total_mb: Some(MAC_RAM_MB / 4 * 3),
+                torch_version: Some("2.7.1".to_owned()),
+                dtype: Some("fp32".to_owned()),
+                ..LoadReport::default()
+            }));
+            Arc::new(StdMutex::new(telemetry)) as TelemetryHandle
+        };
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 60_000, 0);
+        for units in [4, 8, 16] {
+            measured_window(&handle, &admission, units);
+        }
+        assert_eq!(
+            profiles.updates.lock().unwrap().last().unwrap().max_units_measured,
+            16,
+            "the measured anchor is what was written"
+        );
+        let written = profiles.updates.lock().unwrap().len();
+
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::WorkerDied);
+        assert_eq!(
+            ledger.health()[0].workers[0].max_units_measured,
+            8,
+            "the live anchor is halved, which is the point of DP-2"
+        );
+
+        // A window that moves the *fit* without moving the anchor: this is
+        // the settle whose write used to carry the halved figure to disk.
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(2, 0, 140)]);
+        token.finish(WindowOutcome::Responded { oom: false });
+
+        let updates = profiles.updates.lock().unwrap();
+        assert!(
+            updates.len() > written,
+            "the refit really did produce a write, or this proves nothing"
+        );
+        assert!(
+            updates[written..]
+                .iter()
+                .all(|update| update.max_units_measured >= 16),
+            "no write after the death may lower the persisted anchor: {:?}",
+            updates
+                .iter()
+                .map(|update| update.max_units_measured)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Halving bottoms out at **one unit**, not at zero: zero is the sentinel
+    /// for "no local measurement", and `admitted_units` turns the ×2 ratchet
+    /// ceiling *off* when it sees one — so an unfloored halving would have the
+    /// fifth consecutive death loosen admission. A board that genuinely never
+    /// measured anything keeps its zero; there is nothing to halve, and
+    /// inventing an anchor of 1 would pin a fresh model to a single unit.
+    #[test]
+    fn repeated_deaths_never_take_the_anchor_below_one() {
+        let ledger = mps_ledger();
+        let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 60_000, 0);
+        measured_window(&handle, &admission, 2);
+        assert_eq!(ledger.health()[0].workers[0].max_units_measured, 2);
+        for _ in 0..3 {
+            admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted")
+                .finish(WindowOutcome::WorkerDied);
+            assert_eq!(
+                ledger.health()[0].workers[0].max_units_measured,
+                1,
+                "2 → 1, and 1 → 1: the ratchet ceiling stays on"
+            );
+        }
+
+        let fresh = mps_ledger();
+        let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
+        let admission = fresh
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 60_000, 0);
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::WorkerDied);
+        assert_eq!(
+            fresh.health()[0].workers[0].max_units_measured,
+            0,
+            "nothing was measured, so there is no anchor to halve"
+        );
+    }
+
+    /// The same death on a board with **private VRAM** is not a memory
+    /// signal: a mid-window worker death there has too many non-memory
+    /// causes (a driver fault, a killed process, a bug in the impl) to blame
+    /// on the batch size. And an ordinary abort — a teardown, a dropped task
+    /// — is not one on either kind of board.
+    #[test]
+    fn a_death_mid_window_is_not_a_negative_on_a_discrete_board() {
+        let discrete = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = discrete
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 60_000, 0);
+        measured_window(&handle, &admission, 16);
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::WorkerDied);
+        let worker = &discrete.health()[0].workers[0];
+        assert_eq!(worker.deflation, 0);
+        assert_eq!(worker.max_units_measured, 16);
+
+        let unified = mps_ledger();
+        let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
+        let admission = unified
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 60_000, 0);
+        measured_window(&handle, &admission, 16);
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Aborted);
+        let worker = &unified.health()[0].workers[0];
+        assert_eq!(worker.deflation, 0, "an abort is not a death");
+        assert_eq!(worker.max_units_measured, 16);
     }
 
     /// A grant and the pool growth it produces are the **same memory**: a
@@ -6294,6 +7052,8 @@ mod tests {
             GpuLedger {
                 name: "TEST 9000".to_owned(),
                 total_mb: 10_000,
+                unified_ram_mb: None,
+                total_adopted: false,
                 bdf: None,
                 free,
                 seen_authoritative_free: false,
@@ -7975,6 +8735,25 @@ mod tests {
             "INFERENCE_OOM_WINDOW: batch of 32 failed"
         ));
         assert!(message_reports_oom("CUDA out of memory. Tried to allocate"));
+        // The unified backends, whose only negative signal this is: MPS
+        // capitalises differently and CPU torch never says "out of memory"
+        // at all. Both forms are what the worker's own classifier matches.
+        assert!(message_reports_oom(
+            "RuntimeError: MPS backend out of memory (MPS allocated: 96.00 GB)"
+        ));
+        assert!(message_reports_oom(
+            "RuntimeError: [enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: \
+             can't allocate memory: you tried to allocate 8589934592 bytes"
+        ));
         assert!(!message_reports_oom("ValueError: bad input"));
+        // Neither half of the CPU pair means anything on its own, and the
+        // pair is per **line**: two halves in unrelated lines of a multi-line
+        // blob are two unrelated lines, not an allocator failure.
+        assert!(!message_reports_oom(
+            "DefaultCPUAllocator: this is some other complaint"
+        ));
+        assert!(!message_reports_oom(
+            "DefaultCPUAllocator: reset\nfailed to allocate memory for the log buffer"
+        ));
     }
 }

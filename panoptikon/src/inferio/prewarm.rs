@@ -988,6 +988,7 @@ config.devices = ["3"]
                 compute_cap: Some("12.0".into()),
                 bdf: None,
                 gfx_target_version: None,
+                unified_ram_mb: None,
             },
             crate::inferio::gpu::GpuInfo {
                 index: 3,
@@ -997,6 +998,7 @@ config.devices = ["3"]
                 compute_cap: Some("12.0".into()),
                 bdf: None,
                 gfx_target_version: None,
+                unified_ram_mb: None,
             },
         ])
     }

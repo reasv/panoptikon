@@ -253,17 +253,18 @@ fn vram_budgets(config: &crate::config::VramConfig) -> super::ledger::VramBudget
 /// resolution failed outright (a validation error), and `cpu` is the label
 /// that promises the least.
 ///
-/// macOS/MPS lands on `cpu` too, for the same reason and with the same
-/// consequence: the accelerator enum has no MPS variant, so an Apple-silicon
-/// host keys its profiles as `cpu`. Harmless today — a worker that reports no
-/// CUDA/ROCm board never registers with the ledger, so nothing on such a host
-/// is ever priced, seeded or persisted — but the day MPS gets admission it
-/// needs its own label here, or a Mac's measurements and a CPU-wheel box's
-/// would share one key and describe different silicon.
+/// Apple Silicon keys as `mps`, which is the split this comment used to
+/// reserve: the wheels are the same default-PyPI ones a macOS `cpu` host
+/// installs, but the measurements are of a Metal device against a
+/// unified-memory budget and describe nothing a CPU-wheel box would measure
+/// (docs/unified-memory-admission.md, "Calibration keying summary"). Nothing
+/// on a Mac ever registered with the ledger before that design, so no
+/// existing profile changes meaning.
 fn accelerator_backend(accelerator: crate::config::Accelerator) -> &'static str {
     match accelerator {
         crate::config::Accelerator::Cuda => "cuda",
         crate::config::Accelerator::Rocm => "rocm",
+        crate::config::Accelerator::Mps => "mps",
         crate::config::Accelerator::Cpu | crate::config::Accelerator::Auto => "cpu",
     }
 }
