@@ -108,10 +108,22 @@ impl PredictOutput {
 /// pre-error-slot response gets. Present, it is the original input positions
 /// in output order, so a partial item's stored `index` stays the page/frame
 /// number it always was instead of being renumbered by the drop.
-pub(super) fn input_index(survivors: Option<&[usize]>, position: usize) -> i64 {
+///
+/// A position past the end of the map means the peer returned more surviving
+/// outputs than inputs survived — a protocol impossibility that the local
+/// orchestrator's count check already rules out, but a remote server can
+/// produce. It surfaces as an error (transient, never persisted) rather than
+/// falling back to the raw position, which would silently attribute the
+/// output to whatever frame happens to live at that index.
+pub(super) fn input_index(survivors: Option<&[usize]>, position: usize) -> ApiResult<i64> {
     match survivors {
-        Some(map) => map.get(position).copied().unwrap_or(position) as i64,
-        None => position as i64,
+        Some(map) => map.get(position).copied().map(|index| index as i64).ok_or_else(|| {
+            ApiError::internal(format!(
+                "output position {position} exceeds the {} surviving inputs",
+                map.len()
+            ))
+        }),
+        None => Ok(position as i64),
     }
 }
 

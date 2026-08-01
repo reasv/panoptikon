@@ -1427,11 +1427,11 @@ fn is_protocol_violation(err: &anyhow::Error) -> bool {
 }
 
 /// The `max_batch` an isolated retry advertises on the wire. Splitting the
-/// request locally is not isolation on its own: the dispatcher's
-/// `effective_cap` takes the *max* over the caps in its window, so a unit
-/// re-submitted while still advertising the job's chunk size can simply be
-/// merged back into a GPU batch with other requests — the exact situation the
-/// retry exists to rule out.
+/// request locally is not isolation on its own — the dispatcher merges queued
+/// requests into windows — but its admission rule treats every member's own
+/// cap as a promise about the merged batch it may ride in
+/// (`dispatch::window_take_count`), so a request advertising 1 is guaranteed
+/// a window, and therefore a worker batch, of its own.
 const ISOLATION_MAX_BATCH: u32 = 1;
 
 /// Isolation retry: re-submit `inputs` one at a time, sequentially, and

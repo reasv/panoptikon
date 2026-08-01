@@ -2719,8 +2719,8 @@ mod tests {
         }
         assert_eq!(
             recorded,
-            Some(("header".to_string(), "input".to_string(), 1, 1)),
-            "an image with no parseable header is a settled input verdict"
+            Some(("header".to_string(), "input".to_string(), 1, 2)),
+            "an unparseable header is an input verdict awaiting a later run's confirmation"
         );
 
         // A second event for the same unchanged file must not re-process it.
@@ -2740,7 +2740,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
             row(&index_db).await,
-            Some(("header".to_string(), "input".to_string(), 1, 1)),
+            Some(("header".to_string(), "input".to_string(), 1, 2)),
             "a suppressed file is not re-attempted"
         );
 

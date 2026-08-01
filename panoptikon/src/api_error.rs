@@ -167,6 +167,15 @@ impl ApiError {
         )
     }
 
+    /// The item individually exceeds a resource limit on *this machine* — a
+    /// decode memory ceiling, a classified batch-1 OOM. A verdict on the
+    /// budget rather than the payload, so it must never be `input`: it is
+    /// clearable by a retry directive after the ceiling is raised, not by
+    /// calling the file corrupt.
+    pub fn resource(detail: impl Into<String>) -> Self {
+        Self::classified(ApiErrorKind::Resource, SKIP_AFTER_CONFIRMED, detail)
+    }
+
     pub fn kind(&self) -> ApiErrorKind {
         self.kind
     }
@@ -202,22 +211,13 @@ impl ApiError {
     }
 }
 
-/// The two classification tools no gateway-native stage produces yet: the
-/// `resource` verdict comes from the GPU-compat batch-1 OOM path
-/// (`InferenceOOMError` / `INFERENCE_OOM_BATCH_SIZE_1:`, still unclassified
-/// on the dispatch side) and `with_skip_after` from a site that needs a
-/// threshold its constructor does not imply. The worker-protocol phase left
-/// both unused: a typed `input` slot is confirmed at one attempt, which
-/// `ApiError::input` already is. Kept behind their own `allow` so the wired
-/// constructors above stay lint-covered.
+/// The one classification tool no site needs yet: `with_skip_after`, for a
+/// site that needs a threshold its constructor does not imply. (`resource` is
+/// wired by the extraction-side image classifiers; the batch-1 OOM path still
+/// leaves it unclassified on the dispatch side.) Kept behind its own `allow`
+/// so the wired constructors above stay lint-covered.
 #[allow(dead_code)]
 impl ApiError {
-    /// The item individually exceeds a resource limit (classified batch-1
-    /// OOM, decode memory limit).
-    pub fn resource(detail: impl Into<String>) -> Self {
-        Self::classified(ApiErrorKind::Resource, SKIP_AFTER_CONFIRMED, detail)
-    }
-
     /// Overrides the confirmation threshold of an already-classified error.
     /// A threshold on a transient error is a caller bug: nothing persists it,
     /// so the tuning silently does nothing.

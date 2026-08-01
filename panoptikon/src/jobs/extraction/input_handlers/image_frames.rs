@@ -197,9 +197,25 @@ fn ensure_image_readable(buffer: &[u8], path: &str) -> ApiResult<()> {
         .into_dimensions()
         .map_err(|err| {
             tracing::error!(error = %err, path, "image is not readable");
-            ApiError::input(format!("Image {path} has an unreadable header: {err}"))
+            classify_image_error(err, format!("Image {path} has an unreadable header"))
         })?;
     Ok(())
+}
+
+/// The scan-side rule ([`crate::jobs::files`]'s image classifier), applied to
+/// the extraction-side image-crate stages: `Limits` is a verdict on this
+/// machine's decode budget, never on the file, so it is `resource` — settled
+/// at one attempt and clearable by a retry directive after the ceiling is
+/// raised. Everything else these stages produce is a verdict on bytes already
+/// in memory, so it stays `input` confirmed at one attempt. (The header parse
+/// runs under the image crate's default 512 MiB caps; the full decodes under
+/// the configurable `image_decode_memory_limit_mb` ceiling — filing either as
+/// `input` would mark a perfectly good file corrupt forever.)
+fn classify_image_error(err: image::ImageError, context: String) -> ApiError {
+    match err {
+        image::ImageError::Limits(_) => ApiError::resource(format!("{context}: {err}")),
+        err => ApiError::input(format!("{context}: {err}")),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -451,17 +467,17 @@ fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     if !matches!(image::guess_format(&buffer), Ok(image::ImageFormat::Gif)) {
         let image = crate::jobs::files::decode_image_bytes(&buffer).map_err(|err| {
             tracing::error!(error = %err, path, "failed to decode mis-named gif");
-            ApiError::input(format!("Failed to decode mis-named gif {path}: {err}"))
+            classify_image_error(err, format!("Failed to decode mis-named gif {path}"))
         })?;
         return Ok(vec![BaseFrame::sized_by_item(encode_jpeg(&image)?)]);
     }
     let decoder = GifDecoder::new(std::io::Cursor::new(&buffer)).map_err(|err| {
         tracing::error!(error = %err, path, "failed to decode gif");
-        ApiError::input(format!("Failed to decode gif {path}: {err}"))
+        classify_image_error(err, format!("Failed to decode gif {path}"))
     })?;
     let frames = decoder.into_frames().collect_frames().map_err(|err| {
         tracing::error!(error = %err, path, "failed to collect gif frames");
-        ApiError::input(format!("Failed to collect gif frames of {path}: {err}"))
+        classify_image_error(err, format!("Failed to collect gif frames of {path}"))
     })?;
     if frames.is_empty() {
         return Ok(Vec::new());

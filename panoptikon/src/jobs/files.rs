@@ -42,6 +42,7 @@ use crate::{
         scan_errors::{
             STAGE_DECODE, STAGE_HEADER, STAGE_METADATA, STAGE_MIME, ScanErrorRecord, ScanErrorSkip,
             fold_scan_path, list_distinct_scan_blockers, load_scan_errors_under,
+            stage_blocks_indexing,
         },
         storage::{StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail},
         system_config::{SystemConfig, SystemConfigStore},
@@ -602,13 +603,16 @@ async fn execute_folder_scan(
     let scan_time = current_iso_timestamp();
     let mut scan_ids = Vec::new();
     let mut totals = ScanTotals::default();
-    // One attempt token for the whole run. `visual_attempts.attempts` counts
-    // *runs* that saw the same conclusion and dedups on this value, but a run
+    // One attempt token for the whole run. Both ledgers' `attempts` count
+    // *runs* that saw the same conclusion and dedup on this value, but a run
     // opens one `file_scans` row per root — so identical content indexed under
-    // two roots would be counted twice by a single run, confirming a
-    // `skip_after = 2` verdict the run only saw fail once. The first root's id
-    // is a token every root of this run shares and no later run reuses.
-    let mut visuals_scan_id: Option<i64> = None;
+    // two roots (`visual_attempts`, keyed by sha), or one file walked twice
+    // because two registered roots alias on a case-insensitive filesystem
+    // (`scan_errors`, keyed by path), would be counted twice by a single run,
+    // confirming a `skip_after = 2` verdict the run only saw fail once. The
+    // first root's id is a token every root of this run shares and no later
+    // run reuses.
+    let mut attempt_scan_id: Option<i64> = None;
 
     for folder in starting_points {
         let scan_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddFileScan {
@@ -618,7 +622,7 @@ async fn execute_folder_scan(
         })
         .await?;
         scan_ids.push(scan_id);
-        let visuals_scan_id = *visuals_scan_id.get_or_insert(scan_id);
+        let attempt_scan_id = *attempt_scan_id.get_or_insert(scan_id);
 
         let excluded_paths = excluded_folders
             .iter()
@@ -632,7 +636,7 @@ async fn execute_folder_scan(
             &folder,
             &excluded_paths,
             scan_id,
-            visuals_scan_id,
+            attempt_scan_id,
             &scan_time,
             options,
         )
@@ -940,10 +944,11 @@ enum TaskOutcome {
 struct ScanContext {
     index_db: String,
     scan_id: i64,
-    /// The attempt token for every `visual_attempts` write of this *run*, which
-    /// is the first root's scan id — see [`execute_folder_scan`]. Equal to
-    /// `scan_id` for the first root, and for every single-root scan.
-    visuals_scan_id: i64,
+    /// The attempt token for every `visual_attempts` and `scan_errors` write
+    /// of this *run*, which is the first root's scan id — see
+    /// [`execute_folder_scan`]. Equal to `scan_id` for the first root, and
+    /// for every single-root scan.
+    attempt_scan_id: i64,
     scan_time: String,
     filescan_filter: Option<Arc<Match>>,
     semaphore: Arc<Semaphore>,
@@ -993,7 +998,7 @@ async fn scan_single_folder(
     folder: &str,
     excluded_paths: &[PathBuf],
     scan_id: i64,
-    visuals_scan_id: i64,
+    attempt_scan_id: i64,
     scan_time: &str,
     options: ScanOptions,
 ) -> ApiResult<FolderStats> {
@@ -1013,7 +1018,7 @@ async fn scan_single_folder(
     let mut ctx = ScanContext {
         index_db: index_db.to_string(),
         scan_id,
-        visuals_scan_id,
+        attempt_scan_id,
         scan_time: scan_time.to_string(),
         filescan_filter: parse_filescan_filter(config).map(Arc::new),
         semaphore: Arc::new(Semaphore::new(options.worker_count)),
@@ -1238,7 +1243,14 @@ impl ScanContext {
         // filescan filter, a mime guess that no longer resolves). Such a row
         // suppresses nothing that would otherwise be processed, and keeping
         // it means a filter the user narrows and widens again does not cost a
-        // full re-attempt of every broken file it swept out.
+        // full re-attempt of every broken file it swept out. That protection
+        // only reaches gates from here on: a file the walk loop filtered out
+        // *before* this point (a scan-type toggle dropping its extension, a
+        // newly excluded folder) is never marked, so its rows are swept as if
+        // the file had vanished, and re-enabling costs a fresh confirmation
+        // per broken file. Bounded and rare, so deliberately not defended —
+        // teaching the sweep the filter config is the cure worse than the
+        // disease.
         let ledger_entry = if self.scan_errors.is_empty() {
             None
         } else {
@@ -1464,12 +1476,15 @@ impl ScanContext {
             error: failure.message.clone(),
             skip_after: failure.skip_after,
         };
-        let scan_id = self.scan_id;
+        let scan_id = self.attempt_scan_id;
         if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::UpsertScanError {
                 record: record.clone(),
-                // Always the real scan: `attempts` dedups on it, and a
-                // scan-less write would stop counting across consecutive runs.
+                // The run's token, not this root's scan row: `attempts` dedups
+                // on it (a scan-less write would stop counting across runs),
+                // and two registered roots that alias the same file on a
+                // case-insensitive filesystem would otherwise let one run
+                // confirm a `skip_after = 2` verdict it only saw fail once.
                 scan_id: Some(scan_id),
                 reply,
             }
@@ -1528,6 +1543,53 @@ impl ScanContext {
         }
     }
 
+    /// The false-change disproof: a re-hash under a new mtime produced the
+    /// same sha256, so the bytes a ledger row describes are still the bytes
+    /// on disk. An audit-only row is re-keyed to the new stat and pinned
+    /// against this pass's success-side clear — without this, a touch (mtime
+    /// moved, bytes identical) deletes the audit record while the sha-keyed
+    /// `visual_attempts` marker keeps suppressing: silent suppression with
+    /// nothing on the failures surface, which is the state the audit rows
+    /// exist to prevent. A blocking-stage row is left alone: reaching the
+    /// false-change branch means the file just cleared every gate it used to
+    /// fail, so the normal success-side clear is the right outcome for it.
+    async fn rekey_audit_scan_error(&mut self, path: &str, last_modified: &str, file_size: i64) {
+        if self.scan_errors.is_empty() {
+            return;
+        }
+        let key = fold_scan_path(path);
+        let Some(entry) = self.scan_errors.get_mut(&key) else {
+            return;
+        };
+        if stage_blocks_indexing(&entry.stage) {
+            return;
+        }
+        // The in-memory copy moves with the stored row, so every later
+        // decision this run makes sees the row it just wrote.
+        entry.last_modified = last_modified.to_string();
+        entry.file_size = file_size;
+        let stored = entry.path.clone();
+        self.pinned_scan_errors.insert(key);
+        if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::RekeyScanError {
+                path: stored.clone(),
+                last_modified: last_modified.to_string(),
+                file_size,
+                reply,
+            }
+        })
+        .await
+        {
+            // Advisory, like the success-side clear: a lost rekey costs one
+            // stale-keyed audit row, never correctness.
+            tracing::warn!(
+                error = ?err,
+                path,
+                "failed to rekey an audit row after a false change"
+            );
+        }
+    }
+
     async fn handle_hashed(&mut self, hashed: HashedFile) -> ApiResult<()> {
         let HashedFile {
             path,
@@ -1547,6 +1609,10 @@ impl ScanContext {
         if existing_sha256.as_deref() == Some(sha256.as_str()) {
             // The timestamp changed but the contents did not.
             tracing::warn!(path = %path.display(), "file has a new timestamp but the same hash");
+            // Before `update_file_data` below, whose success-side clear the
+            // pin this takes has to beat.
+            self.rekey_audit_scan_error(&path_str, &last_modified, real_size)
+                .await;
             let data = FileScanData {
                 sha256: sha256.clone(),
                 last_modified,
@@ -1663,10 +1729,12 @@ impl ScanContext {
         let Some(record) = record else {
             return;
         };
-        let scan_id = self.scan_id;
+        let scan_id = self.attempt_scan_id;
         if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::UpsertScanError {
                 record: record.clone(),
+                // The run's token, for the same aliased-roots reason as every
+                // other attempt-counting write of this walker.
                 scan_id: Some(scan_id),
                 reply,
             }
@@ -1742,7 +1810,7 @@ impl ScanContext {
             return;
         }
         let records = visual_attempt_records(verdicts, sha256, mime_type);
-        let scan_id = self.visuals_scan_id;
+        let scan_id = self.attempt_scan_id;
         if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::UpsertVisualAttempts {
                 records: records.clone(),
@@ -2514,11 +2582,17 @@ impl FileProcessError {
     /// so every failure there is this machine's problem and stays transient.
     ///
     /// A header the crate cannot parse is the metadata phase's own verdict on
-    /// bytes it read successfully: nothing about the file will change until
-    /// the file does, so it is `input`, settled at one attempt, and the file
-    /// is not indexed. (Truncation is *not* this case — a truncated JPEG's
-    /// header is intact; that failure surfaces one phase later, in the
-    /// visuals, and no longer blocks indexing.)
+    /// bytes it read successfully, so it is `input` and the file is not
+    /// indexed. Not settled at one attempt, though: the parse itself is
+    /// deterministic, but the walker may have read a file another process was
+    /// still writing — a copier that preallocates the final size has the
+    /// destination at its final (path, mtime, size) key before the header
+    /// bytes exist, and a one-shot verdict would suppress the finished file
+    /// forever. The ambiguity is in the bytes read, not the reader, and it is
+    /// the same mid-flight ambiguity that gives every stage doing its own
+    /// file I/O `SKIP_AFTER_AMBIGUOUS`. (Truncation is *not* the header case —
+    /// a truncated JPEG's header is intact; that failure surfaces one phase
+    /// later, in the visuals, and no longer blocks indexing.)
     ///
     /// The decode arm survives for the ledger's benefit rather than the
     /// metadata phase's: since the un-fusing, no caller reaches it from a
@@ -2547,7 +2621,9 @@ impl FileProcessError {
                     message: limit_err.to_string(),
                 })
             }
-            (ImageStage::Header, err) => ScanFailure::input(STAGE_HEADER, err.to_string()),
+            (ImageStage::Header, err) => {
+                ScanFailure::input_unconfirmed(STAGE_HEADER, err.to_string())
+            }
             (ImageStage::Decode, image::ImageError::Limits(limit_err)) => {
                 FileProcessError::Classified(ScanFailure {
                     stage: STAGE_DECODE,
@@ -5047,10 +5123,10 @@ LIMIT 1
         );
 
         // First pass: the folder update scans the new folder and the file
-        // fails there. A header verdict is settled by that one failure —
-        // nothing was decoded, so there is no mid-read mount drop to confuse
-        // it with — so the full rescan this same call performs afterwards
-        // already skips the file, and the count stays at one.
+        // fails there once. A header verdict is ambiguous — the walker may
+        // have read a file another process was still writing — so it takes a
+        // second run to confirm, and the full rescan this same call performs
+        // afterwards is that second run: two attempts, confirmed.
         service.rescan_folders().await.unwrap();
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let rows = scan_error_rows(&mut conn).await;
@@ -5068,11 +5144,11 @@ LIMIT 1
                 broken_path.as_str(),
                 STAGE_HEADER,
                 "input",
-                1,
-                SKIP_AFTER_CONFIRMED,
+                2,
+                SKIP_AFTER_AMBIGUOUS,
                 Some("image/png")
             ),
-            "an unparseable header is a settled input verdict, recorded with its format"
+            "an unparseable header is an input verdict confirmed by the second run"
         );
         // The retry key is the *stat* pair, not the byte count the hasher
         // read: the continuous scan only ever has a stat, so a batch failure
@@ -5102,7 +5178,7 @@ LIMIT 1
         service.rescan_folders().await.unwrap();
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let rows = scan_error_rows(&mut conn).await;
-        assert_eq!((rows.len(), rows[0].3), (1, 1), "no re-attempt: {rows:?}");
+        assert_eq!((rows.len(), rows[0].3), (1, 2), "no re-attempt: {rows:?}");
         let (_, _, _, errors, marked) = latest_scan_record(&mut conn).await;
         assert_eq!(
             (errors, marked),
@@ -5832,6 +5908,84 @@ LIMIT 1
         );
     }
 
+    // The other side of the retry key's job: a *false* change (mtime moved,
+    // bytes identical — a backup restore, a `touch`) must not spend the audit
+    // row. The re-hash proves the bytes did not move, the sha-keyed marker
+    // keeps suppressing regardless of mtime, and clearing the row on the stat
+    // proxy would leave that suppression with no record on the failures
+    // surface. The row follows the stat instead, counters intact.
+    #[tokio::test]
+    async fn a_touched_undecodable_image_keeps_its_audit_row() {
+        let test_env = test_data_dir();
+        let root = test_env.path();
+        let index_db = next_db_name();
+        let user_data_db = next_db_name();
+        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+            .await
+            .unwrap();
+
+        let media_dir = root.join("media-audit-touched");
+        fs::create_dir_all(&media_dir).unwrap();
+        let corrupt = media_dir.join("corrupt.png");
+        write_undecodable_png(&corrupt, 0.6);
+
+        let store = SystemConfigStore::new(root.to_path_buf());
+        let mut config = SystemConfig::default();
+        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+        let scan = || {
+            execute_folder_scan(
+                &index_db,
+                &user_data_db,
+                &config,
+                &config.included_folders,
+                &[],
+                ScanOptions { worker_count: 2 },
+            )
+        };
+
+        // Two runs confirm the verdict on both ledgers.
+        scan().await.unwrap();
+        scan().await.unwrap();
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let before = scan_error_keys(&mut conn).await;
+        assert_eq!((before.len(), before[0].1), (1, 2), "{before:?}");
+        drop(conn);
+
+        // Same bytes, new mtime.
+        let mtime = fs::metadata(&corrupt).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&corrupt)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_secs(10))
+            .unwrap();
+        let (_, totals) = scan().await.unwrap();
+        assert_eq!(
+            (totals.modified_files, totals.known_bad),
+            (0, 0),
+            "a touch is neither a modification nor a suppressed skip"
+        );
+
+        let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
+        let after = scan_error_keys(&mut conn).await;
+        assert_eq!(after.len(), 1, "the audit row survived the touch: {after:?}");
+        assert_eq!(after[0].0, before[0].0);
+        assert_eq!(
+            after[0].1, 2,
+            "nothing was attempted, so nothing was learned: the count stands"
+        );
+        assert_ne!(after[0].2, before[0].2, "the key follows the mtime");
+        assert_eq!(after[0].3, before[0].3, "the bytes did not move");
+        let marker: (i64,) = sqlx::query_as(
+            "SELECT attempts FROM storage.visual_attempts WHERE kind = 'thumbnail'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(marker.0, 2, "the sha-keyed marker never noticed the mtime");
+    }
+
     // Markers for content that left the index are swept with the blobs — but
     // their count must stay out of the "something was deleted" flag, which is
     // what gates the post-job VACUUM. A handful of marker rows must never
@@ -6151,6 +6305,41 @@ LIMIT 1
                 *token,
                 Some(scan_ids[0]),
                 "every write of this run shares its first root's scan id ({sha256})"
+            );
+        }
+    }
+
+    // The scan ledger's twin of the marker test above: `scan_errors.attempts`
+    // dedups on the same run-shared token. The path key makes the aliasing
+    // case harder to hit than the content-keyed markers (it takes two
+    // registered roots that name the same file, e.g. case-drifted roots on
+    // Windows), but the invariant is the same — one run must never be able to
+    // count itself twice, whatever the walk order — and the token is what
+    // pins it.
+    #[tokio::test]
+    async fn scan_error_writes_share_one_attempt_token_per_run() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-tok-a", "media-tok-b"]).await;
+        for dir in &env.media_dirs {
+            fs::write(dir.join("broken.png"), b"not a png at all").unwrap();
+        }
+
+        let (scan_ids, _) = env.scan().await;
+        assert_eq!(scan_ids.len(), 2, "one scan row per root is the premise");
+
+        let mut conn = env.read().await;
+        let rows: Vec<(String, i64, Option<i64>)> =
+            sqlx::query_as("SELECT path, attempts, last_scan_id FROM scan_errors ORDER BY path")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 2, "one row per broken path: {rows:?}");
+        for (path, attempts, token) in &rows {
+            assert_eq!(*attempts, 1, "one run, one attempt ({path})");
+            assert_eq!(
+                *token,
+                Some(scan_ids[0]),
+                "every ledger write of this run shares its first root's scan id ({path})"
             );
         }
     }
@@ -6646,9 +6835,10 @@ LIMIT 1
 
         // Bytes that were read fine and describe no image at all: the metadata
         // phase's own verdict on the payload, and the one image failure that
-        // still keeps a file out of the index. Settled at one attempt — no
-        // pixel data was touched, so there is nothing for a mid-read mount
-        // drop to be confused with.
+        // still keeps a file out of the index. Ambiguous, not settled at one
+        // attempt: the walker may have read a file mid-copy (a preallocated
+        // destination sits at its final stat key before its bytes exist), so a
+        // one-shot verdict could suppress the finished file forever.
         let garbage = dir.path().join("garbage.png");
         fs::write(&garbage, b"definitely not an image").unwrap();
         let (stage, err) = image_header_dimensions(&garbage)
@@ -6659,7 +6849,7 @@ LIMIT 1
         let failure = err.classified().expect("a header failure is recorded");
         assert_eq!(failure.stage, STAGE_HEADER);
         assert_eq!(failure.kind, ApiErrorKind::Input);
-        assert_eq!(failure.skip_after, SKIP_AFTER_CONFIRMED);
+        assert_eq!(failure.skip_after, SKIP_AFTER_AMBIGUOUS);
 
         // The decode stage still classifies as the ambiguous input class
         // wherever it reaches the ledger: a decoder that reads as it goes

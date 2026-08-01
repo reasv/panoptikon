@@ -49,7 +49,7 @@ pub(super) async fn handle_text_output(
             .map(|s| s.to_string());
         let language_confidence = value.get("language_confidence").and_then(Value::as_f64);
         entries.push(TextEntry {
-            index: input_index(survivors, position),
+            index: input_index(survivors, position)?,
             text: transcription,
             language,
             language_confidence,

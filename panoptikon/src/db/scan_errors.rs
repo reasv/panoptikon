@@ -447,6 +447,36 @@ pub(crate) async fn delete_scan_error(
     Ok(result.rows_affected())
 }
 
+/// Moves a row's retry key to a new `(last_modified, file_size)` without
+/// touching its verdict or its counters.
+///
+/// For the false-change path only: the walker re-hashed a file whose mtime
+/// moved and got the same sha256 back, which *proves* the bytes the row
+/// describes are still the bytes on disk. An audit-only row must follow the
+/// stat rather than be cleared by it — its sha-keyed `visual_attempts` marker
+/// is untouched by an mtime change, and deleting the audit row here would
+/// leave that marker suppressing with no record on the failures surface.
+/// Attempts are deliberately preserved: nothing was attempted, so nothing was
+/// learned in either direction.
+pub(crate) async fn rekey_scan_error(
+    conn: &mut sqlx::SqliteConnection,
+    path: &str,
+    last_modified: &str,
+    file_size: i64,
+) -> ApiResult<u64> {
+    let result = sqlx::query("UPDATE scan_errors SET last_modified = ?, file_size = ? WHERE path = ?")
+        .bind(last_modified)
+        .bind(file_size)
+        .bind(path)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, path, "failed to rekey scan error");
+            ApiError::internal("Failed to rekey scan failure")
+        })?;
+    Ok(result.rows_affected())
+}
+
 /// The end-of-root sweep: rows whose path the walk never reached (the file is
 /// gone, moved, excluded, or no longer has a scanned extension). One statement
 /// instead of a delete per path, because this runs inside a write transaction

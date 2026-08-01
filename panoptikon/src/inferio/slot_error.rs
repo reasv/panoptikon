@@ -88,6 +88,13 @@ impl std::fmt::Display for SlotError {
 /// to tell it apart from an ordinary failure and skip the retries that only
 /// make sense for non-deterministic ones (an isolation pass re-submitting the
 /// same inputs to the same broken server buys nothing but GPU time).
+///
+/// The typing does not survive every hop, though. It fires when the client's
+/// own response parsing detects the violation (the remote-server case); a
+/// violation the *local orchestrator* detects on the msgpack hop kills the
+/// worker and surfaces through the HTTP layer as a generic 500, which callers
+/// cannot downcast — those take the bounded isolation pass anyway. Best
+/// effort, not a cross-hop guarantee.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolViolation {
     pub message: String,

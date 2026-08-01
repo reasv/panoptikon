@@ -24,7 +24,7 @@ pub(super) async fn handle_clip_output(
             for (position, buffer) in buffers.iter().enumerate() {
                 let embedding = parse_npy_to_f32(buffer)?;
                 entries.push(EmbeddingEntry {
-                    index: input_index(survivors, position),
+                    index: input_index(survivors, position)?,
                     embedding: serialize_f32(&embedding),
                 });
             }
@@ -33,7 +33,7 @@ pub(super) async fn handle_clip_output(
             for (position, value) in values.iter().enumerate() {
                 let embedding = parse_embedding_json(value)?;
                 entries.push(EmbeddingEntry {
-                    index: input_index(survivors, position),
+                    index: input_index(survivors, position)?,
                     embedding: serialize_f32(&embedding),
                 });
             }

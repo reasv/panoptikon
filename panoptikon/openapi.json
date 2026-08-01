@@ -3438,7 +3438,7 @@
           {
             "name": "stage",
             "in": "query",
-            "description": "`mime`, `metadata` or `decode`.",
+            "description": "`mime`, `metadata`, `header` or `decode`.",
             "required": false,
             "schema": {
               "type": [

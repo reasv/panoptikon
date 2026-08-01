@@ -659,7 +659,7 @@ pub(crate) struct ScanFailuresQuery {
     /// `input`, `blocked` or `resource`. Anything else is a 400.
     #[param(nullable)]
     error_class: Option<String>,
-    /// `mime`, `metadata` or `decode`.
+    /// `mime`, `metadata`, `header` or `decode`.
     #[param(nullable)]
     stage: Option<String>,
     /// Prefix of the recorded mime type, e.g. `image/`. Rows whose mime guess

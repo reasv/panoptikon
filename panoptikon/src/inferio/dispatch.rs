@@ -167,13 +167,30 @@ pub(crate) fn effective_cap(
 /// merged batch: take requests in order while the running total of work
 /// units stays <= cap, but always take at least the first request (an
 /// oversized first request is taken alone and split by the caller).
-pub(crate) fn window_take_count(unit_counts: &[usize], cap: usize) -> usize {
+///
+/// Each request is `(unit_count, explicit_cap)`. A request's own cap is a
+/// promise about the merged batch it may ride in, so admission also respects
+/// the *smallest* explicit cap among the members and the candidate — the
+/// window-wide `cap` is the max over the queue (see [`effective_cap`]) and
+/// would otherwise let a large request's opinion override a small one's.
+/// This is what makes an isolation retry's `max_batch = 1` actually isolate:
+/// queued behind (or ahead of) a job chunk advertising the job's batch size,
+/// the retry is never merged into that chunk's GPU batch. Cap-less requests
+/// contribute no opinion, exactly as in [`effective_cap`].
+pub(crate) fn window_take_count(requests: &[(usize, Option<u32>)], cap: usize) -> usize {
     let mut taken = 0usize;
     let mut units = 0usize;
-    for &count in unit_counts {
-        if taken == 0 || units + count <= cap {
+    let mut member_cap = cap;
+    for &(count, explicit) in requests {
+        let admit_cap = match explicit {
+            // Non-positive caps carry no opinion, as in `effective_cap`.
+            Some(request_cap) if request_cap > 0 => member_cap.min(request_cap as usize),
+            _ => member_cap,
+        };
+        if taken == 0 || units + count <= admit_cap {
             taken += 1;
             units += count;
+            member_cap = admit_cap;
         } else {
             break;
         }
@@ -227,8 +244,10 @@ pub(crate) async fn run_dispatcher(
                 ctx.registry_default_batch,
                 ctx.server_default_batch,
             );
-            let unit_counts: Vec<usize> =
-                queue.iter().map(|request| request.inputs.len()).collect();
+            let unit_counts: Vec<(usize, Option<u32>)> = queue
+                .iter()
+                .map(|request| (request.inputs.len(), request.max_batch))
+                .collect();
             let take = window_take_count(&unit_counts, cap);
             let window: Vec<DispatchRequest> = queue.drain(..take).collect();
             let worker = free.pop().expect("checked non-empty");
@@ -619,17 +638,17 @@ mod tests {
     fn window_take_is_fifo_prefix_only() {
         // cap 8: 3 + 4 fit (7), the next 2 would exceed -> take 2, even
         // though the trailing 1-unit request would still fit.
-        assert_eq!(window_take_count(&[3, 4, 2, 1], 8), 2);
+        assert_eq!(window_take_count(&capless(&[3, 4, 2, 1]), 8), 2);
         // All fit exactly.
-        assert_eq!(window_take_count(&[2, 3, 3], 8), 3);
+        assert_eq!(window_take_count(&capless(&[2, 3, 3]), 8), 3);
     }
 
     /// At-least-one guarantee: a first request larger than the cap is taken
     /// alone (the dispatcher splits it into sub-batches); it never starves.
     #[test]
     fn oversized_first_request_taken_alone() {
-        assert_eq!(window_take_count(&[100, 1], 8), 1);
-        assert_eq!(window_take_count(&[100], 8), 1);
+        assert_eq!(window_take_count(&capless(&[100, 1]), 8), 1);
+        assert_eq!(window_take_count(&capless(&[100]), 8), 1);
     }
 
     /// Zero-unit requests merge trivially and an empty window takes
@@ -637,8 +656,36 @@ mod tests {
     /// function must not panic or loop).
     #[test]
     fn window_take_edge_cases() {
-        assert_eq!(window_take_count(&[], 8), 0);
-        assert_eq!(window_take_count(&[0, 0, 3], 3), 3);
+        assert_eq!(window_take_count(&capless(&[]), 8), 0);
+        assert_eq!(window_take_count(&capless(&[0, 0, 3]), 3), 3);
+    }
+
+    fn capless(unit_counts: &[usize]) -> Vec<(usize, Option<u32>)> {
+        unit_counts.iter().map(|&count| (count, None)).collect()
+    }
+
+    /// A request's own `max_batch` is a promise about the merged batch it may
+    /// ride in, whichever side of the merge it sits on. The window-wide cap
+    /// is the *max* over the queue, so without member-cap admission an
+    /// isolation retry advertising `max_batch = 1` behind (or ahead of) a job
+    /// chunk advertising 8 would be merged straight back into a GPU batch —
+    /// the exact situation the retry exists to rule out.
+    #[test]
+    fn a_capped_request_is_never_merged_beyond_its_own_cap() {
+        // The isolated unit queued behind a chunk: the chunk is taken, the
+        // unit waits for its own window.
+        assert_eq!(window_take_count(&[(7, Some(8)), (1, Some(1))], 8), 1);
+        // And queued ahead of one: taken alone, the chunk must not join it.
+        assert_eq!(window_take_count(&[(1, Some(1)), (7, Some(8))], 8), 1);
+        // Two isolated units do not merge with each other either.
+        assert_eq!(window_take_count(&[(1, Some(1)), (1, Some(1))], 8), 1);
+        // Same-cap chunks still merge as before.
+        assert_eq!(window_take_count(&[(3, Some(8)), (4, Some(8))], 8), 2);
+        // A cap-less request (a search single) carries no opinion, but the
+        // capped member's promise still bounds the merge.
+        assert_eq!(window_take_count(&[(1, Some(1)), (1, None)], 8), 1);
+        // Non-positive caps carry no opinion, mirroring `effective_cap`.
+        assert_eq!(window_take_count(&[(2, Some(0)), (3, None)], 8), 2);
     }
 
     /// Splitting a merged window's outputs stays aligned when some slots are

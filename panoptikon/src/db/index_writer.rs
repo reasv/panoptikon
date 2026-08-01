@@ -41,7 +41,7 @@ use crate::db::{
     open_index_db_read_no_user_data, open_index_db_write_no_user_data,
     scan_errors::{
         ScanErrorRecord, delete_blocked_scan_errors, delete_scan_error, delete_scan_errors,
-        upsert_scan_error,
+        rekey_scan_error, upsert_scan_error,
     },
     storage::{
         StoredImage, delete_orphaned_frames, delete_orphaned_thumbnails,
@@ -256,6 +256,15 @@ pub(crate) enum IndexDbWriterMessage {
     /// Success path: the scan can process this path after all.
     DeleteScanError {
         path: String,
+        reply: Reply<u64>,
+    },
+    /// False-change path: the bytes provably did not move (same sha256 under
+    /// a new mtime), so an audit-only row follows the stat instead of being
+    /// cleared by it. Verdict and counters stay put.
+    RekeyScanError {
+        path: String,
+        last_modified: String,
+        file_size: i64,
         reply: Reply<u64>,
     },
     /// End-of-root sweep: rows the walk never reached, in one statement.
@@ -927,6 +936,21 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move { delete_scan_error(conn, &path).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::RekeyScanError {
+                path,
+                last_modified,
+                file_size,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            rekey_scan_error(conn, &path, &last_modified, file_size).await
+                        })
                     })
                     .await;
                 let _ = reply.send(result);
