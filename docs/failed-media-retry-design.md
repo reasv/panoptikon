@@ -277,16 +277,23 @@ Two layers:
 inferio predict protocol currently returns exactly one output per input or
 fails the whole roundtrip (`worker.rs:433`). Extend the protocol (we own
 it; explicitly changeable per the port's design constraints): an output slot
-may be an error object `{error: {class: "input"|..., message}}` instead of a
-payload. On the Python side, the natural seam is the shared deserialization
-helper (`inferio/impl/utils.py` — where PIL opens the bytes): catch
+may be an error object
+`{"__error__": {"class": "input"|"transient", "message": ...}}` instead of a
+payload (as implemented; wire format and compatibility rules in
+`docs/inferio-worker-protocol.md`). On the Python side, the natural seam is
+the shared deserialization helper (`inferio/impl/utils.py` — where PIL opens the bytes): catch
 `UnidentifiedImageError`/decode `OSError` per item *before* the batch is
 assembled, exclude the item from the tensor batch, and emit an error slot.
 This fixes batch poisoning at the root — a corrupt item can no longer take
 healthy batch-mates down — and makes PIL-with-truncation-enabled the image
 arbiter, satisfying parity by construction. Worker impls that decode
 somewhere other than the shared helper need a one-time audit; any that
-slip through are covered by layer 2.
+slip through are covered by layer 2. (Audit outcome: every image impl now
+routes through the shared seam. The audio impls — `clap`, `whisper` — do not:
+they deserialize an npy buffer the *gateway* produced with ffmpeg, so a
+failure there is a gateway-side verdict, not the worker's. `danbooru` and the
+saucenao impls are the mutable-source extractors this design lists as a
+non-goal, and `sentence_transformers` decodes nothing.)
 
 **Granularity caveat — text-entity models.** For a text-entity model a
 per-item worker verdict is really a verdict on one *data row* (one extracted
@@ -308,6 +315,39 @@ stays `transient` (counted, retried next run). No isolation result is ever
 promoted to `input` by pattern-matching exception text: unclassified means
 transient, so the system can never be stricter than the pipeline (req 1),
 merely slower to learn.
+
+*Where layer 2 actually applies (found while implementing).* Extraction never
+puts two **items** in one predict call: each item task chunks its own work
+units by the job's batch size and issues one request per chunk. Cross-item
+merging happens one layer down, in the local orchestrator's dispatcher, which
+already implements exactly this fallback (a merged window that fails with a
+per-request `WorkerError` is retried request by request — `dispatch.rs`), so
+an item never loses its batch-mates' work to a neighbour's bad file. What was
+missing is the level below: one item's chunk of many units (video frames, PDF
+pages). That is where the implemented isolation retry sits — a failed
+multi-unit chunk re-submits its units one at a time, once, and a unit that
+still fails alone fails the whole item transiently rather than writing partial
+data (an unclassified failure leaves the item selectable, so it is reprocessed
+in full next run).
+
+*Partial typed failures.* **All-`input` partials proceed**: an item where only
+some inputs came back as typed slots, *and every one of those slots is class
+`input`*, is processed with the outputs that succeeded — the verdict has to be
+about the item's media, and media that partially decodes is processable media.
+A `transient` slot is not a verdict at all, so a single one anywhere in the
+response (partial or not) fails the whole item transiently: proceeding would
+mark the item processed and permanently lose the unit the worker asked us to
+retry. Class is therefore decided before arity. Only an item whose inputs
+*all* failed with class `input` earns a ledger row (stage `inference`,
+`skip_after 1` — the worker decoded bytes it already held).
+
+The excluded units of a proceeding item are logged, counted nowhere, and never
+persisted, and that is deliberate rather than a gap: the item *is* processed,
+so there is no ledger row to attach a unit-level failure to and no counter it
+could increment without lying about the item's outcome — the log line (path,
+sha256, input index) is the whole record. Note also that the surviving outputs
+keep their *original* input positions, so a dropped frame leaves a gap in
+`item_data.idx` instead of renumbering its successors.
 
 Gateway-native prepare stages classify directly (they are the pipeline):
 

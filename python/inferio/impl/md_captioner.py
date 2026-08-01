@@ -5,7 +5,13 @@ from typing import List, Sequence, Type
 
 from PIL import Image as PILImage
 
-from inferio.impl.utils import clean_whitespace, clear_cache, get_device, load_image_from_buffer
+from inferio.impl.utils import (
+    assemble_slots,
+    clean_whitespace,
+    clear_cache,
+    decode_image_inputs,
+    get_device,
+)
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 
@@ -82,14 +88,11 @@ class MoondreamCaptioner(InferenceModel):
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
-        image_inputs: List[PILImage.Image] = []
-        configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
-        for input_item in inputs:
-            if input_item.file:
-                image: PILImage.Image = load_image_from_buffer(input_item.file)
-                image_inputs.append(image)
-            else:
-                raise ValueError("Moondream requires image inputs.")
+        # Undecodable payloads are excluded before anything is encoded and
+        # come back as error slots (docs/inferio-worker-protocol.md).
+        image_inputs, kept, slots = decode_image_inputs(
+            inputs, what="Moondream", logger=logger
+        )
 
         results: List[str] = []
         for image in image_inputs:
@@ -115,7 +118,7 @@ class MoondreamCaptioner(InferenceModel):
         ), "Mismatch in input and output."
 
         outputs: List[dict] = []
-        for file_text, config in zip(results, configs):
+        for file_text in results:
             file_text = file_text.strip()
             file_text = clean_whitespace(file_text)
             outputs.append(
@@ -127,11 +130,7 @@ class MoondreamCaptioner(InferenceModel):
                 }
             )
 
-        assert len(outputs) == len(
-            inputs
-        ), f"Expected {len(inputs)} outputs but got {len(outputs)}"
-
-        return outputs
+        return assemble_slots(len(inputs), kept, outputs, slots)
 
     def unload(self) -> None:
         if self._model_loaded:

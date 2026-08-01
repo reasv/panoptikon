@@ -6,10 +6,11 @@ import numpy as np
 from PIL import Image as PILImage
 from inferio.impl.utils import (
     InferenceOOMError,
+    assemble_slots,
     clean_whitespace,
     clear_cache,
+    decode_image_inputs,
     get_device,
-    load_image_from_buffer,
     run_with_oom_retry,
 )
 from inferio.model import InferenceModel
@@ -97,14 +98,13 @@ class EasyOCRModel(InferenceModel):
         outputs: List[dict] = []
         configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
         
-        # Collect all images
-        image_inputs: List[np.ndarray] = []
-        for input_item in inputs:
-            if input_item.file:
-                image = load_image_from_buffer(input_item.file)
-                image_inputs.append(np.array(image))
-            else:
-                raise ValueError("OCR requires image inputs.")
+        # Collect all images. Undecodable payloads are excluded here, before
+        # the batch is assembled, and come back as error slots
+        # (docs/inferio-worker-protocol.md).
+        images, kept, slots = decode_image_inputs(
+            inputs, what="OCR", logger=logger
+        )
+        image_inputs: List[np.ndarray] = [np.array(image) for image in images]
         
         # Check if we need to pad images
         heights = [img.shape[0] for img in image_inputs]
@@ -116,11 +116,13 @@ class EasyOCRModel(InferenceModel):
         if (len(set(heights)) > 1 or len(set(widths)) > 1) and use_batched:
             image_inputs = pad_images_to_same_size(image_inputs)
         
-        # Extract batch parameters from configs
+        # Extract batch parameters from configs. The batch is the *kept*
+        # inputs, so its first config is `configs[kept[0]]` — reading
+        # `configs[0]` would apply a rejected input's settings to the batch
+        # that never contained it.
         batch_params = {}
-        if configs and len(configs) > 0:
-            # Use parameters from the first config if available
-            first_config = configs[0]
+        if kept:
+            first_config = configs[kept[0]]
             for param in ['decoder', 'beamWidth', 'batch_size', 'workers', 'allowlist', 
                           'blocklist', 'detail', 'rotation_info', 'paragraph', 'min_size',
                           'contrast_ths', 'adjust_contrast', 'filter_ths', 'text_threshold',
@@ -159,7 +161,8 @@ class EasyOCRModel(InferenceModel):
                 batch_results.append(result)
         
         # Process results for each image
-        for result, config in zip(batch_results, configs):
+        for result, index in zip(batch_results, kept):
+            config = configs[index]
             threshold = config.get("threshold", None)
             assert (
                 isinstance(threshold, float) or threshold is None
@@ -233,11 +236,7 @@ class EasyOCRModel(InferenceModel):
                 "language_confidence": 1,  # EasyOCR doesn't provide language confidence
             })
         
-        assert len(outputs) == len(
-            inputs
-        ), f"Expected {len(inputs)} outputs but got {len(outputs)}"
-        
-        return outputs
+        return assemble_slots(len(inputs), kept, outputs, slots)
 
     def unload(self) -> None:
         if self._model_loaded:

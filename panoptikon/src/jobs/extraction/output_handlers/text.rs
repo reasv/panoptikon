@@ -7,19 +7,25 @@ use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::inferio_client::PredictOutput;
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
 
-use super::OutputDisposition;
+use super::{OutputDisposition, input_index};
 
+/// The stored `index` is the *input's* position (the frame/page the text was
+/// read from), taken from the survivor map rather than the enumeration of the
+/// outputs: a rejected input must leave a gap, not shift its successors. The
+/// dedup/length filters below already produce gaps, so downstream consumers
+/// tolerate them by construction.
 pub(super) async fn handle_text_output(
     index_db: &str,
     model: &ModelMetadata,
     job_id: i64,
     item: &JobInputData,
     outputs: PredictOutput,
+    survivors: Option<&[usize]>,
 ) -> ApiResult<OutputDisposition> {
     let values = outputs.into_json("text")?;
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
-    for (idx, value) in values.iter().enumerate() {
+    for (position, value) in values.iter().enumerate() {
         let transcription = value
             .get("transcription")
             .and_then(Value::as_str)
@@ -43,7 +49,7 @@ pub(super) async fn handle_text_output(
             .map(|s| s.to_string());
         let language_confidence = value.get("language_confidence").and_then(Value::as_f64);
         entries.push(TextEntry {
-            index: idx as i64,
+            index: input_index(survivors, position),
             text: transcription,
             language,
             language_confidence,

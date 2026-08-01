@@ -6,10 +6,11 @@ import numpy as np
 from PIL import Image as PILImage
 
 from inferio.impl.utils import (
+    assemble_slots,
     clean_whitespace,
     clear_cache,
+    decode_image_inputs,
     get_device,
-    load_image_from_buffer,
     run_with_oom_retry,
     select_dtype,
 )
@@ -64,14 +65,11 @@ class DoctrModel(InferenceModel):
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
-        image_inputs: List[np.ndarray] = []
         configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
-        for input_item in inputs:
-            if input_item.file:
-                image: PILImage.Image = load_image_from_buffer(input_item.file)
-                image_inputs.append((np.array(image)))
-            else:
-                raise ValueError("OCR requires image inputs.")
+        # Undecodable payloads are excluded before the batch is assembled and
+        # come back as error slots (docs/inferio-worker-protocol.md).
+        images, kept, slots = decode_image_inputs(inputs, what="OCR")
+        image_inputs: List[np.ndarray] = [np.array(image) for image in images]
 
         pages = run_with_oom_retry(
             lambda chunk: list(self.model(list(chunk)).pages), image_inputs
@@ -82,7 +80,8 @@ class DoctrModel(InferenceModel):
         ), "Mismatch in input and output."
 
         outputs: List[dict] = []
-        for page, config in zip(pages, configs):
+        for page, index in zip(pages, kept):
+            config = configs[index]
             threshold = config.get("threshold", None)
             assert (
                 isinstance(threshold, float) or threshold is None
@@ -122,11 +121,7 @@ class DoctrModel(InferenceModel):
                 }
             )
 
-        assert len(outputs) == len(
-            inputs
-        ), f"Expected {len(inputs)} outputs but got {len(outputs)}"
-
-        return outputs
+        return assemble_slots(len(inputs), kept, outputs, slots)
 
     def unload(self) -> None:
         if self._model_loaded:

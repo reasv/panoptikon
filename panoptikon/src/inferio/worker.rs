@@ -47,6 +47,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 use super::registry::SpawnSpec;
+use super::slot_error::{ERROR_SLOT_KEY, SlotError, slot_error_from_parts};
 use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_process_group};
 
 /// Protocol version this orchestrator speaks; workers answering anything
@@ -130,11 +131,15 @@ pub struct WorkerInput {
 }
 
 /// One entry of a `predict` response: msgpack bin stays bytes (serialized
-/// numpy etc.), anything else is converted to JSON.
+/// numpy etc.), anything else is converted to JSON — except a map carrying
+/// the reserved [`ERROR_SLOT_KEY`], which is a typed per-input failure
+/// ([`WorkerOutput::Error`]) rather than a payload.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkerOutput {
     Bytes(Vec<u8>),
     Json(JsonValue),
+    /// This input failed on its own; the rest of the batch is unaffected.
+    Error(SlotError),
 }
 
 /// A per-request failure reported by a live worker (`error` frame). The
@@ -430,6 +435,12 @@ impl Worker {
     /// Send `predict` with the given inputs and return one output per input,
     /// in order. No deadline in v1 (models take arbitrarily long); to cancel,
     /// drop the future and `kill()` the worker.
+    ///
+    /// A slot may come back as [`WorkerOutput::Error`] — the worker's typed
+    /// verdict on *that input alone* (protocol doc, "Per-item error slots").
+    /// It is a normal, successful roundtrip: the count still has to match, so
+    /// slot alignment downstream is unchanged, and only a malformed error
+    /// object (or a wrong count) is fatal.
     pub async fn predict(&mut self, inputs: &[WorkerInput]) -> Result<Vec<WorkerOutput>> {
         let entries = inputs
             .iter()
@@ -480,28 +491,46 @@ impl Worker {
                 ))
                 .await);
         }
-        outputs
-            .into_iter()
-            .enumerate()
-            .map(|(index, output)| match output {
-                Value::Binary(bytes) => Ok(WorkerOutput::Bytes(bytes)),
-                other => rmpv_to_json(&other).map(WorkerOutput::Json).map_err(|err| {
-                    // The exchange completed and the stream is in sync — an
-                    // unconvertible output (non-finite float, nested bin/ext)
-                    // is a per-request failure, not a supervision failure.
-                    // Surface it as a WorkerError so the dispatcher applies
-                    // its per-request fallback instead of killing a healthy
-                    // worker and failing the whole queue.
-                    anyhow::Error::new(WorkerError {
-                        message: format!(
-                            "predict output {index} is not representable as JSON: {err:#}"
-                        ),
-                        traceback: String::new(),
-                        stderr_tail: self.stderr_tail_snapshot(),
-                    })
-                }),
-            })
-            .collect()
+        let mut converted = Vec::with_capacity(outputs.len());
+        for (index, output) in outputs.into_iter().enumerate() {
+            match error_slot_from_rmpv(&output) {
+                Some(Ok(error)) => converted.push(WorkerOutput::Error(error)),
+                // The reserved key with a body the protocol does not define is
+                // a violation, exactly like a count mismatch: guessing a class
+                // would let a broken worker fabricate an "undecodable media"
+                // verdict, which the ledger would then persist.
+                Some(Err(reason)) => {
+                    return Err(self
+                        .fatal(format!(
+                            "predict output {index} is a malformed error slot: {reason}"
+                        ))
+                        .await);
+                }
+                None => match output {
+                    Value::Binary(bytes) => converted.push(WorkerOutput::Bytes(bytes)),
+                    other => match rmpv_to_json(&other) {
+                        Ok(value) => converted.push(WorkerOutput::Json(value)),
+                        Err(err) => {
+                            // The exchange completed and the stream is in sync
+                            // — an unconvertible output (non-finite float,
+                            // nested bin/ext) is a per-request failure, not a
+                            // supervision failure. Surface it as a WorkerError
+                            // so the dispatcher applies its per-request
+                            // fallback instead of killing a healthy worker and
+                            // failing the whole queue.
+                            return Err(anyhow::Error::new(WorkerError {
+                                message: format!(
+                                    "predict output {index} is not representable as JSON: {err:#}"
+                                ),
+                                traceback: String::new(),
+                                stderr_tail: self.stderr_tail_snapshot(),
+                            }));
+                        }
+                    },
+                },
+            }
+        }
+        Ok(converted)
     }
 
     /// Liveness check: send `ping`, await `ok`. Bounded by the handshake
@@ -883,6 +912,24 @@ fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     map.iter()
         .find(|(k, _)| k.as_str() == Some(key))
         .map(|(_, v)| v)
+}
+
+/// Reads one msgpack output slot as a typed error (protocol doc, "Per-item
+/// error slots"). `None` means an ordinary payload; `Some(Err(..))` means the
+/// reserved key was there but the body is not a valid error object, which the
+/// caller treats as a fatal protocol violation.
+fn error_slot_from_rmpv(value: &Value) -> Option<Result<SlotError, String>> {
+    let Value::Map(entries) = value else {
+        return None;
+    };
+    let body = map_get(entries, ERROR_SLOT_KEY)?;
+    let Value::Map(body) = body else {
+        return Some(Err(format!("`{ERROR_SLOT_KEY}` is not a map: {body}")));
+    };
+    Some(slot_error_from_parts(
+        map_get(body, "class").and_then(Value::as_str),
+        map_get(body, "message").and_then(Value::as_str),
+    ))
 }
 
 fn take_field(map: &mut Vec<(Value, Value)>, key: &str) -> Option<Value> {
@@ -1271,6 +1318,152 @@ mod tests {
 
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0));
+    }
+
+    /// The msgpack half of the error-slot decoder, in isolation: only a map
+    /// carrying the reserved key is a slot error, a malformed body is
+    /// reported as a violation rather than guessed at, and ordinary payloads
+    /// (including maps with other keys) are left alone.
+    #[test]
+    fn error_slot_from_rmpv_accepts_only_the_documented_shape() {
+        let slot = Value::Map(vec![(
+            Value::from(ERROR_SLOT_KEY),
+            Value::Map(vec![
+                (Value::from("class"), Value::from("input")),
+                (Value::from("message"), Value::from("Unreadable image")),
+            ]),
+        )]);
+        assert_eq!(
+            error_slot_from_rmpv(&slot),
+            Some(Ok(SlotError {
+                class: super::super::slot_error::SlotErrorClass::Input,
+                message: "Unreadable image".to_owned(),
+            }))
+        );
+
+        for payload in [
+            Value::Binary(vec![1, 2]),
+            Value::from("text"),
+            Value::Map(vec![(Value::from("tags"), Value::from("a"))]),
+        ] {
+            assert_eq!(error_slot_from_rmpv(&payload), None, "{payload}");
+        }
+
+        for malformed in [
+            Value::Map(vec![(Value::from(ERROR_SLOT_KEY), Value::from("boom"))]),
+            Value::Map(vec![(
+                Value::from(ERROR_SLOT_KEY),
+                Value::Map(vec![(Value::from("class"), Value::from("blocked"))]),
+            )]),
+            Value::Map(vec![(
+                Value::from(ERROR_SLOT_KEY),
+                Value::Map(vec![(Value::from("class"), Value::from("input"))]),
+            )]),
+        ] {
+            assert!(
+                matches!(error_slot_from_rmpv(&malformed), Some(Err(_))),
+                "{malformed} must be rejected"
+            );
+        }
+    }
+
+    /// Per-item error slots end to end against a real worker: a batch mixing
+    /// two typed failures with healthy JSON and binary outputs comes back
+    /// with every slot in its input's position (alignment is the whole point
+    /// — a shifted slot would blame the wrong file), and the worker is still
+    /// serviceable afterwards, because an error slot is a *successful*
+    /// roundtrip, not a failure.
+    #[tokio::test]
+    async fn error_slots_decode_and_stay_aligned_with_healthy_outputs() {
+        let cfg = test_spawn_config();
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/errorslot", &spec("errorslot_test"), None)
+                .await
+                .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+
+        let inputs = [
+            WorkerInput {
+                data: Some(json!("first")),
+                file: None,
+            },
+            WorkerInput {
+                data: Some(json!("bad")),
+                file: None,
+            },
+            WorkerInput {
+                data: None,
+                file: Some(b"payload".to_vec()),
+            },
+            WorkerInput {
+                data: Some(json!("flaky")),
+                file: None,
+            },
+        ];
+        let outputs = worker.predict(&inputs).await.expect("predict ok");
+        assert_eq!(outputs.len(), inputs.len(), "one slot per input");
+        assert_eq!(outputs[0], WorkerOutput::Json(json!({"ok": "first"})));
+        assert_eq!(
+            outputs[1],
+            WorkerOutput::Error(SlotError {
+                class: super::super::slot_error::SlotErrorClass::Input,
+                message: "Unreadable image: truncated".to_owned(),
+            })
+        );
+        assert_eq!(outputs[2], WorkerOutput::Bytes(b"bytes:payload".to_vec()));
+        assert_eq!(
+            outputs[3],
+            WorkerOutput::Error(SlotError {
+                class: super::super::slot_error::SlotErrorClass::Transient,
+                message: "try again".to_owned(),
+            })
+        );
+
+        // Nothing about the worker changed: it keeps serving.
+        let outputs = worker
+            .predict(&[WorkerInput {
+                data: Some(json!("again")),
+                file: None,
+            }])
+            .await
+            .expect("worker is still serviceable");
+        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": "again"}))]);
+        let status = worker.shutdown().await.expect("graceful shutdown");
+        assert_eq!(status.code(), Some(0));
+    }
+
+    /// A slot carrying the reserved key with a body the protocol does not
+    /// define is a protocol violation, exactly like a count mismatch: the
+    /// worker is killed and poisoned rather than the class being guessed —
+    /// guessing would let a broken worker fabricate an "undecodable media"
+    /// verdict that the ledger then persists.
+    #[tokio::test]
+    async fn a_malformed_error_slot_kills_the_worker() {
+        let cfg = test_spawn_config();
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/errorslot", &spec("errorslot_test"), None)
+                .await
+                .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+
+        let err = worker
+            .predict(&[WorkerInput {
+                data: Some(json!("malformed")),
+                file: None,
+            }])
+            .await
+            .expect_err("a malformed error slot must fail the predict");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("malformed error slot"),
+            "the error names the violation: {text}"
+        );
+        assert!(
+            err.downcast_ref::<WorkerError>().is_none(),
+            "a protocol violation is fatal, not a per-request worker error"
+        );
+        let err = worker.ping().await.expect_err("the worker is poisoned");
+        assert!(format!("{err:#}").contains("dead"));
     }
 
     /// Non-finite floats and binary/ext nested inside a JSON-like output

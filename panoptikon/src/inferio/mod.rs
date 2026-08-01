@@ -5,7 +5,8 @@
 //! in the spawn handshake; workers never read TOML themselves.
 //!
 //! Layers: the registry (`registry`), worker supervision (`worker`), the
-//! model manager with dispatch-time batching (`manager` + `dispatch`), and
+//! model manager with dispatch-time batching (`manager` + `dispatch`), the
+//! wire vocabulary of typed per-item error slots (`slot_error`), and
 //! the wire-compatible HTTP surface (`http`) mounted under
 //! `/api/inference` when `[inference_local].enabled` (or via the `inferio`
 //! subcommand).
@@ -16,4 +17,5 @@ pub mod http;
 pub mod manager;
 pub mod prewarm;
 pub mod registry;
+pub mod slot_error;
 pub mod worker;

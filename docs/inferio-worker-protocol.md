@@ -1,5 +1,10 @@
 # Inferio Worker Protocol v2
 
+v2.1 (2026-08-01), additive, no version bump: `predict` output slots may
+carry a typed per-item error instead of a payload (see "Per-item error
+slots"). Absence of error slots is bit-for-bit the v2 behavior, so old
+workers and the current orchestrator interoperate unchanged.
+
 v2 (2026-07-05): handshake carries worker *identity* only (impl class); the
 new `configure` message binds a concrete model's config and instantiates.
 This is what makes prewarm pools keyable by impl class — a warm worker can
@@ -82,9 +87,66 @@ Normal spawn flow: `handshake` → `configure` → `load`. Pooled flow:
   v2 workers echo 2; the orchestrator kills workers that answer anything else.
 - `configure`, `prewarm`, `load`, `unload`, `ping` → no extra fields.
 - `predict` → `outputs`: array, one entry per input, in order. Each entry is
-  either msgpack `bin` (bytes output, e.g. serialized numpy) or any other
-  msgpack value (JSON-like output). This mirrors what impl `predict()`
-  returns today: `bytes` stay bytes, everything else is data.
+  either msgpack `bin` (bytes output, e.g. serialized numpy), an **error
+  slot** (below), or any other msgpack value (JSON-like output). This mirrors
+  what impl `predict()` returns today: `bytes` stay bytes, everything else is
+  data.
+
+### Per-item error slots (predict)
+
+An output slot may report that *its own input* failed instead of carrying a
+payload. This exists so one undecodable file can no longer take its healthy
+batch-mates down with it, and so the component that actually decodes the media
+(PIL in the worker, with `LOAD_TRUNCATED_IMAGES` on) is the one that calls it
+bad — the gateway never pre-judges media on a worker's behalf
+(`docs/failed-media-retry-design.md`).
+
+Wire shape — a map with the reserved key `__error__`:
+
+```
+{"__error__": {"class": "input" | "transient", "message": <str>}}
+```
+
+- `class` `"input"`: the worker's own decoder rejected **this input's
+  payload**. This is the only class a consumer may treat as a verdict on the
+  media. Nothing else — not OOM, not a model error, not a missing dependency
+  — may be reported this way; those keep failing the whole `predict`, which
+  is what the orchestrator retries.
+- `class` `"transient"`: this slot failed for a reason that says nothing about
+  the payload. Reserved for future worker use; consumers count and retry it
+  and never persist it. Because it is a request to retry, a consumer may not
+  keep only the batch-mates that succeeded and call the item done: one
+  `transient` slot fails the whole item transiently, even when the rest of
+  the response is fine. (An `input` slot among survivors is the opposite: it
+  is a settled verdict on that unit, so the item proceeds without it.)
+- `message`: human-readable detail, carried into logs and the failure ledger.
+
+Rules:
+
+- **The count still has to match.** An error slot occupies its input's
+  position; `outputs.len() == inputs.len()` remains a hard invariant, so slot
+  alignment (and the dispatcher's batch splitting) is unchanged.
+- **Absence is today's protocol.** A worker that never emits error slots
+  behaves exactly as before, and a gateway that receives none takes exactly
+  the old code paths. Workers and orchestrator ship from one repo, so a
+  worker emitting slots always meets an orchestrator that understands them;
+  the protocol version is not bumped for this additive shape.
+- **Malformed is fatal.** A map carrying `__error__` whose body is not an
+  object, whose `class` is missing or unknown, or whose `message` is missing
+  or not a string, is a protocol violation and is treated like a count
+  mismatch (the worker is killed). Guessing would let a broken worker
+  fabricate an "undecodable media" verdict, which the gateway persists.
+- Ordinary outputs are never inspected for this key beyond the top level: a
+  payload map without `__error__` is a payload, and nested occurrences are
+  ignored.
+
+The gateway's HTTP predict surface mirrors the same shape additively: a batch
+containing an error slot is always encoded as the JSON `{"outputs": [...]}`
+envelope (the raw/multipart binary encodings have nowhere to put a typed
+failure), where surviving binary outputs keep their
+`{"__type__": "base64", "content": ...}` wrapper and failed slots are the
+`{"__error__": {...}}` object above. Batches without error slots keep the
+byte-identical legacy encoding.
 
 ## Lifecycle and timeouts (orchestrator side)
 

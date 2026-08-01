@@ -19,6 +19,12 @@
 //!   sub-batches of <= cap and its outputs reassembled in order (the worker
 //!   never sees an oversized batch).
 //!
+//! A typed per-item error slot (`WorkerOutput::Error`, protocol doc) is an
+//! ordinary output as far as this layer is concerned: the worker still
+//! returns one slot per input, so the count-based split below keeps every
+//! slot with its own request. This layer never inspects or acts on them —
+//! only the caller that owns the item does.
+//!
 //! Failure semantics (port of process_model.py `_batch_predict`):
 //! - merged batch of more than one request fails with a per-request
 //!   [`WorkerError`] -> fall back to predicting each request individually;
@@ -417,12 +423,10 @@ async fn run_batch_inner(
     }
 
     match worker.predict(&combined).await {
-        Ok(mut outputs) => {
+        Ok(outputs) => {
             // Split outputs back per request, preserving request order.
-            for (request, count) in window.into_iter().zip(counts) {
-                let rest = outputs.split_off(count);
-                let _ = request.reply.send(Ok(outputs));
-                outputs = rest;
+            for (request, slice) in window.into_iter().zip(split_window_outputs(outputs, &counts)) {
+                let _ = request.reply.send(Ok(slice));
             }
             BatchOutcome::Continue
         }
@@ -522,6 +526,30 @@ async fn run_single(
     BatchOutcome::Continue
 }
 
+/// Cut a merged window's outputs back into one slice per request, in the
+/// order the requests were merged.
+///
+/// Purely positional, and that is the point: the worker returns exactly one
+/// slot per input whether that slot is a payload or a typed per-item error
+/// (protocol doc), so the same count-based cut keeps every error slot with
+/// the request whose input produced it. Sending someone else's error slot to
+/// a request would attach an "undecodable media" verdict to the wrong item.
+///
+/// The worker's count check (`Worker::predict`) guarantees
+/// `outputs.len() == counts.iter().sum()`, which this relies on.
+fn split_window_outputs(
+    mut outputs: Vec<WorkerOutput>,
+    counts: &[usize],
+) -> Vec<Vec<WorkerOutput>> {
+    let mut slices = Vec::with_capacity(counts.len());
+    for &count in counts {
+        let rest = outputs.split_off(count);
+        slices.push(outputs);
+        outputs = rest;
+    }
+    slices
+}
+
 /// Fail every request with a copy of the same error message (anyhow errors
 /// are not Clone; the message is what matters to the callers).
 fn fail_requests(requests: impl Iterator<Item = DispatchRequest>, message: &str) {
@@ -533,6 +561,7 @@ fn fail_requests(requests: impl Iterator<Item = DispatchRequest>, message: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// The stateless cap rule takes the max over explicit caps in the
     /// window: with explicit caps 4 and 8 queued together, the window cap
@@ -610,5 +639,64 @@ mod tests {
     fn window_take_edge_cases() {
         assert_eq!(window_take_count(&[], 8), 0);
         assert_eq!(window_take_count(&[0, 0, 3], 3), 3);
+    }
+
+    /// Splitting a merged window's outputs stays aligned when some slots are
+    /// typed per-item errors: the worker returns one slot per input either
+    /// way, so an error slot must land in the request whose input produced
+    /// it. Misalignment here would hand one item's "undecodable media"
+    /// verdict to a different item, which the extraction job persists.
+    #[test]
+    fn split_keeps_error_slots_with_their_own_request() {
+        use super::super::slot_error::{SlotError, SlotErrorClass};
+
+        let error = |message: &str| {
+            WorkerOutput::Error(SlotError {
+                class: SlotErrorClass::Input,
+                message: message.to_owned(),
+            })
+        };
+        let payload = |tag: u8| WorkerOutput::Bytes(vec![tag]);
+
+        // Window of three requests sized 1, 3, 2 — six inputs, with the
+        // global positions 0 and 4 coming back as error slots.
+        let outputs = vec![
+            error("zero"),
+            payload(1),
+            payload(2),
+            payload(3),
+            error("four"),
+            payload(5),
+        ];
+        let split = split_window_outputs(outputs, &[1, 3, 2]);
+
+        assert_eq!(split.len(), 3);
+        assert_eq!(split[0], vec![error("zero")]);
+        assert_eq!(split[1], vec![payload(1), payload(2), payload(3)]);
+        assert_eq!(split[2], vec![error("four"), payload(5)]);
+    }
+
+    /// The legacy shape (no error slots) and the degenerate ones are the
+    /// same positional cut, which is what makes the rule above additive.
+    #[test]
+    fn split_covers_the_plain_and_degenerate_shapes() {
+        let outputs = vec![
+            WorkerOutput::Json(json!(0)),
+            WorkerOutput::Json(json!(1)),
+            WorkerOutput::Json(json!(2)),
+        ];
+        assert_eq!(
+            split_window_outputs(outputs, &[2, 1]),
+            vec![
+                vec![WorkerOutput::Json(json!(0)), WorkerOutput::Json(json!(1))],
+                vec![WorkerOutput::Json(json!(2))],
+            ]
+        );
+        // A zero-unit request gets an empty slice and shifts nothing.
+        assert_eq!(
+            split_window_outputs(vec![WorkerOutput::Json(json!(0))], &[0, 1]),
+            vec![vec![], vec![WorkerOutput::Json(json!(0))]]
+        );
+        assert!(split_window_outputs(Vec::new(), &[]).is_empty());
     }
 }

@@ -1523,7 +1523,7 @@
           "inference"
         ],
         "summary": "Run a batch prediction on a model",
-        "description": "Runs a batch of inputs through a model, auto-loading it into the given cache slot first if needed. The response encoding depends on the outputs: exactly one binary output is returned raw as `application/octet-stream`; all-binary outputs use `multipart/mixed`; anything else is the JSON `{\"outputs\": [...]}` envelope.",
+        "description": "Runs a batch of inputs through a model, auto-loading it into the given cache slot first if needed. The response encoding depends on the outputs: exactly one binary output is returned raw as `application/octet-stream`; all-binary outputs use `multipart/mixed`; anything else is the JSON `{\"outputs\": [...]}` envelope. An input the model rejected on its own occupies its output slot as `{\"__error__\": {\"class\": \"input\"|\"transient\", \"message\": ...}}`, which always selects the JSON envelope.",
         "operationId": "predict",
         "parameters": [
           {
@@ -7960,7 +7960,7 @@
             "items": {
               "$ref": "#/components/schemas/Value"
             },
-            "description": "One output per input; binary outputs are wrapped as\n`{\"__type__\": \"base64\", \"content\": \"<base64>\"}`."
+            "description": "One output per input; binary outputs are wrapped as\n`{\"__type__\": \"base64\", \"content\": \"<base64>\"}`, and an input the\nmodel rejected on its own is\n`{\"__error__\": {\"class\": \"input\" | \"transient\", \"message\": \"...\"}}`."
           }
         }
       },

@@ -8,9 +8,10 @@ from PIL import Image
 from PIL import Image as PILImage
 
 from inferio.impl.utils import (
+    assemble_slots,
     clear_cache,
+    decode_image_inputs,
     get_device,
-    load_image_from_buffer,
     mcut_threshold,
     pil_ensure_rgb,
     pil_pad_square,
@@ -116,20 +117,20 @@ class WDTagger(InferenceModel):
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
-        image_inputs: List[PILImage.Image] = []
         configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
-        for input_item in inputs:
-            if input_item.file:
-                image: PILImage.Image = load_image_from_buffer(input_item.file)
-                image_inputs.append(image)
-            else:
-                raise ValueError("Tagger requires image inputs.")
+        # Undecodable payloads are excluded before the tensor batch is
+        # assembled and come back as error slots
+        # (docs/inferio-worker-protocol.md).
+        image_inputs, kept, slots = decode_image_inputs(
+            inputs, what="Tagger", logger=logger
+        )
 
         logger.debug(f"Running inference on {len(image_inputs)} images")
 
         prob_list = self.run_batch(image_inputs, 0)
         outputs: List[dict] = []
-        for probs, config in zip(prob_list, configs):
+        for probs, index in zip(prob_list, kept):
+            config = configs[index]
             general_thresh = config.get("threshold", None)
             if general_thresh == 0:
                 general_thresh = None  # Use mcut thresholding
@@ -156,7 +157,7 @@ class WDTagger(InferenceModel):
                 }
             )
 
-        return outputs
+        return assemble_slots(len(inputs), kept, outputs, slots)
 
     def run_batch(
         self,

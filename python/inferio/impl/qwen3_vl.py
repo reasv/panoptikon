@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import logging
 from typing import List, Sequence, Union
 
-from inferio.impl.utils import clear_cache, load_image_from_buffer, serialize_array
+from inferio.impl.utils import (
+    ERROR_SLOT_KEY,
+    assemble_slots,
+    clear_cache,
+    load_image_or_slot,
+    serialize_array,
+)
 from inferio.inferio_types import PredictionInput
 from inferio.model import InferenceModel
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen3VLEmbeddingModel(InferenceModel):
@@ -58,7 +67,9 @@ class Qwen3VLEmbeddingModel(InferenceModel):
         assert self.embedder is not None
 
         payloads: List[dict] = []
-        for input_item in inputs:
+        kept: List[int] = []
+        slots: List[tuple] = []
+        for idx, input_item in enumerate(inputs):
             payload: dict = {}
             if isinstance(input_item.data, dict):
                 if "text" in input_item.data:
@@ -69,16 +80,41 @@ class Qwen3VLEmbeddingModel(InferenceModel):
                     payload["image_url"] = input_item.data["image_url"]
 
             if input_item.file:
-                payload["image"] = load_image_from_buffer(input_item.file)
+                # An undecodable payload takes its own slot instead of the
+                # whole batch (docs/inferio-worker-protocol.md) — but only if
+                # it leaves nothing to embed. This model is multimodal: an
+                # input carrying text as well as a file still has a complete,
+                # embeddable payload without the image, and slotting it would
+                # throw away work the model can do (and record a verdict on
+                # an input the model did not actually fail).
+                image, slot = load_image_or_slot(input_item.file)
+                if slot is not None:
+                    if not payload:
+                        slots.append((idx, slot))
+                        continue
+                    logger.warning(
+                        "Dropping an undecodable image from input %d; "
+                        "embedding its text payload alone: %s",
+                        idx,
+                        slot[ERROR_SLOT_KEY]["message"],
+                    )
+                else:
+                    payload["image"] = image
 
             if not payload:
                 raise ValueError("Each input must provide at least 'text' and/or an image.")
 
             payloads.append(payload)
+            kept.append(idx)
 
-        embeddings = self.embedder.process(payloads)
-        embeddings_np = embeddings.detach().cpu().numpy()
-        return [serialize_array(embeddings_np[i]) for i in range(len(payloads))]
+        results: List[bytes] = []
+        if payloads:
+            embeddings = self.embedder.process(payloads)
+            embeddings_np = embeddings.detach().cpu().numpy()
+            results = [
+                serialize_array(embeddings_np[i]) for i in range(len(payloads))
+            ]
+        return assemble_slots(len(inputs), kept, results, slots)
 
     def unload(self) -> None:
         if self._model_loaded:

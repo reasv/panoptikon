@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::config::Settings;
+use crate::inferio::slot_error::{ProtocolViolation, SlotErrorClass, slot_error_from_json};
 
 #[derive(Debug, Clone)]
 pub(crate) enum InferenceFile {
@@ -36,6 +37,54 @@ impl InferenceInput {
 pub(crate) enum PredictOutput {
     Json(Vec<Value>),
     Binary(Vec<Vec<u8>>),
+}
+
+impl PredictOutput {
+    /// How many successful outputs this carries. Only ever zero when every
+    /// slot of the response was a typed error.
+    pub fn len(&self) -> usize {
+        match self {
+            PredictOutput::Json(values) => values.len(),
+            PredictOutput::Binary(values) => values.len(),
+        }
+    }
+
+    /// True when nothing succeeded, which is the one case callers must not
+    /// merge (an empty `Json` would clash with a `Binary` sibling chunk).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// One input's typed failure, carried alongside the surviving outputs
+/// (`docs/inferio-worker-protocol.md`, "Per-item error slots"). `index` is the
+/// position of the *input* it belongs to, which is not the position of any
+/// output: erroring slots are removed from `PredictResponse::outputs`, so the
+/// survivors close ranks.
+#[derive(Debug, Clone)]
+pub(crate) struct PredictSlotError {
+    pub index: usize,
+    pub class: SlotErrorClass,
+    pub message: String,
+}
+
+/// A predict response: the outputs of the inputs that succeeded, plus the
+/// typed per-slot failures of the ones that did not. `errors` is empty for
+/// every response an inference server without per-item error slots can
+/// produce, which is what keeps this backward compatible.
+#[derive(Debug)]
+pub(crate) struct PredictResponse {
+    pub outputs: PredictOutput,
+    pub errors: Vec<PredictSlotError>,
+}
+
+impl PredictResponse {
+    fn plain(outputs: PredictOutput) -> Self {
+        Self {
+            outputs,
+            errors: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +149,7 @@ impl InferenceApiClient {
         max_batch: Option<u32>,
         prewarm: Option<bool>,
         inputs: &[InferenceInput],
-    ) -> Result<PredictOutput> {
+    ) -> Result<PredictResponse> {
         let url = format!("{}/predict/{}", self.base_url, inference_id);
         let mut query: Vec<(&str, String)> = vec![
             ("cache_key", cache_key.to_string()),
@@ -360,28 +409,118 @@ fn normalize_base_url(raw: String) -> String {
 
 /// Also used by the local orchestrator's HTTP tests as the parity oracle:
 /// whatever `inferio::http` encodes must be parseable by this exact logic.
-pub(crate) fn parse_predict_response(content_type: &str, body: &[u8]) -> Result<PredictOutput> {
+///
+/// The binary encodings cannot carry a typed error slot, so only the JSON
+/// envelope is inspected for them; a malformed one is an error rather than a
+/// payload, mirroring the orchestrator's strictness on the msgpack hop.
+pub(crate) fn parse_predict_response(content_type: &str, body: &[u8]) -> Result<PredictResponse> {
     if content_type.contains("application/json") {
         let value: Value = serde_json::from_slice(body)?;
         let outputs = value
             .get("outputs")
             .and_then(|item| item.as_array())
             .context("predict response missing outputs array")?;
-        return Ok(PredictOutput::Json(outputs.to_vec()));
+        return parse_json_outputs(outputs);
     }
 
     if content_type.contains("multipart/mixed") {
         let boundary =
             extract_boundary(content_type).context("multipart response missing boundary")?;
         let outputs = parse_multipart_outputs(body, &boundary)?;
-        return Ok(PredictOutput::Binary(outputs));
+        return Ok(PredictResponse::plain(PredictOutput::Binary(outputs)));
     }
 
     if content_type.contains("application/octet-stream") {
-        return Ok(PredictOutput::Binary(vec![body.to_vec()]));
+        return Ok(PredictResponse::plain(PredictOutput::Binary(vec![
+            body.to_vec(),
+        ])));
     }
 
     bail!("unexpected inference response content type: {content_type}");
+}
+
+/// Splits a JSON `outputs` array into surviving payloads and typed slot
+/// errors.
+///
+/// The base64 unwrapping only happens when the batch *did* carry an error
+/// slot: without error slots an all-binary batch is encoded as
+/// `multipart/mixed`, never as this envelope, so the rule can only ever fire
+/// on the new shape and every response an older server can produce is passed
+/// through byte-identically to before.
+///
+/// Whether a survivor is binary is decided *per slot* — the encoder wraps
+/// every binary output and leaves every JSON output alone, so wrappedness is
+/// the per-slot record of what the model returned for that input. Since
+/// `PredictOutput` is one type for the whole response, a batch mixing the two
+/// is a response this client cannot represent, and it is reported as such
+/// rather than handed on: passed through as JSON, the wrapper map reaches an
+/// output handler that reads no `transcription` from it and silently drops
+/// the payload.
+fn parse_json_outputs(outputs: &[Value]) -> Result<PredictResponse> {
+    let mut errors = Vec::new();
+    let mut survivors: Vec<&Value> = Vec::with_capacity(outputs.len());
+    for (index, value) in outputs.iter().enumerate() {
+        match slot_error_from_json(value) {
+            Some(Ok(error)) => errors.push(PredictSlotError {
+                index,
+                class: error.class,
+                message: error.message,
+            }),
+            // Typed, because it is deterministic: callers must not spend an
+            // isolation pass re-asking a server that will answer identically.
+            Some(Err(reason)) => {
+                return Err(anyhow::Error::new(ProtocolViolation::new(format!(
+                    "predict output {index} is a malformed error slot: {reason}"
+                ))));
+            }
+            None => survivors.push(value),
+        }
+    }
+    if errors.is_empty() {
+        return Ok(PredictResponse::plain(PredictOutput::Json(
+            survivors.into_iter().cloned().collect(),
+        )));
+    }
+    let wrapped = survivors.iter().filter(|v| is_base64_wrapper(v)).count();
+    if wrapped == 0 {
+        return Ok(PredictResponse {
+            outputs: PredictOutput::Json(survivors.into_iter().cloned().collect()),
+            errors,
+        });
+    }
+    if wrapped != survivors.len() {
+        return Err(anyhow::Error::new(ProtocolViolation::new(format!(
+            "predict response mixes {wrapped} binary and {} JSON outputs, \
+             which have no common representation",
+            survivors.len() - wrapped
+        ))));
+    }
+    let mut decoded = Vec::with_capacity(survivors.len());
+    for value in survivors {
+        decoded.push(decode_base64_wrapper(value)?);
+    }
+    Ok(PredictResponse {
+        outputs: PredictOutput::Binary(decoded),
+        errors,
+    })
+}
+
+fn is_base64_wrapper(value: &Value) -> bool {
+    value
+        .get("__type__")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "base64")
+}
+
+fn decode_base64_wrapper(value: &Value) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let content = value
+        .get("content")
+        .and_then(Value::as_str)
+        .context("base64 output missing content")?;
+    base64::engine::general_purpose::STANDARD
+        .decode(content.as_bytes())
+        .context("invalid base64 output")
 }
 
 async fn parse_json_response(response: reqwest::Response) -> Result<Value> {
@@ -623,5 +762,107 @@ mod tests {
             "load with None omits prewarm: {}",
             queries[3]
         );
+    }
+
+    fn envelope(outputs: Vec<Value>) -> (String, Vec<u8>) {
+        (
+            "application/json".to_string(),
+            serde_json::to_vec(&json!({ "outputs": outputs })).unwrap(),
+        )
+    }
+
+    /// Wrappedness is decided per slot, not all-or-nothing: the encoder wraps
+    /// every binary output and leaves every JSON output alone, so a batch
+    /// with both is a response `PredictOutput` — one type for the whole
+    /// response — cannot represent. It is reported instead of handed on:
+    /// passed through as JSON, the wrapper map reaches an output handler that
+    /// finds no `transcription` in it and drops the payload silently.
+    #[test]
+    fn a_mixed_binary_and_json_batch_is_reported_not_guessed() {
+        let (content_type, body) = envelope(vec![
+            json!({"__error__": {"class": "input", "message": "Unreadable image"}}),
+            json!({"__type__": "base64", "content": "QUFB"}),
+            json!({"transcription": "hello"}),
+        ]);
+        let err = parse_predict_response(&content_type, &body)
+            .expect_err("a response with no common representation must not be guessed at");
+        assert!(
+            is_protocol_violation(&err),
+            "and it is deterministic, so isolation must not retry it: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("mixes 1 binary and 1 JSON"), "{err:#}");
+    }
+
+    /// The two unmixed shapes still round-trip: all survivors wrapped is a
+    /// binary batch (an embedding model whose item had one bad frame), none
+    /// wrapped is a JSON batch. Both keep the slot error at its *input's*
+    /// index while the survivors close ranks.
+    #[test]
+    fn unmixed_survivors_round_trip_beside_an_error_slot() {
+        let (content_type, body) = envelope(vec![
+            json!({"__type__": "base64", "content": "QUFB"}),
+            json!({"__error__": {"class": "input", "message": "Unreadable image"}}),
+            json!({"__type__": "base64", "content": "QkI="}),
+        ]);
+        let parsed = parse_predict_response(&content_type, &body).unwrap();
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].index, 1);
+        match parsed.outputs {
+            PredictOutput::Binary(outputs) => {
+                assert_eq!(outputs, vec![b"AAA".to_vec(), b"BB".to_vec()]);
+            }
+            other => panic!("client parsed {other:?}"),
+        }
+
+        let (content_type, body) = envelope(vec![
+            json!({"__error__": {"class": "transient", "message": "try again"}}),
+            json!({"transcription": "hello"}),
+        ]);
+        let parsed = parse_predict_response(&content_type, &body).unwrap();
+        assert_eq!(parsed.errors[0].class, SlotErrorClass::Transient);
+        match parsed.outputs {
+            PredictOutput::Json(values) => {
+                assert_eq!(values, vec![json!({"transcription": "hello"})]);
+            }
+            other => panic!("client parsed {other:?}"),
+        }
+    }
+
+    /// The legacy no-slot path is untouched: a JSON envelope without error
+    /// slots is passed through verbatim, wrapper maps and all. (The encoder
+    /// never produces that shape — an all-binary batch goes out as
+    /// `multipart/mixed` — so this is only pinning the byte-identical
+    /// behaviour of every response an older server can send.)
+    #[test]
+    fn the_legacy_envelope_is_passed_through_verbatim() {
+        let values = vec![
+            json!({"__type__": "base64", "content": "QUFB"}),
+            json!({"transcription": "hello"}),
+        ];
+        let (content_type, body) = envelope(values.clone());
+        let parsed = parse_predict_response(&content_type, &body).unwrap();
+        assert!(parsed.errors.is_empty());
+        match parsed.outputs {
+            PredictOutput::Json(parsed) => assert_eq!(parsed, values),
+            other => panic!("client parsed {other:?}"),
+        }
+    }
+
+    /// A malformed error slot is a protocol violation rather than a payload
+    /// or a guessed class, and it is *typed* so the extraction job can skip
+    /// the isolation pass that would only ask the same broken server again.
+    #[test]
+    fn a_malformed_error_slot_is_a_typed_protocol_violation() {
+        let (content_type, body) = envelope(vec![
+            json!({"transcription": "hello"}),
+            json!({"__error__": {"class": "blocked", "message": "not ours"}}),
+        ]);
+        let err = parse_predict_response(&content_type, &body).expect_err("malformed");
+        assert!(is_protocol_violation(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("predict output 1"), "{err:#}");
+    }
+
+    fn is_protocol_violation(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<ProtocolViolation>().is_some()
     }
 }

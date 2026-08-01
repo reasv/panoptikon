@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context as _;
+
 use base64::{Engine as _, engine::general_purpose};
 use sea_query::{SqliteQueryBuilder, Value as SeaValue, Values};
 use serde_json::Value;
@@ -20,7 +22,10 @@ use crate::db::items::get_existing_file_for_item_id;
 use crate::db::pql::run_compiled_count;
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::db::{open_index_db_read, open_index_db_read_no_user_data};
-use crate::inferio_client::{InferenceFile, InferenceInput, PredictOutput};
+use crate::inferio::slot_error::{ProtocolViolation, SlotErrorClass};
+use crate::inferio_client::{
+    InferenceFile, InferenceInput, PredictOutput, PredictResponse, PredictSlotError,
+};
 use crate::jobs::continuous_scan;
 use crate::jobs::files::{FileScanService, is_resync_needed};
 use crate::jobs::inference_pool::{InferencePool, job_inference_context};
@@ -772,8 +777,16 @@ async fn process_item(
     let prepared = match prepare_result {
         Ok(prepared) => prepared,
         Err(err) => {
-            let (outcome, returned) =
-                record_prepare_failure(index_db, model, job_id, &sha256, &path, err).await;
+            let (outcome, returned) = record_item_failure(
+                index_db,
+                model,
+                job_id,
+                crate::db::extraction_errors::STAGE_PREPARE,
+                &sha256,
+                &path,
+                err,
+            )
+            .await;
             finalize_item(
                 index_db,
                 job_id,
@@ -840,7 +853,7 @@ async fn process_item(
     drop(loader_permit);
 
     let segments = inference_inputs.len() as i64;
-    let outputs = match run_chunked_inference(
+    let inference = match run_chunked_inference(
         &model.setter_name,
         pool,
         unit_slots,
@@ -850,12 +863,14 @@ async fn process_item(
     )
     .await
     {
-        Ok(outputs) => outputs,
+        Ok(inference) => inference,
         Err(err) => {
-            // Inference failures stay transient: only the worker itself can
-            // call an item's payload bad, and it has no way to say so yet
-            // (the per-item error slots are their own phase). Unclassified
-            // means retried, never suppressed.
+            // A failure of the predict call itself stays transient — even
+            // after `run_chunked_inference`'s isolation retry gave every one
+            // of the item's work units a chance alone. Only a *typed* worker
+            // verdict may say an item's payload is bad; an exception text is
+            // never pattern-matched into one (design doc, layer 2), so an
+            // unclassified failure is retried, never suppressed.
             tracing::error!(
                 path = %prepared.item.path,
                 sha256 = %prepared.item.sha256,
@@ -879,9 +894,101 @@ async fn process_item(
         }
     };
 
-    let result =
-        output_handlers::handle_outputs(index_db, model, job_id, prepared.item.clone(), outputs)
+    // The original input position of every output that came back, needed
+    // because the erroring slots are dropped from `outputs` and the survivors
+    // close ranks — `idx` is a page/frame number, so renumbering it would
+    // silently mis-file a partial item's rows. `None` (the overwhelmingly
+    // common no-slot case) is the identity map and costs nothing.
+    let survivors = surviving_input_indices(inference_inputs.len(), &inference.slot_errors);
+
+    let outputs = match classify_slot_errors(
+        inference_inputs.len(),
+        &inference.slot_errors,
+        targets_text_entity(model),
+    ) {
+        SlotVerdict::Proceed => {
+            for error in &inference.slot_errors {
+                // Partial: the item's media is processable, one of its work
+                // units was not. Logged, counted nowhere, never persisted —
+                // the ledger keys on the item, and this item is fine. This
+                // log line is the *only* record of a dropped input, by design
+                // (docs/failed-media-retry-design.md), so it carries the
+                // item's identity and the input's index.
+                tracing::warn!(
+                    path = %prepared.item.path,
+                    sha256 = %prepared.item.sha256,
+                    stage = crate::db::extraction_errors::STAGE_INFERENCE,
+                    error_class = error.class.as_str(),
+                    input = error.index,
+                    inputs_total = inference_inputs.len(),
+                    error = %error.message,
+                    "inference rejected one of the item's inputs; keeping the rest"
+                );
+            }
+            inference.outputs
+        }
+        SlotVerdict::Transient(detail) => {
+            tracing::error!(
+                path = %prepared.item.path,
+                sha256 = %prepared.item.sha256,
+                stage = crate::db::extraction_errors::STAGE_INFERENCE,
+                error_class = "transient",
+                error = %detail,
+                "extraction item failed"
+            );
+            finalize_item(
+                index_db,
+                job_id,
+                &prepared.item.item_type,
+                segments,
+                ItemOutcome::Failed,
+                counters,
+                total_remaining,
+            )
             .await;
+            return Err(ApiError::internal(format!("Inference failed: {detail}")));
+        }
+        SlotVerdict::InputMedia(detail) => {
+            // The worker — the component that actually decoded the bytes —
+            // rejected every one of this item's inputs. That is a verdict on
+            // the media, recorded at the inference stage with the confirmed
+            // threshold (a decode of bytes the worker already had in hand).
+            let (outcome, returned) = record_item_failure(
+                index_db,
+                model,
+                job_id,
+                crate::db::extraction_errors::STAGE_INFERENCE,
+                &prepared.item.sha256,
+                &prepared.item.path,
+                ApiError::input(detail),
+            )
+            .await;
+            finalize_item(
+                index_db,
+                job_id,
+                &prepared.item.item_type,
+                segments,
+                outcome,
+                counters,
+                total_remaining,
+            )
+            .await;
+            return match returned {
+                Some(err) => Err(err),
+                None => Ok(()),
+            };
+        }
+    };
+
+    let result = output_handlers::handle_outputs(
+        index_db,
+        model,
+        job_id,
+        prepared.item.clone(),
+        outputs,
+        survivors.as_deref(),
+    )
+    .await;
     if let Err(err) = &result {
         // Storing the output is the gateway's own DB work: never a verdict on
         // the media, so it is counted and retried like any other transient.
@@ -914,16 +1021,140 @@ async fn process_item(
     result.map(|_| ())
 }
 
-/// Logs a prepare failure and, when its class is one the ledger stores,
-/// records it. Returns the outcome to count and the error the item task
-/// should return, if any.
+/// The verdict on an item whose inference produced typed per-slot errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlotVerdict {
+    /// No errors, or some inputs succeeded: use the outputs that came back.
+    Proceed,
+    /// Every input failed, but not all of them on the class that settles a
+    /// verdict about the media: counted, retried, never persisted.
+    Transient(String),
+    /// Every input failed with the worker's `input` class: a verdict on the
+    /// item's media, which owes a ledger row.
+    InputMedia(String),
+}
+
+/// Maps an item's typed slot errors onto the ledger taxonomy.
+///
+/// Three rules, all from docs/failed-media-retry-design.md:
+///
+/// - **Class first.** A `transient` slot says nothing about the payload and
+///   must never be swallowed, so *any* non-`input` slot makes the whole item
+///   transient — including when its batch-mates succeeded. Proceeding there
+///   would write the item's partial outputs and mark it processed, which
+///   permanently loses the work unit the worker asked us to retry.
+/// - **Partial success proceeds — but only for `input` slots.** The verdict
+///   has to be about the *item's media*, and media some of whose work units
+///   decoded is processable media. Those failed units are logged and dropped;
+///   only an item whose inputs *all* failed on `input` is bad media.
+/// - **Text-entity models never persist a worker verdict** ("Granularity
+///   caveat — text-entity models"): there, one input is one extracted text
+///   segment, while the ledger and the `failed_for` anti-join key on the
+///   item. Persisting would take every *other* segment of that item out of
+///   the work query because a single segment was bad. Until the ledger grows
+///   a nullable `data_id`, those verdicts stay transient.
+fn classify_slot_errors(
+    total_inputs: usize,
+    errors: &[PredictSlotError],
+    text_entity: bool,
+) -> SlotVerdict {
+    if errors.is_empty() {
+        return SlotVerdict::Proceed;
+    }
+    let detail = summarize_slot_errors(total_inputs, errors);
+    // Class before arity: a retryable slot anywhere poisons the whole item,
+    // whether or not the rest of the batch came back.
+    if !errors
+        .iter()
+        .all(|error| error.class == SlotErrorClass::Input)
+    {
+        return SlotVerdict::Transient(detail);
+    }
+    if errors.len() < total_inputs {
+        return SlotVerdict::Proceed;
+    }
+    if text_entity {
+        return SlotVerdict::Transient(format!(
+            "{detail} (text-entity model: a per-segment verdict is not \
+             recorded against the item)"
+        ));
+    }
+    SlotVerdict::InputMedia(detail)
+}
+
+/// The original input positions of the outputs a partial response carries, in
+/// output order.
+///
+/// The wire protocol drops erroring slots from `outputs`, so the *n*-th
+/// surviving output is not the *n*-th input. Everything downstream that
+/// stores an `index` is storing the input's identity — a video frame number
+/// or a PDF page number (`item_data.idx`) — so it must use this map, not the
+/// enumeration of the survivors.
+///
+/// `None` means "no slots errored", i.e. the identity map: every response an
+/// inference server without error slots can produce takes that path and pays
+/// nothing.
+fn surviving_input_indices(
+    total_inputs: usize,
+    errors: &[PredictSlotError],
+) -> Option<Vec<usize>> {
+    if errors.is_empty() {
+        return None;
+    }
+    let failed: std::collections::HashSet<usize> =
+        errors.iter().map(|error| error.index).collect();
+    Some(
+        (0..total_inputs)
+            .filter(|index| !failed.contains(index))
+            .collect(),
+    )
+}
+
+/// A one-line rendering of an item's slot errors for the log and the ledger's
+/// audit text. One message is the interesting one; the rest is a count, since
+/// every input of a corrupt file usually fails identically. When the classes
+/// are mixed the *non-`input`* one leads, because that is the one that
+/// decided the verdict.
+fn summarize_slot_errors(total_inputs: usize, errors: &[PredictSlotError]) -> String {
+    let Some(first) = errors.first() else {
+        return "inference reported no outputs".to_string();
+    };
+    let lead = errors
+        .iter()
+        .find(|error| error.class != SlotErrorClass::Input)
+        .unwrap_or(first);
+    let scope = if errors.len() == 1 && total_inputs <= 1 {
+        "the input".to_string()
+    } else if errors.len() >= total_inputs {
+        format!("all {} inputs", errors.len())
+    } else {
+        format!("{} of {} inputs", errors.len(), total_inputs)
+    };
+    format!(
+        "worker rejected {scope} ({}): {}",
+        lead.class.as_str(),
+        lead.message
+    )
+}
+
+/// Whether the model's work unit is an extracted text segment rather than the
+/// item's own media — the same `target_entities` discriminator `build_job_pql`
+/// turns into [`EntityType::Text`].
+fn targets_text_entity(model: &ModelMetadata) -> bool {
+    matches!(model.target_entities.as_slice(), [entity] if entity == "text")
+}
+
+/// Logs an item failure and, when its class is one the ledger stores, records
+/// it against `stage`. Returns the outcome to count and the error the item
+/// task should return, if any.
 ///
 /// A failed *ledger write* is counted systemic and returned as an error: a DB
 /// outage must never soft-complete a job as "all corrupt media".
-async fn record_prepare_failure(
+async fn record_item_failure(
     index_db: &str,
     model: &ModelMetadata,
     job_id: i64,
+    stage: &str,
     sha256: &str,
     path: &str,
     err: ApiError,
@@ -932,7 +1163,7 @@ async fn record_prepare_failure(
     tracing::error!(
         path,
         sha256,
-        stage = crate::db::extraction_errors::STAGE_PREPARE,
+        stage,
         error_class = class.unwrap_or("transient"),
         blocker = err.blocker().map(Blocker::as_str).unwrap_or("none"),
         skip_after = err.skip_after(),
@@ -943,7 +1174,7 @@ async fn record_prepare_failure(
         return (ItemOutcome::Failed, Some(err));
     }
 
-    let record = prepare_failure_record(model, job_id, sha256, &err);
+    let record = failure_record(model, job_id, stage, sha256, &err);
     match call_index_db_writer(index_db, |reply| {
         IndexDbWriterMessage::UpsertExtractionError {
             record: record.clone(),
@@ -970,18 +1201,19 @@ async fn record_prepare_failure(
     }
 }
 
-/// The ledger row a classified prepare failure owes. Split out so the job
-/// path and its tests build the same record.
-fn prepare_failure_record(
+/// The ledger row a classified failure owes. Split out so the job path and
+/// its tests build the same record.
+fn failure_record(
     model: &ModelMetadata,
     job_id: i64,
+    stage: &str,
     sha256: &str,
     err: &ApiError,
 ) -> ExtractionErrorRecord {
     ExtractionErrorRecord {
         item_sha256: sha256.to_string(),
         setter_name: model.setter_name.clone(),
-        stage: crate::db::extraction_errors::STAGE_PREPARE.to_string(),
+        stage: stage.to_string(),
         kind: err.kind(),
         error: err.detail().to_string(),
         skip_after: err.skip_after(),
@@ -1047,12 +1279,35 @@ fn input_memory_kib(inputs: &[InferenceInput]) -> u32 {
     u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX)
 }
 
+/// What one item's inference produced: the outputs of the work units that
+/// succeeded, plus the worker's typed verdicts on the ones that did not (in
+/// input order, indices relative to the item's full input list).
+struct ItemInference {
+    outputs: PredictOutput,
+    slot_errors: Vec<PredictSlotError>,
+}
+
 /// Runs inference over one item's work units in chunks of at most
 /// `unit_capacity`, holding one unit permit per work unit for the duration of
 /// each request. Together with the shared semaphore this caps the total
 /// number of work units inside in-flight inference requests at the job's
 /// batch size, and splits oversized items (e.g. many-page PDFs) into multiple
 /// sequential requests whose outputs are concatenated in order.
+///
+/// Layer 2 of the batch-isolation design lives here. Extraction never puts
+/// two *items* in one predict call — cross-item merging happens server-side
+/// in the dispatcher, which already falls back to per-request prediction —
+/// so the multi-unit boundary in this process is one item's chunk. When a
+/// chunk of more than one unit fails as a whole, its units are re-submitted
+/// one at a time, once (`isolate_inputs`), each advertising
+/// [`ISOLATION_MAX_BATCH`] so the dispatcher cannot merge them back together:
+/// a batch-level failure that is not about any single unit then still
+/// completes the item. If one unit fails alone the whole item fails
+/// transiently — partial data is never written for an unclassified failure,
+/// since the item stays selectable and will be processed in full next run.
+///
+/// The one failure that is *not* isolated is a protocol violation: it is
+/// deterministic, so the retry would only re-ask the same broken server.
 async fn run_chunked_inference(
     setter_name: &str,
     pool: &InferencePool,
@@ -1060,40 +1315,176 @@ async fn run_chunked_inference(
     unit_capacity: usize,
     inputs: &[InferenceInput],
     counters: &Arc<Mutex<JobCounters>>,
-) -> anyhow::Result<PredictOutput> {
+) -> anyhow::Result<ItemInference> {
     let chunk_size = unit_capacity.max(1);
     let mut merged: Option<PredictOutput> = None;
+    let mut slot_errors: Vec<PredictSlotError> = Vec::new();
+    let mut base = 0usize;
+    let chunk_cap = u32::try_from(chunk_size).unwrap_or(u32::MAX);
     for chunk in inputs.chunks(chunk_size) {
-        let permits = unit_slots
-            .clone()
-            .acquire_many_owned(chunk.len() as u32)
+        let response = match predict_units(setter_name, pool, unit_slots, chunk_cap, counters, chunk)
             .await
-            .map_err(|_| anyhow::anyhow!("inference unit semaphore closed"))?;
-        let inference_span = counters.lock().await.inference_time.start();
-        let response = pool
-            .predict(
-                setter_name,
-                CACHE_KEY,
-                CACHE_LRU_SIZE,
-                CACHE_TTL_SECS,
-                // The job's resolved batch_size doubles as the server-side
-                // merge cap (design doc §6): a local orchestrator must not
-                // form GPU batches larger than what this job was tuned for.
-                Some(u32::try_from(chunk_size).unwrap_or(u32::MAX)),
-                // Batch jobs opt out of lazy prewarming (design doc §8).
-                Some(false),
-                chunk,
-            )
-            .await;
-        drop(inference_span);
-        drop(permits);
-        let outputs = response?;
-        merged = Some(match merged {
-            None => outputs,
-            Some(previous) => merge_outputs(previous, outputs)?,
-        });
+        {
+            Ok(response) => response,
+            // A protocol violation is deterministic: the server answered with
+            // a shape this client refuses to guess at, and it will answer the
+            // same way one input at a time. Isolating would burn a full extra
+            // GPU pass to learn nothing, so the chunk fails transiently now.
+            Err(err) if is_protocol_violation(&err) => return Err(err),
+            Err(err) if chunk.len() > 1 => {
+                tracing::warn!(
+                    setter = setter_name,
+                    inputs = chunk.len(),
+                    "inference batch failed; retrying this item's inputs one at a time: {err:#}"
+                );
+                // One isolation pass only: the retry itself is never isolated
+                // again, so the worst case is 2x the requests for this chunk.
+                isolate_inputs(chunk, |single, max_batch| async move {
+                    predict_units(setter_name, pool, unit_slots, max_batch, counters, &single).await
+                })
+                .await
+                .with_context(|| format!("batch failed and isolation did not recover it: {err:#}"))?
+            }
+            Err(err) => return Err(err),
+        };
+        for mut error in response.errors {
+            error.index += base;
+            slot_errors.push(error);
+        }
+        let outputs = response.outputs;
+        // A chunk whose every slot errored contributes no outputs at all;
+        // merging it would be a spurious Json/Binary type clash.
+        if !outputs.is_empty() {
+            merged = Some(match merged {
+                None => outputs,
+                Some(previous) => merge_outputs(previous, outputs)?,
+            });
+        }
+        base += chunk.len();
     }
-    merged.ok_or_else(|| anyhow::anyhow!("no inference outputs produced"))
+    let outputs = match merged {
+        Some(outputs) => outputs,
+        // Every unit errored: the outputs are empty by construction, and the
+        // caller classifies the slot errors instead of writing anything.
+        None if !slot_errors.is_empty() => PredictOutput::Json(Vec::new()),
+        None => return Err(anyhow::anyhow!("no inference outputs produced")),
+    };
+    Ok(ItemInference {
+        outputs,
+        slot_errors,
+    })
+}
+
+/// One predict request for a slice of an item's work units, holding one unit
+/// permit per unit for its duration and timing it into the job's inference
+/// phase.
+///
+/// `max_batch` is the cap this request advertises to the server-side
+/// dispatcher. Normally it is the job's chunk size; the isolation retry
+/// passes 1 so the dispatcher cannot merge the retry back into a window with
+/// other requests (see [`ISOLATION_MAX_BATCH`]).
+async fn predict_units(
+    setter_name: &str,
+    pool: &InferencePool,
+    unit_slots: &Arc<Semaphore>,
+    max_batch: u32,
+    counters: &Arc<Mutex<JobCounters>>,
+    inputs: &[InferenceInput],
+) -> anyhow::Result<PredictResponse> {
+    let permits = unit_slots
+        .clone()
+        .acquire_many_owned(inputs.len() as u32)
+        .await
+        .map_err(|_| anyhow::anyhow!("inference unit semaphore closed"))?;
+    let inference_span = counters.lock().await.inference_time.start();
+    let response = pool
+        .predict(
+            setter_name,
+            CACHE_KEY,
+            CACHE_LRU_SIZE,
+            CACHE_TTL_SECS,
+            // The server-side merge cap (design doc §6): a local
+            // orchestrator must not form GPU batches larger than what the
+            // caller asked for — the job's resolved batch_size normally,
+            // 1 for an isolated retry.
+            Some(max_batch),
+            // Batch jobs opt out of lazy prewarming (design doc §8).
+            Some(false),
+            inputs,
+        )
+        .await;
+    drop(inference_span);
+    drop(permits);
+    response
+}
+
+/// Whether a failure is the peer answering in a shape the protocol does not
+/// define. Deterministic by nature, so it must not be retried by isolation:
+/// the same server would produce the same malformed answer one input at a
+/// time, at the cost of a whole extra pass over the item's units.
+fn is_protocol_violation(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ProtocolViolation>().is_some()
+}
+
+/// The `max_batch` an isolated retry advertises on the wire. Splitting the
+/// request locally is not isolation on its own: the dispatcher's
+/// `effective_cap` takes the *max* over the caps in its window, so a unit
+/// re-submitted while still advertising the job's chunk size can simply be
+/// merged back into a GPU batch with other requests — the exact situation the
+/// retry exists to rule out.
+const ISOLATION_MAX_BATCH: u32 = 1;
+
+/// Isolation retry: re-submit `inputs` one at a time, sequentially, and
+/// assemble the result as if it had been one request. The first input that
+/// still fails alone aborts the pass with its own error — never promoted to
+/// an `input` verdict by pattern-matching, which is what keeps the pipeline
+/// from ever being stricter than the model itself (design doc, req 1).
+///
+/// `predict_one` takes ownership of its slice so the closure's future does
+/// not borrow the loop, which is also what makes this testable with an
+/// injected predict function; its second argument is the wire cap the
+/// submission must carry ([`ISOLATION_MAX_BATCH`]).
+async fn isolate_inputs<F, Fut>(
+    inputs: &[InferenceInput],
+    mut predict_one: F,
+) -> anyhow::Result<PredictResponse>
+where
+    F: FnMut(Vec<InferenceInput>, u32) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<PredictResponse>>,
+{
+    let mut merged: Option<PredictOutput> = None;
+    let mut errors: Vec<PredictSlotError> = Vec::new();
+    for (index, input) in inputs.iter().enumerate() {
+        let response = predict_one(vec![input.clone()], ISOLATION_MAX_BATCH)
+            .await
+            .inspect_err(|_| {
+                // The pass aborts here without writing anything, so the units
+                // that already succeeded are re-run next time. That is a
+                // recurring GPU cost on a recurring bad file: log how much of
+                // the pass was thrown away so it is visible per run.
+                tracing::warn!(
+                    recovered_units = index,
+                    total_units = inputs.len(),
+                    "isolation pass aborted; discarding the units that had \
+                     already succeeded"
+                );
+            })
+            .with_context(|| format!("input {index} failed on its own too"))?;
+        for mut error in response.errors {
+            error.index += index;
+            errors.push(error);
+        }
+        if !response.outputs.is_empty() {
+            merged = Some(match merged {
+                None => response.outputs,
+                Some(previous) => merge_outputs(previous, response.outputs)?,
+            });
+        }
+    }
+    Ok(PredictResponse {
+        outputs: merged.unwrap_or(PredictOutput::Json(Vec::new())),
+        errors,
+    })
 }
 
 fn merge_outputs(first: PredictOutput, second: PredictOutput) -> anyhow::Result<PredictOutput> {
@@ -2151,7 +2542,7 @@ mod tests {
         assert_eq!(err.kind(), ApiErrorKind::Input);
         assert_eq!(err.skip_after(), SKIP_AFTER_CONFIRMED);
 
-        let record = prepare_failure_record(&model, 7, "sha_corrupt", &err);
+        let record = failure_record(&model, 7, STAGE_PREPARE, "sha_corrupt", &err);
         upsert_extraction_error(conn, &record).await.unwrap();
 
         let (stage, class, attempts, mime, job): (String, String, i64, String, Option<i64>) =
@@ -2186,7 +2577,7 @@ mod tests {
 
         let err = ApiError::input_unconfirmed("ffmpeg exited 1");
         assert_eq!(err.skip_after(), SKIP_AFTER_AMBIGUOUS);
-        let mut record = prepare_failure_record(&model, 1, "sha_one", &err);
+        let mut record = failure_record(&model, 1, STAGE_PREPARE, "sha_one", &err);
         upsert_extraction_error(conn, &record).await.unwrap();
         assert_eq!(
             work_query_items(conn, &model).await,
@@ -2254,7 +2645,7 @@ mod tests {
         // A confirmed verdict, recorded by the *other* setter.
         let mut tagger = image_model();
         tagger.setter_name = "test/tagger".to_string();
-        let record = prepare_failure_record(&tagger, 1, "sha_one", &ApiError::input("corrupt"));
+        let record = failure_record(&tagger, 1, STAGE_PREPARE, "sha_one", &ApiError::input("corrupt"));
         upsert_extraction_error(conn, &record).await.unwrap();
         assert!(
             work_query_items(conn, &tagger).await.is_empty(),
@@ -2301,7 +2692,7 @@ mod tests {
             "every file row is work before anything failed"
         );
 
-        let record = prepare_failure_record(&model, 1, "sha_one", &ApiError::input("corrupt"));
+        let record = failure_record(&model, 1, STAGE_PREPARE, "sha_one", &ApiError::input("corrupt"));
         upsert_extraction_error(conn, &record).await.unwrap();
         assert_eq!(
             work_query_column(conn, &model, "file_id").await,
@@ -2328,9 +2719,10 @@ mod tests {
                 .unwrap();
             seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.png")]).await;
             // One ambiguous failure: attempts = 1, skip_after = 2.
-            let record = prepare_failure_record(
+            let record = failure_record(
                 &image_model(),
                 1,
+                STAGE_PREPARE,
                 "sha_one",
                 &ApiError::input_unconfirmed("an SMB blip looks like this"),
             );
@@ -2392,10 +2784,11 @@ mod tests {
         // No `setters` row for this name, so the upsert matches nothing.
         let mut model = image_model();
         model.setter_name = "test/never-registered".to_string();
-        let (outcome, returned) = record_prepare_failure(
+        let (outcome, returned) = record_item_failure(
             index_db,
             &model,
             1,
+            STAGE_PREPARE,
             "sha_one",
             "C:/data/1.png",
             ApiError::input("corrupt"),
@@ -2438,10 +2831,11 @@ mod tests {
         .await
         .unwrap();
 
-        let (outcome, returned) = record_prepare_failure(
+        let (outcome, returned) = record_item_failure(
             index_db,
             &model,
             job_id,
+            STAGE_PREPARE,
             "sha_one",
             "C:/data/1.pdf",
             ApiError::blocked(Blocker::Pdfium, "pdfium is not available"),
@@ -2542,7 +2936,7 @@ mod tests {
             .await;
             for (sha256, blocker) in [("sha_pdf", Blocker::Pdfium), ("sha_vid", Blocker::Ffmpeg)] {
                 let err = ApiError::blocked(blocker, "dependency missing");
-                let record = prepare_failure_record(&image_model(), 1, sha256, &err);
+                let record = failure_record(&image_model(), 1, STAGE_PREPARE, sha256, &err);
                 upsert_extraction_error(&mut conn, &record).await.unwrap();
             }
         }
@@ -2608,5 +3002,537 @@ mod tests {
             SKIP_AFTER_AMBIGUOUS,
             "a tool that did its own file I/O never settles a verdict alone"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Worker-reported per-item errors (docs/failed-media-retry-design.md,
+    // "Batch isolation and the worker protocol").
+    // ------------------------------------------------------------------
+
+    fn slot(index: usize, class: SlotErrorClass) -> PredictSlotError {
+        PredictSlotError {
+            index,
+            class,
+            message: "Unreadable image: truncated".to_string(),
+        }
+    }
+
+    // The verdict rules, in one place. Note the partial case: the ledger and
+    // the work query key on the *item*, so an item some of whose work units
+    // decoded on `input` grounds is processable media and must keep its
+    // successful outputs — that per-unit verdict can never suppress the item.
+    #[test]
+    fn slot_error_classification_covers_the_whole_grid() {
+        use SlotErrorClass::{Input, Transient};
+
+        assert_eq!(classify_slot_errors(4, &[], false), SlotVerdict::Proceed);
+        assert_eq!(
+            classify_slot_errors(4, &[slot(1, Input)], false),
+            SlotVerdict::Proceed,
+            "partial input failures keep the item's successful outputs"
+        );
+
+        // Every input failed, all on the worker's `input` class: a verdict on
+        // the media, which owes a ledger row.
+        let verdict = classify_slot_errors(2, &[slot(0, Input), slot(1, Input)], false);
+        let SlotVerdict::InputMedia(detail) = verdict else {
+            panic!("expected an input-media verdict, got {verdict:?}");
+        };
+        assert!(detail.contains("all 2 inputs"), "{detail}");
+        assert!(detail.contains("truncated"), "the worker's own text: {detail}");
+
+        // A single-input item, same rule.
+        assert!(matches!(
+            classify_slot_errors(1, &[slot(0, Input)], false),
+            SlotVerdict::InputMedia(_)
+        ));
+
+        // Mixed classes never settle a verdict: `transient` says nothing
+        // about the payload, so the item stays selectable.
+        assert!(matches!(
+            classify_slot_errors(2, &[slot(0, Input), slot(1, Transient)], false),
+            SlotVerdict::Transient(_)
+        ));
+        assert!(matches!(
+            classify_slot_errors(1, &[slot(0, Transient)], false),
+            SlotVerdict::Transient(_)
+        ));
+
+        // Class is decided *before* arity: a `transient` slot among healthy
+        // batch-mates is a request to retry that unit, and proceeding would
+        // write the item's partial outputs and mark it processed — which
+        // deletes the retry the worker asked for. So a partial mix carrying
+        // any non-`input` class fails the whole item transiently.
+        assert!(
+            matches!(
+                classify_slot_errors(2, &[slot(0, Transient)], false),
+                SlotVerdict::Transient(_)
+            ),
+            "a transient slot is never swallowed by its successful batch-mates"
+        );
+        assert!(matches!(
+            classify_slot_errors(4, &[slot(1, Transient)], false),
+            SlotVerdict::Transient(_)
+        ));
+        let verdict = classify_slot_errors(4, &[slot(1, Input), slot(2, Transient)], false);
+        let SlotVerdict::Transient(detail) = verdict else {
+            panic!("a partial mix with a transient slot must stay transient, got {verdict:?}");
+        };
+        assert!(
+            detail.contains("2 of 4 inputs") && detail.contains("transient"),
+            "the summary names the scope and the class that decided it: {detail}"
+        );
+    }
+
+    // The granularity caveat: for a text-entity model one input is one
+    // extracted segment, while the ledger and the `failed_for` anti-join key
+    // on the item — persisting would take every *other* segment of that item
+    // out of the work query because a single segment was bad. So the same
+    // all-input verdict stays transient there.
+    #[test]
+    fn a_text_entity_model_never_persists_a_worker_verdict() {
+        let errors = [slot(0, SlotErrorClass::Input)];
+        assert!(matches!(
+            classify_slot_errors(1, &errors, false),
+            SlotVerdict::InputMedia(_)
+        ));
+        let verdict = classify_slot_errors(1, &errors, true);
+        let SlotVerdict::Transient(detail) = verdict else {
+            panic!("a text-entity verdict must not be persisted, got {verdict:?}");
+        };
+        assert!(detail.contains("text-entity"), "{detail}");
+
+        // And the discriminator is the same one the work query uses.
+        assert!(targets_text_entity(&test_model("text", true)));
+        assert!(!targets_text_entity(&test_model("items", true)));
+        assert!(!targets_text_entity(&test_model("files", true)));
+    }
+
+    // The inference-stage half of the ledger: a worker verdict on an item's
+    // media lands as `stage = 'inference'`, class `input`, confirmed at one
+    // attempt (the worker decoded bytes it already had), counts input-side,
+    // and takes the item out of the work query.
+    #[tokio::test]
+    async fn a_worker_input_verdict_lands_in_the_ledger_at_the_inference_stage() {
+        let _test_env = test_data_dir();
+        let index_db = ledger_test_db("extraction_worker_verdict").await;
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+                .await
+                .unwrap();
+            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.png")]).await;
+        }
+        let model = image_model();
+        let job_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddDataLog {
+            scan_time: crate::db::extraction_write::current_iso_timestamp(),
+            threshold: None,
+            types: vec![model.output_type.clone()],
+            setter: model.setter_name.clone(),
+            batch_size: 4,
+            reply,
+        })
+        .await
+        .unwrap();
+
+        let SlotVerdict::InputMedia(detail) = classify_slot_errors(
+            1,
+            &[slot(0, SlotErrorClass::Input)],
+            targets_text_entity(&model),
+        ) else {
+            panic!("expected an input-media verdict");
+        };
+        let (outcome, returned) = record_item_failure(
+            index_db,
+            &model,
+            job_id,
+            crate::db::extraction_errors::STAGE_INFERENCE,
+            "sha_one",
+            "C:/data/1.png",
+            ApiError::input(detail),
+        )
+        .await;
+        assert_eq!(outcome, ItemOutcome::InputFailed { blocker: None });
+        assert!(returned.is_none(), "the job continues past bad media");
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        let (stage, class, skip_after, attempts, error): (String, String, i64, i64, String) =
+            sqlx::query_as(
+                "SELECT stage, error_class, skip_after, attempts, error \
+                 FROM item_extraction_errors",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            (stage.as_str(), class.as_str(), skip_after, attempts),
+            (
+                crate::db::extraction_errors::STAGE_INFERENCE,
+                "input",
+                SKIP_AFTER_CONFIRMED,
+                1
+            )
+        );
+        assert!(error.contains("truncated"), "the worker's text is audit: {error}");
+        assert!(
+            work_query_items(&mut conn, &model).await.is_empty(),
+            "the item leaves the work query"
+        );
+
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        finalize_item(
+            index_db,
+            job_id,
+            "image/png",
+            1,
+            outcome,
+            Arc::clone(&counters),
+            1,
+        )
+        .await;
+        let guard = counters.lock().await;
+        assert_eq!((guard.errors, guard.input_errors), (1, 1));
+        assert_eq!(guard.blocked_errors, 0, "a worker verdict blocks on nothing");
+    }
+
+    fn json_response(values: Vec<Value>, errors: Vec<PredictSlotError>) -> PredictResponse {
+        PredictResponse {
+            outputs: PredictOutput::Json(values),
+            errors,
+        }
+    }
+
+    fn text_input(text: &str) -> InferenceInput {
+        InferenceInput::new(serde_json::json!({ "text": text }), None)
+    }
+
+    // Layer 2 of the isolation design at the boundary that actually exists in
+    // this process (one item's multi-unit chunk): every unit is re-submitted
+    // alone, in order, exactly once, and the outputs reassemble as if it had
+    // been one request.
+    #[tokio::test]
+    async fn isolation_retries_each_input_alone_and_keeps_order() {
+        let inputs = [text_input("a"), text_input("b"), text_input("c")];
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&calls);
+        let response = isolate_inputs(&inputs, move |single, max_batch| {
+            let seen = Arc::clone(&seen);
+            async move {
+                assert_eq!(single.len(), 1, "isolation submits one input at a time");
+                assert_eq!(
+                    max_batch, 1,
+                    "and says so on the wire: a retry still advertising the \
+                     job's chunk size can be merged straight back into a GPU \
+                     batch with other requests by the dispatcher's effective_cap"
+                );
+                let text = single[0].data["text"].as_str().unwrap().to_string();
+                seen.lock().unwrap().push(text.clone());
+                Ok(json_response(vec![serde_json::json!(text)], Vec::new()))
+            }
+        })
+        .await
+        .expect("every input succeeded alone");
+
+        assert_eq!(*calls.lock().unwrap(), vec!["a", "b", "c"]);
+        match response.outputs {
+            PredictOutput::Json(values) => assert_eq!(
+                values,
+                vec![
+                    serde_json::json!("a"),
+                    serde_json::json!("b"),
+                    serde_json::json!("c")
+                ]
+            ),
+            other => panic!("expected Json outputs, got {other:?}"),
+        }
+        assert!(response.errors.is_empty());
+    }
+
+    // A unit that still fails alone aborts the pass with its own error and is
+    // never promoted to an `input` verdict by pattern-matching its text (req
+    // 1: the pipeline can never be stricter than the model). The item then
+    // fails transiently, so no partial data is written for it.
+    #[tokio::test]
+    async fn an_input_that_fails_alone_stays_transient() {
+        let inputs = [text_input("a"), text_input("b")];
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let err = isolate_inputs(&inputs, move |_single, _max_batch| {
+            let counted = Arc::clone(&counted);
+            async move {
+                let index = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if index == 1 {
+                    anyhow::bail!("corrupt file: cannot identify image");
+                }
+                Ok(json_response(vec![serde_json::json!("ok")], Vec::new()))
+            }
+        })
+        .await
+        .expect_err("the second input fails alone too");
+        let text = format!("{err:#}");
+        assert!(text.contains("input 1 failed on its own too"), "{text}");
+        assert!(
+            !text.contains("__error__"),
+            "an exception text is never turned into a typed verdict: {text}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the pass stops at the first input that fails alone"
+        );
+    }
+
+    // Typed slots survive isolation with their index rebased onto the item's
+    // input list — the whole point of the retry is that healthy units still
+    // complete while the bad one keeps its verdict.
+    #[tokio::test]
+    async fn isolation_rebases_slot_error_indices() {
+        let inputs = [text_input("a"), text_input("b")];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let response = isolate_inputs(&inputs, move |_single, _max_batch| {
+            let counted = Arc::clone(&counted);
+            async move {
+                let index = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if index == 1 {
+                    // Every slot of this sub-request failed: no outputs.
+                    return Ok(json_response(
+                        Vec::new(),
+                        vec![slot(0, SlotErrorClass::Input)],
+                    ));
+                }
+                Ok(json_response(vec![serde_json::json!("ok")], Vec::new()))
+            }
+        })
+        .await
+        .expect("a typed slot is a successful roundtrip");
+
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(
+            response.errors[0].index, 1,
+            "the slot index is the item's input index, not the sub-request's"
+        );
+        match response.outputs {
+            PredictOutput::Json(values) => assert_eq!(values, vec![serde_json::json!("ok")]),
+            other => panic!("expected the survivor's output, got {other:?}"),
+        }
+    }
+
+    // A protocol violation is deterministic, so isolating it would re-ask the
+    // same broken server one input at a time and burn a whole extra pass over
+    // the item's units to learn nothing. The marker has to survive the
+    // context layers the client and the pool wrap around it, which is what
+    // `downcast_ref` gives us and a string match would not.
+    #[test]
+    fn a_protocol_violation_is_recognisable_through_the_context_chain() {
+        let raw = anyhow::Error::new(ProtocolViolation::new(
+            "predict output 2 is a malformed error slot: unknown class",
+        ));
+        assert!(is_protocol_violation(&raw));
+        let wrapped = raw
+            .context("inference endpoint failed")
+            .context("batch failed");
+        assert!(
+            is_protocol_violation(&wrapped),
+            "the marker must survive the context the client and pool add"
+        );
+
+        // Everything else is retryable and must still reach isolation.
+        assert!(!is_protocol_violation(&anyhow::anyhow!(
+            "CUDA out of memory"
+        )));
+    }
+
+    // The survivor map: `PredictResponse` drops erroring slots, so the n-th
+    // output is not the n-th input. Without a map the identity is used, which
+    // is what every response from a server with no error slots gets.
+    #[test]
+    fn surviving_input_indices_maps_outputs_back_onto_inputs() {
+        assert_eq!(surviving_input_indices(4, &[]), None);
+        assert_eq!(
+            surviving_input_indices(4, &[slot(1, SlotErrorClass::Input)]),
+            Some(vec![0, 2, 3])
+        );
+        assert_eq!(
+            surviving_input_indices(
+                3,
+                &[slot(0, SlotErrorClass::Input), slot(2, SlotErrorClass::Input)]
+            ),
+            Some(vec![1])
+        );
+        assert_eq!(
+            surviving_input_indices(1, &[slot(0, SlotErrorClass::Input)]),
+            Some(Vec::new())
+        );
+    }
+
+    /// `item_data.idx` is documented as the page/frame number, and the CLIP
+    /// handler is where a video's frames get theirs. A rejected frame must
+    /// leave a *gap*, not renumber its successors: stored 0,1,2 for frames
+    /// 0,2,3 would silently mis-file every later frame of the item.
+    #[tokio::test]
+    async fn a_partial_clip_item_stores_the_original_frame_numbers() {
+        let _test_env = test_data_dir();
+        let index_db = ledger_test_db("extraction_partial_clip_idx").await;
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+                .await
+                .unwrap();
+            seed_ledger_fixture(&mut conn, &[(1, "sha_clip", "C:/data/clip.mp4")]).await;
+        }
+        let mut model = image_model();
+        model.output_type = "clip".to_string();
+        let job_id = data_log_job(index_db, &model).await;
+
+        // Four frames, the second of which the worker rejected.
+        let errors = vec![slot(1, SlotErrorClass::Input)];
+        let survivors = surviving_input_indices(4, &errors).expect("a slot errored");
+        let outputs = PredictOutput::Json(vec![
+            serde_json::json!([0.0, 1.0]),
+            serde_json::json!([2.0, 3.0]),
+            serde_json::json!([4.0, 5.0]),
+        ]);
+
+        output_handlers::handle_outputs(
+            index_db,
+            &model,
+            job_id,
+            image_item(1, "sha_clip", "C:/data/clip.mp4"),
+            outputs,
+            Some(&survivors),
+        )
+        .await
+        .expect("the surviving frames are written");
+
+        assert_eq!(
+            stored_indices(index_db, "clip").await,
+            vec![0, 2, 3],
+            "the rejected frame leaves a gap instead of shifting the rest"
+        );
+    }
+
+    /// Same for text outputs, where the index is the reading order of the
+    /// page/frame the text came from. (This handler already tolerates gaps —
+    /// its dedup and length filters make them — so the only question is
+    /// whether the surviving rows keep their own numbers.)
+    #[tokio::test]
+    async fn a_partial_text_item_stores_the_original_input_numbers() {
+        let _test_env = test_data_dir();
+        let index_db = ledger_test_db("extraction_partial_text_idx").await;
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+                .await
+                .unwrap();
+            seed_ledger_fixture(&mut conn, &[(1, "sha_text", "C:/data/doc.pdf")]).await;
+        }
+        let mut model = image_model();
+        model.output_type = "text".to_string();
+        let job_id = data_log_job(index_db, &model).await;
+
+        let errors = vec![slot(1, SlotErrorClass::Input)];
+        let survivors = surviving_input_indices(4, &errors).expect("a slot errored");
+        let outputs = PredictOutput::Json(vec![
+            serde_json::json!({"transcription": "page zero", "confidence": 0.9}),
+            serde_json::json!({"transcription": "page two", "confidence": 0.8}),
+            serde_json::json!({"transcription": "page three", "confidence": 0.7}),
+        ]);
+
+        output_handlers::handle_outputs(
+            index_db,
+            &model,
+            job_id,
+            image_item(1, "sha_text", "C:/data/doc.pdf"),
+            outputs,
+            Some(&survivors),
+        )
+        .await
+        .expect("the surviving pages are written");
+
+        assert_eq!(stored_indices(index_db, "text").await, vec![0, 2, 3]);
+
+        // And the text itself stayed with its own page: reading order is the
+        // property the index exists to preserve.
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT item_data.idx, extracted_text.text FROM item_data \
+             JOIN extracted_text ON extracted_text.id = item_data.id \
+             ORDER BY item_data.idx",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (0, "page zero".to_string()),
+                (2, "page two".to_string()),
+                (3, "page three".to_string()),
+            ]
+        );
+    }
+
+    /// Without a survivor map (no slot errored) the mapping is the identity,
+    /// so every response an inference server without error slots can produce
+    /// is stored exactly as it was before.
+    #[tokio::test]
+    async fn a_complete_clip_item_is_numbered_exactly_as_before() {
+        let _test_env = test_data_dir();
+        let index_db = ledger_test_db("extraction_complete_clip_idx").await;
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
+                .await
+                .unwrap();
+            seed_ledger_fixture(&mut conn, &[(1, "sha_full", "C:/data/full.mp4")]).await;
+        }
+        let mut model = image_model();
+        model.output_type = "clip".to_string();
+        let job_id = data_log_job(index_db, &model).await;
+
+        assert_eq!(surviving_input_indices(3, &[]), None);
+        output_handlers::handle_outputs(
+            index_db,
+            &model,
+            job_id,
+            image_item(1, "sha_full", "C:/data/full.mp4"),
+            PredictOutput::Json(vec![
+                serde_json::json!([0.0]),
+                serde_json::json!([1.0]),
+                serde_json::json!([2.0]),
+            ]),
+            None,
+        )
+        .await
+        .expect("every frame is written");
+
+        assert_eq!(stored_indices(index_db, "clip").await, vec![0, 1, 2]);
+    }
+
+    /// A data_log row to hang the written output off, as a real job would.
+    async fn data_log_job(index_db: &str, model: &ModelMetadata) -> i64 {
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddDataLog {
+            scan_time: crate::db::extraction_write::current_iso_timestamp(),
+            threshold: None,
+            types: vec![model.output_type.clone()],
+            setter: model.setter_name.clone(),
+            batch_size: 4,
+            reply,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The `idx` values actually stored for a data type, in ascending order.
+    async fn stored_indices(index_db: &str, data_type: &str) -> Vec<i64> {
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        sqlx::query_scalar("SELECT idx FROM item_data WHERE data_type = ? ORDER BY idx")
+            .bind(data_type)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap()
     }
 }

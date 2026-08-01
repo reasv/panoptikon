@@ -24,6 +24,12 @@
 //! - errors use FastAPI's `{"detail": ...}` shape (`ApiError`), with
 //!   router.py's exact detail strings for the 500s.
 //!
+//! - predict response, additive: a batch containing a typed per-item error
+//!   slot always uses the JSON envelope, with those slots rendered as
+//!   `{"__error__": {"class": ..., "message": ...}}` (see
+//!   `super::slot_error` and the worker-protocol doc). Batches without error
+//!   slots keep the byte-identical Python encoding above.
+//!
 //! Additive (design §7/§8): optional `max_batch` query param on predict
 //! (forwarded to the dispatcher's merge cap), optional `prewarm` query
 //! param on load AND predict (the lazy-warm hint, absent = true — see
@@ -261,7 +267,9 @@ struct InferencePredictRequest {
 #[allow(dead_code)]
 struct PredictJsonResponse {
     /// One output per input; binary outputs are wrapped as
-    /// `{"__type__": "base64", "content": "<base64>"}`.
+    /// `{"__type__": "base64", "content": "<base64>"}`, and an input the
+    /// model rejected on its own is
+    /// `{"__error__": {"class": "input" | "transient", "message": "..."}}`.
     outputs: Vec<JsonValue>,
 }
 
@@ -304,7 +312,10 @@ struct CacheListResponse {
         given cache slot first if needed. The response encoding depends on the \
         outputs: exactly one binary output is returned raw as \
         `application/octet-stream`; all-binary outputs use `multipart/mixed`; \
-        anything else is the JSON `{\"outputs\": [...]}` envelope.",
+        anything else is the JSON `{\"outputs\": [...]}` envelope. An input the \
+        model rejected on its own occupies its output slot as \
+        `{\"__error__\": {\"class\": \"input\"|\"transient\", \"message\": ...}}`, \
+        which always selects the JSON envelope.",
     params(
         ("group" = String, Path, description = "Model group (first segment of the inference ID)"),
         ("inference_id" = String, Path, description = "Model ID within the group"),
@@ -673,17 +684,28 @@ fn parse_input_request(
 ///   with Python's literal part framing (see module docs);
 /// - otherwise JSON `{"outputs": [...]}` with bytes entries wrapped as
 ///   `{"__type__": "base64", "content": ...}`.
+///
+/// Additive: a batch containing a typed per-item error slot always takes the
+/// JSON envelope (the binary encodings have nowhere to put a typed failure),
+/// with the erroring slots rendered as `{"__error__": {class, message}}` and
+/// the surviving binary payloads keeping the existing base64 wrapper. Absent
+/// error slots the encoding is bit-for-bit what it always was, so existing
+/// consumers see no change.
 fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
-    if outputs.len() == 1 && matches!(outputs[0], WorkerOutput::Bytes(_)) {
+    let has_error_slot = outputs
+        .iter()
+        .any(|output| matches!(output, WorkerOutput::Error(_)));
+    if !has_error_slot && outputs.len() == 1 && matches!(outputs[0], WorkerOutput::Bytes(_)) {
         let WorkerOutput::Bytes(bytes) = outputs.into_iter().next().expect("len checked") else {
             unreachable!("variant checked above");
         };
         return ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response();
     }
 
-    if outputs
-        .iter()
-        .all(|output| matches!(output, WorkerOutput::Bytes(_)))
+    if !has_error_slot
+        && outputs
+            .iter()
+            .all(|output| matches!(output, WorkerOutput::Bytes(_)))
     {
         // Python uses this fixed boundary (utils.py:44); the client's
         // parser reads it back out of the Content-Type header either way.
@@ -722,6 +744,7 @@ fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
                 "__type__": "base64",
                 "content": BASE64_STANDARD.encode(&bytes),
             }),
+            WorkerOutput::Error(error) => error.to_json(),
         })
         .collect();
     Json(json!({"outputs": encoded})).into_response()
@@ -765,6 +788,7 @@ pub struct InferioApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::slot_error::{SlotError, SlotErrorClass};
     use crate::inferio_client::{
         InferenceApiClient, InferenceFile, InferenceInput, PredictOutput, parse_predict_response,
     };
@@ -802,7 +826,7 @@ mod tests {
         assert_eq!(content_type, "application/octet-stream");
         assert_eq!(body, payload);
 
-        match parse_predict_response(&content_type, &body).unwrap() {
+        match parse_predict_response(&content_type, &body).unwrap().outputs {
             PredictOutput::Binary(outputs) => assert_eq!(outputs, vec![payload]),
             other => panic!("client parsed {other:?}"),
         }
@@ -831,7 +855,7 @@ mod tests {
         .concat();
         assert_eq!(body, expected, "byte-for-byte Python framing");
 
-        match parse_predict_response(&content_type, &body).unwrap() {
+        match parse_predict_response(&content_type, &body).unwrap().outputs {
             PredictOutput::Binary(outputs) => {
                 assert_eq!(outputs, vec![b"AAA".to_vec(), b"BB".to_vec()]);
             }
@@ -861,7 +885,7 @@ mod tests {
             b"\x01\x02"
         );
 
-        match parse_predict_response(&content_type, &body).unwrap() {
+        match parse_predict_response(&content_type, &body).unwrap().outputs {
             PredictOutput::Json(outputs) => assert_eq!(outputs.len(), 2),
             other => panic!("client parsed {other:?}"),
         }
@@ -877,6 +901,74 @@ mod tests {
         assert!(content_type.contains("application/json"));
         let value: JsonValue = serde_json::from_slice(&body).unwrap();
         assert_eq!(value, json!({"outputs": [{"echo": {"text": "x"}}]}));
+    }
+
+    /// A typed per-item error slot forces the JSON envelope even for an
+    /// otherwise all-binary batch (the raw and multipart encodings have
+    /// nowhere to put a typed failure), and the client parses it back into
+    /// the surviving *binary* payloads plus the slot error at its input's
+    /// index — an embedding model must not suddenly hand the extraction job
+    /// base64 JSON just because one frame of the item was undecodable.
+    #[tokio::test]
+    async fn an_error_slot_forces_the_json_envelope_and_round_trips() {
+        let response = encode_output_response(vec![
+            WorkerOutput::Bytes(b"AAA".to_vec()),
+            WorkerOutput::Error(SlotError {
+                class: SlotErrorClass::Input,
+                message: "Unreadable image: truncated".to_owned(),
+            }),
+            WorkerOutput::Bytes(b"BB".to_vec()),
+        ]);
+        let (content_type, body) = split_response(response).await;
+        assert!(content_type.contains("application/json"));
+        let value: JsonValue = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["outputs"][1],
+            json!({"__error__": {"class": "input", "message": "Unreadable image: truncated"}})
+        );
+
+        let parsed = parse_predict_response(&content_type, &body).unwrap();
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].index, 1, "the index is the input's");
+        assert_eq!(parsed.errors[0].class, SlotErrorClass::Input);
+        match parsed.outputs {
+            PredictOutput::Binary(outputs) => {
+                assert_eq!(outputs, vec![b"AAA".to_vec(), b"BB".to_vec()]);
+            }
+            other => panic!("client parsed {other:?}"),
+        }
+    }
+
+    /// The same for a JSON-output model (tags/text): survivors stay JSON
+    /// values and the failed slot is reported separately, never as an output.
+    /// A batch where every slot errored yields no outputs at all.
+    #[tokio::test]
+    async fn error_slots_are_separated_from_json_survivors() {
+        let response = encode_output_response(vec![
+            WorkerOutput::Error(SlotError {
+                class: SlotErrorClass::Transient,
+                message: "try again".to_owned(),
+            }),
+            WorkerOutput::Json(json!({"tags": ["a"]})),
+        ]);
+        let (content_type, body) = split_response(response).await;
+        let parsed = parse_predict_response(&content_type, &body).unwrap();
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].class, SlotErrorClass::Transient);
+        assert_eq!(parsed.errors[0].index, 0);
+        match parsed.outputs {
+            PredictOutput::Json(values) => assert_eq!(values, vec![json!({"tags": ["a"]})]),
+            other => panic!("client parsed {other:?}"),
+        }
+
+        let response = encode_output_response(vec![WorkerOutput::Error(SlotError {
+            class: SlotErrorClass::Input,
+            message: "Unreadable image".to_owned(),
+        })]);
+        let (content_type, body) = split_response(response).await;
+        let parsed = parse_predict_response(&content_type, &body).unwrap();
+        assert_eq!(parsed.errors.len(), 1);
+        assert!(parsed.outputs.is_empty(), "nothing succeeded");
     }
 
     // ------------------------------------------------------------------
@@ -1102,7 +1194,7 @@ metadata.description = "echo fixture"
             )
             .await
             .expect("json predict");
-        match output {
+        match output.outputs {
             PredictOutput::Json(values) => {
                 assert_eq!(values, vec![json!({"echo": {"text": "hi"}})]);
             }
@@ -1125,7 +1217,7 @@ metadata.description = "echo fixture"
             )
             .await
             .expect("binary predict");
-        match output {
+        match output.outputs {
             PredictOutput::Binary(outputs) => {
                 assert_eq!(outputs, vec![b"echo:abc".to_vec()]);
             }
@@ -1154,7 +1246,7 @@ metadata.description = "echo fixture"
             )
             .await
             .expect("multipart predict");
-        match output {
+        match output.outputs {
             PredictOutput::Binary(outputs) => {
                 assert_eq!(outputs, vec![b"echo:one".to_vec(), b"echo:two".to_vec()]);
             }
@@ -1281,10 +1373,11 @@ metadata.description = "batch size reporter"
                     .await
                 }));
             }
-            let mut batches = reported_batches(&primer.await.unwrap().expect("primer predict"));
+            let mut batches =
+                reported_batches(&primer.await.unwrap().expect("primer predict").outputs);
             for task in rest {
                 batches.extend(reported_batches(
-                    &task.await.unwrap().expect("queued predict"),
+                    &task.await.unwrap().expect("queued predict").outputs,
                 ));
             }
             batches
@@ -1462,7 +1555,7 @@ config.impl_class = "echo_test"
             )
             .await
             .expect("predict with prewarm=false");
-        match output {
+        match output.outputs {
             PredictOutput::Json(values) => assert_eq!(values, vec![json!({"echo": 1})]),
             other => panic!("expected Json output, got {other:?}"),
         }

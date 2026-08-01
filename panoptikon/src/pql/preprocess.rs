@@ -1,4 +1,4 @@
-use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictOutput};
+use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictOutput, PredictResponse};
 use crate::pql::embedding_utils::{embedding_from_npy_bytes, extract_embeddings, serialize_f32};
 use crate::pql::model::{
     DistanceFunction, EmbedArgs, FailedFor, HasUnprocessedData, InBookmarks, IndexMode, Match,
@@ -911,8 +911,19 @@ fn inference_error<E: std::fmt::Display>(context: &'static str, err: E) -> PqlEr
     PqlError::invalid(context)
 }
 
-fn embedding_from_predict(output: PredictOutput) -> Result<Vec<u8>, PqlError> {
-    match output {
+/// A search-time embed is a single input: a typed error slot on it means the
+/// model rejected the query itself, so there is no embedding to be had. It is
+/// surfaced like every other embed failure (never persisted anywhere — the
+/// ledger is about indexed media, not queries).
+fn embedding_from_predict(response: PredictResponse) -> Result<Vec<u8>, PqlError> {
+    if let Some(error) = response.errors.first() {
+        warn!(
+            class = error.class.as_str(),
+            "inference rejected the embed input: {}", error.message
+        );
+        return Err(PqlError::invalid("inference embed error"));
+    }
+    match response.outputs {
         PredictOutput::Binary(values) => {
             let first = values
                 .first()

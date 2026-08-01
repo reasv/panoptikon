@@ -6,7 +6,7 @@ from typing import List, Sequence, Union
 from inferio.impl.utils import (
     clear_cache,
     get_device,
-    load_image_from_buffer,
+    load_image_or_slot,
     run_with_oom_retry,
     select_dtype,
     serialize_array,
@@ -91,13 +91,17 @@ class NemotronEmbedVLModel(InferenceModel):
 
         text_inputs = []
         image_inputs = []
-        results: List[None | bytes] = [None] * len(inputs)
+        results: List[None | bytes | dict] = [None] * len(inputs)
 
         for idx, input_item in enumerate(inputs):
             if input_item.file:
-                image_inputs.append(
-                    (idx, load_image_from_buffer(input_item.file))
-                )
+                # An undecodable payload takes its own slot instead of the
+                # whole batch (docs/inferio-worker-protocol.md).
+                image, slot = load_image_or_slot(input_item.file, logger=logger)
+                if slot is not None:
+                    results[idx] = slot
+                    continue
+                image_inputs.append((idx, image))
             else:
                 assert isinstance(
                     input_item.data, dict

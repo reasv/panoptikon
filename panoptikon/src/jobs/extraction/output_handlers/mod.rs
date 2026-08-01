@@ -101,17 +101,38 @@ impl PredictOutput {
     }
 }
 
+/// Maps the position of a surviving output back onto the input it came from.
+///
+/// `survivors` is the map built by `surviving_input_indices`: absent means no
+/// slot errored and the mapping is the identity, which is exactly what every
+/// pre-error-slot response gets. Present, it is the original input positions
+/// in output order, so a partial item's stored `index` stays the page/frame
+/// number it always was instead of being renumbered by the drop.
+pub(super) fn input_index(survivors: Option<&[usize]>, position: usize) -> i64 {
+    match survivors {
+        Some(map) => map.get(position).copied().unwrap_or(position) as i64,
+        None => position as i64,
+    }
+}
+
 pub(super) async fn handle_outputs(
     index_db: &str,
     model: &ModelMetadata,
     job_id: i64,
     item: JobInputData,
     outputs: PredictOutput,
+    survivors: Option<&[usize]>,
 ) -> ApiResult<OutputDisposition> {
     match model.output_type.as_str() {
+        // Tags aggregate across the whole item and text embeddings are
+        // single-input by construction, so neither stores a per-input index.
         "tags" => tags::handle_tags_output(index_db, model, job_id, &item, outputs).await,
-        "text" => text::handle_text_output(index_db, model, job_id, &item, outputs).await,
-        "clip" => clip::handle_clip_output(index_db, model, job_id, &item, outputs).await,
+        "text" => {
+            text::handle_text_output(index_db, model, job_id, &item, outputs, survivors).await
+        }
+        "clip" => {
+            clip::handle_clip_output(index_db, model, job_id, &item, outputs, survivors).await
+        }
         "text-embedding" => {
             text_embedding::handle_text_embedding_output(index_db, model, job_id, &item, outputs)
                 .await

@@ -61,9 +61,9 @@ pub enum ApiErrorKind {
     Blocked {
         blocker: Blocker,
     },
-    /// Constructed by the classified batch-1 OOM path of the GPU-compat work,
-    /// which lands with the worker-protocol phase; the ledger and the audit
-    /// surface already carry it.
+    /// Reserved for the classified batch-1 OOM path of the GPU-compat work
+    /// (the worker reports it as a plain message today); the ledger and the
+    /// audit surface already carry the class.
     #[allow(dead_code)]
     Resource,
 }
@@ -203,10 +203,13 @@ impl ApiError {
 }
 
 /// The two classification tools no gateway-native stage produces yet: the
-/// `resource` verdict comes from the GPU-compat batch-1 OOM path and
-/// `with_skip_after` from a site that needs a threshold its constructor does
-/// not imply. Both land with the worker-protocol phase; kept behind their own
-/// `allow` so the wired constructors above stay lint-covered.
+/// `resource` verdict comes from the GPU-compat batch-1 OOM path
+/// (`InferenceOOMError` / `INFERENCE_OOM_BATCH_SIZE_1:`, still unclassified
+/// on the dispatch side) and `with_skip_after` from a site that needs a
+/// threshold its constructor does not imply. The worker-protocol phase left
+/// both unused: a typed `input` slot is confirmed at one attempt, which
+/// `ApiError::input` already is. Kept behind their own `allow` so the wired
+/// constructors above stay lint-covered.
 #[allow(dead_code)]
 impl ApiError {
     /// The item individually exceeds a resource limit (classified batch-1
