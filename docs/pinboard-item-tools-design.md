@@ -177,6 +177,12 @@ Consequences, and why this is the cheap model:
   visible region, mirrored — never "behind" it. Flipping twice in the same
   direction is the group identity: exact cancellation, including the crop
   rects.
+
+  Implementer warning: remapping the manual and auto slots separately is
+  *not* always equal to remapping their composition, because `composeCrops`
+  runs `clampCrop`, which pins composites at `MIN_CROP_FRAC` (2%) — the
+  mismatch only shows up for sub-2% composites, it is a pre-existing
+  property of that floor, and it must not be chased as a rotation bug.
 - The auto crop needs **no reset-and-reapply**: `computeAutoCrop` only
   ever produces centered windows, and a centered window is invariant under
   flips and maps to the correspondingly-centered window under rotation. The
@@ -250,15 +256,27 @@ per-item and bulk variants share it entirely.
 
 ### Codec
 
-- `hField` grows one suffix segment: `o<1-7>`, encoding
+- `hField` grows one suffix segment: `O<1-7>`, encoding
   `quarterTurns + 4·flipped`, appended after the `L` lock segment; identity
-  (0) is omitted so untouched boards serialize byte-identically.
+  (0) is omitted so untouched boards serialize byte-identically. The prefix
+  is **uppercase** for the same reason `L` is: the trim bounds are
+  variable-length base36, so a lowercase `o` appended after them is
+  swallowed as another trim digit — `t5k.8ao5` is genuinely ambiguous
+  (`end = "8ao5"` vs `end = "8a"` plus an orientation), and both the old
+  parser and any new one resolve it wrongly rather than failing cleanly,
+  which would break the forward-compat story below.
+- `quarterTurns` counts CLOCKWISE turns of the source image and the mirror
+  is applied AFTER them, in display space
+  (`display = flipH^flipped ∘ rotateCW^quarterTurns`). The opposite order
+  encodes the same eight states with a different `quarterTurns` on the
+  mirrored half, so the convention has to be stated for the D4 composition
+  and the render transform to agree.
 - `packHField`/`parseHField` currently take positional args and are called
   from ~6 sites (`GalleryPinBoard` rebuild/lock/crop/trim writes,
   `migrateRecords`, `pinboardPreview`); this change should convert them to
   a single extras object (`{crop, autoCrop, trim, lock, orient}`) so the
   next segment doesn't repeat this churn.
-- Forward compat: an old client parsing a field with an `o` segment fails
+- Forward compat: an old client parsing a field with an `O` segment fails
   the strict regex and falls back to height-only (drops crop/trim/lock for
   that pin, keeps geometry). Same degradation class as every previous
   codec growth; acceptable — URLs travel forward, not back.
@@ -415,7 +433,7 @@ over it.
 
 | Area | Files |
 |---|---|
-| Codec (`o` segment, extras-object refactor) | `lib/pinboardCrop.ts`, `lib/pinboardGrid.ts`, `GalleryPinBoard.tsx` (rebuild + lock/crop/trim writers), `lib/pinboardPreview.ts` |
+| Codec (`O` segment, extras-object refactor) | `lib/pinboardCrop.ts`, `lib/pinboardGrid.ts`, `GalleryPinBoard.tsx` (rebuild + lock/crop/trim writers), `lib/pinboardPreview.ts` |
 | Orientation render | `CropView.tsx` (style transform helper), `GalleryPinBoard.tsx` (oriented dims), `lib/pinboardPreview.ts` (canvas transform) |
 | Rotate/flip actions | `hooks/pinboardLayout.ts` (new verbs + rect remap helpers), `PinBoardContextMenu.tsx` (submenu), `GalleryPinBoard.tsx` (selection flips) |
 | Removal verbs | `hooks/pinboardLayout.ts` (below-line verb, sync `foldRows`), `lib/state/pinboardBoardApi.ts`, `PinboardGlobalMenu.tsx`, `PinBoardContextMenu.tsx`, `GalleryPinBoard.tsx` (`SELECTION_VERBS`) |
