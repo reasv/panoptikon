@@ -83,7 +83,7 @@ pub(crate) enum OrderByField {
     Random,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum OrderDirection {
     Asc,
