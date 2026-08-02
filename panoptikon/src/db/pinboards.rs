@@ -137,7 +137,29 @@ fn decay(at: Option<i64>, now: i64, half_life: f64) -> f64 {
 /// The score section 2 of the activity order ranks by: a small recency
 /// boost plus the decayed visit count.
 fn activity_score(board: &PinboardSummary, now: i64) -> f64 {
-    B * decay(board.last_seen, now, HR) + board.frecency * decay(board.frecency_at, now, HF)
+    activity_score_columns(board.last_seen, board.frecency, board.frecency_at, now)
+}
+
+/// `activity_score` over the raw activity columns, for rankers that hold
+/// something other than a `PinboardSummary` (the pinboard content search
+/// ranks its own row type) — so the constants stay in one place.
+pub(crate) fn activity_score_columns(
+    last_seen: Option<i64>,
+    frecency: f64,
+    frecency_at: Option<i64>,
+    now: i64,
+) -> f64 {
+    B * decay(last_seen, now, HR) + frecency * decay(frecency_at, now, HF)
+}
+
+/// Unix seconds, the clock the activity columns are stamped in. Every helper
+/// here takes the time as a parameter so tests run on fixed clocks; this is
+/// what handlers pass.
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Whether an event at `now` counts, or falls inside the debounce window of

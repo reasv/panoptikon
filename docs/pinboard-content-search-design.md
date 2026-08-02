@@ -150,11 +150,22 @@ pub(crate) struct ItemSetBuild {
 The `Results`/`Count` paths are untouched (the mode refactor is mechanical;
 the byte-identical-SQL tests around pagination and count builds pin them).
 
-### 2. New endpoint: `POST /api/search/pql/pinboards`
+### 2. New endpoint: `POST /api/pinboards/search`
 
 Handler in `api/search.rs` (it reuses that module's compile helpers), route
-registered in `main.rs` next to `/api/search/pql`, OpenAPI-registered.
-`DbConnection<ReadOnly>`.
+registered in `main.rs` next to the other `/api/pinboards` routes,
+OpenAPI-registered. `DbConnection<ReadOnly>`.
+
+The path deliberately lives in the **pinboard** authorization domain rather
+than the search one: a ruleset that grants `path_prefix = "/api/search/"`
+without granting pinboards (the shipped `restricted_demo` does exactly that)
+would otherwise leak board names, ids, timestamps and counts, and this is the
+same domain as the `pinboards` client-config capability the UI gates the
+feature on. Placing it under `/api/pinboards/` makes every existing pinboard
+denial cover it automatically. (`search` is a literal segment where the other
+pinboard routes take `{pinboard_id}`; axum 0.8 gives the literal priority and
+`pinboard_id` is an `i64`, so no board URL is shadowed — pinned by a routing
+test in `main.rs`.)
 
 Request body: the **same PQL payload the UI already builds** for
 `/api/search/pql` (so the UI reuses `SearchRequestParts.searchQuery`
@@ -301,7 +312,7 @@ plugged into `queryFromState`
 
 ### Tab content: `PinboardSearchGrid` (new component)
 
-- Fires `POST /api/search/pql/pinboards` with the same
+- Fires `POST /api/pinboards/search` with the same
   `SearchRequestParts.searchQuery` + `dbs` the results/count requests use
   (`ui/lib/searchRequest.ts`), `enabled` only while the tab is active,
   `placeholderData: keepPreviousData` so typing in the search box doesn't
@@ -338,7 +349,7 @@ plugged into `queryFromState`
 1. `BuildMode` + `build_item_set_preprocessed` (+ `primary_order` metadata) +
    unit tests: composed SQL shape, count/results SQL byte-unchanged,
    order-key selection for semantic / default / seeded-random orders.
-2. `POST /api/search/pql/pinboards` + tests: empty query, filtered query,
+2. `POST /api/pinboards/search` + tests: empty query, filtered query,
    best-rank ordering vs. a ROW_NUMBER reference implementation on a fixture
    DB, multi-file item dedupe, head-version-only, user scoping,
    missing-item pins dropped, NULL-key boards last, fraction tiebreak.

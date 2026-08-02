@@ -68,9 +68,6 @@ pub(crate) struct PrimaryOrderKey {
 /// aggregate over it (the pinboard content search intersects it with board
 /// membership). Projection is `file_id`, `item_id` (plus `data_id` for
 /// `entity: text`) and the order-key columns — no user-selected columns.
-// Read by the pinboard content-search endpoint (stage 2 of
-// docs/pinboard-content-search-design.md); tests are the only reader today.
-#[allow(dead_code)]
 pub(crate) struct ItemSetBuild {
     /// No final ORDER BY and no LIMIT/OFFSET; the caller wraps it.
     pub(crate) query: SelectStatement,
@@ -82,7 +79,11 @@ pub(crate) struct ItemSetBuild {
     /// either, so there is no key to project and the caller picks its own
     /// fallback.
     pub(crate) primary_order: Option<PrimaryOrderKey>,
-    /// True when any filter joins the attached user_data database.
+    /// True when any filter joins the attached user_data database. Unread
+    /// today: its only consumer is result-cache keying, and the pinboard
+    /// content search deliberately does not cache in v1 — the board join
+    /// touches user_data unconditionally anyway.
+    #[allow(dead_code)]
     pub(crate) uses_user_data: bool,
 }
 
@@ -242,9 +243,6 @@ pub(crate) fn build_query_preprocessed(
 /// already be preprocessed (semantic filters need their embeddings resolved),
 /// and the caller must have resolved the random-order seed, exactly as for a
 /// results build.
-// Consumed by the pinboard content-search endpoint (stage 2 of
-// docs/pinboard-content-search-design.md); tests are the only caller today.
-#[allow(dead_code)]
 pub(crate) fn build_item_set_preprocessed(
     mut input_query: PqlQuery,
 ) -> Result<ItemSetBuild, PqlError> {

@@ -24,6 +24,7 @@ impl Modify for JsonValueSchema {
     paths(
         crate::api::search::search_pql,
         crate::api::search::search_pql_build,
+        crate::api::search::search_pql_pinboards,
         crate::api::search::get_search_cache,
         crate::api::search::clear_search_cache,
         crate::api::search_cache::get_result_cache,
@@ -109,6 +110,8 @@ impl Modify for JsonValueSchema {
             crate::api::search::PqlBuildResponse,
             crate::api::search::SearchResult,
             crate::api::search::FileSearchResponse,
+            crate::api::search::PinboardSearchMatch,
+            crate::api::search::PinboardSearchResponse,
             crate::api::search::TagSearchResults,
             crate::api::search::TagFrequency,
             crate::api::search::TagStats,

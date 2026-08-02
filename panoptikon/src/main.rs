@@ -466,6 +466,15 @@ async fn async_main() -> anyhow::Result<()> {
                 "/api/pinboards",
                 get(api::pinboards::list_pinboards).post(api::pinboards::create_pinboard),
             )
+            // Content search lives in the pinboard authz domain, not the
+            // search one: under /api/search/ it would inherit search-only
+            // ruleset grants (`path_prefix = "/api/search/"`) and leak board
+            // names, ids and timestamps to policies that deny pinboards. The
+            // handler still lives in api/search.rs.
+            .route(
+                "/api/pinboards/search",
+                post(api::search::search_pql_pinboards),
+            )
             .route(
                 "/api/pinboards/{pinboard_id}",
                 get(api::pinboards::get_pinboard)
@@ -676,6 +685,76 @@ mod route_tests {
                 "/api/relay/pairing-operations/{operation_id}/cancel",
                 axum::routing::delete(api::relay::cancel_pairing_operation),
             );
+    }
+
+    /// The pinboard content search is a literal segment sitting where every
+    /// other pinboard route has a `{pinboard_id}` path param. axum 0.8 gives
+    /// the literal priority and still matches ids, but that is a routing
+    /// subtlety worth pinning: this replicates the registered path set with
+    /// stand-in handlers and asserts both shapes reach the right one.
+    #[tokio::test]
+    async fn pinboard_search_route_does_not_shadow_the_id_route() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app: Router = Router::new()
+            .route(
+                "/api/pinboards",
+                get(|| async { "list" }).post(|| async { "create" }),
+            )
+            .route("/api/pinboards/search", post(|| async { "search" }))
+            .route(
+                "/api/pinboards/{pinboard_id}",
+                get(|axum::extract::Path(id): axum::extract::Path<i64>| async move {
+                    format!("board {id}")
+                }),
+            )
+            .route(
+                "/api/pinboards/{pinboard_id}/versions",
+                get(|| async { "versions" }),
+            );
+
+        async fn call(app: &Router, method: &str, path: &str) -> (StatusCode, String) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("route");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            (status, String::from_utf8(body.to_vec()).expect("utf8"))
+        }
+
+        assert_eq!(
+            call(&app, "POST", "/api/pinboards/search").await,
+            (StatusCode::OK, "search".to_string())
+        );
+        assert_eq!(
+            call(&app, "GET", "/api/pinboards/123").await,
+            (StatusCode::OK, "board 123".to_string())
+        );
+        // The literal wins outright: axum does *not* fall back to the param
+        // route for a method the literal route does not serve. Harmless,
+        // because `{pinboard_id}` is an i64 — `/api/pinboards/search` was
+        // never a reachable board URL — but worth pinning, since it is the
+        // one behavior that would bite if ids ever became names.
+        assert_eq!(
+            call(&app, "GET", "/api/pinboards/search").await.0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            call(&app, "GET", "/api/pinboards/123/versions").await,
+            (StatusCode::OK, "versions".to_string())
+        );
     }
 }
 

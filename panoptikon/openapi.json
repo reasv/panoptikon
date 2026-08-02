@@ -3770,6 +3770,81 @@
         }
       }
     },
+    "/api/pinboards/search": {
+      "post": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Find the pinboards whose images match a search",
+        "description": "Runs the same PQL query `/api/search/pql` would run, intersects its full result set with every pinboard's pinned items, and returns the boards that intersect — not files. Membership is the board's head version only, by sha256, so a pin whose item is no longer indexed never matches.\n\nThe result is unpaginated: the response carries every matching board, ordered by the position of its best-ranked matching image (the direction-adjusted extreme of the search's first order key), then by match fraction, then by match count, then by the library's activity score. Multi-key orders are approximated by their primary key. `page`, `page_size`, `partition_by`, `count`, `results` and `check_path` in the body are ignored: there is one result shape.",
+        "operationId": "search_pql_pinboards",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user",
+            "in": "query",
+            "description": "The user whose pinboards to search.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "user"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The PQL Search query whose results the boards are intersected with",
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PqlQuery"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Matching pinboards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PinboardSearchResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/pinboards/{pinboard_id}": {
       "get": {
         "tags": [
@@ -8009,6 +8084,104 @@
           "activity",
           "updated"
         ]
+      },
+      "PinboardSearchMatch": {
+        "type": "object",
+        "description": "One matching board: the `PinboardSummaryResponse` fields the library card\nrenders, plus how much of the board the search matched.",
+        "required": [
+          "id",
+          "time_added",
+          "time_updated",
+          "item_count",
+          "version_count",
+          "match_count"
+        ],
+        "properties": {
+          "head_version_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "item_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_seen": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the board's last activity — opening it counts, not\njust saving. Null only for rows predating the activity columns."
+          },
+          "match_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Distinct items on the board's head version that the search matched."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "preview_h": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "preview_w": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "screenful_h": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "time_added": {
+            "type": "string"
+          },
+          "time_updated": {
+            "type": "string"
+          },
+          "version_count": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "PinboardSearchResponse": {
+        "type": "object",
+        "required": [
+          "pinboards",
+          "metrics"
+        ],
+        "properties": {
+          "metrics": {
+            "$ref": "#/components/schemas/SearchMetrics"
+          },
+          "pinboards": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardSearchMatch"
+            },
+            "description": "Every board with at least one matching image, unpaginated, in the\nserver's default order (see the endpoint description)."
+          }
+        }
       },
       "PinboardSummaryResponse": {
         "type": "object",
