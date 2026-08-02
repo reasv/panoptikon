@@ -1,7 +1,9 @@
 # Pinboard: multi-remove, rotation/flip, and compress — design
 
-Status: DESIGN — not implemented. Scope is the UI (`ui/` submodule) only; no
-backend or API changes. Five new tool families for the pinboard:
+Status: IMPLEMENTED 2026-08-02 (ui commits 9bb1e18..5eb47ce, six steps:
+codec, rendering, rotate/flip verbs, removal, compress, toolbar flip).
+Scope is the UI (`ui/` submodule) only; no backend or API changes. Five
+new tool families for the pinboard:
 
 1. **Remove Selected** and **Remove All but Selected** (selection scope)
 2. **Remove Items Below Viewport** (board-global scope)
