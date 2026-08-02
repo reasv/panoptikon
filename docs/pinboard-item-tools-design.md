@@ -159,8 +159,12 @@ Consequences, and why this is the cheap model:
   applied to `mediaStyle` and `ghostStyle`. `<video>` takes the same style
   object as `<img>`, so **videos get rotation, flip, crop, and trim with
   zero extra work** — CSS transforms apply to video frames like any other
-  replaced element. Playback, controls overlays, and the timeline are
-  outside the transformed element and are unaffected.
+  replaced element. Playback and the app's own overlays (`MediaControls`,
+  `VideoTimeline`, the pin button) sit outside the transformed element and
+  are unaffected. The browser-native `<video controls>` bar is the one
+  exception — it renders *inside* the element, so it rotates and mirrors
+  with the frames; native controls are opt-in and this is accepted, as
+  shadow-DOM controls admit no counter-transform.
 - The crop **editor** needs no coordinate mapping either: it pans/zooms the
   oriented image and commits oriented-space fractions, which is exactly
   what we store. Only its rendering goes through the same style transform.
@@ -294,9 +298,15 @@ per-item and bulk variants share it entirely.
   around the cell). Without this, saved-board thumbnails would silently
   show unrotated content.
 - The SSR/pre-hydration `object-view-box` fallback in `CropView` gets the
-  CSS transform appended; the inset mapping is already in display space so
-  the crop rect is correct as stored. Worst case is one pre-hydration
-  frame with imperfect framing on exotic browsers — cosmetic.
+  CSS transform appended, and its inset must be mapped **back to source
+  space** through the inverse of the display map (`sourceRect` in
+  `pinboardCrop.ts`): `object-view-box` selects a region of the replaced
+  element's own content and is consumed *before* `transform` applies, so
+  the stored display-space rect would select the wrong region under every
+  non-identity orientation. With the mapping the even quarter-turn states
+  (q=0 flipped, q=2) render this fallback exactly; odd quarter turns stay
+  approximate for one pre-hydration frame, because the transform is
+  origin-center while the contain fit sizes the source box — cosmetic.
 
 ---
 
