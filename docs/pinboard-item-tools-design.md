@@ -199,14 +199,20 @@ Consequences, and why this is the cheap model:
 
 Rotate Left/Right swaps the box's *pixel* dimensions, not its grid units
 (columns and rows have different pixel scales): compute the new column
-span from the current pixel height, then derive the height via the
-existing `findOptimalHeight` against the new (inverted) cropped aspect —
-the same path Resize Item uses. Keep `x`/`y`; RGL's compactor resolves the
+span from the current pixel height and the new row span from the current
+pixel width. That is a genuine pixel swap, and it is what keeps the
+remapped auto crop an exact fit — the cell shape rotates with the content.
+Deriving the height from an aspect instead would be wrong for every item
+whose cell does not match its base aspect (auto-cropped items — the
+default-on path — and hand-letterboxed ones), stranding the remapped crop
+in a wrong-shaped cell. Keep `x`/`y`; RGL's compactor resolves the
 footprint change exactly as it does for Resize Item — rotation is
 explicitly allowed to push neighbors down; that cascade is accepted
 behavior, not a defect to engineer around. Clamp to `minPinUnits` and
-`grid.columns` (a very tall image rotated on a narrow board width-clamps
-and lets `findOptimalHeight` restore the aspect).
+`grid.columns`; the clamped case is the only one that falls back to the
+aspect path — a very tall image rotated on a narrow board width-clamps,
+and `findOptimalHeight` against the swapped (inverted) cropped aspect then
+restores the aspect at that width, the same path Resize Item uses.
 
 Flips change no geometry at all.
 
