@@ -38,6 +38,12 @@ pub(crate) struct ClientCapabilities {
     pub inference: bool,
     /// POST /api/pinboards
     pub pinboards: bool,
+    /// POST /api/pinboards/search
+    ///
+    /// Separate from `pinboards` because that probe is a *write*: a policy
+    /// granting read-only board access would report `pinboards: false` while
+    /// the library search still works.
+    pub pinboard_search: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -74,6 +80,7 @@ fn derive_capabilities(settings: &Settings, policy: &PolicyConfig) -> ClientCapa
         db_create: allows(Method::POST, "/api/db/create"),
         inference: allows(Method::POST, "/api/inference/predict/group/probe"),
         pinboards: allows(Method::POST, "/api/pinboards"),
+        pinboard_search: allows(Method::POST, "/api/pinboards/search"),
     }
 }
 
@@ -245,6 +252,7 @@ disable_backend_open = true
         assert!(!caps.db_create);
         assert!(!caps.inference);
         assert!(!caps.pinboards);
+        assert!(!caps.pinboard_search);
         assert_eq!(
             response.client,
             serde_json::json!({ "search_throttle_ms": 1500, "disable_backend_open": true })
@@ -270,6 +278,7 @@ disable_backend_open = true
                 && caps.db_create
                 && caps.inference
                 && caps.pinboards
+                && caps.pinboard_search
         );
         assert_eq!(
             response.client,
@@ -324,6 +333,57 @@ disable_backend_open = true
         assert_eq!(json["policy"], "demo");
         assert_eq!(json["capabilities"]["scan_jobs"], false);
         assert_eq!(json["client"]["search_throttle_ms"], 1500);
+    }
+
+    /// A read-only-boards ruleset: browsing and searching the library is
+    /// allowed, creating/updating boards is not. `pinboards` (a write probe)
+    /// and `pinboard_search` (a read probe) must disagree here — which is the
+    /// whole reason the second capability exists.
+    #[test]
+    fn read_only_boards_splits_the_two_pinboard_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[rulesets.read_only_boards]
+allow = [
+    { methods = ["GET", "POST"], path_prefix = "/api/search/" },
+    { methods = ["GET"], path_prefix = "/api/pinboards" },
+    { methods = ["POST"], path = "/api/pinboards/search" },
+]
+
+[[policies]]
+name = "reader"
+ruleset = "read_only_boards"
+
+[policies.match]
+hosts = ["reader.example.com"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#,
+        )
+        .unwrap();
+        let settings = Settings::load(Some(path)).unwrap();
+        let caps = derive_capabilities(&settings, &settings.policies[0]);
+        assert!(!caps.pinboards);
+        assert!(caps.pinboard_search);
     }
 
     /// A policy with no ruleset at all (unrestricted) also yields all-true.

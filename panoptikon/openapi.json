@@ -5192,7 +5192,8 @@
           "open_files",
           "db_create",
           "inference",
-          "pinboards"
+          "pinboards",
+          "pinboard_search"
         ],
         "properties": {
           "bookmarks": {
@@ -5214,6 +5215,10 @@
           "open_files": {
             "type": "boolean",
             "description": "POST /api/open/file/{sha256}"
+          },
+          "pinboard_search": {
+            "type": "boolean",
+            "description": "POST /api/pinboards/search\n\nSeparate from `pinboards` because that probe is a *write*: a policy\ngranting read-only board access would report `pinboards: false` while\nthe library search still works."
           },
           "pinboards": {
             "type": "boolean",
