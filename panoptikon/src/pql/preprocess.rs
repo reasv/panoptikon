@@ -1,9 +1,10 @@
 use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictOutput, PredictResponse};
 use crate::pql::embedding_utils::{embedding_from_npy_bytes, extract_embeddings, serialize_f32};
 use crate::pql::model::{
-    DistanceFunction, EmbedArgs, FailedFor, HasUnprocessedData, InBookmarks, IndexMode, Match,
-    MatchAnd, MatchOps, MatchOr, MatchPath, MatchTags, MatchText, MatchValue, MatchValues, Matches,
-    ProcessedBy, QuantResolved, QueryElement, SemanticImageSearch, SemanticTextSearch, SimilarTo,
+    DistanceFunction, EmbedArgs, FailedFor, HasUnprocessedData, InBookmarks, InPinboard, IndexMode,
+    Match, MatchAnd, MatchOps, MatchOr, MatchPath, MatchTags, MatchText, MatchValue, MatchValues,
+    Matches, ProcessedBy, QuantResolved, QueryElement, SemanticImageSearch, SemanticTextSearch,
+    SimilarTo,
 };
 use crate::pql::utils::parse_and_escape_query;
 use base64::{Engine as _, engine::general_purpose};
@@ -245,6 +246,7 @@ pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>,
             Ok(filter.validate().map(QueryElement::HasUnprocessedData))
         }
         QueryElement::FailedFor(filter) => Ok(filter.validate().map(QueryElement::FailedFor)),
+        QueryElement::InPinboard(filter) => Ok(filter.validate().map(QueryElement::InPinboard)),
     }
 }
 
@@ -536,6 +538,7 @@ fn preprocess_query_async_inner<'a, 'b>(
                 Ok(filter.validate().map(QueryElement::HasUnprocessedData))
             }
             QueryElement::FailedFor(filter) => Ok(filter.validate().map(QueryElement::FailedFor)),
+            QueryElement::InPinboard(filter) => Ok(filter.validate().map(QueryElement::InPinboard)),
         }
     })
 }
@@ -596,6 +599,16 @@ impl MatchTags {
 impl InBookmarks {
     fn validate(self) -> Option<Self> {
         if self.in_bookmarks.filter {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+impl InPinboard {
+    fn validate(self) -> Option<Self> {
+        if self.in_pinboard.filter {
             Some(self)
         } else {
             None

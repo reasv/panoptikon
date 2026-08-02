@@ -6458,6 +6458,40 @@
           }
         }
       },
+      "InPinboard": {
+        "type": "object",
+        "description": "Restrict search to items pinned on a pinboard.\n\nNot sortable: pinboard membership has no natural per-item rank, so this\nfollows the `ProcessedBy`/`FailedFor` shape (no `SortableOptions`, no\n`order_rank` column, never an order source) rather than the `InBookmarks`\none.",
+        "required": [
+          "in_pinboard"
+        ],
+        "properties": {
+          "in_pinboard": {
+            "$ref": "#/components/schemas/InPinboardArgs",
+            "description": "Restrict search to items pinned on a pinboard\n\nOnly include items that are members of the head version of a pinboard."
+          }
+        }
+      },
+      "InPinboardArgs": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "boolean",
+            "description": "Enable the filter\n\nMust be set to True, this option only exists to make sure the filter is not empty,\ngiven that that all fields are optional."
+          },
+          "pinboard_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "description": "Pinboard IDs\n\nList of pinboard IDs to filter by. An item matches if it is pinned in the\nhead (current) version of at least one of them.\nIf empty, membership in *any* of the user's pinboards matches."
+          },
+          "user": {
+            "type": "string",
+            "description": "The user whose pinboards are searched."
+          }
+        }
+      },
       "IndexMode": {
         "type": "string",
         "description": "Index mode for vector filters (docs/vector-index-design.md).\n\n`auto` resolves to the default quant profile where its coverage is ready\nfor the queried setter(s), else exact. `exact` always brute-forces\nfull-precision vectors. `quant` demands a quant profile (the `variant`\nor the default) and errors when it isn't ready. `ann` is reserved.",
@@ -8603,6 +8637,9 @@
           },
           {
             "$ref": "#/components/schemas/FailedFor"
+          },
+          {
+            "$ref": "#/components/schemas/InPinboard"
           }
         ]
       },

@@ -226,6 +226,8 @@ impl Modify for JsonValueSchema {
             crate::pql::model::TagsArgs,
             crate::pql::model::InBookmarks,
             crate::pql::model::InBookmarksArgs,
+            crate::pql::model::InPinboard,
+            crate::pql::model::InPinboardArgs,
             crate::pql::model::ProcessedBy,
             crate::pql::model::FailedFor,
             crate::pql::model::HasUnprocessedData,

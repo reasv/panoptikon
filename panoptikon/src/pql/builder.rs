@@ -702,6 +702,7 @@ fn process_query_element(
         QueryElement::ProcessedBy(filter) => filter.build(context, state),
         QueryElement::FailedFor(filter) => filter.build(context, state),
         QueryElement::HasUnprocessedData(filter) => filter.build(context, state),
+        QueryElement::InPinboard(filter) => filter.build(context, state),
     }
 }
 
@@ -2268,4 +2269,23 @@ enum Bookmarks {
     Namespace,
     Sha256,
     TimeAdded,
+}
+
+/// Board identity. Membership is head-version-only, which is why
+/// `HeadVersionId` is the join key rather than a version list.
+#[derive(sea_query::Iden)]
+enum Pinboards {
+    Table,
+    Id,
+    User,
+    HeadVersionId,
+}
+
+/// The reverse membership index; `idx_pinboard_version_items_sha256`
+/// (sha256, version_id) drives the probe from a file's hash.
+#[derive(sea_query::Iden)]
+enum PinboardVersionItems {
+    Table,
+    VersionId,
+    Sha256,
 }

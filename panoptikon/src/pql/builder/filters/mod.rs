@@ -4,6 +4,7 @@ mod failed_for;
 mod has_unprocessed;
 mod image_embeddings;
 mod in_bookmarks;
+mod in_pinboard;
 mod item_similarity;
 mod match_filter;
 mod match_path;
@@ -20,6 +21,7 @@ pub(crate) use failed_for::FailedFor;
 pub(crate) use has_unprocessed::{DerivedDataArgs, HasUnprocessedData};
 pub(crate) use image_embeddings::{SemanticImageArgs, SemanticImageSearch};
 pub(crate) use in_bookmarks::{InBookmarks, InBookmarksArgs};
+pub(crate) use in_pinboard::{InPinboard, InPinboardArgs};
 pub(crate) use item_similarity::{SimilarTo, SimilarityArgs, SourceArgs};
 pub(crate) use match_filter::{
     Match, MatchAnd, MatchNot, MatchOps, MatchOr, MatchValue, MatchValues, Matches, OneOrMany,

@@ -3,10 +3,11 @@ use utoipa::ToSchema;
 
 pub(crate) use crate::pql::builder::filters::{
     DerivedDataArgs, DistanceAggregation, DistanceFunction, EmbedArgs, FailedFor,
-    HasUnprocessedData, InBookmarks, InBookmarksArgs, IndexMode, Match, MatchAnd, MatchNot,
-    MatchOps, MatchOr, MatchPath, MatchPathArgs, MatchTags, MatchText, MatchTextArgs, MatchValue,
-    MatchValues, Matches, ProcessedBy, QuantResolved, SemanticImageArgs, SemanticImageSearch,
-    SemanticTextArgs, SemanticTextSearch, SimilarTo, SimilarityArgs, SourceArgs, TagsArgs,
+    HasUnprocessedData, InBookmarks, InBookmarksArgs, InPinboard, InPinboardArgs, IndexMode, Match,
+    MatchAnd, MatchNot, MatchOps, MatchOr, MatchPath, MatchPathArgs, MatchTags, MatchText,
+    MatchTextArgs, MatchValue, MatchValues, Matches, ProcessedBy, QuantResolved, SemanticImageArgs,
+    SemanticImageSearch, SemanticTextArgs, SemanticTextSearch, SimilarTo, SimilarityArgs,
+    SourceArgs, TagsArgs,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
@@ -516,6 +517,7 @@ pub(crate) enum QueryElement {
     // variants in declaration order, and a new variant placed ahead of an
     // existing one could change how an already-stored query parses.
     FailedFor(FailedFor),
+    InPinboard(InPinboard),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
