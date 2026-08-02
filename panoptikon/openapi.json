@@ -3634,7 +3634,7 @@
           "pinboards"
         ],
         "summary": "List saved pinboards",
-        "description": "Lists the user's saved pinboards, most recently updated first, with head-version metadata (preview dimensions, item and version counts) but without layouts or preview blobs.\nThe `q` parameter matches pinboard names via FTS prefix search.",
+        "description": "Lists the user's saved pinboards with head-version metadata (preview dimensions, item and version counts) but without layouts or preview blobs.\nOrdered by `order`: `activity` (default) ranks by a recency strip followed by a decaying visit score — opening a board counts as activity, not just saving it — while `updated` is plain last-saved-first. The order applies identically under the `q` name search (FTS prefix match).",
         "operationId": "list_pinboards",
         "parameters": [
           {
@@ -3678,6 +3678,15 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "description": "List ordering: `activity` (recency + decaying visit frequency, the\ndefault) or `updated` (last saved first).",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PinboardOrder"
             }
           }
         ],
@@ -7993,6 +8002,14 @@
           }
         }
       },
+      "PinboardOrder": {
+        "type": "string",
+        "description": "Library list ordering. `Activity` is the recency+frequency hybrid;\n`Updated` is the historical `time_updated DESC` order.",
+        "enum": [
+          "activity",
+          "updated"
+        ]
+      },
       "PinboardSummaryResponse": {
         "type": "object",
         "required": [
@@ -8017,6 +8034,14 @@
           "item_count": {
             "type": "integer",
             "format": "int64"
+          },
+          "last_seen": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the board's last activity — opening it counts, not\njust saving. Null only for rows predating the activity columns."
           },
           "name": {
             "type": [

@@ -7,14 +7,24 @@ use axum::{
 use axum_extra::extract::Query;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use sqlx::Connection as _;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::api::db_params::DbQueryParams;
 use crate::api_error::ApiError;
-use crate::db::pinboards;
-use crate::db::{DbConnection, ReadOnly, UserDataWrite};
+use crate::db::pinboards::{self, PinboardOrder};
+use crate::db::{DbConnection, ReadOnly, UserDataWrite, open_user_data_write};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
+
+/// Unix seconds, the clock the activity columns are stamped in. Every db
+/// helper takes the time as a parameter so tests run on fixed clocks.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 const DEFAULT_USER: &str = "user";
 /// Decoded preview blobs larger than this are rejected outright.
@@ -46,6 +56,10 @@ pub(crate) struct PinboardListQuery {
     user: String,
     /// Optional name search (FTS prefix match on pinboard names).
     q: Option<String>,
+    /// List ordering: `activity` (recency + decaying visit frequency, the
+    /// default) or `updated` (last saved first).
+    #[serde(default)]
+    order: PinboardOrder,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -122,6 +136,9 @@ pub(crate) struct PinboardSummaryResponse {
     head_version_id: Option<i64>,
     time_added: String,
     time_updated: String,
+    /// Unix seconds of the board's last activity — opening it counts, not
+    /// just saving. Null only for rows predating the activity columns.
+    last_seen: Option<i64>,
     preview_w: Option<i64>,
     preview_h: Option<i64>,
     screenful_h: Option<i64>,
@@ -250,6 +267,7 @@ fn map_summary(summary: pinboards::PinboardSummary) -> PinboardSummaryResponse {
         head_version_id: summary.head_version_id,
         time_added: summary.time_added,
         time_updated: summary.time_updated,
+        last_seen: summary.last_seen,
         preview_w: summary.preview_w,
         preview_h: summary.preview_h,
         screenful_h: summary.screenful_h,
@@ -277,7 +295,7 @@ fn map_version(version: pinboards::PinboardVersionRecord) -> PinboardVersionResp
     path = "/api/pinboards",
     tag = "pinboards",
     summary = "List saved pinboards",
-    description = "Lists the user's saved pinboards, most recently updated first, with head-version metadata (preview dimensions, item and version counts) but without layouts or preview blobs.\nThe `q` parameter matches pinboard names via FTS prefix search.",
+    description = "Lists the user's saved pinboards with head-version metadata (preview dimensions, item and version counts) but without layouts or preview blobs.\nOrdered by `order`: `activity` (default) ranks by a recency strip followed by a decaying visit score — opening a board counts as activity, not just saving it — while `updated` is plain last-saved-first. The order applies identically under the `q` name search (FTS prefix match).",
     params(DbQueryParams, PinboardListQuery),
     responses(
         (status = 200, description = "Saved pinboards", body = PinboardListResponse)
@@ -287,8 +305,14 @@ pub async fn list_pinboards(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<PinboardListQuery>,
 ) -> ApiResult<Json<PinboardListResponse>> {
-    let summaries =
-        pinboards::list_pinboards(&mut db.conn, &query.user, query.q.as_deref()).await?;
+    let summaries = pinboards::list_pinboards(
+        &mut db.conn,
+        &query.user,
+        query.q.as_deref(),
+        query.order,
+        unix_now(),
+    )
+    .await?;
     Ok(Json(PinboardListResponse {
         pinboards: summaries.into_iter().map(map_summary).collect(),
     }))
@@ -322,6 +346,7 @@ pub async fn create_pinboard(
             &query.user,
             request.name.as_deref(),
             flags.as_deref(),
+            unix_now(),
         )
         .await?;
         let version_id = pinboards::append_version(
@@ -382,6 +407,7 @@ pub async fn get_pinboard(
     else {
         return Err(ApiError::not_found("Pinboard not found"));
     };
+    spawn_activity_write(&db, pinboard_id, &query.user, &summary);
     Ok(Json(PinboardDetailResponse {
         id: summary.id,
         name: summary.name,
@@ -391,6 +417,52 @@ pub async fn get_pinboard(
         version_count: summary.version_count,
         head: head.map(map_version),
     }))
+}
+
+/// Counts an open of `pinboard_id`, unless the last counted event is still
+/// inside the debounce window — the check is free, riding on the row
+/// `get_pinboard` already fetched. Every path that shows a board hits that
+/// endpoint (library open, `pbid`+`pbl` links, and every page load, refresh
+/// or session restore of a tab with a board open), so this is the entire
+/// recording mechanism; there is no client-side beacon.
+///
+/// Fire-and-forget: the response never waits. The spawned task opens its own
+/// short-lived write connection because `get_pinboard` runs on a pooled READ
+/// connection, and that connection deliberately bypasses `DbConnection`'s
+/// drop-time epoch bump — the activity columns can never affect a search
+/// result, so counting an open must not invalidate the search cache.
+/// Failures (notably losing a lock race with a concurrent save) are logged
+/// at debug and dropped: activity data is telemetry, not content.
+fn spawn_activity_write(
+    db: &DbConnection<ReadOnly>,
+    pinboard_id: i64,
+    user: &str,
+    summary: &pinboards::PinboardSummary,
+) {
+    let now = unix_now();
+    if crate::db::readonly_mode() || !pinboards::activity_due(summary.frecency_at, now) {
+        return;
+    }
+    let index_db = db.index_db.clone();
+    let user_data_db = db.user_data_db.clone();
+    let user = user.to_string();
+    let frecency = summary.frecency;
+    let frecency_at = summary.frecency_at;
+    tokio::spawn(async move {
+        let mut conn = match open_user_data_write(&index_db, &user_data_db).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::debug!(error = ?err, "pinboard activity: failed to open database");
+                return;
+            }
+        };
+        if let Err(err) =
+            pinboards::record_open(&mut conn, pinboard_id, &user, now, frecency, frecency_at).await
+        {
+            tracing::debug!(error = %err, "pinboard activity: failed to record open");
+        }
+        let _ = conn.close().await;
+    });
 }
 
 #[utoipa::path(
@@ -564,6 +636,10 @@ pub async fn save_pinboard_version(
                     }
                     None => false,
                 };
+                // A save is a deliberate act even when the layout no-ops,
+                // so it still counts as activity (the frecency half of it
+                // is debounced, so an editing session is one visit).
+                pinboards::touch_saved(&mut db.conn, pinboard_id, &query.user, unix_now()).await?;
                 return Ok(SavePinboardResponse {
                     pinboard_id,
                     version_id: head_version_id,
@@ -590,6 +666,7 @@ pub async fn save_pinboard_version(
             }
             None => false,
         };
+        pinboards::touch_saved(&mut db.conn, pinboard_id, &query.user, unix_now()).await?;
         Ok(SavePinboardResponse {
             pinboard_id,
             version_id,
@@ -771,8 +848,16 @@ fn image_response(bytes: Vec<u8>, media_type: &str) -> ApiResult<Response<Body>>
     Ok(response)
 }
 
+/// IMMEDIATE, not deferred, is a correctness requirement: these transactions
+/// read user_data before their first write, and the background activity
+/// writer (`spawn_activity_write`) commits to the same database at any time.
+/// Under a deferred BEGIN the read pins a WAL snapshot, and the first write
+/// after a concurrent commit fails `SQLITE_BUSY_SNAPSHOT` — which does NOT
+/// invoke the busy handler, so `busy_timeout` never applies and the user's
+/// save 500s. Taking the write lock up front routes the contention through
+/// the busy handler instead, with the telemetry write as the loser.
 async fn begin_transaction(conn: &mut sqlx::SqliteConnection) -> ApiResult<()> {
-    sqlx::query("BEGIN TRANSACTION")
+    sqlx::query("BEGIN IMMEDIATE")
         .execute(conn)
         .await
         .map_err(|err| {
@@ -819,13 +904,16 @@ mod tests {
         }
     }
 
+    /// A fixed clock for tests that don't care about activity timestamps.
+    const T0: i64 = 1_800_000_000;
+
     async fn create_board(
         conn: &mut sqlx::SqliteConnection,
         name: Option<&str>,
         records: &[&str],
         items: &[&str],
     ) -> (i64, i64) {
-        let pinboard_id = pinboards::create_pinboard(conn, "user", name, None)
+        let pinboard_id = pinboards::create_pinboard(conn, "user", name, None, T0)
             .await
             .unwrap();
         let request = save_request(records, items);
@@ -865,9 +953,15 @@ mod tests {
         )
         .await;
 
-        let boards = pinboards::list_pinboards(&mut dbs.index_conn, "user", None)
-            .await
-            .unwrap();
+        let boards = pinboards::list_pinboards(
+            &mut dbs.index_conn,
+            "user",
+            None,
+            PinboardOrder::Activity,
+            T0,
+        )
+        .await
+        .unwrap();
         assert_eq!(boards.len(), 2);
         let board = boards.iter().find(|board| board.id == board_a).unwrap();
         assert_eq!(board.name.as_deref(), Some("poses"));
@@ -884,9 +978,15 @@ mod tests {
         create_board(&mut dbs.index_conn, Some("landscapes"), &["v2"], &[]).await;
         create_board(&mut dbs.index_conn, None, &["v2"], &[]).await;
 
-        let hits = pinboards::list_pinboards(&mut dbs.index_conn, "user", Some("pos"))
-            .await
-            .unwrap();
+        let hits = pinboards::list_pinboards(
+            &mut dbs.index_conn,
+            "user",
+            Some("pos"),
+            PinboardOrder::Activity,
+            T0,
+        )
+        .await
+        .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name.as_deref(), Some("poses standing"));
     }
@@ -1091,7 +1191,7 @@ mod tests {
     #[tokio::test]
     async fn preview_blob_round_trip() {
         let mut dbs = setup_test_databases().await;
-        let pinboard_id = pinboards::create_pinboard(&mut dbs.index_conn, "user", None, None)
+        let pinboard_id = pinboards::create_pinboard(&mut dbs.index_conn, "user", None, None, T0)
             .await
             .unwrap();
         let version_id = pinboards::append_version(
@@ -1130,7 +1230,7 @@ mod tests {
         let mut dbs = setup_test_databases().await;
         let flags = r#"{"pba":true,"pbc":true}"#;
         let pinboard_id =
-            pinboards::create_pinboard(&mut dbs.index_conn, "user", None, Some(flags))
+            pinboards::create_pinboard(&mut dbs.index_conn, "user", None, Some(flags), T0)
                 .await
                 .unwrap();
         pinboards::append_version(
@@ -1215,6 +1315,142 @@ mod tests {
         ok.preview_b64 = Some(base64::engine::general_purpose::STANDARD.encode([1, 2, 3]));
         let upload = validate_version_request(&ok).unwrap();
         assert_eq!(upload.bytes.unwrap(), vec![1, 2, 3]);
+    }
+
+    /// A user_data write connection shaped like the request-scoped
+    /// `UserDataWrite` ones (index db as `main`, user_data attached
+    /// read-write in WAL), with a short busy timeout so a losing writer fails
+    /// in bounded time instead of at sqlx's five-second default. On-disk
+    /// because the shared-cache in-memory databases cannot be opened twice
+    /// as independent connections.
+    async fn connect_user_data_write(
+        index_file: &std::path::Path,
+        user_data_file: &std::path::Path,
+    ) -> sqlx::SqliteConnection {
+        use sqlx::Connection;
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(index_file)
+            .create_if_missing(true)
+            .busy_timeout(std::time::Duration::from_millis(250));
+        let mut conn = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        sqlx::query("ATTACH DATABASE ? AS user_data")
+            .bind(user_data_file.to_string_lossy().to_string())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_data.journal_mode=WAL")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn
+    }
+
+    /// Two connections to one on-disk user_data database, with a board.
+    async fn contention_fixture(
+        dir: &tempfile::TempDir,
+    ) -> (sqlx::SqliteConnection, sqlx::SqliteConnection, i64) {
+        let index_file = dir.path().join("index.db");
+        let user_data_file = dir.path().join("user_data.db");
+        crate::db::migrations::migrate_user_data_db_file(&user_data_file)
+            .await
+            .unwrap();
+        let mut saver = connect_user_data_write(&index_file, &user_data_file).await;
+        let telemetry = connect_user_data_write(&index_file, &user_data_file).await;
+        let (pinboard_id, _) = create_board(
+            &mut saver,
+            None,
+            &["v2", "aaaa", "0", "0", "10", "10"],
+            &["a1"],
+        )
+        .await;
+        (saver, telemetry, pinboard_id)
+    }
+
+    // Ensures the user-facing write transaction beats the fire-and-forget
+    // activity writer: taking the user_data write lock up front makes the
+    // background record_open the contention loser (it waits out the busy
+    // timeout and fails), while the save's own read, write and COMMIT all
+    // succeed. Reverting begin_transaction to a deferred BEGIN flips both
+    // assertions — see the deferred counterpart below.
+    #[tokio::test]
+    async fn save_transaction_beats_background_activity_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut saver, mut telemetry, pinboard_id) = contention_fixture(&dir).await;
+        let now = T0 + 3 * 60 * 60;
+
+        begin_transaction(&mut saver).await.unwrap();
+        // The save path reads before its first write — the deferred-BEGIN trap.
+        let (summary, _) = pinboards::get_pinboard(&mut saver, pinboard_id, "user")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let recorded = pinboards::record_open(
+            &mut telemetry,
+            pinboard_id,
+            "user",
+            now,
+            summary.frecency,
+            summary.frecency_at,
+        )
+        .await;
+        assert!(
+            recorded.is_err(),
+            "telemetry write must lose the race, got {recorded:?}"
+        );
+
+        pinboards::touch_saved(&mut saver, pinboard_id, "user", now)
+            .await
+            .expect("the user's save must survive the contention");
+        commit_transaction(&mut saver).await.unwrap();
+
+        let (summary, _) = pinboards::get_pinboard(&mut telemetry, pinboard_id, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.last_seen, Some(now));
+    }
+
+    // Pins the reason begin_transaction must not be deferred: with a deferred
+    // BEGIN the save's read pins a WAL snapshot, the background telemetry
+    // write commits over it, and the save's *first write* then fails
+    // SQLITE_BUSY_SNAPSHOT — which does not invoke the busy handler, so the
+    // busy timeout above never applies and the failure is immediate.
+    #[tokio::test]
+    async fn deferred_transaction_loses_to_background_activity_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut saver, mut telemetry, pinboard_id) = contention_fixture(&dir).await;
+        let now = T0 + 3 * 60 * 60;
+
+        sqlx::query("BEGIN TRANSACTION")
+            .execute(&mut saver)
+            .await
+            .unwrap();
+        let (summary, _) = pinboards::get_pinboard(&mut saver, pinboard_id, "user")
+            .await
+            .unwrap()
+            .unwrap();
+
+        pinboards::record_open(
+            &mut telemetry,
+            pinboard_id,
+            "user",
+            now,
+            summary.frecency,
+            summary.frecency_at,
+        )
+        .await
+        .expect("nothing holds the write lock, so telemetry wins instead");
+
+        assert!(
+            pinboards::touch_saved(&mut saver, pinboard_id, "user", now)
+                .await
+                .is_err(),
+            "a deferred save must fail here — that is why BEGIN IMMEDIATE is required"
+        );
+        let _ = rollback_transaction(&mut saver).await;
     }
 
     // Ensures media type sniffing recognizes the formats browsers upload.

@@ -681,8 +681,16 @@ fn default_true() -> bool {
     true
 }
 
+/// IMMEDIATE, not deferred, is a correctness requirement: these transactions
+/// read user_data before their first write, and the background pinboard
+/// activity writer commits to the same database at any time. Under a deferred
+/// BEGIN the read pins a WAL snapshot, and the first write after a concurrent
+/// commit fails `SQLITE_BUSY_SNAPSHOT` — which does NOT invoke the busy
+/// handler, so `busy_timeout` never applies and the user's write 500s. Taking
+/// the write lock up front routes the contention through the busy handler
+/// instead, with the telemetry write as the loser.
 async fn begin_transaction(conn: &mut sqlx::SqliteConnection) -> ApiResult<()> {
-    sqlx::query("BEGIN TRANSACTION")
+    sqlx::query("BEGIN IMMEDIATE")
         .execute(conn)
         .await
         .map_err(|err| {

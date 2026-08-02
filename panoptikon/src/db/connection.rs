@@ -131,6 +131,20 @@ pub(crate) async fn open_index_db_read_at_path(
     connect_db(&paths, false, false, false).await
 }
 
+/// A short-lived user-data write connection for background best-effort
+/// writes, configured exactly like the request-scoped `UserDataWrite`
+/// connections (same pragmas, same sqlx busy timeout) but WITHOUT
+/// `DbConnection`'s drop-time epoch bump: the pinboard activity columns can
+/// never affect a search result, so counting an open must not invalidate the
+/// search cache.
+pub(crate) async fn open_user_data_write(
+    index_db: &str,
+    user_data_db: &str,
+) -> Result<SqliteConnection, ApiError> {
+    let paths = db_paths(index_db, user_data_db)?;
+    connect_db(&paths, false, true, true).await
+}
+
 pub(crate) async fn open_index_db_write_no_user_data(
     index_db: &str,
 ) -> Result<SqliteConnection, ApiError> {
