@@ -66,9 +66,12 @@ tab menu. Nothing removes a subset.
   scoped, back-restorable edits.
 - Surfaces: appended to `SELECTION_VERBS` (so they're pinnable to the
   toolbar) and to the context menu's Selection submenu, after a separator,
-  **below** Clear Selection so the destructive pair sits last. Both get
-  destructive styling (filled destructive bg + cursor-pointer, never
-  red-text-on-dark).
+  **below** Clear Selection so the removal pair sits last. Neither gets
+  destructive styling: the pair is back-restorable, and a filled red row
+  advertises a finality these verbs don't have. Position and the separator
+  do the fencing; on the toolbar a pinned removal is an ordinary button.
+  (Revised 2026-08-03 — they shipped with the destructive fill and it read
+  as far heavier than the action warranted.)
 - Availability: `min: 1` for both. "Remove All but Selected" with
   everything selected is a no-op (the no-change guard in `updateRecords`
   already swallows it). Locks do **not** protect against explicit removal
