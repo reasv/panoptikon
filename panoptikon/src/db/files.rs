@@ -554,6 +554,14 @@ pub(crate) async fn delete_files_not_allowed(
         tracing::error!(error = ?err, "failed to compile job filter PQL query");
         ApiError::internal("Failed to delete files")
     })?;
+    // Bookmark/pinboard predicates are circular as file_scan gates (a file
+    // must already be indexed before it can be bookmarked or pinned), and
+    // this connection has no user_data schema attached anyway.
+    if built.uses_user_data {
+        return Err(ApiError::bad_request(
+            "in_bookmarks/in_pinboard filters are not supported in file_scan job filters",
+        ));
+    }
     let paginated = built.paginated_query();
     let (sql, values) = match built.with_clause {
         Some(with_clause) => paginated.with(with_clause).build_sqlx(SqliteQueryBuilder),
@@ -648,6 +656,31 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1
 
         assert_eq!(record.sha256, "sha_one");
         assert_eq!(record.last_modified, "2024-01-01T00:00:00");
+    }
+
+    // A file_scan job filter over user_data (in_bookmarks/in_pinboard) is
+    // circular — a file must already be indexed to be bookmarked — and runs
+    // on a connection without user_data attached; it must fail with a clear
+    // error, not "no such table: user_data.bookmarks".
+    #[tokio::test]
+    async fn delete_files_not_allowed_rejects_user_data_filters() {
+        let mut dbs = setup_test_databases().await;
+        let filter = JobFilter {
+            setter_names: vec!["file_scan".to_string()],
+            pql_query: serde_json::from_value(serde_json::json!({
+                "in_bookmarks": { "filter": true }
+            }))
+            .unwrap(),
+        };
+
+        let err = delete_files_not_allowed(&mut dbs.index_conn, &[filter])
+            .await
+            .expect_err("user_data job filter must be rejected");
+        assert!(
+            err.detail().contains("in_bookmarks"),
+            "unexpected error: {}",
+            err.detail()
+        );
     }
 
     // Ensures update_file_data inserts items and files when new data arrives.
