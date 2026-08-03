@@ -6,6 +6,168 @@ Desktop release notes.
 
 ## [Unreleased]
 
+## [v0.1.8] - 2026-08-03
+
+### Added
+
+- **Files that fail processing are now recorded, skipped, and healed.**
+  Previously a broken file failed again on every job and every rescan,
+  forever, with nothing to show for it. Now:
+  - Failures are classified (bad input, missing dependency, resource limit,
+    or transient) and recorded per file and model. Persistently failing
+    files are skipped on later runs after at most two attempts.
+  - The scan page gained a failed-files card: browse recorded failures,
+    hover for the full error text, click to copy file paths. Job logs count
+    input errors separately from real job failures.
+  - One bad file no longer poisons its whole batch: inference workers
+    report per-item errors, and an implicated item is retried alone so the
+    rest of the batch survives.
+  - A job whose only failures are bad input files completes with a warning
+    instead of reporting failure.
+  - Images whose full decode fails are still indexed (searchable by name,
+    path, and metadata, just without thumbnails) - only files whose basic
+    metadata cannot be read are excluded, matching how broken videos and
+    PDFs already behaved. Broken visuals are remembered, so rescans stop
+    re-decoding the same broken files every time.
+  - Failures caused by a missing dependency (for example no usable pdfium)
+    heal automatically once the dependency is available, and upgrades can
+    ship targeted retries so files that failed due to a now-fixed bug are
+    re-attempted - never a blanket retry of everything.
+  - AppleDouble sidecar files and HTML error pages saved with a media
+    extension are identified by content when they fail, so they are
+    skipped after a single attempt.
+- **Search inside your pinboards.**
+  - A new Library tab in the grid view runs your current search against
+    your pinboards: it lists the boards containing matching images, ordered
+    by where their best match ranks in the results, with match counts.
+  - A new sidebar filter restricts search results by pinboard membership:
+    pinned to any board, pinned to specific boards, or not pinned anywhere -
+    that last one is made for finding matches you haven't curated yet.
+  - PQL gained an `in_pinboard` filter (composable with NOT), and access
+    policies gained a `pinboard_search` read capability gating the new
+    endpoint.
+- **Pinboard pins can be rotated, flipped, and bulk-edited.**
+  - Rotate 90° left/right and flip horizontally/vertically, per pin or for
+    a whole selection. Crops are preserved exactly: the content you framed
+    stays framed, rotated along with the image.
+  - Compress Left/Right/Up shrink letterboxed pins in the chosen direction,
+    cascading so the spacing between pins is preserved.
+  - New removal verbs: Remove Selected (also bound to the Delete key),
+    Remove All but Selected, and Remove Items Below Viewport. No
+    confirmation dialogs - a toast offers undo, and the browser Back button
+    restores the board.
+  - The selection toolbar moves below the selection when it would otherwise
+    cover the controls of pins at the top edge.
+- **The pinboard library sorts by activity.** Boards you recently opened
+  float to the top, followed by a blend of how often and how recently each
+  board is used; a toggle restores the old last-updated order. There is
+  also a new "Open maximized in new tabs" option, and board links opened in
+  new tabs get clean URLs instead of inheriting the whole search state.
+- **New embedding models**: Meta's PE-Core-L14-336 and PE-Core-bigG-14-448,
+  SigLIP2 B/16-384, and NVIDIA's llama-nemotron-embed-vl-1b (a
+  visual-document retrieval model, strongest on screenshots and documents;
+  registered for image embedding with plain text queries). Model
+  descriptions now state the measured VRAM each model needs.
+- **Support for older NVIDIA GPUs.** Models that hardcoded bf16 now
+  negotiate their dtype from the GPU's actual capability at load time, so
+  pre-Ampere cards get fp32 instead of crashes or garbage output (an
+  explicit dtype in your config still wins). Whisper picks a compute type
+  the device supports. Models with a hard hardware floor (dots.ocr needs
+  compute capability 8.0) are marked unavailable in the scan UI with the
+  reason, and refuse to start instead of failing mid-job - they stay
+  selectable so Delete Data still works after a hardware downgrade. GPU
+  out-of-memory during a batch is retried with halved batches; an item
+  that cannot fit even alone fails alone, without sinking the job.
+- The AMD inference stack moved to ROCm 7.2 multi-arch torch builds, with
+  the worker HIP environment derived from the actual install and MIOpen
+  auto-tuning enabled.
+- **Nix packaging**: a Nix flake and NixOS module under `contrib/`,
+  installable from release tags.
+- The server logs the resolved inference accelerator (cpu/cuda/rocm) and
+  detected GPUs at startup, and a new `panoptikon accelerator` subcommand
+  prints the same report on demand.
+
+### Changed
+
+- **Vector quantization moved from binary to int8 and is now on by
+  default.** The experimental binary quantization from v0.1.7 is retired:
+  quant profiles now store int8 codes (about a quarter of full-precision
+  size) whose results are nearly indistinguishable from exact search
+  (identical top-10, top-100 overlap above 96% in evaluation) while being
+  measurably faster - composed default searches ran 1.4-1.8x faster end to
+  end on real databases. Because the ordering now matches exact search,
+  semantic searches use the quantized path automatically whenever the
+  default profile's coverage is ready, falling back to exact scoring
+  otherwise. Existing configs are migrated on upgrade and the quant table
+  is rebuilt automatically. The `k` argument on vector filters is
+  deprecated and ignored, and its control was removed from the search UI.
+- **Database maintenance now runs once per batch of jobs.** Checkpoints,
+  ANALYZE, vacuum checks, and the tag recount used to run after every
+  single job; now jobs report what they changed and maintenance runs when
+  a database's queue empties, as a visible, cancellable Database
+  Maintenance job. Models also stay loaded across consecutive jobs that
+  use them, and cron schedules from multiple databases are merged so jobs
+  sharing a model run back to back instead of reloading it per database.
+  Cancel Selected gained a skip-maintenance option, and a new Database
+  Maintenance card on the scan page runs maintenance on demand.
+- **Tag autocomplete is ranked and fast.** Suggestions are ordered by how
+  many results each tag would actually return, using a per-tag count kept
+  up to date by post-job maintenance - one-letter queries on a database
+  with 22 million tag rows went from ~600 ms to ~2 ms, and the suggestions
+  are the most useful matches instead of an arbitrary sample. The top-tags
+  API endpoint, previously unusable on any sizeable database (10+
+  minutes), now answers in ~150 ms.
+- **CLIP image embedding defaults to FP16**: about half the VRAM and ~6x
+  the throughput, with retrieval quality verified unchanged.
+- **Scans now skip hidden and macOS junk directories.** Directories whose
+  name starts with `.`, and `__MACOSX` directories, are no longer descended
+  into below a scan root (a root you explicitly add still scans even if its
+  own name starts with a dot). Content previously indexed under such
+  directories is retired like any other removed file.
+- Composed semantic searches evaluate exact distances once, in a
+  materialized subquery, instead of repeatedly inside the result sorter,
+  and several prefix lookups (file hashes, tag namespaces, scan roots) now
+  use indexes instead of scanning.
+
+### Fixed
+
+- **Runaway WAL growth during large jobs.** A 1.2M-item tagging job was
+  reported growing the index write-ahead log to 33 GB, with writes slowing
+  to minutes as it grew. The extraction driver held a single job-long read
+  snapshot that no checkpoint could pass; it now drains its work queue in
+  chunks. Additionally, the WAL is capped and truncated by a checkpoint
+  after each job.
+- **Slow searches after upgrading.** Database migrations that change the
+  schema now refresh the query planner's statistics; previously an
+  upgraded database could keep pathological query plans (minutes-long
+  full-text searches) until the next maintenance run.
+- **Corrupt audio no longer sinks embedding jobs.** An audio stream whose
+  metadata lies about its duration could decode to gigabytes, crash the
+  inference worker, and fail its job on every run. Audio embedding models
+  now cap decode duration (they only consume the first seconds anyway),
+  batches are admitted by payload size with a raised 2 GiB transfer cap,
+  and a file that still exceeds the limits lands in the failed-files
+  ledger while the job completes.
+- **Pinboard editing gestures.** Cropping the lowest pin no longer shears
+  the image out of the crop window mid-drag; drag and resize gestures
+  freeze the board's scroll range so small movements are no longer
+  amplified by the board scrolling underneath the pointer; releasing a
+  shrink glides smoothly instead of snapping; dragging or growing a pin
+  past the bottom edge auto-scrolls the board; and layout verbs invoked
+  while crop mode is open no longer commit overlapping layouts.
+- **Bookmark and pinboard saves are more robust under concurrent writes.**
+  Two regressions from the Rust port were fixed: saves could fail
+  instantly instead of waiting their turn when another write was in
+  flight, and saving user data briefly write-locked the whole index.
+- File-scan jobs configured with bookmark or pinboard filters now return a
+  clear error explaining those filters cannot apply to file scans, instead
+  of failing with an internal "no such table" error.
+- Tag autocomplete treats `_` and `%` in the typed query literally instead
+  of as wildcards.
+- Configured pdfium, HTML-renderer, and font paths that fail to resolve
+  are reported with a warning at startup instead of being silently
+  ignored.
+
 ## [v0.1.7] - 2026-07-21
 
 ### Added
