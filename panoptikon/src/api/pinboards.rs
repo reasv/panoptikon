@@ -210,8 +210,14 @@ pub(crate) struct PinboardDeleteResponse {
     new_head_version_id: Option<i64>,
 }
 
+/// A validated preview upload: the decoded blob plus the dimensions that
+/// will be recorded next to it, each range-checked and cross-checked
+/// against the image itself.
 struct PreviewUpload {
     bytes: Option<Vec<u8>>,
+    width: Option<i64>,
+    height: Option<i64>,
+    screenful_h: Option<i64>,
 }
 
 /// Validates and canonicalizes the request's flags into the stored string
@@ -261,9 +267,67 @@ fn validate_version_request(request: &SaveVersionRequest) -> ApiResult<PreviewUp
         }
     }
 
+    validate_preview_upload(
+        request.preview_b64.as_deref(),
+        request.preview_w,
+        request.preview_h,
+        request.screenful_h,
+    )
+}
+
+/// The one place a preview blob and its declared dimensions are accepted.
+///
+/// Every writer goes through this — POST create, POST version, and the PUT
+/// preview replacement — because the read side treats the recorded
+/// `preview_w`/`preview_h` as the truth about the stored bytes: the serve
+/// path answers a `maxw` request with the stored image whenever `preview_w`
+/// says it is already narrow enough (so a too-small declared width makes
+/// even the 160px history rail download the full master forever), and the
+/// library/history cards frame their crop from the declared pair. A single
+/// wrong write would poison every consumer of that version for the rest of
+/// its life, so the declared dimensions are verified against the actual
+/// encoded image here rather than trusted.
+fn validate_preview_upload(
+    preview_b64: Option<&str>,
+    preview_w: Option<i64>,
+    preview_h: Option<i64>,
+    screenful_h: Option<i64>,
+) -> ApiResult<PreviewUpload> {
+    let bytes = decode_preview(preview_b64)?;
+    let width = validate_preview_dimension(preview_w)?;
+    let height = validate_preview_dimension(preview_h)?;
+    // A viewport height, not an image dimension: range-checked only.
+    let screenful_h = validate_preview_dimension(screenful_h)?;
+
+    if let Some(encoded) = bytes.as_deref()
+        && (width.is_some() || height.is_some())
+    {
+        let (actual_w, actual_h) = probe_image_dimensions(encoded)?;
+        if width.is_some_and(|declared| declared != i64::from(actual_w))
+            || height.is_some_and(|declared| declared != i64::from(actual_h))
+        {
+            return Err(ApiError::bad_request(
+                "Preview dimensions do not match the uploaded image",
+            ));
+        }
+    }
+
     Ok(PreviewUpload {
-        bytes: decode_preview(request.preview_b64.as_deref())?,
+        bytes,
+        width,
+        height,
+        screenful_h,
     })
+}
+
+/// Reads an encoded image's pixel dimensions from its header, without
+/// decoding the pixels — cheap enough to run on every preview write.
+fn probe_image_dimensions(bytes: &[u8]) -> ApiResult<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| ApiError::bad_request("Unreadable preview image"))?
+        .into_dimensions()
+        .map_err(|_| ApiError::bad_request("Unreadable preview image"))
 }
 
 /// Decodes an uploaded preview blob. Absent or empty means "no preview",
@@ -287,6 +351,12 @@ fn decode_preview(preview_b64: Option<&str>) -> ApiResult<Option<Vec<u8>>> {
 /// allowed (that is what a version without recorded dimensions looks like);
 /// zero, negative and absurd values are not — the serve path trusts
 /// `preview_w` to decide whether a `maxw` request needs any work at all.
+///
+/// This is only the range half of that trust. The other half — that the
+/// declared numbers are the image's ACTUAL dimensions — is enforced at
+/// write time too, by [`validate_preview_upload`], which every writer of a
+/// preview goes through; the serve path is therefore reading an invariant,
+/// not a client's claim.
 fn validate_preview_dimension(value: Option<i64>) -> ApiResult<Option<i64>> {
     match value {
         None => Ok(None),
@@ -390,9 +460,9 @@ pub async fn create_pinboard(
             &request.version.layout,
             &request.version.items,
             preview.bytes.as_deref(),
-            request.version.preview_w,
-            request.version.preview_h,
-            request.version.screenful_h,
+            preview.width,
+            preview.height,
+            preview.screenful_h,
         )
         .await?;
         Ok((pinboard_id, version_id))
@@ -690,9 +760,9 @@ pub async fn save_pinboard_version(
             &request.layout,
             &request.items,
             preview.bytes.as_deref(),
-            request.preview_w,
-            request.preview_h,
-            request.screenful_h,
+            preview.width,
+            preview.height,
+            preview.screenful_h,
         )
         .await?;
         let flags_updated = match flags.as_deref() {
@@ -861,12 +931,17 @@ pub async fn update_pinboard_version_preview(
     Query(query): Query<PinboardUserQuery>,
     Json(request): Json<UpdatePreviewRequest>,
 ) -> ApiResult<Json<PinboardDeleteResponse>> {
-    let Some(bytes) = decode_preview(Some(request.preview_b64.as_str()))? else {
+    let preview = validate_preview_upload(
+        Some(request.preview_b64.as_str()),
+        request.preview_w,
+        request.preview_h,
+        request.screenful_h,
+    )?;
+    let Some(bytes) = preview.bytes else {
         return Err(ApiError::bad_request("Preview image required"));
     };
-    let preview_w = validate_preview_dimension(request.preview_w)?;
-    let preview_h = validate_preview_dimension(request.preview_h)?;
-    let screenful_h = validate_preview_dimension(request.screenful_h)?;
+    let (preview_w, preview_h, screenful_h) =
+        (preview.width, preview.height, preview.screenful_h);
 
     begin_transaction(&mut db.conn).await?;
     let updated = match pinboards::update_version_preview(
@@ -1448,6 +1523,55 @@ mod tests {
         assert!(validate_preview_dimension(Some(0)).is_err());
         assert!(validate_preview_dimension(Some(-1)).is_err());
         assert!(validate_preview_dimension(Some(MAX_PREVIEW_DIMENSION + 1)).is_err());
+    }
+
+    /// A real encoded PNG of the given size, so the header probe has
+    /// something truthful to read.
+    fn encoded_png(width: u32, height: u32) -> String {
+        let img = image::RgbImage::new(width, height);
+        let mut bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode");
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }
+
+    // Ensures no writer can record dimensions the uploaded image does not
+    // actually have. The serve path skips all work when preview_w says the
+    // stored image is already narrow enough, so a wrong width would make
+    // every consumer — down to the 160px history rail — fetch the full
+    // master for the rest of that version's life.
+    #[test]
+    fn declared_preview_dimensions_must_match_the_image() {
+        let png = encoded_png(64, 32);
+
+        let upload = validate_preview_upload(Some(&png), Some(64), Some(32), Some(16)).unwrap();
+        assert_eq!(upload.width, Some(64));
+        assert_eq!(upload.height, Some(32));
+        assert_eq!(upload.screenful_h, Some(16));
+
+        // Either half wrong is a rejection.
+        assert!(validate_preview_upload(Some(&png), Some(16), Some(32), None).is_err());
+        assert!(validate_preview_upload(Some(&png), Some(64), Some(999), None).is_err());
+        // Out-of-range dimensions are still caught before the image is read.
+        assert!(validate_preview_upload(Some(&png), Some(0), None, None).is_err());
+        // Undeclared dimensions stay legal: that is a version with no
+        // recorded size, which the serve path already handles by decoding.
+        let undeclared = validate_preview_upload(Some(&png), None, None, None).unwrap();
+        assert_eq!(undeclared.width, None);
+        // Bytes that are not a decodable image cannot back a declared size.
+        let junk = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
+        assert!(validate_preview_upload(Some(&junk), Some(64), None, None).is_err());
+        // An empty blob is "no preview", which the PUT handler turns into a
+        // 400 and the save paths accept as a version without a picture.
+        assert!(
+            validate_preview_upload(Some(""), None, None, None)
+                .unwrap()
+                .bytes
+                .is_none()
+        );
     }
 
     // Ensures flags round-trip on the board, and set_flags detects change

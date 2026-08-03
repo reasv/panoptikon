@@ -417,9 +417,23 @@ consumer through the existing `maxw` pipeline.
 1. **Raise the master**: `PREVIEW_WIDTH` 1024 → **2048**. Size check: 2048-wide,
    2-screenful WebP q0.82 lands in the hundreds of KB, far under the 8 MiB cap
    (`MAX_PREVIEW_BYTES`); the serve clamp already allows `maxw` ≤ 4096.
+   `MAX_PREVIEW_BYTES` was never the binding ceiling, though: previews travel
+   base64-encoded inside the JSON body, and axum's `DefaultBodyLimit` is
+   **2 MiB**, so a dense board (1.6–3.1 MB of base64) 413'd at the extractor
+   before the handler ran at all — the board became permanently unsaveable and
+   the 8 MiB cap was unreachable. Fixed by merging the pinboard routes as their
+   own router under `DefaultBodyLimit::max(PINBOARD_BODY_LIMIT)` (16 MiB: 8 MiB
+   × 4/3 base64 inflation, plus the 1 MiB `MAX_LAYOUT_BYTES` and JSON
+   overhead), so `api::pinboards` is again what decides that an upload is too
+   big. Every other route keeps the 2 MiB default.
 2. **Serve-path fix**: when `maxw` ≥ stored width, return the stored bytes
    instead of upscale-guarding through a JPEG re-encode — removes the
-   double-compression on popovers permanently.
+   double-compression on popovers permanently. This makes the recorded
+   `preview_w` load-bearing, so all three writers (POST create, POST version,
+   PUT preview) verify the declared `preview_w`/`preview_h` against the actual
+   encoded image with a header-only dimension probe and 400 on a mismatch —
+   otherwise one bad write would make every consumer, down to the 160px
+   history rail, fetch the full master forever.
 3. **Consumer sizes**: in-modal library grid keeps 320 (fine there); the search
    tab requests a dedicated larger card size (proposal: `maxw=768`); hover
    popovers request the master with no `maxw` (with fix 2 this is the pristine
