@@ -1,7 +1,8 @@
 # Pinboard: gravity toggle, mosaic export, proportional grid — feasibility & design
 
-Status: **designed, not implemented** (2026-08-03). Five features; the
-gravity toggle and the proportional grid share one storage mechanism (a grid-token
+Status: features 1-5 **implemented** on branch `claude/pinboard-view-features`
+(2026-08-03); feature 6 (resize-handles toggle) added afterwards. The gravity
+toggle and the proportional grid share one storage mechanism (a grid-token
 extension), the mosaic export is purely additive. Features 4 (row-wise new-pin
 placement) and 5 (preview resolution + regeneration) are ridealongs added after
 the first design pass; feature 4 is effectively a prerequisite for shipping the
@@ -417,9 +418,23 @@ consumer through the existing `maxw` pipeline.
 1. **Raise the master**: `PREVIEW_WIDTH` 1024 → **2048**. Size check: 2048-wide,
    2-screenful WebP q0.82 lands in the hundreds of KB, far under the 8 MiB cap
    (`MAX_PREVIEW_BYTES`); the serve clamp already allows `maxw` ≤ 4096.
+   `MAX_PREVIEW_BYTES` was never the binding ceiling, though: previews travel
+   base64-encoded inside the JSON body, and axum's `DefaultBodyLimit` is
+   **2 MiB**, so a dense board (1.6–3.1 MB of base64) 413'd at the extractor
+   before the handler ran at all — the board became permanently unsaveable and
+   the 8 MiB cap was unreachable. Fixed by merging the pinboard routes as their
+   own router under `DefaultBodyLimit::max(PINBOARD_BODY_LIMIT)` (16 MiB: 8 MiB
+   × 4/3 base64 inflation, plus the 1 MiB `MAX_LAYOUT_BYTES` and JSON
+   overhead), so `api::pinboards` is again what decides that an upload is too
+   big. Every other route keeps the 2 MiB default.
 2. **Serve-path fix**: when `maxw` ≥ stored width, return the stored bytes
    instead of upscale-guarding through a JPEG re-encode — removes the
-   double-compression on popovers permanently.
+   double-compression on popovers permanently. This makes the recorded
+   `preview_w` load-bearing, so all three writers (POST create, POST version,
+   PUT preview) verify the declared `preview_w`/`preview_h` against the actual
+   encoded image with a header-only dimension probe and 400 on a mismatch —
+   otherwise one bad write would make every consumer, down to the 160px
+   history rail, fetch the full master forever.
 3. **Consumer sizes**: in-modal library grid keeps 320 (fine there); the search
    tab requests a dedicated larger card size (proposal: `maxw=768`); hover
    popovers request the master with no `maxw` (with fix 2 this is the pristine
@@ -458,6 +473,55 @@ button — which is honest opt-in UI, not a migration.
 Note: once feature 3 exists, boards saved with `w<int>` in the token *do*
 record their authored width, making exact batch regeneration possible for those
 versions later.
+
+---
+
+## Feature 6 — All-resize-handles toggle
+
+Today `RESIZE_CONFIG = { enabled: true }` leaves react-resizable's default
+handle set — the bottom-right (`se`) corner only — on every normal pin, as a
+deliberate simplification against accidental grabs. The full set already exists
+in the codebase: `ALL_RESIZE_HANDLES` (`GalleryPinBoard.tsx:55-56`) is applied
+per-item to the crop-mode item (`:519-521`), so RGL v2's per-item
+`resizeHandles` mechanism and the CSS for all 8 handles are both proven.
+
+Design — exactly the Show Grid shape (the user's framing):
+
+- **Board flag `prh`** in the `PinboardDefaultableKey` registry (codec default
+  `false`, creation default `false`, label "All Resize Handles"). Registry
+  enrollment is TS-enforced since feature 3, so flags save/load/stamp,
+  sanitizer, destroy-clear, and the new-board defaults set all follow
+  automatically. Not version-scoped, not in the token — a pure view preference
+  like `pg`.
+- **Render**: in the layout memo, when the flag is on, normal items get
+  `resizeHandles: ALL_RESIZE_HANDLES` alongside their existing `minW`/`minH`.
+  Unchanged: the crop-mode item (always all 8), size-locked items (no handles),
+  anchored statics (RGL ignores resize on statics anyway — verify).
+- **UI**: checkbox "All Resize Handles" directly after Show Grid in the global
+  menu (tooltip "Resize from every edge and corner, not just the bottom-right
+  one"), plus a fullscreen-bar toggle. No empty-board disable needed — like
+  `pg`, it is a plain flag with no token dependency.
+- **Verification focus**: the non-crop `onResizeStart`/`onResizeStop` paths must
+  not assume the `se` handle (the crop-mode branch already parses all 8
+  directions); north/west-edge resizes move `x`/`y` natively in RGL. As
+  implemented, the review found that the north handles are not merely
+  "re-settling" under gravity: RGL v2's `GridItem` re-derives the resize anchor
+  from the item's *current* layout position on every event, and
+  `fastVerticalCompactor` snaps that position back between events, so `n`/`nw`/
+  `ne` are functionally **inverted** (dragging the top edge down shrinks from
+  the bottom) — the same failure the crop-mode compactor comment documents.
+  Resolution: the handle set is **gravity-gated**. Gravity off (float, where
+  the compactor is `noCompactor`) gets all eight (`ALL_RESIZE_HANDLES`);
+  gravity on gets only the handles compaction cannot fight,
+  `GRAVITY_RESIZE_HANDLES = ["s", "w", "e", "sw", "se"]`. Under gravity the top
+  edge is pinned by the layout physics anyway, so the excluded handles have no
+  coherent meaning there; both toggle tooltips say top-edge handles need
+  Gravity off.
+
+### Resolved decisions (feature 6)
+
+14. Label "All Resize Handles"; default OFF everywhere (the one-corner
+    simplification remains the out-of-box behavior).
 
 ---
 

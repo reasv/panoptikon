@@ -111,6 +111,21 @@ enum Command {
     },
 }
 
+/// Request-body ceiling for the pinboard routes.
+///
+/// Pinboard writes carry the board's composited preview image inline in the
+/// JSON body as base64 (`POST /api/pinboards`, `POST …/versions`, and
+/// `PUT …/versions/{id}/preview`), so axum's 2 MiB `DefaultBodyLimit` cuts
+/// them off long before the handler's own caps apply: a dense board at the
+/// 2048px preview master is a multi-megabyte payload, and a 413 at the
+/// extractor makes the board permanently unsaveable. The worst case the
+/// handlers actually accept is `MAX_PREVIEW_BYTES` (8 MiB) inflated ~4/3 by
+/// base64 (~10.7 MiB) plus `MAX_LAYOUT_BYTES` (1 MiB) and JSON overhead, so
+/// 16 MiB puts the limit just above what `api::pinboards` will accept and
+/// keeps the handler the thing that rejects oversized uploads. Every other
+/// route keeps the 2 MiB default.
+const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
 fn main() -> anyhow::Result<()> {
     // Build a custom tokio runtime with a larger worker thread stack size.
     // The default 2MB stack can be insufficient for deeply nested async code,
@@ -462,37 +477,47 @@ async fn async_main() -> anyhow::Result<()> {
                     .put(api::bookmarks::add_bookmark_by_sha256)
                     .delete(api::bookmarks::delete_bookmark_by_sha256),
             )
-            .route(
-                "/api/pinboards",
-                get(api::pinboards::list_pinboards).post(api::pinboards::create_pinboard),
-            )
-            // Content search lives in the pinboard authz domain, not the
-            // search one: under /api/search/ it would inherit search-only
-            // ruleset grants (`path_prefix = "/api/search/"`) and leak board
-            // names, ids and timestamps to policies that deny pinboards. The
-            // handler still lives in api/search.rs.
-            .route(
-                "/api/pinboards/search",
-                post(api::search::search_pql_pinboards),
-            )
-            .route(
-                "/api/pinboards/{pinboard_id}",
-                get(api::pinboards::get_pinboard)
-                    .patch(api::pinboards::update_pinboard)
-                    .delete(api::pinboards::delete_pinboard),
-            )
-            .route(
-                "/api/pinboards/{pinboard_id}/versions",
-                get(api::pinboards::list_pinboard_versions)
-                    .post(api::pinboards::save_pinboard_version),
-            )
-            .route(
-                "/api/pinboards/{pinboard_id}/versions/{version_id}",
-                delete(api::pinboards::delete_pinboard_version),
-            )
-            .route(
-                "/api/pinboards/{pinboard_id}/versions/{version_id}/preview",
-                get(api::pinboards::pinboard_version_preview),
+            // The pinboard surface is merged as its own router purely so the
+            // raised body limit lands on these paths and nowhere else; the
+            // routes are otherwise ordinary members of the app.
+            .merge(
+                Router::new()
+                    .route(
+                        "/api/pinboards",
+                        get(api::pinboards::list_pinboards)
+                            .post(api::pinboards::create_pinboard),
+                    )
+                    // Content search lives in the pinboard authz domain, not
+                    // the search one: under /api/search/ it would inherit
+                    // search-only ruleset grants (`path_prefix =
+                    // "/api/search/"`) and leak board names, ids and
+                    // timestamps to policies that deny pinboards. The handler
+                    // still lives in api/search.rs.
+                    .route(
+                        "/api/pinboards/search",
+                        post(api::search::search_pql_pinboards),
+                    )
+                    .route(
+                        "/api/pinboards/{pinboard_id}",
+                        get(api::pinboards::get_pinboard)
+                            .patch(api::pinboards::update_pinboard)
+                            .delete(api::pinboards::delete_pinboard),
+                    )
+                    .route(
+                        "/api/pinboards/{pinboard_id}/versions",
+                        get(api::pinboards::list_pinboard_versions)
+                            .post(api::pinboards::save_pinboard_version),
+                    )
+                    .route(
+                        "/api/pinboards/{pinboard_id}/versions/{version_id}",
+                        delete(api::pinboards::delete_pinboard_version),
+                    )
+                    .route(
+                        "/api/pinboards/{pinboard_id}/versions/{version_id}/preview",
+                        get(api::pinboards::pinboard_version_preview)
+                            .put(api::pinboards::update_pinboard_version_preview),
+                    )
+                    .layer(axum::extract::DefaultBodyLimit::max(PINBOARD_BODY_LIMIT)),
             )
             .route("/api/items/item/file", get(api::items::item_file))
             .route("/api/items/item/thumbnail", get(api::items::item_thumbnail))
