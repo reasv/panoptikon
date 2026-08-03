@@ -58,6 +58,24 @@ Desktop release notes.
     restores the board.
   - The selection toolbar moves below the selection when it would otherwise
     cover the controls of pins at the top edge.
+- **Pinboard layout modes and export.**
+  - A gravity toggle per board: turn off the automatic upward packing so
+    pins stay exactly where you place them. On gravity-off boards, layout
+    tools resolve any overlaps they would create by nudging pins downward
+    instead of repacking the whole board.
+  - A proportional layout mode that scales the entire arrangement with the
+    window width, so a board composed at one size keeps its proportions at
+    any other - instead of fixed-size cells reflowing.
+  - Export a board as a single JPEG mosaic image, either seamless (gaps
+    closed up) or reproducing the board's visible extent as arranged.
+  - A per-board toggle to show resize handles on every edge and corner of
+    each pin, not just the bottom-right (boards with gravity on omit the
+    top handles, which cannot work under automatic packing).
+  - Newly pinned items are placed row by row into the first free spot near
+    the bottom of the board, instead of always starting a new row.
+  - Pinboard preview images are sharper (the stored master doubled to
+    2048px), and a Refresh Preview action re-renders a board's preview on
+    demand.
 - **The pinboard library sorts by activity.** Boards you recently opened
   float to the top, followed by a blend of how often and how recently each
   board is used; a toggle restores the old last-updated order. There is
