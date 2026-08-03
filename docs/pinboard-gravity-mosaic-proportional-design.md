@@ -1,7 +1,8 @@
 # Pinboard: gravity toggle, mosaic export, proportional grid — feasibility & design
 
-Status: **designed, not implemented** (2026-08-03). Five features; the
-gravity toggle and the proportional grid share one storage mechanism (a grid-token
+Status: features 1-5 **implemented** on branch `claude/pinboard-view-features`
+(2026-08-03); feature 6 (resize-handles toggle) added afterwards. The gravity
+toggle and the proportional grid share one storage mechanism (a grid-token
 extension), the mosaic export is purely additive. Features 4 (row-wise new-pin
 placement) and 5 (preview resolution + regeneration) are ridealongs added after
 the first design pass; feature 4 is effectively a prerequisite for shipping the
@@ -472,6 +473,45 @@ button — which is honest opt-in UI, not a migration.
 Note: once feature 3 exists, boards saved with `w<int>` in the token *do*
 record their authored width, making exact batch regeneration possible for those
 versions later.
+
+---
+
+## Feature 6 — All-resize-handles toggle
+
+Today `RESIZE_CONFIG = { enabled: true }` leaves react-resizable's default
+handle set — the bottom-right (`se`) corner only — on every normal pin, as a
+deliberate simplification against accidental grabs. The full set already exists
+in the codebase: `ALL_RESIZE_HANDLES` (`GalleryPinBoard.tsx:55-56`) is applied
+per-item to the crop-mode item (`:519-521`), so RGL v2's per-item
+`resizeHandles` mechanism and the CSS for all 8 handles are both proven.
+
+Design — exactly the Show Grid shape (the user's framing):
+
+- **Board flag `prh`** in the `PinboardDefaultableKey` registry (codec default
+  `false`, creation default `false`, label "All Resize Handles"). Registry
+  enrollment is TS-enforced since feature 3, so flags save/load/stamp,
+  sanitizer, destroy-clear, and the new-board defaults set all follow
+  automatically. Not version-scoped, not in the token — a pure view preference
+  like `pg`.
+- **Render**: in the layout memo, when the flag is on, normal items get
+  `resizeHandles: ALL_RESIZE_HANDLES` alongside their existing `minW`/`minH`.
+  Unchanged: the crop-mode item (always all 8), size-locked items (no handles),
+  anchored statics (RGL ignores resize on statics anyway — verify).
+- **UI**: checkbox "All Resize Handles" directly after Show Grid in the global
+  menu (tooltip "Resize from every edge and corner, not just the bottom-right
+  one"), plus a fullscreen-bar toggle. No empty-board disable needed — like
+  `pg`, it is a plain flag with no token dependency.
+- **Verification focus**: the non-crop `onResizeStart`/`onResizeStop` paths must
+  not assume the `se` handle (the crop-mode branch already parses all 8
+  directions); north/west-edge resizes move `x`/`y` natively in RGL — with
+  gravity on the item may re-settle after the gesture, which is standard RGL
+  behavior and accepted; with gravity off the existing noCompactor semantics
+  apply unchanged.
+
+### Resolved decisions (feature 6)
+
+14. Label "All Resize Handles"; default OFF everywhere (the one-corner
+    simplification remains the out-of-box behavior).
 
 ---
 
