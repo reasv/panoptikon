@@ -503,10 +503,20 @@ Design — exactly the Show Grid shape (the user's framing):
   `pg`, it is a plain flag with no token dependency.
 - **Verification focus**: the non-crop `onResizeStart`/`onResizeStop` paths must
   not assume the `se` handle (the crop-mode branch already parses all 8
-  directions); north/west-edge resizes move `x`/`y` natively in RGL — with
-  gravity on the item may re-settle after the gesture, which is standard RGL
-  behavior and accepted; with gravity off the existing noCompactor semantics
-  apply unchanged.
+  directions); north/west-edge resizes move `x`/`y` natively in RGL. As
+  implemented, the review found that the north handles are not merely
+  "re-settling" under gravity: RGL v2's `GridItem` re-derives the resize anchor
+  from the item's *current* layout position on every event, and
+  `fastVerticalCompactor` snaps that position back between events, so `n`/`nw`/
+  `ne` are functionally **inverted** (dragging the top edge down shrinks from
+  the bottom) — the same failure the crop-mode compactor comment documents.
+  Resolution: the handle set is **gravity-gated**. Gravity off (float, where
+  the compactor is `noCompactor`) gets all eight (`ALL_RESIZE_HANDLES`);
+  gravity on gets only the handles compaction cannot fight,
+  `GRAVITY_RESIZE_HANDLES = ["s", "w", "e", "sw", "se"]`. Under gravity the top
+  edge is pinned by the layout physics anyway, so the excluded handles have no
+  coherent meaning there; both toggle tooltips say top-edge handles need
+  Gravity off.
 
 ### Resolved decisions (feature 6)
 
