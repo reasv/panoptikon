@@ -492,7 +492,8 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/pinboards/{pinboard_id}/versions/{version_id}/preview",
-                get(api::pinboards::pinboard_version_preview),
+                get(api::pinboards::pinboard_version_preview)
+                    .put(api::pinboards::update_pinboard_version_preview),
             )
             .route("/api/items/item/file", get(api::items::item_file))
             .route("/api/items/item/thumbnail", get(api::items::item_thumbnail))

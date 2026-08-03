@@ -78,6 +78,10 @@ pub(crate) struct PinboardVersionRecord {
 
 pub(crate) struct PreviewBlob {
     pub bytes: Vec<u8>,
+    /// The width the client composited at, as recorded when the version was
+    /// saved. Lets the serve path answer a `maxw` request that is already
+    /// satisfied without decoding the image. None for rows saved without it.
+    pub width: Option<i64>,
 }
 
 pub(crate) enum DeleteVersionOutcome {
@@ -920,7 +924,7 @@ pub(crate) async fn get_version_preview(
 ) -> ApiResult<Option<PreviewBlob>> {
     let row = sqlx::query(
         r#"
-        SELECT v.preview, v.time_added
+        SELECT v.preview, v.preview_w, v.time_added
         FROM user_data.pinboard_versions v
         JOIN user_data.pinboards p ON p.id = v.pinboard_id
         WHERE v.id = ? AND v.pinboard_id = ? AND p.user = ?
@@ -937,7 +941,52 @@ pub(crate) async fn get_version_preview(
     let bytes: Option<Vec<u8>> = row
         .try_get("preview")
         .map_err(internal("Failed to get pinboard preview"))?;
-    Ok(bytes.map(|bytes| PreviewBlob { bytes }))
+    let width: Option<i64> = row
+        .try_get("preview_w")
+        .map_err(internal("Failed to get pinboard preview"))?;
+    Ok(bytes.map(|bytes| PreviewBlob { bytes, width }))
+}
+
+/// Replaces the stored preview of one existing version in place, user-scoped
+/// via the owning board. Returns false when no such version belongs to that
+/// user's board (the 404 case).
+///
+/// Deliberately does NOT bump `pinboards.time_updated`, and never touches the
+/// version's layout, items or name-at-save: re-rendering the picture of a
+/// version is not a content change, so it must not reorder the library list —
+/// the same reasoning as `set_flags`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn update_version_preview(
+    conn: &mut sqlx::SqliteConnection,
+    pinboard_id: i64,
+    version_id: i64,
+    user: &str,
+    preview: &[u8],
+    preview_w: Option<i64>,
+    preview_h: Option<i64>,
+    screenful_h: Option<i64>,
+) -> ApiResult<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE user_data.pinboard_versions
+        SET preview = ?, preview_w = ?, preview_h = ?, screenful_h = ?
+        WHERE id = ? AND pinboard_id = ? AND pinboard_id IN (
+            SELECT id FROM user_data.pinboards WHERE id = ? AND user = ?
+        )
+        "#,
+    )
+    .bind(preview)
+    .bind(preview_w)
+    .bind(preview_h)
+    .bind(screenful_h)
+    .bind(version_id)
+    .bind(pinboard_id)
+    .bind(pinboard_id)
+    .bind(user)
+    .execute(conn)
+    .await
+    .map_err(internal("Failed to update pinboard preview"))?;
+    Ok(result.rows_affected() > 0)
 }
 
 // Activity ordering: the recording rules (debounce, decay, seeding) and the

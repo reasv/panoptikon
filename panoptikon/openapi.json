@@ -4299,7 +4299,7 @@
           "pinboards"
         ],
         "summary": "Get the stored preview image for a pinboard version",
-        "description": "Serves the client-composited preview for one version. Versions are immutable, so responses carry immutable cache headers.\nWith `maxw`, the image is downscaled on the fly (JPEG) to at most that width; without it, the stored image is served as uploaded.",
+        "description": "Serves the client-composited preview for one version. Responses carry immutable cache headers.\nWith `maxw`, the image is downscaled on the fly (JPEG) to at most that width — unless the stored image is already no wider than `maxw`, in which case it is served as uploaded, exactly as it is without `maxw`. Asking for the full master therefore costs no second lossy pass.",
         "operationId": "pinboard_version_preview",
         "parameters": [
           {
@@ -4374,6 +4374,95 @@
           },
           "404": {
             "description": "No preview stored for this version"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "pinboards"
+        ],
+        "summary": "Replace the stored preview image of a pinboard version",
+        "description": "Overwrites one version's preview image and its recorded dimensions, leaving the layout, items and name-at-save untouched. The compositor is client-side, so this is how a board saved at an older preview resolution gets a better picture without minting a version: recomposite the head version's layout and PUT the result.\nThe board's `time_updated` is deliberately not bumped — re-rendering the picture of a version is not a content change, so it must not reorder the library.\nCaveat: version previews are served with immutable cache headers (versions were immutable until this endpoint existed), so after a refresh, already-cached sizes persist in browsers and proxies until a hard refresh. Accepted as-is: this is a one-time local operation, not a cache-busting mechanism.",
+        "operationId": "update_pinboard_version_preview",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "pinboard_id",
+            "in": "path",
+            "description": "The pinboard id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "version_id",
+            "in": "path",
+            "description": "The version id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "user",
+            "in": "query",
+            "description": "The user the pinboard belongs to.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "user"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Preview replaced",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PinboardDeleteResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Version not found"
           }
         }
       }
@@ -10129,6 +10218,41 @@
             "items": {
               "$ref": "#/components/schemas/ExtractedTextRecord"
             }
+          }
+        }
+      },
+      "UpdatePreviewRequest": {
+        "type": "object",
+        "description": "A replacement preview image for an existing version. Same field semantics\nas the preview half of [`SaveVersionRequest`]; nothing else about the\nversion can be changed.",
+        "required": [
+          "preview_b64"
+        ],
+        "properties": {
+          "preview_b64": {
+            "type": "string",
+            "description": "Base64-encoded preview image (WebP or PNG), composited client-side."
+          },
+          "preview_h": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "preview_w": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "screenful_h": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Height in preview-image pixels of one save-time viewport screenful."
           }
         }
       },

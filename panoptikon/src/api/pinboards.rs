@@ -33,6 +33,9 @@ const MAX_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LAYOUT_BYTES: usize = 1024 * 1024;
 /// Serialized board flags larger than this are rejected outright.
 const MAX_FLAGS_BYTES: usize = 4096;
+/// Upper bound for a recorded preview dimension, in pixels. Far above any
+/// composite a browser canvas can produce, low enough to be obviously bogus.
+const MAX_PREVIEW_DIMENSION: i64 = 100_000;
 
 fn default_user() -> String {
     DEFAULT_USER.to_string()
@@ -96,6 +99,19 @@ pub(crate) struct SaveVersionRequest {
     /// "unsaved". Omitted = leave the stored flags unchanged.
     #[serde(default)]
     flags: Option<serde_json::Value>,
+}
+
+/// A replacement preview image for an existing version. Same field semantics
+/// as the preview half of [`SaveVersionRequest`]; nothing else about the
+/// version can be changed.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct UpdatePreviewRequest {
+    /// Base64-encoded preview image (WebP or PNG), composited client-side.
+    preview_b64: String,
+    preview_w: Option<i64>,
+    preview_h: Option<i64>,
+    /// Height in preview-image pixels of one save-time viewport screenful.
+    screenful_h: Option<i64>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -245,8 +261,16 @@ fn validate_version_request(request: &SaveVersionRequest) -> ApiResult<PreviewUp
         }
     }
 
-    let bytes = match request.preview_b64.as_deref() {
-        None | Some("") => None,
+    Ok(PreviewUpload {
+        bytes: decode_preview(request.preview_b64.as_deref())?,
+    })
+}
+
+/// Decodes an uploaded preview blob. Absent or empty means "no preview",
+/// which every upload path treats as a version without a picture.
+fn decode_preview(preview_b64: Option<&str>) -> ApiResult<Option<Vec<u8>>> {
+    match preview_b64 {
+        None | Some("") => Ok(None),
         Some(encoded) => {
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
@@ -254,10 +278,21 @@ fn validate_version_request(request: &SaveVersionRequest) -> ApiResult<PreviewUp
             if decoded.len() > MAX_PREVIEW_BYTES {
                 return Err(ApiError::bad_request("Preview image too large"));
             }
-            Some(decoded)
+            Ok(Some(decoded))
         }
-    };
-    Ok(PreviewUpload { bytes })
+    }
+}
+
+/// Rejects preview dimensions that cannot describe a real image. Absent is
+/// allowed (that is what a version without recorded dimensions looks like);
+/// zero, negative and absurd values are not — the serve path trusts
+/// `preview_w` to decide whether a `maxw` request needs any work at all.
+fn validate_preview_dimension(value: Option<i64>) -> ApiResult<Option<i64>> {
+    match value {
+        None => Ok(None),
+        Some(px) if px > 0 && px <= MAX_PREVIEW_DIMENSION => Ok(Some(px)),
+        Some(_) => Err(ApiError::bad_request("Invalid preview dimensions")),
+    }
 }
 
 fn map_summary(summary: pinboards::PinboardSummary) -> PinboardSummaryResponse {
@@ -745,7 +780,7 @@ pub async fn delete_pinboard_version(
     path = "/api/pinboards/{pinboard_id}/versions/{version_id}/preview",
     tag = "pinboards",
     summary = "Get the stored preview image for a pinboard version",
-    description = "Serves the client-composited preview for one version. Versions are immutable, so responses carry immutable cache headers.\nWith `maxw`, the image is downscaled on the fly (JPEG) to at most that width; without it, the stored image is served as uploaded.",
+    description = "Serves the client-composited preview for one version. Responses carry immutable cache headers.\nWith `maxw`, the image is downscaled on the fly (JPEG) to at most that width — unless the stored image is already no wider than `maxw`, in which case it is served as uploaded, exactly as it is without `maxw`. Asking for the full master therefore costs no second lossy pass.",
     params(
         DbQueryParams,
         ("pinboard_id" = i64, Path, description = "The pinboard id"),
@@ -769,6 +804,17 @@ pub async fn pinboard_version_preview(
     };
 
     let (bytes, media_type) = match query.maxw {
+        // A `maxw` at or above the stored width asks for nothing the stored
+        // image doesn't already have, so it takes the same path as no `maxw`
+        // at all: the bytes as uploaded. Going through downscale_preview
+        // would decode and re-encode them as JPEG q85 — a second lossy pass
+        // over an already-lossy composite, for zero pixels gained. The
+        // recorded preview_w answers this without touching the image; rows
+        // that predate it (or that stored no width) still decode to find out.
+        Some(maxw) if width_at_least(preview.width, maxw) => {
+            let media_type = sniff_image_media_type(&preview.bytes);
+            (preview.bytes, media_type)
+        }
         Some(maxw) => {
             let maxw = maxw.clamp(16, 4096);
             downscale_preview(preview.bytes, maxw).await?
@@ -780,6 +826,77 @@ pub async fn pinboard_version_preview(
     };
 
     image_response(bytes, media_type)
+}
+
+/// Whether a request for `maxw` pixels is already satisfied by an image of
+/// the recorded `stored` width. Applies the same lower clamp the downscale
+/// path does, so a tiny `maxw` behaves identically on both branches.
+fn width_at_least(stored: Option<i64>, maxw: u32) -> bool {
+    let maxw = maxw.clamp(16, 4096);
+    matches!(stored, Some(width) if width > 0 && i64::from(maxw) >= width)
+}
+
+#[utoipa::path(
+    put,
+    operation_id = "update_pinboard_version_preview",
+    path = "/api/pinboards/{pinboard_id}/versions/{version_id}/preview",
+    tag = "pinboards",
+    summary = "Replace the stored preview image of a pinboard version",
+    description = "Overwrites one version's preview image and its recorded dimensions, leaving the layout, items and name-at-save untouched. The compositor is client-side, so this is how a board saved at an older preview resolution gets a better picture without minting a version: recomposite the head version's layout and PUT the result.\nThe board's `time_updated` is deliberately not bumped — re-rendering the picture of a version is not a content change, so it must not reorder the library.\nCaveat: version previews are served with immutable cache headers (versions were immutable until this endpoint existed), so after a refresh, already-cached sizes persist in browsers and proxies until a hard refresh. Accepted as-is: this is a one-time local operation, not a cache-busting mechanism.",
+    params(
+        DbQueryParams,
+        ("pinboard_id" = i64, Path, description = "The pinboard id"),
+        ("version_id" = i64, Path, description = "The version id"),
+        PinboardUserQuery
+    ),
+    request_body(content = UpdatePreviewRequest),
+    responses(
+        (status = 200, description = "Preview replaced", body = PinboardDeleteResponse),
+        (status = 404, description = "Version not found")
+    )
+)]
+pub async fn update_pinboard_version_preview(
+    mut db: DbConnection<UserDataWrite>,
+    Path((pinboard_id, version_id)): Path<(i64, i64)>,
+    Query(query): Query<PinboardUserQuery>,
+    Json(request): Json<UpdatePreviewRequest>,
+) -> ApiResult<Json<PinboardDeleteResponse>> {
+    let Some(bytes) = decode_preview(Some(request.preview_b64.as_str()))? else {
+        return Err(ApiError::bad_request("Preview image required"));
+    };
+    let preview_w = validate_preview_dimension(request.preview_w)?;
+    let preview_h = validate_preview_dimension(request.preview_h)?;
+    let screenful_h = validate_preview_dimension(request.screenful_h)?;
+
+    begin_transaction(&mut db.conn).await?;
+    let updated = match pinboards::update_version_preview(
+        &mut db.conn,
+        pinboard_id,
+        version_id,
+        &query.user,
+        &bytes,
+        preview_w,
+        preview_h,
+        screenful_h,
+    )
+    .await
+    {
+        Ok(updated) => updated,
+        Err(err) => {
+            let _ = rollback_transaction(&mut db.conn).await;
+            return Err(err);
+        }
+    };
+    commit_transaction(&mut db.conn).await?;
+
+    if !updated {
+        return Err(ApiError::not_found("Version not found"));
+    }
+    Ok(Json(PinboardDeleteResponse {
+        message: "Replaced version preview".to_string(),
+        deleted_board: false,
+        new_head_version_id: None,
+    }))
 }
 
 /// Downscales a stored preview to `maxw` pixels wide on a blocking thread.
@@ -1213,6 +1330,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(preview.bytes, vec![1, 2, 3, 4]);
+        // The serve path decides on the recorded width, so it has to come
+        // back with the blob.
+        assert_eq!(preview.width, Some(1024));
 
         assert!(
             pinboards::get_version_preview(&mut dbs.index_conn, pinboard_id, version_id, "other")
@@ -1220,6 +1340,114 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // Ensures a preview refresh replaces the blob and its dimensions in
+    // place, is user-scoped, and leaves the board's time_updated alone (a
+    // re-render is not a content change — same rule as set_flags).
+    #[tokio::test]
+    async fn update_version_preview_replaces_in_place() {
+        let mut dbs = setup_test_databases().await;
+        let pinboard_id = pinboards::create_pinboard(&mut dbs.index_conn, "user", None, None, T0)
+            .await
+            .unwrap();
+        let version_id = pinboards::append_version(
+            &mut dbs.index_conn,
+            pinboard_id,
+            &layout(&["v2", "a"]),
+            &[],
+            Some(&[1, 2, 3, 4]),
+            Some(1024),
+            Some(768),
+            Some(500),
+        )
+        .await
+        .unwrap();
+        let (summary, _) = pinboards::get_pinboard(&mut dbs.index_conn, pinboard_id, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        let time_updated = summary.time_updated;
+
+        assert!(
+            !pinboards::update_version_preview(
+                &mut dbs.index_conn,
+                pinboard_id,
+                version_id,
+                "other",
+                &[9, 9],
+                Some(2048),
+                Some(1536),
+                Some(900),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            pinboards::update_version_preview(
+                &mut dbs.index_conn,
+                pinboard_id,
+                version_id,
+                "user",
+                &[5, 6, 7],
+                Some(2048),
+                Some(1536),
+                Some(900),
+            )
+            .await
+            .unwrap()
+        );
+
+        let preview =
+            pinboards::get_version_preview(&mut dbs.index_conn, pinboard_id, version_id, "user")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(preview.bytes, vec![5, 6, 7]);
+        assert_eq!(preview.width, Some(2048));
+
+        let versions = pinboards::list_versions(&mut dbs.index_conn, pinboard_id, "user")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1, "a refresh must not mint a version");
+        assert_eq!(versions[0].preview_h, Some(1536));
+        assert_eq!(versions[0].screenful_h, Some(900));
+        assert_eq!(versions[0].layout, layout(&["v2", "a"]));
+
+        let (summary, _) = pinboards::get_pinboard(&mut dbs.index_conn, pinboard_id, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.time_updated, time_updated);
+    }
+
+    // Ensures the serve path's passthrough test matches the downscale
+    // path's clamp: at or above the stored width serves the stored bytes,
+    // below it downscales, and an unrecorded width always downscales.
+    #[test]
+    fn stored_width_decides_the_passthrough() {
+        assert!(width_at_least(Some(1024), 1024));
+        assert!(width_at_least(Some(1024), 4096));
+        // Clamped to 4096 like the downscale branch, so a wider master
+        // still takes the same branch it always did.
+        assert!(!width_at_least(Some(8192), 9000));
+        assert!(!width_at_least(Some(2048), 1024));
+        assert!(!width_at_least(None, 4096));
+        assert!(!width_at_least(Some(0), 4096));
+        // The lower clamp: maxw 1 is really 16, so a 16px master passes.
+        assert!(width_at_least(Some(16), 1));
+        assert!(!width_at_least(Some(17), 1));
+    }
+
+    // Ensures replacement previews can't record impossible dimensions —
+    // the serve path trusts preview_w to skip decoding entirely.
+    #[test]
+    fn preview_dimensions_are_validated() {
+        assert_eq!(validate_preview_dimension(None).unwrap(), None);
+        assert_eq!(validate_preview_dimension(Some(2048)).unwrap(), Some(2048));
+        assert!(validate_preview_dimension(Some(0)).is_err());
+        assert!(validate_preview_dimension(Some(-1)).is_err());
+        assert!(validate_preview_dimension(Some(MAX_PREVIEW_DIMENSION + 1)).is_err());
     }
 
     // Ensures flags round-trip on the board, and set_flags detects change
