@@ -1318,11 +1318,13 @@ mod tests {
     }
 
     /// A user_data write connection shaped like the request-scoped
-    /// `UserDataWrite` ones (index db as `main`, user_data attached
-    /// read-write in WAL), with a short busy timeout so a losing writer fails
-    /// in bounded time instead of at sqlx's five-second default. On-disk
-    /// because the shared-cache in-memory databases cannot be opened twice
-    /// as independent connections.
+    /// `UserDataWrite` ones where it matters here: user_data attached
+    /// read-write in WAL. (The real ones also hold index/storage read-only —
+    /// covered by `db::connection` tests — which is irrelevant to these
+    /// user_data-lock contention tests.) Short busy timeout so a losing
+    /// writer fails in bounded time instead of at sqlx's five-second
+    /// default. On-disk because the shared-cache in-memory databases cannot
+    /// be opened twice as independent connections.
     async fn connect_user_data_write(
         index_file: &std::path::Path,
         user_data_file: &std::path::Path,

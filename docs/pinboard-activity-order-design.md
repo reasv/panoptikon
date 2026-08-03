@@ -63,7 +63,12 @@ response never waits):
   snapshot and the background writer's commit would make the *save's*
   first write fail `SQLITE_BUSY_SNAPSHOT` (which bypasses the busy
   handler) — the contention asymmetry must run the other way, with the
-  telemetry write as the loser.
+  telemetry write as the loser. Because `BEGIN IMMEDIATE` write-locks every
+  *writable* attached schema, `UserDataWrite` connections (and this
+  writer's) open the index (`main`) and `storage` schemas read-only — via
+  `mode=ro` URIs on a read-write connection, since a read-only connection
+  cannot attach user_data read-write — confining the immediate lock to
+  user_data so saves never contend with the index writer's transactions.
 - Deliberately bypasses the `DbConnection` drop-time user-data epoch bump:
   `last_seen`/`frecency`/`frecency_at` can never affect any search result,
   so counted opens must not invalidate the search cache.

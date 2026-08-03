@@ -583,10 +583,38 @@ async fn connect_db(
                 ApiError::internal("Failed to open database")
             })?;
         conn
+    } else if !write_lock {
+        // A user_data-only writer (request-scoped `UserDataWrite` and the
+        // background activity writer). `BEGIN IMMEDIATE` takes a write
+        // transaction on every *writable* attached schema, so the index
+        // (`main`) and `storage` are opened read-only here to confine the
+        // immediate lock to user_data — otherwise every pinboard/bookmark
+        // save contends with the index writer's own immediate transactions.
+        // A read-only *connection* cannot attach user_data read-write
+        // (`mode` may only be more restrictive than the open flags), so the
+        // connection stays read-write and the read-only-ness comes from
+        // `mode=ro` URI filenames on the two index schemas instead.
+        let options = SqliteConnectOptions::new().filename(read_only_db_uri(&paths.index_db_file));
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to open index database");
+                ApiError::internal("Failed to open database")
+            })?;
+
+        sqlx::query("ATTACH DATABASE ? AS storage")
+            .bind(read_only_db_uri(&paths.storage_db_file))
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to attach storage database");
+                ApiError::internal("Failed to open database")
+            })?;
+        conn
     } else {
         let options = SqliteConnectOptions::new()
             .filename(&paths.index_db_file)
-            .create_if_missing(write_lock);
+            .create_if_missing(true);
         let mut conn = SqliteConnection::connect_with(&options)
             .await
             .map_err(|err| {
@@ -602,32 +630,30 @@ async fn connect_db(
                 tracing::error!(error = %err, "failed to attach storage database");
                 ApiError::internal("Failed to open database")
             })?;
-        if write_lock {
-            sqlx::query("PRAGMA journal_mode=WAL")
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to enable WAL mode");
+                ApiError::internal("Failed to open database")
+            })?;
+        // Bound the WAL high-water mark: with a limit set, any checkpoint
+        // that resets the log truncates the file back to the limit instead
+        // of leaving it at peak size until every connection closes. The
+        // pragma is per-connection and per-schema: autocheckpoints run on
+        // the committing connection, which is opened through this path,
+        // and each writable schema needs its own line.
+        for pragma in [
+            format!("PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"),
+            format!("PRAGMA storage.journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(pragma))
                 .execute(&mut conn)
                 .await
                 .map_err(|err| {
-                    tracing::error!(error = %err, "failed to enable WAL mode");
+                    tracing::error!(error = %err, "failed to set WAL size limit");
                     ApiError::internal("Failed to open database")
                 })?;
-            // Bound the WAL high-water mark: with a limit set, any checkpoint
-            // that resets the log truncates the file back to the limit instead
-            // of leaving it at peak size until every connection closes. The
-            // pragma is per-connection and per-schema: autocheckpoints run on
-            // the committing connection, which is opened through this path,
-            // and each writable schema needs its own line.
-            for pragma in [
-                format!("PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"),
-                format!("PRAGMA storage.journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"),
-            ] {
-                sqlx::query(sqlx::AssertSqlSafe(pragma))
-                    .execute(&mut conn)
-                    .await
-                    .map_err(|err| {
-                        tracing::error!(error = %err, "failed to set WAL size limit");
-                        ApiError::internal("Failed to open database")
-                    })?;
-            }
         }
         conn
     };
@@ -686,10 +712,140 @@ fn user_data_attach_path(path: &Path, read_only: bool) -> String {
     if !read_only {
         return path.to_string_lossy().to_string();
     }
+    read_only_db_uri(path)
+}
+
+/// `file:` URI that opens `path` read-only regardless of the connection's
+/// open flags (sqlx always passes `SQLITE_OPEN_URI`). `mode=ro` may be more
+/// restrictive than the connection flags but never less, which is exactly
+/// what mixed-mode connections need: a read-write connection with individual
+/// schemas held read-only.
+fn read_only_db_uri(path: &Path) -> String {
     if let Ok(mut url) = Url::from_file_path(path) {
         url.set_query(Some("mode=ro"));
         return url.to_string();
     }
     let path = path.to_string_lossy().replace('\\', "/");
     format!("file:{path}?mode=ro")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the `UserDataWrite` connection shape: index (`main`) and
+    /// `storage` are attached read-only, so its `BEGIN IMMEDIATE` write lock
+    /// is confined to user_data and never contends with the index writer's
+    /// own immediate transactions (and vice versa). A regression back to
+    /// read-write index schemas fails this test twice over: the readonly
+    /// INSERT probes succeed, and the overlapping BEGIN IMMEDIATE pairs
+    /// deadlock into sqlx's busy timeout.
+    #[tokio::test]
+    async fn user_data_write_conn_does_not_lock_index_or_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DbPaths {
+            index_db_file: dir.path().join("index.db"),
+            storage_db_file: dir.path().join("storage.db"),
+            user_db_file: dir.path().join("user.db"),
+        };
+
+        // Seed index + storage through the index-writer path and user_data
+        // via a direct open; the user-data write path creates nothing.
+        {
+            let mut writer = connect_db(&paths, true, false, false).await.unwrap();
+            sqlx::query("CREATE TABLE t (v INTEGER)")
+                .execute(&mut writer)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE storage.s (v INTEGER)")
+                .execute(&mut writer)
+                .await
+                .unwrap();
+            writer.close().await.unwrap();
+        }
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(&paths.user_db_file)
+                .create_if_missing(true);
+            let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+            sqlx::query("CREATE TABLE u (v INTEGER)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+        }
+
+        let mut index_writer = connect_db(&paths, true, false, false).await.unwrap();
+        let mut user_data_writer = connect_db(&paths, false, true, true).await.unwrap();
+
+        // The index schemas must be read-only on the user-data connection —
+        // this is what keeps BEGIN IMMEDIATE from write-locking them.
+        assert!(
+            sqlx::query("INSERT INTO t (v) VALUES (1)")
+                .execute(&mut user_data_writer)
+                .await
+                .is_err(),
+            "index (main) must be read-only on a UserDataWrite connection"
+        );
+        assert!(
+            sqlx::query("INSERT INTO storage.s (v) VALUES (1)")
+                .execute(&mut user_data_writer)
+                .await
+                .is_err(),
+            "storage must be read-only on a UserDataWrite connection"
+        );
+
+        // User-data transaction first, index writer second: the index
+        // writer's BEGIN IMMEDIATE and COMMIT proceed while the user-data
+        // transaction is still open.
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_data.u (v) VALUES (1)")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut index_writer)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t (v) VALUES (2)")
+            .execute(&mut index_writer)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut index_writer)
+            .await
+            .unwrap();
+
+        sqlx::query("COMMIT")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+
+        // And the reverse order: with the index write transaction open, the
+        // user-data save begins, writes, and commits without waiting.
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut index_writer)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_data.u (v) VALUES (2)")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut index_writer)
+            .await
+            .unwrap();
+    }
 }
