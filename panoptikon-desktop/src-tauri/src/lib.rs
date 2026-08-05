@@ -2245,7 +2245,9 @@ mod tests {
 
         let launch_html = include_str!("../../dist/launch.html");
         let launch_js = include_str!("../../dist/launch.js");
+        let launch_logo = include_str!("../../dist/spinner_text.svg");
         assert!(launch_html.contains("spinner_text.svg"));
+        assert!(launch_logo.contains("lines-dark text-light wheel-border-thick"));
         assert!(!launch_js.contains("__TAURI__"));
         assert!(!launch_js.contains("invoke("));
 

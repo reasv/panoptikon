@@ -41,7 +41,8 @@ Behavior (important)
   them; continuous whitelist validation also enforces the staged full-scan
   include/exclude scope. Completion saves file types, both folder lists, the
   staged continuous-scan configuration, the cron model list, and its routine
-  schedule. It atomically queues an initial folder update followed by the
+  schedule; the stored schedule must remain valid even while the routine is
+  disabled. It atomically queues an initial folder update followed by the
   selected models; later cron/manual runs use a full rescan instead. Schedule
   preview parses staged cron strings without saving them. Serving processes take an
   advisory `<root>/runtime/server.lock`; lock contention is a clear startup

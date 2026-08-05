@@ -492,9 +492,9 @@ The Open action is state-aware:
 Login startup never invokes Open automatically. A normal/manual launch MUST
 show the bundled launch-progress webview immediately when the Server is not
 ready; it cannot wait for the Next.js UI. The view uses the animated Panoptikon
-logo, coarse current activity, a safe-to-close/background explanation, and
-redacted copyable diagnostics. Login/autostart does not open a window on its
-own.
+logo pinned to its white-bordered dark-background palette, coarse current
+activity, a safe-to-close/background explanation, and redacted copyable
+diagnostics. Login/autostart does not open a window on its own.
 
 If the progress window remains open, readiness navigates that same
 privilege-free webview to `/desktop/setup?mode=onboarding` when the configured
@@ -612,7 +612,12 @@ existing daily 03:00 schedule. Every automatic or later manual routine run
 performs a full rescan followed by the persisted model list. The first run is
 always queued when the wizard finishes, even if later automatic runs are
 disabled; it uses the folder-update scan path so a new database is not scanned
-twice while its folder rows are first synchronized.
+twice while its folder rows are first synchronized. Daily, hourly, and weekly
+choices are locally known-valid and do not block Continue while their next-run
+preview is loading. An enabled custom cron expression must finish validation;
+disabling automatic runs removes schedule validation from the wizard's
+navigation gate, but an invalid custom draft is replaced by the most recent
+valid schedule when setup is saved.
 
 The wizard fills its webview as three independent vertical regions: a fixed
 step indicator, a `min-height: 0` internally scrolling step-content region,

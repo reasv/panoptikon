@@ -626,7 +626,9 @@ Setup completion revalidates them, optionally creates a named index database,
 saves file-type, folder, continuous-scan, model-plan, and schedule settings,
 then atomically queues an initial folder update followed by every selected
 model. `POST /api/desktop/setup-schedule/preview` validates a staged cron string
-and returns its next local-time occurrence without saving it.
+and returns its next local-time occurrence without saving it. Setup completion
+always requires a valid stored routine schedule, including when automatic runs
+are disabled.
 `GET /api/desktop/setup-status` evaluates the
 policy-resolved default index database and reports it ready once at least one
 currently included folder has a matching `file_scans` row, meaning a scan for
