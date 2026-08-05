@@ -326,15 +326,34 @@ pub fn run() {
     let app = builder
         .build(tauri::generate_context!())
         .expect("error while building Panoptikon Desktop");
-    app.run(|_app, event| {
-        if let tauri::RunEvent::ExitRequested {
-            code: None, api, ..
-        } = event
-        {
-            // Closing the last webview must not terminate the tray process.
-            // Explicit Quit and updater restart requests carry an exit code
-            // and are therefore allowed through.
-            api.prevent_exit();
+    app.run(|app, event| {
+        match event {
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } => {
+                // Launch Services sends a native reopen request when the user
+                // clicks a pinned Dock icon for an already-running app. It
+                // does not start a secondary process, so the single-instance
+                // callback never sees this activation.
+                route_activation(app.clone(), ActivationIntent::Open);
+
+                // Reconcile after the native activation has completed. When
+                // Open needs a bundled window, show_desktop_window promotes
+                // us back to Regular; the usual browser path has no bundled
+                // window and must leave the tray process as an Accessory.
+                schedule_macos_activation_policy_sync(app.clone());
+            }
+            tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } => {
+                // Closing the last webview must not terminate the tray process.
+                // Explicit Quit and updater restart requests carry an exit code
+                // and are therefore allowed through.
+                api.prevent_exit();
+            }
+            _ => {}
         }
     });
 }

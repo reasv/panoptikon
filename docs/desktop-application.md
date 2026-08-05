@@ -331,6 +331,10 @@ sidecar.
 Activation behavior:
 
 - normal launch: run the state-aware Open action in section 11;
+- on macOS, a native reopen request for the already-running app with no visible
+  bundled window: run the same state-aware Open action, then restore accessory
+  activation if the action opens only the external browser; this Launch
+  Services path does not pass through the single-instance plugin;
 - launch from login/autostart: do not open a browser or window;
 - update relaunch: show nothing unless recovery is required;
 - future deep-link/file activation: forward the complete activation payload.
@@ -1042,18 +1046,20 @@ For Windows, Linux, and macOS release candidates:
    setup;
 6. verify Open launches `/search` in the default browser;
 7. launch Desktop again and verify the existing process handles activation;
-8. verify only one gateway and one tray exist;
-9. restart and quit with graceful database/job shutdown;
-10. crash Desktop and verify no sidecar/process tree remains;
-11. induce invalid config, port collision, and sidecar crash and verify Recovery;
-12. enable Relay, pair a test remote origin, map a fixture path, and exercise
+8. on macOS, close every bundled window, click a pinned Dock icon, and verify
+   `/search` opens in the browser while Desktop returns to accessory mode;
+9. verify only one gateway and one tray exist;
+10. restart and quit with graceful database/job shutdown;
+11. crash Desktop and verify no sidecar/process tree remains;
+12. induce invalid config, port collision, and sidecar crash and verify Recovery;
+13. enable Relay, pair a test remote origin, map a fixture path, and exercise
     open/reveal without shell injection or traversal;
-13. revoke the pair and verify requests fail;
-14. install a signed test update containing a different sidecar version;
-15. verify both Desktop and sidecar update together and resources reconcile;
-16. verify a tampered update is rejected; and
-17. verify login startup remains silent and single-instance.
-18. disable the local Server, verify the Server root is not touched on a fresh
+14. revoke the pair and verify requests fail;
+15. install a signed test update containing a different sidecar version;
+16. verify both Desktop and sidecar update together and resources reconcile;
+17. verify a tampered update is rejected; and
+18. verify login startup remains silent and single-instance.
+19. disable the local Server, verify the Server root is not touched on a fresh
     profile, and exercise Relay-only startup, update, and shutdown.
 
 Linux testing MUST cover at least GNOME and KDE tray behavior plus one
