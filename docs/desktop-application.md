@@ -452,6 +452,12 @@ Requirements:
   Relay when enabled, flushes logs, and exits Tauri.
 - Closing a control window hides/destroys that window as appropriate but does
   not quit Desktop.
+- On macOS, Desktop uses the regular application activation policy while any
+  bundled webview window is visible, so that window remains available from the
+  Dock and application switcher. Once the last bundled window is hidden or
+  destroyed, Desktop switches to the accessory policy and remains available
+  only from its menu-bar icon. If tray creation fails, Desktop remains a
+  regular application so the visible fallback cannot become undiscoverable.
 - “Start Panoptikon automatically” is opt-in and user-scoped. It launches
   Desktop in the background and never opens a browser at login. The same
   setting is exposed on the control window's Overview tab and in the tray menu.

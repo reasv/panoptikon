@@ -142,6 +142,12 @@ pub fn run() {
             Some(vec!["--background"]),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .on_window_event(|_window, _event| {
+            #[cfg(target_os = "macos")]
+            if matches!(_event, tauri::WindowEvent::Destroyed) {
+                schedule_macos_activation_policy_sync(_window.app_handle().clone());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_status, get_startup_warnings, open_action_command, open_setup_command, restart_server, set_local_server_enabled,
             set_start_at_login, open_known_folder, log_tail, choose_scan_folders, open_panoptikon_page,
@@ -274,6 +280,7 @@ pub fn run() {
                 Ok(Ok(tray)) => {
                     let runtime = app.state::<RuntimeState>();
                     tauri::async_runtime::block_on(async { *runtime.tray.lock().await = Some(tray); });
+                    sync_macos_activation_policy(app.handle());
                 }
                 Ok(Err(error)) => {
                     tracing::error!(%error, "tray initialization failed; using visible control fallback");
@@ -349,6 +356,64 @@ fn init_logging(
         );
     let _ = subscriber.try_init();
     Ok(guard)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn should_use_macos_accessory_policy(tray_available: bool, any_window_visible: bool) -> bool {
+    tray_available && !any_window_visible
+}
+
+#[cfg(target_os = "macos")]
+fn sync_macos_activation_policy(app: &AppHandle) {
+    let any_window_visible = app
+        .webview_windows()
+        .values()
+        .any(|window| window.is_visible().unwrap_or(false));
+    let tray_available = app.tray_by_id("panoptikon-desktop").is_some();
+    let policy = if should_use_macos_accessory_policy(tray_available, any_window_visible) {
+        tauri::ActivationPolicy::Accessory
+    } else {
+        tauri::ActivationPolicy::Regular
+    };
+    if let Err(error) = app.set_activation_policy(policy) {
+        tracing::warn!(%error, "failed to update macOS activation policy");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_macos_activation_policy(_app: &AppHandle) {}
+
+#[cfg(target_os = "macos")]
+fn schedule_macos_activation_policy_sync(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // A Destroyed event can arrive before Tauri removes the window from
+        // the application manager. Reconcile on the next executor turn so
+        // visibility is derived from the post-destruction window set.
+        tokio::task::yield_now().await;
+        sync_macos_activation_policy(&app);
+    });
+}
+
+fn show_desktop_window(window: &WebviewWindow, focus: bool) -> tauri::Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = window
+        .app_handle()
+        .set_activation_policy(tauri::ActivationPolicy::Regular)
+    {
+        tracing::warn!(%error, "failed to show Panoptikon in the macOS Dock");
+    }
+    window.show()?;
+    if focus {
+        window.unminimize()?;
+        window.set_focus()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn hide_desktop_window(window: &WebviewWindow) -> tauri::Result<()> {
+    window.hide()?;
+    sync_macos_activation_policy(window.app_handle());
+    Ok(())
 }
 
 fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
@@ -697,6 +762,7 @@ pub(crate) fn show_launch_window(app: &AppHandle, focus: bool) -> tauri::Result<
             .title("Starting Panoptikon")
             .inner_size(720.0, 720.0)
             .min_inner_size(540.0, 540.0)
+            .visible(false)
             .on_page_load(|window, payload| {
                 if payload.event() == tauri::webview::PageLoadEvent::Finished
                     && payload.url().path().ends_with("/launch.html")
@@ -716,11 +782,7 @@ pub(crate) fn show_launch_window(app: &AppHandle, focus: bool) -> tauri::Result<
                 .store(false, Ordering::Release);
         }
     });
-    window.show()?;
-    if focus {
-        window.unminimize()?;
-        window.set_focus()?;
-    }
+    show_desktop_window(&window, focus)?;
     let refresh_app = app.clone();
     tauri::async_runtime::spawn(async move { refresh_launch_window(&refresh_app).await });
     Ok(())
@@ -754,21 +816,18 @@ pub(crate) fn show_control_window(app: &AppHandle, focus: bool) -> tauri::Result
                 .title("Panoptikon Desktop")
                 .inner_size(780.0, 1000.0)
                 .min_inner_size(560.0, 480.0)
+                .visible(false)
                 .build()?;
         let close_window = window.clone();
         window.on_window_event(move |event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = close_window.hide();
+                let _ = hide_desktop_window(&close_window);
             }
         });
         window
     };
-    window.show()?;
-    if focus {
-        window.unminimize()?;
-        window.set_focus()?;
-    }
+    show_desktop_window(&window, focus)?;
     Ok(())
 }
 
@@ -781,6 +840,7 @@ fn show_relay_pairing_window(app: &AppHandle, focus: bool) -> tauri::Result<()> 
                 .title("Pair with Panoptikon Relay")
                 .inner_size(560.0, 620.0)
                 .min_inner_size(460.0, 500.0)
+                .visible(false)
                 .build()?;
         let close_app = app.clone();
         window.on_window_event(move |event| {
@@ -799,11 +859,7 @@ fn show_relay_pairing_window(app: &AppHandle, focus: bool) -> tauri::Result<()> 
         });
         window
     };
-    window.show()?;
-    if focus {
-        window.unminimize()?;
-        window.set_focus()?;
-    }
+    show_desktop_window(&window, focus)?;
     Ok(())
 }
 
@@ -816,6 +872,7 @@ fn show_relay_mapping_window(app: &AppHandle, focus: bool) -> tauri::Result<()> 
                 .title("Add a Panoptikon Relay mapping")
                 .inner_size(620.0, 620.0)
                 .min_inner_size(480.0, 500.0)
+                .visible(false)
                 .build()?;
         let close_app = app.clone();
         window.on_window_event(move |event| {
@@ -834,11 +891,7 @@ fn show_relay_mapping_window(app: &AppHandle, focus: bool) -> tauri::Result<()> 
         });
         window
     };
-    window.show()?;
-    if focus {
-        window.unminimize()?;
-        window.set_focus()?;
-    }
+    show_desktop_window(&window, focus)?;
     Ok(())
 }
 
@@ -880,10 +933,10 @@ fn show_setup_window(app: &AppHandle, port: u16, mode: SetupMode) -> tauri::Resu
         WebviewWindowBuilder::new(app, "launch", WebviewUrl::External(url))
             .title(mode.title())
             .inner_size(SETUP_WINDOW_WIDTH, SETUP_WINDOW_HEIGHT)
+            .visible(false)
             .build()?
     };
-    window.show()?;
-    window.set_focus()
+    show_desktop_window(&window, true)
 }
 
 fn send_clickable_notification(app: &AppHandle, title: &str, body: &str) {
@@ -1978,7 +2031,18 @@ async fn quit_inner(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{local_browser_url, pythonpath_without_appdir, update_menu_label};
+    use super::{
+        local_browser_url, pythonpath_without_appdir, should_use_macos_accessory_policy,
+        update_menu_label,
+    };
+
+    #[test]
+    fn macos_accessory_policy_requires_a_tray_and_no_visible_windows() {
+        assert!(should_use_macos_accessory_policy(true, false));
+        assert!(!should_use_macos_accessory_policy(true, true));
+        assert!(!should_use_macos_accessory_policy(false, false));
+        assert!(!should_use_macos_accessory_policy(false, true));
+    }
 
     /// The AppImage scrub drops exactly the mount-rooted PYTHONPATH entries
     /// (plus launcher-introduced empty segments) and leaves clean values —

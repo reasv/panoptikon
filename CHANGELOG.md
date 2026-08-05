@@ -6,6 +6,11 @@ Desktop release notes.
 
 ## [Unreleased]
 
+- **Panoptikon Desktop now stays out of the macOS Dock while running in the
+  background.** Its Dock and application-switcher entry appears while a native
+  setup, settings, Relay, or update window is visible, then disappears when the
+  last such window closes. The menu-bar icon remains available throughout.
+
 ## [v0.1.8] - 2026-08-03
 
 ### Added
