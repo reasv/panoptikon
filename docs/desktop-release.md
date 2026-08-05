@@ -62,3 +62,30 @@ its roaming and local application-data roots. The already-installed app will
 repeat extraction, environment preparation, and first-database setup on its
 next launch. Use
 `-WhatIf` to print the guarded targets and `-Force` to skip the RESET prompt.
+
+## macOS development app, DMG, and clean-state testing
+
+The scripts require a current Rust toolchain, Node.js/npm, and an Xcode command
+line environment whose license has already been reviewed and accepted. If the
+Xcode check fails, run `sudo xcodebuild -license` in Terminal before building.
+
+For normal source development on macOS, run `scripts/run-desktop-dev.sh`. It
+initializes the pinned UI submodule when necessary, builds the current
+standalone UI and debug bundled Server sidecar, stages the sidecar under its
+host target triple, and launches the unpackaged application with the isolated
+`app.panoptikon.desktop.dev` profile. Use `--skip-ui-build` for Desktop-shell
+iterations or `--skip-npm-ci` to reuse installed UI dependencies. Normal mode
+uses Tauri's source-watching development runner, whose raw executable has no
+macOS bundle identity. Use `--bundled-app` when testing Dock icons, activation
+policy, Launch Services, or other behavior that requires a real `.app` bundle;
+the script builds a debug app and launches it through macOS Launch Services.
+
+Run `scripts/build-desktop-dev.sh` to build the standalone UI, release Server
+sidecar, and a `Panoptikon Desktop Dev` app and DMG. The Desktop shell is a
+debug build by default; pass `--release-desktop` for a release shell and
+`--skip-npm-ci` to reuse `ui/node_modules`.
+
+After quitting Desktop Dev, run `scripts/reset-desktop-dev.sh --dry-run` to
+inspect the guarded Application Support and Logs targets. Run it without
+arguments and type `RESET`, or pass `--force`, to remove only the isolated
+development profile so first-time setup runs again.

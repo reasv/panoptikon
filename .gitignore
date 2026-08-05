@@ -169,6 +169,10 @@ cython_debug/
 !/scripts/build-desktop-dev.ps1
 !/scripts/reset-desktop-dev.ps1
 !/scripts/run-desktop-dev.ps1
+!/scripts/desktop-dev-macos-lib.sh
+!/scripts/build-desktop-dev.sh
+!/scripts/reset-desktop-dev.sh
+!/scripts/run-desktop-dev.sh
 !/scripts/generate-nix-dev-config.py
 !/scripts/sync-nix-ui-pin.py
 !/scripts/generate-hicolor-icons.sh

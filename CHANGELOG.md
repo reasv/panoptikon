@@ -10,6 +10,9 @@ Desktop release notes.
   background.** Its Dock and application-switcher entry appears while a native
   setup, settings, Relay, or update window is visible, then disappears when the
   last such window closes. The menu-bar icon remains available throughout.
+- **macOS now has first-class Desktop development scripts.** Developers can run
+  the isolated unpackaged app, build a dev app/DMG, and safely reset its local
+  profile with shell equivalents of the existing Windows workflows.
 
 ## [v0.1.8] - 2026-08-03
 
