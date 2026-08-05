@@ -176,7 +176,11 @@ cython_debug/
 !/scripts/generate-nix-dev-config.py
 !/scripts/sync-nix-ui-pin.py
 !/scripts/generate-hicolor-icons.sh
+!/scripts/stage-pdfium.py
 .vscode/
+
+# Native PDFium payloads are reproducibly staged from contrib/pdfium/pdfium-lock.json.
+/panoptikon-desktop/src-tauri/resources/pdfium/
 
 .DS_Store
 data/

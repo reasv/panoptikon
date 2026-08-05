@@ -204,6 +204,7 @@ Panoptikon Desktop (Tauri process)
 ├── signed updater
 ├── Relay loopback service (when enabled)
 ├── bundled control webview assets
+├── bundled PDFium dynamic library + redistribution notices
 └── Panoptikon Server sidecar
     ├── gateway/API/jobs/cron/databases
     ├── local inference and workers

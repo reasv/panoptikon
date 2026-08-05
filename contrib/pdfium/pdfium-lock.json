@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "pypdfium2_version": "4.30.1",
+  "pdfium_build": 6899,
+  "targets": {
+    "aarch64-apple-darwin": {
+      "url": "https://files.pythonhosted.org/packages/c2/6a/f6995b21f9c6c155487ce7df70632a2df1ba49efcb291b9943ea45f28b15/pypdfium2-4.30.1-py3-none-macosx_11_0_arm64.whl",
+      "sha256": "5ea2d44e96d361123b67b00f527017aa9c847c871b5714e013c01c3eb36a79fe",
+      "library": "libpdfium.dylib"
+    },
+    "x86_64-pc-windows-msvc": {
+      "url": "https://files.pythonhosted.org/packages/a4/f3/8d3a350efb4286b5ebdabcf6736f51d8e3b10dbe68804c6930b00f5cf329/pypdfium2-4.30.1-py3-none-win_amd64.whl",
+      "sha256": "598a7f20264ab5113853cba6d86c4566e4356cad037d7d1f849c8c9021007e05",
+      "library": "pdfium.dll"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "url": "https://files.pythonhosted.org/packages/be/d9/a2f1ee03d47fbeb48bcfde47ed7155772739622cfadf7135a84ba6a97824/pypdfium2-4.30.1-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "sha256": "f454032a0bc7681900170f67d8711b3942824531e765f91c2f5ce7937f999794",
+      "library": "libpdfium.so"
+    }
+  }
+}

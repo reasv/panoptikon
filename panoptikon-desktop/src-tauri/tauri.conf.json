@@ -18,6 +18,9 @@
     "targets": "all",
     "createUpdaterArtifacts": true,
     "externalBin": ["binaries/panoptikon"],
+    "resources": {
+      "resources/pdfium/": "pdfium/"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/64x64.png",
@@ -35,7 +38,10 @@
     },
     "macOS": {
       "signingIdentity": "-",
-      "minimumSystemVersion": "12.0"
+      "minimumSystemVersion": "12.0",
+      "frameworks": [
+        "./resources/pdfium/libpdfium.dylib"
+      ]
     },
     "linux": {
       "appimage": {

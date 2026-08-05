@@ -79,6 +79,15 @@ if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
 New-Item -ItemType Directory -Force -Path (Split-Path $stagedSidecar -Parent) | Out-Null
 Copy-Item -LiteralPath $sidecar -Destination $stagedSidecar -Force
 
+Write-Host "Staging the pinned PDFium runtime..."
+Push-Location $repoRoot
+try {
+    Invoke-Checked "python.exe" @("scripts/stage-pdfium.py", "--target", "x86_64-pc-windows-msvc")
+}
+finally {
+    Pop-Location
+}
+
 Write-Host "Starting unpackaged Panoptikon Desktop Dev (Ctrl+C to stop)..."
 Push-Location $desktopRoot
 try {

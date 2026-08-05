@@ -4,13 +4,15 @@ set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/desktop-dev-macos-lib.sh"
 
 skip_npm_ci=false
+skip_ui_build=false
 release_desktop=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-npm-ci) skip_npm_ci=true ;;
+        --skip-ui-build) skip_ui_build=true ;;
         --release-desktop) release_desktop=true ;;
         -h|--help)
-            echo "Usage: scripts/build-desktop-dev.sh [--skip-npm-ci] [--release-desktop]"
+            echo "Usage: scripts/build-desktop-dev.sh [--skip-npm-ci] [--skip-ui-build] [--release-desktop]"
             exit 0
             ;;
         *) desktop_dev_die "unknown argument: $1" ;;
@@ -19,7 +21,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 desktop_dev_init
-if [[ "$skip_npm_ci" == "true" ]]; then
+if [[ "$skip_ui_build" == "true" ]]; then
+    desktop_dev_require_standalone
+elif [[ "$skip_npm_ci" == "true" ]]; then
     desktop_dev_build_ui false
 else
     desktop_dev_build_ui true

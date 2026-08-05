@@ -30,7 +30,14 @@ stale pin without gating the binary artifacts.
 
 For a release, push a canonical `vX.Y.Z` tag. CI builds the UI and bundled
 Server natively for each target, stages that exact Server as the Tauri sidecar,
-and builds signed Desktop bundles. Verify that the release has three Server
+extracts the target's PDFium library and redistribution notices from the
+hash-pinned wheel in `contrib/pdfium/pdfium-lock.json`, and builds signed
+Desktop bundles. PDFium is a Desktop runtime resource, independent of the
+managed Python inference environment; `scripts/stage-pdfium.py` must run before
+every Tauri build. On macOS, Tauri installs and signs the dylib under
+`Contents/Frameworks`; hardened runtime library validation does not permit
+loading the wheel's original resource signature. Verify that the release has
+three Server
 artifacts, three human-facing Desktop installers, three updater payloads plus
 signatures, `latest.json`, and `latest-desktop.json`. Test the direct installer
 and an update from the preceding release on every supported platform.
@@ -83,7 +90,13 @@ the script builds a debug app and launches it through macOS Launch Services.
 Run `scripts/build-desktop-dev.sh` to build the standalone UI, release Server
 sidecar, and a `Panoptikon Desktop Dev` app and DMG. The Desktop shell is a
 debug build by default; pass `--release-desktop` for a release shell and
-`--skip-npm-ci` to reuse `ui/node_modules`.
+`--skip-npm-ci` to reuse `ui/node_modules`, or `--skip-ui-build` to reuse an
+already-current standalone UI bundle. The script also downloads,
+hash-verifies, and stages the pinned macOS PDFium resource; subsequent builds
+reuse the verified wheel under `target/pdfium-cache`. The ad-hoc-signed Dev
+bundle alone disables macOS library validation because ad-hoc executables and
+dylibs have no common Apple Team ID; production keeps library validation and
+signs both with the release identity.
 
 After quitting Desktop Dev, run `scripts/reset-desktop-dev.sh --dry-run` to
 inspect the guarded Application Support and Logs targets. Run it without

@@ -878,6 +878,14 @@ they became the `[jobs]` keys `pdfium`, `html_renderer` and
 etc., so setting the variables in `.env` still works — through the
 templating layer, not a direct read.
 
+Panoptikon Desktop sets `PDFIUM_PATH` to the absolute path of its bundled,
+version-pinned PDFium library before it starts the Server. On macOS that path
+is the Tauri-signed copy under `Contents/Frameworks`, as required by hardened
+runtime library validation. Standalone Server
+installs retain the normal discovery order; managed-venv PDFium libraries are
+canonicalized before loading so hardened macOS processes never receive a
+relative `dlopen` path.
+
 The config file path itself can be overridden on the CLI:
 
 ```bash

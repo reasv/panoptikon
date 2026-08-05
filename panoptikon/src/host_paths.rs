@@ -331,7 +331,10 @@ pub fn find_pdfium_in_venvs() -> Option<PathBuf> {
     for site in site_packages {
         let candidate = site.join("pypdfium2_raw").join(lib_name);
         if candidate.is_file() {
-            return Some(candidate);
+            // Hardened macOS processes reject relative dlopen() paths even
+            // when the file exists. All platforms benefit from handing the
+            // dynamic loader an unambiguous absolute path.
+            return fs::canonicalize(&candidate).ok().or(Some(candidate));
         }
     }
     None

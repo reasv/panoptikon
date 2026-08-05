@@ -31,6 +31,7 @@ desktop_dev_init() {
 
     desktop_dev_require npm
     desktop_dev_require npx
+    desktop_dev_require python3
 
     if command -v rustup >/dev/null 2>&1; then
         local requested="${RUSTUP_TOOLCHAIN:-stable}"
@@ -114,6 +115,9 @@ desktop_dev_build_sidecar() {
     if [[ "$profile" == "release" ]]; then
         cargo_args+=(--release)
     fi
+
+    echo "Staging the pinned PDFium runtime..."
+    (cd "$REPO_ROOT" && python3 scripts/stage-pdfium.py --target "$HOST_TRIPLE")
 
     echo "Building the bundled Panoptikon Server sidecar ($profile)..."
     (cd "$REPO_ROOT" && PANOPTIKON_UI_BUNDLE="$STANDALONE" cargo "${cargo_args[@]}")

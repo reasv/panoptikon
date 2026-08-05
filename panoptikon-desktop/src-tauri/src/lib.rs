@@ -2104,8 +2104,20 @@ mod tests {
         assert_eq!(production["identifier"], "app.panoptikon.desktop");
         assert_eq!(development["identifier"], "app.panoptikon.desktop.dev");
         assert_eq!(
+            development["bundle"]["macOS"]["entitlements"],
+            "Entitlements.dev.plist"
+        );
+        assert_eq!(
             production["bundle"]["externalBin"][0],
             "binaries/panoptikon"
+        );
+        assert_eq!(
+            production["bundle"]["resources"]["resources/pdfium/"],
+            "pdfium/"
+        );
+        assert_eq!(
+            production["bundle"]["macOS"]["frameworks"][0],
+            "./resources/pdfium/libpdfium.dylib"
         );
         assert!(
             production["bundle"]["createUpdaterArtifacts"]
