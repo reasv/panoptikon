@@ -71,13 +71,25 @@ Small dark popover (same visual family as the bubbles). Items:
   `videoPlayerState.setControls`, which resyncs React state from the DOM on
   the way back). While native controls are active, the entire custom surface
   hides except a **lone kebab at the video's top-right** to switch back.
+- **Playback speed** — a **Speed** row, not a submenu: an inline strip of
+  choices (0.25 · 0.5 · 1 · 1.5 · 2) under the label, current one lit blue
+  like the trim popover's set bounds, and clicking one leaves the menu open
+  (comparing speeds is one errand, same rationale as the mini tier's loop
+  verbs). At a rate other than 1 the label carries it as a suffix
+  ("Speed — 1.5×") so a non-1× player is glanceable. Present at every tier;
+  the rate is ephemeral (never stored, unlike volume) but survives the
+  element, which the gallery remounts on navigation. `useVideoTrim`'s
+  seek-vs-playback threshold is media time, so it scales with the rate —
+  otherwise a 2× loop in a hidden tab overshoots its end point.
 - **Close video** — the existing `stopVideo` (unload back to thumbnail).
-- (Future, not in scope now: playback speed.)
 
 ### Trim controls
 
-- The rail keeps markers/band/bubbles as today. `useVideoTrim`, the marker
-  gesture code, and the h-field codec are **untouched** by this redesign.
+- The rail keeps markers/band/bubbles as today. The marker gesture code and
+  the h-field codec are **untouched** by this redesign; `useVideoTrim` is
+  untouched apart from one carve-out — the seek-vs-playback crossing
+  threshold scales with the element's playback rate (see Playback speed in
+  the kebab section).
 - **One trim button** in the row (bracket-pair icon). Hover → a **popover
   toolbar** above it containing:
   - **Set start** / **Set end** buttons: click = set that bound to the
@@ -195,6 +207,7 @@ natural size) supersedes them as soon as either loads.
 | `I` / `O` | set loop start / end at playhead | shift = clear that bound |
 | `,` / `.` | frame step back / forward | pauses first; ~1/30 s |
 | `J` / `L` | seek −5 s / +5 s | |
+| `<` / `>` | playback speed down / up | steps the kebab's ladder, clamped at 0.25× and 2× |
 | `←` / `→` | previous / next gallery item | same meaning in and out of fullscreen (browsing is the app's core loop); fills a long-standing gap — a stale comment in `VirtualizedHorizontalScroll.tsx` already claims arrow-key nav exists |
 
 All bindings follow the existing guards: skipped when the target is an
@@ -302,7 +315,7 @@ in the 2026-08-07 design session (codec regex `pinboardCrop.ts`,
 coincident-marker direction logic `VideoTimeline.tsx`, etc.).
 
 Also deferred: shift-drag range painting on the rail, fine-drag modifier on
-markers, playback speed menu item.
+markers.
 
 ## Implementation plan
 
