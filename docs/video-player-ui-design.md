@@ -51,7 +51,7 @@ Layout, bottom-up:
    X-in-bubble-clear behavior, hover time bubble, scrub-pauses-then-resumes.
    The rail spans the full row, so it takes the outermost strip where it
    occludes least. It may thicken slightly on hover for grabbability.
-2. **Flat button row above the rail.** White glyphs (~17 px) with a faint
+2. **Flat button row above the rail.** White glyphs (~20 px) with a faint
    white pill on hover (`bg-white/15`, rounded), never circles.
    - Left group: **play/pause** · **volume** (slider extends inline to the
      right on hover) · **time readout** `0:42.3 / 1:36.1` (tabular numerals).
@@ -122,9 +122,28 @@ The surface is one thing; a `useIdleHide`-style hook drives it:
   player surface. Available from the **gallery and from any pin** —
   fullscreening a pin is how a curated clip is actually watched.
 - `F` toggles (gallery/fullscreen keyboard scope), `Esc` exits (native).
-- In fullscreen, clicking the video surface toggles play/pause. Outside
-  fullscreen the gallery's click-to-navigate halves are unchanged.
+- In fullscreen, clicking the video surface toggles play/pause.
 - The surface scales up modestly in fullscreen (larger insets/hit targets).
+
+**Outside fullscreen, a loaded gallery video splits the panel into zones.**
+While the player world is on (S1, playing or paused) the picture is no longer
+simply the left/right navigate halves. Let `L` be the horizontal letterbox
+beside the displayed video, per side. With `L ≥ 96 px` — enough room to page
+comfortably without aiming at the picture — clicking anywhere **on** the
+displayed video rect toggles play/pause, and everything outside it still
+navigates by which half of the panel was clicked. When the video is too wide
+for that (`L < 96 px`), the navigate strips encroach `96 − L` into the video
+from each side, capped at 30 % of the video's width per side so a play/pause
+centre strip of **at least 40 % of the video width** always survives; the
+vertical letterbox above and below the picture always navigates. S0
+thumbnails, plain images and native-controls mode keep the pure navigate
+halves, as does a video whose displayed box is not measured yet.
+The cursor is honest only in the uncrowded case: when the whole picture is the
+play/pause zone the `<video>` element box coincides with that zone exactly, so
+it carries the default arrow. In the encroached case (`L < 96 px`) the zone is
+a centre strip inside that same box, and the wrapper's `cursor-pointer` keeps
+showing over it — accepted deliberately, as an honest cursor there would cost
+an extra layer and the pointer-events juggling that comes with it.
 
 ### Size ladder (pins; container-query driven)
 
@@ -147,7 +166,24 @@ checks where possible:
   must be recomputed for the new bottom-band footprint, and its comment
   updated.
 
-The gallery always renders the full row.
+**In the gallery the surface hugs the displayed video.** The gallery panel is
+far wider than a letterboxed picture, and a panel-wide row over empty
+letterbox reads as sparse. The surface's width is therefore
+`min(container width, max(displayed video width, PLAYER_SIZE_FULL_WIDTH))` —
+the floor is the width the full control row itself needs (the 280 px full tier
+threshold), never a fraction of the container, so it only engages for videos
+narrower than the row. The box is centred on the picture and bottom-aligned
+with the picture's bottom edge, and the tier is derived from the resulting
+width through the same `playerSizeForWidth` the pins use: a panel under 280 px
+degrades to medium/mini exactly like a pin. In fullscreen the player owns the
+screen and the surface spans it, as every fullscreen video's controls do. The
+S0 play button anchors to the thumbnail's rendered corner by the same rule,
+and so does S2's lone escape kebab — it belongs beside the native control bar
+it escapes from, not out in the letterbox. The aspect those boxes are built
+from is the **displayed** one: `item.width`/`item.height` are coded dimensions
+and read swapped for a rotated phone video, so the element-confirmed ratio
+(the video's `videoWidth`/`videoHeight`, or the rotation-corrected thumbnail's
+natural size) supersedes them as soon as either loads.
 
 ### Keyboard (gallery and fullscreen only — pins have no key focus)
 
