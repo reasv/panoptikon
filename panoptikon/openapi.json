@@ -5778,6 +5778,9 @@
           "cron_schedule": {
             "type": "string"
           },
+          "detect_outros": {
+            "type": "boolean"
+          },
           "enable_cron_job": {
             "type": "boolean"
           },
@@ -9371,7 +9374,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Content End (ms)\n\nWhere the item's real content ends, when an outro was found."
+            "description": "Content End (ms)\n\nWhere the item's real content ends, when an outro was found. Absent\nwhen no outro is recorded or the column was not selected."
           },
           "data_id": {
             "type": [
@@ -9463,7 +9466,7 @@
               "string",
               "null"
             ],
-            "description": "Outro Kind\n\nThe raw stored outro verdict, detector version included (`tiktok_card/1`,\n`none/1`); absent when the item was never examined. Kind-specific\nqueries must prefix-match, not compare the whole value — see\n`docs/video-outro-detection-design.md` §6.2. \"Has an outro\" is\n`content_end_ms` being present."
+            "description": "Outro Kind\n\nThe raw stored outro verdict, detector version included (`tiktok_card/1`,\n`none/1`); absent when the item was never examined or the column was\nnot selected. Kind-specific\nqueries must prefix-match, not compare the whole value — see\n`docs/video-outro-detection-design.md` §6.2. \"Has an outro\" is\n`content_end_ms` being present."
           },
           "path": {
             "type": [

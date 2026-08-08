@@ -76,6 +76,8 @@ pub(crate) struct DesktopSetupCompleteRequest {
     pub scan_pdf: bool,
     #[serde(default)]
     pub scan_html: bool,
+    #[serde(default = "default_true")]
+    pub detect_outros: bool,
     #[serde(default)]
     pub cron_jobs: Vec<CronJob>,
     #[serde(default)]
@@ -1100,6 +1102,7 @@ pub(crate) async fn complete_setup(
     config.scan_audio = request.scan_audio;
     config.scan_pdf = request.scan_pdf;
     config.scan_html = request.scan_html;
+    config.detect_outros = request.detect_outros;
     config.cron_jobs = request.cron_jobs;
     config.enable_cron_job = request.enable_cron_job;
     config.cron_schedule = request.cron_schedule;
