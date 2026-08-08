@@ -85,6 +85,47 @@ impl ProxyState {
     }
 }
 
+/// A `ProxyState` over stand-in upstreams, for tests that call an API
+/// handler taking `State<Arc<ProxyState>>` directly.
+///
+/// Nothing is ever dialed: the settings are deserialized rather than loaded
+/// (no config file, no env templating, so no `env_lock`), and the handler
+/// paths this serves reach the inference client only for queries that need
+/// an embedding.
+#[cfg(test)]
+pub(crate) fn test_proxy_state() -> Arc<ProxyState> {
+    // Discard-protocol port: parsed and stored, never connected to.
+    const STAND_IN: &str = "http://127.0.0.1:9";
+    let upstream = Upstream::parse("api", STAND_IN).expect("stand-in upstream");
+    let inference_client =
+        InferenceApiClient::new_with_metadata_cache(STAND_IN.to_string(), false)
+            .expect("stand-in inference client");
+    let settings: Settings = toml::from_str(
+        r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:9"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:9"
+"#,
+    )
+    .expect("minimal settings");
+    Arc::new(ProxyState::new(
+        upstream.clone(),
+        upstream.clone(),
+        upstream,
+        inference_client,
+        0,
+        Arc::new(settings),
+        Arc::new(TokenKey::random()),
+        watch::channel(false).1,
+    ))
+}
+
 pub async fn proxy_ui(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<ProxyState>>,

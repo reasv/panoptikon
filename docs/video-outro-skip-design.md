@@ -160,10 +160,18 @@ player has no other need for). Instead, the API stops serving the metadata:
   for every client, with zero config plumbing in the player. This extends the
   detection design's §8 contract ("off ⇒ consumers ignore the metadata") to
   the API as a consumer.
-- Config is read per-request via the existing `SystemConfigStore::from_env()`
-  pattern (as the jobs handlers do). The nulling must be applied **after any
-  result-cache read, at response mapping time**, so a config change takes
-  effect immediately and cached rows never leak stale policy.
+- Config is resolved per-request through `SystemConfigStore::from_env()`, but
+  the request pays for a stat, not a parse: the `detect_outros` bit is cached
+  per index database against the stamp (modification time and length) of its
+  `config.toml`, and re-read only when that stamp moves. A config save
+  rewrites the file, so the next request after it sees a new stamp and
+  re-reads — a change still takes effect immediately, without a TOML parse on
+  every search. The read never creates the file (a GET must not write to the
+  data folder) and fails open: an unreadable or malformed config logs a
+  warning and serves the metadata rather than failing the request.
+- The nulling must be applied **after any result-cache read, at response
+  mapping time**, so a config change takes effect immediately and cached rows
+  never leak stale policy.
 - **Deliberate asymmetry**: PQL *predicates* (`match` filters, `order_by`) on
   the outro columns stay functional with the toggle off. Querying is a query
   capability, not playback; gating the PQL builder is invasive and the

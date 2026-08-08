@@ -88,6 +88,24 @@ pub struct DbConnection<M: DbMode> {
     _mode: PhantomData<M>,
 }
 
+#[cfg(test)]
+impl<M: DbMode> DbConnection<M> {
+    /// Wraps an already-open connection in the request-scoped shape the
+    /// extractor would have produced, so handler bodies can be called
+    /// directly in tests. `_mode` is private, so this is the only way to
+    /// build one outside this module — and without it every handler-level
+    /// invariant (which of the two database names a handler reads, for one)
+    /// would only ever be tested through stand-ins.
+    pub(crate) fn for_tests(conn: SqliteConnection, index_db: &str, user_data_db: &str) -> Self {
+        Self {
+            conn: DbConn::Direct(conn),
+            index_db: index_db.to_string(),
+            user_data_db: user_data_db.to_string(),
+            _mode: PhantomData,
+        }
+    }
+}
+
 impl<M: DbMode> Drop for DbConnection<M> {
     fn drop(&mut self) {
         // Unconditional bump on release of a user-data write connection:

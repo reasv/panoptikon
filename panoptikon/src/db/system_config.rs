@@ -214,6 +214,9 @@ impl SystemConfigStore {
             .join("config.toml")
     }
 
+    /// Reads the stored configuration, creating it from defaults when the
+    /// file does not exist yet. For the jobs/config surfaces, which are
+    /// entitled to materialize the file they are about to edit.
     pub(crate) fn load(&self, index_db: &str) -> ApiResult<SystemConfig> {
         let config_path = self.config_path(index_db);
         if !config_path.exists() {
@@ -222,17 +225,26 @@ impl SystemConfigStore {
             return Ok(config);
         }
 
-        let raw = fs::read_to_string(&config_path).map_err(|err| {
-            tracing::error!(error = %err, path = %config_path.display(), "failed to read system config");
-            ApiError::internal("Failed to read system configuration")
-        })?;
-        let mut config: SystemConfig = toml::from_str(&raw).map_err(|err| {
-            tracing::error!(error = %err, path = %config_path.display(), "failed to parse system config");
-            ApiError::internal("Failed to parse system configuration")
-        })?;
+        read_config_file(&config_path)
+    }
 
-        normalize_folder_lists(&mut config);
-        Ok(config)
+    /// The same read as [`load`](Self::load) with the create-on-missing side
+    /// effect removed: a missing file simply reads as
+    /// `SystemConfig::default()`, and nothing is written.
+    ///
+    /// This is what read paths must use. A plain GET has no business creating
+    /// files in the data folder: a read-only server refuses exactly that kind
+    /// of on-demand write (see `db::connection::ensure_migrations_allowed`),
+    /// a search-only capability client has no config-write entitlement, and a
+    /// GET racing a `PUT /api/jobs/config` could otherwise drop a defaults
+    /// file on top of the save.
+    pub(crate) fn load_readonly(&self, index_db: &str) -> ApiResult<SystemConfig> {
+        let config_path = self.config_path(index_db);
+        if !config_path.exists() {
+            return Ok(SystemConfig::default());
+        }
+
+        read_config_file(&config_path)
     }
 
     pub(crate) fn save(&self, index_db: &str, config: &SystemConfig) -> ApiResult<()> {
@@ -278,6 +290,23 @@ impl SystemConfigStore {
         })?;
         Ok(())
     }
+}
+
+/// Reads and parses an existing `config.toml`. Shared by both load paths so
+/// they can never drift in how a stored file is interpreted; they differ
+/// only in what they do when there is no file.
+fn read_config_file(config_path: &Path) -> ApiResult<SystemConfig> {
+    let raw = fs::read_to_string(config_path).map_err(|err| {
+        tracing::error!(error = %err, path = %config_path.display(), "failed to read system config");
+        ApiError::internal("Failed to read system configuration")
+    })?;
+    let mut config: SystemConfig = toml::from_str(&raw).map_err(|err| {
+        tracing::error!(error = %err, path = %config_path.display(), "failed to parse system config");
+        ApiError::internal("Failed to parse system configuration")
+    })?;
+
+    normalize_folder_lists(&mut config);
+    Ok(config)
 }
 
 fn normalize_folder_lists(config: &mut SystemConfig) {

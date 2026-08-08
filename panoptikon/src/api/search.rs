@@ -215,7 +215,9 @@ pub(crate) struct SearchResult {
     /// asymmetry — PQL predicates (`match` filters, `order_by`) on this
     /// column keep working with the toggle off, because querying your own
     /// data is a query capability, not playback
-    /// (`docs/video-outro-skip-design.md` §6).
+    /// (`docs/video-outro-skip-design.md` §6). The visible edge of that
+    /// asymmetry: an `order_by` on `content_end_ms` still orders the rows by
+    /// the stored boundaries even though every served value is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     outro_kind: Option<String>,
     /// Content End (ms)
@@ -225,7 +227,8 @@ pub(crate) struct SearchResult {
     ///
     /// Also absent on every row when the index database has `detect_outros`
     /// off, on the same terms (and with the same PQL asymmetry) as
-    /// `outro_kind`.
+    /// `outro_kind` — an `order_by` on this column still orders the rows by
+    /// the stored boundaries even though every served value is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     content_end_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -653,7 +656,7 @@ pub async fn search_pql(
     // from the cache were stored under whatever policy was in force when
     // they were executed, so gating any earlier would let a stale policy
     // survive in the cache and a config change take effect late.
-    apply_outro_gate(&db.index_db, &mut results)?;
+    apply_outro_gate(&db.index_db, &mut results).await;
 
     Ok(Json(FileSearchResponse {
         count,
@@ -672,18 +675,17 @@ pub async fn search_pql(
 /// the very next request, hit or miss. The PQL builder is untouched by
 /// design: filters and orders on these columns keep working with the toggle
 /// off, only the served values are withheld.
-fn apply_outro_gate(index_db: &str, results: &mut [SearchResult]) -> ApiResult<()> {
+async fn apply_outro_gate(index_db: &str, results: &mut [SearchResult]) {
     let carries_metadata = results
         .iter()
         .any(|result| result.outro_kind.is_some() || result.content_end_ms.is_some());
-    if serve_outro_metadata(index_db, carries_metadata)? {
-        return Ok(());
+    if serve_outro_metadata(index_db, carries_metadata).await {
+        return;
     }
     for result in results {
         result.outro_kind = None;
         result.content_end_ms = None;
     }
-    Ok(())
 }
 
 /// Whether the result cache may serve this request at all: enabled globally
@@ -3316,8 +3318,13 @@ mod tests {
     /// stored value is the only served form (design §6.3). The negative row
     /// proves `content_end_ms` — not the kind string — is what "has an outro"
     /// reads, and the never-examined row proves absent stays absent.
+    ///
+    /// This is the mapping up to but not including the serving gate, i.e.
+    /// what the response carries whenever `detect_outros` is on (the
+    /// default). The toggle-off contract is
+    /// [`outro_columns_gated_by_detect_outros`].
     #[tokio::test]
-    async fn outro_columns_are_selectable_and_served_raw() {
+    async fn outro_columns_served_raw_when_detection_enabled() {
         use crate::pql::model::Column as PqlColumn;
 
         let mut dbs = setup_test_databases().await;
@@ -3554,7 +3561,7 @@ mod tests {
         // stored values reach the response unchanged.
         crate::test_utils::write_detect_outros_config("search-outro-on", true);
         let mut served = mapped_results(&mut dbs.index_conn).await;
-        apply_outro_gate("search-outro-on", &mut served).expect("gate with detection on");
+        apply_outro_gate("search-outro-on", &mut served).await;
         let card = served
             .iter()
             .find(|result| result.sha256.as_deref() == Some("sha_card"))
@@ -3564,7 +3571,7 @@ mod tests {
 
         crate::test_utils::write_detect_outros_config("search-outro-off", false);
         let mut gated = mapped_results(&mut dbs.index_conn).await;
-        apply_outro_gate("search-outro-off", &mut gated).expect("gate with detection off");
+        apply_outro_gate("search-outro-off", &mut gated).await;
         assert_eq!(gated.len(), 2);
         for result in &gated {
             assert_eq!(
@@ -3592,5 +3599,93 @@ mod tests {
             vec!["sha_card".to_string()],
             "filtering on content_end_ms survives detect_outros being off"
         );
+    }
+
+    /// The wiring, not the helper: `search_pql` must gate on the request's
+    /// **index** database config, not its user-data one. Both names are
+    /// stamped with opposite toggles and the handler is run twice with them
+    /// swapped, so reading the wrong name fails whichever way it is wrong.
+    #[tokio::test]
+    async fn search_pql_gates_on_the_index_db_config() {
+        let _env = crate::test_utils::test_data_dir();
+        crate::test_utils::write_detect_outros_config("search-handler-index-off", false);
+        crate::test_utils::write_detect_outros_config("search-handler-user-on", true);
+        crate::test_utils::write_detect_outros_config("search-handler-index-on", true);
+        crate::test_utils::write_detect_outros_config("search-handler-user-off", false);
+
+        /// Runs the real handler over a throwaway database holding one file
+        /// whose item carries a detected outro. `cache: false` keeps the
+        /// process-global result cache out of it; the gate sits after the
+        /// cache read either way.
+        async fn serve(index_db: &str, user_data_db: &str) -> Vec<SearchResult> {
+            let mut dbs = setup_test_databases().await;
+            sqlx::query(
+                r#"
+                INSERT INTO items (
+                    id, sha256, md5, type, duration, outro_kind, content_end_ms, time_added
+                )
+                VALUES (1, 'sha_card', 'md5_1', 'video/mp4', 12.0, 'tiktok_card/1', 8000,
+                        '2024-01-01T00:00:00')
+                "#,
+            )
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+            insert_scan(&mut dbs.index_conn, 1, r"C:\outro").await;
+            sqlx::query(
+                r#"
+                INSERT INTO files (
+                    id, sha256, item_id, path, filename, last_modified, scan_id, available
+                )
+                VALUES (10, 'sha_card', 1, 'C:\outro\a.mp4', 'a.mp4', '2024-01-02T00:00:00', 1, 1)
+                "#,
+            )
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+
+            let crate::db::migrations::InMemoryDatabases {
+                index_conn,
+                storage_conn,
+                user_data_conn,
+            } = dbs;
+            // Held so the shared-cache in-memory databases outlive the call.
+            let _attached = (storage_conn, user_data_conn);
+            let db = DbConnection::<ReadOnly>::for_tests(index_conn, index_db, user_data_db);
+
+            search_pql(
+                State(crate::proxy::test_proxy_state()),
+                db,
+                Query(
+                    serde_json::from_value(serde_json::json!({}))
+                        .expect("default bookmark params"),
+                ),
+                None,
+                Some(Json(serde_json::json!({
+                    "select": ["sha256", "outro_kind", "content_end_ms"],
+                    "page_size": 0,
+                    "count": false,
+                    "check_path": false,
+                    "cache": false,
+                }))),
+            )
+            .await
+            .expect("search")
+            .0
+            .results
+        }
+
+        let gated = serve("search-handler-index-off", "search-handler-user-on").await;
+        assert_eq!(gated.len(), 1);
+        assert_eq!(
+            gated[0].outro_kind, None,
+            "the index database's toggle is off, so nothing is served"
+        );
+        assert_eq!(gated[0].content_end_ms, None);
+
+        let served = serve("search-handler-index-on", "search-handler-user-off").await;
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].outro_kind.as_deref(), Some("tiktok_card/1"));
+        assert_eq!(served[0].content_end_ms, Some(8000));
     }
 }

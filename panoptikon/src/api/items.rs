@@ -187,14 +187,18 @@ pub(crate) struct ItemRecordResponse {
     /// Note the deliberate asymmetry — PQL predicates (`match` filters,
     /// `order_by`) on this column keep working with the toggle off, because
     /// querying your own data is a query capability, not playback
-    /// (`docs/video-outro-skip-design.md` §6).
+    /// (`docs/video-outro-skip-design.md` §6). The visible edge of that
+    /// asymmetry: an `order_by` on `content_end_ms` still orders the rows by
+    /// the stored boundaries even though every served value is null.
     #[schema(required)]
     outro_kind: Option<String>,
     /// Where the item's real content ends, when an outro was found.
     ///
     /// Served as `null` for every item when the index database has
     /// `detect_outros` off, on the same terms (and with the same PQL
-    /// asymmetry) as `outro_kind`.
+    /// asymmetry) as `outro_kind` — an `order_by` on this column still
+    /// orders the rows by the stored boundaries even though every served
+    /// value is null.
     #[schema(required)]
     content_end_ms: Option<i64>,
     time_added: String,
@@ -292,7 +296,7 @@ pub async fn item_meta(
     };
 
     let response = ItemMetadataResponse {
-        item: map_item_record(&db.index_db, &item)?,
+        item: map_item_record(&db.index_db, &item).await,
         files: item_data.files.into_iter().map(map_file_record).collect(),
     };
 
@@ -868,12 +872,13 @@ fn bytes_response(
 /// Maps an item record for the response, applying the index database's outro
 /// serving gate (`docs/video-outro-skip-design.md` §6): with `detect_outros`
 /// off, both outro fields are served null whatever the row holds.
-fn map_item_record(index_db: &str, item: &ItemRecord) -> ApiResult<ItemRecordResponse> {
+async fn map_item_record(index_db: &str, item: &ItemRecord) -> ItemRecordResponse {
     let serve_outro = serve_outro_metadata(
         index_db,
         item.outro_kind.is_some() || item.content_end_ms.is_some(),
-    )?;
-    Ok(ItemRecordResponse {
+    )
+    .await;
+    ItemRecordResponse {
         id: item.id,
         sha256: item.sha256.clone(),
         md5: item.md5.clone(),
@@ -889,7 +894,7 @@ fn map_item_record(index_db: &str, item: &ItemRecord) -> ApiResult<ItemRecordRes
         outro_kind: serve_outro.then(|| item.outro_kind.clone()).flatten(),
         content_end_ms: serve_outro.then_some(item.content_end_ms).flatten(),
         time_added: item.time_added.clone(),
-    })
+    }
 }
 
 fn map_file_record(file: FileRecord) -> FileRecordResponse {
@@ -1281,8 +1286,8 @@ mod tests {
     /// `detect_outros` off both arrive null even though the record carries a
     /// detected boundary, and the positive control proves the values do
     /// travel when the toggle is on (the default).
-    #[test]
-    fn outro_fields_gated_by_detect_outros() {
+    #[tokio::test]
+    async fn outro_fields_gated_by_detect_outros() {
         let _env = crate::test_utils::test_data_dir();
         let file_path = temp_path("outro_gate");
         let (mut item, _file) = test_records(&file_path);
@@ -1290,12 +1295,12 @@ mod tests {
         item.content_end_ms = Some(8000);
 
         crate::test_utils::write_detect_outros_config("items-outro-on", true);
-        let served = map_item_record("items-outro-on", &item).expect("map with detection on");
+        let served = map_item_record("items-outro-on", &item).await;
         assert_eq!(served.outro_kind.as_deref(), Some("tiktok_card/1"));
         assert_eq!(served.content_end_ms, Some(8000));
 
         crate::test_utils::write_detect_outros_config("items-outro-off", false);
-        let gated = map_item_record("items-outro-off", &item).expect("map with detection off");
+        let gated = map_item_record("items-outro-off", &item).await;
         assert_eq!(
             gated.outro_kind, None,
             "an already-detected verdict is withheld once the toggle is off"
@@ -1304,6 +1309,95 @@ mod tests {
         // Everything else is untouched by the gate.
         assert_eq!(gated.sha256, item.sha256);
         assert_eq!(gated.size, item.size);
+    }
+
+    /// The wiring, not the helper: `item_meta` must consult the request's
+    /// **index** database config, not its user-data one. Both names are
+    /// stamped with opposite toggles and the handler is run twice with them
+    /// swapped, so reading the wrong name fails whichever way it is wrong.
+    #[tokio::test]
+    async fn item_meta_gates_on_the_index_db_config() {
+        let _env = crate::test_utils::test_data_dir();
+        crate::test_utils::write_detect_outros_config("items-handler-index-off", false);
+        crate::test_utils::write_detect_outros_config("items-handler-user-on", true);
+        crate::test_utils::write_detect_outros_config("items-handler-index-on", true);
+        crate::test_utils::write_detect_outros_config("items-handler-user-off", false);
+
+        /// The item's sha256, spelled in full so the lookup takes the exact
+        /// match rather than the prefix-range branch.
+        const SHA: &str = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
+
+        /// Runs the real handler over a throwaway database holding one item
+        /// with a detected outro. The file row exists only because the
+        /// metadata lookup joins it; it need not exist on disk.
+        async fn serve(index_db: &str, user_data_db: &str) -> ItemRecordResponse {
+            let mut dbs = crate::db::migrations::setup_test_databases().await;
+            sqlx::query(
+                r#"
+                INSERT INTO items (
+                    id, sha256, md5, type, duration, outro_kind, content_end_ms, time_added
+                )
+                VALUES (1, ?, 'md5_1', 'video/mp4', 12.0, 'tiktok_card/1', 8000,
+                        '2024-01-01T00:00:00')
+                "#,
+            )
+            .bind(SHA)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
+                .bind("2024-01-01T00:00:00")
+                .bind(r"C:\outro")
+                .execute(&mut dbs.index_conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO files (
+                    id, sha256, item_id, path, filename, last_modified, scan_id, available
+                )
+                VALUES (10, ?, 1, 'C:\outro\a.mp4', 'a.mp4', '2024-01-02T00:00:00', 1, 1)
+                "#,
+            )
+            .bind(SHA)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+            let crate::db::migrations::InMemoryDatabases {
+                index_conn,
+                storage_conn,
+                user_data_conn,
+            } = dbs;
+            // Held so the shared-cache in-memory databases outlive the call.
+            let _attached = (storage_conn, user_data_conn);
+            let db = DbConnection::<ReadOnlyNoUserData>::for_tests(
+                index_conn,
+                index_db,
+                user_data_db,
+            );
+            item_meta(
+                db,
+                Query(ItemQuery {
+                    id: SHA.to_string(),
+                    id_type: ItemIdentifierType::Sha256,
+                }),
+            )
+            .await
+            .expect("item metadata")
+            .0
+            .item
+        }
+
+        let gated = serve("items-handler-index-off", "items-handler-user-on").await;
+        assert_eq!(
+            gated.outro_kind, None,
+            "the index database's toggle is off, so nothing is served"
+        );
+        assert_eq!(gated.content_end_ms, None);
+
+        let served = serve("items-handler-index-on", "items-handler-user-off").await;
+        assert_eq!(served.outro_kind.as_deref(), Some("tiktok_card/1"));
+        assert_eq!(served.content_end_ms, Some(8000));
     }
 
     #[test]
