@@ -84,11 +84,15 @@ from the item's own metadata.
   outro end marker (§4). Hover shows an explanatory bubble in the existing
   black/80 style: "TikTok end card detected — skipped during playback.
   Click to disable."
-- **Inert state**: while a user *end* bound is set, the end override wins and
-  the button renders dimmed, with the bubble explaining "Manual trim end
-  overrides outro skip." It stays clickable — clicking still flips the global
-  preference (harmless, takes effect wherever no end override exists). A user
-  start bound alone does not dim it.
+- **Inert state**: while skip is on *and* a user *end* bound is set, the end
+  override wins and the button renders dimmed, with the bubble explaining
+  "Manual trim end overrides outro skip." It stays clickable — clicking still
+  flips the global preference (harmless, takes effect wherever no end
+  override exists). A user start bound alone does not dim it. The off state
+  always wins the presentation: skip off shows the unlit off-copy even when a
+  user end exists (dimming there would hide that the feature is off). Four
+  bubble states total: governing, off, overridden-by-end, suppressed by the
+  degenerate-start guard.
 - Turning the toggle off simply removes the default: full video, native-style
   loop at the file end (via `isEmptyTrim` on the now-empty effective range).
 
@@ -116,9 +120,13 @@ toggle button dims per §3. The seed lives in the **drag state**, and the
 gesture writes exactly **one** `onTrimChange` — at release, carrying the cut
 point when nothing moved and the final position otherwise. Seeding on
 pointerdown *and* committing on pointerup would push two history entries for
-one gesture, against the one-entry-per-trim-edit rule of the `vt` param. This gives "adjust the detected endpoint" without
-any conversion ambiguity — the default becomes user-owned only on a physical
-grab of that specific marker.
+one gesture, against the one-entry-per-trim-edit rule of the `vt` param.
+Because the seed is uncommitted until release, a chorded second pointerdown
+mid-gesture must be ignored (the stood-down outro marker leaves no end value
+to reseed from), and a cancelled gesture (pointercancel / lost capture) must
+clear the drag state without committing. This gives "adjust the detected
+endpoint" without any conversion ambiguity — the default becomes user-owned
+only on a physical grab of that specific marker.
 
 After the grab, frame-precision adjustment uses the existing affordances
 (popover frame-step, gallery `,`/`.` keys) since the end is now a real user
@@ -202,8 +210,18 @@ player has no other need for). Instead, the API stops serving the metadata:
   ("has an outro" = `content_end_ms` non-null).
 - Pinboard pins already receive it: their item fetch returns
   `ItemRecordResponse`, which always carries the field.
-- Regenerate `ui/lib/panoptikon.d.ts` only if the API schema shape changes
-  (the gating changes served values, not the schema, so likely not).
+- **Hand-built current-item payloads must carry the field.** Three sites
+  construct a `SearchResult`-shaped current-item object by hand rather than
+  passing a search row through, and each must copy `content_end_ms` or the
+  feature silently disappears for that selection path: the pin corner select
+  button (`SelectButton.tsx`), the pinboard double-click verb
+  (`GalleryPinBoard.selectAsCurrentItem`), and the similarity-target open
+  path (`itemSimilarity/similarityTarget.tsx`). Any future builder of that
+  shape inherits the same requirement.
+- Regenerate `ui/lib/panoptikon.d.ts` when the API's field *descriptions*
+  change, not just the shape — openapi-typescript emits descriptions as
+  JSDoc, so a comment-only server change still desyncs the file (it did for
+  the Step 1 gating notes).
 
 ## 8. Out of scope
 
