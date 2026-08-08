@@ -66,6 +66,41 @@ SELECT EXISTS(
     Ok(row.0 == 1)
 }
 
+/// Whether `storage.frames` holds anything at all for this content, at any
+/// version.
+///
+/// Deliberately unversioned, unlike [`has_frame`]: this answers "does this
+/// item have frames" for the scan's *bookkeeping* — whether a failed
+/// extraction may call them permanently unobtainable, and whether §7.1 has
+/// anything to replace — rather than "would the current generator serve
+/// these". A row written by an older generator is still a stored visual on
+/// both counts. It is also the exact question [`get_frames_bytes`] answers by
+/// returning a non-empty vector, so the two are interchangeable evidence.
+pub(crate) async fn has_any_frame(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+SELECT EXISTS(
+    SELECT 1
+    FROM storage.frames
+    WHERE item_sha256 = ?1
+    LIMIT 1
+) AS exists_flag
+        "#,
+    )
+    .bind(sha256)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to check frame existence");
+        ApiError::internal("Failed to read frame")
+    })?;
+
+    Ok(row.0 == 1)
+}
+
 pub(crate) async fn store_thumbnails(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,

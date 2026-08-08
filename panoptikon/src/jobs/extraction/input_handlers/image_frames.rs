@@ -6,6 +6,7 @@ use image::{DynamicImage, GenericImageView};
 use serde_json::{Value, json};
 
 use crate::api_error::{ApiError, Blocker};
+use crate::db::files::get_item_content_end_ms;
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::open_index_db_read_no_user_data;
 use crate::db::storage::{StoredImage, get_frames_bytes};
@@ -33,10 +34,23 @@ impl BaseFrame {
     }
 }
 
+/// `detect_outros` is the job's folded `scan_video && detect_outros` config
+/// pair. It gates the outro clamp below, per design §8's "consumers ignore the
+/// metadata".
+///
+/// Note what that does *not* buy on this side: `load_base_frames` returns
+/// `storage.frames` before it ever reaches the clamp, and §7.1's recovery path
+/// (erase a setter's `item_data`, re-run its extraction) does not touch
+/// `storage.frames`. So turning detection off and re-running extraction reuses
+/// whatever frames are cached, trimmed ones included. Undoing a false positive
+/// takes a scan-side regeneration — that is the path that actually replaces
+/// `storage.frames`; this gate only decides how frames are sampled when there
+/// is no cache to reuse.
 pub(super) async fn build_image_frames_inputs(
     index_db: &str,
     item: &JobInputData,
     model: &ModelMetadata,
+    detect_outros: bool,
 ) -> ApiResult<Vec<InferenceInput>> {
     let opts = &model.input_handler_opts;
     let max_frames = opts.get("max_frames").and_then(Value::as_i64).unwrap_or(4) as usize;
@@ -57,7 +71,7 @@ pub(super) async fn build_image_frames_inputs(
         None
     };
 
-    let frames = load_base_frames(index_db, item).await?;
+    let frames = load_base_frames(index_db, item, detect_outros).await?;
     if frames.is_empty() {
         return Ok(Vec::new());
     }
@@ -85,9 +99,12 @@ pub(super) async fn build_image_frames_inputs(
     Ok(outputs)
 }
 
+/// `detect_outros` gates the outro clamp on video frame sampling; see
+/// [`build_image_frames_inputs`].
 pub(super) async fn load_base_frames(
     index_db: &str,
     item: &JobInputData,
+    detect_outros: bool,
 ) -> ApiResult<Vec<BaseFrame>> {
     // Mirrors the Python image_loader guard: absurdly small images are
     // skipped outright (placeholder written) for every media type.
@@ -124,9 +141,23 @@ pub(super) async fn load_base_frames(
         }
         let duration = item.duration.unwrap_or(0.0);
         if duration > 0.0 && item.video_tracks.unwrap_or(0) > 0 {
+            // Where the item's real content ends, when the scan's outro
+            // detector found a boundary (docs/video-outro-detection-design.md
+            // §7). Read here rather than threaded through `JobInputData`
+            // because the work query's select list is PQL's, and this
+            // connection is open and indexed by sha256 already. `None` — never
+            // examined, examined and negative, or detection switched off —
+            // clamps nothing.
+            let content_end_ms = if detect_outros {
+                get_item_content_end_ms(&mut conn, &item.sha256)
+                    .await
+                    .unwrap_or(None)
+            } else {
+                None
+            };
             let extracted = tokio::task::spawn_blocking({
                 let path = item.path.clone();
-                move || extract_video_frames(&path, 4, duration)
+                move || extract_video_frames(&path, 4, duration, content_end_ms)
             })
             .await
             .map_err(|_| ApiError::internal("Failed to extract frames"))??;
@@ -508,34 +539,53 @@ fn extract_video_frames(
     path: &str,
     num_frames: usize,
     duration: f64,
+    content_end_ms: Option<i64>,
 ) -> ApiResult<Vec<DynamicImage>> {
     if duration <= 0.0 {
         return Ok(Vec::new());
     }
-    let interval = duration / num_frames as f64;
+    // The same window the scan side samples, computed by the same helper: the
+    // interval spreads the N frames across the content, and the decode bound
+    // is what keeps `fps=1/interval` from emitting a card frame past it.
+    let (window, bounded) = crate::jobs::files::frame_sampling_window(duration, content_end_ms);
+    let interval = window / num_frames as f64;
     let temp_dir = temp_dir_path();
     std::fs::create_dir_all(&temp_dir).map_err(|err| {
         tracing::error!(error = %err, "failed to create temp dir");
         ApiError::internal("Failed to extract frames")
     })?;
-    let result = extract_video_frames_into(path, num_frames, interval, &temp_dir);
+    let result = extract_video_frames_into(
+        path,
+        num_frames,
+        interval,
+        bounded.then_some(window),
+        &temp_dir,
+    );
     if let Err(err) = std::fs::remove_dir_all(&temp_dir) {
         tracing::debug!(error = %err, path = %temp_dir.display(), "failed to remove temp frame dir");
     }
     result
 }
 
+/// `decode_limit` is the outro clamp, in seconds, passed as an *input* option
+/// (`-t` before `-i`) so it bounds the decode rather than only what the muxer
+/// writes. The twin of the scan side's.
 fn extract_video_frames_into(
     path: &str,
     num_frames: usize,
     interval: f64,
+    decode_limit: Option<f64>,
     temp_dir: &std::path::Path,
 ) -> ApiResult<Vec<DynamicImage>> {
     let output_pattern = temp_dir.join("frame_%04d.png");
     // stdout is silenced, but stderr is captured so a failure can say why
     // (corrupt file, missing codec, disk full); it is only surfaced on a
     // non-zero exit.
-    let output = std::process::Command::new(crate::media_tools::ffmpeg())
+    let mut command = std::process::Command::new(crate::media_tools::ffmpeg());
+    if let Some(limit) = decode_limit {
+        command.arg("-t").arg(format!("{limit}"));
+    }
+    let output = command
         .arg("-i")
         .arg(path)
         .arg("-vf")
@@ -663,4 +713,49 @@ async fn render_html_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
         height: Some(shot.height() as i64),
         bytes: encode_jpeg(&shot)?,
     }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::files::{corner_is_card, write_clip};
+
+    /// The extraction side has its own ffmpeg invocation, so the scan side's
+    /// clamp test proves nothing about it. Both values of the gate are here:
+    /// `Some` is what `detect_outros` on produces, `None` is both "never
+    /// examined" and — per design §8 — "detection switched off, so the
+    /// consumer ignores the metadata".
+    ///
+    /// The `None` case is narrower than an undo, though: it only governs what
+    /// a *fresh* extraction samples. `load_base_frames` serves
+    /// `storage.frames` before reaching this call, so re-running extraction
+    /// with detection off reuses trimmed cached frames. See that function's
+    /// note.
+    #[test]
+    fn sampling_is_clamped_only_when_a_boundary_is_supplied() {
+        let dir = tempfile::TempDir::new().expect("a temp dir");
+        let clip = dir.path().join("card.mp4");
+        if !write_clip(&clip, Some(2)) {
+            return;
+        }
+        let path = clip.to_string_lossy().to_string();
+
+        let clamped = extract_video_frames(&path, 4, 7.0, Some(5000)).expect("ffmpeg runs");
+        assert_eq!(
+            clamped.len(),
+            4,
+            "the interval shrinks with the window, so the count is unchanged"
+        );
+        assert!(
+            !clamped.iter().any(corner_is_card),
+            "no frame sent to inference may come from the card"
+        );
+
+        let unclamped = extract_video_frames(&path, 4, 7.0, None).expect("ffmpeg runs");
+        assert_eq!(unclamped.len(), 4);
+        assert!(
+            unclamped.iter().any(corner_is_card),
+            "unclamped sampling lands in the card — that is what the gate turns back on"
+        );
+    }
 }

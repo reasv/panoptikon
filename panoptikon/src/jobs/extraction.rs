@@ -315,6 +315,12 @@ async fn run_extraction_job_inner(
 ) -> ApiResult<ExtractionOutcome> {
     let config_store = SystemConfigStore::from_env();
     let config = config_store.load(&job.index_db)?;
+    // Folded once for the whole job, exactly like the scan walker's, and
+    // threaded down to the frame handler rather than re-read per item: the
+    // only consumer of `items.content_end_ms` on this side is frame sampling,
+    // and design §8 says a consumer ignores the metadata while detection is
+    // off (`scan_video` outranking its own switch).
+    let detect_outros = config.scan_video && config.detect_outros;
 
     // The embedded resync no longer runs maintenance of its own, so its
     // changes are folded into this job's report (which also removes the old
@@ -544,6 +550,7 @@ async fn run_extraction_job_inner(
                     counters,
                     total_remaining,
                     &ledger_shas,
+                    detect_outros,
                 )
                 .await;
                 if let Err(err) = result {
@@ -767,12 +774,13 @@ async fn process_item(
     counters: Arc<Mutex<JobCounters>>,
     total_remaining: i64,
     ledger_shas: &std::collections::HashSet<String>,
+    detect_outros: bool,
 ) -> ApiResult<()> {
     let item_type = item.item_type.clone();
     let sha256 = item.sha256.clone();
     let path = item.path.clone();
     let load_span = counters.lock().await.data_load_time.start();
-    let prepare_result = input_handlers::prepare_item(index_db, model, item).await;
+    let prepare_result = input_handlers::prepare_item(index_db, model, item, detect_outros).await;
     drop(load_span);
     let prepared = match prepare_result {
         Ok(prepared) => prepared,
@@ -2536,6 +2544,7 @@ mod tests {
             "unused",
             &model,
             image_item(1, "sha_corrupt", corrupt.to_string_lossy().as_ref()),
+            true,
         )
         .await
         .expect_err("an unparseable header must fail the item");
@@ -2618,7 +2627,7 @@ mod tests {
         ] {
             let mut item = image_item(1, "sha_one", &path);
             item.item_type = mime.to_string();
-            let err = input_handlers::prepare_item("unused", &model, item)
+            let err = input_handlers::prepare_item("unused", &model, item, true)
                 .await
                 .expect_err("a missing file must fail the item");
             assert_eq!(
@@ -2993,7 +3002,7 @@ mod tests {
         item.duration = Some(10.0);
         item.video_tracks = Some(1);
 
-        let err = input_handlers::prepare_item(index_db, &image_model(), item)
+        let err = input_handlers::prepare_item(index_db, &image_model(), item, true)
             .await
             .expect_err("ffmpeg must reject a file that is not a container");
         assert_eq!(err.kind(), ApiErrorKind::Input);

@@ -35,8 +35,9 @@ use crate::{
     db::{
         file_scans::{FileScanUpdate, get_completed_scan_paths, get_open_file_scan_id},
         files::{
-            FileScanData, FileUpsertResult, ItemScanMeta, get_file_by_path, get_item_id,
-            get_item_dimensions, get_item_visual_meta, has_blurhash,
+            FileScanData, FileUpsertResult, ItemScanMeta, PendingOutroItem, get_file_by_path,
+            get_item_content_end_ms, get_item_dimensions, get_item_id, get_item_visual_meta,
+            get_pending_outro_item, has_blurhash,
         },
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
@@ -46,7 +47,10 @@ use crate::{
             fold_scan_path, list_distinct_scan_blockers, load_scan_errors_under,
             stage_blocks_indexing,
         },
-        storage::{StoredImage, get_frames_bytes, get_thumbnail_bytes, has_frame, has_thumbnail},
+        storage::{
+            StoredImage, get_frames_bytes, get_thumbnail_bytes, has_any_frame, has_frame,
+            has_thumbnail,
+        },
         system_config::{SystemConfig, SystemConfigStore},
         visual_attempts::{
             VisualAttemptRecord, VisualFailure, VisualKind, VisualVerdict,
@@ -55,6 +59,9 @@ use crate::{
     },
     jobs::queue::ChangeSummary,
     jobs::timing::PhaseTimer,
+    media_tools::outro::{
+        OUTRO_DETECTOR_VERSION, OutroProbeError, OutroVerdict, RejectReason, detect_outro,
+    },
     pql::builder::filters::evaluate_match,
     pql::model::{Match, MatchValue},
 };
@@ -892,6 +899,10 @@ struct NewItemData {
     /// used to keep a file out of the index entirely. See
     /// [`visuals_audit_failure`].
     visuals_scan_error: Option<ScanErrorRecord>,
+    /// Where this file's real content ends, when the outro pass produced a
+    /// verdict (docs/video-outro-detection-design.md). `None` whenever the
+    /// stage did not run or failed — the column holds verdicts only.
+    outro: Option<OutroRecord>,
 }
 
 struct BackfillResult {
@@ -906,6 +917,12 @@ struct BackfillResult {
     /// `attempts` tracks the marker's instead of freezing at the new-item
     /// pass's 1 — see [`backfill_scan_error`].
     visuals_scan_error: Option<ScanErrorRecord>,
+    /// See [`NewItemData::outro`].
+    outro: Option<OutroRecord>,
+    /// Design §7.1: this item newly turned positive *and* already had visuals,
+    /// so the ones this pass produced replace them rather than filling a gap.
+    /// The store guards are bypassed for exactly this case and no other.
+    replace_visuals: bool,
 }
 
 struct FailedFile {
@@ -953,6 +970,12 @@ struct ScanContext {
     attempt_scan_id: i64,
     scan_time: String,
     filescan_filter: Option<Arc<Match>>,
+    /// Whether this scan examines videos for an appended outro
+    /// (docs/video-outro-detection-design.md §8). Subordinate to `scan_video`:
+    /// the pair is folded once, here, so every site downstream asks one
+    /// question. Off leaves already-stored verdicts alone — it only stops
+    /// future examinations.
+    detect_outros: bool,
     semaphore: Arc<Semaphore>,
     tasks: JoinSet<TaskOutcome>,
     // Path (and whether the task is a visuals backfill) per in-flight task, so
@@ -1023,6 +1046,7 @@ async fn scan_single_folder(
         attempt_scan_id,
         scan_time: scan_time.to_string(),
         filescan_filter: parse_filescan_filter(config).map(Arc::new),
+        detect_outros: config.scan_video && config.detect_outros,
         semaphore: Arc::new(Semaphore::new(options.worker_count)),
         tasks: JoinSet::new(),
         task_paths: HashMap::new(),
@@ -1745,6 +1769,9 @@ impl ScanContext {
         };
         let result = self.update_file_data(data).await?;
         self.tally(&result);
+        // Strictly after the write that inserts the `items` row this updates.
+        self.record_outro_verdict(&item.sha256, item.outro.as_ref())
+            .await;
         // Strictly after the file write, because that write clears this path's
         // ledger row: the item indexed, so whatever verdict the path carried
         // from a previous version of itself is spent — and the row this pass
@@ -1867,6 +1894,41 @@ impl ScanContext {
         }
     }
 
+    /// Stores one genuine outro verdict, which also drops the probe's failure
+    /// marker in the same transaction
+    /// (docs/video-outro-detection-design.md §7.2).
+    ///
+    /// Never fails the file: a lost verdict costs one re-probe on the next
+    /// scan, which is the same trade every writer of the negative cache makes.
+    /// Empty for every non-video and for every item already examined, and the
+    /// emptiness is checked before the writer is touched.
+    async fn record_outro_verdict(&mut self, sha256: &str, record: Option<&OutroRecord>) {
+        let Some(record) = record else {
+            return;
+        };
+        match call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::SetOutroVerdict {
+                sha256: sha256.to_string(),
+                outro_kind: record.kind.clone(),
+                content_end_ms: record.content_end_ms,
+                reply,
+            }
+        })
+        .await
+        {
+            // The item went away between the pass and this write (deleted, or
+            // never inserted because its file write failed). Nothing to fix:
+            // the next scan re-examines whatever is there.
+            Ok(0) => tracing::debug!(sha256, "no item to store an outro verdict on"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                error = ?err,
+                sha256,
+                "failed to store an outro verdict; it will be re-probed next scan"
+            ),
+        }
+    }
+
     async fn handle_backfill(&mut self, backfill: BackfillResult) {
         self.in_flight_visuals.remove(&backfill.sha256);
 
@@ -1886,7 +1948,13 @@ impl ScanContext {
 
         // Storage failures for backfilled visuals are logged and skipped so a
         // single bad file cannot abort the scan; the next scan retries them.
-        if !backfill.thumbnails.is_empty() && !already_stored {
+        // `replace_visuals` is the one case that writes over a stored visual:
+        // this item newly turned positive, so what is stored was sampled
+        // across the card and the pass just rebuilt it against the clamped
+        // range (design §7.1). `store_thumbnails`/`store_frames` already
+        // delete-then-insert at the same version, so bypassing the guard is
+        // all it takes.
+        if !backfill.thumbnails.is_empty() && (backfill.replace_visuals || !already_stored) {
             wrote_visuals = true;
             if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
                 IndexDbWriterMessage::StoreThumbnails {
@@ -1906,7 +1974,7 @@ impl ScanContext {
         let frames_stored = has_frame(&mut self.conn, &backfill.sha256, FRAME_PROCESS_VERSION)
             .await
             .unwrap_or(false);
-        if !backfill.extracted_frames.is_empty() && !frames_stored {
+        if !backfill.extracted_frames.is_empty() && (backfill.replace_visuals || !frames_stored) {
             wrote_visuals = true;
             if let Err(err) =
                 call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::StoreFrames {
@@ -1948,6 +2016,12 @@ impl ScanContext {
         // finds the row it means to increment rather than re-inserting one.
         self.record_visuals_scan_error(backfill.visuals_scan_error)
             .await;
+        // The item already exists on this path, so there is no write to order
+        // against; last only because the marker delete it carries should not
+        // race the marker write above (they are mutually exclusive, and this
+        // makes that irrelevant rather than load-bearing).
+        self.record_outro_verdict(&backfill.sha256, backfill.outro.as_ref())
+            .await;
 
         if wrote_visuals {
             self.stats.backfilled_visuals += 1;
@@ -1965,6 +2039,11 @@ impl ScanContext {
     ) -> ApiResult<()> {
         let mut needs_thumb =
             !has_thumbnail(&mut self.conn, &sha256, THUMBNAIL_PROCESS_VERSION).await?;
+        // The positive cache's answer, before the image and marker branches
+        // below repurpose `needs_thumb`. Only the outro's replacement rule
+        // reads it, and only §7.1's question: is there anything stored here to
+        // replace?
+        let thumbnail_stored = !needs_thumb;
         let needs_blurhash = !has_blurhash(&mut self.conn, &sha256).await?;
         // *Why* a thumbnail is not needed decides what the rest of this
         // function may still do: a stored or served-directly thumbnail says
@@ -2005,11 +2084,35 @@ impl ScanContext {
             needs_thumb = false;
             thumb_suppressed = true;
         }
+        // The dispatcher's third question (docs/video-outro-detection-design.md
+        // §7): "is this a video nothing has examined for an appended outro?"
+        // Unlike the other two it is not about a missing visual, so a video
+        // with both a thumbnail and a blurhash is still work — that is exactly
+        // what backfills an existing library, with no migration and no
+        // separate job.
+        let mut outro_work = self.pending_outro_work(&sha256, &mime_type, &path).await;
+        if let Some(pending) = &outro_work
+            && !outro_needs_probe(pending.video_tracks)
+        {
+            // Answered from the item's own metadata, so it needs no worker and
+            // no ffmpeg: settled here, before any of the early returns below
+            // can drop it on the floor. The verdict is constructed rather than
+            // taken from `run_outro_pass`, which is documented blocking-only
+            // and must not be reachable from this async thread at all.
+            self.record_outro_verdict(&sha256, Some(&outro_verdict_without_a_probe()))
+                .await;
+            outro_work = None;
+        }
         if !needs_thumb && !needs_blurhash {
+            // Counted before the outro question is consulted: the marker did
+            // remove a whole visuals dispatch, whether or not a probe still
+            // owes this file a run of its own.
             if thumb_suppressed {
                 self.note_suppressed_visuals(&path);
             }
-            return Ok(());
+            if outro_work.is_none() {
+                return Ok(());
+            }
         }
         // Identical content elsewhere in this scan already has a visuals task
         // in flight; its results apply to this sha256 as well.
@@ -2018,6 +2121,10 @@ impl ScanContext {
         }
 
         let mut existing_frames = Vec::new();
+        // Whether the fetch below actually ran, which decides whether
+        // `existing_frames` is evidence about `storage.frames` or merely the
+        // default. See `frames_stored`.
+        let mut frames_fetched = false;
         let mut video_duration = 0.0_f64;
         if needs_thumb && mime_type.starts_with("video") {
             // Frames already stored in the database can rebuild the thumbnail
@@ -2025,6 +2132,7 @@ impl ScanContext {
             // ffmpeg extraction needs a usable duration (matching Python,
             // which consults metadata only when no frames exist).
             existing_frames = get_frames_bytes(&mut self.conn, &sha256).await?;
+            frames_fetched = true;
             if existing_frames.is_empty() {
                 if let Some((duration, video_tracks)) =
                     get_item_visual_meta(&mut self.conn, &sha256).await?
@@ -2055,9 +2163,16 @@ impl ScanContext {
                             &mime_type,
                         )
                         .await;
-                        return Ok(());
+                        if outro_work.is_none() {
+                            return Ok(());
+                        }
+                        // A probe is still owed and needs neither frames nor a
+                        // duration to reach a verdict, so the dispatch goes
+                        // ahead with the thumbnail half switched off.
+                        needs_thumb = false;
+                    } else {
+                        video_duration = duration;
                     }
-                    video_duration = duration;
                 }
             }
         }
@@ -2088,11 +2203,83 @@ impl ScanContext {
             }
             no_source = no_source || thumb_suppressed;
             if no_source {
+                // As above: the suppression is counted even when the outro
+                // question keeps the dispatch alive for a probe.
                 if thumb_suppressed {
                     self.note_suppressed_visuals(&path);
                 }
-                return Ok(());
+                if outro_work.is_none() {
+                    return Ok(());
+                }
             }
+        }
+
+        // Whether `storage.frames` holds anything for this content. Two
+        // questions need it and they must not disagree: §7.1's "is there
+        // anything here to replace", and — threaded into the worker — the fact
+        // `build_backfill_thumbnails` classifies a failed extraction by.
+        //
+        // `existing_frames` answers it for free wherever the thumbnail half
+        // fetched it (`get_frames_bytes` is unversioned, so empty means no
+        // rows). The query is only needed where it did not, which is exactly
+        // the replace path: a stored thumbnail makes `needs_thumb` false at
+        // dispatch, so nothing fetches the frames, yet a positive verdict may
+        // be about to re-extract them. Deriving the fact from the unfetched
+        // default there would call an item with frames frameless — and then a
+        // failed re-extraction writes a `Frame` failure marker, or a
+        // zero-frame one writes a `nothing(Frame)` verdict, for a video that
+        // has frames.
+        let frames_stored = if frames_fetched {
+            !existing_frames.is_empty()
+        } else if outro_work.is_some() && mime_type.starts_with("video") {
+            has_any_frame(&mut self.conn, &sha256).await?
+        } else {
+            false
+        };
+        // §7.1: replacement, not first generation — this item already carries
+        // visuals sampled across the card. Frames count as well as thumbnails:
+        // extraction stores frames of its own, so an item can have those and
+        // no thumbnail. A marker-suppressed item is left alone whatever the
+        // probe finds; the verdict that settled its decode still stands.
+        let outro_replaces_visuals = matches!(&outro_work, Some(_) if !thumb_suppressed)
+            && (thumbnail_stored || frames_stored);
+        let outro_work = outro_work.map(|item| OutroBackfill {
+            replaces_visuals: outro_replaces_visuals,
+            item,
+        });
+        // The boundary this item was *already* examined for. Without it, every
+        // regeneration after the verdict was stored — a storage.db rebuild, a
+        // `THUMBNAIL_PROCESS_VERSION`/`FRAME_PROCESS_VERSION` bump, a store
+        // that failed transiently — would sample the whole file again and put
+        // the card back permanently, because the pass's own verdict only ever
+        // exists while `outro_kind IS NULL`.
+        //
+        // Clamp-only, and deliberately so: it must never reach §7.1's
+        // replacement rule or the stored-frame discard, or an ordinary
+        // backfill of an already-positive item would re-extract on every scan
+        // — "not on every scan, and not for negatives".
+        //
+        // Gated on the config pair like every other read of this metadata
+        // (design §8: "consumers ignore the metadata"), which is also what
+        // makes turning detection off the escape hatch for a false positive:
+        // off, then regenerate, and the visuals come back untrimmed.
+        let stored_content_end_ms = if self.detect_outros
+            && outro_work.is_none()
+            && needs_thumb
+            && mime_type.starts_with("video")
+        {
+            get_item_content_end_ms(&mut self.conn, &sha256).await?
+        } else {
+            None
+        };
+        if video_duration <= 0.0 {
+            // The probe carries the duration for the case the thumbnail half
+            // never asked for one: an item whose visuals are complete and
+            // whose outro turns out positive still has to re-extract.
+            video_duration = outro_work
+                .as_ref()
+                .and_then(|work| work.item.duration)
+                .unwrap_or(0.0);
         }
 
         let permit = self
@@ -2121,7 +2308,10 @@ impl ScanContext {
                     needs_blurhash,
                     existing_frames,
                     existing_thumb,
+                    frames_stored,
                     video_duration,
+                    outro_work,
+                    stored_content_end_ms,
                     &timers,
                 )
             })
@@ -2150,12 +2340,69 @@ impl ScanContext {
                         // unrecorded.
                         visual_verdicts: Vec::new(),
                         visuals_scan_error: None,
+                        outro: None,
+                        replace_visuals: false,
                     })
                 }
             }
         });
         self.task_paths.insert(handle.id(), tracked);
         Ok(())
+    }
+
+    /// The outro dispatch question, answered against the index and the
+    /// negative cache (docs/video-outro-detection-design.md §7, §7.2).
+    ///
+    /// `None` means nothing to probe: detection is off (or `scan_video` is),
+    /// the file is not a video, the item already carries a verdict, or a
+    /// confirmed probe failure at this detector version suppresses it.
+    async fn pending_outro_work(
+        &mut self,
+        sha256: &str,
+        mime_type: &str,
+        path: &Path,
+    ) -> Option<PendingOutroItem> {
+        if !self.detect_outros || !mime_type.starts_with("video") {
+            return None;
+        }
+        let pending = match get_pending_outro_item(&mut self.conn, sha256).await {
+            Ok(pending) => pending?,
+            // Advisory, like every other read on this path: without the answer
+            // the file is simply left alone this run.
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to read the outro state; skipping detection"
+                );
+                return None;
+            }
+        };
+        match visuals_suppressed(
+            &mut self.conn,
+            sha256,
+            VisualKind::Outro,
+            OUTRO_DETECTOR_VERSION,
+        )
+        .await
+        {
+            Ok(true) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    "skipping the outro probe with an active recorded attempt"
+                );
+                None
+            }
+            Ok(false) => Some(pending),
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to read the visuals negative cache; probing anyway"
+                );
+                Some(pending)
+            }
+        }
     }
 
     async fn dispatch_hash(
@@ -2238,6 +2485,7 @@ impl ScanContext {
             .await
             .map_err(|_| ApiError::internal("Failed to schedule scan work"))?;
         let filter = self.filescan_filter.clone();
+        let detect_outros = self.detect_outros;
         let tracked = TrackedTask {
             path: path.to_string_lossy().to_string(),
             backfill_sha256: None,
@@ -2256,6 +2504,7 @@ impl ScanContext {
                     md5,
                     sha256,
                     filter,
+                    detect_outros,
                     &timers,
                 )
             })
@@ -2314,6 +2563,7 @@ fn prepare_new_item(
     md5: String,
     sha256: String,
     filter: Option<Arc<Match>>,
+    detect_outros: bool,
     timers: &ScanTimers,
 ) -> TaskOutcome {
     // Every failure below is about this exact file, so they all carry the same
@@ -2358,7 +2608,9 @@ fn prepare_new_item(
         return failed(path, FileProcessError::Filtered);
     }
 
-    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, timers);
+    // The outro probe runs inside this call, before the generation it clamps
+    // (design §7) and inside the same blocking task.
+    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, detect_outros, timers);
     // Built here because this is the last place that holds the file's ledger
     // identity — the same stat pair the `failed` closure above uses, for the
     // same reason.
@@ -2385,7 +2637,27 @@ fn prepare_new_item(
         blurhash: visuals.blurhash,
         visual_verdicts: visuals.verdicts,
         visuals_scan_error,
+        outro: visuals.outro,
     })
+}
+
+/// The outro stage of a *new-item* pass: gated on the config pair and on the
+/// file being a video, and answered from the metadata this pass just measured.
+fn outro_pass_for(
+    path: &Path,
+    mime_type: &str,
+    metadata: &ItemScanMeta,
+    detect_outros: bool,
+) -> OutroPass {
+    if !detect_outros || !mime_type.starts_with("video") {
+        return OutroPass::default();
+    }
+    run_outro_pass(
+        path,
+        metadata.duration,
+        metadata.video_tracks,
+        outro_source_dims(metadata.width, metadata.height),
+    )
 }
 
 pub(crate) struct PreparedFile {
@@ -2403,6 +2675,8 @@ pub(crate) struct PreparedFile {
     pub(crate) visual_verdicts: Vec<VisualVerdict>,
     /// See [`NewItemData::visuals_scan_error`].
     pub(crate) visuals_scan_error: Option<ScanErrorRecord>,
+    /// See [`NewItemData::outro`].
+    pub(crate) outro: Option<OutroRecord>,
 }
 
 pub(crate) struct FileWriteData {
@@ -2418,6 +2692,9 @@ pub(crate) struct FileWriteData {
     pub(crate) visual_verdicts: Vec<VisualVerdict>,
     /// See [`NewItemData::visuals_scan_error`].
     pub(crate) visuals_scan_error: Option<ScanErrorRecord>,
+    /// See [`NewItemData::outro`]. Written *after* the file/item write, which
+    /// is what creates the row it updates.
+    pub(crate) outro: Option<OutroRecord>,
     pub(crate) time_added: String,
 }
 
@@ -2442,6 +2719,7 @@ impl FileWriteData {
             blurhash: prepared.blurhash,
             visual_verdicts: prepared.visual_verdicts,
             visuals_scan_error: prepared.visuals_scan_error,
+            outro: prepared.outro,
             time_added,
         }
     }
@@ -2787,6 +3065,174 @@ fn visual_process_version(kind: VisualKind) -> i64 {
     match kind {
         VisualKind::Thumbnail => THUMBNAIL_PROCESS_VERSION,
         VisualKind::Frame => FRAME_PROCESS_VERSION,
+        // The same number the kind string's `/N` suffix carries, so a detector
+        // bump retires failure markers through the ledger's existing
+        // `version >= ?` consult while the unrecognised suffix recovers the
+        // negatives (docs/video-outro-detection-design.md §7.2).
+        VisualKind::Outro => OUTRO_DETECTOR_VERSION,
+    }
+}
+
+/// One examination's answer about where a file's real content ends
+/// (docs/video-outro-detection-design.md §6). Written to `items`, never to the
+/// ledger.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutroRecord {
+    /// `items.outro_kind`, detector version included.
+    pub(crate) kind: String,
+    /// `items.content_end_ms`. Legitimately `None` on a *positive* verdict
+    /// whose duration is missing or nonsense, which is why "has an outro" is
+    /// this column being non-null and never the kind string (§6.3).
+    pub(crate) content_end_ms: Option<i64>,
+}
+
+/// What the outro stage of one pass concluded. Exactly one half is ever
+/// populated: a probe either produces a verdict or owes a marker.
+#[derive(Default)]
+pub(crate) struct OutroPass {
+    /// `None` when the stage did not run, or when it ran and failed — the
+    /// column only ever holds genuine verdicts (§7.2).
+    record: Option<OutroRecord>,
+    /// The negative-cache marker a failed probe owes.
+    verdict: Option<VisualVerdict>,
+}
+
+impl OutroPass {
+    /// Where frame sampling must stop, when this pass found a boundary.
+    fn content_end_ms(&self) -> Option<i64> {
+        self.record
+            .as_ref()
+            .and_then(|record| record.content_end_ms)
+    }
+}
+
+/// The item's stored dimensions in the shape the detector wants them.
+fn outro_source_dims(width: Option<i64>, height: Option<i64>) -> Option<(u32, u32)> {
+    match (width, height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            Some((width as u32, height as u32))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a probe is worth spawning at all, or the answer already follows
+/// from the item's own metadata.
+///
+/// A container with no video stream has no card to carry: probing it would
+/// burn two ffmpeg starts before the ledger settled, and leave the item
+/// dispatched on every scan in between.
+///
+/// `None` counts as no track, and what makes that safe rather than a guess is
+/// [`extract_media_info`]: *every* way ffprobe can fail — it will not start,
+/// it exits non-zero, its output will not parse — returns `Err`, which
+/// [`extract_item_metadata`] propagates and which keeps the file out of the
+/// index entirely. So for an item that is indexed with a `video/` type,
+/// `video_tracks` being unset can only mean "ffprobe ran, succeeded, and
+/// found no video stream" — [`extract_item_metadata`] leaves the column unset
+/// in that case rather than storing a zero. (Items inherited from the Python
+/// indexer are outside that invariant; the backfill dispatcher already reads
+/// them the same way, concluding a permanent nothing for both visual kinds.)
+///
+/// Not the same gate as [`build_new_item_thumbnails`], which needs
+/// `video_tracks > 0 && duration > 0.0` because it has to place sample points
+/// inside a known length. The probe needs no duration at all: it works from
+/// the end of the stream backwards, and a missing duration only costs it a
+/// `content_end_ms`, never the verdict. So this gates on tracks alone, and is
+/// deliberately the looser of the two.
+fn outro_needs_probe(video_tracks: Option<i64>) -> bool {
+    video_tracks.unwrap_or(0) > 0
+}
+
+/// The verdict a container with no video stream earns without any probe.
+///
+/// Shared by [`run_outro_pass`] and the dispatcher's synchronous shortcut so
+/// the two can never drift. Recorded rather than left `NULL`: without a stored
+/// verdict the dispatcher would ask about the file on every scan forever. The
+/// version suffix still applies, so a future detector re-examines it with
+/// every other negative (design §6.2).
+fn outro_verdict_without_a_probe() -> OutroRecord {
+    OutroRecord {
+        kind: OutroVerdict::None(RejectReason::Gate).kind_value(),
+        content_end_ms: None,
+    }
+}
+
+/// Runs the detector over one video and maps its two error variants onto the
+/// ledger vocabulary of design §7.2.
+///
+/// Blocking (a process spawn plus its own file I/O), so every caller is
+/// already inside `spawn_blocking` — the same rule the frame extractor and the
+/// PDF/HTML renderers follow.
+fn run_outro_pass(
+    path: &Path,
+    duration: Option<f64>,
+    video_tracks: Option<i64>,
+    source_dims: Option<(u32, u32)>,
+) -> OutroPass {
+    if !outro_needs_probe(video_tracks) {
+        return OutroPass {
+            record: Some(outro_verdict_without_a_probe()),
+            verdict: None,
+        };
+    }
+
+    match detect_outro(path, source_dims) {
+        Ok(verdict) => {
+            let content_end_ms = match (verdict.k_seconds(), duration) {
+                (Some(k_seconds), Some(duration)) => {
+                    crate::media_tools::outro::content_end_ms(duration, k_seconds)
+                }
+                _ => None,
+            };
+            match &verdict {
+                OutroVerdict::TiktokCard { k_seconds } => tracing::debug!(
+                    path = %path.display(),
+                    k_seconds,
+                    content_end_ms,
+                    "detected an appended outro"
+                ),
+                OutroVerdict::None(reason) => tracing::debug!(
+                    path = %path.display(),
+                    reason = reason.as_str(),
+                    "no appended outro"
+                ),
+            }
+            OutroPass {
+                record: Some(OutroRecord {
+                    kind: verdict.kind_value(),
+                    content_end_ms,
+                }),
+                verdict: None,
+            }
+        }
+        Err(err) => {
+            // Debug rather than error: unlike a failed thumbnail this costs no
+            // visible output at all — the consumer simply behaves as if no
+            // outro exists — and the measured failure rate is 0.37%, which at
+            // library scale is thousands of log lines for nothing.
+            tracing::debug!(path = %path.display(), error = %err, "outro probe failed");
+            let failure = match err {
+                // Never a verdict on the media: a missing toolchain is
+                // `blocked` and heals when it binds, anything else about this
+                // machine stays transient and is retried untouched.
+                OutroProbeError::Spawn(err) => FileProcessError::visuals_from_api_error(
+                    crate::media_tools::spawn_error("ffmpeg", &err),
+                ),
+                // ffmpeg ran and failed: the probe does its own file I/O, so a
+                // broken file and a transient mount hiccup exit identically
+                // and one failure does not settle it.
+                OutroProbeError::Decode(detail) => {
+                    visuals_input_unconfirmed(format!("outro probe failed: {detail}"))
+                }
+            };
+            OutroPass {
+                record: None,
+                verdict: failure
+                    .visual_failure()
+                    .map(|failure| VisualVerdict::failed(VisualKind::Outro, failure.clone())),
+            }
+        }
     }
 }
 
@@ -2807,6 +3253,9 @@ pub(crate) struct GeneratedVisuals {
     /// The failure that also owes a `scan_errors` audit row. See
     /// [`visuals_audit_failure`].
     pub(crate) audit: Option<ScanFailure>,
+    /// What the outro stage of this pass concluded, which is what the frame
+    /// sampling above was clamped to. See [`NewItemData::outro`].
+    pub(crate) outro: Option<OutroRecord>,
 }
 
 /// Turns a pass's verdicts into markers for one item. Each kind is stamped
@@ -2830,6 +3279,7 @@ pub(crate) fn visual_attempt_records(
 pub(crate) fn process_file(
     path: PathBuf,
     filescan_filter: Option<Arc<Match>>,
+    detect_outros: bool,
     timers: &ScanTimers,
 ) -> Result<PreparedFile, FileProcessError> {
     let (last_modified, file_size) = get_last_modified_time_and_size(&path)
@@ -2877,7 +3327,9 @@ pub(crate) fn process_file(
         return Err(FileProcessError::Filtered);
     }
 
-    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, timers);
+    // The probe runs inside this call, before the generation it clamps,
+    // exactly as in `prepare_new_item`.
+    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, detect_outros, timers);
     let visuals_scan_error = visuals.audit.map(|failure| ScanErrorRecord {
         path: path.to_string_lossy().to_string(),
         last_modified: last_modified.clone(),
@@ -2901,6 +3353,7 @@ pub(crate) fn process_file(
         blurhash: visuals.blurhash,
         visual_verdicts: visuals.verdicts,
         visuals_scan_error,
+        outro: visuals.outro,
     })
 }
 
@@ -3258,13 +3711,21 @@ fn generate_new_item_visuals(
     path: &Path,
     mime_type: &str,
     metadata: &ItemScanMeta,
+    detect_outros: bool,
     timers: &ScanTimers,
 ) -> GeneratedVisuals {
+    // Inside the thumbgen span, and first within it: the probe is part of the
+    // visuals pass (~85ms of process spawn per video), and leaving it outside
+    // every phase would quietly drop that out of the per-scan times. Running
+    // it *before* the generation it clamps is design §7's ordering, and being
+    // in one function is what makes that structural rather than a convention.
     let thumb_span = timers.thumbgen.start();
-    let attempt = build_new_item_thumbnails(path, mime_type, metadata);
+    let outro = outro_pass_for(path, mime_type, metadata, detect_outros);
+    let attempt = build_new_item_thumbnails(path, mime_type, metadata, outro.content_end_ms());
     drop(thumb_span);
 
     let mut visuals = GeneratedVisuals::default();
+    visuals.outro = outro.record;
     let blurhash_source = match attempt {
         Ok(produced) => {
             visuals.thumbnails = produced.thumbnails;
@@ -3292,6 +3753,10 @@ fn generate_new_item_visuals(
         }
     };
 
+    // After the generation verdicts, which is where the pass's own list is
+    // built: a failed probe owes a marker of its own kind alongside them.
+    visuals.verdicts.extend(outro.verdict);
+
     let blurhash_span = timers.blurhash.start();
     visuals.blurhash = blurhash_source.and_then(|image| compute_blurhash(&image).ok());
     drop(blurhash_span);
@@ -3299,10 +3764,13 @@ fn generate_new_item_visuals(
     visuals
 }
 
+/// `content_end_ms` is this pass's own outro verdict, which ran before it
+/// (design §7): frame sampling is clamped to `[0, content_end_ms)`.
 fn build_new_item_thumbnails(
     path: &Path,
     mime_type: &str,
     metadata: &ItemScanMeta,
+    content_end_ms: Option<i64>,
 ) -> Result<ProducedVisuals, VisualsError> {
     let mut out = ProducedVisuals::default();
 
@@ -3311,8 +3779,8 @@ fn build_new_item_thumbnails(
         if metadata.video_tracks.unwrap_or(0) > 0 && duration > 0.0 {
             // The one failure that really does invalidate both kinds: the
             // thumbnail grid is built out of these frames.
-            let extracted_frames =
-                extract_video_frames(path, 4, duration).map_err(VisualsError::both)?;
+            let extracted_frames = extract_video_frames(path, 4, duration, content_end_ms)
+                .map_err(VisualsError::both)?;
             if extracted_frames.is_empty() {
                 // ffmpeg ran and this file yields no frame to sample. Nothing
                 // about that will change until the generator does.
@@ -3417,6 +3885,14 @@ fn html_visuals_failure(err: HtmlRenderError) -> FileProcessError {
     }
 }
 
+/// The outro half of one backfill dispatch.
+struct OutroBackfill {
+    item: PendingOutroItem,
+    /// Whether a positive verdict *replaces* visuals rather than informing
+    /// their first generation (design §7.1).
+    replaces_visuals: bool,
+}
+
 /// Regenerates only the visuals a file is missing. Never fails hard: partial
 /// or failed generation degrades to empty results, matching the Python
 /// behavior of catching thumbnail/blurhash errors per file.
@@ -3429,10 +3905,60 @@ fn generate_backfill_visuals(
     needs_blurhash: bool,
     existing_frames: Vec<Vec<u8>>,
     existing_thumb: Option<Vec<u8>>,
+    frames_stored: bool,
     video_duration: f64,
+    outro: Option<OutroBackfill>,
+    stored_content_end_ms: Option<i64>,
     timers: &ScanTimers,
 ) -> BackfillResult {
+    // Inside the thumbgen span, and first within it: everything below samples
+    // frames, and design §7 requires detection to have happened by then. The
+    // ~85ms of process spawn belongs to the visuals phase it clamps rather
+    // than to no phase at all.
     let thumb_span = timers.thumbgen.start();
+    let replaces_visuals = outro
+        .as_ref()
+        .map(|work| work.replaces_visuals)
+        .unwrap_or(false);
+    let outro = outro.map(|work| {
+        run_outro_pass(
+            path,
+            work.item.duration,
+            work.item.video_tracks,
+            outro_source_dims(work.item.width, work.item.height),
+        )
+    });
+    // What *this pass* found, which is the only thing §7.1 keys off: an item
+    // is newly positive exactly once, and its visuals are replaced exactly
+    // then.
+    let pass_content_end_ms = outro.as_ref().and_then(|pass| pass.content_end_ms());
+    // `frames_stored` is the dispatcher's answer about `storage.frames`, not
+    // anything derived from `existing_frames` — which the discard below
+    // empties, and which the replace path never fetched in the first place.
+    // `build_backfill_thumbnails` classifies a failed extraction by it: with
+    // frames in the database an extraction failure is a thumbnail-only
+    // verdict, and calling those frames permanently unobtainable would be a
+    // lie.
+    //
+    // Newly positive: the stored frames were sampled across the whole file,
+    // card frames included, so rebuilding a thumbnail out of them would
+    // reproduce exactly what the verdict just invalidated.
+    let existing_frames = match pass_content_end_ms {
+        Some(_) => Vec::new(),
+        None => existing_frames,
+    };
+    // Negatives change nothing, and an item that has no visuals yet only needs
+    // the clamp — the replacement is for the item that already had them.
+    let replace_visuals = pass_content_end_ms.is_some() && replaces_visuals;
+    let needs_thumb = needs_thumb || replace_visuals;
+    // A replaced thumbnail leaves the blurhash describing the old one, which
+    // is the same class of visual and the only one derived from it.
+    let needs_blurhash = needs_blurhash || replace_visuals;
+    // The clamp, and only the clamp, also honours the boundary a *previous*
+    // scan stored: any regeneration of an already-examined item must sample
+    // the same content range the first one did, or the card comes back.
+    let content_end_ms = pass_content_end_ms.or(stored_content_end_ms);
+
     let mut thumbnails = Vec::new();
     let mut extracted_frames = Vec::new();
     let mut blurhash_source: Option<DynamicImage> = None;
@@ -3446,7 +3972,14 @@ fn generate_backfill_visuals(
     // blurhash fallback only runs when the thumbnail half did not fail.
     let mut audit: Option<ScanFailure> = None;
     if needs_thumb {
-        match build_backfill_thumbnails(path, mime_type, &existing_frames, video_duration) {
+        match build_backfill_thumbnails(
+            path,
+            mime_type,
+            &existing_frames,
+            frames_stored,
+            video_duration,
+            content_end_ms,
+        ) {
             Ok(produced) => {
                 thumbnails = produced.thumbnails;
                 extracted_frames = produced.frames;
@@ -3514,6 +4047,12 @@ fn generate_backfill_visuals(
     }
     drop(blurhash_span);
 
+    let (outro_record, outro_verdict) = match outro {
+        Some(pass) => (pass.record, pass.verdict),
+        None => (None, None),
+    };
+    verdicts.extend(outro_verdict);
+
     BackfillResult {
         sha256,
         mime_type: mime_type.to_string(),
@@ -3522,6 +4061,8 @@ fn generate_backfill_visuals(
         blurhash,
         visual_verdicts: verdicts,
         visuals_scan_error: audit.and_then(|failure| backfill_scan_error(path, mime_type, failure)),
+        outro: outro_record,
+        replace_visuals,
     }
 }
 
@@ -3568,11 +4109,22 @@ fn backfill_scan_error(
     })
 }
 
+/// `content_end_ms` is where the item's content ends — this pass's own outro
+/// verdict, or the one a previous scan stored. See
+/// [`build_new_item_thumbnails`].
+///
+/// `frames_stored` is whether `storage.frames` holds anything for this item.
+/// It is *not* `!existing_frames.is_empty()`: the caller empties that list
+/// when a newly-positive verdict makes the stored frames wrong to reuse, and
+/// classifying an extraction failure from the emptied list would call frames
+/// that exist permanently unobtainable.
 fn build_backfill_thumbnails(
     path: &Path,
     mime_type: &str,
     existing_frames: &[Vec<u8>],
+    frames_stored: bool,
     video_duration: f64,
+    content_end_ms: Option<i64>,
 ) -> Result<ProducedVisuals, VisualsError> {
     let mut out = ProducedVisuals::default();
 
@@ -3585,15 +4137,16 @@ fn build_backfill_thumbnails(
         let mut fresh = false;
         if frames.is_empty() {
             frames =
-                extract_video_frames(path, 4, video_duration).map_err(|err| {
-                    match existing_frames.is_empty() {
+                extract_video_frames(path, 4, video_duration, content_end_ms).map_err(|err| {
+                    match frames_stored {
                         // Nothing is stored, so this extraction was the frames'
                         // only chance too.
-                        true => VisualsError::both(err),
-                        // Frames *are* stored, they just would not decode: the
+                        false => VisualsError::both(err),
+                        // Frames *are* stored — they would not decode, or a
+                        // new verdict made them wrong to reuse: the
                         // re-extraction was a thumbnail rescue, and calling the
                         // stored frames a failure would be a lie.
-                        false => VisualsError::thumbnail(err),
+                        true => VisualsError::thumbnail(err),
                     }
                 })?;
             fresh = true;
@@ -3605,7 +4158,7 @@ fn build_backfill_thumbnails(
             // decode) or with no usable duration, ffmpeg concluded nothing
             // about this content and a `none` here would suppress the frames
             // of a video that has them.
-            if fresh && existing_frames.is_empty() && video_duration > 0.0 {
+            if fresh && !frames_stored && video_duration > 0.0 {
                 out.nothing.push(VisualKind::Frame);
             }
         } else {
@@ -4412,20 +4965,54 @@ fn build_image_grid(frames: &[DynamicImage]) -> DynamicImage {
     DynamicImage::ImageRgb8(grid)
 }
 
+/// The window frame sampling may draw from, given the item's duration and
+/// where its real content ends (docs/video-outro-detection-design.md §7).
+///
+/// Returns `(seconds, bounded)`. `bounded` says the verdict actually shortens
+/// this file, and it is what becomes ffmpeg's decode bound. Both halves are
+/// needed: the interval is `seconds / num_frames`, so the N frames spread
+/// across the *content* instead of the whole file — but `fps=1/interval`
+/// keeps emitting frames to the end of the stream, so a shortened interval
+/// alone still puts a card frame in the sample. The bound is what stops it.
+///
+/// A `content_end_ms` at or past the duration clamps nothing, which is also
+/// what a missing or nonsensical value does: absent behaviour, never wrong
+/// behaviour.
+pub(crate) fn frame_sampling_window(duration: f64, content_end_ms: Option<i64>) -> (f64, bool) {
+    let Some(content_end_ms) = content_end_ms else {
+        return (duration, false);
+    };
+    let content_end = content_end_ms as f64 / 1000.0;
+    if !content_end.is_finite() || content_end <= 0.0 || content_end >= duration {
+        return (duration, false);
+    }
+    (content_end, true)
+}
+
+/// `content_end_ms` is the item's stored outro boundary, when it has one; see
+/// [`frame_sampling_window`].
 fn extract_video_frames(
     path: &Path,
     num_frames: usize,
     duration: f64,
+    content_end_ms: Option<i64>,
 ) -> Result<Vec<DynamicImage>, FileProcessError> {
     if duration <= 0.0 {
         return Ok(Vec::new());
     }
 
-    let interval = duration / num_frames as f64;
+    let (window, bounded) = frame_sampling_window(duration, content_end_ms);
+    let interval = window / num_frames as f64;
     let temp_dir = temp_dir_path();
     fs::create_dir_all(&temp_dir).map_err(|err| FileProcessError::Io(err.to_string()))?;
 
-    let result = extract_video_frames_into(path, num_frames, interval, &temp_dir);
+    let result = extract_video_frames_into(
+        path,
+        num_frames,
+        interval,
+        bounded.then_some(window),
+        &temp_dir,
+    );
     if let Err(err) = fs::remove_dir_all(&temp_dir) {
         tracing::debug!(error = %err, path = %temp_dir.display(), "failed to remove temp frame dir");
     }
@@ -4444,17 +5031,26 @@ pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
     }
 }
 
+/// `decode_limit` is the outro clamp, in seconds. Passed as an *input* option
+/// (`-t` before `-i`) so it bounds the decode itself rather than only what the
+/// image muxer writes; the filter graph then never sees a frame past the
+/// boundary, which is what design §7 asks for over a recomputed interval.
 fn extract_video_frames_into(
     path: &Path,
     num_frames: usize,
     interval: f64,
+    decode_limit: Option<f64>,
     temp_dir: &Path,
 ) -> Result<Vec<DynamicImage>, FileProcessError> {
     let output_pattern = temp_dir.join("frame_%04d.png");
     // stdout is silenced, but stderr is captured so a failure can say why
     // (corrupt file, missing codec, disk full) instead of just "ffmpeg
     // failed"; it is only surfaced on a non-zero exit.
-    let output = Command::new(crate::media_tools::ffmpeg())
+    let mut command = Command::new(crate::media_tools::ffmpeg());
+    if let Some(limit) = decode_limit {
+        command.arg("-t").arg(format!("{limit}"));
+    }
+    let output = command
         .arg("-i")
         .arg(path)
         .arg("-vf")
@@ -4976,6 +5572,56 @@ pub(crate) fn override_mime_from_content(record: &mut ScanErrorRecord, path: &Pa
     };
     record.mime_type = Some(mime.to_string());
     record.skip_after = SKIP_AFTER_CONFIRMED;
+}
+
+/// A 7s clip: 5s of flat grey, then `card_seconds` of the TikTok card
+/// background with a white box where the logo sits. Returns `false` when
+/// this machine cannot build it, so the tests that need real media skip
+/// rather than fail. Lives outside `mod tests` because the extraction-side
+/// sampler has tests that clamp the same fixture through an ffmpeg invocation
+/// of its own.
+#[cfg(test)]
+pub(crate) fn write_clip(path: &Path, card_seconds: Option<u32>) -> bool {
+    if !crate::media_tools::ffmpeg_available() {
+        return false;
+    }
+    let mut command = Command::new(crate::media_tools::ffmpeg());
+    command.args(["-y", "-v", "error", "-f", "lavfi"]);
+    match card_seconds {
+        Some(seconds) => {
+            command.args([
+                "-i",
+                "color=c=0x404040:s=576x1024:d=5:r=30",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=c=0x0C0D19:s=576x1024:d={seconds}:r=30"),
+                "-filter_complex",
+                "[1:v]drawbox=x=100:y=480:w=376:h=60:color=white:t=fill[card];\
+                 [0:v][card]concat=n=2:v=1:a=0[out]",
+                "-map",
+                "[out]",
+            ]);
+        }
+        None => {
+            command.args(["-i", "color=c=0x404040:s=576x1024:d=7:r=30"]);
+        }
+    }
+    command
+        .args(["-pix_fmt", "yuv420p", "-crf", "18"])
+        .arg(path);
+    matches!(command.status(), Ok(status) if status.success())
+}
+
+/// The colour of a frame's top-left corner, which is flat background in
+/// both halves of the fixture: grey in the content, the card colour in the
+/// card.
+#[cfg(test)]
+pub(crate) fn corner_is_card(image: &DynamicImage) -> bool {
+    let pixel = image.to_rgb8();
+    let pixel = pixel.get_pixel(4, 4);
+    (0..3)
+        .all(|channel| (i32::from(pixel[channel]) - i32::from([12u8, 13, 25][channel])).abs() <= 10)
 }
 
 #[cfg(test)]
@@ -6740,6 +7386,17 @@ LIMIT 1
             "both kinds concluded a permanent nothing: {rows:?}"
         );
         assert_eq!(thumbnail_count(&mut conn).await, 0);
+        // And the outro stage concluded the same nothing from the same
+        // metadata, without an ffmpeg start of its own — no third marker, a
+        // stored negative, and therefore no re-dispatch on the next scan.
+        let sha256: String = sqlx::query_scalar("SELECT sha256 FROM items")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            outro_columns(&mut conn, &sha256).await,
+            (Some("none/1".to_string()), None)
+        );
     }
 
     // The backfill write path, which is a different record site from the
@@ -6780,11 +7437,15 @@ LIMIT 1
     }
 
     // Frame markers are written but never consulted, because nothing ever asks
-    // for frames alone: the dispatcher's only questions are "is there a
-    // thumbnail" and "is there a blurhash". A video with both and no frames is
-    // therefore invisible to it — no work, and no marker read. This pins that
-    // invariant so the day a frames-only backfill appears, it arrives together
-    // with the consult its markers were written for.
+    // for frames alone: a video with a thumbnail, a blurhash and no frames is
+    // invisible to the dispatcher — no work, and no marker read.
+    //
+    // The outro question is the third the dispatcher asks
+    // (docs/video-outro-detection-design.md §7), and it is *not* about a
+    // missing visual, so the second half of this test pins the difference: the
+    // very same file, with its verdict cleared, is dispatched — for the probe
+    // and for nothing else. That is the backfill, and it is why the frames-only
+    // invariant had to be re-stated rather than simply kept.
     #[tokio::test]
     async fn a_video_missing_only_frames_is_not_dispatched() {
         let test_env = test_data_dir();
@@ -6803,6 +7464,9 @@ LIMIT 1
             Some("LEHV6nWB2yk8pyo0adR*".to_string()),
         )
         .await;
+        // Already examined, so the outro question is settled and only the
+        // frames gap remains — the state this test has always been about.
+        set_outro_kind(&env, sha256, Some("none/1")).await;
         let thumbnail = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
             .expect("an 8x8 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
@@ -6833,6 +7497,611 @@ LIMIT 1
         assert!(
             visual_attempt_rows(&mut conn).await.is_empty(),
             "no pass ran on this file, so nothing concluded anything about it"
+        );
+        drop(conn);
+
+        // Now the same file with no verdict: the outro question alone is
+        // enough to dispatch it, and the probe is all that runs. What it
+        // concludes about these bytes is a probe failure either way — `failed`
+        // where ffmpeg is installed, `blocked` where it is not — and either is
+        // a marker of the new kind and nothing else.
+        set_outro_kind(&env, sha256, None).await;
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "a probe stores no visual, so nothing was backfilled"
+        );
+        let mut conn = env.read().await;
+        let rows = visual_attempt_rows(&mut conn).await;
+        assert_eq!(
+            rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            vec![VisualKind::Outro.as_str()],
+            "only the probe ran; the frames gap is still invisible: {rows:?}"
+        );
+        assert_eq!(
+            rows[0].4, OUTRO_DETECTOR_VERSION,
+            "the marker carries the detector version, not a generator's"
+        );
+        assert_eq!(
+            outro_columns(&mut conn, sha256).await,
+            (None, None),
+            "a failed probe is never a verdict"
+        );
+        let frames: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage.frames")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(frames, 0);
+    }
+
+    /// Sets (or clears) an item's stored outro verdict, which is what the
+    /// dispatcher's third question reads.
+    async fn set_outro_kind(env: &VisualsEnv, sha256: &str, kind: Option<&str>) {
+        let mut conn = env.write().await;
+        sqlx::query("UPDATE items SET outro_kind = ?1, content_end_ms = NULL WHERE sha256 = ?2")
+            .bind(kind)
+            .bind(sha256)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    async fn outro_columns(
+        conn: &mut sqlx::SqliteConnection,
+        sha256: &str,
+    ) -> (Option<String>, Option<i64>) {
+        sqlx::query_as("SELECT outro_kind, content_end_ms FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_one(conn)
+            .await
+            .unwrap()
+    }
+
+    // Detection is opt-out and subordinate to `scan_video` (design §8): with
+    // either switch off nothing is examined, and an item left `NULL` is picked
+    // up naturally once both are on again. The two offs are not the same
+    // mechanism — `scan_video` also keeps the extension out of the walk
+    // entirely — which is exactly why both are pinned here.
+    #[tokio::test]
+    async fn outro_detection_is_gated_on_both_config_switches() {
+        let test_env = test_data_dir();
+        let mut env = visuals_env(test_env.path(), &["media-outro-gate"]).await;
+        let clip = env.media_dirs[0].join("clip.mp4");
+        fs::write(&clip, b"not a container, and never opened").unwrap();
+        let sha256 = "sha_outro_gate";
+        seed_video_item(
+            &env,
+            &clip,
+            sha256,
+            1,
+            Some("LEHV6nWB2yk8pyo0adR*".to_string()),
+        )
+        .await;
+        // A stored thumbnail, so the *only* thing that could dispatch this file
+        // is the outro question.
+        let thumbnail = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+            .expect("an 8x8 image encodes");
+        call_index_db_writer(&env.index_db, |reply| {
+            IndexDbWriterMessage::StoreThumbnails {
+                sha256: sha256.to_string(),
+                mime_type: "video/mp4".to_string(),
+                process_version: THUMBNAIL_PROCESS_VERSION,
+                thumbnails: vec![thumbnail.clone()],
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+
+        env.config.detect_outros = false;
+        env.scan().await;
+        {
+            let mut conn = env.read().await;
+            assert!(
+                visual_attempt_rows(&mut conn).await.is_empty(),
+                "detection off: nothing examined it, so nothing concluded anything"
+            );
+            assert_eq!(outro_columns(&mut conn, sha256).await, (None, None));
+        }
+
+        // Detection on, video scanning off: subordinate, so still nothing.
+        env.config.detect_outros = true;
+        env.config.scan_video = false;
+        env.scan().await;
+        {
+            let mut conn = env.read().await;
+            assert!(
+                visual_attempt_rows(&mut conn).await.is_empty(),
+                "video scanning off outranks the detection switch"
+            );
+            assert_eq!(outro_columns(&mut conn, sha256).await, (None, None));
+        }
+
+        // Both on: the item is still `NULL`, so the next scan picks it up with
+        // no migration and no separate job.
+        env.config.scan_video = true;
+        env.scan().await;
+        let mut conn = env.read().await;
+        let rows = visual_attempt_rows(&mut conn).await;
+        assert_eq!(
+            rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            vec![VisualKind::Outro.as_str()],
+            "the probe ran on bytes it cannot read: {rows:?}"
+        );
+    }
+
+    // The negative cache's consult, for the new kind. A probe that has failed
+    // its way to a confirmed verdict must not be re-run at this detector
+    // version — one SMB blip mid-backfill would otherwise cost a re-probe of
+    // thousands of files on every scan, forever.
+    #[tokio::test]
+    async fn a_confirmed_outro_failure_suppresses_the_probe() {
+        use crate::db::visual_attempts::upsert_visual_attempts;
+
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-outro-suppressed"]).await;
+        let clip = env.media_dirs[0].join("clip.mp4");
+        fs::write(&clip, b"not a container, and never opened").unwrap();
+        let sha256 = "sha_outro_suppressed";
+        seed_video_item(
+            &env,
+            &clip,
+            sha256,
+            1,
+            Some("LEHV6nWB2yk8pyo0adR*".to_string()),
+        )
+        .await;
+        let thumbnail = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+            .expect("an 8x8 image encodes");
+        call_index_db_writer(&env.index_db, |reply| {
+            IndexDbWriterMessage::StoreThumbnails {
+                sha256: sha256.to_string(),
+                mime_type: "video/mp4".to_string(),
+                process_version: THUMBNAIL_PROCESS_VERSION,
+                thumbnails: vec![thumbnail.clone()],
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        // Two runs' worth of the same ambiguous failure: confirmed, and
+        // therefore suppressing.
+        {
+            let mut conn = env.write().await;
+            for scan in [1_i64, 2] {
+                upsert_visual_attempts(
+                    &mut conn,
+                    &[VisualVerdict::failed(
+                        VisualKind::Outro,
+                        VisualFailure {
+                            kind: ApiErrorKind::Input,
+                            skip_after: SKIP_AFTER_AMBIGUOUS,
+                            message: "outro probe failed".to_string(),
+                        },
+                    )
+                    .into_record(sha256, "video/mp4", OUTRO_DETECTOR_VERSION)],
+                    Some(scan),
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        env.scan().await;
+
+        let mut conn = env.read().await;
+        let rows = visual_attempt_rows(&mut conn).await;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.0.as_str(), row.2))
+                .collect::<Vec<_>>(),
+            vec![(VisualKind::Outro.as_str(), 2)],
+            "a suppressed scan runs no probe, so it confirms nothing: {rows:?}"
+        );
+        assert_eq!(outro_columns(&mut conn, sha256).await, (None, None));
+    }
+
+    // A stored verdict retires the probe's marker, and the two writes are one
+    // transaction — the index-side `items` update and the `storage.` delete
+    // (design §7.2, mirroring `store_thumbnails`). Exercised through the real
+    // writer, which is what supplies the `BEGIN IMMEDIATE`.
+    #[tokio::test]
+    async fn an_outro_verdict_retires_its_probe_marker() {
+        use crate::db::visual_attempts::upsert_visual_attempts;
+
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-outro-verdict"]).await;
+        let clip = env.media_dirs[0].join("clip.mp4");
+        fs::write(&clip, b"not a container, and never opened").unwrap();
+        let sha256 = "sha_outro_verdict";
+        seed_video_item(&env, &clip, sha256, 1, None).await;
+        {
+            let mut conn = env.write().await;
+            upsert_visual_attempts(
+                &mut conn,
+                &[VisualVerdict::failed(
+                    VisualKind::Outro,
+                    VisualFailure {
+                        kind: ApiErrorKind::Input,
+                        skip_after: SKIP_AFTER_AMBIGUOUS,
+                        message: "outro probe failed".to_string(),
+                    },
+                )
+                .into_record(sha256, "video/mp4", OUTRO_DETECTOR_VERSION)],
+                Some(1),
+            )
+            .await
+            .unwrap();
+        }
+
+        let updated = call_index_db_writer(&env.index_db, |reply| {
+            IndexDbWriterMessage::SetOutroVerdict {
+                sha256: sha256.to_string(),
+                outro_kind: "tiktok_card/1".to_string(),
+                content_end_ms: Some(6000),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(updated, 1);
+
+        let mut conn = env.read().await;
+        assert_eq!(
+            outro_columns(&mut conn, sha256).await,
+            (Some("tiktok_card/1".to_string()), Some(6000))
+        );
+        assert!(
+            visual_attempt_rows(&mut conn).await.is_empty(),
+            "the marker cannot outlive the verdict that answered it"
+        );
+    }
+
+    // The clamp, against real media and at the seam that matters: the sampled
+    // frames themselves. Design §7 warns that shrinking the interval is not
+    // enough — `fps=1/interval` keeps emitting to the end of the stream — so
+    // the unclamped half of this test is not a control, it is the bug the
+    // decode bound exists to stop.
+    #[tokio::test]
+    async fn frame_sampling_stays_inside_the_content_range() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let clip = dir.path().join("card.mp4");
+        if !write_clip(&clip, Some(2)) {
+            return;
+        }
+
+        let unclamped = extract_video_frames(&clip, 4, 7.0, None).expect("ffmpeg runs");
+        assert_eq!(unclamped.len(), 4);
+        assert!(
+            unclamped.iter().any(corner_is_card),
+            "sampling the whole file lands in the card — that is the problem"
+        );
+
+        // 5000ms is where the content ends. Every frame must come from before
+        // it, and there must still be four of them.
+        let clamped = extract_video_frames(&clip, 4, 7.0, Some(5000)).expect("ffmpeg runs");
+        assert_eq!(
+            clamped.len(),
+            4,
+            "the interval shrinks with the window, so the count is unchanged"
+        );
+        assert!(
+            !clamped.iter().any(corner_is_card),
+            "no sampled frame may come from the card"
+        );
+    }
+
+    // What a failed extraction is allowed to conclude, given whether frames
+    // are stored — the rule the replace path made load-bearing.
+    //
+    // On that path `existing_frames` arrives empty for two different reasons:
+    // a stored thumbnail meant `needs_thumb` was false at dispatch so nothing
+    // ever fetched it, and a newly-positive verdict deliberately discards what
+    // was fetched. Neither means the item is frameless, so the fact travels
+    // separately. Derive it from the empty list instead and a failed
+    // re-extraction writes a `Frame` failure marker over frames that are
+    // sitting in `storage.frames` — one that then suppresses the very
+    // regeneration that would have worked.
+    #[test]
+    fn a_failed_extraction_only_condemns_frames_that_are_not_stored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let clip = dir.path().join("clip.mp4");
+        fs::write(&clip, b"not a container, and never opened").unwrap();
+
+        // The replace path's shape: no frames in hand, but four in the
+        // database. The thumbnail is gone and nothing else is.
+        let Err(err) = build_backfill_thumbnails(&clip, "video/mp4", &[], true, 10.0, Some(5000))
+        else {
+            panic!("unreadable bytes cannot yield frames");
+        };
+        assert_eq!(
+            failure_verdicts(&err)
+                .iter()
+                .map(|verdict| verdict.kind)
+                .collect::<Vec<_>>(),
+            vec![VisualKind::Thumbnail],
+            "frames are stored, so this extraction was a thumbnail rescue"
+        );
+
+        // Nothing stored anywhere: the same failure really is both kinds'
+        // only chance, and that has not changed.
+        let Err(err) = build_backfill_thumbnails(&clip, "video/mp4", &[], false, 10.0, None) else {
+            panic!("unreadable bytes cannot yield frames");
+        };
+        assert_eq!(
+            failure_verdicts(&err)
+                .iter()
+                .map(|verdict| verdict.kind)
+                .collect::<Vec<_>>(),
+            vec![VisualKind::Thumbnail, VisualKind::Frame]
+        );
+    }
+
+    // §7.1's replacement, end to end: an item indexed *before* detection was
+    // on already has thumbnails and frames sampled across the card. Turning
+    // detection on must not merely record the verdict — the visuals it
+    // invalidates have to be rebuilt against the clamped range.
+    #[tokio::test]
+    async fn a_newly_positive_item_has_its_visuals_replaced() {
+        let test_env = test_data_dir();
+        let mut env = visuals_env(test_env.path(), &["media-outro-positive"]).await;
+        let clip = env.media_dirs[0].join("card.mp4");
+        if !write_clip(&clip, Some(2)) {
+            return;
+        }
+
+        // Indexed with detection off: the frames are the un-clamped ones.
+        env.config.detect_outros = false;
+        env.scan().await;
+        let sha256: String = {
+            let mut conn = env.read().await;
+            let sha256: String = sqlx::query_scalar("SELECT sha256 FROM items")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(outro_columns(&mut conn, &sha256).await, (None, None));
+            let frames = stored_frames(&mut conn, &sha256).await;
+            assert_eq!(frames.len(), 4);
+            assert!(
+                frames.iter().any(|frame| corner_is_card(frame)),
+                "the premise: a card frame is among the stored ones"
+            );
+            sha256
+        };
+
+        env.config.detect_outros = true;
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 1,
+            "the replacement is a visuals write, and counted as one"
+        );
+
+        let mut conn = env.read().await;
+        let (kind, content_end_ms) = outro_columns(&mut conn, &sha256).await;
+        assert_eq!(kind.as_deref(), Some("tiktok_card/1"));
+        assert_eq!(content_end_ms, Some(5000), "7.0s file, 2.00s card");
+        let frames = stored_frames(&mut conn, &sha256).await;
+        assert_eq!(frames.len(), 4, "replaced, not appended to");
+        assert!(
+            !frames.iter().any(|frame| corner_is_card(frame)),
+            "every stored frame must now come from the content"
+        );
+        assert!(
+            thumbnail_count(&mut conn).await > 0,
+            "the thumbnail is rebuilt from the new frames, not dropped"
+        );
+    }
+
+    // The other half of §7.1: a negative verdict changes nothing. The existing
+    // outputs are already correct, and re-extracting them on the strength of
+    // "we looked" would re-decode every video in a library on the first scan
+    // after the upgrade.
+    #[tokio::test]
+    async fn a_negative_verdict_leaves_existing_visuals_untouched() {
+        let test_env = test_data_dir();
+        let mut env = visuals_env(test_env.path(), &["media-outro-negative"]).await;
+        let clip = env.media_dirs[0].join("plain.mp4");
+        if !write_clip(&clip, None) {
+            return;
+        }
+
+        env.config.detect_outros = false;
+        env.scan().await;
+        let (sha256, before) = {
+            let mut conn = env.read().await;
+            let sha256: String = sqlx::query_scalar("SELECT sha256 FROM items")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            let before: Vec<Vec<u8>> = get_frames_bytes(&mut conn, &sha256).await.unwrap();
+            assert_eq!(before.len(), 4);
+            (sha256, before)
+        };
+
+        env.config.detect_outros = true;
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "nothing was regenerated: the verdict is the only new thing"
+        );
+
+        let mut conn = env.read().await;
+        let (kind, content_end_ms) = outro_columns(&mut conn, &sha256).await;
+        assert_eq!(kind.as_deref(), Some("none/1"));
+        assert_eq!(content_end_ms, None, "no boundary, nothing to clamp to");
+        assert_eq!(
+            get_frames_bytes(&mut conn, &sha256).await.unwrap(),
+            before,
+            "the stored frames are the same bytes, not re-encoded ones"
+        );
+    }
+
+    // The clamp has to survive the verdict being *stored*. A pass only ever
+    // produces `content_end_ms` while `outro_kind IS NULL`, so a regeneration
+    // after that — storage.db rebuilt, a generator version bumped, a store
+    // that failed transiently — would sample the whole file again and put the
+    // card back permanently. Here the visuals are dropped after the item has
+    // been examined, which is exactly that shape.
+    //
+    // The second half is design §8's other promise: with detection off the
+    // consumer ignores the metadata, so the same regeneration comes back
+    // untrimmed. This — a *scan-side* regeneration — is what undoing a false
+    // positive actually takes, because it is the only path that replaces
+    // `storage.frames`. Turning detection off on the extraction side does not
+    // do it: that loader serves the cached frames before it ever reaches the
+    // clamp, and §7.1's recovery (erase `item_data`, re-run) leaves the cache
+    // alone.
+    #[tokio::test]
+    async fn a_regeneration_after_the_verdict_was_stored_is_still_clamped() {
+        let test_env = test_data_dir();
+        let mut env = visuals_env(test_env.path(), &["media-outro-restored"]).await;
+        let clip = env.media_dirs[0].join("card.mp4");
+        if !write_clip(&clip, Some(2)) {
+            return;
+        }
+
+        env.scan().await;
+        let sha256: String = {
+            let mut conn = env.read().await;
+            let sha256: String = sqlx::query_scalar("SELECT sha256 FROM items")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(
+                outro_columns(&mut conn, &sha256).await,
+                (Some("tiktok_card/1".to_string()), Some(5000)),
+                "the premise: this item is examined and positive"
+            );
+            sha256
+        };
+
+        // Everything a storage.db rebuild or a version bump leaves behind:
+        // no visuals, and an `items` row that still carries its verdict.
+        async fn drop_visuals(env: &VisualsEnv) {
+            let mut conn = env.write().await;
+            for statement in [
+                "DELETE FROM storage.thumbnails",
+                "DELETE FROM storage.frames",
+            ] {
+                sqlx::query(statement).execute(&mut conn).await.unwrap();
+            }
+        }
+        drop_visuals(&env).await;
+
+        env.scan().await;
+        {
+            let mut conn = env.read().await;
+            let frames = stored_frames(&mut conn, &sha256).await;
+            assert_eq!(frames.len(), 4, "the frames were regenerated");
+            assert!(
+                !frames.iter().any(|frame| corner_is_card(frame)),
+                "the stored boundary must clamp a regeneration, not only the \
+                 scan that discovered it"
+            );
+            assert_eq!(
+                outro_columns(&mut conn, &sha256).await,
+                (Some("tiktok_card/1".to_string()), Some(5000)),
+                "and nothing re-examined it"
+            );
+        }
+
+        // Detection off: the consumer ignores the stored boundary, so the same
+        // regeneration samples the whole file again.
+        drop_visuals(&env).await;
+        env.config.detect_outros = false;
+        env.scan().await;
+        let mut conn = env.read().await;
+        let frames = stored_frames(&mut conn, &sha256).await;
+        assert_eq!(frames.len(), 4);
+        assert!(
+            frames.iter().any(|frame| corner_is_card(frame)),
+            "with detection off a scan-side regeneration brings the untrimmed \
+             visuals back — the storage.frames replacement undoing a false \
+             positive has to go through"
+        );
+        assert_eq!(
+            outro_columns(&mut conn, &sha256).await,
+            (Some("tiktok_card/1".to_string()), Some(5000)),
+            "off skips future examinations; it never erases a stored one"
+        );
+    }
+
+    async fn stored_frames(conn: &mut sqlx::SqliteConnection, sha256: &str) -> Vec<DynamicImage> {
+        get_frames_bytes(conn, sha256)
+            .await
+            .unwrap()
+            .iter()
+            .map(|bytes| decode_image_bytes(bytes).expect("a stored frame decodes"))
+            .collect()
+    }
+
+    // The pure half of the clamp: which window frame sampling draws from, and
+    // whether it owes ffmpeg a decode bound at all.
+    #[test]
+    fn the_sampling_window_follows_the_content_boundary() {
+        // Never examined, or examined and negative: the whole file, unbounded.
+        assert_eq!(frame_sampling_window(7.0, None), (7.0, false));
+        // A boundary inside the file shortens the window *and* asks for the
+        // bound; the interval then spreads four frames over the content.
+        assert_eq!(frame_sampling_window(7.0, Some(5000)), (5.0, true));
+        assert_eq!(frame_sampling_window(7.0, Some(5000)).0 / 4.0, 1.25);
+        // A boundary at or past the duration clamps nothing — including the
+        // exact-equality case, where a bound would only cost a decode option.
+        assert_eq!(frame_sampling_window(7.0, Some(7000)), (7.0, false));
+        assert_eq!(frame_sampling_window(7.0, Some(9000)), (7.0, false));
+        // Nonsense is absent behaviour, never wrong behaviour.
+        assert_eq!(frame_sampling_window(7.0, Some(0)), (7.0, false));
+        assert_eq!(frame_sampling_window(7.0, Some(-1)), (7.0, false));
+    }
+
+    // The metadata shortcut: a `video/` container ffprobe found no video
+    // stream in has no card to carry, and probing it would burn two ffmpeg
+    // starts before the ledger settled while the dispatcher re-asked on every
+    // scan in between.
+    #[test]
+    fn a_container_with_no_video_stream_is_answered_without_a_probe() {
+        assert!(outro_needs_probe(Some(1)));
+        assert!(!outro_needs_probe(Some(0)));
+        // `extract_item_metadata` leaves the column unset rather than storing a
+        // zero, which is the shape this really has to handle.
+        assert!(!outro_needs_probe(None));
+
+        let pass = run_outro_pass(Path::new("never-opened.mp4"), Some(10.0), Some(0), None);
+        assert_eq!(
+            pass.record,
+            Some(OutroRecord {
+                kind: "none/1".to_string(),
+                content_end_ms: None,
+            })
+        );
+        assert!(pass.verdict.is_none(), "nothing ran, so nothing failed");
+        assert_eq!(pass.content_end_ms(), None);
+    }
+
+    // The gate in front of the whole stage: off, or not a video, and no probe
+    // is even considered.
+    #[test]
+    fn the_outro_stage_is_skipped_when_it_is_off_or_the_file_is_not_a_video() {
+        let meta = |mime: &str| ItemScanMeta {
+            md5: "md5".to_string(),
+            mime_type: mime.to_string(),
+            width: Some(576),
+            height: Some(1024),
+            duration: Some(7.0),
+            audio_tracks: Some(1),
+            video_tracks: Some(1),
+            subtitle_tracks: Some(0),
+        };
+        let path = Path::new("never-opened.mp4");
+        assert!(
+            outro_pass_for(path, "video/mp4", &meta("video/mp4"), false)
+                .record
+                .is_none()
+        );
+        assert!(
+            outro_pass_for(path, "image/png", &meta("image/png"), true)
+                .record
+                .is_none()
         );
     }
 
@@ -6962,6 +8231,7 @@ LIMIT 1
             &dir.path().join("audio-only.mp4"),
             "video/mp4",
             &meta(0, 10.0),
+            None,
         )
         .expect("a missing video track is not a failure");
         assert_eq!(produced.nothing, vec![VisualKind::Thumbnail, VisualKind::Frame]);
@@ -6971,7 +8241,7 @@ LIMIT 1
         // for the kind that could have existed.
         let plain = dir.path().join("notes.txt");
         fs::write(&plain, b"hello").unwrap();
-        let produced = build_new_item_thumbnails(&plain, "text/plain", &meta(0, 0.0))
+        let produced = build_new_item_thumbnails(&plain, "text/plain", &meta(0, 0.0), None)
             .expect("an unsupported type is not a failure");
         assert_eq!(produced.nothing, vec![VisualKind::Thumbnail]);
 
@@ -6979,7 +8249,7 @@ LIMIT 1
         // marker — the predicate already answers this without decoding.
         let small = dir.path().join("small.png");
         image::RgbImage::new(8, 8).save(&small).unwrap();
-        let produced = build_new_item_thumbnails(&small, "image/png", &meta(0, 0.0))
+        let produced = build_new_item_thumbnails(&small, "image/png", &meta(0, 0.0), None)
             .expect("a small image is not a failure");
         assert!(
             produced.nothing.is_empty() && produced.thumbnails.is_empty(),
@@ -6989,7 +8259,7 @@ LIMIT 1
         // And an image that does get a thumbnail concludes nothing at all.
         let large = dir.path().join("large.bmp");
         image::RgbImage::new(4900, 400).save(&large).unwrap();
-        let produced = build_new_item_thumbnails(&large, "image/bmp", &meta(0, 0.0)).unwrap();
+        let produced = build_new_item_thumbnails(&large, "image/bmp", &meta(0, 0.0), None).unwrap();
         assert!(produced.nothing.is_empty() && produced.thumbnails.len() == 1);
     }
 

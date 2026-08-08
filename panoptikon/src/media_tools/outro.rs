@@ -16,9 +16,6 @@
 //! half that must stay bit-equivalent to the Python reference of design §3.3
 //! (§12), and it is the half worth testing on synthetic buffers.
 
-// Temporary: nothing wires the detector in until scan integration lands.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
@@ -1190,11 +1187,17 @@ mod tests {
     /// The one test that goes through ffmpeg: output-geometry parsing, frame
     /// streaming and exit handling are exactly what the pure tests above
     /// cannot reach, and a wrong filter string would otherwise surface only
-    /// against real media. Ignored so the default run stays hermetic; run it
-    /// with `cargo test -- --ignored outro`.
+    /// against real media.
+    ///
+    /// Skipped rather than `#[ignore]`d, so it runs by default wherever ffmpeg
+    /// and its lavfi input device exist — which is every machine that can
+    /// actually index video — instead of only when someone remembers
+    /// `--ignored`. A machine without them returns early rather than failing.
     #[test]
-    #[ignore = "spawns ffmpeg and needs the lavfi input device"]
     fn a_generated_card_is_detected_end_to_end() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().expect("a temp dir");
         let clip = dir.path().join("card.mp4");
         let status = Command::new(crate::media_tools::ffmpeg())
@@ -1221,9 +1224,13 @@ mod tests {
                 "18",
             ])
             .arg(&clip)
-            .status()
-            .expect("ffmpeg runs");
-        assert!(status.success(), "fixture generation failed");
+            .status();
+        // No lavfi (or no working encoder) on this build: nothing to test
+        // against, and a failure here would be about the fixture, not the
+        // detector.
+        if !matches!(status, Ok(status) if status.success()) {
+            return;
+        }
 
         assert!(gate_promotes(&clip).expect("the gate runs"));
         // 576x1024 is TikTok's own export geometry, so this also pins the

@@ -37,6 +37,21 @@ pub(crate) enum VisualKind {
     Thumbnail,
     /// Shadows `storage.frames`.
     Frame,
+    /// Failures of the appended-outro probe
+    /// (docs/video-outro-detection-design.md §7.2).
+    ///
+    /// The one acknowledged semantic stretch in this table: every other kind
+    /// shadows a *storage-side* positive cache, but the outro verdict lives in
+    /// `items.outro_kind` over in index.db. The design accepts it because the
+    /// advisory property holds in both mismatch directions — "a marker
+    /// orphaned by a storage.db wipe costs one ~85ms re-probe; one surviving
+    /// an index.db rebuild correctly suppresses re-probing a file that would
+    /// fail again; never a wrong answer" — and the alternative is a parallel
+    /// index-side ledger, i.e. duplicated machinery for what measured 0.37% of
+    /// files. The positive cache this one is consulted *after* is the
+    /// `outro_kind` column itself: a row that already carries a verdict is
+    /// never dispatched, so the marker is only ever read for a file with none.
+    Outro,
 }
 
 impl VisualKind {
@@ -44,6 +59,7 @@ impl VisualKind {
         match self {
             VisualKind::Thumbnail => "thumbnail",
             VisualKind::Frame => "frame",
+            VisualKind::Outro => "outro",
         }
     }
 
@@ -56,6 +72,7 @@ impl VisualKind {
         match value {
             "thumbnail" => Some(VisualKind::Thumbnail),
             "frame" => Some(VisualKind::Frame),
+            "outro" => Some(VisualKind::Outro),
             _ => None,
         }
     }

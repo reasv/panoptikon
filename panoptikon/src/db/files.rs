@@ -289,6 +289,116 @@ pub(crate) async fn get_item_visual_meta(
     Ok(row)
 }
 
+/// A video the outro detector has never examined, and everything the probe
+/// needs about it (docs/video-outro-detection-design.md §7).
+pub(crate) struct PendingOutroItem {
+    pub duration: Option<f64>,
+    pub video_tracks: Option<i64>,
+    /// The item's stored — that is, *coded* — dimensions, which the detector
+    /// consults only as a fallback for a decode whose geometry ffmpeg never
+    /// reported, and even then only when the byte count corroborates them.
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+}
+
+/// The scan dispatcher's outro question: "is this content a video that still
+/// has to be examined?" `None` means there is nothing to do — the item is not
+/// a video, has already been examined, or is not indexed at all.
+///
+/// `type >= 'video/' AND type < 'video0'` rather than `LIKE 'video/%'`, and in
+/// that order: `items.type` holds the whole mime string, and a LIKE prefix
+/// cannot be served from an index under SQLite's default case-insensitive
+/// LIKE. It is also exactly the predicate `idx_items_outro_pending` was
+/// written for, so the definition of "video" lives in one place even though
+/// this particular call is a point lookup on the `sha256` unique index.
+pub(crate) async fn get_pending_outro_item(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<Option<PendingOutroItem>> {
+    let row: Option<(Option<f64>, Option<i64>, Option<i64>, Option<i64>)> = sqlx::query_as(
+        r#"
+SELECT duration, video_tracks, width, height
+FROM items
+WHERE sha256 = ?1
+  AND outro_kind IS NULL
+  AND type >= 'video/' AND type < 'video0'
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read an item's outro state");
+        ApiError::internal("Failed to query item")
+    })?;
+    Ok(
+        row.map(|(duration, video_tracks, width, height)| PendingOutroItem {
+            duration,
+            video_tracks,
+            width,
+            height,
+        }),
+    )
+}
+
+/// Where the item's real content ends, for the consumers that sample frames.
+/// `None` covers both "never examined" and "examined, no outro" — neither
+/// clamps anything, which is exactly the "absent behaviour, never wrong
+/// behaviour" the design asks of a consumer.
+pub(crate) async fn get_item_content_end_ms(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<Option<i64>> {
+    let row: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT content_end_ms FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read an item's content end");
+                ApiError::internal("Failed to query item")
+            })?;
+    Ok(row.and_then(|(content_end_ms,)| content_end_ms))
+}
+
+/// Stores one genuine outro verdict and drops the probe's failure marker.
+///
+/// The delete is here, in the caller's transaction, for the same reason
+/// [`crate::db::storage::store_thumbnails`] does it: the negative cache must
+/// never outlive the positive answer. Connections carry both databases
+/// attached, so the index-side write and the `storage.` delete are one commit.
+/// Unconditional and version-agnostic — a marker from *any* detector version
+/// is answered by a stored verdict.
+///
+/// `content_end_ms` is `None` on a negative verdict, and legitimately `None`
+/// on a positive one whose duration is missing or nonsense: "has an outro" is
+/// `content_end_ms` non-null, never the kind string (design §6.3).
+pub(crate) async fn set_outro_verdict(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    outro_kind: &str,
+    content_end_ms: Option<i64>,
+) -> ApiResult<u64> {
+    let result =
+        sqlx::query("UPDATE items SET outro_kind = ?1, content_end_ms = ?2 WHERE sha256 = ?3")
+            .bind(outro_kind)
+            .bind(content_end_ms)
+            .bind(sha256)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, sha256, "failed to store an outro verdict");
+                ApiError::internal("Failed to store an outro verdict")
+            })?;
+    crate::db::visual_attempts::delete_visual_attempt(
+        &mut *conn,
+        sha256,
+        crate::db::visual_attempts::VisualKind::Outro,
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Returns the item's stored pixel dimensions, used to decide whether an
 /// image would produce a thumbnail at all without decoding it again.
 pub(crate) async fn get_item_dimensions(

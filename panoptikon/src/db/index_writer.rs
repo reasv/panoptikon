@@ -32,7 +32,7 @@ use crate::db::{
     files::{
         FileScanData, FileUpsertResult, delete_file_by_path, delete_files_not_allowed,
         delete_item_if_orphan, delete_items_without_files, rename_file_path, set_blurhash,
-        update_file_data,
+        set_outro_verdict, update_file_data,
     },
     folders::{
         add_folder_to_database, delete_files_not_under_included_folders,
@@ -138,6 +138,19 @@ pub(crate) enum IndexDbWriterMessage {
         process_version: i64,
         frames: Vec<StoredImage>,
         reply: Reply<()>,
+    },
+    /// One genuine outro verdict (docs/video-outro-detection-design.md §7.2).
+    /// The `items` write and the probe marker's delete share this one
+    /// transaction, mirroring [`Self::StoreThumbnails`] — connections have
+    /// both databases attached, so the negative cache can never outlive the
+    /// answer that retired it. Probe *failures* never come through here: they
+    /// are `UpsertVisualAttempts` records, because `outro_kind` only ever
+    /// holds verdicts.
+    SetOutroVerdict {
+        sha256: String,
+        outro_kind: String,
+        content_end_ms: Option<i64>,
+        reply: Reply<u64>,
     },
     RenameFilePath {
         old_path: String,
@@ -663,6 +676,21 @@ impl Actor for IndexDbWriter {
                     .with_transaction(move |conn| {
                         Box::pin(async move {
                             store_frames(conn, &sha256, &mime_type, process_version, &frames).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::SetOutroVerdict {
+                sha256,
+                outro_kind,
+                content_end_ms,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            set_outro_verdict(conn, &sha256, &outro_kind, content_end_ms).await
                         })
                     })
                     .await;

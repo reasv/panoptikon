@@ -67,6 +67,10 @@ const WATCHER_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(60);
 struct FileWork {
     path: PathBuf,
     filescan_filter: Option<Arc<Match>>,
+    /// Folded from the config pair at dispatch, the twin of the batch walker's
+    /// `ScanContext::detect_outros`: detection is subordinate to `scan_video`
+    /// (docs/video-outro-detection-design.md §8).
+    detect_outros: bool,
     epoch: u64,
     scan_time: String,
     index_db: String,
@@ -101,6 +105,7 @@ impl Worker for ContinuousWorker {
         let FileWork {
             path,
             filescan_filter,
+            detect_outros,
             epoch,
             scan_time,
             index_db,
@@ -177,11 +182,12 @@ impl Worker for ContinuousWorker {
         }
 
         let work_path = path.clone();
-        let result =
-            tokio::task::spawn_blocking(move || process_file(work_path, filescan_filter, &timers))
-                .await
-                .map_err(|err| FileProcessError::Worker(err.to_string()))
-                .and_then(|res| res);
+        let result = tokio::task::spawn_blocking(move || {
+            process_file(work_path, filescan_filter, detect_outros, &timers)
+        })
+        .await
+        .map_err(|err| FileProcessError::Worker(err.to_string()))
+        .and_then(|res| res);
 
         let _ = reply_to.cast(ContinuousScanMessage::WorkerResult {
             epoch,
@@ -936,6 +942,7 @@ impl ContinuousScanState {
         let msg = FileWork {
             path,
             filescan_filter: self.filescan_filter.clone(),
+            detect_outros: self.config.scan_video && self.config.detect_outros,
             epoch: self.epoch,
             scan_time,
             index_db: self.index_db.clone(),
@@ -1638,6 +1645,20 @@ impl Actor for ContinuousScanActor {
                         if let Some(record) = file_data.visuals_scan_error {
                             state.record_visuals_scan_error(record).await;
                         }
+                        // Strictly after the write that inserts the `items`
+                        // row this updates, and only on its success: a verdict
+                        // with no item to hang it on is simply re-probed.
+                        if let Some(outro) = &file_data.outro {
+                            let _ = call_index_db_writer(&state.index_db, |reply| {
+                                IndexDbWriterMessage::SetOutroVerdict {
+                                    sha256: file_data.sha256.clone(),
+                                    outro_kind: outro.kind.clone(),
+                                    content_end_ms: outro.content_end_ms,
+                                    reply,
+                                }
+                            })
+                            .await;
+                        }
                     }
                     Err(err) => {
                         tracing::error!(error = ?err, "failed to update file data");
@@ -2251,6 +2272,7 @@ mod tests {
         let prepared = process_file(
             file_path.clone(),
             parse_filescan_filter(&config).map(Arc::new),
+            false,
             &ScanTimers::default(),
         )
         .unwrap();
@@ -2345,6 +2367,7 @@ mod tests {
         let prepared = process_file(
             file_path.clone(),
             parse_filescan_filter(&config).map(Arc::new),
+            false,
             &ScanTimers::default(),
         )
         .unwrap();
@@ -2530,6 +2553,7 @@ mod tests {
         let prepared = process_file(
             file_path.clone(),
             parse_filescan_filter(&config).map(Arc::new),
+            false,
             &ScanTimers::default(),
         )
         .unwrap();
