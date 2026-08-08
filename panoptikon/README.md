@@ -626,7 +626,9 @@ Setup completion revalidates them, optionally creates a named index database,
 saves file-type, folder, continuous-scan, model-plan, and schedule settings,
 then atomically queues an initial folder update followed by every selected
 model. `POST /api/desktop/setup-schedule/preview` validates a staged cron string
-and returns its next local-time occurrence without saving it.
+and returns its next local-time occurrence without saving it. Setup completion
+always requires a valid stored routine schedule, including when automatic runs
+are disabled.
 `GET /api/desktop/setup-status` evaluates the
 policy-resolved default index database and reports it ready once at least one
 currently included folder has a matching `file_scans` row, meaning a scan for
@@ -875,6 +877,14 @@ they became the `[jobs]` keys `pdfium`, `html_renderer` and
 `thumbnail_font`, which the shipped configs template as `${PDFIUM_PATH:-}`
 etc., so setting the variables in `.env` still works — through the
 templating layer, not a direct read.
+
+Panoptikon Desktop sets `PDFIUM_PATH` to the absolute path of its bundled,
+version-pinned PDFium library before it starts the Server. On macOS that path
+is the Tauri-signed copy under `Contents/Frameworks`, as required by hardened
+runtime library validation. Standalone Server
+installs retain the normal discovery order; managed-venv PDFium libraries are
+canonicalized before loading so hardened macOS processes never receive a
+relative `dlopen` path.
 
 The config file path itself can be overridden on the CLI:
 

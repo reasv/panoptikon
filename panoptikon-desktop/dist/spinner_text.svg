@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg class="gh-palette" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 540 625" width="540.0pt" height="625.0pt">
+<svg class="gh-palette lines-dark text-light wheel-border-thick" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 540 625" width="540.0pt" height="625.0pt">
 <defs>
     <style type="text/css">
       :root {
@@ -223,4 +223,3 @@
 
 <text font-size="80px" class="svg-logo-text" x="10" y="607">PANOPTIKON</text>
 </svg>
-

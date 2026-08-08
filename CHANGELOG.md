@@ -6,6 +6,22 @@ Desktop release notes.
 
 ## [Unreleased]
 
+- **The Desktop startup splash now uses the correct dark-background logo.**
+  Its white border and wordmark no longer depend on the embedded WebView's
+  appearance reporting.
+- **The Desktop setup wizard no longer gets stuck on the Schedule step.**
+  Disabling automatic runs allows Continue immediately, and generated daily,
+  hourly, or weekly schedules no longer wait for the next-run preview. Enabled
+  custom cron expressions still require successful validation; invalid custom
+  drafts are never saved when automatic runs are disabled.
+- **Panoptikon Desktop now stays out of the macOS Dock while running in the
+  background.** Its Dock and application-switcher entry appears while a native
+  setup, settings, Relay, or update window is visible, then disappears when the
+  last such window closes. The menu-bar icon remains available throughout.
+- **macOS now has first-class Desktop development scripts.** Developers can run
+  the isolated unpackaged app, build a dev app/DMG, and safely reset its local
+  profile with shell equivalents of the existing Windows workflows.
+
 ## [v0.1.8] - 2026-08-03
 
 ### Added
