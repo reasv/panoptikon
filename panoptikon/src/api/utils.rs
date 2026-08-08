@@ -1,5 +1,5 @@
 use axum::http::header;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -59,7 +59,9 @@ enum ConfigStat {
     Unknown,
 }
 
-/// A remembered verdict, and the file state it was read from.
+/// A remembered verdict, and the file state it was read from. A verdict that
+/// came from a *failed* read is remembered the same way: it is still tied to
+/// the stamp that produced it, so a fixed file re-reads on the next request.
 struct CachedGate {
     stamp: ConfigStamp,
     detect_outros: bool,
@@ -79,6 +81,20 @@ fn lock_gate_cache() -> std::sync::MutexGuard<'static, HashMap<String, CachedGat
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// True the first time this `key` is seen, false ever after.
+///
+/// The gate runs on the request path, so any condition it cannot cache away
+/// would otherwise log at request rate. Those get one warning per process
+/// (and a `debug!` afterwards, for anyone who does want the per-request
+/// trace) rather than a permanent stream of identical lines.
+fn first_time(key: String) -> bool {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key)
+}
+
 /// This database's `detect_outros`, read at most once per version of its
 /// `config.toml`.
 ///
@@ -88,21 +104,37 @@ fn lock_gate_cache() -> std::sync::MutexGuard<'static, HashMap<String, CachedGat
 /// which is what keeps §6's "takes effect immediately" true without paying
 /// for a parse on every search.
 ///
-/// Fails open at every step, and never caches a failure: a hand-broken
-/// config must not take search or item metadata down with it (same stance as
-/// `jobs::continuous_scan`, which refuses to abort a whole resync over one
-/// unreadable config). The toggle is a playback preference; availability
-/// outranks it.
+/// Fails open at every step: a hand-broken config must not take search or
+/// item metadata down with it (same stance as `jobs::continuous_scan`, which
+/// refuses to abort a whole resync over one unreadable config). The toggle is
+/// a playback preference; availability outranks it.
+///
+/// The fail-open verdict is cached like any other, against the stamp that
+/// produced it — a broken config must not make every request re-read and
+/// re-parse it, nor re-log (this repository has already been burned once by a
+/// warning that fired on every config load forever). Recovery is unchanged:
+/// fixing the file moves its stamp, and the next request re-reads.
 async fn detect_outros_enabled(index_db: &str) -> bool {
     let config_path = SystemConfigStore::from_env().config_path(index_db);
     let stamp = match stat_config(&config_path).await {
         ConfigStat::Missing => return SystemConfig::default().detect_outros,
+        // No stamp to key on, so this one genuinely cannot be cached and
+        // recurs per request: it is loud once, then quiet.
         ConfigStat::Unknown => {
-            tracing::warn!(
-                index_db = %index_db,
-                path = %config_path.display(),
-                "could not stat the database config; serving outro metadata"
-            );
+            if first_time(format!("stat:{index_db}")) {
+                tracing::warn!(
+                    index_db = %index_db,
+                    path = %config_path.display(),
+                    "could not stat the database config; serving outro metadata \
+                     (logged once per database, retried on every request)"
+                );
+            } else {
+                tracing::debug!(
+                    index_db = %index_db,
+                    path = %config_path.display(),
+                    "could not stat the database config; serving outro metadata"
+                );
+            }
             return true;
         }
         ConfigStat::Present(stamp) => stamp,
@@ -110,8 +142,18 @@ async fn detect_outros_enabled(index_db: &str) -> bool {
 
     // A stamp with no modification time can never be expired by one, so it
     // is never allowed to answer (nor to be stored): the file would pin its
-    // first verdict for the life of the process.
+    // first verdict for the life of the process. That silently costs a read
+    // and a parse per request, so say so once — otherwise the degradation is
+    // invisible.
     let cacheable = stamp.modified.is_some();
+    if !cacheable && first_time(format!("mtime:{index_db}")) {
+        tracing::warn!(
+            index_db = %index_db,
+            path = %config_path.display(),
+            "the database config reports no modification time; the outro gate \
+             cannot cache it and re-reads it on every request"
+        );
+    }
     if cacheable
         && let Some(cached) = lock_gate_cache().get(index_db)
         && cached.stamp == stamp
@@ -125,29 +167,43 @@ async fn detect_outros_enabled(index_db: &str) -> bool {
             .load_readonly(&owned_db)
             .map(|config| config.detect_outros)
     });
-    let detect_outros = match tokio::time::timeout(CONFIG_IO_TIMEOUT, read).await {
-        Ok(Ok(Ok(detect_outros))) => detect_outros,
-        Ok(Ok(Err(err))) => {
-            tracing::warn!(
-                index_db = %index_db,
-                error = ?err,
-                "could not read the database config; serving outro metadata"
-            );
-            return true;
-        }
-        Ok(Err(err)) => {
-            tracing::warn!(
-                index_db = %index_db,
-                error = %err,
-                "database config read task failed; serving outro metadata"
-            );
-            return true;
-        }
-        Err(_) => {
-            tracing::warn!(
-                index_db = %index_db,
-                "timed out reading the database config; serving outro metadata"
-            );
+    let read = match tokio::time::timeout(CONFIG_IO_TIMEOUT, read).await {
+        Ok(Ok(Ok(detect_outros))) => Ok(detect_outros),
+        Ok(Ok(Err(err))) => Err(format!("could not read the database config: {err:?}")),
+        Ok(Err(err)) => Err(format!("database config read task failed: {err}")),
+        Err(_) => Err("timed out reading the database config".to_string()),
+    };
+    let detect_outros = match read {
+        Ok(detect_outros) => detect_outros,
+        Err(reason) => {
+            // Fail open, and remember that. Reaching here means the cache had
+            // no entry for this stamp, so the insert is exactly once per
+            // broken revision of the file — and so is the warning.
+            let loud = if cacheable {
+                lock_gate_cache().insert(
+                    index_db.to_string(),
+                    CachedGate {
+                        stamp,
+                        detect_outros: true,
+                    },
+                );
+                true
+            } else {
+                first_time(format!("read:{index_db}"))
+            };
+            if loud {
+                tracing::warn!(
+                    index_db = %index_db,
+                    reason = %reason,
+                    "serving outro metadata despite an unusable database config"
+                );
+            } else {
+                tracing::debug!(
+                    index_db = %index_db,
+                    reason = %reason,
+                    "serving outro metadata despite an unusable database config"
+                );
+            }
             return true;
         }
     };
@@ -268,16 +324,38 @@ mod tests {
     /// gate logs and serves. A 500 here would break search and item metadata
     /// for a whole database over a hand-edit, and data-dependently at that
     /// (only rows carrying outro metadata reach the read).
+    ///
+    /// And it must not pay for the broken file twice: the fail-open verdict
+    /// is cached against the same stamp as a good one, so a hand-broken
+    /// config costs one read, one parse and one warning per revision rather
+    /// than one per request.
     #[tokio::test]
     async fn malformed_config_fails_open() {
         let _env = crate::test_utils::test_data_dir();
-        let path = config_path("utils-outro-malformed");
+        let index_db = "utils-outro-malformed";
+        let path = config_path(index_db);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "detect_outros = = broken\n[unterminated\n").unwrap();
 
         assert!(
-            serve_outro_metadata("utils-outro-malformed", true).await,
+            serve_outro_metadata(index_db, true).await,
             "an unparseable config serves the metadata rather than failing"
+        );
+
+        // Flipping the remembered bit under the unchanged stamp makes the
+        // second call's source observable: a re-read of the broken file would
+        // fail open to true again, so `false` can only have come from cache.
+        {
+            let mut cache = lock_gate_cache();
+            let cached = cache
+                .get_mut(index_db)
+                .expect("the fail-open verdict is cached against the file's stamp");
+            assert!(cached.detect_outros, "and it is the fail-open verdict");
+            cached.detect_outros = false;
+        }
+        assert!(
+            !serve_outro_metadata(index_db, true).await,
+            "the second call is answered from the cache, without re-parsing"
         );
     }
 

@@ -168,7 +168,12 @@ player has no other need for). Instead, the API stops serving the metadata:
   re-reads — a change still takes effect immediately, without a TOML parse on
   every search. The read never creates the file (a GET must not write to the
   data folder) and fails open: an unreadable or malformed config logs a
-  warning and serves the metadata rather than failing the request.
+  warning and serves the metadata rather than failing the request. That
+  fail-open verdict is cached against the same stamp, so a broken file costs
+  one read and one warning per revision of it, not per request, and still
+  recovers on the next request after it is fixed. The one case that cannot be
+  cached is a config whose modification time is unreadable — there is no stamp
+  to expire against, so it degrades to a read per request and says so once.
 - The nulling must be applied **after any result-cache read, at response
   mapping time**, so a config change takes effect immediately and cached rows
   never leak stale policy.

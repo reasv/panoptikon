@@ -92,6 +92,12 @@ impl ProxyState {
 /// (no config file, no env templating, so no `env_lock`), and the handler
 /// paths this serves reach the inference client only for queries that need
 /// an embedding.
+///
+/// Not usable for upgrade-bridge tests: the shutdown `Sender` is dropped
+/// here, which `proxy_request`'s bridge deliberately reads as "no signal can
+/// ever arrive", so a test expecting shutdown-driven teardown would hang —
+/// and a test that does reach the inference client waits out its ~10s retries
+/// against the discard port.
 #[cfg(test)]
 pub(crate) fn test_proxy_state() -> Arc<ProxyState> {
     // Discard-protocol port: parsed and stored, never connected to.

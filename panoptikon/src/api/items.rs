@@ -295,8 +295,14 @@ pub async fn item_meta(
         return Err(ApiError::not_found("Item not found"));
     };
 
+    // The mapping's outro gate stats a config file, which can block on a
+    // network mount; the query is already done, so the pooled connection goes
+    // back to the read pool before that rather than being pinned across it.
+    let index_db = db.index_db.clone();
+    drop(db);
+
     let response = ItemMetadataResponse {
-        item: map_item_record(&db.index_db, &item).await,
+        item: map_item_record(&index_db, &item).await,
         files: item_data.files.into_iter().map(map_file_record).collect(),
     };
 

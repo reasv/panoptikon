@@ -656,7 +656,13 @@ pub async fn search_pql(
     // from the cache were stored under whatever policy was in force when
     // they were executed, so gating any earlier would let a stale policy
     // survive in the cache and a config change take effect late.
-    apply_outro_gate(&db.index_db, &mut results).await;
+    //
+    // All SQL is done by here, and the gate does filesystem work that can
+    // block on a network mount, so the pooled connection is handed back
+    // first: a slow config stat must not hold one of the read pool's slots.
+    let index_db = db.index_db.clone();
+    drop(db);
+    apply_outro_gate(&index_db, &mut results).await;
 
     Ok(Json(FileSearchResponse {
         count,
