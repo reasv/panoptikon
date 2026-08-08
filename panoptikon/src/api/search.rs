@@ -1,4 +1,5 @@
 use crate::api::db_params::DbQueryParams;
+use crate::api::pinboards::{PinboardDatabaseResponse, map_databases};
 use crate::api::search_cache::{self, CacheLookup, EpochSnapshot, QueryKey};
 use crate::api_error::ApiError;
 use crate::db::bookmarks::get_all_bookmark_namespaces;
@@ -7,6 +8,7 @@ use crate::db::folders::get_folders_from_database;
 use crate::db::items::{
     TextStats, get_all_mime_types, get_existing_file_for_item_id, get_file_stats, get_text_stats,
 };
+use crate::db::pinboard_dbs::{self, AssociationContext, BoardOverlap};
 use crate::db::pql::{run_compiled_count, run_compiled_query};
 use crate::db::tags::{
     find_tags, get_all_tag_namespaces, get_min_tag_confidence, get_most_common_tags_frequency,
@@ -782,6 +784,11 @@ pub(crate) struct PinboardSearchQuery {
     #[serde(default = "default_user")]
     #[param(default = "user")]
     user: String,
+    /// Return only the boards associated with the selected index database —
+    /// the same server-computed rule and the same client preference as the
+    /// library list.
+    #[serde(default)]
+    associated_only: bool,
 }
 
 /// One matching board: the `PinboardSummaryResponse` fields the library card
@@ -800,9 +807,18 @@ pub(crate) struct PinboardSearchMatch {
     preview_h: Option<i64>,
     screenful_h: Option<i64>,
     item_count: i64,
+    /// How many of the board's items exist in the selected index database
+    /// (`match_count` is how many the *search* matched). Same field as on the
+    /// library list summary.
+    present_count: i64,
     version_count: i64,
     /// Distinct items on the board's head version that the search matched.
     match_count: i64,
+    /// Whether the board belongs to the selected index database, by the same
+    /// rule the library list applies.
+    associated: bool,
+    /// The databases this board is stamped for, newest stamp first.
+    databases: Vec<PinboardDatabaseResponse>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -921,12 +937,15 @@ pub async fn search_pql_pinboards(
         metrics.preprocess = preprocess;
     }
 
+    let ctx = AssociationContext::load(&mut db.conn, &db.index_db).await;
     let pinboards = run_pinboard_search(
         &mut db.conn,
         query,
         &params.user,
         crate::db::pinboards::unix_now(),
         &mut metrics,
+        &ctx,
+        params.associated_only,
     )
     .await?;
 
@@ -935,12 +954,19 @@ pub async fn search_pql_pinboards(
 
 /// Builds, executes and ranks the board intersection for an already
 /// preprocessed query. Stamps build/compile/execute into `metrics`.
+///
+/// The association fields are computed over the matched boards and
+/// `associated_only` applied as a post-filter — after the ranking, so the
+/// filter only ever removes rows from an order it never influenced.
+#[allow(clippy::too_many_arguments)]
 async fn run_pinboard_search(
     conn: &mut sqlx::SqliteConnection,
     query: PqlQuery,
     user: &str,
     now: i64,
     metrics: &mut SearchMetrics,
+    ctx: &AssociationContext,
+    associated_only: bool,
 ) -> ApiResult<Vec<PinboardSearchMatch>> {
     let start = Instant::now();
     let built = build_item_set_preprocessed(query).map_err(map_pql_error)?;
@@ -961,7 +987,27 @@ async fn run_pinboard_search(
         ranked.push(map_pinboard_match(row, primary_order.is_some(), now)?);
     }
     sort_pinboard_matches(&mut ranked, primary_order.as_ref());
-    Ok(ranked.into_iter().map(|entry| entry.board).collect())
+
+    let mut boards: Vec<PinboardSearchMatch> =
+        ranked.into_iter().map(|entry| entry.board).collect();
+    let overlaps: Vec<BoardOverlap> = boards
+        .iter()
+        .map(|board| BoardOverlap {
+            pinboard_id: board.id,
+            present_count: board.present_count,
+            item_count: board.item_count,
+        })
+        .collect();
+    let mut associations = pinboard_dbs::load_associations(conn, ctx, &overlaps).await?;
+    for board in &mut boards {
+        let association = associations.remove(&board.id).unwrap_or_default();
+        board.associated = association.associated;
+        board.databases = map_databases(association.databases);
+    }
+    if associated_only {
+        boards.retain(|board| board.associated);
+    }
+    Ok(boards)
 }
 
 /// Wraps the unsorted item set in the board intersection: one row per board
@@ -1066,6 +1112,35 @@ fn compose_pinboard_search(
         );
     query.expr_as(item_count, Alias::new("item_count"));
 
+    // The overlap with the current index database, next to the item count:
+    // the display signal, and clause (c) of the association rule when the two
+    // are equal. `items.sha256` is UNIQUE, so this is one indexed probe per
+    // pin. Deliberately expression-only (no bound value) — the composed
+    // statement's single parameter is the user scope.
+    let mut present_count = SeaQuery::select();
+    let present = Alias::new("pc");
+    let present_item = Alias::new("pi");
+    let mut indexed_here = SeaQuery::select();
+    indexed_here
+        .column((present_item.clone(), Alias::new("sha256")))
+        .from_as(Alias::new("items"), present_item.clone())
+        .and_where(
+            Expr::col((present_item, Alias::new("sha256")))
+                .equals((present.clone(), Alias::new("sha256"))),
+        );
+    present_count
+        .expr(Func::count(Expr::col(Asterisk)))
+        .from_as(
+            (user_data.clone(), Alias::new("pinboard_version_items")),
+            present.clone(),
+        )
+        .and_where(
+            Expr::col((present.clone(), Alias::new("version_id")))
+                .equals((p.clone(), Alias::new("head_version_id"))),
+        )
+        .and_where(Expr::exists(indexed_here));
+    query.expr_as(present_count, Alias::new("present_count"));
+
     let mut version_count = SeaQuery::select();
     let versions = Alias::new("v");
     version_count
@@ -1099,8 +1174,13 @@ fn map_pinboard_match(
         preview_h: read_pinboard_column(row, "preview_h")?,
         screenful_h: read_pinboard_column(row, "screenful_h")?,
         item_count: read_pinboard_column(row, "item_count")?,
+        present_count: read_pinboard_column(row, "present_count")?,
         version_count: read_pinboard_column(row, "version_count")?,
         match_count: read_pinboard_column(row, "match_count")?,
+        // Filled in once the whole result set is known: the stamp rows are
+        // read in one query for every matched board, not one per row.
+        associated: false,
+        databases: Vec::new(),
     };
     Ok(RankedPinboard {
         board,
@@ -2589,10 +2669,39 @@ mod tests {
         query: PqlQuery,
         user: &str,
     ) -> Vec<PinboardSearchMatch> {
+        search_boards_with(conn, query, user, &no_associations(), false).await
+    }
+
+    /// A context nothing is stamped for and no database claims: only clause
+    /// (c) can associate a board, which is what the ranking tests want.
+    fn no_associations() -> AssociationContext {
+        AssociationContext::for_tests(
+            None,
+            None,
+            "",
+            crate::db::local_dbs::LocalDbIdentities::for_tests(&[], false),
+        )
+    }
+
+    async fn search_boards_with(
+        conn: &mut sqlx::SqliteConnection,
+        query: PqlQuery,
+        user: &str,
+        ctx: &AssociationContext,
+        associated_only: bool,
+    ) -> Vec<PinboardSearchMatch> {
         let mut metrics = SearchMetrics::default();
-        run_pinboard_search(conn, query, user, PINBOARD_NOW, &mut metrics)
-            .await
-            .expect("pinboard search")
+        run_pinboard_search(
+            conn,
+            query,
+            user,
+            PINBOARD_NOW,
+            &mut metrics,
+            ctx,
+            associated_only,
+        )
+        .await
+        .expect("pinboard search")
     }
 
     fn board_names(boards: &[PinboardSearchMatch]) -> Vec<String> {
@@ -2701,6 +2810,73 @@ mod tests {
         assert_eq!(board_c.match_count, 1, "the unindexed pin must not match");
         assert_eq!(board_c.item_count, 2, "but it is still on the board");
         assert_eq!(board_c.version_count, 1);
+    }
+
+    // The grid Library tab obeys the same association rule and the same
+    // stored preference as the library list: a board fully present here is
+    // admitted by 100% overlap, a rotted one needs a stamp, and
+    // `associated_only` post-filters the ranked list without disturbing the
+    // order of what survives.
+    #[tokio::test]
+    async fn pinboard_search_reports_and_filters_associations() {
+        let mut dbs = setup_pinboard_search_db().await;
+        let boards = search_boards(&mut dbs.index_conn, PqlQuery::default(), "user").await;
+
+        let intact = boards
+            .iter()
+            .find(|board| board.name.as_deref() == Some("a"))
+            .unwrap();
+        assert_eq!((intact.present_count, intact.item_count), (2, 2));
+        assert!(intact.associated, "a fully present board is associated");
+
+        let rotted = boards
+            .iter()
+            .find(|board| board.name.as_deref() == Some("c"))
+            .unwrap();
+        assert_eq!((rotted.present_count, rotted.item_count), (1, 2));
+        assert!(!rotted.associated, "partial overlap is never membership");
+        assert!(rotted.databases.is_empty());
+        let rotted_id = rotted.id;
+
+        let unstamped = board_names(&boards);
+        let filtered = search_boards_with(
+            &mut dbs.index_conn,
+            PqlQuery::default(),
+            "user",
+            &no_associations(),
+            true,
+        )
+        .await;
+        let expected: Vec<String> = unstamped
+            .iter()
+            .filter(|name| name.as_str() != "c")
+            .cloned()
+            .collect();
+        assert_eq!(board_names(&filtered), expected);
+
+        // Stamped for the database being searched, it comes back — in the
+        // same place the unfiltered order put it.
+        crate::db::pinboard_dbs::stamp_for_tests(
+            &mut dbs.index_conn,
+            rotted_id,
+            "uuid_here",
+            "photos",
+            "inst",
+            PINBOARD_NOW,
+        )
+        .await;
+        let ctx = AssociationContext::for_tests(
+            Some("uuid_here"),
+            Some("inst"),
+            "photos",
+            crate::db::local_dbs::LocalDbIdentities::for_tests(&[("photos", "uuid_here")], false),
+        );
+        let filtered =
+            search_boards_with(&mut dbs.index_conn, PqlQuery::default(), "user", &ctx, true).await;
+        assert_eq!(board_names(&filtered), unstamped);
+        let stamped = filtered.iter().find(|board| board.id == rotted_id).unwrap();
+        assert!(stamped.associated);
+        assert_eq!(stamped.databases.len(), 1);
     }
 
     // Membership is the head version only: an item dropped from the board in

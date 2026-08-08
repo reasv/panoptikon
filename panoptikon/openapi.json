@@ -3634,7 +3634,7 @@
           "pinboards"
         ],
         "summary": "List saved pinboards",
-        "description": "Lists the user's saved pinboards with head-version metadata (preview dimensions, item and version counts) but without layouts or preview blobs.\nOrdered by `order`: `activity` (default) ranks by a recency strip followed by a decaying visit score — opening a board counts as activity, not just saving it — while `updated` is plain last-saved-first. The order applies identically under the `q` name search (FTS prefix match).",
+        "description": "Lists the user's saved pinboards with head-version metadata (preview dimensions, item and version counts) but without layouts or preview blobs.\nOrdered by `order`: `activity` (default) ranks by a recency strip followed by a decaying visit score — opening a board counts as activity, not just saving it — while `updated` is plain last-saved-first. The order applies identically under the `q` name search (FTS prefix match).\nEach board carries its association with the selected index database: `associated` (stamped for this database, or fully present in it), the stamped `databases`, and `present_count` — which is reported whether or not `associated_only` filters the list.",
         "operationId": "list_pinboards",
         "parameters": [
           {
@@ -3687,6 +3687,15 @@
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/PinboardOrder"
+            }
+          },
+          {
+            "name": "associated_only",
+            "in": "query",
+            "description": "Return only the boards associated with the selected index database.\nThe verdict is server-computed (see `associated`); the client sends\nits stored preference.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -3811,6 +3820,15 @@
             "schema": {
               "type": "string",
               "default": "user"
+            }
+          },
+          {
+            "name": "associated_only",
+            "in": "query",
+            "description": "Return only the boards associated with the selected index database —\nthe same server-computed rule and the same client preference as the\nlibrary list.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -4055,6 +4073,90 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Pinboard not found"
+          }
+        }
+      }
+    },
+    "/api/pinboards/{pinboard_id}/databases": {
+      "put": {
+        "tags": [
+          "pinboards"
+        ],
+        "summary": "Replace the databases a pinboard is associated with",
+        "description": "Sets the board's database associations to exactly the names given, replacing whatever was there (an empty list clears them). This is the manual fix path every automatic verdict has: associations are hints, so renames, accidental stamps and instance-identity resets all need somewhere to go.\nA name the board is already stamped for is kept exactly as stored — including one whose database no longer exists locally, which the server has no way to mint again. Every other name must resolve to a local index database; one that resolves to nothing is a 400 and nothing is written. Removing a name is expressed by omitting it.\nThe board's `time_updated` is deliberately not bumped: an association is not a content change and must not reorder the library.",
+        "operationId": "set_pinboard_databases",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "pinboard_id",
+            "in": "path",
+            "description": "The pinboard id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "user",
+            "in": "query",
+            "description": "The user the pinboard belongs to.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "user"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPinboardDatabasesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The board's associations after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PinboardDatabasesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A name that is neither already stamped nor a local index database"
           },
           "404": {
             "description": "Pinboard not found"
@@ -8182,6 +8284,51 @@
           "desc"
         ]
       },
+      "PinboardDatabaseResponse": {
+        "type": "object",
+        "description": "One stamped database of a board. Databases are named, never identified by\nUUID, on the wire: the UUIDs are server-side matching keys.",
+        "required": [
+          "name",
+          "last_stamped",
+          "associated"
+        ],
+        "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether this row is the database currently selected."
+          },
+          "last_stamped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds of the last stamp for this database."
+          },
+          "name": {
+            "type": "string",
+            "description": "The index database's name as of the stamp. It may no longer resolve\nto a local database, in which case it is a residual label only."
+          }
+        }
+      },
+      "PinboardDatabasesResponse": {
+        "type": "object",
+        "description": "A board's associations after the manual editor changed them — the same\ntwo fields the list and detail responses carry, so the client can update\nthe card in place without re-listing.",
+        "required": [
+          "associated",
+          "databases"
+        ],
+        "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether the board now belongs to the selected index database, by the\nfull rule (so it can still be true through 100% item overlap with no\nstamp at all)."
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardDatabaseResponse"
+            },
+            "description": "The databases the board is stamped for, newest stamp first."
+          }
+        }
+      },
       "PinboardDeleteResponse": {
         "type": "object",
         "required": [
@@ -8212,9 +8359,23 @@
           "id",
           "time_added",
           "time_updated",
-          "version_count"
+          "version_count",
+          "present_count",
+          "associated",
+          "databases"
         ],
         "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether the board belongs to the selected index database."
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardDatabaseResponse"
+            },
+            "description": "The databases this board is stamped for, newest stamp first."
+          },
           "flags": {
             "description": "The board's stored editing-behavior flags, verbatim as last saved.\nNull for boards saved before flags existed; the UI treats that as\nits codec defaults."
           },
@@ -8237,6 +8398,11 @@
               "string",
               "null"
             ]
+          },
+          "present_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The head version's items that exist in the selected index database\n(`head.item_count` is the total). Same field as on the list summary."
           },
           "time_added": {
             "type": "string"
@@ -8280,10 +8446,24 @@
           "time_added",
           "time_updated",
           "item_count",
+          "present_count",
           "version_count",
-          "match_count"
+          "match_count",
+          "associated",
+          "databases"
         ],
         "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether the board belongs to the selected index database, by the same\nrule the library list applies."
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardDatabaseResponse"
+            },
+            "description": "The databases this board is stamped for, newest stamp first."
+          },
           "head_version_id": {
             "type": [
               "integer",
@@ -8317,6 +8497,11 @@
               "string",
               "null"
             ]
+          },
+          "present_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of the board's items exist in the selected index database\n(`match_count` is how many the *search* matched). Same field as on the\nlibrary list summary."
           },
           "preview_h": {
             "type": [
@@ -8377,9 +8562,23 @@
           "time_added",
           "time_updated",
           "item_count",
-          "version_count"
+          "version_count",
+          "present_count",
+          "associated",
+          "databases"
         ],
         "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether the board belongs to the selected index database, by the full\nrule: a stamp for this database (by identity, or by name for a\ndatabase this instance rebuilt), or 100% of its items present here."
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardDatabaseResponse"
+            },
+            "description": "The databases this board is stamped for, newest stamp first."
+          },
           "head_version_id": {
             "type": [
               "integer",
@@ -8408,6 +8607,11 @@
               "string",
               "null"
             ]
+          },
+          "present_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of the board's items exist in the selected index database.\nBelow `item_count` this is rot (\"38/40 here\"), and is reported\nwhatever `associated_only` says — it is what tells rot apart from a\nboard that belongs somewhere else."
           },
           "preview_h": {
             "type": [
@@ -9763,6 +9967,22 @@
             }
           }
         ]
+      },
+      "SetPinboardDatabasesRequest": {
+        "type": "object",
+        "description": "The manual editor's payload: exactly the databases the board should be\nassociated with afterwards. An empty list clears every association.",
+        "required": [
+          "databases"
+        ],
+        "properties": {
+          "databases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Index database names. Each keeps every stamp already stored under it\n(including one whose database no longer exists, which the server could\nnot mint again) *and* associates the board with the live database that\nname refers to here. A name that is neither stamped nor local is a\n400. Omitting a name removes it."
+          }
+        }
       },
       "SetterDataStats": {
         "type": "object",
