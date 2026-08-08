@@ -4,16 +4,18 @@ use std::{
     ffi::OsStr,
     fs,
     io::{self, Read},
+    net::{SocketAddr, TcpStream},
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use ab_glyph::{FontVec, PxScale};
+use base64::Engine;
 use blurhash::encode as blurhash_encode;
 use image::ColorType;
 use image::codecs::jpeg::JpegEncoder;
@@ -711,9 +713,9 @@ async fn execute_folder_scan(
 /// render). They wait on the same set of backends, and probing is the
 /// expensive half, so splitting them would mean binding pdfium twice.
 ///
-/// The backends are cached in `OnceLock`s, so a dependency installed while the
-/// gateway runs is seen at the next restart; the markers clear on the first
-/// scan after that.
+/// Backend cache lifetime is backend-specific. In particular, HTML renderer
+/// absence is not cached, so installing a browser can clear its markers on the
+/// next scan without restarting the gateway.
 pub(crate) async fn heal_blocked_scan_errors(index_db: &str) -> ApiResult<()> {
     let waiting = {
         let mut conn = open_index_db_read_no_user_data(index_db).await?;
@@ -1384,6 +1386,16 @@ impl ScanContext {
                 "file does not match the filescan filter (stage 1), skipping"
             );
             self.stats.errors += 1;
+            return Ok(());
+        }
+        if let Err(error) = require_html_renderer_for_indexing(&mime_type) {
+            self.fail_file(FailedFile {
+                path,
+                error,
+                stat: Some((last_modified, file_size)),
+                mime_type: Some(mime_type),
+            })
+            .await;
             return Ok(());
         }
 
@@ -2608,9 +2620,22 @@ fn prepare_new_item(
         return failed(path, FileProcessError::Filtered);
     }
 
+    if let Err(error) = require_html_renderer_for_indexing(&mime_type) {
+        return failed(path, error);
+    }
+
     // The outro probe runs inside this call, before the generation it clamps
     // (design §7) and inside the same blocking task.
-    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, detect_outros, timers);
+    let visuals = match generate_new_item_visuals(
+        &path,
+        &mime_type,
+        &metadata,
+        detect_outros,
+        timers,
+    ) {
+        Ok(visuals) => visuals,
+        Err(error) => return failed(path, error),
+    };
     // Built here because this is the last place that holds the file's ledger
     // identity — the same stat pair the `failed` closure above uses, for the
     // same reason.
@@ -3239,9 +3264,9 @@ fn run_outro_pass(
 /// What one visuals generation pass produced, plus what the negative cache
 /// owes because of it.
 ///
-/// Deliberately not a `Result`: a visuals failure never fails the file (the
-/// item is indexed without visuals, exactly as before), so the error half is
-/// not an error at this level — it is a verdict to remember.
+/// Ordinary visuals failures do not fail the file: the item is indexed without
+/// visuals and the verdict is remembered. Opt-in HTML is the exception at the
+/// caller: its first screenshot must succeed before a new item is inserted.
 #[derive(Default)]
 pub(crate) struct GeneratedVisuals {
     pub(crate) thumbnails: Vec<StoredImage>,
@@ -3295,6 +3320,7 @@ pub(crate) fn process_file(
     ) {
         return Err(FileProcessError::Filtered);
     }
+    require_html_renderer_for_indexing(&mime_type)?;
 
     let hash_span = timers.hashing.start();
     let (md5, sha256, real_size) =
@@ -3326,10 +3352,12 @@ pub(crate) fn process_file(
     ) {
         return Err(FileProcessError::Filtered);
     }
+    require_html_renderer_for_indexing(&mime_type)?;
 
     // The probe runs inside this call, before the generation it clamps,
     // exactly as in `prepare_new_item`.
-    let visuals = generate_new_item_visuals(&path, &mime_type, &metadata, detect_outros, timers);
+    let visuals =
+        generate_new_item_visuals(&path, &mime_type, &metadata, detect_outros, timers)?;
     let visuals_scan_error = visuals.audit.map(|failure| ScanErrorRecord {
         path: path.to_string_lossy().to_string(),
         last_modified: last_modified.clone(),
@@ -3713,7 +3741,7 @@ fn generate_new_item_visuals(
     metadata: &ItemScanMeta,
     detect_outros: bool,
     timers: &ScanTimers,
-) -> GeneratedVisuals {
+) -> Result<GeneratedVisuals, FileProcessError> {
     // Inside the thumbgen span, and first within it: the probe is part of the
     // visuals pass (~85ms of process spawn per video), and leaving it outside
     // every phase would quietly drop that out of the per-scan times. Running
@@ -3736,6 +3764,9 @@ fn generate_new_item_visuals(
                 .map(VisualVerdict::nothing)
                 .collect();
             produced.blurhash_source
+        }
+        Err(err) if mime_type.starts_with("text/html") => {
+            return Err(html_visuals_error_blocks_indexing(err));
         }
         Err(err) => {
             // Unchanged behaviour: the item is indexed without visuals. What
@@ -3761,7 +3792,19 @@ fn generate_new_item_visuals(
     visuals.blurhash = blurhash_source.and_then(|image| compute_blurhash(&image).ok());
     drop(blurhash_span);
 
-    visuals
+    Ok(visuals)
+}
+
+fn html_visuals_error_blocks_indexing(err: VisualsError) -> FileProcessError {
+    match err.error {
+        FileProcessError::Visuals(failure) => FileProcessError::Classified(ScanFailure {
+            stage: STAGE_METADATA,
+            kind: failure.kind,
+            skip_after: failure.skip_after,
+            message: failure.message,
+        }),
+        other => other,
+    }
 }
 
 /// `content_end_ms` is this pass's own outro verdict, which ran before it
@@ -4458,8 +4501,8 @@ pub(crate) fn render_pdf_pages(path: &Path) -> Result<Vec<DynamicImage>, PdfRend
 
 /// Whether a dependency the extraction/scan ledger is waiting on now binds.
 /// Only the blockers with rows in the ledger are probed, so a run never loads
-/// a library it has no use for. The backends are cached in `OnceLock`s, so a
-/// dependency installed while the gateway runs is seen at the next restart.
+/// a library it has no use for. Backend cache lifetime is backend-specific;
+/// HTML renderer absence is deliberately re-probed on each relevant scan.
 pub(crate) fn probe_blocker(blocker: crate::api_error::Blocker) -> bool {
     match blocker {
         crate::api_error::Blocker::Pdfium => pdfium().is_some(),
@@ -4468,32 +4511,76 @@ pub(crate) fn probe_blocker(blocker: crate::api_error::Blocker) -> bool {
     }
 }
 
-static HTML_RENDERER: OnceLock<Option<PathBuf>> = OnceLock::new();
+static HTML_RENDERER: RwLock<Option<PathBuf>> = RwLock::new(None);
+static HTML_RENDERER_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Lazily locates a locally installed Chromium-family browser for headless
-/// HTML screenshots. Degrades gracefully: when no browser is found, HTML
-/// thumbnails are skipped (warned once) and all other scanning is unaffected.
-fn html_renderer() -> Option<&'static PathBuf> {
-    HTML_RENDERER
-        .get_or_init(|| {
-            if let Some(custom) = &crate::config::runtime().html_renderer {
-                if let Some(path) = crate::host_paths::resolve_configured_executable(custom) {
-                    tracing::debug!(path = %path.display(), "html renderer from config");
-                    return Some(path);
-                }
-                tracing::warn!(
-                    path = %custom.display(),
-                    "configured html_renderer not found; falling back to discovery"
-                );
-            }
-            if let Some(path) = crate::host_paths::find_html_renderer() {
-                tracing::debug!(path = %path.display(), "html renderer resolved");
-                return Some(path);
-            }
-            tracing::warn!("no headless browser found; HTML thumbnails are disabled");
-            None
-        })
+/// HTML screenshots. Successful discovery is cached while the executable
+/// exists; absence is deliberately not cached, so installing a browser makes
+/// blocked HTML files eligible on the next scan without restarting Panoptikon.
+fn html_renderer() -> Option<PathBuf> {
+    if let Some(custom) = &crate::config::runtime().html_renderer {
+        if let Some(path) = crate::host_paths::resolve_configured_executable(custom) {
+            HTML_RENDERER_MISSING_LOGGED.store(false, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "html renderer from config");
+            return Some(path);
+        }
+        if !HTML_RENDERER_MISSING_LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                path = %custom.display(),
+                "configured html_renderer not found; falling back to discovery"
+            );
+        }
+    }
+
+    if let Some(path) = HTML_RENDERER
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
+        .filter(|path| path.is_file())
+        .cloned()
+    {
+        return Some(path);
+    }
+
+    if let Some(path) = crate::host_paths::find_html_renderer() {
+        tracing::debug!(path = %path.display(), "html renderer resolved");
+        HTML_RENDERER_MISSING_LOGGED.store(false, Ordering::Relaxed);
+        *HTML_RENDERER
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.clone());
+        return Some(path);
+    }
+
+    *HTML_RENDERER
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    if !HTML_RENDERER_MISSING_LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("no headless browser found; HTML files will not be indexed");
+    }
+    None
+}
+
+fn require_html_renderer_for_indexing(mime_type: &str) -> Result<(), FileProcessError> {
+    require_html_renderer_for_indexing_with(mime_type, html_renderer().is_some())
+}
+
+fn require_html_renderer_for_indexing_with(
+    mime_type: &str,
+    renderer_available: bool,
+) -> Result<(), FileProcessError> {
+    if !mime_type.starts_with("text/html") || renderer_available {
+        return Ok(());
+    }
+    Err(FileProcessError::Classified(ScanFailure {
+        stage: STAGE_METADATA,
+        kind: ApiErrorKind::Blocked {
+            blocker: Blocker::HtmlRenderer,
+        },
+        skip_after: SKIP_AFTER_CONFIRMED,
+        message: "HTML indexing requires Chrome, Chromium, Brave, Edge, or another configured compatible browser"
+            .to_string(),
+    }))
 }
 
 /// Builds a percent-encoded file:// URL from a canonicalized path, so names
@@ -4599,10 +4686,9 @@ impl std::fmt::Display for HtmlRenderError {
 /// intentionally replaces the Python weasyprint HTML->PDF pipeline with a
 /// browser viewport capture.
 ///
-/// Never fails a file: both callers (extraction's ledger and the scan's
-/// visuals cache) turn the reason into a marker and carry on. The reason is
-/// what they need — "install a browser" and "this page cannot be rendered"
-/// are cleared by different events.
+/// The reason is classified so dependency absence and page/render failures can
+/// be retried for different reasons. New HTML items require this first render
+/// to succeed; already-indexed items retain the ordinary visuals-marker path.
 pub(crate) fn render_html_screenshot_classified(
     path: &Path,
 ) -> Result<DynamicImage, HtmlRenderError> {
@@ -4630,12 +4716,7 @@ pub(crate) fn render_html_screenshot_classified(
             "failed to create the temp screenshot dir: {err}"
         )));
     }
-    let screenshot = temp_dir.join("shot.png");
-    // A leftover file here (crashed previous run, reused directory) would
-    // decode as this file's screenshot before the browser writes anything.
-    let _ = fs::remove_file(&screenshot);
-
-    let result = run_html_screenshot(browser, &url, &profile_dir, &screenshot, path);
+    let result = run_html_screenshot(&browser, &url, &profile_dir, path);
     if let Err(err) = fs::remove_dir_all(&temp_dir) {
         tracing::debug!(error = %err, path = %temp_dir.display(), "failed to remove temp screenshot dir");
     }
@@ -4646,7 +4727,6 @@ fn run_html_screenshot(
     browser: &Path,
     url: &str,
     profile_dir: &Path,
-    screenshot: &Path,
     path: &Path,
 ) -> Result<DynamicImage, HtmlRenderError> {
     // Scanned HTML lives in user-approved folders, but a saved page can still
@@ -4654,30 +4734,41 @@ fn run_html_screenshot(
     // (including localhost, via the <-loopback> bypass override) is routed
     // into a dead proxy — no beaconing, no SSRF. file:// subresources are
     // unaffected, matching what the Python weasyprint pipeline could load.
-    // JavaScript stays enabled: --blink-settings=scriptEnabled=false makes
-    // Edge's new headless mode never produce a screenshot (verified against
-    // Edge 13x), and with the network dead a runaway script can only burn CPU
-    // until the deadline, where the job object kills the process tree.
+    // JavaScript stays enabled. With the network dead, a runaway script can
+    // only burn CPU until the deadline, where the process guard kills the
+    // browser tree.
     let mut command = Command::new(browser);
     command
-        .arg("--headless")
+        .arg("--headless=new")
         .arg("--disable-gpu")
         .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-background-networking")
+        .arg("--disable-component-update")
+        .arg("--disable-default-apps")
+        .arg("--disable-extensions")
+        .arg("--disable-sync")
+        .arg("--metrics-recording-only")
         .arg("--hide-scrollbars")
         .arg("--proxy-server=127.0.0.1:0")
         .arg("--proxy-bypass-list=<-loopback>")
-        .arg("--window-size=1280,2000")
         .arg("--default-background-color=FFFFFFFF")
-        .arg(format!("--user-data-dir={}", profile_dir.display()))
-        .arg(format!("--screenshot={}", screenshot.display()));
+        .arg("--remote-debugging-address=127.0.0.1")
+        .arg("--remote-debugging-port=0")
+        .arg(format!("--user-data-dir={}", profile_dir.display()));
     for extra in &crate::config::runtime().html_renderer_args {
         command.arg(extra);
     }
     command
-        .arg(url)
+        .arg("about:blank")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let mut child = match command.spawn() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
             tracing::error!(error = %err, browser = %browser.display(), "failed to launch headless browser");
@@ -4690,60 +4781,288 @@ fn run_html_screenshot(
             });
         }
     };
-    // Chromium is a process tree, and on Windows msedge.exe is a launcher
-    // whose real browser detaches from it entirely; killing the direct child
-    // leaves the tree running. A kill-on-close job object captures every
-    // descendant, so dropping the guard (any return path) reaps them all.
-    let _job = crate::process_tree::JobGuard::assign(&child);
+    let mut process = BrowserProcess::new(child);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let endpoint = wait_for_devtools_endpoint(&mut process.child, profile_dir, deadline)
+        .map_err(|detail| html_render_protocol_error(path, detail))?;
+    capture_html_over_devtools(&endpoint, url, deadline)
+        .map_err(|detail| html_render_protocol_error(path, detail))
+}
 
-    // Poll instead of wait() so a wedged renderer cannot stall a scan worker
-    // forever; these run inside spawn_blocking, so sleeping here is fine.
-    let deadline = Instant::now() + std::time::Duration::from_secs(30);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    tracing::error!(path = %path.display(), "headless browser timed out rendering HTML");
-                    return Err(HtmlRenderError::Render(
-                        "the headless browser timed out rendering the page".to_string(),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(err) => {
-                tracing::error!(error = %err, path = %path.display(), "failed to wait for headless browser");
-                return Err(HtmlRenderError::Render(format!(
-                    "failed to wait for the headless browser: {err}"
-                )));
-            }
-        }
-    };
-    if !status.success() {
-        tracing::error!(status = %status, path = %path.display(), "headless browser exited with an error");
-        return Err(HtmlRenderError::Render(format!(
-            "the headless browser exited with {status}"
-        )));
+struct BrowserProcess {
+    child: Child,
+    _job: crate::process_tree::JobGuard,
+}
+
+impl BrowserProcess {
+    fn new(child: Child) -> Self {
+        let job = crate::process_tree::JobGuard::assign(&child);
+        Self { child, _job: job }
     }
-    // On Windows the spawned executable can be a launcher that exits at once
-    // while a detached browser process writes the screenshot, so poll until
-    // the file decodes (a partially written PNG fails to decode) or time is
-    // up.
-    let mut last_err = None;
+}
+
+impl Drop for BrowserProcess {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+struct DevtoolsEndpoint {
+    port: u16,
+    browser_path: String,
+}
+
+fn wait_for_devtools_endpoint(
+    child: &mut Child,
+    profile_dir: &Path,
+    deadline: Instant,
+) -> Result<DevtoolsEndpoint, String> {
+    let active_port = profile_dir.join("DevToolsActivePort");
+    let mut exited = None;
     while Instant::now() < deadline {
-        match open_image(screenshot) {
-            Ok(image) => return Ok(image),
-            Err(err) => last_err = Some(err),
+        if let Ok(contents) = fs::read_to_string(&active_port) {
+            let mut lines = contents.lines();
+            let port = lines
+                .next()
+                .ok_or_else(|| "DevToolsActivePort contains no port".to_string())?
+                .parse::<u16>()
+                .map_err(|err| format!("invalid DevTools port: {err}"))?;
+            let browser_path = lines
+                .next()
+                .filter(|line| line.starts_with("/devtools/browser/"))
+                .ok_or_else(|| "DevToolsActivePort contains no browser endpoint".to_string())?
+                .to_string();
+            return Ok(DevtoolsEndpoint { port, browser_path });
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        if exited.is_none() {
+            match child.try_wait() {
+                // Edge on Windows can be a launcher whose browser child owns
+                // DevTools, so keep polling the profile after the direct
+                // process exits.
+                Ok(Some(status)) => exited = Some(status),
+                Ok(None) => {}
+                Err(err) => return Err(format!("failed to inspect the headless browser: {err}")),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    tracing::error!(error = ?last_err, path = %path.display(), "failed to read HTML screenshot");
-    Err(HtmlRenderError::Render(match last_err {
-        Some(err) => format!("the headless browser produced no readable screenshot: {err}"),
-        None => "the headless browser produced no screenshot".to_string(),
-    }))
+    Err(match exited {
+        Some(status) => {
+            format!("the headless browser exited with {status} before DevTools started")
+        }
+        None => "the headless browser timed out starting DevTools".to_string(),
+    })
+}
+
+fn capture_html_over_devtools(
+    endpoint: &DevtoolsEndpoint,
+    url: &str,
+    deadline: Instant,
+) -> Result<DynamicImage, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let address = SocketAddr::from(([127, 0, 0, 1], endpoint.port));
+    let stream = TcpStream::connect_timeout(&address, remaining.min(Duration::from_secs(5)))
+        .map_err(|err| format!("failed to connect to browser DevTools: {err}"))?;
+    stream
+        .set_read_timeout(Some(remaining))
+        .map_err(|err| format!("failed to set the DevTools read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(remaining))
+        .map_err(|err| format!("failed to set the DevTools write timeout: {err}"))?;
+    let websocket_url = format!("ws://127.0.0.1:{}{}", endpoint.port, endpoint.browser_path);
+    let (mut socket, _) = tungstenite::client(websocket_url.as_str(), stream)
+        .map_err(|err| format!("failed to open browser DevTools: {err}"))?;
+    let mut next_id = 1_u64;
+
+    let created = devtools_command(
+        &mut socket,
+        &mut next_id,
+        "Target.createTarget",
+        serde_json::json!({ "url": "about:blank" }),
+        None,
+        deadline,
+    )?;
+    let target_id = created["targetId"]
+        .as_str()
+        .ok_or_else(|| "DevTools did not return a target id".to_string())?;
+    let attached = devtools_command(
+        &mut socket,
+        &mut next_id,
+        "Target.attachToTarget",
+        serde_json::json!({ "targetId": target_id, "flatten": true }),
+        None,
+        deadline,
+    )?;
+    let session_id = attached["sessionId"]
+        .as_str()
+        .ok_or_else(|| "DevTools did not return a session id".to_string())?
+        .to_string();
+    devtools_command(
+        &mut socket,
+        &mut next_id,
+        "Page.enable",
+        serde_json::json!({}),
+        Some(&session_id),
+        deadline,
+    )?;
+    devtools_command(
+        &mut socket,
+        &mut next_id,
+        "Page.setLifecycleEventsEnabled",
+        serde_json::json!({ "enabled": true }),
+        Some(&session_id),
+        deadline,
+    )?;
+    devtools_command(
+        &mut socket,
+        &mut next_id,
+        "Emulation.setDeviceMetricsOverride",
+        serde_json::json!({
+            "width": 1280,
+            "height": 2000,
+            "deviceScaleFactor": 1,
+            "mobile": false
+        }),
+        Some(&session_id),
+        deadline,
+    )?;
+    let navigated = devtools_command(
+        &mut socket,
+        &mut next_id,
+        "Page.navigate",
+        serde_json::json!({ "url": url }),
+        Some(&session_id),
+        deadline,
+    )?;
+    if let Some(error_text) = navigated["errorText"].as_str() {
+        return Err(format!(
+            "the browser could not load the HTML file: {error_text}"
+        ));
+    }
+    let loader_id = navigated["loaderId"]
+        .as_str()
+        .ok_or_else(|| "DevTools navigation returned no loader id".to_string())?;
+    wait_for_devtools_load(&mut socket, &session_id, loader_id, deadline)?;
+    let screenshot = devtools_command(
+        &mut socket,
+        &mut next_id,
+        "Page.captureScreenshot",
+        serde_json::json!({
+            "format": "png",
+            "fromSurface": true,
+            "captureBeyondViewport": false
+        }),
+        Some(&session_id),
+        deadline,
+    )?;
+    let encoded = screenshot["data"]
+        .as_str()
+        .ok_or_else(|| "DevTools returned no screenshot data".to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|err| format!("DevTools returned invalid screenshot data: {err}"))?;
+    image::load_from_memory(&bytes)
+        .map_err(|err| format!("DevTools returned an invalid screenshot: {err}"))
+}
+
+fn devtools_command(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    next_id: &mut u64,
+    method: &str,
+    params: serde_json::Value,
+    session_id: Option<&str>,
+    deadline: Instant,
+) -> Result<serde_json::Value, String> {
+    let id = *next_id;
+    *next_id += 1;
+    let mut request = serde_json::json!({
+        "id": id,
+        "method": method,
+        "params": params
+    });
+    if let Some(session_id) = session_id {
+        request["sessionId"] = serde_json::Value::String(session_id.to_string());
+    }
+    socket
+        .send(tungstenite::Message::text(request.to_string()))
+        .map_err(|err| format!("failed to send DevTools command {method}: {err}"))?;
+    loop {
+        let message = read_devtools_message(socket, deadline)
+            .map_err(|err| format!("failed reading DevTools response to {method}: {err}"))?;
+        let Ok(text) = message.to_text() else {
+            continue;
+        };
+        let response: serde_json::Value = serde_json::from_str(text)
+            .map_err(|err| format!("DevTools returned invalid JSON: {err}"))?;
+        if response["id"].as_u64() != Some(id) {
+            continue;
+        }
+        if let Some(error) = response.get("error") {
+            return Err(format!("DevTools {method} failed: {error}"));
+        }
+        return Ok(response.get("result").cloned().unwrap_or_default());
+    }
+}
+
+fn wait_for_devtools_load(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    session_id: &str,
+    loader_id: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    loop {
+        let message = read_devtools_message(socket, deadline)
+            .map_err(|err| format!("failed waiting for the HTML page to load: {err}"))?;
+        let Ok(text) = message.to_text() else {
+            continue;
+        };
+        let event: serde_json::Value = serde_json::from_str(text)
+            .map_err(|err| format!("DevTools returned invalid JSON: {err}"))?;
+        if event["sessionId"].as_str() == Some(session_id)
+            && event["method"].as_str() == Some("Page.lifecycleEvent")
+            && event["params"]["name"].as_str() == Some("load")
+            && event["params"]["loaderId"].as_str() == Some(loader_id)
+        {
+            return Ok(());
+        }
+    }
+}
+
+fn read_devtools_message(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    deadline: Instant,
+) -> Result<tungstenite::Message, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("the headless browser timed out rendering the page".to_string());
+    }
+    socket
+        .get_mut()
+        .set_read_timeout(Some(remaining))
+        .map_err(|err| format!("failed to update the DevTools timeout: {err}"))?;
+    socket.read().map_err(|err| match err {
+        tungstenite::Error::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            "the headless browser timed out rendering the page".to_string()
+        }
+        other => other.to_string(),
+    })
+}
+
+fn html_render_protocol_error(path: &Path, detail: String) -> HtmlRenderError {
+    tracing::error!(path = %path.display(), error = %detail, "headless browser failed rendering HTML");
+    HtmlRenderError::Render(detail)
 }
 
 static LABEL_FONT: OnceLock<Option<FontVec>> = OnceLock::new();
@@ -5298,9 +5617,8 @@ fn iso_format() -> &'static [FormatItem<'static>] {
 }
 
 /// Returns a temp directory path that is unique across processes and process
-/// restarts. A bare counter is not enough: after a crash, leftover files from
-/// a previous run's `frames-0` would be picked up as the *wrong file's*
-/// output (a stale screenshot decodes fine and gets stored keyed by sha256).
+/// restarts. A bare counter is not enough: after a crash, a previous run's
+/// `frames-0` could still contain media output or a locked browser profile.
 fn temp_dir_path() -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     static STARTUP_NONCE: OnceLock<u64> = OnceLock::new();
@@ -5633,6 +5951,34 @@ mod tests {
     fn next_db_name() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         format!("testdb_{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[test]
+    fn html_indexing_requires_a_renderer_but_other_types_do_not() {
+        assert!(require_html_renderer_for_indexing_with("image/png", false).is_ok());
+        assert!(require_html_renderer_for_indexing_with("text/plain", false).is_ok());
+        assert!(require_html_renderer_for_indexing_with("text/html", true).is_ok());
+
+        let error = require_html_renderer_for_indexing_with("text/html", false).unwrap_err();
+        let failure = error.classified().expect("missing renderer is persistent");
+        assert_eq!(failure.stage, STAGE_METADATA);
+        assert_eq!(failure.kind.blocker(), Some(Blocker::HtmlRenderer));
+        assert_eq!(failure.skip_after, SKIP_AFTER_CONFIRMED);
+        assert!(failure.message.contains("HTML indexing requires"));
+    }
+
+    #[test]
+    fn html_render_failures_are_indexing_failures() {
+        let error = html_visuals_error_blocks_indexing(VisualsError::thumbnail(
+            html_visuals_failure(HtmlRenderError::Render("browser exited".to_string())),
+        ));
+        let failure = error
+            .classified()
+            .expect("HTML render failure must block insertion");
+        assert_eq!(failure.stage, STAGE_METADATA);
+        assert_eq!(failure.kind, ApiErrorKind::Input);
+        assert_eq!(failure.skip_after, SKIP_AFTER_AMBIGUOUS);
+        assert_eq!(failure.message, "browser exited");
     }
 
     // The VACUUM gate decides from a measurement (`PRAGMA freelist_count` vs
@@ -9918,6 +10264,35 @@ LIMIT 1
         assert_eq!(page.dimensions(), (400, 200));
     }
 
+    #[tokio::test]
+    async fn scan_indexes_html_after_a_real_screenshot() {
+        if html_renderer().is_none() {
+            eprintln!("no headless browser available, skipping");
+            return;
+        }
+        let test_env = test_data_dir();
+        let mut env = visuals_env(test_env.path(), &["media-html-render"]).await;
+        env.config.scan_html = true;
+        fs::write(
+            env.media_dirs[0].join("sample.html"),
+            "<html><body style=\"background:#ff0000\"><h1>hello</h1></body></html>",
+        )
+        .unwrap();
+
+        env.scan().await;
+        let mut conn = env.read().await;
+        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE type = 'text/html'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(items, 1, "the rendered HTML file must be indexed");
+        assert_eq!(
+            thumbnail_count(&mut conn).await,
+            1,
+            "successful HTML indexing must store its screenshot thumbnail"
+        );
+    }
+
     // HTML rendering depends on a locally installed Chromium-family browser;
     // the scan pipeline (and this test) must degrade gracefully without one.
     #[test]
@@ -9937,5 +10312,10 @@ LIMIT 1
         let shot = render_html_screenshot_classified(&path).expect("screenshot should render");
         // --window-size fixes the viewport width; the height can vary.
         assert_eq!(shot.width(), 1280);
+        let pixel = shot.get_pixel(10, 10);
+        assert!(
+            pixel.0[0] > 200 && pixel.0[1] < 50 && pixel.0[2] < 50,
+            "the screenshot must contain the rendered red page, got {pixel:?}"
+        );
     }
 }

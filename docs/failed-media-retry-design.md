@@ -467,9 +467,17 @@ now binds, delete its `blocked` rows — those items become selectable in the
 same run. Lazy per-blocker probing is deliberate (same reasoning as the
 visual_attempts design): never load a library the run doesn't need.
 
-Caveat to document for users: the backends are cached in `OnceLock`s, so
-installing a dependency takes effect at the next gateway restart; the
-ledger clears on the first job after that.
+Backend cache lifetime is backend-specific. PDFium retains its process-lifetime
+binding, while HTML caches only a successful executable that still exists and
+never caches absence. Installing a compatible browser can therefore clear
+`blocked(html-renderer)` rows on the next scan without restarting the gateway.
+
+HTML is the deliberate exception to the ordinary metadata/visuals split. It is
+default-off and has no useful non-visual extraction path, so a new HTML item is
+not inserted unless its first screenshot succeeds. Missing browsers and
+persistent render failures are recorded in `scan_errors` at the metadata stage;
+already-indexed HTML items are not retroactively removed if the renderer
+disappears.
 
 ## Targeted retry directives (req 7)
 

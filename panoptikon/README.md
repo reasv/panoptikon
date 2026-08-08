@@ -844,6 +844,15 @@ default = "default"
 allow = "*"
 ```
 
+HTML scanning is opt-in and requires a Chromium-family browser. Panoptikon
+discovers Chrome, Chromium, Brave, and Edge from PATH and their conventional
+platform install locations, or uses `jobs.html_renderer` when set. A new HTML
+file is indexed only after its first screenshot renders successfully; missing
+or failing renderers create an auditable scan failure instead of a metadata-only
+item. Installing a browser makes dependency-blocked files eligible on the next
+scan without restarting Panoptikon. Existing HTML items are not removed if the
+browser later becomes unavailable.
+
 Registry/impl directory resolution for local inference is configured only by
 `[inference_local].config_dirs` / `impl_dirs` (defaults:
 `["python/inferio/config", "config/inference"]` and
