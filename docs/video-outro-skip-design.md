@@ -23,8 +23,11 @@ effectiveEnd   = userTrim.end                        if the user set an end boun
   (the storage resolution of the trim codec). The −150 ms guard covers the
   card's audio bang, which leads the first card frame by up to 60 ms
   (detection design §2.3/§10).
-- **Eligibility**: item has `content_end_ms` non-null AND `cutPoint > 0`.
-  A degenerate cut point (≤ 0) means the item is treated as having no outro.
+- **Eligibility**: item has `content_end_ms` non-null AND
+  `cutPoint > FREEZE_EPS` (0.02 s, `lib/videoTrim.ts`). A cut point inside
+  the freeze band means the item is treated as having no outro: `{start:
+  null, end: 0.01}` is not a short video, it is `useVideoTrim`'s freeze
+  branch showing frame 1 and pausing, with no user trim anywhere in sight.
 - The effective range feeds the existing `useVideoTrim` hook **unchanged** —
   `{start: null, end}` already loops back to 0 on crossing the end, and
   `isEmptyTrim(effective)` (not the user trim) must govern the native `loop`
@@ -36,12 +39,16 @@ effectiveEnd   = userTrim.end                        if the user set an end boun
   orthogonal to the end default). This is deliberate: placing a loop start
   must not silently resurrect the end card.
 - **Degenerate-range guard**: the outro default applies only when
-  `cutPoint > effectiveStart`. A user start placed at or past the cut point
-  suppresses the default for that video (plays out to the file end) — without
-  this, the composed `start ≥ end` range would hit `useVideoTrim`'s freeze
-  branch and pause the video, which is never what a start-only trim means.
-  User-set ends are exempt (they own the range; `trimWithBound` already
-  keeps user bounds consistent with each other).
+  `cutPoint − effectiveStart > FREEZE_EPS` — the exact complement of
+  `useVideoTrim`'s freeze test (`end − start ≤ FREEZE_EPS`), *not*
+  `cutPoint > effectiveStart`. A user start at, past, or within one freeze
+  band before the cut point suppresses the default for that video (plays out
+  to the file end); a `start < end` range that is merely a centisecond wide
+  would still hit the freeze branch and pause the video, which is never what
+  a start-only trim means. Same threshold as the eligibility rule above,
+  which is this predicate at `effectiveStart = 0`. User-set ends are exempt
+  (they own the range; `trimWithBound` already keeps user bounds consistent
+  with each other).
 
 Because the outro end is a default and never *becomes* a user trim, every
 state question dissolves: nothing is written to the URL (`vt`) or the
@@ -105,7 +112,11 @@ The cyan outro marker is **draggable**. Grabbing it seeds a user end bound at
 its current position (the cut point) and from that instant it is an ordinary
 user-trim edit: the marker turns blue mid-drag, the normal end-marker gesture
 continues, and commit populates `vt` (gallery) / the h-field (pinboard). The
-toggle button dims per §3. This gives "adjust the detected endpoint" without
+toggle button dims per §3. The seed lives in the **drag state**, and the
+gesture writes exactly **one** `onTrimChange` — at release, carrying the cut
+point when nothing moved and the final position otherwise. Seeding on
+pointerdown *and* committing on pointerup would push two history entries for
+one gesture, against the one-entry-per-trim-edit rule of the `vt` param. This gives "adjust the detected endpoint" without
 any conversion ambiguity — the default becomes user-owned only on a physical
 grab of that specific marker.
 
@@ -227,12 +238,14 @@ Known repo state caution: `ui` has an unrelated uncommitted change
 
 - Composition helper is pure — unit-test the table in §1 (user end past cut,
   start-only trim, ineligible item, toggle off).
-- Seed-on-grab: grabbing the cyan marker must produce exactly one user end
-  bound at the cut point before any movement is applied (a click-without-move
-  on the marker = end bound set at the cut point, board/URL populated).
-- Degenerate-range guard (§1): a user start at or past the cut point must
-  suppress the outro default (assert the composed range never has
-  `start ≥ end` from composition alone). The rail should then show no cyan
-  marker for that video while that start bound exists.
+- Seed-on-grab: a click-without-move on the cyan marker must produce exactly
+  one user end bound at the cut point (board/URL populated) through exactly
+  one `onTrimChange` call; a grab-and-drag must also produce exactly one, at
+  the released position.
+- Degenerate-range guard (§1): a user start at, past, or within `FREEZE_EPS`
+  before the cut point must suppress the outro default (assert that whenever
+  composition applies the default the composed range satisfies
+  `end − start > FREEZE_EPS`, not merely `start < end`). The rail should then
+  show no cyan marker for that video while that start bound exists.
 - Server gating: config off ⇒ item endpoint and search select both serve
   null; cache warm/cold behavior identical.
