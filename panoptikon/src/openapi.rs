@@ -174,6 +174,7 @@ impl Modify for JsonValueSchema {
             crate::api::pinboards::RenamePinboardRequest,
             crate::api::pinboards::SavePinboardResponse,
             crate::api::pinboards::PinboardSummaryResponse,
+            crate::api::pinboards::PinboardDatabaseResponse,
             crate::api::pinboards::PinboardVersionResponse,
             crate::api::pinboards::PinboardListResponse,
             crate::api::pinboards::PinboardDetailResponse,

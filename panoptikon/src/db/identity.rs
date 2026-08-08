@@ -42,7 +42,6 @@ pub(crate) fn is_identity_uuid(value: &str) -> bool {
 /// table existed, whose row somehow went missing, or whose row holds a value
 /// that cannot be an identity — a matching key that matches nothing is not
 /// worth carrying.
-#[allow(dead_code)] // Consumed by the pinboard association match rule (step 2).
 pub(crate) async fn current_index_db_uuid(conn: &mut SqliteConnection) -> Option<String> {
     match sqlx::query_scalar::<_, String>(READ_INDEX_UUID_SQL)
         .fetch_optional(&mut *conn)
@@ -71,7 +70,6 @@ pub(crate) async fn current_index_db_uuid(conn: &mut SqliteConnection) -> Option
 /// name fallback — fail closed. Silently folding it into
 /// [`ClaimsNothing`](DbIdentityProbe::ClaimsNothing) would let a momentarily
 /// locked database hand its boards to a same-named one.
-#[allow(dead_code)] // Consumed by the local-UUID cache (step 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DbIdentityProbe {
     /// The database was read and holds this identity.
@@ -100,7 +98,6 @@ pub(crate) enum DbIdentityProbe {
 /// creates (and leaves behind) its `-shm` sidecar, and may leave a `-wal`.
 /// That is accepted and benign — the probe touches the filesystem, it just
 /// never migrates, writes rows, or creates a database.
-#[allow(dead_code)] // Consumed by the local-UUID cache (step 2).
 pub(crate) async fn probe_index_db_uuid(index_db_file: &Path) -> DbIdentityProbe {
     match std::fs::metadata(index_db_file) {
         Ok(_) => {}

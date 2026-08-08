@@ -51,7 +51,6 @@ macro_rules! warn_once_then_debug {
 /// *success* is cached — a read that failed for a transient reason (or a
 /// read-only server whose file appears later) is retried on the next call.
 /// `None` means no identity could be obtained this call.
-#[allow(dead_code)] // Consumed by the pinboard association match rule (step 2).
 pub(crate) fn instance_uuid() -> Option<&'static str> {
     static INSTANCE_UUID: OnceLock<String> = OnceLock::new();
     static INIT_LOCK: Mutex<()> = Mutex::new(());

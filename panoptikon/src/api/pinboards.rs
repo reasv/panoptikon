@@ -12,6 +12,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::api::db_params::DbQueryParams;
 use crate::api_error::ApiError;
+use crate::db::pinboard_dbs::{self, AssociationContext, BoardOverlap, PinboardAssociation};
 use crate::db::pinboards::{self, PinboardOrder};
 use crate::db::{DbConnection, ReadOnly, UserDataWrite, open_user_data_write};
 
@@ -63,6 +64,11 @@ pub(crate) struct PinboardListQuery {
     /// default) or `updated` (last saved first).
     #[serde(default)]
     order: PinboardOrder,
+    /// Return only the boards associated with the selected index database.
+    /// The verdict is server-computed (see `associated`); the client sends
+    /// its stored preference.
+    #[serde(default)]
+    associated_only: bool,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -160,6 +166,30 @@ pub(crate) struct PinboardSummaryResponse {
     screenful_h: Option<i64>,
     item_count: i64,
     version_count: i64,
+    /// How many of the board's items exist in the selected index database.
+    /// Below `item_count` this is rot ("38/40 here"), and is reported
+    /// whatever `associated_only` says — it is what tells rot apart from a
+    /// board that belongs somewhere else.
+    present_count: i64,
+    /// Whether the board belongs to the selected index database, by the full
+    /// rule: a stamp for this database (by identity, or by name for a
+    /// database this instance rebuilt), or 100% of its items present here.
+    associated: bool,
+    /// The databases this board is stamped for, newest stamp first.
+    databases: Vec<PinboardDatabaseResponse>,
+}
+
+/// One stamped database of a board. Databases are named, never identified by
+/// UUID, on the wire: the UUIDs are server-side matching keys.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PinboardDatabaseResponse {
+    /// The index database's name as of the stamp. It may no longer resolve
+    /// to a local database, in which case it is a residual label only.
+    name: String,
+    /// Unix seconds of the last stamp for this database.
+    last_stamped: i64,
+    /// Whether this row is the database currently selected.
+    associated: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -191,6 +221,13 @@ pub(crate) struct PinboardDetailResponse {
     time_added: String,
     time_updated: String,
     version_count: i64,
+    /// The head version's items that exist in the selected index database
+    /// (`head.item_count` is the total). Same field as on the list summary.
+    present_count: i64,
+    /// Whether the board belongs to the selected index database.
+    associated: bool,
+    /// The databases this board is stamped for, newest stamp first.
+    databases: Vec<PinboardDatabaseResponse>,
     head: Option<PinboardVersionResponse>,
 }
 
@@ -365,7 +402,10 @@ fn validate_preview_dimension(value: Option<i64>) -> ApiResult<Option<i64>> {
     }
 }
 
-fn map_summary(summary: pinboards::PinboardSummary) -> PinboardSummaryResponse {
+fn map_summary(
+    summary: pinboards::PinboardSummary,
+    association: PinboardAssociation,
+) -> PinboardSummaryResponse {
     PinboardSummaryResponse {
         id: summary.id,
         name: summary.name,
@@ -378,6 +418,33 @@ fn map_summary(summary: pinboards::PinboardSummary) -> PinboardSummaryResponse {
         screenful_h: summary.screenful_h,
         item_count: summary.item_count,
         version_count: summary.version_count,
+        present_count: summary.present_count,
+        associated: association.associated,
+        databases: map_databases(association.databases),
+    }
+}
+
+/// The stamp rows of one board, in wire form.
+pub(crate) fn map_databases(
+    databases: Vec<pinboard_dbs::PinboardDatabase>,
+) -> Vec<PinboardDatabaseResponse> {
+    databases
+        .into_iter()
+        .map(|database| PinboardDatabaseResponse {
+            name: database.name,
+            last_stamped: database.last_stamped,
+            associated: database.associated,
+        })
+        .collect()
+}
+
+/// The overlap counts clause (c) of the association rule reads, as the
+/// listing queries already computed them.
+fn overlap_of(summary: &pinboards::PinboardSummary) -> BoardOverlap {
+    BoardOverlap {
+        pinboard_id: summary.id,
+        present_count: summary.present_count,
+        item_count: summary.item_count,
     }
 }
 
@@ -400,7 +467,7 @@ fn map_version(version: pinboards::PinboardVersionRecord) -> PinboardVersionResp
     path = "/api/pinboards",
     tag = "pinboards",
     summary = "List saved pinboards",
-    description = "Lists the user's saved pinboards with head-version metadata (preview dimensions, item and version counts) but without layouts or preview blobs.\nOrdered by `order`: `activity` (default) ranks by a recency strip followed by a decaying visit score — opening a board counts as activity, not just saving it — while `updated` is plain last-saved-first. The order applies identically under the `q` name search (FTS prefix match).",
+    description = "Lists the user's saved pinboards with head-version metadata (preview dimensions, item and version counts) but without layouts or preview blobs.\nOrdered by `order`: `activity` (default) ranks by a recency strip followed by a decaying visit score — opening a board counts as activity, not just saving it — while `updated` is plain last-saved-first. The order applies identically under the `q` name search (FTS prefix match).\nEach board carries its association with the selected index database: `associated` (stamped for this database, or fully present in it), the stamped `databases`, and `present_count` — which is reported whether or not `associated_only` filters the list.",
     params(DbQueryParams, PinboardListQuery),
     responses(
         (status = 200, description = "Saved pinboards", body = PinboardListResponse)
@@ -410,17 +477,40 @@ pub async fn list_pinboards(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<PinboardListQuery>,
 ) -> ApiResult<Json<PinboardListResponse>> {
-    let summaries = pinboards::list_pinboards(
-        &mut db.conn,
-        &query.user,
-        query.q.as_deref(),
-        query.order,
-        unix_now(),
-    )
-    .await?;
-    Ok(Json(PinboardListResponse {
-        pinboards: summaries.into_iter().map(map_summary).collect(),
-    }))
+    let ctx = AssociationContext::load(&mut db.conn, &db.index_db).await;
+    let pinboards = list_pinboard_summaries(&mut db.conn, &ctx, &query, unix_now()).await?;
+    Ok(Json(PinboardListResponse { pinboards }))
+}
+
+/// The list endpoint's body: the summaries, their association verdicts, and
+/// the `associated_only` filter — applied *after* the verdicts are computed,
+/// so it only ever hides rows.
+///
+/// Split out of the handler so tests can drive it with a synthetic
+/// association context; building the real one reads the process-global data
+/// folder.
+async fn list_pinboard_summaries(
+    conn: &mut sqlx::SqliteConnection,
+    ctx: &AssociationContext,
+    query: &PinboardListQuery,
+    now: i64,
+) -> ApiResult<Vec<PinboardSummaryResponse>> {
+    let summaries =
+        pinboards::list_pinboards(conn, &query.user, query.q.as_deref(), query.order, now).await?;
+    let overlaps: Vec<BoardOverlap> = summaries.iter().map(overlap_of).collect();
+    let mut associations = pinboard_dbs::load_associations(conn, ctx, &overlaps).await?;
+
+    let mut pinboards: Vec<PinboardSummaryResponse> = summaries
+        .into_iter()
+        .map(|summary| {
+            let association = associations.remove(&summary.id).unwrap_or_default();
+            map_summary(summary, association)
+        })
+        .collect();
+    if query.associated_only {
+        pinboards.retain(|board| board.associated);
+    }
+    Ok(pinboards)
 }
 
 #[utoipa::path(
@@ -513,15 +603,44 @@ pub async fn get_pinboard(
         return Err(ApiError::not_found("Pinboard not found"));
     };
     spawn_activity_write(&db, pinboard_id, &query.user, &summary);
-    Ok(Json(PinboardDetailResponse {
+    let ctx = AssociationContext::load(&mut db.conn, &db.index_db).await;
+    let association = board_association(&mut db.conn, &ctx, &summary).await?;
+    Ok(Json(map_detail(summary, head, association)))
+}
+
+/// The association verdict for a single board. Same computation as the list,
+/// asked for one row.
+async fn board_association(
+    conn: &mut sqlx::SqliteConnection,
+    ctx: &AssociationContext,
+    summary: &pinboards::PinboardSummary,
+) -> ApiResult<PinboardAssociation> {
+    let pinboard_id = summary.id;
+    Ok(
+        pinboard_dbs::load_associations(conn, ctx, &[overlap_of(summary)])
+            .await?
+            .remove(&pinboard_id)
+            .unwrap_or_default(),
+    )
+}
+
+fn map_detail(
+    summary: pinboards::PinboardSummary,
+    head: Option<pinboards::PinboardVersionRecord>,
+    association: PinboardAssociation,
+) -> PinboardDetailResponse {
+    PinboardDetailResponse {
         id: summary.id,
         name: summary.name,
         flags: parse_stored_flags(summary.flags),
         time_added: summary.time_added,
         time_updated: summary.time_updated,
         version_count: summary.version_count,
+        present_count: summary.present_count,
+        associated: association.associated,
+        databases: map_databases(association.databases),
         head: head.map(map_version),
-    }))
+    }
 }
 
 /// Counts an open of `pinboard_id`, unless the last counted event is still
@@ -1162,6 +1281,147 @@ mod tests {
         assert_eq!(board.version_count, 1);
     }
 
+    /// Indexes an item in the current database — what `present_count` counts.
+    async fn index_item(conn: &mut sqlx::SqliteConnection, sha256: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO main.items (sha256, md5, type, time_added)
+            VALUES (?, ?, 'image/png', '2026-01-01T00:00:00')
+            "#,
+        )
+        .bind(sha256)
+        .bind(sha256)
+        .execute(conn)
+        .await
+        .unwrap();
+    }
+
+    fn list_query(associated_only: bool) -> PinboardListQuery {
+        PinboardListQuery {
+            user: DEFAULT_USER.to_string(),
+            q: None,
+            order: PinboardOrder::Updated,
+            associated_only,
+        }
+    }
+
+    /// The database being viewed: identity `uuid_here`, named `default`, and
+    /// the only one that exists locally.
+    fn current_db() -> AssociationContext {
+        AssociationContext::for_tests(
+            Some("uuid_here"),
+            Some("inst"),
+            "default",
+            crate::db::local_dbs::LocalDbIdentities::for_tests(&[("default", "uuid_here")], false),
+        )
+    }
+
+    fn ids(boards: &[PinboardSummaryResponse]) -> Vec<i64> {
+        let mut ids: Vec<i64> = boards.iter().map(|board| board.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    // Ensures the list reports the association of every board and that
+    // `associated_only` filters AFTER the verdicts are computed: a board
+    // present here in full is admitted by overlap alone, a rotted one is
+    // hidden until something stamps it, and present_count is reported either
+    // way — it is what tells rot apart from a board from another database.
+    #[tokio::test]
+    async fn list_reports_and_filters_associations() {
+        let mut dbs = setup_test_databases().await;
+        index_item(&mut dbs.index_conn, "a1").await;
+        let (present, _) =
+            create_board(&mut dbs.index_conn, Some("here"), &["v2", "a"], &["a1"]).await;
+        let (rotted, _) = create_board(
+            &mut dbs.index_conn,
+            Some("elsewhere"),
+            &["v2", "b"],
+            &["gone"],
+        )
+        .await;
+        let ctx = current_db();
+
+        let all = list_pinboard_summaries(&mut dbs.index_conn, &ctx, &list_query(false), T0)
+            .await
+            .unwrap();
+        assert_eq!(ids(&all), vec![present, rotted]);
+        let board = |boards: &[PinboardSummaryResponse], id: i64| {
+            boards
+                .iter()
+                .find(|board| board.id == id)
+                .map(|board| (board.present_count, board.item_count, board.associated))
+                .unwrap()
+        };
+        assert_eq!(board(&all, present), (1, 1, true));
+        assert_eq!(board(&all, rotted), (0, 1, false));
+        assert!(all.iter().all(|board| board.databases.is_empty()));
+
+        let filtered = list_pinboard_summaries(&mut dbs.index_conn, &ctx, &list_query(true), T0)
+            .await
+            .unwrap();
+        assert_eq!(ids(&filtered), vec![present]);
+        assert_eq!(filtered[0].present_count, 1);
+
+        // Clause (a): a stamp carrying this database's identity brings the
+        // rotted board back, whatever name the stamp was written under.
+        crate::db::pinboard_dbs::stamp_for_tests(
+            &mut dbs.index_conn,
+            rotted,
+            "uuid_here",
+            "named-back-then",
+            "inst",
+            T0,
+        )
+        .await;
+        let filtered = list_pinboard_summaries(&mut dbs.index_conn, &ctx, &list_query(true), T0)
+            .await
+            .unwrap();
+        assert_eq!(ids(&filtered), vec![present, rotted]);
+        let stamped = filtered.iter().find(|board| board.id == rotted).unwrap();
+        assert!(stamped.associated);
+        assert_eq!(stamped.databases.len(), 1);
+        assert_eq!(stamped.databases[0].name, "named-back-then");
+        assert_eq!(stamped.databases[0].last_stamped, T0);
+        assert!(stamped.databases[0].associated);
+    }
+
+    // Ensures the detail response carries the same fields as the list row.
+    #[tokio::test]
+    async fn detail_carries_the_association_fields() {
+        let mut dbs = setup_test_databases().await;
+        index_item(&mut dbs.index_conn, "a1").await;
+        let (pinboard_id, _) =
+            create_board(&mut dbs.index_conn, None, &["v2", "a"], &["a1", "gone"]).await;
+        crate::db::pinboard_dbs::stamp_for_tests(
+            &mut dbs.index_conn,
+            pinboard_id,
+            "uuid_here",
+            "default",
+            "inst",
+            T0,
+        )
+        .await;
+
+        let ctx = current_db();
+        let (summary, head) = pinboards::get_pinboard(&mut dbs.index_conn, pinboard_id, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        let association = board_association(&mut dbs.index_conn, &ctx, &summary)
+            .await
+            .unwrap();
+        let detail = map_detail(summary, head, association);
+
+        // Half the board is missing here, so only the stamp associates it.
+        assert_eq!(detail.present_count, 1);
+        assert_eq!(detail.head.as_ref().unwrap().item_count, 2);
+        assert!(detail.associated);
+        assert_eq!(detail.databases.len(), 1);
+        assert_eq!(detail.databases[0].name, "default");
+        assert!(detail.databases[0].associated);
+    }
+
     // Ensures FTS name search matches by prefix and ignores other boards.
     #[tokio::test]
     async fn list_pinboards_fts_name_search() {
@@ -1701,12 +1961,18 @@ mod tests {
         conn
     }
 
-    /// Two connections to one on-disk user_data database, with a board.
+    /// Two connections to one on-disk user_data database, with a board. The
+    /// index database is migrated too, not left as the empty file the
+    /// connection would create: the board reads count how many of a board's
+    /// items are present in it, so `main.items` has to exist.
     async fn contention_fixture(
         dir: &tempfile::TempDir,
     ) -> (sqlx::SqliteConnection, sqlx::SqliteConnection, i64) {
         let index_file = dir.path().join("index.db");
         let user_data_file = dir.path().join("user_data.db");
+        crate::db::migrations::migrate_index_db_file(&index_file)
+            .await
+            .unwrap();
         crate::db::migrations::migrate_user_data_db_file(&user_data_file)
             .await
             .unwrap();

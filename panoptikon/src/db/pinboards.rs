@@ -60,6 +60,11 @@ pub(crate) struct PinboardSummary {
     pub preview_h: Option<i64>,
     pub screenful_h: Option<i64>,
     pub item_count: i64,
+    /// How many of those items exist in the *current* index database. Equal
+    /// to `item_count` means the board is fully present here, which is
+    /// clause (c) of the association rule; anything in between is rot, and is
+    /// reported for display ("38/40 here") but never taken as membership.
+    pub present_count: i64,
     pub version_count: i64,
 }
 
@@ -490,6 +495,11 @@ pub(crate) async fn list_pinboards(
                 WHERE i.version_id = p.head_version_id
             ) AS item_count,
             (
+                SELECT COUNT(*) FROM user_data.pinboard_version_items i
+                WHERE i.version_id = p.head_version_id
+                  AND EXISTS (SELECT 1 FROM main.items x WHERE x.sha256 = i.sha256)
+            ) AS present_count,
+            (
                 SELECT COUNT(*) FROM user_data.pinboard_versions pv
                 WHERE pv.pinboard_id = p.id
             ) AS version_count
@@ -553,6 +563,9 @@ pub(crate) async fn list_pinboards(
             item_count: row
                 .try_get("item_count")
                 .map_err(internal("Failed to list pinboards"))?,
+            present_count: row
+                .try_get("present_count")
+                .map_err(internal("Failed to list pinboards"))?,
             version_count: row
                 .try_get("version_count")
                 .map_err(internal("Failed to list pinboards"))?,
@@ -585,6 +598,11 @@ pub(crate) async fn get_pinboard(
                     SELECT COUNT(*) FROM user_data.pinboard_version_items i
                     WHERE i.version_id = p.head_version_id
                 ) AS item_count,
+                (
+                    SELECT COUNT(*) FROM user_data.pinboard_version_items i
+                    WHERE i.version_id = p.head_version_id
+                      AND EXISTS (SELECT 1 FROM main.items x WHERE x.sha256 = i.sha256)
+                ) AS present_count,
                 (
                     SELECT COUNT(*) FROM user_data.pinboard_versions pv
                     WHERE pv.pinboard_id = p.id
@@ -651,6 +669,9 @@ pub(crate) async fn get_pinboard(
             .try_get("screenful_h")
             .map_err(internal("Failed to get pinboard"))?,
         item_count,
+        present_count: row
+            .try_get("present_count")
+            .map_err(internal("Failed to get pinboard"))?,
         version_count: row
             .try_get("version_count")
             .map_err(internal("Failed to get pinboard"))?,
@@ -1087,6 +1108,7 @@ mod tests {
             preview_h: None,
             screenful_h: None,
             item_count: 0,
+            present_count: 0,
             version_count: 0,
         }
     }
@@ -1278,6 +1300,121 @@ mod tests {
         expected.push(habitual);
         expected.extend(ids[6..].iter().rev());
         assert_eq!(ordered, expected);
+    }
+
+    /// Indexes an item in the *current* database, which is what
+    /// `present_count` counts.
+    async fn index_item(conn: &mut sqlx::SqliteConnection, sha256: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO main.items (sha256, md5, type, time_added)
+            VALUES (?, ?, 'image/png', '2026-01-01T00:00:00')
+            "#,
+        )
+        .bind(sha256)
+        .bind(sha256)
+        .execute(conn)
+        .await
+        .unwrap();
+    }
+
+    // Ensures present_count counts the head version's items that exist in
+    // the current index database — the display signal, and clause (c) of the
+    // association rule when it equals item_count. A pin whose item is not
+    // indexed here counts never; an item indexed here but not pinned counts
+    // nowhere.
+    #[tokio::test]
+    async fn present_count_counts_head_items_indexed_here() {
+        let mut dbs = setup_test_databases().await;
+        for sha256 in ["a1", "b2"] {
+            index_item(&mut dbs.index_conn, sha256).await;
+        }
+
+        let all_present = create_pinboard(&mut dbs.index_conn, "user", None, None, T0)
+            .await
+            .unwrap();
+        append_version(
+            &mut dbs.index_conn,
+            all_present,
+            &["v2".to_string()],
+            &["a1".to_string(), "b2".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let partial = create_pinboard(&mut dbs.index_conn, "user", None, None, T0)
+            .await
+            .unwrap();
+        append_version(
+            &mut dbs.index_conn,
+            partial,
+            &["v2".to_string()],
+            &["a1".to_string(), "gone".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let foreign = create_pinboard(&mut dbs.index_conn, "user", None, None, T0)
+            .await
+            .unwrap();
+        append_version(
+            &mut dbs.index_conn,
+            foreign,
+            &["v2".to_string()],
+            &["x9".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let boards = list_pinboards(&mut dbs.index_conn, "user", None, PinboardOrder::Updated, T0)
+            .await
+            .unwrap();
+        let counts = |id: i64| {
+            let board = boards.iter().find(|board| board.id == id).unwrap();
+            (board.present_count, board.item_count)
+        };
+        assert_eq!(counts(all_present), (2, 2));
+        assert_eq!(counts(partial), (1, 2));
+        assert_eq!(counts(foreign), (0, 1));
+
+        // The detail query computes it the same way.
+        let (summary, _) = get_pinboard(&mut dbs.index_conn, partial, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((summary.present_count, summary.item_count), (1, 2));
+
+        // Membership is the head version only: an item dropped from the
+        // board stops being present, and stops being counted.
+        append_version(
+            &mut dbs.index_conn,
+            all_present,
+            &["v2".to_string()],
+            &["a1".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (summary, _) = get_pinboard(&mut dbs.index_conn, all_present, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((summary.present_count, summary.item_count), (1, 1));
     }
 
     // Ensures order=updated still returns the historical time_updated DESC
