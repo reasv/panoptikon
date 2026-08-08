@@ -197,6 +197,22 @@ pub(crate) struct SearchResult {
     subtitle_tracks: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     blurhash: Option<String>,
+    /// Outro Kind
+    ///
+    /// The raw stored outro verdict, detector version included (`tiktok_card/1`,
+    /// `none/1`); absent when the item was never examined or the column was
+    /// not selected. Kind-specific
+    /// queries must prefix-match, not compare the whole value — see
+    /// `docs/video-outro-detection-design.md` §6.2. "Has an outro" is
+    /// `content_end_ms` being present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outro_kind: Option<String>,
+    /// Content End (ms)
+    ///
+    /// Where the item's real content ends, when an outro was found. Absent
+    /// when no outro is recorded or the column was not selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_end_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1639,6 +1655,8 @@ fn map_search_result(
     result.video_tracks = read_optional(row, &columns, "video_tracks")?;
     result.subtitle_tracks = read_optional(row, &columns, "subtitle_tracks")?;
     result.blurhash = read_optional(row, &columns, "blurhash")?;
+    result.outro_kind = read_optional(row, &columns, "outro_kind")?;
+    result.content_end_ms = read_optional(row, &columns, "content_end_ms")?;
     result.data_id = read_optional(row, &columns, "data_id")?;
     result.language = read_optional(row, &columns, "language")?;
     result.language_confidence = read_optional(row, &columns, "language_confidence")?;
@@ -1735,6 +1753,8 @@ fn is_known_column(name: &str) -> bool {
             | "video_tracks"
             | "subtitle_tracks"
             | "blurhash"
+            | "outro_kind"
+            | "content_end_ms"
             | "data_id"
             | "language"
             | "language_confidence"
@@ -3072,5 +3092,183 @@ mod tests {
             search_cache::lookup_rows(&key, 0, Some(1)),
             CacheLookup::Miss
         ));
+    }
+
+    /// Both outro columns travel the whole select → SQL → row-reader path,
+    /// and the kind arrives with its detector-version suffix intact: the
+    /// stored value is the only served form (design §6.3). The negative row
+    /// proves `content_end_ms` — not the kind string — is what "has an outro"
+    /// reads, and the never-examined row proves absent stays absent.
+    #[tokio::test]
+    async fn outro_columns_are_selectable_and_served_raw() {
+        use crate::pql::model::Column as PqlColumn;
+
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, duration, outro_kind, content_end_ms, time_added)
+            VALUES
+                (1, 'sha_card', 'md5_1', 'video/mp4', 12.0, 'tiktok_card/1', 8000, '2024-01-01T00:00:00'),
+                (2, 'sha_none', 'md5_2', 'video/mp4', 12.0, 'none/1', NULL, '2024-01-01T00:00:00'),
+                (3, 'sha_new', 'md5_3', 'video/mp4', 12.0, NULL, NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\outro").await;
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_card', 1, 'C:\outro\a.mp4', 'a.mp4', '2024-01-03T00:00:00', 1, 1),
+                (11, 'sha_none', 2, 'C:\outro\b.mp4', 'b.mp4', '2024-01-02T00:00:00', 1, 1),
+                (12, 'sha_new', 3, 'C:\outro\c.mp4', 'c.mp4', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let query = PqlQuery {
+            select: vec![
+                PqlColumn::Sha256,
+                PqlColumn::OutroKind,
+                PqlColumn::ContentEndMs,
+            ],
+            page_size: 0,
+            count: false,
+            check_path: false,
+            ..PqlQuery::default()
+        };
+        let built = build_query_preprocessed(query, false).expect("build");
+        let extra_columns = built.extra_columns.clone();
+        let compiled = compile_select(built).expect("compile");
+        let rows = run_compiled_query(&mut dbs.index_conn, &compiled.sql, &compiled.params)
+            .await
+            .expect("run results query");
+        let results: Vec<SearchResult> = rows
+            .iter()
+            .map(|row| map_search_result(row, &extra_columns).expect("map result"))
+            .collect();
+
+        let by_sha = |sha: &str| {
+            results
+                .iter()
+                .find(|result| result.sha256.as_deref() == Some(sha))
+                .unwrap_or_else(|| panic!("{sha} in results"))
+        };
+
+        let card = by_sha("sha_card");
+        assert_eq!(
+            card.outro_kind.as_deref(),
+            Some("tiktok_card/1"),
+            "the version suffix is never stripped at the API boundary"
+        );
+        assert_eq!(card.content_end_ms, Some(8000));
+
+        let negative = by_sha("sha_none");
+        assert_eq!(negative.outro_kind.as_deref(), Some("none/1"));
+        assert_eq!(
+            negative.content_end_ms, None,
+            "examined and negative carries no boundary"
+        );
+
+        let unexamined = by_sha("sha_new");
+        assert_eq!(unexamined.outro_kind, None);
+        assert_eq!(unexamined.content_end_ms, None);
+    }
+
+    /// Compiles and runs `filter` as a whole PQL query, returning the matched
+    /// sha256s in result order.
+    async fn outro_query_shas(
+        conn: &mut sqlx::SqliteConnection,
+        filter: serde_json::Value,
+    ) -> Vec<String> {
+        let mut query: PqlQuery = serde_json::from_value(filter).expect("pql query");
+        query.select = vec![
+            crate::pql::model::Column::Sha256,
+            crate::pql::model::Column::ContentEndMs,
+        ];
+        query.page_size = 0;
+        query.count = false;
+        query.check_path = false;
+        let built = build_query_preprocessed(query, false).expect("build");
+        let extra_columns = built.extra_columns.clone();
+        let compiled = compile_select(built).expect("compile");
+        let rows = run_compiled_query(conn, &compiled.sql, &compiled.params)
+            .await
+            .expect("run results query");
+        rows.iter()
+            .map(|row| {
+                map_search_result(row, &extra_columns)
+                    .expect("map result")
+                    .sha256
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// A kind-specific query prefix-matches, and the boundary column filters
+    /// and orders numerically. Both run against real SQLite so the column
+    /// mapping, not just the enum, is exercised.
+    #[tokio::test]
+    async fn outro_columns_filter_and_order() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, outro_kind, content_end_ms, time_added)
+            VALUES
+                (1, 'sha_1', 'md5_1', 'video/mp4', 'tiktok_card/1', 9000, '2024-01-01T00:00:00'),
+                (2, 'sha_2', 'md5_2', 'video/mp4', 'tiktok_card/1', 3000, '2024-01-01T00:00:00'),
+                (3, 'sha_3', 'md5_3', 'video/mp4', 'none/1', NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\outro").await;
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_1', 1, 'C:\outro\1.mp4', '1.mp4', '2024-01-01T00:00:00', 1, 1),
+                (11, 'sha_2', 2, 'C:\outro\2.mp4', '2.mp4', '2024-01-01T00:00:00', 1, 1),
+                (12, 'sha_3', 3, 'C:\outro\3.mp4', '3.mp4', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        // Prefix, not equality: the stored value carries a version suffix.
+        let mut prefixed = outro_query_shas(
+            &mut dbs.index_conn,
+            serde_json::json!({
+                "query": { "match": { "startswith": { "outro_kind": "tiktok_card/" } } }
+            }),
+        )
+        .await;
+        prefixed.sort();
+        assert_eq!(prefixed, vec!["sha_1".to_string(), "sha_2".to_string()]);
+
+        // Numeric comparison on the boundary, ordered ascending by it.
+        let bounded = outro_query_shas(
+            &mut dbs.index_conn,
+            serde_json::json!({
+                "query": { "match": { "gte": { "content_end_ms": 1000 } } },
+                "order_by": [{ "order_by": "content_end_ms", "order": "asc", "priority": 0 }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            bounded,
+            vec!["sha_2".to_string(), "sha_1".to_string()],
+            "NULL content_end_ms is excluded and the rest sort numerically"
+        );
     }
 }

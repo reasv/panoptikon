@@ -172,6 +172,17 @@ pub(crate) struct ItemRecordResponse {
     subtitle_tracks: Option<i64>,
     #[schema(required)]
     blurhash: Option<String>,
+    /// The raw stored outro verdict, detector version included
+    /// (`tiktok_card/1`, `none/1`); `null` when the item was never examined.
+    /// Kind-specific checks must prefix-match (`tiktok_card/`) rather than
+    /// compare the whole value — see
+    /// `docs/video-outro-detection-design.md` §6.2. "Has an outro" is
+    /// `content_end_ms` being non-null.
+    #[schema(required)]
+    outro_kind: Option<String>,
+    /// Where the item's real content ends, when an outro was found.
+    #[schema(required)]
+    content_end_ms: Option<i64>,
     time_added: String,
 }
 
@@ -854,6 +865,8 @@ fn map_item_record(item: &ItemRecord) -> ItemRecordResponse {
         video_tracks: item.video_tracks,
         subtitle_tracks: item.subtitle_tracks,
         blurhash: item.blurhash.clone(),
+        outro_kind: item.outro_kind.clone(),
+        content_end_ms: item.content_end_ms,
         time_added: item.time_added.clone(),
     }
 }
@@ -902,6 +915,8 @@ mod tests {
             video_tracks: None,
             subtitle_tracks: None,
             blurhash: None,
+            outro_kind: None,
+            content_end_ms: None,
             time_added: "2024-01-01T00:00:00".to_string(),
         };
         let file = FileRecord {

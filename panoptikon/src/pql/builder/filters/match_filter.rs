@@ -56,6 +56,14 @@ pub(crate) struct MatchValues {
     pub subtitle_tracks: Option<OneOrMany<i64>>,
     #[serde(default)]
     pub blurhash: Option<OneOrMany<String>>,
+    /// The raw stored outro verdict, detector version included
+    /// (`tiktok_card/1`, `none/1`). Kind-specific queries must prefix-match
+    /// (`startswith: "tiktok_card/"`) rather than compare the whole value; see
+    /// `docs/video-outro-detection-design.md` §6.2.
+    #[serde(default)]
+    pub outro_kind: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub content_end_ms: Option<OneOrMany<i64>>,
     #[serde(default)]
     pub data_id: Option<OneOrMany<i64>>,
     #[serde(default)]
@@ -116,6 +124,11 @@ pub(crate) struct MatchValue {
     pub subtitle_tracks: Option<i64>,
     #[serde(default)]
     pub blurhash: Option<String>,
+    /// See [`MatchValues::outro_kind`].
+    #[serde(default)]
+    pub outro_kind: Option<String>,
+    #[serde(default)]
+    pub content_end_ms: Option<i64>,
     #[serde(default)]
     pub data_id: Option<i64>,
     #[serde(default)]
@@ -361,6 +374,74 @@ mod tests {
         run_full_pql_query(QueryElement::Match(filter), EntityType::File)
             .await
             .expect("match query");
+    }
+
+    /// `outro_kind` is a TEXT column on `items`, so it takes the string
+    /// operators — and `startswith` is the operator kind-specific queries must
+    /// use, because the stored value carries a detector-version suffix
+    /// (docs/video-outro-detection-design.md §6.2). It is *not* a "text
+    /// column" in the `is_text_column` sense (that means the text entity), so
+    /// it stays usable in a plain file query, which is what this builds.
+    #[test]
+    fn match_filter_prefix_matches_outro_kind() {
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "startswith": { "outro_kind": "tiktok_card/" } }
+        }))
+        .expect("startswith filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(
+            sql.contains(r#""items"."outro_kind" LIKE 'tiktok_card/%'"#),
+            "{sql}"
+        );
+
+        // Raw equality still works — it is just the wrong tool for kinds.
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "eq": { "outro_kind": "none/1" } }
+        }))
+        .expect("eq filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains(r#""items"."outro_kind" = 'none/1'"#), "{sql}");
+    }
+
+    /// `content_end_ms` is the integer column, and "has an outro" is asking
+    /// for it at all: a numeric comparison, not a kind string.
+    #[test]
+    fn match_filter_compares_content_end_ms_numerically() {
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "gte": { "content_end_ms": 5000 } }
+        }))
+        .expect("gte filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains(r#""items"."content_end_ms" >= 5000"#), "{sql}");
+
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "in_": { "content_end_ms": [1000, 2000] } }
+        }))
+        .expect("in_ filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(
+            sql.contains(r#""items"."content_end_ms" IN (1000, 2000)"#),
+            "{sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn outro_match_filter_runs_full_query() {
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "startswith": { "outro_kind": "tiktok_card/" } }
+        }))
+        .expect("match filter");
+        run_full_pql_query(QueryElement::Match(filter), EntityType::File)
+            .await
+            .expect("outro match query");
     }
 
     #[test]
@@ -1042,6 +1123,12 @@ fn collect_match_value_fields(values: &MatchValue) -> Vec<(Column, FieldValue)> 
     if let Some(value) = values.blurhash.clone() {
         fields.push((Column::Blurhash, FieldValue::String(value)));
     }
+    if let Some(value) = values.outro_kind.clone() {
+        fields.push((Column::OutroKind, FieldValue::String(value)));
+    }
+    if let Some(value) = values.content_end_ms {
+        fields.push((Column::ContentEndMs, FieldValue::Int(value)));
+    }
     if let Some(value) = values.data_id {
         fields.push((Column::DataId, FieldValue::Int(value)));
     }
@@ -1154,6 +1241,15 @@ fn collect_match_values_fields(values: &MatchValues) -> Vec<(Column, FieldValues
             Column::Blurhash,
             convert_one_or_many(value, |v| FieldValue::String(v.clone())),
         ));
+    }
+    if let Some(value) = values.outro_kind.as_ref() {
+        fields.push((
+            Column::OutroKind,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
+    }
+    if let Some(value) = values.content_end_ms.as_ref() {
+        fields.push((Column::ContentEndMs, convert_one_or_many(value, map_int)));
     }
     if let Some(value) = values.data_id.as_ref() {
         fields.push((Column::DataId, convert_one_or_many(value, map_int)));

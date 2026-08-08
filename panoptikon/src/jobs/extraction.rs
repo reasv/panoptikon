@@ -135,6 +135,12 @@ struct JobInputData {
     last_modified: String,
     item_type: String,
     duration: Option<f64>,
+    /// Where the item's real content ends, when the scan's outro detector
+    /// found a boundary (docs/video-outro-detection-design.md §7). `None` —
+    /// never examined, or examined and negative — clamps nothing. Selected
+    /// unconditionally; whether it is *used* is the job's `detect_outros`
+    /// gate, threaded separately.
+    content_end_ms: Option<i64>,
     // Loaded from the item row for parity with Python's job input record;
     // available to input handlers even though none read them yet.
     #[allow(dead_code)]
@@ -1581,6 +1587,7 @@ async fn map_job_input(
     let last_modified: String = row.try_get("last_modified").map_err(map_row_err)?;
     let item_type: String = row.try_get("type").map_err(map_row_err)?;
     let duration: Option<f64> = row.try_get("duration").unwrap_or(None);
+    let content_end_ms: Option<i64> = row.try_get("content_end_ms").unwrap_or(None);
     let audio_tracks: Option<i64> = row.try_get("audio_tracks").unwrap_or(None);
     let video_tracks: Option<i64> = row.try_get("video_tracks").unwrap_or(None);
     let subtitle_tracks: Option<i64> = row.try_get("subtitle_tracks").unwrap_or(None);
@@ -1598,6 +1605,7 @@ async fn map_job_input(
         last_modified,
         item_type,
         duration,
+        content_end_ms,
         audio_tracks,
         video_tracks,
         subtitle_tracks,
@@ -1697,6 +1705,7 @@ fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQ
                 Column::Width,
                 Column::Height,
                 Column::Duration,
+                Column::ContentEndMs,
                 Column::AudioTracks,
                 Column::VideoTracks,
                 Column::SubtitleTracks,
@@ -1714,6 +1723,7 @@ fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQ
                 Column::Width,
                 Column::Height,
                 Column::Duration,
+                Column::ContentEndMs,
                 Column::AudioTracks,
                 Column::VideoTracks,
                 Column::SubtitleTracks,
@@ -2500,6 +2510,7 @@ mod tests {
             last_modified: "2026-01-01T00:00:00".to_string(),
             item_type: "image/png".to_string(),
             duration: None,
+            content_end_ms: None,
             audio_tracks: None,
             video_tracks: None,
             subtitle_tracks: None,

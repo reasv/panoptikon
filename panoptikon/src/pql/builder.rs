@@ -1470,6 +1470,8 @@ fn column_name(col: Column) -> &'static str {
         Column::VideoTracks => "video_tracks",
         Column::SubtitleTracks => "subtitle_tracks",
         Column::Blurhash => "blurhash",
+        Column::OutroKind => "outro_kind",
+        Column::ContentEndMs => "content_end_ms",
         Column::DataId => "data_id",
         Column::Language => "language",
         Column::LanguageConfidence => "language_confidence",
@@ -1503,6 +1505,8 @@ fn order_by_name(field: OrderByField) -> &'static str {
         OrderByField::VideoTracks => "video_tracks",
         OrderByField::SubtitleTracks => "subtitle_tracks",
         OrderByField::Blurhash => "blurhash",
+        OrderByField::OutroKind => "outro_kind",
+        OrderByField::ContentEndMs => "content_end_ms",
         OrderByField::DataId => "data_id",
         OrderByField::Language => "language",
         OrderByField::LanguageConfidence => "language_confidence",
@@ -1537,6 +1541,8 @@ fn get_column_expr(column: Column) -> Expr {
         Column::VideoTracks => Expr::col((Items::Table, Items::VideoTracks)),
         Column::SubtitleTracks => Expr::col((Items::Table, Items::SubtitleTracks)),
         Column::Blurhash => Expr::col((Items::Table, Items::Blurhash)),
+        Column::OutroKind => Expr::col((Items::Table, Items::OutroKind)),
+        Column::ContentEndMs => Expr::col((Items::Table, Items::ContentEndMs)),
         Column::DataId => Expr::col((ItemData::Table, ItemData::Id)),
         Column::Language => Expr::col((ExtractedText::Table, ExtractedText::Language)),
         Column::LanguageConfidence => {
@@ -1585,6 +1591,8 @@ fn get_order_by_expr(field: OrderByField, seed: i64) -> Expr {
         OrderByField::VideoTracks => Expr::col((Items::Table, Items::VideoTracks)),
         OrderByField::SubtitleTracks => Expr::col((Items::Table, Items::SubtitleTracks)),
         OrderByField::Blurhash => Expr::col((Items::Table, Items::Blurhash)),
+        OrderByField::OutroKind => Expr::col((Items::Table, Items::OutroKind)),
+        OrderByField::ContentEndMs => Expr::col((Items::Table, Items::ContentEndMs)),
         OrderByField::DataId => Expr::col((ItemData::Table, ItemData::Id)),
         OrderByField::Language => Expr::col((ExtractedText::Table, ExtractedText::Language)),
         OrderByField::LanguageConfidence => {
@@ -1601,6 +1609,11 @@ fn get_order_by_expr(field: OrderByField, seed: i64) -> Expr {
     }
 }
 
+/// Whether a column belongs to the *text entity* (`item_data` /
+/// `extracted_text` / `setters`), and so is only available once those tables
+/// are joined. This is not a SQL type test: `confidence` and `text_length` are
+/// numeric and listed, while string-valued `items`/`files` columns such as
+/// `blurhash`, `path` or `outro_kind` are not.
 fn is_text_column(column: Column) -> bool {
     matches!(
         column,
@@ -2174,6 +2187,8 @@ enum Items {
     VideoTracks,
     SubtitleTracks,
     Blurhash,
+    OutroKind,
+    ContentEndMs,
 }
 
 #[derive(sea_query::Iden)]

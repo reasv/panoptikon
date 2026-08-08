@@ -32,6 +32,12 @@ pub(crate) struct ItemRecord {
     pub video_tracks: Option<i64>,
     pub subtitle_tracks: Option<i64>,
     pub blurhash: Option<String>,
+    /// The raw stored outro verdict, detector version included
+    /// (`tiktok_card/1`, `none/1`); `None` when never examined. Served raw:
+    /// the version suffix is never stripped (design §6.3).
+    pub outro_kind: Option<String>,
+    /// Where the item's real content ends, when an outro was found.
+    pub content_end_ms: Option<i64>,
     pub time_added: String,
 }
 
@@ -157,6 +163,8 @@ fn item_metadata_query(
         items.video_tracks AS video_tracks,
         items.subtitle_tracks AS subtitle_tracks,
         items.blurhash AS blurhash,
+        items.outro_kind AS outro_kind,
+        items.content_end_ms AS content_end_ms,
         items.time_added AS time_added,
         files.id AS file_id,
         files.path AS path,
@@ -286,6 +294,14 @@ pub(crate) async fn get_item_metadata_unchecked(
             tracing::error!(error = %err, "failed to read blurhash");
             ApiError::internal("Failed to get item")
         })?;
+        let outro_kind: Option<String> = row.try_get("outro_kind").map_err(|err| {
+            tracing::error!(error = %err, "failed to read outro kind");
+            ApiError::internal("Failed to get item")
+        })?;
+        let content_end_ms: Option<i64> = row.try_get("content_end_ms").map_err(|err| {
+            tracing::error!(error = %err, "failed to read content end");
+            ApiError::internal("Failed to get item")
+        })?;
         let time_added: String = row.try_get("time_added").map_err(|err| {
             tracing::error!(error = %err, "failed to read time_added");
             ApiError::internal("Failed to get item")
@@ -321,6 +337,8 @@ pub(crate) async fn get_item_metadata_unchecked(
                 video_tracks,
                 subtitle_tracks,
                 blurhash,
+                outro_kind,
+                content_end_ms,
                 time_added,
             });
         }

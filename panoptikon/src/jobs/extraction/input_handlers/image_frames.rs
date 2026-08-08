@@ -6,7 +6,6 @@ use image::{DynamicImage, GenericImageView};
 use serde_json::{Value, json};
 
 use crate::api_error::{ApiError, Blocker};
-use crate::db::files::get_item_content_end_ms;
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::open_index_db_read_no_user_data;
 use crate::db::storage::{StoredImage, get_frames_bytes};
@@ -143,15 +142,14 @@ pub(super) async fn load_base_frames(
         if duration > 0.0 && item.video_tracks.unwrap_or(0) > 0 {
             // Where the item's real content ends, when the scan's outro
             // detector found a boundary (docs/video-outro-detection-design.md
-            // §7). Read here rather than threaded through `JobInputData`
-            // because the work query's select list is PQL's, and this
-            // connection is open and indexed by sha256 already. `None` — never
-            // examined, examined and negative, or detection switched off —
-            // clamps nothing.
+            // §7). Selected by the work query alongside `duration`, so it is
+            // a chunk-boundary snapshot: a verdict written after this item's
+            // work chunk was fetched is not seen, and the frames cached below
+            // are then unclamped until a scan-side replacement rewrites them.
+            // `None` — never examined, examined and negative, or detection
+            // switched off — clamps nothing.
             let content_end_ms = if detect_outros {
-                get_item_content_end_ms(&mut conn, &item.sha256)
-                    .await
-                    .unwrap_or(None)
+                item.content_end_ms
             } else {
                 None
             };

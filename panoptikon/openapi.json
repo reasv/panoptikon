@@ -5374,6 +5374,8 @@
           "video_tracks",
           "subtitle_tracks",
           "blurhash",
+          "outro_kind",
+          "content_end_ms",
           "data_id",
           "language",
           "language_confidence",
@@ -6677,6 +6679,8 @@
           "video_tracks",
           "subtitle_tracks",
           "blurhash",
+          "outro_kind",
+          "content_end_ms",
           "time_added"
         ],
         "properties": {
@@ -6692,6 +6696,14 @@
               "string",
               "null"
             ]
+          },
+          "content_end_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Where the item's real content ends, when an outro was found."
           },
           "duration": {
             "type": [
@@ -6713,6 +6725,13 @@
           },
           "md5": {
             "type": "string"
+          },
+          "outro_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The raw stored outro verdict, detector version included\n(`tiktok_card/1`, `none/1`); `null` when the item was never examined.\nKind-specific checks must prefix-match (`tiktok_card/`) rather than\ncompare the whole value — see\n`docs/video-outro-detection-design.md` §6.2. \"Has an outro\" is\n`content_end_ms` being non-null."
           },
           "sha256": {
             "type": "string"
@@ -7429,6 +7448,13 @@
             ],
             "format": "double"
           },
+          "content_end_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
           "data_id": {
             "type": [
               "integer",
@@ -7508,6 +7534,13 @@
               "string",
               "null"
             ]
+          },
+          "outro_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See [`MatchValues::outro_kind`]."
           },
           "path": {
             "type": [
@@ -7629,6 +7662,16 @@
               }
             ]
           },
+          "content_end_ms": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OneOrMany_i64"
+              }
+            ]
+          },
           "data_id": {
             "oneOf": [
               {
@@ -7746,6 +7789,17 @@
               },
               {
                 "$ref": "#/components/schemas/OneOrMany_String"
+              }
+            ]
+          },
+          "outro_kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OneOrMany_String",
+                "description": "The raw stored outro verdict, detector version included\n(`tiktok_card/1`, `none/1`). Kind-specific queries must prefix-match\n(`startswith: \"tiktok_card/\"`) rather than compare the whole value; see\n`docs/video-outro-detection-design.md` §6.2."
               }
             ]
           },
@@ -8102,6 +8156,8 @@
           "video_tracks",
           "subtitle_tracks",
           "blurhash",
+          "outro_kind",
+          "content_end_ms",
           "data_id",
           "language",
           "language_confidence",
@@ -9309,6 +9365,14 @@
             ],
             "format": "double"
           },
+          "content_end_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Content End (ms)\n\nWhere the item's real content ends, when an outro was found."
+          },
           "data_id": {
             "type": [
               "integer",
@@ -9393,6 +9457,13 @@
               "string",
               "null"
             ]
+          },
+          "outro_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Outro Kind\n\nThe raw stored outro verdict, detector version included (`tiktok_card/1`,\n`none/1`); absent when the item was never examined. Kind-specific\nqueries must prefix-match, not compare the whole value — see\n`docs/video-outro-detection-design.md` §6.2. \"Has an outro\" is\n`content_end_ms` being present."
           },
           "path": {
             "type": [
