@@ -53,11 +53,32 @@ pub(crate) async fn current_index_db_uuid(conn: &mut SqliteConnection) -> Option
             None
         }
         Ok(None) => None,
+        // A database that predates the identity migration answers here, as
+        // "no such table" — a plain fact about an old database, and the only
+        // expected failure. Anything else is a real error, and it silently
+        // switches off the identity clause of the association rule for this
+        // request: the library then comes back nearly empty under the
+        // association filter, which must not be an unexplained mystery.
+        Err(err) if is_missing_identity_table(&err) => {
+            tracing::debug!(error = %err, "index database has no identity table");
+            None
+        }
         Err(err) => {
-            tracing::debug!(error = %err, "index database has no readable identity row");
+            tracing::warn!(
+                error = %err,
+                "could not read the index database's identity; \
+                 pinboard associations cannot match this database by identity"
+            );
             None
         }
     }
+}
+
+/// Whether a failed identity read is just "this database predates the
+/// identity migration": SQLite reports a missing table as an error rather
+/// than as an empty result.
+fn is_missing_identity_table(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db) if db.message().contains("no such table"))
 }
 
 /// What an identity probe of a database file could establish.

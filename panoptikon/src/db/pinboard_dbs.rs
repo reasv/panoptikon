@@ -28,7 +28,7 @@ use crate::api_error::ApiError;
 
 use super::identity::current_index_db_uuid;
 use super::instance_id::instance_uuid;
-use super::local_dbs::{LocalDbIdentities, local_index_db_identities};
+use super::local_dbs::{LocalDbIdentities, canonical_index_db_name, local_index_db_identities};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -93,18 +93,24 @@ pub(crate) struct AssociationContext {
     /// This instance's identity, or `None` when it could not be obtained (a
     /// read-only deployment, say), which simply switches clause (b) off.
     instance_uuid: Option<String>,
-    /// The `index_db` name the client selected — clause (b)'s name compare.
+    /// The index database being viewed, under its folder's own spelling —
+    /// clause (b)'s name compare, and (from the next step) what a stamp
+    /// records as `db_name`.
     index_db: String,
     /// What the local index databases claim, for clause (b)'s gate.
     local: LocalDbIdentities,
 }
 
 impl AssociationContext {
+    /// `index_db` is the name the request runs under; it is canonicalized to
+    /// the folder's spelling, because the configured default is trusted
+    /// unchecked and a case-only difference would otherwise split clause (b)'s
+    /// name comparison in two.
     pub(crate) async fn load(conn: &mut sqlx::SqliteConnection, index_db: &str) -> Self {
         Self {
             current_db_uuid: current_index_db_uuid(conn).await,
             instance_uuid: instance_uuid().map(str::to_string),
-            index_db: index_db.to_string(),
+            index_db: canonical_index_db_name(index_db),
             local: local_index_db_identities().await,
         }
     }

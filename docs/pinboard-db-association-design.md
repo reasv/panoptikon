@@ -147,6 +147,16 @@ A board is **associated with the current index DB** iff any of:
 
 The filter (default-on, see UI) hides non-associated boards.
 
+The name (b) compares — and that a stamp records as `db_name` — is
+**canonicalized to the folder's own spelling** first: an explicitly passed
+`index_db` is checked against the folder listing, but the configured default
+is trusted unchecked, and on Windows a config saying `Default` opens the
+folder `default` quite happily. Without canonicalizing, the two spellings
+would split (b)'s comparison, and the stamps, in half. An exact match always
+wins; a single case-insensitive match supplies the spelling; anything
+ambiguous (two folders differing only in case, which only a case-sensitive
+filesystem can hold) is left as it came in.
+
 ### Why each clause is shaped this way — rejected predecessors
 
 This rule is the fourth iteration; the first three each failed a concrete
@@ -225,9 +235,20 @@ foreignness.
 
 The gate needs "the set of UUIDs of currently existing local index DBs".
 Per-process cache, name → **probe result** (not name → UUID: the probe is
-three-state, see below), re-validated against the folder listing per list
-call (folders can be deleted out-of-band, so entries for vanished folders are
-dropped — `load_db_info` already enumerates the folders).
+three-state, see below), re-validated against the folder listing (folders can
+be deleted out-of-band, so entries for vanished folders are dropped —
+`load_db_info` already enumerates the folders). Each entry also carries the
+**file stamp** (mtime + length) of the `index.db` it was read from, and is
+re-probed when that changes: a name-keyed cache alone would keep answering
+for a DB **replaced in place** — delete-and-recreate via `POST /api/db/create`,
+a restore from backup, a `VACUUM INTO` over the top — and a stale `Claimed`
+defeats (b) in exactly the rebuilt-from-TOML case (b) exists for. The stamp
+also closes the creation window, where a probe landing before the identity
+migration would otherwise cache "claims nothing" for good. The folder listing
+itself (and the stamps taken with it) is reused for a **short TTL** (~2s):
+every list, detail and board-search request needs it, and the deployment
+keeps its data on an SMB-mounted NAS where each `read_dir`/stat is a network
+round trip.
 
 **The cache must fill eagerly on miss, not only on normal DB opens** (review
 finding 2026-08-08): the rename-reuse walkthrough only refuses (b) because
@@ -258,8 +279,13 @@ The probe is **three-state**, and the difference is load-bearing for the gate
   DB hand its boards to a same-named one, which is precisely the collision
   the instance UUID exists to prevent.
 
-Unknown results are **not cached** — a lock or a busy file is transient, so
-the next list call re-probes. Only the two real answers are cached.
+Unknown is **never cached as an answer**: only the two real answers are ever
+believed, and while an Unknown is outstanding the gate stays closed. It *is*
+remembered with a timestamp, though, purely to **rate-limit the retry** (~30s):
+a lock is transient, but a DB that is unreadable for good would otherwise cost
+a full SQLite open on every request for the life of the process. Between
+retries the remembered Unknown keeps `any_unknown` true — the fail-closed
+verdict is what persists, never a permissive one.
 
 ## Write points
 

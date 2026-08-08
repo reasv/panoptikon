@@ -928,6 +928,16 @@ pub(crate) async fn delete_pinboard(
         .execute(&mut *conn)
         .await
         .map_err(internal("Failed to delete pinboard"))?;
+    // The database associations go with the board, explicitly — none of these
+    // tables has an FK cascade. Leaving them behind would not merely be
+    // litter: `pinboards.id` is an INTEGER PRIMARY KEY, so SQLite hands the
+    // highest deleted id to the next board created, which would silently
+    // inherit a stranger's stamps.
+    sqlx::query("DELETE FROM user_data.pinboard_databases WHERE pinboard_id = ?")
+        .bind(pinboard_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(internal("Failed to delete pinboard"))?;
     sqlx::query("DELETE FROM user_data.pinboards WHERE id = ?")
         .bind(pinboard_id)
         .execute(conn)

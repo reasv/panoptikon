@@ -1596,6 +1596,76 @@ mod tests {
         assert_eq!(items, 0);
     }
 
+    // Ensures a deleted board takes its database associations with it. Left
+    // behind they would not stay harmless litter: `pinboards.id` is a plain
+    // INTEGER PRIMARY KEY (no AUTOINCREMENT), so SQLite hands the highest
+    // deleted id to the very next board — which would then inherit a dead
+    // board's stamps and count as associated on the strength of them.
+    #[tokio::test]
+    async fn deleting_a_board_takes_its_database_stamps() {
+        let mut dbs = setup_test_databases().await;
+        let (kept, _) = create_board(&mut dbs.index_conn, Some("kept"), &["v2", "a"], &[]).await;
+        let (doomed, _) =
+            create_board(&mut dbs.index_conn, Some("doomed"), &["v2", "b"], &[]).await;
+        for (board, name) in [(kept, "archive"), (doomed, "default")] {
+            crate::db::pinboard_dbs::stamp_for_tests(
+                &mut dbs.index_conn,
+                board,
+                "uuid_here",
+                name,
+                "inst",
+                T0,
+            )
+            .await;
+        }
+
+        assert!(
+            pinboards::delete_pinboard(&mut dbs.index_conn, doomed, "user")
+                .await
+                .unwrap()
+        );
+        let stamps: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_data.pinboard_databases WHERE pinboard_id = ?",
+        )
+        .bind(doomed)
+        .fetch_one(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        assert_eq!(stamps, 0);
+
+        // The next board really does get the dead one's id — that is the
+        // whole reason the delete above has to be explicit.
+        let (recycled, _) =
+            create_board(&mut dbs.index_conn, Some("new"), &["v2", "c"], &["gone"]).await;
+        assert_eq!(recycled, doomed, "SQLite recycles the highest deleted id");
+
+        let ctx = current_db();
+        let association = association_of(&mut dbs.index_conn, &ctx, recycled).await;
+        assert!(
+            association.databases.is_empty(),
+            "a recycled id must not inherit the dead board's stamps"
+        );
+        assert!(!association.associated);
+
+        // ...and the board that was not deleted keeps its own.
+        let association = association_of(&mut dbs.index_conn, &ctx, kept).await;
+        assert_eq!(association.databases.len(), 1);
+        assert_eq!(association.databases[0].name, "archive");
+    }
+
+    /// The association of one board, as the detail endpoint computes it.
+    async fn association_of(
+        conn: &mut sqlx::SqliteConnection,
+        ctx: &AssociationContext,
+        pinboard_id: i64,
+    ) -> PinboardAssociation {
+        let (summary, _) = pinboards::get_pinboard(conn, pinboard_id, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        board_association(conn, ctx, &summary).await.unwrap()
+    }
+
     // Ensures user scoping hides other users' boards from every accessor.
     #[tokio::test]
     async fn user_scoping_is_enforced() {
