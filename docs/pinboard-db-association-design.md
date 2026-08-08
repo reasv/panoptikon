@@ -183,6 +183,20 @@ Residual failure modes, accepted:
 - **Wiped data dir**: new instance UUID; rotted boards lose (b) across a
   subsequent rebuild until re-stamped (backfill tool / manual editor).
   Accepted — the stamps remain, only the fallback declines to fire.
+- **Memory-only instance identity** (minting worked, persisting the file did
+  not): stamps written during that run carry an instance UUID that exists
+  nowhere on disk, so after a restart the instance mints a different one.
+  Clause (a) is unaffected — the `db_uuid` is what it matches on — and only
+  the cross-restart continuity of (b) is lost, the same degradation as an
+  instance with no identity at all. Accepted; the alternative (refusing to
+  stamp) would cost (a) as well.
+- **Copied index DB** (folder copied, or `VACUUM INTO` of an index DB):
+  the copy carries the original's `db_uuid`, so clause (a) matches *both*
+  incarnations and the badge / opens-in link may point at the stale copy.
+  Accepted — associations are hints, never authority, and the manual editor
+  is the fix path. Step 2's local-UUID cache should log a warning when two
+  local folders probe to the same UUID; that is the only place the
+  duplication is visible.
 
 Note (b)'s entire cargo is *rotted boards across a same-instance rebuild*:
 intact boards re-admit through (c) after a rebuild of the same folders, no
@@ -210,9 +224,10 @@ foreignness.
 ### The local-UUID set (for (b)'s not-claimed-elsewhere gate)
 
 The gate needs "the set of UUIDs of currently existing local index DBs".
-Per-process cache, name → UUID, re-validated against the folder listing per
-list call (folders can be deleted out-of-band, so entries for vanished
-folders are dropped — `load_db_info` already enumerates the folders).
+Per-process cache, name → **probe result** (not name → UUID: the probe is
+three-state, see below), re-validated against the folder listing per list
+call (folders can be deleted out-of-band, so entries for vanished folders are
+dropped — `load_db_info` already enumerates the folders).
 
 **The cache must fill eagerly on miss, not only on normal DB opens** (review
 finding 2026-08-08): the rename-reuse walkthrough only refuses (b) because
@@ -222,11 +237,29 @@ lazy-only fill leaves the cache cold until "phone" happens to be opened, and
 index folder absent from the cache gets a cheap read-only identity probe —
 open the file read-only, SELECT the UUID, close. **Never through the normal
 open path**: `migrate_path` runs migrations plus post-migration ANALYZE, and
-a pinboard list must not trigger that on every local DB. A DB whose identity
-table doesn't exist yet (pre-upgrade, never opened) legitimately claims
-nothing, as does one that can't be opened. Cost is bounded by folder count
-and paid only on misses. The current DB's own UUID is a one-row query on the
-already-attached connection.
+a pinboard list must not trigger that on every local DB. Cost is bounded by
+folder count and paid only on misses. The current DB's own UUID is a one-row
+query on the already-attached connection.
+
+The probe is **three-state**, and the difference is load-bearing for the gate
+(`db::identity::DbIdentityProbe`):
+
+- **Claims a UUID** — read successfully, identity row present.
+- **Claims nothing** — read successfully, but there is no identity table
+  (pre-upgrade, never opened), no row, or an unusable value. Also a path with
+  no file at all. This is a real answer: the DB claims no UUID, so it cannot
+  be the elsewhere-claimant that refuses (b).
+- **Unknown** — the file exists but could not be interrogated (locked,
+  corrupt, unreadable, read-only filesystem refusing the `-shm`). Not an
+  answer: that DB might be holding exactly the stamped UUID. The gate must
+  **fail closed** — an Unknown anywhere in the folder listing refuses the
+  name-fallback clause (b) for stamps whose UUID is otherwise unaccounted
+  for. Folding Unknown into "claims nothing" would let a momentarily locked
+  DB hand its boards to a same-named one, which is precisely the collision
+  the instance UUID exists to prevent.
+
+Unknown results are **not cached** — a lock or a busy file is transient, so
+the next list call re-probes. Only the two real answers are cached.
 
 ## Write points
 
@@ -238,6 +271,13 @@ already-attached connection.
   upsert the current DB's stamp **iff `present_count > 0`**. Zero overlap
   means the save happened under a mistakenly-selected DB; don't record it.
 - **Not on open.** Opening a foreign board must not associate it.
+- **No instance identity, no stamp.** If `instance_uuid()` reads `None`
+  (read-only deployment, unreadable file), write **no row at all** — never a
+  sentinel like `''`. A sentinel would compare equal across every
+  identity-less instance, so (b) would match any same-named DB anywhere,
+  which is exactly rejected rule 3 reintroduced through the back door. The
+  cost of skipping the row is that clause (a) is not recorded either; that is
+  the smaller loss, and clause (c) still admits intact boards.
 - All stamps run inside the existing save transactions (`BEGIN IMMEDIATE`
   convention — the background activity writer makes deferred BEGINs a
   `SQLITE_BUSY_SNAPSHOT` trap; see the header in `api/pinboards.rs`).
