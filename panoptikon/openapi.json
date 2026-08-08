@@ -6808,7 +6808,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Where the item's real content ends, when an outro was found."
+            "description": "Where the item's real content ends, when an outro was found.\n\nServed as `null` for every item when the index database has\n`detect_outros` off, on the same terms (and with the same PQL\nasymmetry) as `outro_kind`."
           },
           "duration": {
             "type": [
@@ -6836,7 +6836,7 @@
               "string",
               "null"
             ],
-            "description": "The raw stored outro verdict, detector version included\n(`tiktok_card/1`, `none/1`); `null` when the item was never examined.\nKind-specific checks must prefix-match (`tiktok_card/`) rather than\ncompare the whole value — see\n`docs/video-outro-detection-design.md` §6.2. \"Has an outro\" is\n`content_end_ms` being non-null."
+            "description": "The raw stored outro verdict, detector version included\n(`tiktok_card/1`, `none/1`); `null` when the item was never examined.\nKind-specific checks must prefix-match (`tiktok_card/`) rather than\ncompare the whole value — see\n`docs/video-outro-detection-design.md` §6.2. \"Has an outro\" is\n`content_end_ms` being non-null.\n\nServed as `null` for every item when the index database has\n`detect_outros` off, including items whose outro was detected while it\nwas on: the toggle turns the whole feature off for its database.\nNote the deliberate asymmetry — PQL predicates (`match` filters,\n`order_by`) on this column keep working with the toggle off, because\nquerying your own data is a query capability, not playback\n(`docs/video-outro-skip-design.md` §6)."
           },
           "sha256": {
             "type": "string"
@@ -9578,7 +9578,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Content End (ms)\n\nWhere the item's real content ends, when an outro was found. Absent\nwhen no outro is recorded or the column was not selected."
+            "description": "Content End (ms)\n\nWhere the item's real content ends, when an outro was found. Absent\nwhen no outro is recorded or the column was not selected.\n\nAlso absent on every row when the index database has `detect_outros`\noff, on the same terms (and with the same PQL asymmetry) as\n`outro_kind`."
           },
           "data_id": {
             "type": [
@@ -9670,7 +9670,7 @@
               "string",
               "null"
             ],
-            "description": "Outro Kind\n\nThe raw stored outro verdict, detector version included (`tiktok_card/1`,\n`none/1`); absent when the item was never examined or the column was\nnot selected. Kind-specific\nqueries must prefix-match, not compare the whole value — see\n`docs/video-outro-detection-design.md` §6.2. \"Has an outro\" is\n`content_end_ms` being present."
+            "description": "Outro Kind\n\nThe raw stored outro verdict, detector version included (`tiktok_card/1`,\n`none/1`); absent when the item was never examined or the column was\nnot selected. Kind-specific\nqueries must prefix-match, not compare the whole value — see\n`docs/video-outro-detection-design.md` §6.2. \"Has an outro\" is\n`content_end_ms` being present.\n\nAbsent on every row when the index database has `detect_outros` off,\neven for items whose outro was detected while it was on: the toggle\nturns the whole feature off for its database. Note the deliberate\nasymmetry — PQL predicates (`match` filters, `order_by`) on this\ncolumn keep working with the toggle off, because querying your own\ndata is a query capability, not playback\n(`docs/video-outro-skip-design.md` §6)."
           },
           "path": {
             "type": [

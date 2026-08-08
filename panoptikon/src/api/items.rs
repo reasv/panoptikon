@@ -14,7 +14,9 @@ use tokio_util::io::ReaderStream;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::api::db_params::DbQueryParams;
-use crate::api::utils::{content_disposition_value, iso_to_system_time, strip_non_latin1_chars};
+use crate::api::utils::{
+    content_disposition_value, iso_to_system_time, serve_outro_metadata, strip_non_latin1_chars,
+};
 use crate::api_error::ApiError;
 use crate::db::items::{
     ExtractedTextRecord, FileRecord, ItemIdentifierType, ItemRecord, get_all_tags_for_item,
@@ -178,9 +180,21 @@ pub(crate) struct ItemRecordResponse {
     /// compare the whole value — see
     /// `docs/video-outro-detection-design.md` §6.2. "Has an outro" is
     /// `content_end_ms` being non-null.
+    ///
+    /// Served as `null` for every item when the index database has
+    /// `detect_outros` off, including items whose outro was detected while it
+    /// was on: the toggle turns the whole feature off for its database.
+    /// Note the deliberate asymmetry — PQL predicates (`match` filters,
+    /// `order_by`) on this column keep working with the toggle off, because
+    /// querying your own data is a query capability, not playback
+    /// (`docs/video-outro-skip-design.md` §6).
     #[schema(required)]
     outro_kind: Option<String>,
     /// Where the item's real content ends, when an outro was found.
+    ///
+    /// Served as `null` for every item when the index database has
+    /// `detect_outros` off, on the same terms (and with the same PQL
+    /// asymmetry) as `outro_kind`.
     #[schema(required)]
     content_end_ms: Option<i64>,
     time_added: String,
@@ -278,7 +292,7 @@ pub async fn item_meta(
     };
 
     let response = ItemMetadataResponse {
-        item: map_item_record(&item),
+        item: map_item_record(&db.index_db, &item)?,
         files: item_data.files.into_iter().map(map_file_record).collect(),
     };
 
@@ -851,8 +865,15 @@ fn bytes_response(
     Ok(response)
 }
 
-fn map_item_record(item: &ItemRecord) -> ItemRecordResponse {
-    ItemRecordResponse {
+/// Maps an item record for the response, applying the index database's outro
+/// serving gate (`docs/video-outro-skip-design.md` §6): with `detect_outros`
+/// off, both outro fields are served null whatever the row holds.
+fn map_item_record(index_db: &str, item: &ItemRecord) -> ApiResult<ItemRecordResponse> {
+    let serve_outro = serve_outro_metadata(
+        index_db,
+        item.outro_kind.is_some() || item.content_end_ms.is_some(),
+    )?;
+    Ok(ItemRecordResponse {
         id: item.id,
         sha256: item.sha256.clone(),
         md5: item.md5.clone(),
@@ -865,10 +886,10 @@ fn map_item_record(item: &ItemRecord) -> ItemRecordResponse {
         video_tracks: item.video_tracks,
         subtitle_tracks: item.subtitle_tracks,
         blurhash: item.blurhash.clone(),
-        outro_kind: item.outro_kind.clone(),
-        content_end_ms: item.content_end_ms,
+        outro_kind: serve_outro.then(|| item.outro_kind.clone()).flatten(),
+        content_end_ms: serve_outro.then_some(item.content_end_ms).flatten(),
         time_added: item.time_added.clone(),
-    }
+    })
 }
 
 fn map_file_record(file: FileRecord) -> FileRecordResponse {
@@ -1254,6 +1275,35 @@ mod tests {
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             CACHE_IMMUTABLE
         );
+    }
+
+    /// The item endpoint's outro fields are gated per index database: with
+    /// `detect_outros` off both arrive null even though the record carries a
+    /// detected boundary, and the positive control proves the values do
+    /// travel when the toggle is on (the default).
+    #[test]
+    fn outro_fields_gated_by_detect_outros() {
+        let _env = crate::test_utils::test_data_dir();
+        let file_path = temp_path("outro_gate");
+        let (mut item, _file) = test_records(&file_path);
+        item.outro_kind = Some("tiktok_card/1".to_string());
+        item.content_end_ms = Some(8000);
+
+        crate::test_utils::write_detect_outros_config("items-outro-on", true);
+        let served = map_item_record("items-outro-on", &item).expect("map with detection on");
+        assert_eq!(served.outro_kind.as_deref(), Some("tiktok_card/1"));
+        assert_eq!(served.content_end_ms, Some(8000));
+
+        crate::test_utils::write_detect_outros_config("items-outro-off", false);
+        let gated = map_item_record("items-outro-off", &item).expect("map with detection off");
+        assert_eq!(
+            gated.outro_kind, None,
+            "an already-detected verdict is withheld once the toggle is off"
+        );
+        assert_eq!(gated.content_end_ms, None);
+        // Everything else is untouched by the gate.
+        assert_eq!(gated.sha256, item.sha256);
+        assert_eq!(gated.size, item.size);
     }
 
     #[test]

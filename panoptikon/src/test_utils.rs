@@ -54,3 +54,17 @@ pub(crate) fn test_data_dir() -> TestDataGuard {
     );
     TestDataGuard { _lock: lock, root }
 }
+
+/// Writes a per-database `config.toml` carrying only `detect_outros`, at the
+/// path `SystemConfigStore::from_env()` resolves for `index_db`.
+///
+/// The API-side outro gate reads its config through `from_env`, so a test
+/// that wants the toggle off has to place the file where that store will
+/// look. Every other key stays absent and therefore at its serde default.
+/// Call while holding [`test_data_dir`] and use a database name no other
+/// test uses.
+pub(crate) fn write_detect_outros_config(index_db: &str, detect_outros: bool) {
+    let path = crate::db::system_config::SystemConfigStore::from_env().config_path(index_db);
+    std::fs::create_dir_all(path.parent().expect("config path has a parent")).unwrap();
+    std::fs::write(&path, format!("detect_outros = {detect_outros}\n")).unwrap();
+}

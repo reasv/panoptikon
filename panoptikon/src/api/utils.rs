@@ -1,6 +1,35 @@
 use axum::http::header;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::api_error::ApiError;
+use crate::db::system_config::SystemConfigStore;
+
+/// Whether the request's index database may serve the outro playback
+/// metadata (`content_end_ms`, `outro_kind`).
+///
+/// `detect_outros` off means the whole outro feature is off for that
+/// database — including boundaries that were already detected while it was
+/// on. Serving them as null is what turns the feature off for every client
+/// at once, with no config plumbing in the player
+/// (`docs/video-outro-skip-design.md` §6). Deliberately keyed on
+/// `detect_outros` alone: the folded `scan_video && detect_outros` is a
+/// scan-side concern.
+///
+/// `carries_metadata` says whether the response actually has one of the two
+/// values in it. When it does not, the answer cannot change what is
+/// serialized, so the config read is skipped — nulling an already-null field
+/// is a no-op, making this exactly equivalent to an unconditional read while
+/// keeping the filesystem off the hot metadata and search paths.
+pub(crate) fn serve_outro_metadata(
+    index_db: &str,
+    carries_metadata: bool,
+) -> Result<bool, ApiError> {
+    if !carries_metadata {
+        return Ok(true);
+    }
+    Ok(SystemConfigStore::from_env().load(index_db)?.detect_outros)
+}
+
 pub(crate) fn content_disposition_value(kind: &str, filename: &str) -> Option<header::HeaderValue> {
     let mut value = Vec::new();
     value.extend_from_slice(kind.as_bytes());

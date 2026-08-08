@@ -1,6 +1,7 @@
 use crate::api::db_params::DbQueryParams;
 use crate::api::pinboards::{PinboardDatabaseResponse, map_databases};
 use crate::api::search_cache::{self, CacheLookup, EpochSnapshot, QueryKey};
+use crate::api::utils::serve_outro_metadata;
 use crate::api_error::ApiError;
 use crate::db::bookmarks::get_all_bookmark_namespaces;
 use crate::db::extraction_log::get_existing_setters;
@@ -207,12 +208,24 @@ pub(crate) struct SearchResult {
     /// queries must prefix-match, not compare the whole value — see
     /// `docs/video-outro-detection-design.md` §6.2. "Has an outro" is
     /// `content_end_ms` being present.
+    ///
+    /// Absent on every row when the index database has `detect_outros` off,
+    /// even for items whose outro was detected while it was on: the toggle
+    /// turns the whole feature off for its database. Note the deliberate
+    /// asymmetry — PQL predicates (`match` filters, `order_by`) on this
+    /// column keep working with the toggle off, because querying your own
+    /// data is a query capability, not playback
+    /// (`docs/video-outro-skip-design.md` §6).
     #[serde(skip_serializing_if = "Option::is_none")]
     outro_kind: Option<String>,
     /// Content End (ms)
     ///
     /// Where the item's real content ends, when an outro was found. Absent
     /// when no outro is recorded or the column was not selected.
+    ///
+    /// Also absent on every row when the index database has `detect_outros`
+    /// off, on the same terms (and with the same PQL asymmetry) as
+    /// `outro_kind`.
     #[serde(skip_serializing_if = "Option::is_none")]
     content_end_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -636,6 +649,12 @@ pub async fn search_pql(
     }
     result_metrics.enrich = elapsed_seconds(enrich_start);
 
+    // Response-mapping time, deliberately after the cache read: rows served
+    // from the cache were stored under whatever policy was in force when
+    // they were executed, so gating any earlier would let a stale policy
+    // survive in the cache and a config change take effect late.
+    apply_outro_gate(&db.index_db, &mut results)?;
+
     Ok(Json(FileSearchResponse {
         count,
         results,
@@ -643,6 +662,28 @@ pub async fn search_pql(
         result_metrics,
         seed: seed.effective,
     }))
+}
+
+/// Blanks the outro playback metadata on a page of results when the index
+/// database has `detect_outros` off (`docs/video-outro-skip-design.md` §6).
+///
+/// Must be called at response-mapping time — never on the rows handed to the
+/// result cache, which are stored raw so that a config change is reflected by
+/// the very next request, hit or miss. The PQL builder is untouched by
+/// design: filters and orders on these columns keep working with the toggle
+/// off, only the served values are withheld.
+fn apply_outro_gate(index_db: &str, results: &mut [SearchResult]) -> ApiResult<()> {
+    let carries_metadata = results
+        .iter()
+        .any(|result| result.outro_kind.is_some() || result.content_end_ms.is_some());
+    if serve_outro_metadata(index_db, carries_metadata)? {
+        return Ok(());
+    }
+    for result in results {
+        result.outro_kind = None;
+        result.content_end_ms = None;
+    }
+    Ok(())
 }
 
 /// Whether the result cache may serve this request at all: enabled globally
@@ -3445,6 +3486,111 @@ mod tests {
             bounded,
             vec!["sha_2".to_string(), "sha_1".to_string()],
             "NULL content_end_ms is excluded and the rest sort numerically"
+        );
+    }
+
+    /// The per-database serving gate (`docs/video-outro-skip-design.md` §6):
+    /// with `detect_outros` off, both outro fields are blanked on the mapped
+    /// rows — even for an item whose outro was detected while it was on —
+    /// while a PQL predicate on the same column keeps filtering. The
+    /// asymmetry is deliberate: playback metadata is withheld, query
+    /// capability is not.
+    #[tokio::test]
+    async fn outro_columns_gated_by_detect_outros() {
+        let _env = crate::test_utils::test_data_dir();
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, duration, outro_kind, content_end_ms, time_added)
+            VALUES
+                (1, 'sha_card', 'md5_1', 'video/mp4', 12.0, 'tiktok_card/1', 8000, '2024-01-01T00:00:00'),
+                (2, 'sha_none', 'md5_2', 'video/mp4', 12.0, 'none/1', NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\outro").await;
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_card', 1, 'C:\outro\a.mp4', 'a.mp4', '2024-01-02T00:00:00', 1, 1),
+                (11, 'sha_none', 2, 'C:\outro\b.mp4', 'b.mp4', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        /// Selects both outro columns and maps the rows exactly as the
+        /// handler does, up to (but not including) the gate.
+        async fn mapped_results(conn: &mut sqlx::SqliteConnection) -> Vec<SearchResult> {
+            let query = PqlQuery {
+                select: vec![
+                    crate::pql::model::Column::Sha256,
+                    crate::pql::model::Column::OutroKind,
+                    crate::pql::model::Column::ContentEndMs,
+                ],
+                page_size: 0,
+                count: false,
+                check_path: false,
+                ..PqlQuery::default()
+            };
+            let built = build_query_preprocessed(query, false).expect("build");
+            let extra_columns = built.extra_columns.clone();
+            let compiled = compile_select(built).expect("compile");
+            let rows = run_compiled_query(conn, &compiled.sql, &compiled.params)
+                .await
+                .expect("run results query");
+            rows.iter()
+                .map(|row| map_search_result(row, &extra_columns).expect("map result"))
+                .collect()
+        }
+
+        // Positive control: the gate is a no-op with the toggle on, so the
+        // stored values reach the response unchanged.
+        crate::test_utils::write_detect_outros_config("search-outro-on", true);
+        let mut served = mapped_results(&mut dbs.index_conn).await;
+        apply_outro_gate("search-outro-on", &mut served).expect("gate with detection on");
+        let card = served
+            .iter()
+            .find(|result| result.sha256.as_deref() == Some("sha_card"))
+            .expect("sha_card in results");
+        assert_eq!(card.outro_kind.as_deref(), Some("tiktok_card/1"));
+        assert_eq!(card.content_end_ms, Some(8000));
+
+        crate::test_utils::write_detect_outros_config("search-outro-off", false);
+        let mut gated = mapped_results(&mut dbs.index_conn).await;
+        apply_outro_gate("search-outro-off", &mut gated).expect("gate with detection off");
+        assert_eq!(gated.len(), 2);
+        for result in &gated {
+            assert_eq!(
+                result.outro_kind, None,
+                "outro_kind is withheld for every row, verdict or not"
+            );
+            assert_eq!(result.content_end_ms, None);
+            assert!(
+                result.sha256.is_some(),
+                "the gate touches nothing but the two outro fields"
+            );
+        }
+
+        // Same database, same toggle-off config: PQL predicates on the
+        // gated columns still select rows by their stored values.
+        let filtered = outro_query_shas(
+            &mut dbs.index_conn,
+            serde_json::json!({
+                "query": { "match": { "gte": { "content_end_ms": 1000 } } }
+            }),
+        )
+        .await;
+        assert_eq!(
+            filtered,
+            vec!["sha_card".to_string()],
+            "filtering on content_end_ms survives detect_outros being off"
         );
     }
 }
