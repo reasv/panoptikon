@@ -9897,13 +9897,16 @@
       "SetPinboardDatabasesRequest": {
         "type": "object",
         "description": "The manual editor's payload: exactly the databases the board should be\nassociated with afterwards. An empty list clears every association.",
+        "required": [
+          "databases"
+        ],
         "properties": {
           "databases": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Index database names. A name the board is already stamped for keeps\nthat stamp untouched (including a name whose database no longer\nexists, which the server could not mint again); any other name must\nresolve to a local index database. Omitting a name removes it."
+            "description": "Index database names. Each keeps every stamp already stored under it\n(including one whose database no longer exists, which the server could\nnot mint again) *and* associates the board with the live database that\nname refers to here. A name that is neither stamped nor local is a\n400. Omitting a name removes it."
           }
         }
       },

@@ -39,6 +39,15 @@ const MAX_FLAGS_BYTES: usize = 4096;
 /// Upper bound for a recorded preview dimension, in pixels. Far above any
 /// composite a browser canvas can produce, low enough to be obviously bogus.
 const MAX_PREVIEW_DIMENSION: i64 = 100_000;
+/// Databases one manual-editor request may name. A board's checklist is the
+/// local index databases plus its own stamped names; a couple of dozen would
+/// already be a remarkable installation, and every name costs a resolution
+/// and a row write inside the write transaction.
+const MAX_BOARD_DATABASES: usize = 64;
+/// Longest index database name the editor will consider. Names are folder
+/// names, so a real one is short; this only keeps a client from spending the
+/// transaction's time on strings that could never match a folder.
+const MAX_DB_NAME_BYTES: usize = 256;
 
 fn default_user() -> String {
     DEFAULT_USER.to_string()
@@ -134,11 +143,11 @@ pub(crate) struct CreatePinboardRequest {
 /// associated with afterwards. An empty list clears every association.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct SetPinboardDatabasesRequest {
-    /// Index database names. A name the board is already stamped for keeps
-    /// that stamp untouched (including a name whose database no longer
-    /// exists, which the server could not mint again); any other name must
-    /// resolve to a local index database. Omitting a name removes it.
-    #[serde(default)]
+    /// Index database names. Each keeps every stamp already stored under it
+    /// (including one whose database no longer exists, which the server could
+    /// not mint again) *and* associates the board with the live database that
+    /// name refers to here. A name that is neither stamped nor local is a
+    /// 400. Omitting a name removes it.
     databases: Vec<String>,
 }
 
@@ -820,41 +829,65 @@ pub async fn set_pinboard_databases(
     Query(query): Query<PinboardUserQuery>,
     Json(request): Json<SetPinboardDatabasesRequest>,
 ) -> ApiResult<Json<PinboardDatabasesResponse>> {
+    validate_database_names(&request.databases)?;
     // Before the transaction: building the context probes the local database
     // files, which is not work to do while holding the write lock. It is also
     // what resolves the names, and what computes the response's verdict.
     let ctx = AssociationContext::load(&mut db.conn, &db.index_db).await;
 
     begin_transaction(&mut db.conn).await?;
-    let result = replace_board_databases(
-        &mut db.conn,
-        &ctx,
-        pinboard_id,
-        &query.user,
-        &request.databases,
-        unix_now(),
-    )
+    let result: ApiResult<PinboardDatabasesResponse> = async {
+        replace_board_databases(
+            &mut db.conn,
+            &ctx,
+            pinboard_id,
+            &query.user,
+            &request.databases,
+            unix_now(),
+        )
+        .await?;
+        // Re-read rather than reason about what was written: the response is
+        // the full verdict, which the overlap clause can satisfy with no stamp
+        // at all. Inside the transaction, so it cannot report a board another
+        // writer has since changed (or deleted) out from under it.
+        let Some((summary, _)) =
+            pinboards::get_pinboard(&mut db.conn, pinboard_id, &query.user).await?
+        else {
+            return Err(ApiError::not_found("Pinboard not found"));
+        };
+        let association = board_association(&mut db.conn, &ctx, &summary).await?;
+        Ok(PinboardDatabasesResponse {
+            associated: association.associated,
+            databases: map_databases(association.databases),
+        })
+    }
     .await;
+
     match result {
-        Ok(()) => commit_transaction(&mut db.conn).await?,
+        Ok(response) => {
+            commit_transaction(&mut db.conn).await?;
+            Ok(Json(response))
+        }
         Err(err) => {
             let _ = rollback_transaction(&mut db.conn).await;
-            return Err(err);
+            Err(err)
         }
     }
+}
 
-    // Re-read rather than reason about what was written: the response is the
-    // full verdict, which the overlap clause can satisfy with no stamp at all.
-    let Some((summary, _)) =
-        pinboards::get_pinboard(&mut db.conn, pinboard_id, &query.user).await?
-    else {
-        return Err(ApiError::not_found("Pinboard not found"));
-    };
-    let association = board_association(&mut db.conn, &ctx, &summary).await?;
-    Ok(Json(PinboardDatabasesResponse {
-        associated: association.associated,
-        databases: map_databases(association.databases),
-    }))
+/// Bounds the editor's payload before any of it reaches the write
+/// transaction. Every name costs a resolution and a row write under the
+/// user_data write lock, and neither limit can be reached by the shipped
+/// client: the checklist is the local databases plus the board's own stamps,
+/// and the names are folder names.
+fn validate_database_names(names: &[String]) -> ApiResult<()> {
+    if names.len() > MAX_BOARD_DATABASES {
+        return Err(ApiError::bad_request("Too many databases"));
+    }
+    if names.iter().any(|name| name.len() > MAX_DB_NAME_BYTES) {
+        return Err(ApiError::bad_request("Database name too long"));
+    }
+    Ok(())
 }
 
 /// The manual editor's transaction body: the ownership check, then the
@@ -1906,6 +1939,21 @@ mod tests {
             .time_updated
     }
 
+    /// Pins `time_updated` to a value the clock cannot produce, and returns
+    /// it. Comparing the column against whatever it happened to hold would
+    /// pass by accident whenever a bump landed inside the same millisecond;
+    /// against a sentinel, "unchanged" is an assertion about the code.
+    async fn pin_time_updated(conn: &mut sqlx::SqliteConnection, pinboard_id: i64) -> String {
+        const SENTINEL: &str = "1999-12-31T23:59:59.999";
+        sqlx::query("UPDATE user_data.pinboards SET time_updated = ? WHERE id = ?")
+            .bind(SENTINEL)
+            .bind(pinboard_id)
+            .execute(conn)
+            .await
+            .unwrap();
+        SENTINEL.to_string()
+    }
+
     /// The identity of the database `current_db()` describes — what a save or
     /// a create running against it stamps.
     fn current_identity() -> StampIdentity {
@@ -2091,7 +2139,7 @@ mod tests {
         let identity = current_identity();
         let board =
             create_through_handler(&mut dbs.index_conn, &["v2", "a"], &["a1"], None, T0).await;
-        let time_updated = time_updated_of(&mut dbs.index_conn, board).await;
+        let time_updated = pin_time_updated(&mut dbs.index_conn, board).await;
 
         let saved = save_through_handler(
             &mut dbs.index_conn,
@@ -2217,6 +2265,23 @@ mod tests {
         now: i64,
     ) -> ApiResult<()> {
         replace_board_databases(conn, ctx, pinboard_id, user, &names(requested), now).await
+    }
+
+    // Ensures the editor's payload is bounded before it reaches the write
+    // transaction: every name costs a resolution and a row write under the
+    // user_data write lock, and neither limit is reachable by the shipped
+    // client (the checklist is the local databases plus the board's stamps).
+    #[test]
+    fn database_name_lists_are_bounded() {
+        let list = |count: usize| -> Vec<String> {
+            (0..count).map(|index| format!("db{index}")).collect()
+        };
+        assert!(validate_database_names(&[]).is_ok());
+        assert!(validate_database_names(&list(MAX_BOARD_DATABASES)).is_ok());
+        assert!(validate_database_names(&list(MAX_BOARD_DATABASES + 1)).is_err());
+
+        assert!(validate_database_names(&["x".repeat(MAX_DB_NAME_BYTES)]).is_ok());
+        assert!(validate_database_names(&["x".repeat(MAX_DB_NAME_BYTES + 1)]).is_err());
     }
 
     fn status_of(err: ApiError) -> axum::http::StatusCode {
@@ -2439,7 +2504,7 @@ mod tests {
         let board =
             create_through_handler(&mut dbs.index_conn, &["v2", "a"], &["beef"], None, T0).await;
         let ctx = current_db();
-        let time_updated = time_updated_of(&mut dbs.index_conn, board).await;
+        let time_updated = pin_time_updated(&mut dbs.index_conn, board).await;
 
         let err = set_databases(
             &mut dbs.index_conn,

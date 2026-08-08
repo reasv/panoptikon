@@ -20,7 +20,7 @@
 //! Associations are hints, never authority — every automatic verdict has a
 //! manual fix path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sqlx::Row;
 
@@ -181,9 +181,9 @@ impl AssociationContext {
         self.instance_uuid.is_some()
     }
 
-    /// The stamp a name the manual editor has no stored row for would become:
-    /// the local index database it names, under that folder's own spelling,
-    /// keyed by that database's identity and signed by this instance.
+    /// The stamp a name in the manual editor becomes: the local index
+    /// database it names, under that folder's own spelling, keyed by that
+    /// database's identity and signed by this instance.
     ///
     /// `None` when the name resolves to no local database that claims an
     /// identity, or when this instance has none to sign with — the same
@@ -191,12 +191,33 @@ impl AssociationContext {
     /// editor as a rejected name rather than a silently dropped one.
     pub(crate) fn resolve_name(&self, name: &str) -> Option<StampIdentity> {
         let instance_uuid = self.instance_uuid.clone()?;
-        let (db_name, db_uuid) = self.local.claimed(name)?;
-        Some(StampIdentity {
-            db_uuid: db_uuid.to_string(),
-            db_name: db_name.to_string(),
-            instance_uuid,
-        })
+        // The probe-backed lookup goes first: its exact-match rule must keep
+        // winning for a sibling folder that differs from the viewed DB only
+        // by case (possible on a case-sensitive filesystem).
+        if let Some((db_name, db_uuid)) = self.local.claimed(name) {
+            return Some(StampIdentity {
+                db_uuid: db_uuid.to_string(),
+                db_name: db_name.to_string(),
+                instance_uuid,
+            });
+        }
+        // Fallback: the database being viewed answers for itself. Its
+        // identity was read off the open connection, not off a file probe, so
+        // a probe that came back Unknown (a momentarily locked file) must not
+        // make the editor refuse the very database the request is running
+        // against — and then blame a name it has no quarrel with. The
+        // comparison is case-folded because `index_db` is already the
+        // folder's own spelling, which is also what the row records.
+        if let Some(db_uuid) = self.current_db_uuid.as_deref()
+            && name.eq_ignore_ascii_case(&self.index_db)
+        {
+            return Some(StampIdentity {
+                db_uuid: db_uuid.to_string(),
+                db_name: self.index_db.clone(),
+                instance_uuid,
+            });
+        }
+        None
     }
 
     /// A context that matches nothing by stamp, for tests and for callers
@@ -381,16 +402,33 @@ async fn write_stamp(
 /// Replaces a board's stamps with exactly the databases `names` lists — the
 /// manual editor, and the endpoint the backfill tool applies through.
 ///
-/// Clear-then-set, with one wrinkle that a naive replacement cannot express:
-/// a stamped name whose database is *gone* (deleted, or on another machine)
-/// cannot be re-derived, so the server could never mint the row again. Such a
-/// name is therefore **carried through verbatim** — same identity, same
-/// instance, same `last_stamped`, which stays the honest record of when the
-/// board was actually stamped for it. Only a genuinely new name has to
-/// resolve to a local database, and one that resolves to nothing is a
-/// rejection rather than a silent omission: the editor's checklist would
+/// A requested name means *"associate this board with what that name refers
+/// to here, and keep the history stamped under it"*, which is two things at
+/// once because a name is not a key:
+///
+/// - Every stored row whose `db_name` is that name is **carried through
+///   verbatim** — identity, instance and `last_stamped` alike, the last being
+///   the honest record of when the board really was stamped for it. All of
+///   them, not the first: a database rebuilt from its TOML leaves two rows
+///   sharing one name, and dropping either would discard history the server
+///   cannot reconstruct. This is also the only way a name whose database is
+///   *gone* can survive at all, since nothing could mint it again.
+/// - The name is **also resolved locally**, and if the live database it names
+///   is not already among the rows just carried, it is stamped afresh. That
+///   is what lets one operation re-point a stale stamp at the rebuilt
+///   database it belongs to; carrying alone could never do it, and the
+///   editor would have no way to express it.
+///
+/// A name that matches stored rows but resolves to nothing is carry-only (a
+/// retired database is a legitimate thing to keep). A name that does neither
+/// is a rejection rather than a silent omission: the editor's checklist would
 /// otherwise lose an entry with no explanation. Removing a name — resolvable
 /// or not — is expressed by leaving it out.
+///
+/// The final rows are unique per database, and which row wins is decided
+/// before anything is written, so the order names arrive in cannot change the
+/// result: a carried row always beats a fresh resolution of the same
+/// database, and between two fresh resolutions the first requested wins.
 ///
 /// Runs inside the caller's transaction, so a rejected name leaves the
 /// board's stamps exactly as they were.
@@ -406,18 +444,16 @@ pub(crate) async fn set_board_databases(
         .remove(&pinboard_id)
         .unwrap_or_default();
 
-    let mut rows: Vec<StampRow> = Vec::with_capacity(names.len());
-    let mut seen: Vec<&str> = Vec::with_capacity(names.len());
-    let mut unresolved: Vec<&str> = Vec::new();
-    for name in names {
-        if seen.contains(&name.as_str()) {
-            continue;
-        }
-        seen.push(name);
-        // Matched against the name exactly as stored: that is the string the
-        // client was handed in the board's `databases` array, and a row whose
-        // database no longer exists has nothing else to be recognized by.
-        if let Some(stamp) = existing.iter().find(|stamp| stamp.db_name == *name) {
+    // Pass one: everything the request keeps. Names are matched against
+    // `db_name` exactly as stored — that is the string the client was handed
+    // in the board's `databases` array, and a row whose database no longer
+    // exists has nothing else to be recognized by.
+    let requested: Vec<&str> = dedup_in_order(names);
+    let mut rows: Vec<StampRow> = Vec::with_capacity(existing.len() + requested.len());
+    let mut kept: HashSet<&str> = HashSet::with_capacity(existing.len());
+    for name in &requested {
+        for stamp in existing.iter().filter(|stamp| stamp.db_name == *name) {
+            kept.insert(stamp.db_uuid.as_str());
             rows.push(StampRow {
                 pinboard_id,
                 db_uuid: stamp.db_uuid.clone(),
@@ -425,17 +461,36 @@ pub(crate) async fn set_board_databases(
                 instance_uuid: stamp.instance_uuid.clone(),
                 last_stamped: stamp.last_stamped,
             });
-            continue;
         }
+    }
+
+    // Pass two: the live database each name refers to. Separate from pass one
+    // so that a name carrying a database is known before any name resolves to
+    // it, whatever order they were listed in.
+    let mut fresh: HashSet<String> = HashSet::new();
+    let mut unresolved: Vec<&str> = Vec::new();
+    for name in &requested {
         match ctx.resolve_name(name) {
-            Some(identity) => rows.push(StampRow {
-                pinboard_id,
-                db_uuid: identity.db_uuid,
-                db_name: identity.db_name,
-                instance_uuid: identity.instance_uuid,
-                last_stamped: now,
-            }),
-            None => unresolved.push(name),
+            Some(identity) => {
+                if kept.contains(identity.db_uuid.as_str())
+                    || !fresh.insert(identity.db_uuid.clone())
+                {
+                    // Already spoken for: a carried row keeps its own stamp
+                    // time rather than being refreshed by a name that merely
+                    // points at the same database.
+                    continue;
+                }
+                rows.push(StampRow {
+                    pinboard_id,
+                    db_uuid: identity.db_uuid,
+                    db_name: identity.db_name,
+                    instance_uuid: identity.instance_uuid,
+                    last_stamped: now,
+                });
+            }
+            // Carry-only is fine; nothing at all is not.
+            None if !existing.iter().any(|stamp| stamp.db_name == *name) => unresolved.push(name),
+            None => {}
         }
     }
 
@@ -460,9 +515,6 @@ pub(crate) async fn set_board_databases(
         .await
         .map_err(internal("Failed to update pinboard databases"))?;
     for row in &rows {
-        // Upserted, not plainly inserted: two names can resolve to one
-        // database (a stamped name and the folder it was renamed to), and the
-        // primary key would reject the second.
         write_stamp(
             conn,
             pinboard_id,
@@ -474,6 +526,17 @@ pub(crate) async fn set_board_databases(
         .await?;
     }
     Ok(())
+}
+
+/// The requested names, first occurrence kept. Duplicates are a client
+/// artefact (a checklist can hand the same name twice), never an instruction.
+fn dedup_in_order(names: &[String]) -> Vec<&str> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(names.len());
+    names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| seen.insert(name))
+        .collect()
 }
 
 /// Writes a stamp row with an explicit timestamp, so the match rule can be
@@ -809,11 +872,36 @@ mod tests {
         );
     }
 
-    // Two names resolving to ONE database (a stamped name and the folder it
-    // was renamed to) collapse into a single row rather than colliding on the
-    // primary key.
+    /// The board's rows as (db_uuid, db_name, last_stamped), sorted — the
+    /// shape the editor's outcomes are stated in.
+    async fn rows_of(
+        conn: &mut sqlx::SqliteConnection,
+        pinboard_id: i64,
+    ) -> Vec<(String, String, i64)> {
+        let mut rows: Vec<(String, String, i64)> = fetch_stamps(conn, &[pinboard_id])
+            .await
+            .unwrap()
+            .remove(&pinboard_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|stamp| (stamp.db_uuid, stamp.db_name, stamp.last_stamped))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    fn requested(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    // Two names for ONE database (a stamped name and the folder it was
+    // renamed to) collapse into a single row rather than colliding on the
+    // primary key — and the carried row wins, keeping its own stamp time: a
+    // name that merely points at a database the request is already keeping is
+    // not a re-stamp of it. Which is true in either order, because the
+    // outcome is decided before anything is written.
     #[tokio::test]
-    async fn two_names_for_one_database_collapse() {
+    async fn two_names_for_one_database_collapse_onto_the_carried_row() {
         let mut dbs = setup_test_databases().await;
         stamp(&mut dbs.index_conn, 1, "uuid_p", "photos", "inst", T0).await;
         let ctx = AssociationContext::for_tests(
@@ -823,27 +911,153 @@ mod tests {
             LocalDbIdentities::for_tests(&[("phone", "uuid_p")], false),
         );
 
+        for names in [
+            requested(&["photos", "phone"]),
+            requested(&["phone", "photos"]),
+        ] {
+            set_board_databases(&mut dbs.index_conn, &ctx, 1, &names, T0 + 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                rows_of(&mut dbs.index_conn, 1).await,
+                vec![("uuid_p".into(), "photos".into(), T0)],
+                "one database is one row, and the carried one keeps its time"
+            );
+        }
+    }
+
+    // The rebuilt-database case, which is why carrying takes ALL the rows a
+    // name has: a remake mints a fresh UUID, so the board ends up with two
+    // rows called `default`. Naming it must keep both — the older row is
+    // history the server could not write again.
+    #[tokio::test]
+    async fn one_name_carries_every_row_stamped_under_it() {
+        let mut dbs = setup_test_databases().await;
+        stamp(&mut dbs.index_conn, 1, "uuid_old", "default", "inst", T0).await;
+        stamp(&mut dbs.index_conn, 1, "uuid_new", "default", "inst", T0 + 5).await;
+        let ctx = AssociationContext::for_tests(
+            Some("uuid_new"),
+            Some("inst"),
+            "default",
+            LocalDbIdentities::for_tests(&[("default", "uuid_new")], false),
+        );
+
         set_board_databases(
             &mut dbs.index_conn,
             &ctx,
             1,
-            &["photos".to_string(), "phone".to_string()],
+            &requested(&["default"]),
             T0 + 10,
         )
         .await
         .unwrap();
+        assert_eq!(
+            rows_of(&mut dbs.index_conn, 1).await,
+            vec![
+                ("uuid_new".into(), "default".into(), T0 + 5),
+                ("uuid_old".into(), "default".into(), T0),
+            ],
+            "both rows are kept, and neither is re-stamped"
+        );
+    }
 
-        let rows = fetch_stamps(&mut dbs.index_conn, &[1])
+    // Carrying alone could never re-point a stale stamp: the stored row names
+    // a database that no longer holds that UUID, and no request can conjure
+    // the new one. Naming it therefore does both — keeps the history row and
+    // stamps the live database the name refers to now, in one operation.
+    // (This is also what the backfill tool applies through.)
+    #[tokio::test]
+    async fn naming_a_stale_stamp_also_stamps_the_live_database() {
+        let mut dbs = setup_test_databases().await;
+        stamp(&mut dbs.index_conn, 1, "uuid_old", "default", "inst", T0).await;
+        let ctx = AssociationContext::for_tests(
+            Some("uuid_new"),
+            Some("inst"),
+            "default",
+            LocalDbIdentities::for_tests(&[("default", "uuid_new")], false),
+        );
+
+        set_board_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            1,
+            &requested(&["default"]),
+            T0 + 10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_of(&mut dbs.index_conn, 1).await,
+            vec![
+                ("uuid_new".into(), "default".into(), T0 + 10),
+                ("uuid_old".into(), "default".into(), T0),
+            ],
+            "the stale row is kept as history; the live database is stamped now"
+        );
+    }
+
+    // A database that could not be interrogated must not cost the editor the
+    // database being VIEWED: its identity came off the open connection, not
+    // off the probe, so it resolves regardless — and a request naming it is
+    // not reported back as an unknown name.
+    #[tokio::test]
+    async fn the_current_database_resolves_even_when_probes_are_unknown() {
+        let mut dbs = setup_test_databases().await;
+        let ctx = AssociationContext::for_tests(
+            Some("uuid_here"),
+            Some("inst"),
+            "default",
+            LocalDbIdentities::for_tests(&[], true),
+        );
+
+        set_board_databases(&mut dbs.index_conn, &ctx, 1, &requested(&["default"]), T0)
             .await
-            .unwrap()
-            .remove(&1)
             .unwrap();
         assert_eq!(
-            rows.len(),
-            1,
-            "one database is one row, whatever it is called"
+            rows_of(&mut dbs.index_conn, 1).await,
+            vec![("uuid_here".into(), "default".into(), T0)]
         );
-        assert_eq!(rows[0].db_name, "phone", "the last name given wins");
+
+        // Anything else is still unresolvable, and is named as the problem.
+        let err = set_board_databases(&mut dbs.index_conn, &ctx, 1, &requested(&["archive"]), T0)
+            .await
+            .expect_err("an unprobeable database cannot be named");
+        assert!(err.detail().contains("archive"), "got {}", err.detail());
+    }
+
+    // A name with stored rows but no local database is carry-only, not an
+    // error: keeping a retired database's history is exactly what the editor
+    // is for. A name with neither is still refused.
+    #[tokio::test]
+    async fn a_stamped_name_that_resolves_to_nothing_is_carried_not_refused() {
+        let mut dbs = setup_test_databases().await;
+        stamp(&mut dbs.index_conn, 1, "uuid_gone", "retired", "inst", T0).await;
+        let ctx = AssociationContext::for_tests(
+            Some("uuid_here"),
+            Some("inst"),
+            "default",
+            LocalDbIdentities::for_tests(&[("default", "uuid_here")], false),
+        );
+
+        set_board_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            1,
+            &requested(&["retired"]),
+            T0 + 10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_of(&mut dbs.index_conn, 1).await,
+            vec![("uuid_gone".into(), "retired".into(), T0)]
+        );
+
+        assert!(
+            set_board_databases(&mut dbs.index_conn, &ctx, 1, &requested(&["never"]), T0 + 10)
+                .await
+                .is_err()
+        );
     }
 
     // A board nobody stamped and nothing overlaps is simply not associated,

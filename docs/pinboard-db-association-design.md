@@ -315,7 +315,12 @@ verdict is what persists, never a permissive one.
 ## API changes
 
 All under the pinboards authorization domain (a policy denying pinboards
-denies these).
+denies these). The client's `pinboards` capability is probed as `POST
+/api/pinboards`, which stands in for the whole write surface under
+path-scoped policies — the shipped kind. A ruleset that splits *methods*
+within `/api/pinboards` (granting POST but not PUT, say) would desync the
+probe from the editor endpoint; that is out of scope here, as it is for
+every other pinboard write.
 
 - `GET /api/pinboards` — new query param `associated_only: bool`
   (default false; the client sends its stored preference). New per-board
@@ -334,13 +339,42 @@ denies these).
 - `PUT /api/pinboards/{pinboard_id}/databases` — the manual editor: body
   is a list of DB names; the server replaces the board's rows
   (clear-then-set, like flags restore). Resolution semantics (settled
-  2026-08-08 — naive clear-then-set can't keep an unresolvable name, since
-  the server can't mint a row for it): a name matching an **existing
-  stamped row** carries that row through verbatim; only genuinely new names
-  must resolve to a local DB (`(db_uuid, db_name, instance_uuid)`), and an
-  unknown-and-unresolvable name is a 400. Removing any stamped name —
+  2026-08-08, revised at implementation review the same day — naive
+  clear-then-set can't keep an unresolvable name, since the server can't
+  mint a row for it): a requested name means **"associate this board with
+  the live DB that name refers to here, *and* keep every stamp already
+  stored under it"** — both, not either:
+  - every stored row whose `db_name` equals the name is **carried through
+    verbatim** (identity, instance, `last_stamped`) — *all* of them, since
+    a rebuild leaves two rows sharing one name and neither can be
+    reconstructed;
+  - the name is **also resolved locally**, and if that DB is not already
+    among the carried rows it is stamped afresh
+    (`(db_uuid, db_name, instance_uuid)`, folder spelling, now). This is
+    the only way to re-point a stale same-named stamp at the rebuilt DB —
+    carrying alone can't, and the backfill tool needs it;
+  - a resolution landing on an already-carried UUID loses: the carried row
+    keeps its own `last_stamped`, and among competing fresh resolutions
+    the first requested wins — so **request order never changes which
+    databases the board ends up associated with** (only the residual
+    `db_name` hint on a fresh row can differ when two spellings resolve to
+    one UUID);
+  - a name with stored rows that resolves to nothing is carry-only (a
+    retired DB is a legitimate thing to keep); a name that neither matches
+    a stored row nor resolves is a 400.
+
+  The DB being viewed resolves even when its folder probe is Unknown, from
+  the identity read off the open connection (case-folded name compare; the
+  probe-backed exact-match lookup still wins first, so a case-only sibling
+  folder is never shadowed): a transiently unreadable file must not make
+  the editor refuse the very DB the request is running against (and then
+  blame the name for it). This needs the viewed DB to have an identity row
+  (post-migration) and the instance to have one to sign with — without
+  either, the name follows the ordinary resolve-or-400 path. Removing any
+  stamped name —
   resolvable or not — is expressed by omitting it. Write-domain endpoint;
-  does not bump `time_updated`.
+  does not bump `time_updated`. The payload is capped (name count, name
+  length) before the write transaction opens.
 
 ## UI
 
