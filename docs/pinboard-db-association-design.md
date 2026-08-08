@@ -394,7 +394,13 @@ every other pinboard write.
   switch is explicit in the URL, works identically for middle-click/new
   tab, and is trivially reversible. Never overridden when the current DB
   is itself associated. No click-time query — the list response already
-  carried everything.
+  carried everything. A non-associated board whose stamps resolve to no
+  local DB — the pre-backfill state, and the only case with no home to
+  link to — gets the same badge carrying "not from this database" instead
+  of a name, purely so it is not indistinguishable from a board that does
+  belong here; its click behaviour is unchanged, since there is nowhere to
+  send it (rendering its missing items as labelled placeholders is the
+  out-of-scope item below).
 - **Rot display**: `present_count`/`item_count` on cards when they differ
   ("38/40 here").
 - **Manual editor** — card context menu → "Databases": checklist of local
