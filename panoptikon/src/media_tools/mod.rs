@@ -13,6 +13,12 @@
 //! first-use download) never blocks the async runtime.
 
 pub(crate) mod outro;
+/// Driver for the outro-detector equivalence harness of design §12
+/// (`tools/outro-equivalence`). `cfg(test)` so the shipped binary gains no
+/// surface — and the only form with access to `outro`'s `pub(crate)` items,
+/// this crate having no library target.
+#[cfg(test)]
+mod outro_equivalence;
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
