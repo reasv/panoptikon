@@ -418,7 +418,10 @@ pre-existing board belongs to (principle 2). New users simply start with
 no associations; (c) plus create-stamping covers them going forward.
 
 For existing libraries (realistically: the author's ~100 boards), a
-one-off script under `tools/` driving the API:
+one-off script under `tools/` driving the API
+(`tools/pinboard-associations/run_backfill.py`, stdlib Python; the proposal
+computation is a pure function over the fetched JSON, with `--self-test`
+fixtures standing in for a gateway):
 
 1. Enumerate index DBs (`/api/db`), fetch all boards, compute the
    board × DB overlap matrix.
@@ -428,7 +431,13 @@ one-off script under `tools/` driving the API:
 3. Apply via the `PUT …/databases` endpoint.
 
 Boards at 100% overlap need no stamp at all (clause (c) admits them), so
-the review list is only the rotted-but-mine boards — small.
+the review list is only the rotted-but-mine boards — small. A board with
+plausible overlap in *two* databases (or a candidate on a board already at
+home somewhere) is printed but never written without an extra flag: that is
+principle 2 again — incidental sharing between unrelated databases is
+exactly what partial overlap cannot distinguish from membership. Because the
+PUT replaces, every proposal is sent as the board's existing stamped names
+plus the addition; the tool never removes an association.
 
 Rollout plan (2026-08-08): the backfill is run locally against the author's
 databases as part of shipping this feature — it is not left as a
