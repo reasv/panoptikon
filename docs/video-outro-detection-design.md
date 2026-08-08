@@ -1,11 +1,20 @@
 # Video outro detection (TikTok end cards)
 
-Status: **designed, not implemented**. Measurement and validation are done
-(2026-08-07) against real data; the numbers below are measured, not estimated.
-Re-validated 2026-08-08 over 2,703 files including 2025–26 material (§4.1);
-review resolutions (§7.1, §7.2) folded in the same day. Final round
-2026-08-08: API/PQL exposure decided in-scope (§6.3); first-scan backfill
-cost accepted as-is (§7).
+Status: **implemented and validated** (2026-08-08, five commits ending at the
+equivalence harness). Measurement and validation were done 2026-08-07 against
+real data; the numbers below are measured, not estimated. Re-validated
+2026-08-08 over 2,703 files including 2025–26 material (§4.1); review
+resolutions (§7.1, §7.2), the API/PQL scope decision (§6.3) and the
+first-scan backfill acceptance (§7) folded the same day. §12's equivalence
+requirement was executed at implementation time: 878 files (821 unique)
+sampled deterministically from `tiktok`/`camera` (positives) and
+`screenshots`/`default`/`rustest`/`rustest2` (negatives) — **zero verdict
+mismatches, zero K mismatches** (271 accepted, exact float equality),
+identical rejection-reason histograms per DB, identical error classes
+(3 files, 0.34%), zero acceptances in 578 negative rows, K clustering on
+2.00/3.00/4.00 with 98.5% within ±0.04. Detector:
+[`media_tools/outro.rs`](../panoptikon/src/media_tools/outro.rs); harness:
+[`tools/outro-equivalence/`](../tools/outro-equivalence/).
 
 ## 1. Problem
 
@@ -192,6 +201,15 @@ accept(K=run)
   seek and decoded the whole video. Harmless *only because* K is anchored to
   the end of the stream (§12) — but the decode loop must never assume
   ≤ 210 frames.
+- **As implemented, the height formula is the fallback, not the primary.**
+  Stored `items.width`/`height` are *coded* dimensions, while the filter
+  graph sees the auto-rotated size — deriving the height from stored dims is
+  wrong on every rotated phone capture, i.e. the `camera` population. The
+  Rust detector therefore parses the scaled geometry off ffmpeg's own
+  output-stream log line (byte-robust drain; `Stream #` lines inside the
+  `Output #` block only), and uses the formula above only as a fallback
+  corroborated against the received byte count (ambiguity → probe error,
+  never a guess).
 
 ## 4. Validation
 
@@ -352,7 +370,12 @@ the pre-outro range.
   absorbs the whole backfill — the probe pass *and* §7.1's thumbnail/frame
   regeneration for every newly positive item — in one go. Accepted as-is
   (settled 2026-08-08): no pacing, no per-scan cap; scan duration is not a
-  design input.
+  design input. Probe wall-clock is attributed to the existing thumbgen
+  phase (it is visuals work serving the clamp); no new timer phase exists.
+  One known cost asymmetry: the *continuous* scan has no DB handle at probe
+  time, so a file whose mtime moves is re-probed and its (identical) verdict
+  rewritten — §6.1's "negatives are never re-examined" holds for the batch
+  walker, and is cost-only, never wrong, for the watcher.
 - Frame/thumbnail generation clamps its sampling window to
   `[0, content_end_ms)` when set.
   Call sites: [`jobs/files.rs:4415`](../panoptikon/src/jobs/files.rs)
@@ -451,6 +474,15 @@ regenerated against the trimmed range — those stay trimmed until something els
 forces re-extraction. This is accepted (trimmed thumbnails are better
 regardless), but the UI description must not imply the switch undoes anything.
 
+As implemented, "consumers ignore the metadata" is literal: with the switch
+off, both the scan-side and extraction-side clamps stop reading the stored
+boundary, so a *regeneration* while off produces untrimmed visuals — the
+false-positive escape hatch. Note the hatch is scan-side only: extraction's
+frame cache (`storage.frames`) is returned before the gate is consulted, and
+§7.1's recovery path (erase `item_data`, re-run) does not clear that cache —
+undoing a false positive takes a scan-side regeneration, which is the only
+path that replaces `storage.frames`.
+
 ## 9. UI surface
 
 A switch-card in **Scan Configuration**, alongside Image/Video/Audio/PDF/HTML
@@ -525,3 +557,16 @@ identical verdicts and K values (the pql-equivalence discipline). Divergence
 risk concentrates in exactly two places — median semantics (numpy's median
 over an even-length axis averages the two middle values; the Rust side must
 match) and the `scale=48:-2` height rounding of §3.4.
+
+This was executed at implementation time (see Status) via
+[`tools/outro-equivalence/`](../tools/outro-equivalence/): a faithful §3.3
+Python reference plus a runner driving
+`media_tools::outro_equivalence` — an `#[ignore]`d `cfg(test)` entry point,
+the only form with access to the detector's `pub(crate)` surface in a
+bin-only crate, adding nothing to the shipped binary. Two operational
+requirements the harness enforces that this section originally did not
+name: both engines must be pinned to the **same ffmpeg binary** (the
+detector otherwise resolves the venv's static-ffmpeg — a different build
+would be a divergence blamed on the algorithm), and the Python reference
+must apply ffprobe's rotation side-data (coded dims vs auto-rotated filter
+graph, §3.4) before computing the scaled height.
