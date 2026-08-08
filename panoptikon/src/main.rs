@@ -35,7 +35,7 @@ use crate::jobs::inference_pool::{InferencePool, JobInferenceContext, set_job_in
 use anyhow::Context as _;
 use axum::{
     Router,
-    routing::{any, delete, get, post},
+    routing::{any, delete, get, post, put},
 };
 use clap::Parser;
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -502,6 +502,10 @@ async fn async_main() -> anyhow::Result<()> {
                         get(api::pinboards::get_pinboard)
                             .patch(api::pinboards::update_pinboard)
                             .delete(api::pinboards::delete_pinboard),
+                    )
+                    .route(
+                        "/api/pinboards/{pinboard_id}/databases",
+                        put(api::pinboards::set_pinboard_databases),
                     )
                     .route(
                         "/api/pinboards/{pinboard_id}/versions",

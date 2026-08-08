@@ -579,6 +579,31 @@ pub(crate) async fn list_pinboards(
     Ok(summaries)
 }
 
+/// How many of one version's items exist in the current index database —
+/// the same count `list_pinboards` reports as `present_count`, asked for a
+/// version by id.
+///
+/// The save path's stamp decision reads it *after* the version is written, so
+/// what it measures is the overlap of the version the save is leaving behind:
+/// asking beforehand would measure the previous head, which is a different
+/// board.
+pub(crate) async fn version_present_count(
+    conn: &mut sqlx::SqliteConnection,
+    version_id: i64,
+) -> ApiResult<i64> {
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM user_data.pinboard_version_items i
+        WHERE i.version_id = ?
+          AND EXISTS (SELECT 1 FROM main.items x WHERE x.sha256 = i.sha256)
+        "#,
+    )
+    .bind(version_id)
+    .fetch_one(conn)
+    .await
+    .map_err(internal("Failed to count pinboard items present here"))
+}
+
 /// The identity row plus its full head version (layout included), or None if
 /// the board doesn't exist for this user.
 pub(crate) async fn get_pinboard(

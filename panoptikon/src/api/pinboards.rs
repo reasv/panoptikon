@@ -12,7 +12,9 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::api::db_params::DbQueryParams;
 use crate::api_error::ApiError;
-use crate::db::pinboard_dbs::{self, AssociationContext, BoardOverlap, PinboardAssociation};
+use crate::db::pinboard_dbs::{
+    self, AssociationContext, BoardOverlap, PinboardAssociation, StampIdentity,
+};
 use crate::db::pinboards::{self, PinboardOrder};
 use crate::db::{DbConnection, ReadOnly, UserDataWrite, open_user_data_write};
 
@@ -128,6 +130,18 @@ pub(crate) struct CreatePinboardRequest {
     version: SaveVersionRequest,
 }
 
+/// The manual editor's payload: exactly the databases the board should be
+/// associated with afterwards. An empty list clears every association.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct SetPinboardDatabasesRequest {
+    /// Index database names. A name the board is already stamped for keeps
+    /// that stamp untouched (including a name whose database no longer
+    /// exists, which the server could not mint again); any other name must
+    /// resolve to a local index database. Omitting a name removes it.
+    #[serde(default)]
+    databases: Vec<String>,
+}
+
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct RenamePinboardRequest {
     name: Option<String>,
@@ -190,6 +204,19 @@ pub(crate) struct PinboardDatabaseResponse {
     last_stamped: i64,
     /// Whether this row is the database currently selected.
     associated: bool,
+}
+
+/// A board's associations after the manual editor changed them — the same
+/// two fields the list and detail responses carry, so the client can update
+/// the card in place without re-listing.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PinboardDatabasesResponse {
+    /// Whether the board now belongs to the selected index database, by the
+    /// full rule (so it can still be true through 100% item overlap with no
+    /// stamp at all).
+    associated: bool,
+    /// The databases the board is stamped for, newest stamp first.
+    databases: Vec<PinboardDatabaseResponse>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -533,30 +560,22 @@ pub async fn create_pinboard(
 ) -> ApiResult<Json<SavePinboardResponse>> {
     let preview = validate_version_request(&request.version)?;
     let flags = canonical_flags(&request.version)?;
+    // Before the transaction on purpose: obtaining the identity reads the
+    // instance file and canonicalizes the name against the index folder
+    // listing, and this deployment keeps its data on a network mount — that
+    // is not work to do while holding the user_data write lock.
+    let identity = StampIdentity::load(&mut db.conn, &db.index_db).await;
 
     begin_transaction(&mut db.conn).await?;
-    let result: ApiResult<(i64, i64)> = async {
-        let pinboard_id = pinboards::create_pinboard(
-            &mut db.conn,
-            &query.user,
-            request.name.as_deref(),
-            flags.as_deref(),
-            unix_now(),
-        )
-        .await?;
-        let version_id = pinboards::append_version(
-            &mut db.conn,
-            pinboard_id,
-            &request.version.layout,
-            &request.version.items,
-            preview.bytes.as_deref(),
-            preview.width,
-            preview.height,
-            preview.screenful_h,
-        )
-        .await?;
-        Ok((pinboard_id, version_id))
-    }
+    let result = create_board_with_version(
+        &mut db.conn,
+        &query.user,
+        &request,
+        &preview,
+        flags.as_deref(),
+        identity.as_ref(),
+        unix_now(),
+    )
     .await;
 
     match result {
@@ -574,6 +593,41 @@ pub async fn create_pinboard(
             Err(err)
         }
     }
+}
+
+/// The create transaction's body: the board, its first version, and the stamp
+/// for the database it was made in.
+///
+/// Split out of the handler so tests can drive it with a synthetic identity —
+/// and with none at all, which is a process-global fact the real loader
+/// cannot be talked out of.
+async fn create_board_with_version(
+    conn: &mut sqlx::SqliteConnection,
+    user: &str,
+    request: &CreatePinboardRequest,
+    preview: &PreviewUpload,
+    flags: Option<&str>,
+    identity: Option<&StampIdentity>,
+    now: i64,
+) -> ApiResult<(i64, i64)> {
+    let pinboard_id =
+        pinboards::create_pinboard(conn, user, request.name.as_deref(), flags, now).await?;
+    let version_id = pinboards::append_version(
+        conn,
+        pinboard_id,
+        &request.version.layout,
+        &request.version.items,
+        preview.bytes.as_deref(),
+        preview.width,
+        preview.height,
+        preview.screenful_h,
+    )
+    .await?;
+    // Unconditional, unlike the save path's overlap test: the database a board
+    // is MADE in is the strongest signal there is, whether or not its items
+    // happen to be indexed here yet.
+    pinboard_dbs::stamp_current_db(conn, pinboard_id, identity, now).await?;
+    Ok((pinboard_id, version_id))
 }
 
 #[utoipa::path(
@@ -742,6 +796,84 @@ pub async fn update_pinboard(
 }
 
 #[utoipa::path(
+    put,
+    operation_id = "set_pinboard_databases",
+    path = "/api/pinboards/{pinboard_id}/databases",
+    tag = "pinboards",
+    summary = "Replace the databases a pinboard is associated with",
+    description = "Sets the board's database associations to exactly the names given, replacing whatever was there (an empty list clears them). This is the manual fix path every automatic verdict has: associations are hints, so renames, accidental stamps and instance-identity resets all need somewhere to go.\nA name the board is already stamped for is kept exactly as stored — including one whose database no longer exists locally, which the server has no way to mint again. Every other name must resolve to a local index database; one that resolves to nothing is a 400 and nothing is written. Removing a name is expressed by omitting it.\nThe board's `time_updated` is deliberately not bumped: an association is not a content change and must not reorder the library.",
+    params(
+        DbQueryParams,
+        ("pinboard_id" = i64, Path, description = "The pinboard id"),
+        PinboardUserQuery
+    ),
+    request_body(content = SetPinboardDatabasesRequest),
+    responses(
+        (status = 200, description = "The board's associations after the change", body = PinboardDatabasesResponse),
+        (status = 400, description = "A name that is neither already stamped nor a local index database"),
+        (status = 404, description = "Pinboard not found")
+    )
+)]
+pub async fn set_pinboard_databases(
+    mut db: DbConnection<UserDataWrite>,
+    Path(pinboard_id): Path<i64>,
+    Query(query): Query<PinboardUserQuery>,
+    Json(request): Json<SetPinboardDatabasesRequest>,
+) -> ApiResult<Json<PinboardDatabasesResponse>> {
+    // Before the transaction: building the context probes the local database
+    // files, which is not work to do while holding the write lock. It is also
+    // what resolves the names, and what computes the response's verdict.
+    let ctx = AssociationContext::load(&mut db.conn, &db.index_db).await;
+
+    begin_transaction(&mut db.conn).await?;
+    let result = replace_board_databases(
+        &mut db.conn,
+        &ctx,
+        pinboard_id,
+        &query.user,
+        &request.databases,
+        unix_now(),
+    )
+    .await;
+    match result {
+        Ok(()) => commit_transaction(&mut db.conn).await?,
+        Err(err) => {
+            let _ = rollback_transaction(&mut db.conn).await;
+            return Err(err);
+        }
+    }
+
+    // Re-read rather than reason about what was written: the response is the
+    // full verdict, which the overlap clause can satisfy with no stamp at all.
+    let Some((summary, _)) =
+        pinboards::get_pinboard(&mut db.conn, pinboard_id, &query.user).await?
+    else {
+        return Err(ApiError::not_found("Pinboard not found"));
+    };
+    let association = board_association(&mut db.conn, &ctx, &summary).await?;
+    Ok(Json(PinboardDatabasesResponse {
+        associated: association.associated,
+        databases: map_databases(association.databases),
+    }))
+}
+
+/// The manual editor's transaction body: the ownership check, then the
+/// replacement. Split out of the handler so tests can drive both.
+async fn replace_board_databases(
+    conn: &mut sqlx::SqliteConnection,
+    ctx: &AssociationContext,
+    pinboard_id: i64,
+    user: &str,
+    names: &[String],
+    now: i64,
+) -> ApiResult<()> {
+    if !pinboards::pinboard_exists(&mut *conn, pinboard_id, user).await? {
+        return Err(ApiError::not_found("Pinboard not found"));
+    }
+    pinboard_dbs::set_board_databases(conn, ctx, pinboard_id, names, now).await
+}
+
+#[utoipa::path(
     delete,
     operation_id = "delete_pinboard",
     path = "/api/pinboards/{pinboard_id}",
@@ -839,65 +971,22 @@ pub async fn save_pinboard_version(
 ) -> ApiResult<Json<SavePinboardResponse>> {
     let preview = validate_version_request(&request)?;
     let flags = canonical_flags(&request)?;
+    // Outside the transaction, for the reason create_pinboard states.
+    let identity = StampIdentity::load(&mut db.conn, &db.index_db).await;
 
     begin_transaction(&mut db.conn).await?;
-    let result: ApiResult<SavePinboardResponse> = async {
-        if !pinboards::pinboard_exists(&mut db.conn, pinboard_id, &query.user).await? {
-            return Err(ApiError::not_found("Pinboard not found"));
-        }
-
-        if let Some((head_version_id, head_layout)) =
-            pinboards::get_head_layout(&mut db.conn, pinboard_id, &query.user).await?
-        {
-            let incoming = serde_json::to_string(&request.layout)
-                .map_err(|_| ApiError::bad_request("Invalid layout"))?;
-            if incoming == head_layout {
-                // Settings-only save: the layout no-ops but the board's
-                // flags still advance to what the client sent.
-                let flags_updated = match flags.as_deref() {
-                    Some(flags) => {
-                        pinboards::set_flags(&mut db.conn, pinboard_id, &query.user, flags).await?
-                    }
-                    None => false,
-                };
-                // A save is a deliberate act even when the layout no-ops,
-                // so it still counts as activity (the frecency half of it
-                // is debounced, so an editing session is one visit).
-                pinboards::touch_saved(&mut db.conn, pinboard_id, &query.user, unix_now()).await?;
-                return Ok(SavePinboardResponse {
-                    pinboard_id,
-                    version_id: head_version_id,
-                    no_op: true,
-                    flags_updated,
-                });
-            }
-        }
-
-        let version_id = pinboards::append_version(
-            &mut db.conn,
-            pinboard_id,
-            &request.layout,
-            &request.items,
-            preview.bytes.as_deref(),
-            preview.width,
-            preview.height,
-            preview.screenful_h,
-        )
-        .await?;
-        let flags_updated = match flags.as_deref() {
-            Some(flags) => {
-                pinboards::set_flags(&mut db.conn, pinboard_id, &query.user, flags).await?
-            }
-            None => false,
-        };
-        pinboards::touch_saved(&mut db.conn, pinboard_id, &query.user, unix_now()).await?;
-        Ok(SavePinboardResponse {
-            pinboard_id,
-            version_id,
-            no_op: false,
-            flags_updated,
-        })
-    }
+    let result = save_version(
+        &mut db.conn,
+        pinboard_id,
+        &query.user,
+        SaveInputs {
+            request: &request,
+            preview: &preview,
+            flags: flags.as_deref(),
+            identity: identity.as_ref(),
+        },
+        unix_now(),
+    )
     .await;
 
     match result {
@@ -910,6 +999,116 @@ pub async fn save_pinboard_version(
             Err(err)
         }
     }
+}
+
+/// Everything the save transaction needs besides the board it is saving.
+/// Grouped so the body keeps a signature a reader can hold in their head.
+struct SaveInputs<'a> {
+    request: &'a SaveVersionRequest,
+    preview: &'a PreviewUpload,
+    flags: Option<&'a str>,
+    /// The current database's stamp identity, or `None` when there is none to
+    /// write (see `StampIdentity::load`).
+    identity: Option<&'a StampIdentity>,
+}
+
+/// The save transaction's body, both paths of it: a new version, or the
+/// settings-only no-op. Split out of the handler so tests can drive it with a
+/// synthetic identity.
+async fn save_version(
+    conn: &mut sqlx::SqliteConnection,
+    pinboard_id: i64,
+    user: &str,
+    inputs: SaveInputs<'_>,
+    now: i64,
+) -> ApiResult<SavePinboardResponse> {
+    let SaveInputs {
+        request,
+        preview,
+        flags,
+        identity,
+    } = inputs;
+    if !pinboards::pinboard_exists(&mut *conn, pinboard_id, user).await? {
+        return Err(ApiError::not_found("Pinboard not found"));
+    }
+
+    if let Some((head_version_id, head_layout)) =
+        pinboards::get_head_layout(&mut *conn, pinboard_id, user).await?
+    {
+        let incoming = serde_json::to_string(&request.layout)
+            .map_err(|_| ApiError::bad_request("Invalid layout"))?;
+        if incoming == head_layout {
+            // Settings-only save: the layout no-ops but the board's flags
+            // still advance to what the client sent.
+            let flags_updated = match flags {
+                Some(flags) => pinboards::set_flags(&mut *conn, pinboard_id, user, flags).await?,
+                None => false,
+            };
+            // A save is a deliberate act even when the layout no-ops, so it
+            // still counts as activity (the frecency half of it is debounced,
+            // so an editing session is one visit) — and, for the same reason,
+            // it still stamps. The head is unchanged here, so the overlap the
+            // stamp test reads is that unchanged head's.
+            pinboards::touch_saved(&mut *conn, pinboard_id, user, now).await?;
+            stamp_if_present_here(conn, pinboard_id, head_version_id, identity, now).await?;
+            return Ok(SavePinboardResponse {
+                pinboard_id,
+                version_id: head_version_id,
+                no_op: true,
+                flags_updated,
+            });
+        }
+    }
+
+    let version_id = pinboards::append_version(
+        &mut *conn,
+        pinboard_id,
+        &request.layout,
+        &request.items,
+        preview.bytes.as_deref(),
+        preview.width,
+        preview.height,
+        preview.screenful_h,
+    )
+    .await?;
+    let flags_updated = match flags {
+        Some(flags) => pinboards::set_flags(&mut *conn, pinboard_id, user, flags).await?,
+        None => false,
+    };
+    pinboards::touch_saved(&mut *conn, pinboard_id, user, now).await?;
+    stamp_if_present_here(conn, pinboard_id, version_id, identity, now).await?;
+    Ok(SavePinboardResponse {
+        pinboard_id,
+        version_id,
+        no_op: false,
+        flags_updated,
+    })
+}
+
+/// The save path's stamp: the current database is recorded only if some item
+/// of the head version actually exists in it.
+///
+/// Zero overlap means the save happened under a mistakenly-selected database,
+/// and recording that would hand the board to a database it has nothing to do
+/// with. (Partial overlap is deliberately enough — it is a mistake guard, not
+/// a membership test, which principle 2 says partial overlap can never be.)
+///
+/// `version_id` must be the head as it stands *after* this save, so the count
+/// measures the board being left behind rather than the one being replaced.
+async fn stamp_if_present_here(
+    conn: &mut sqlx::SqliteConnection,
+    pinboard_id: i64,
+    version_id: i64,
+    identity: Option<&StampIdentity>,
+    now: i64,
+) -> ApiResult<()> {
+    if identity.is_none() {
+        return Ok(());
+    }
+    if pinboards::version_present_count(&mut *conn, version_id).await? == 0 {
+        return Ok(());
+    }
+    pinboard_dbs::stamp_current_db(conn, pinboard_id, identity, now).await
 }
 
 #[utoipa::path(
@@ -1653,6 +1852,342 @@ mod tests {
         assert_eq!(association.databases[0].name, "archive");
     }
 
+    /// The board's stamp rows exactly as stored, by name.
+    async fn stamps(
+        conn: &mut sqlx::SqliteConnection,
+        pinboard_id: i64,
+    ) -> Vec<(String, String, String, i64)> {
+        use sqlx::Row as _;
+        sqlx::query(
+            r#"
+            SELECT db_uuid, db_name, instance_uuid, last_stamped
+            FROM user_data.pinboard_databases
+            WHERE pinboard_id = ?
+            ORDER BY db_name
+            "#,
+        )
+        .bind(pinboard_id)
+        .fetch_all(conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("db_uuid"),
+                row.get::<String, _>("db_name"),
+                row.get::<String, _>("instance_uuid"),
+                row.get::<i64, _>("last_stamped"),
+            )
+        })
+        .collect()
+    }
+
+    /// A stamp row as the tests spell one out.
+    fn stamp_row(
+        db_uuid: &str,
+        db_name: &str,
+        instance_uuid: &str,
+        last_stamped: i64,
+    ) -> (String, String, String, i64) {
+        (
+            db_uuid.to_string(),
+            db_name.to_string(),
+            instance_uuid.to_string(),
+            last_stamped,
+        )
+    }
+
+    async fn time_updated_of(conn: &mut sqlx::SqliteConnection, pinboard_id: i64) -> String {
+        pinboards::get_pinboard(conn, pinboard_id, "user")
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .time_updated
+    }
+
+    /// The identity of the database `current_db()` describes — what a save or
+    /// a create running against it stamps.
+    fn current_identity() -> StampIdentity {
+        StampIdentity::for_tests("uuid_here", "default", "inst")
+    }
+
+    /// Creates a board through the create handler's transaction body, so the
+    /// stamp under test is the one the endpoint writes.
+    async fn create_through_handler(
+        conn: &mut sqlx::SqliteConnection,
+        records: &[&str],
+        items: &[&str],
+        identity: Option<&StampIdentity>,
+        now: i64,
+    ) -> i64 {
+        let request = CreatePinboardRequest {
+            name: None,
+            version: save_request(records, items),
+        };
+        let preview = validate_version_request(&request.version).unwrap();
+        create_board_with_version(conn, "user", &request, &preview, None, identity, now)
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// Saves through the save handler's transaction body, same reason.
+    async fn save_through_handler(
+        conn: &mut sqlx::SqliteConnection,
+        pinboard_id: i64,
+        records: &[&str],
+        items: &[&str],
+        identity: Option<&StampIdentity>,
+        now: i64,
+    ) -> SavePinboardResponse {
+        let request = save_request(records, items);
+        let preview = validate_version_request(&request).unwrap();
+        save_version(
+            conn,
+            pinboard_id,
+            "user",
+            SaveInputs {
+                request: &request,
+                preview: &preview,
+                flags: None,
+                identity,
+            },
+            now,
+        )
+        .await
+        .unwrap()
+    }
+
+    // Ensures a board is stamped for the database it was made in — the
+    // strongest signal there is, so it is recorded unconditionally: this board
+    // has not one item indexed here and is stamped anyway.
+    #[tokio::test]
+    async fn create_stamps_the_database_it_was_made_in() {
+        let mut dbs = setup_test_databases().await;
+        let identity = current_identity();
+        let board = create_through_handler(
+            &mut dbs.index_conn,
+            &["v2", "a"],
+            &["beef"],
+            Some(&identity),
+            T0,
+        )
+        .await;
+
+        assert_eq!(
+            stamps(&mut dbs.index_conn, board).await,
+            vec![stamp_row("uuid_here", "default", "inst", T0)]
+        );
+        // ...and it is associated on the strength of that alone, with no
+        // overlap whatsoever.
+        let ctx = current_db();
+        assert!(
+            association_of(&mut dbs.index_conn, &ctx, board)
+                .await
+                .associated
+        );
+    }
+
+    // Ensures a deployment with no identity to sign a stamp with writes NO
+    // ROW rather than a sentinel one: an empty instance_uuid would compare
+    // equal across every identity-less instance, so the name fallback would
+    // match any same-named database anywhere. Creation itself must still work.
+    #[tokio::test]
+    async fn create_without_an_identity_writes_no_row_at_all() {
+        let mut dbs = setup_test_databases().await;
+        let board =
+            create_through_handler(&mut dbs.index_conn, &["v2", "a"], &["a1"], None, T0).await;
+
+        assert!(stamps(&mut dbs.index_conn, board).await.is_empty());
+        let (summary, head) = pinboards::get_pinboard(&mut dbs.index_conn, board, "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(head.is_some(), "the board itself must still have been made");
+        assert_eq!(summary.version_count, 1);
+    }
+
+    // Ensures a save records the current database only when something of the
+    // board is actually here: a save under a mistakenly-selected database
+    // (zero overlap) must not hand it that board, while any overlap at all is
+    // enough — this is a mistake guard, not a membership test.
+    #[tokio::test]
+    async fn save_stamps_only_when_something_of_the_board_is_here() {
+        let mut dbs = setup_test_databases().await;
+        index_item(&mut dbs.index_conn, "a1").await;
+        let identity = current_identity();
+        let board =
+            create_through_handler(&mut dbs.index_conn, &["v2", "a"], &["beef"], None, T0).await;
+
+        // Nothing of this version exists here: no stamp.
+        let saved = save_through_handler(
+            &mut dbs.index_conn,
+            board,
+            &["v2", "b"],
+            &["beef", "dead"],
+            Some(&identity),
+            T0 + 10,
+        )
+        .await;
+        assert!(!saved.no_op);
+        assert!(stamps(&mut dbs.index_conn, board).await.is_empty());
+
+        // The overlap that decides is the INCOMING version's, not the one the
+        // save is replacing: this payload is the first with an item here.
+        save_through_handler(
+            &mut dbs.index_conn,
+            board,
+            &["v2", "c"],
+            &["a1", "beef"],
+            Some(&identity),
+            T0 + 20,
+        )
+        .await;
+        assert_eq!(
+            stamps(&mut dbs.index_conn, board).await,
+            vec![stamp_row("uuid_here", "default", "inst", T0 + 20)]
+        );
+
+        // A later save refreshes the row rather than adding a second.
+        save_through_handler(
+            &mut dbs.index_conn,
+            board,
+            &["v2", "d"],
+            &["a1"],
+            Some(&identity),
+            T0 + 30,
+        )
+        .await;
+        assert_eq!(
+            stamps(&mut dbs.index_conn, board).await,
+            vec![stamp_row("uuid_here", "default", "inst", T0 + 30)]
+        );
+
+        // And with no identity to sign with, a save writes nothing either.
+        let other =
+            create_through_handler(&mut dbs.index_conn, &["v2", "e"], &["a1"], None, T0).await;
+        save_through_handler(
+            &mut dbs.index_conn,
+            other,
+            &["v2", "f"],
+            &["a1"],
+            None,
+            T0 + 40,
+        )
+        .await;
+        assert!(stamps(&mut dbs.index_conn, other).await.is_empty());
+    }
+
+    // Ensures a settings-only save stamps too (a save is a deliberate act,
+    // same reasoning as touch_saved) — reading the overlap of the unchanged
+    // head, since there is no new version — and that stamping does not bump
+    // time_updated: an association is not a content change and must not
+    // reorder the library.
+    #[tokio::test]
+    async fn a_settings_only_save_stamps_without_reordering_the_library() {
+        let mut dbs = setup_test_databases().await;
+        index_item(&mut dbs.index_conn, "a1").await;
+        let identity = current_identity();
+        let board =
+            create_through_handler(&mut dbs.index_conn, &["v2", "a"], &["a1"], None, T0).await;
+        let time_updated = time_updated_of(&mut dbs.index_conn, board).await;
+
+        let saved = save_through_handler(
+            &mut dbs.index_conn,
+            board,
+            &["v2", "a"],
+            &["a1"],
+            Some(&identity),
+            T0 + 10,
+        )
+        .await;
+        assert!(saved.no_op, "an identical layout must not mint a version");
+        assert_eq!(
+            stamps(&mut dbs.index_conn, board).await,
+            vec![stamp_row("uuid_here", "default", "inst", T0 + 10)]
+        );
+        assert_eq!(
+            time_updated_of(&mut dbs.index_conn, board).await,
+            time_updated,
+            "a stamp must not reorder the library"
+        );
+
+        // The head's own overlap is what decides here: a board with nothing
+        // present gets no stamp from a settings-only save either.
+        let rotted =
+            create_through_handler(&mut dbs.index_conn, &["v2", "b"], &["beef"], None, T0).await;
+        let saved = save_through_handler(
+            &mut dbs.index_conn,
+            rotted,
+            &["v2", "b"],
+            &["beef"],
+            Some(&identity),
+            T0 + 10,
+        )
+        .await;
+        assert!(saved.no_op);
+        assert!(stamps(&mut dbs.index_conn, rotted).await.is_empty());
+    }
+
+    // Ensures opening a board never associates it. Opening a FOREIGN board is
+    // exactly how a wrongly-selected database would collect other databases'
+    // boards, so the open path (the detail read plus the activity write it
+    // spawns) must leave the stamps alone — both by not adding one and by not
+    // refreshing one that is there.
+    #[tokio::test]
+    async fn opening_a_board_never_stamps_it() {
+        let mut dbs = setup_test_databases().await;
+        index_item(&mut dbs.index_conn, "a1").await;
+        let identity = current_identity();
+        let stamped = create_through_handler(
+            &mut dbs.index_conn,
+            &["v2", "a"],
+            &["a1"],
+            Some(&identity),
+            T0,
+        )
+        .await;
+        let unstamped =
+            create_through_handler(&mut dbs.index_conn, &["v2", "b"], &["a1"], None, T0).await;
+
+        let now = T0 + 3 * 60 * 60;
+        for board in [stamped, unstamped] {
+            let (summary, _) = pinboards::get_pinboard(&mut dbs.index_conn, board, "user")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(pinboards::activity_due(summary.frecency_at, now));
+            pinboards::record_open(
+                &mut dbs.index_conn,
+                board,
+                "user",
+                now,
+                summary.frecency,
+                summary.frecency_at,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            stamps(&mut dbs.index_conn, stamped).await,
+            vec![stamp_row("uuid_here", "default", "inst", T0)],
+            "an open must not even refresh an existing stamp"
+        );
+        assert!(stamps(&mut dbs.index_conn, unstamped).await.is_empty());
+        // The open itself was recorded, so this is not a test of nothing.
+        assert_eq!(
+            pinboards::get_pinboard(&mut dbs.index_conn, stamped, "user")
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .last_seen,
+            Some(now)
+        );
+    }
+
     /// The association of one board, as the detail endpoint computes it.
     async fn association_of(
         conn: &mut sqlx::SqliteConnection,
@@ -1664,6 +2199,276 @@ mod tests {
             .unwrap()
             .unwrap();
         board_association(conn, ctx, &summary).await.unwrap()
+    }
+
+    /// The editor's payload.
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// Drives the manual editor's transaction body — the ownership check and
+    /// the replacement, exactly as the endpoint runs them.
+    async fn set_databases(
+        conn: &mut sqlx::SqliteConnection,
+        ctx: &AssociationContext,
+        pinboard_id: i64,
+        user: &str,
+        requested: &[&str],
+        now: i64,
+    ) -> ApiResult<()> {
+        replace_board_databases(conn, ctx, pinboard_id, user, &names(requested), now).await
+    }
+
+    fn status_of(err: ApiError) -> axum::http::StatusCode {
+        use axum::response::IntoResponse as _;
+        err.into_response().status()
+    }
+
+    // The editor's core contract. A stamped name whose database is GONE
+    // cannot be re-derived by the server, so keeping it has to mean carrying
+    // the stored row through verbatim — identity, instance and last_stamped
+    // alike, the last being the honest record of when the board really was
+    // stamped for it. A genuinely new name resolves to a local database, and
+    // removal is expressed by omission (including removing the unresolvable
+    // one, which is the whole point of the editor existing).
+    #[tokio::test]
+    async fn the_editor_carries_stamped_names_through_and_resolves_new_ones() {
+        let mut dbs = setup_test_databases().await;
+        let board =
+            create_through_handler(&mut dbs.index_conn, &["v2", "a"], &["beef"], None, T0).await;
+        crate::db::pinboard_dbs::stamp_for_tests(
+            &mut dbs.index_conn,
+            board,
+            "uuid_retired",
+            "retired",
+            "inst",
+            T0,
+        )
+        .await;
+        let ctx = current_db();
+
+        set_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            board,
+            "user",
+            &["retired", "default"],
+            T0 + 100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stamps(&mut dbs.index_conn, board).await,
+            vec![
+                stamp_row("uuid_here", "default", "inst", T0 + 100),
+                stamp_row("uuid_retired", "retired", "inst", T0),
+            ],
+            "the unresolvable row keeps its own stamp time; the new one gets now"
+        );
+
+        // Dropping the unresolvable name is simply leaving it out.
+        set_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            board,
+            "user",
+            &["default"],
+            T0 + 200,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stamps(&mut dbs.index_conn, board).await,
+            vec![stamp_row("uuid_here", "default", "inst", T0 + 100)],
+            "a carried-through row is not re-stamped either"
+        );
+
+        // An empty list is a valid instruction: clear everything.
+        set_databases(&mut dbs.index_conn, &ctx, board, "user", &[], T0 + 300)
+            .await
+            .unwrap();
+        assert!(stamps(&mut dbs.index_conn, board).await.is_empty());
+        assert!(
+            !association_of(&mut dbs.index_conn, &ctx, board)
+                .await
+                .associated,
+            "a rotted board with its stamps cleared belongs nowhere"
+        );
+    }
+
+    // Ensures a new name is recorded under the FOLDER's spelling, not the
+    // client's: a stamp written as `Default` would never match a request
+    // running under `default`, splitting the name fallback in half.
+    #[tokio::test]
+    async fn the_editor_records_the_folders_own_spelling() {
+        let mut dbs = setup_test_databases().await;
+        let board =
+            create_through_handler(&mut dbs.index_conn, &["v2", "a"], &["beef"], None, T0).await;
+        let ctx = AssociationContext::for_tests(
+            Some("uuid_here"),
+            Some("inst"),
+            "Photos",
+            crate::db::local_dbs::LocalDbIdentities::for_tests(&[("Photos", "uuid_here")], false),
+        );
+
+        set_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            board,
+            "user",
+            &["photos"],
+            T0 + 100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stamps(&mut dbs.index_conn, board).await,
+            vec![stamp_row("uuid_here", "Photos", "inst", T0 + 100)]
+        );
+    }
+
+    // Ensures a name that is neither stamped nor local is refused rather than
+    // silently dropped — the editor's checklist would otherwise lose an entry
+    // with no explanation — and that the refusal writes nothing.
+    #[tokio::test]
+    async fn the_editor_rejects_a_name_it_cannot_resolve() {
+        let mut dbs = setup_test_databases().await;
+        let board =
+            create_through_handler(&mut dbs.index_conn, &["v2", "a"], &["beef"], None, T0).await;
+        crate::db::pinboard_dbs::stamp_for_tests(
+            &mut dbs.index_conn,
+            board,
+            "uuid_retired",
+            "retired",
+            "inst",
+            T0,
+        )
+        .await;
+        let ctx = current_db();
+
+        let err = set_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            board,
+            "user",
+            &["default", "nowhere"],
+            T0 + 100,
+        )
+        .await
+        .expect_err("an unknown name must be refused");
+        assert!(err.detail().contains("nowhere"), "got {}", err.detail());
+        assert_eq!(status_of(err), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            stamps(&mut dbs.index_conn, board).await,
+            vec![stamp_row("uuid_retired", "retired", "inst", T0)],
+            "a refused request must leave the board's stamps untouched"
+        );
+    }
+
+    // Ensures the no-identity degradation is exactly what the design says:
+    // no NEW stamps, but carrying stored rows through and clearing them still
+    // work — otherwise an identity-less deployment could never undo a stamp.
+    #[tokio::test]
+    async fn without_an_instance_identity_the_editor_can_still_carry_and_clear() {
+        let mut dbs = setup_test_databases().await;
+        let board =
+            create_through_handler(&mut dbs.index_conn, &["v2", "a"], &["beef"], None, T0).await;
+        crate::db::pinboard_dbs::stamp_for_tests(
+            &mut dbs.index_conn,
+            board,
+            "uuid_here",
+            "default",
+            "inst",
+            T0,
+        )
+        .await;
+        let ctx = AssociationContext::for_tests(
+            Some("uuid_here"),
+            None,
+            "default",
+            crate::db::local_dbs::LocalDbIdentities::for_tests(&[("default", "uuid_here")], false),
+        );
+
+        // The stored row is kept by naming it, even though nothing could mint
+        // it now.
+        set_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            board,
+            "user",
+            &["default"],
+            T0 + 100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stamps(&mut dbs.index_conn, board).await,
+            vec![stamp_row("uuid_here", "default", "inst", T0)]
+        );
+
+        // A name with no stored row cannot be signed, and says so.
+        let err = set_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            board,
+            "user",
+            &["default", "archive"],
+            T0 + 200,
+        )
+        .await
+        .expect_err("a new name needs an instance identity");
+        assert!(err.detail().contains("archive"), "got {}", err.detail());
+        assert!(
+            err.detail().contains("no identity"),
+            "the reason must be the missing instance identity: {}",
+            err.detail()
+        );
+
+        set_databases(&mut dbs.index_conn, &ctx, board, "user", &[], T0 + 300)
+            .await
+            .unwrap();
+        assert!(stamps(&mut dbs.index_conn, board).await.is_empty());
+    }
+
+    // Ensures the editor is user-scoped like every other pinboard mutation,
+    // and that it leaves time_updated alone — an association is not a content
+    // change, so editing one must not reorder the library.
+    #[tokio::test]
+    async fn the_editor_is_user_scoped_and_does_not_reorder_the_library() {
+        let mut dbs = setup_test_databases().await;
+        let board =
+            create_through_handler(&mut dbs.index_conn, &["v2", "a"], &["beef"], None, T0).await;
+        let ctx = current_db();
+        let time_updated = time_updated_of(&mut dbs.index_conn, board).await;
+
+        let err = set_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            board,
+            "other",
+            &["default"],
+            T0 + 100,
+        )
+        .await
+        .expect_err("another user's board must not be editable");
+        assert_eq!(status_of(err), axum::http::StatusCode::NOT_FOUND);
+        assert!(stamps(&mut dbs.index_conn, board).await.is_empty());
+
+        set_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            board,
+            "user",
+            &["default"],
+            T0 + 100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stamps(&mut dbs.index_conn, board).await.len(), 1);
+        assert_eq!(
+            time_updated_of(&mut dbs.index_conn, board).await,
+            time_updated
+        );
     }
 
     // Ensures user scoping hides other users' boards from every accessor.

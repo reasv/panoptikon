@@ -4080,6 +4080,90 @@
         }
       }
     },
+    "/api/pinboards/{pinboard_id}/databases": {
+      "put": {
+        "tags": [
+          "pinboards"
+        ],
+        "summary": "Replace the databases a pinboard is associated with",
+        "description": "Sets the board's database associations to exactly the names given, replacing whatever was there (an empty list clears them). This is the manual fix path every automatic verdict has: associations are hints, so renames, accidental stamps and instance-identity resets all need somewhere to go.\nA name the board is already stamped for is kept exactly as stored — including one whose database no longer exists locally, which the server has no way to mint again. Every other name must resolve to a local index database; one that resolves to nothing is a 400 and nothing is written. Removing a name is expressed by omitting it.\nThe board's `time_updated` is deliberately not bumped: an association is not a content change and must not reorder the library.",
+        "operationId": "set_pinboard_databases",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "pinboard_id",
+            "in": "path",
+            "description": "The pinboard id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "user",
+            "in": "query",
+            "description": "The user the pinboard belongs to.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "user"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPinboardDatabasesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The board's associations after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PinboardDatabasesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A name that is neither already stamped nor a local index database"
+          },
+          "404": {
+            "description": "Pinboard not found"
+          }
+        }
+      }
+    },
     "/api/pinboards/{pinboard_id}/versions": {
       "get": {
         "tags": [
@@ -8165,6 +8249,27 @@
           }
         }
       },
+      "PinboardDatabasesResponse": {
+        "type": "object",
+        "description": "A board's associations after the manual editor changed them — the same\ntwo fields the list and detail responses carry, so the client can update\nthe card in place without re-listing.",
+        "required": [
+          "associated",
+          "databases"
+        ],
+        "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether the board now belongs to the selected index database, by the\nfull rule (so it can still be true through 100% item overlap with no\nstamp at all)."
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardDatabaseResponse"
+            },
+            "description": "The databases the board is stamped for, newest stamp first."
+          }
+        }
+      },
       "PinboardDeleteResponse": {
         "type": "object",
         "required": [
@@ -9788,6 +9893,19 @@
             }
           }
         ]
+      },
+      "SetPinboardDatabasesRequest": {
+        "type": "object",
+        "description": "The manual editor's payload: exactly the databases the board should be\nassociated with afterwards. An empty list clears every association.",
+        "properties": {
+          "databases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Index database names. A name the board is already stamped for keeps\nthat stamp untouched (including a name whose database no longer\nexists, which the server could not mint again); any other name must\nresolve to a local index database. Omitting a name removes it."
+          }
+        }
       },
       "SetterDataStats": {
         "type": "object",

@@ -197,6 +197,33 @@ impl LocalDbIdentities {
         self.claimed.values().any(|claimed| claimed == uuid)
     }
 
+    /// The identity claimed by the local index database `name` refers to,
+    /// together with the folder's **own spelling** — which is what a stamp
+    /// records, for the same reason [`canonical_index_db_name`] exists: two
+    /// spellings of one folder would split the name comparison of the match
+    /// rule's clause (b), and the stamps written under each, in half.
+    ///
+    /// This is the manual editor's resolver for a name it has no stamped row
+    /// for. `None` when nothing local answers to that name, when what does
+    /// claims no identity (a database that predates the identity migration —
+    /// there is no key to stamp), or when the name is ambiguous between two
+    /// folders differing only in case, which only a case-sensitive filesystem
+    /// can hold. All three are "cannot be resolved", which the editor reports
+    /// rather than guessing at.
+    pub(crate) fn claimed(&self, name: &str) -> Option<(&str, &str)> {
+        if let Some((folder, uuid)) = self.claimed.get_key_value(name) {
+            return Some((folder.as_str(), uuid.as_str()));
+        }
+        let mut folded = self
+            .claimed
+            .iter()
+            .filter(|(folder, _)| folder.eq_ignore_ascii_case(name));
+        match (folded.next(), folded.next()) {
+            (Some((folder, uuid)), None) => Some((folder.as_str(), uuid.as_str())),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn any_unknown(&self) -> bool {
         self.any_unknown
@@ -535,6 +562,26 @@ mod tests {
             !uncertain.is_dangling("uuid_gone"),
             "an unreadable database might be the claimant"
         );
+    }
+
+    // The manual editor's name resolver: a name resolves to the identity of
+    // the folder it refers to, under that folder's own spelling — the same
+    // canonicalization the match rule's name comparison uses, so a stamp
+    // written through the editor compares equal to one written by a save.
+    #[test]
+    fn a_name_resolves_to_the_folders_own_spelling_and_identity() {
+        let local = LocalDbIdentities::for_tests(&[("Photos", "uuid_p")], false);
+        assert_eq!(local.claimed("Photos"), Some(("Photos", "uuid_p")));
+        assert_eq!(local.claimed("photos"), Some(("Photos", "uuid_p")));
+        assert_eq!(local.claimed("gone"), None);
+
+        // An exact match wins over the case-folded one...
+        let cased =
+            LocalDbIdentities::for_tests(&[("photos", "uuid_a"), ("Photos", "uuid_b")], false);
+        assert_eq!(cased.claimed("photos"), Some(("photos", "uuid_a")));
+        // ...and with no exact match, an ambiguous name resolves to nothing
+        // rather than to a coin flip between two databases.
+        assert_eq!(cased.claimed("PHOTOS"), None);
     }
 
     // The name a request runs under is canonicalized to the folder's own

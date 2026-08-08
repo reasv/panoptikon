@@ -54,6 +54,49 @@ struct StampRow {
     last_stamped: i64,
 }
 
+/// The three identity columns a fresh stamp is written with: which database
+/// (its identity UUID), under what name, and who stamped it.
+///
+/// Obtaining one is all-or-nothing on purpose — see [`StampIdentity::load`].
+pub(crate) struct StampIdentity {
+    db_uuid: String,
+    db_name: String,
+    instance_uuid: String,
+}
+
+impl StampIdentity {
+    /// The identity of the index database this request is running against, or
+    /// `None` when either half is missing.
+    ///
+    /// **No instance identity, no stamp.** A row with an empty-string
+    /// `instance_uuid` would compare equal across every identity-less
+    /// instance, so clause (b) would match any same-named database anywhere —
+    /// which is the rejected "UUID OR (name AND dangling)" rule reintroduced
+    /// through the back door. Skipping the row costs clause (a) as well, and
+    /// that is the smaller loss: clause (c) still admits intact boards.
+    ///
+    /// The name is canonicalized to the folder's own spelling for the same
+    /// reason clause (b)'s comparison is: the configured default is trusted
+    /// unchecked, so a config saying `Default` would otherwise stamp rows a
+    /// request under `default` cannot match.
+    pub(crate) async fn load(conn: &mut sqlx::SqliteConnection, index_db: &str) -> Option<Self> {
+        Some(Self {
+            db_uuid: current_index_db_uuid(conn).await?,
+            db_name: canonical_index_db_name(index_db),
+            instance_uuid: instance_uuid()?.to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(db_uuid: &str, db_name: &str, instance_uuid: &str) -> Self {
+        Self {
+            db_uuid: db_uuid.to_string(),
+            db_name: db_name.to_string(),
+            instance_uuid: instance_uuid.to_string(),
+        }
+    }
+}
+
 /// A stamp row as the API reports it: the database's name as of the stamp
 /// (the residual hint that labels a link whose database is gone), when it was
 /// stamped, and whether it is the database currently being viewed.
@@ -129,6 +172,31 @@ impl AssociationContext {
         self.instance_uuid.as_deref() == Some(stamp.instance_uuid.as_str())
             && stamp.db_name == self.index_db
             && self.local.is_dangling(&stamp.db_uuid)
+    }
+
+    /// Whether this instance has an identity to sign a *new* stamp with. The
+    /// manual editor reports the difference: with no identity it can still
+    /// carry existing rows through and clear them, but it cannot mint one.
+    pub(crate) fn has_instance_identity(&self) -> bool {
+        self.instance_uuid.is_some()
+    }
+
+    /// The stamp a name the manual editor has no stored row for would become:
+    /// the local index database it names, under that folder's own spelling,
+    /// keyed by that database's identity and signed by this instance.
+    ///
+    /// `None` when the name resolves to no local database that claims an
+    /// identity, or when this instance has none to sign with — the same
+    /// no-identity-no-row rule as [`StampIdentity::load`], surfaced to the
+    /// editor as a rejected name rather than a silently dropped one.
+    pub(crate) fn resolve_name(&self, name: &str) -> Option<StampIdentity> {
+        let instance_uuid = self.instance_uuid.clone()?;
+        let (db_name, db_uuid) = self.local.claimed(name)?;
+        Some(StampIdentity {
+            db_uuid: db_uuid.to_string(),
+            db_name: db_name.to_string(),
+            instance_uuid,
+        })
     }
 
     /// A context that matches nothing by stamp, for tests and for callers
@@ -242,9 +310,175 @@ async fn fetch_stamps(
     Ok(grouped)
 }
 
-/// Writes a stamp row directly: the write points land in the next step, and
-/// the rule has to be exercised against every shape of stored row (here and
-/// in the API tests that drive the endpoints' association fields).
+/// Stamps `pinboard_id` for the database `identity` names, refreshing an
+/// existing row rather than duplicating it. `None` writes nothing at all —
+/// the no-identity-no-row rule, in the one place every write point goes
+/// through (see [`StampIdentity::load`]).
+///
+/// Runs inside the caller's transaction, and touches nothing but this table:
+/// an association is not a content change, so it must never bump
+/// `pinboards.time_updated` and reorder the library.
+pub(crate) async fn stamp_current_db(
+    conn: &mut sqlx::SqliteConnection,
+    pinboard_id: i64,
+    identity: Option<&StampIdentity>,
+    now: i64,
+) -> ApiResult<()> {
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    write_stamp(
+        conn,
+        pinboard_id,
+        &identity.db_uuid,
+        &identity.db_name,
+        &identity.instance_uuid,
+        now,
+    )
+    .await
+}
+
+/// Upserts one stamp row.
+///
+/// The conflict target is the table's primary key — one row per (board,
+/// database incarnation) — and re-stamping refreshes all three of the
+/// mutable columns: `last_stamped` because it is the "most recently stamped"
+/// order the client's opens-in link reads, `db_name` because a folder rename
+/// must update the residual hint (the identity is what matched, so the old
+/// name would now be a lie), and `instance_uuid` because the instance that
+/// last stamped it is the one clause (b) should ask about.
+async fn write_stamp(
+    conn: &mut sqlx::SqliteConnection,
+    pinboard_id: i64,
+    db_uuid: &str,
+    db_name: &str,
+    instance_uuid: &str,
+    last_stamped: i64,
+) -> ApiResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO user_data.pinboard_databases (
+            pinboard_id, db_uuid, db_name, instance_uuid, last_stamped
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (pinboard_id, db_uuid) DO UPDATE SET
+            db_name = excluded.db_name,
+            instance_uuid = excluded.instance_uuid,
+            last_stamped = excluded.last_stamped
+        "#,
+    )
+    .bind(pinboard_id)
+    .bind(db_uuid)
+    .bind(db_name)
+    .bind(instance_uuid)
+    .bind(last_stamped)
+    .execute(conn)
+    .await
+    .map_err(internal("Failed to stamp pinboard database"))?;
+    Ok(())
+}
+
+/// Replaces a board's stamps with exactly the databases `names` lists — the
+/// manual editor, and the endpoint the backfill tool applies through.
+///
+/// Clear-then-set, with one wrinkle that a naive replacement cannot express:
+/// a stamped name whose database is *gone* (deleted, or on another machine)
+/// cannot be re-derived, so the server could never mint the row again. Such a
+/// name is therefore **carried through verbatim** — same identity, same
+/// instance, same `last_stamped`, which stays the honest record of when the
+/// board was actually stamped for it. Only a genuinely new name has to
+/// resolve to a local database, and one that resolves to nothing is a
+/// rejection rather than a silent omission: the editor's checklist would
+/// otherwise lose an entry with no explanation. Removing a name — resolvable
+/// or not — is expressed by leaving it out.
+///
+/// Runs inside the caller's transaction, so a rejected name leaves the
+/// board's stamps exactly as they were.
+pub(crate) async fn set_board_databases(
+    conn: &mut sqlx::SqliteConnection,
+    ctx: &AssociationContext,
+    pinboard_id: i64,
+    names: &[String],
+    now: i64,
+) -> ApiResult<()> {
+    let existing = fetch_stamps(conn, &[pinboard_id])
+        .await?
+        .remove(&pinboard_id)
+        .unwrap_or_default();
+
+    let mut rows: Vec<StampRow> = Vec::with_capacity(names.len());
+    let mut seen: Vec<&str> = Vec::with_capacity(names.len());
+    let mut unresolved: Vec<&str> = Vec::new();
+    for name in names {
+        if seen.contains(&name.as_str()) {
+            continue;
+        }
+        seen.push(name);
+        // Matched against the name exactly as stored: that is the string the
+        // client was handed in the board's `databases` array, and a row whose
+        // database no longer exists has nothing else to be recognized by.
+        if let Some(stamp) = existing.iter().find(|stamp| stamp.db_name == *name) {
+            rows.push(StampRow {
+                pinboard_id,
+                db_uuid: stamp.db_uuid.clone(),
+                db_name: stamp.db_name.clone(),
+                instance_uuid: stamp.instance_uuid.clone(),
+                last_stamped: stamp.last_stamped,
+            });
+            continue;
+        }
+        match ctx.resolve_name(name) {
+            Some(identity) => rows.push(StampRow {
+                pinboard_id,
+                db_uuid: identity.db_uuid,
+                db_name: identity.db_name,
+                instance_uuid: identity.instance_uuid,
+                last_stamped: now,
+            }),
+            None => unresolved.push(name),
+        }
+    }
+
+    if !unresolved.is_empty() {
+        let names = unresolved.join(", ");
+        // Which of the two it is matters to the user: one is a typo or a
+        // database that is gone, the other is a deployment that cannot record
+        // associations at all until its identity file can be written.
+        return Err(ApiError::bad_request(if ctx.has_instance_identity() {
+            format!("Not an index database on this instance: {names}")
+        } else {
+            format!(
+                "This instance has no identity, so it cannot record new database \
+                 associations: {names}"
+            )
+        }));
+    }
+
+    sqlx::query("DELETE FROM user_data.pinboard_databases WHERE pinboard_id = ?")
+        .bind(pinboard_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(internal("Failed to update pinboard databases"))?;
+    for row in &rows {
+        // Upserted, not plainly inserted: two names can resolve to one
+        // database (a stamped name and the folder it was renamed to), and the
+        // primary key would reject the second.
+        write_stamp(
+            conn,
+            pinboard_id,
+            &row.db_uuid,
+            &row.db_name,
+            &row.instance_uuid,
+            row.last_stamped,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Writes a stamp row with an explicit timestamp, so the match rule can be
+/// exercised against every shape of stored row without going through a write
+/// point (here and in the API tests that drive the endpoints' fields).
 #[cfg(test)]
 pub(crate) async fn stamp_for_tests(
     conn: &mut sqlx::SqliteConnection,
@@ -254,20 +488,14 @@ pub(crate) async fn stamp_for_tests(
     instance_uuid: &str,
     last_stamped: i64,
 ) {
-    sqlx::query(
-        r#"
-        INSERT INTO user_data.pinboard_databases (
-            pinboard_id, db_uuid, db_name, instance_uuid, last_stamped
-        )
-        VALUES (?, ?, ?, ?, ?)
-        "#,
+    write_stamp(
+        conn,
+        pinboard_id,
+        db_uuid,
+        db_name,
+        instance_uuid,
+        last_stamped,
     )
-    .bind(pinboard_id)
-    .bind(db_uuid)
-    .bind(db_name)
-    .bind(instance_uuid)
-    .bind(last_stamped)
-    .execute(conn)
     .await
     .unwrap();
 }
@@ -526,6 +754,96 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![true, false]
         );
+    }
+
+    // Re-stamping the same database refreshes the one row instead of piling
+    // up duplicates (the primary key would reject them anyway) — and it
+    // refreshes the residual name too, so a renamed folder stops being
+    // labelled by the name it no longer has.
+    #[tokio::test]
+    async fn re_stamping_refreshes_the_row_it_already_wrote() {
+        let mut dbs = setup_test_databases().await;
+        let before = StampIdentity::for_tests("uuid_here", "photos", "inst");
+        stamp_current_db(&mut dbs.index_conn, 1, Some(&before), T0)
+            .await
+            .unwrap();
+        let after = StampIdentity::for_tests("uuid_here", "phone", "inst");
+        stamp_current_db(&mut dbs.index_conn, 1, Some(&after), T0 + 10)
+            .await
+            .unwrap();
+
+        let rows = fetch_stamps(&mut dbs.index_conn, &[1])
+            .await
+            .unwrap()
+            .remove(&1)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "a re-stamp must not add a second row");
+        assert_eq!(rows[0].db_name, "phone");
+        assert_eq!(rows[0].last_stamped, T0 + 10);
+
+        // A second database is a second row, though: one per incarnation.
+        let elsewhere = StampIdentity::for_tests("uuid_other", "archive", "inst");
+        stamp_current_db(&mut dbs.index_conn, 1, Some(&elsewhere), T0 + 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetch_stamps(&mut dbs.index_conn, &[1])
+                .await
+                .unwrap()
+                .remove(&1)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // No identity, no row — the write point's whole degradation.
+        stamp_current_db(&mut dbs.index_conn, 2, None, T0)
+            .await
+            .unwrap();
+        assert!(
+            fetch_stamps(&mut dbs.index_conn, &[2])
+                .await
+                .unwrap()
+                .remove(&2)
+                .is_none()
+        );
+    }
+
+    // Two names resolving to ONE database (a stamped name and the folder it
+    // was renamed to) collapse into a single row rather than colliding on the
+    // primary key.
+    #[tokio::test]
+    async fn two_names_for_one_database_collapse() {
+        let mut dbs = setup_test_databases().await;
+        stamp(&mut dbs.index_conn, 1, "uuid_p", "photos", "inst", T0).await;
+        let ctx = AssociationContext::for_tests(
+            Some("uuid_p"),
+            Some("inst"),
+            "phone",
+            LocalDbIdentities::for_tests(&[("phone", "uuid_p")], false),
+        );
+
+        set_board_databases(
+            &mut dbs.index_conn,
+            &ctx,
+            1,
+            &["photos".to_string(), "phone".to_string()],
+            T0 + 10,
+        )
+        .await
+        .unwrap();
+
+        let rows = fetch_stamps(&mut dbs.index_conn, &[1])
+            .await
+            .unwrap()
+            .remove(&1)
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one database is one row, whatever it is called"
+        );
+        assert_eq!(rows[0].db_name, "phone", "the last name given wins");
     }
 
     // A board nobody stamped and nothing overlaps is simply not associated,
