@@ -9980,6 +9980,10 @@
           "cron_schedule": {
             "type": "string"
           },
+          "detect_outros": {
+            "type": "boolean",
+            "description": "Probe videos for an appended platform outro (TikTok end cards) at scan\ntime, so thumbnails and frames stop sampling the card\n(docs/video-outro-detection-design.md §8). Subordinate to `scan_video`:\noff when video scanning is off, regardless of this. Turning it off does\nnot revert visuals already regenerated against a trimmed range (§8.1)."
+          },
           "enable_cron_job": {
             "type": "boolean"
           },

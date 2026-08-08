@@ -12,6 +12,8 @@
 //! callers are blocking job helpers, so the python probe (and a possible
 //! first-use download) never blocks the async runtime.
 
+pub(crate) mod outro;
+
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

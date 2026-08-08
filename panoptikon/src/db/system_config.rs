@@ -92,6 +92,13 @@ pub(crate) struct SystemConfig {
     pub scan_html: bool,
     #[serde(default)]
     pub scan_pdf: bool,
+    /// Probe videos for an appended platform outro (TikTok end cards) at scan
+    /// time, so thumbnails and frames stop sampling the card
+    /// (docs/video-outro-detection-design.md §8). Subordinate to `scan_video`:
+    /// off when video scanning is off, regardless of this. Turning it off does
+    /// not revert visuals already regenerated against a trimmed range (§8.1).
+    #[serde(default = "default_true")]
+    pub detect_outros: bool,
     #[serde(default)]
     pub enable_cron_job: bool,
     #[serde(default = "default_cron_schedule")]
@@ -162,6 +169,7 @@ impl Default for SystemConfig {
             scan_audio: false,
             scan_html: false,
             scan_pdf: false,
+            detect_outros: true,
             enable_cron_job: false,
             cron_schedule: default_cron_schedule(),
             cron_jobs: Vec::new(),
@@ -350,6 +358,8 @@ mod tests {
         );
         assert_eq!(config.scan_images, default.scan_images);
         assert_eq!(config.scan_video, default.scan_video);
+        assert_eq!(config.detect_outros, default.detect_outros);
+        assert!(config.detect_outros, "outro detection is opt-out");
         assert!(config.job_filters.is_empty());
         assert!(config.filescan_filter.is_none());
         assert!(store.config_path("default").exists());
@@ -364,6 +374,7 @@ mod tests {
         let raw = r#"
 scan_images = true
 scan_video = false
+detect_outros = false
 
 job_filters = [
   { setter_names = ["file_scan"], pql_query = { match = { gt = { size = 10 } } } }
@@ -385,6 +396,7 @@ some_future_key = { a = 1, b = [1, 2, 3] }
         assert_eq!(loaded.job_filters.len(), 1);
         assert!(loaded.filescan_filter.is_some());
         assert!(loaded.extra.contains_key("some_future_key"));
+        assert!(!loaded.detect_outros);
 
         store.save("default", &loaded).unwrap();
 
@@ -392,6 +404,7 @@ some_future_key = { a = 1, b = [1, 2, 3] }
         assert_eq!(reloaded.job_filters.len(), loaded.job_filters.len());
         assert!(reloaded.filescan_filter.is_some());
         assert!(reloaded.extra.contains_key("some_future_key"));
+        assert!(!reloaded.detect_outros);
     }
 
     #[test]
@@ -409,6 +422,10 @@ some_future_key = { a = 1, b = [1, 2, 3] }
         );
         fs::write(&path, raw).unwrap();
         let mut config = store.load("default").unwrap();
+        // A key the file has never carried keeps its serde default and is not
+        // written back: a new setting reaches existing databases without a
+        // migration and without rewriting hand-edited config (design §8).
+        assert!(config.detect_outros);
         config.scan_video = false;
         store.save("default", &config).unwrap();
         assert_eq!(
