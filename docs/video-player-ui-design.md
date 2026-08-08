@@ -65,12 +65,9 @@ Layout, bottom-up:
 
 ### Kebab menu
 
-Small dark popover (same visual family as the bubbles). Items:
+Small dark popover (same visual family as the bubbles). Items, in rendered
+order:
 
-- **Native controls** — toggles `showControls` (the existing
-  `videoPlayerState.setControls`, which resyncs React state from the DOM on
-  the way back). While native controls are active, the entire custom surface
-  hides except a **lone kebab at the video's top-right** to switch back.
 - **Playback speed** — a **Speed** row, not a submenu: an inline strip of
   choices (0.25 · 0.5 · 1 · 1.5 · 2) under the label, current one lit blue
   like the trim popover's set bounds, and clicking one leaves the menu open
@@ -81,6 +78,23 @@ Small dark popover (same visual family as the bubbles). Items:
   element, which the gallery remounts on navigation. `useVideoTrim`'s
   seek-vs-playback threshold is media time, so it scales with the rate —
   otherwise a 2× loop in a hidden tab overshoots its end point.
+- **Download original** — saves the file the element is playing. The one row
+  that is a link rather than a verb: an `<a>` carrying that same file URL and
+  a `download` attribute naming the file. The server's Content-Disposition
+  already carries the indexed basename, but stripped to Latin-1 — the
+  attribute supplies the full UTF-8 name, and a pathless item falls back to
+  its hash stem plus the mime subtype so the OS can open what it saves.
+  Styled exactly like the other rows, `draggable={false}` (a draggable link
+  dropped on the board would mint an unresolvable pin), Space-activated like
+  its button siblings. It sits above the mode verbs — this one acts on the
+  file, they act on the player — and closes the menu, being one-shot. The
+  host supplies the URL and name, so a surface whose host has no item data
+  yet simply has no such row. Not in S2's escape kebab, which carries the
+  way back and nothing else.
+- **Native controls** — toggles `showControls` (the existing
+  `videoPlayerState.setControls`, which resyncs React state from the DOM on
+  the way back). While native controls are active, the entire custom surface
+  hides except a **lone kebab at the video's top-right** to switch back.
 - **Close video** — the existing `stopVideo` (unload back to thumbnail).
 
 ### Trim controls
