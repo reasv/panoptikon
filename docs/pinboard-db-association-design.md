@@ -418,26 +418,32 @@ pre-existing board belongs to (principle 2). New users simply start with
 no associations; (c) plus create-stamping covers them going forward.
 
 For existing libraries (realistically: the author's ~100 boards), a
-one-off script under `tools/` driving the API
-(`tools/pinboard-associations/run_backfill.py`, stdlib Python; the proposal
-computation is a pure function over the fetched JSON, with `--self-test`
-fixtures standing in for a gateway):
+one-off **personal** script driving the API — deliberately NOT part of the
+repo (user-corrected 2026-08-08: a one-time tool for the author's own
+migration has no business being committed; it lives on disk untracked and
+gets deleted when done).
 
-1. Enumerate index DBs (`/api/db`), fetch all boards, compute the
-   board × DB overlap matrix.
-2. Print proposed stamps (`board → DB, 34/40, 85%`) — **report-then-apply**
-   (`--apply` flag), not a blind threshold, because no threshold is
-   defensible in general and a human can eyeball 100 rows in a minute.
-3. Apply via the `PUT …/databases` endpoint.
+The proposal policy (user-corrected 2026-08-08 — an earlier draft of this
+section had it exactly backwards):
 
-Boards at 100% overlap need no stamp at all (clause (c) admits them), so
-the review list is only the rotted-but-mine boards — small. A board with
-plausible overlap in *two* databases (or a candidate on a board already at
-home somewhere) is printed but never written without an extra flag: that is
-principle 2 again — incidental sharing between unrelated databases is
-exactly what partial overlap cannot distinguish from membership. Because the
-PUT replaces, every proposal is sent as the board's existing stamped names
-plus the addition; the tool never removes an association.
+- **A board at 100% overlap with a DB, and not yet stamped for it, is
+  precisely the board the backfill exists to stamp.** Clause (c)'s
+  admission is temporary by construction: the moment one file on the board
+  is modified or deleted, overlap drops below 100% and the board vanishes
+  from every filtered view. The backfill's job is to convert that fragile
+  admission into a permanent stamp while the evidence is still perfect.
+  Principle 1 makes this unambiguous — 100% overlap is always valid — so
+  these pairs are auto-applied, including a board fully present in more
+  than one DB (all such stamps are valid).
+- **Partial overlap is report-only, never written by the tool** — that is
+  principle 2: incidental sharing is indistinguishable from rot. The fix
+  path for rotted-but-mine boards is the manual Databases editor in the
+  UI, board by board, by a human.
+
+Report-then-apply (`--apply` flag), one verified PUT per (board, DB), and
+because the PUT replaces, every proposal is sent as the board's freshly
+re-read stamped names plus the addition; the tool never removes an
+association.
 
 Rollout plan (2026-08-08): the backfill is run locally against the author's
 databases as part of shipping this feature — it is not left as a
