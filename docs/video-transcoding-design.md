@@ -147,11 +147,38 @@ ML-stack). `OnceLock` probe in `media_tools/`:
 Config: `[transcode] hwaccel = "auto" | "off" | "<name>"`, following the
 `[jobs]` tool-override idiom.
 
-**Open verification item:** whether the `static-ffmpeg` pip builds and the
-Docker image's Debian ffmpeg actually ship nvenc/amf/qsv (Debian ffmpeg has
-nvenc; static builds usually include nvenc, often lack vaapi/qsv). Determines
-how real "GPU where available" is per deployment target. Verify before
-implementation planning hardens.
+**HW encoder availability per deployment target (VERIFIED 2026-08-09):**
+
+| Surface | ffmpeg | HW encoders present |
+|---|---|---|
+| Windows (static-ffmpeg pip → gyan.dev 8.0.1 "essentials") | 8.0.1 | nvenc, AMF, QSV, MediaFoundation (h264/hevc/av1 each) |
+| Linux bare server (static-ffmpeg pip → BtbN linux64 GPL, pinned in `zackees/ffmpeg_bins` v8.0) | 8.0 master snapshot | nvenc, VAAPI, QSV (oneVPL), AMF |
+| Docker (`ubuntu:24.04` apt ffmpeg) | 6.1.1 | nvenc, VAAPI, QSV (libvpl); **no AMF** |
+| Nix (nixpkgs default `ffmpeg` via wrap.nix) | current | nvenc, VAAPI, AMF; **QSV only in `ffmpeg-full`** |
+| macOS (static-ffmpeg pip → evermeet/osxexperts) | 8.x | videotoolbox expected (OS framework, autodetected) — not empirically run |
+
+All bundles also carry libx264, libx265, libvpx, libaom, libwebp
+(incl. `libwebp_anim`), libopus, libmp3lame — mp4/webm/animated-webp are
+covered everywhere. No separate ffmpeg bundling is needed on any surface;
+the feared bare-server gap does not exist (BtbN GPL builds are fully
+loaded).
+
+Empirical validation on the dev box (NVIDIA) confirmed the probe design:
+`h264_nvenc`/`hevc_nvenc` encode fine while `h264_amf` and `h264_qsv` are
+*listed but fail* (no AMD/Intel hardware) — listing is worthless, the
+1-frame test encode is mandatory. Windows MediaFoundation (`h264_mf`) is a
+vendor-neutral OS-level HW path worth including as a probe candidate after
+the vendor encoders.
+
+Deployment caveats to document when the feature ships:
+
+- **Docker + nvenc** needs the NVIDIA container toolkit *and*
+  `NVIDIA_DRIVER_CAPABILITIES` including `video` — the common
+  `compute,utility` default (typical for CUDA inference setups) does not
+  inject `libnvidia-encode.so`, so nvenc fails even in a GPU-enabled
+  container. Compose examples must set `compute,utility,video`.
+- **VAAPI in Docker** needs `/dev/dri` passthrough.
+- Nix could switch wrap.nix to `ffmpeg-full` if QSV matters there.
 
 ## 5. Presets and the fast channel
 
@@ -315,8 +342,6 @@ learns pinboard semantics and never parses the `h` codec.
 
 ## 10. Open items
 
-- Verify HW encoder availability in static-ffmpeg builds and the Docker
-  Debian ffmpeg (§4) before implementation hardens.
 - SSE through the relay: confirm the relay path doesn't buffer
   `text/event-stream` (keep-alives mitigate; snapshot endpoint is the
   fallback).
