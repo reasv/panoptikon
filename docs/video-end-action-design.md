@@ -166,9 +166,11 @@ prefetch stands down on the same flag.
 
   During the await the gallery simply keeps showing the ended video, parked
   and paused; after the flip, the one-commit throttle window is covered by
-  the existing `heldIndex` hold. The first commit of the new page therefore
-  already has `gi` on the first video (which autoplays, continuing the
-  chain) — no intermediate item is ever displayed.
+  the existing `heldIndex` hold, and for one further commit the
+  selection→`currentItem` fallback still renders the old (playable, parked)
+  video before the landing video takes over. At no commit is an unrelated
+  item displayed — which is also what keeps fullscreen alive through the
+  turn (§"Fullscreen continuity").
 
 **Prefetch ahead of the turn**: the end-of-video fetch should be a cache
 hit, not a network round-trip — a NAS-speed fetch between the last frame
@@ -338,9 +340,17 @@ and keeps pushing.
 - **Placement**: the S1 right-hand group, leftmost — immediately left of the
   outro-skip button, so the row reads left-to-right as "what happens at the
   end → where the end is → edit the range" (end action, outro, trim).
-  Follows the trim button's size ladder: absent at the mini tier (the
-  gallery's surface only reaches mini in degenerate layouts; not worth a
-  kebab row until someone misses it).
+  **Full tier only** — one rung stricter than the trim button's ladder
+  (implementation finding): at the medium tier the row's shrink-0 children
+  with an outro button present already need ~192 px against a 160 px floor,
+  and a fifth button pushes the overflow onto the kebab, the tier's only
+  route to fullscreen and close. No kebab fallback row at the smaller tiers
+  (the gallery only reaches them in degenerate layouts; the mode still
+  governs playback there). Companion change: the gallery's surface-width
+  floor rises by one button-width (`GALLERY_SURFACE_FLOOR` = 310 px) so the
+  time readout survives at the floor — the shared `PLAYER_SIZE_FULL_WIDTH`
+  tier constant must not rise instead, which would demote 280–310 px pins
+  for a button they don't render.
 - **Icons** (lucide, matching the row's stock-glyph language):
   - `loop`: `Repeat`. Plain repeat, not `Repeat1` — there is no "repeat all"
     here for "repeat one" to contrast against.
