@@ -61,12 +61,24 @@ silent.
    a panic.
 9. **Linux default = external-tool probe.** The shared crate's Linux
    implementation shells out to the first available of `wl-copy`
-   (Wayland) then `xclip -t text/uri-list` (X11), mirroring the
-   `host_open` xdg-open→gio→… chain precedent, writing
-   `text/uri-list` / `x-special/gnome-copied-files` content. No native
-   selection-holder in v1; the custom clipboard command is the escape
-   hatch beyond that. Windows/macOS are native (CF_HDROP;
-   NSPasteboard).
+   (Wayland) then `xclip` (X11), mirroring the `host_open`
+   xdg-open→gio→… chain precedent. No native selection-holder in v1;
+   the custom clipboard command is the escape hatch beyond that.
+   Windows/macOS are native (CF_HDROP; NSPasteboard).
+
+   **One MIME type per invocation.** Neither tool can advertise two
+   flavours in a single run (`wl-copy --type` / `xclip -t` take one
+   value), and no single flavour is universal: GNOME-family file
+   managers (Nautilus, Nemo, Caja) paste files *only* from
+   `x-special/gnome-copied-files`, while Dolphin, Thunar, PCManFM,
+   browsers and chat clients read `text/uri-list`. The type is therefore
+   selected from `XDG_CURRENT_DESKTOP`: a case-insensitive match on
+   `GNOME`, `Cinnamon`, `X-Cinnamon`, `MATE` or `Unity` ⇒
+   `x-special/gnome-copied-files` with a `copy\n<uri>` LF-separated
+   payload and no trailing newline; anything else (or an unset variable)
+   ⇒ `text/uri-list` with CRLF-terminated URIs. Selection and framing
+   live in one pure function pair so they are unit-testable off-platform
+   (`panoptikon-clipboard/src/payload.rs`).
 10. **macOS pasteboard on main thread.** In the desktop app the clipboard
     write is dispatched via `app_handle.run_on_main_thread` (AppKit
     pasteboard calls are main-thread-hostile); the shared crate stays
