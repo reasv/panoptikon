@@ -117,6 +117,17 @@ existing arrow-key navigation path, unchanged. The whole step no-ops while
 `resultsAreStale`: an index chosen against rows the URL no longer names is
 the exact mistake the `heldIndex` machinery exists to prevent.
 
+It equally no-ops while the live query is **withheld** — `useSearch`'s
+`queryEnabled` is false (update lock holding uncommitted sidebar edits,
+invalid input, or a maximized board). `resultsAreStale` is deliberately
+false in the update-lock state (the gallery must not freeze during an
+uncommitted edit), so it cannot carry this: without its own gate, a video
+ending mid-edit would fetch the next page of the *uncommitted* query, write
+it into the cache under the live key the disabled observer is watching, and
+land the gallery on a search the user explicitly withheld. `queryEnabled`
+is exported from `useSearch` and threaded to the gallery; the ahead-of-turn
+prefetch stands down on the same flag.
+
 **Page boundary**: no playable item in the rest of the page:
 
 - `page >= totalPages` → do nothing. The last video stays parked at its end.
@@ -167,9 +178,14 @@ current item is the **last playable item of a non-final page**, an effect in
 (page, sha) — the same warm-the-cache verb the manual turn uses, started
 when that video becomes current instead of when it ends. Step 1's
 cache-first read then lands on it. Guarded by the same `resultsAreStale`
-gate as the scan; failures are ignored (the end-of-video fetch is the
-retry). Not gated on `showVideo`: `advance` mode plus standing on the last
-playable item is already the signal, and one page of rows is cheap.
+and `queryEnabled` gates as the scan; failures are ignored (the
+end-of-video fetch is the retry). Not gated on `showVideo`: `advance` mode
+plus standing on the last playable item is already the signal, and one page
+of rows is cheap. The prefetch passes an explicit `gcTime` far above
+react-query's 5-minute default: the entry has zero observers until the
+turn, and the gap between prefetch and consumption is the video's own
+length — a long video would otherwise watch its warmed entry get
+garbage-collected before the turn arrives.
 
 **Supersession**: the await is a window the user can act in. A token ref
 (the `useCommitPageSize` in-flight pattern) is captured before the fetch and
