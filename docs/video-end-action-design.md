@@ -181,7 +181,12 @@ cache-first read then lands on it. Guarded by the same `resultsAreStale`
 and `queryEnabled` gates as the scan; failures are ignored (the
 end-of-video fetch is the retry). Not gated on `showVideo`: `advance` mode
 plus standing on the last playable item is already the signal, and one page
-of rows is cheap. The prefetch passes an explicit `gcTime` far above
+of rows is cheap. The prefetch is **silent** — it must not arm the shared
+search spinner (which windowed paints the full-panel loading overlay *over
+the video being watched* and swallows its clicks), and its settle must not
+clear a spinner a real user-gesture search armed; the spinner path remains
+for the gesture-backed manual turns only. It passes an explicit `gcTime`
+far above
 react-query's 5-minute default: the entry has zero observers until the
 turn, and the gap between prefetch and consumption is the video's own
 length — a long video would otherwise watch its warmed entry get
@@ -193,6 +198,19 @@ checked after it; manual navigation, gallery close, switching the mode off
 `advance`, and a user-initiated `play` on the parked video all invalidate
 it, and an invalidated turn writes nothing. A stale intent must never move
 the gallery after the user has taken over.
+
+The token only covers verbs the gallery *owns*. Writers it does not — a
+PageSelect click, browser Back/Forward, a query edit under instant search, a
+page-size commit — are caught by a second, commit-synced gates check after
+the await: the turn re-verifies `page`, `gi`, the results object's
+**identity**, `resultsAreStale` and `queryEnabled` against what it captured
+at entry, and any movement ends the chain with nothing written. The identity
+compare is load-bearing: a query edit can swap the entire row set while
+leaving `page` and `gi` numerically unchanged. A landing page with **zero
+rows** also ends the chain with no write, in both modes — SearchPage only
+mounts the gallery while results exist, so turning onto an empty page would
+unmount it (reachable when the result set shrank after the count query
+answered; `totalPages` is only as fresh as `nResults`).
 
 ### Fullscreen continuity
 
@@ -216,8 +234,14 @@ load-bearing for fullscreen, not just for flash avoidance.
 
 The one place the player world genuinely ends is a videoless landing page:
 writing `gi = 0` onto an image unmounts the host wrapper and force-exits
-fullscreen mid-binge. So the end-of-chain behavior forks on
-`player.isFullscreen` (the host passes the flag into the advance callback):
+fullscreen mid-binge. So the end-of-chain behavior forks on the player's
+fullscreen state — read through a **live getter** the host passes into the
+advance callback (`isFullscreen: () => boolean`, dereferencing a
+commit-synced ref), never a boolean captured when the video ended: the fork
+is decided *after* the turn's fetch, and the user can enter or leave
+fullscreen while that fetch is in the air — a stale flag gets both
+directions wrong (a stale `true` kills a turn windowed rules allow; a stale
+`false` force-exits the fullscreen the user just entered):
 
 - **Windowed**: turn the page, land at index 0, chain over (§3 step 2).
 - **Fullscreen**: suppress the turn entirely — the chain ends parked on the
