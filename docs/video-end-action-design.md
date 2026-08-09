@@ -352,8 +352,9 @@ and keeps pushing.
   tier constant must not rise instead, which would demote 280–310 px pins
   for a button they don't render.
 - **Icons** (lucide, matching the row's stock-glyph language):
-  - `loop`: `Repeat`. Plain repeat, not `Repeat1` — there is no "repeat all"
-    here for "repeat one" to contrast against.
+  - `loop`: `Repeat1` (user-corrected in field validation from plain
+    `Repeat`: players universally badge loop-*one* with the 1, and the
+    contrast the badge draws here is with auto-advance).
   - `stop`: `ArrowRightToLine` — runs to the wall and stops.
   - `advance`: `ListVideo` — play through the list. `SkipForward` is
     rejected for the same reason the outro design rejected it: it reads as a
