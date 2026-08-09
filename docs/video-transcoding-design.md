@@ -1,6 +1,9 @@
 # Backend video transcoding
 
-Status: DESIGNED 2026-08-09, not implemented.
+Status: DESIGNED 2026-08-09, not implemented. Implementation plan (and the
+contract deltas settled during planning — compose sibling route, artifact
+GET semantics, cancel route, compose time model):
+`docs/video-transcoding-implementation.md`.
 
 One backend system serving three product features plus one future plan:
 
