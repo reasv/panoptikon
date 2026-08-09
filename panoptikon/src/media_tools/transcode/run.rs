@@ -929,7 +929,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.mp4");
-        if !crate::jobs::files::write_clip(&source, None) {
+        if !crate::jobs::files::write_clip(&source, None, None) {
             return;
         }
 

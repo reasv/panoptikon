@@ -1341,7 +1341,7 @@ mod tests {
         }
         let fixtures = tempfile::tempdir().unwrap();
         let source = fixtures.path().join("source.mp4");
-        if !crate::jobs::files::write_clip(&source, None) {
+        if !crate::jobs::files::write_clip(&source, None, None) {
             return;
         }
 

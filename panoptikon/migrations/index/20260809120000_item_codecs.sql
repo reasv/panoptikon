@@ -1,0 +1,46 @@
+-- Per-stream codec names (docs/video-transcoding-design.md §6).
+--
+-- ffprobe already reports `codec_name` for every stream at scan time; it was
+-- parsed and thrown away. Persisting it is what lets a client decide whether
+-- the browser can play a file *before* mounting a `<video>` on it, instead of
+-- guessing from the container mime and showing a black frame for HEVC-in-mp4.
+--
+-- Immutable per item, like duration/width/height: any content change yields a
+-- new sha256 and therefore a new item, so these are measured once and never
+-- revisited.
+--
+-- In-band sentinels, and deliberately **unversioned** — unlike `outro_kind`,
+-- a codec name is a fact ffprobe reports, not a detector verdict that a later
+-- threshold could overturn, so there is nothing for a version suffix to
+-- recover:
+--   NULL        never probed
+--   'none'      probed, the container has no video stream
+--   'unknown'   a video stream exists but ffprobe reported no codec name
+--   else        `codec_name` verbatim ('h264', 'hevc', 'av1', ...)
+--
+-- `audio_codec` has no 'none': NULL there conflates "never probed" with "no
+-- audio stream". Accepted — termination keys on `video_codec` alone, and no
+-- consumer needs to tell the two apart (a file with no audio and a file whose
+-- audio is unknown are both "do not veto playback on the audio codec").
+ALTER TABLE items ADD COLUMN video_codec TEXT;
+ALTER TABLE items ADD COLUMN audio_codec TEXT;
+
+-- Serves the backfill dispatch question "is there a video still to probe".
+-- Partial on the NULL state so the video half of it drains away as the
+-- backfill runs, instead of carrying every row in the database forever.
+-- (Images and audio keep a NULL `video_codec` and so stay in the index; the
+-- `type` key means the dispatch seek never walks them.)
+--
+-- `type` leads because items.type holds the whole mime string ('video/mp4'),
+-- so the video population is a half-open range scan
+-- (`type >= 'video/' AND type < 'video0'`, '0' being the byte after '/').
+-- Not `LIKE 'video/%'`: SQLite cannot serve a LIKE prefix from an index under
+-- the default case-insensitive LIKE, which is the anti-pattern this codebase
+-- has already paid for on sha256, tag namespaces and file_scans.
+--
+-- The backfill population is that video range and nothing else. Audio items
+-- get their `audio_codec` at scan time going forward but are deliberately not
+-- backfilled: the consumer is video playback compatibility, an audio file has
+-- no `<video>` to fail on, and widening the pass would put every audio item in
+-- an existing library through an ffprobe run for a column nothing reads.
+CREATE INDEX idx_items_codec_pending ON items(type) WHERE video_codec IS NULL;

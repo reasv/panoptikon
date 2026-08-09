@@ -37,9 +37,9 @@ use crate::{
     db::{
         file_scans::{FileScanUpdate, get_completed_scan_paths, get_open_file_scan_id},
         files::{
-            FileScanData, FileUpsertResult, ItemScanMeta, PendingOutroItem, get_file_by_path,
-            get_item_content_end_ms, get_item_dimensions, get_item_id, get_item_visual_meta,
-            get_pending_outro_item, has_blurhash,
+            FileScanData, FileUpsertResult, ItemScanMeta, PendingCodecItem, PendingOutroItem,
+            get_file_by_path, get_item_content_end_ms, get_item_dimensions, get_item_id,
+            get_item_visual_meta, get_pending_outro_item, has_blurhash, item_codec_pending,
         },
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
@@ -921,6 +921,11 @@ struct BackfillResult {
     visuals_scan_error: Option<ScanErrorRecord>,
     /// See [`NewItemData::outro`].
     outro: Option<OutroRecord>,
+    /// This file's stream codecs, when the backfill probed for them
+    /// (docs/video-transcoding-design.md §6). `None` whenever the stage did not
+    /// run or the probe failed — the columns hold answers only. There is no
+    /// new-item twin: those codecs ride the `items` INSERT itself.
+    codecs: Option<CodecRecord>,
     /// Design §7.1: this item newly turned positive *and* already had visuals,
     /// so the ones this pass produced replace them rather than filling a gap.
     /// The store guards are bypassed for exactly this case and no other.
@@ -1941,6 +1946,39 @@ impl ScanContext {
         }
     }
 
+    /// Stores one item's stream codecs (docs/video-transcoding-design.md §6).
+    ///
+    /// Never fails the file, for the same reason its outro twin does not: a
+    /// lost record costs one re-probe on the next scan. Empty for every
+    /// non-video and every item already probed, and the emptiness is checked
+    /// before the writer is touched.
+    async fn record_item_codecs(&mut self, sha256: &str, record: Option<&CodecRecord>) {
+        let Some(record) = record else {
+            return;
+        };
+        match call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::SetItemCodecs {
+                sha256: sha256.to_string(),
+                video_codec: record.video_codec.clone(),
+                audio_codec: record.audio_codec.clone(),
+                reply,
+            }
+        })
+        .await
+        {
+            // The item went away between the pass and this write (deleted, or
+            // never inserted because its file write failed). Nothing to fix:
+            // the next scan re-probes whatever is there.
+            Ok(0) => tracing::debug!(sha256, "no item to store codecs on"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                error = ?err,
+                sha256,
+                "failed to store item codecs; they will be re-probed next scan"
+            ),
+        }
+    }
+
     async fn handle_backfill(&mut self, backfill: BackfillResult) {
         self.in_flight_visuals.remove(&backfill.sha256);
 
@@ -2034,6 +2072,8 @@ impl ScanContext {
         // makes that irrelevant rather than load-bearing).
         self.record_outro_verdict(&backfill.sha256, backfill.outro.as_ref())
             .await;
+        self.record_item_codecs(&backfill.sha256, backfill.codecs.as_ref())
+            .await;
 
         if wrote_visuals {
             self.stats.backfilled_visuals += 1;
@@ -2115,14 +2155,32 @@ impl ScanContext {
                 .await;
             outro_work = None;
         }
+        // The dispatcher's fourth question (docs/video-transcoding-design.md
+        // §6): "is this a video whose stream codecs nothing has recorded?"
+        // Like the outro question it is not about a missing visual, so a video
+        // with every visual it needs is still work — that is what backfills an
+        // existing library, with no separate job. Unlike it, nothing switches
+        // it off: codecs are scan metadata like width and height.
+        let mut codec_work = self.pending_codec_work(&sha256, &mime_type, &path).await;
+        if let Some(pending) = &codec_work
+            && !codec_needs_probe(pending.video_tracks)
+        {
+            // Answered from the item's own metadata, so it needs no worker and
+            // no ffprobe: settled here, before any of the early returns below
+            // can drop it on the floor.
+            self.record_item_codecs(&sha256, Some(&codec_record_without_a_probe()))
+                .await;
+            codec_work = None;
+        }
+        let codec_work = codec_work.is_some();
         if !needs_thumb && !needs_blurhash {
-            // Counted before the outro question is consulted: the marker did
-            // remove a whole visuals dispatch, whether or not a probe still
-            // owes this file a run of its own.
+            // Counted before the outro and codec questions are consulted: the
+            // marker did remove a whole visuals dispatch, whether or not a
+            // probe still owes this file a run of its own.
             if thumb_suppressed {
                 self.note_suppressed_visuals(&path);
             }
-            if outro_work.is_none() {
+            if outro_work.is_none() && !codec_work {
                 return Ok(());
             }
         }
@@ -2175,7 +2233,7 @@ impl ScanContext {
                             &mime_type,
                         )
                         .await;
-                        if outro_work.is_none() {
+                        if outro_work.is_none() && !codec_work {
                             return Ok(());
                         }
                         // A probe is still owed and needs neither frames nor a
@@ -2215,12 +2273,12 @@ impl ScanContext {
             }
             no_source = no_source || thumb_suppressed;
             if no_source {
-                // As above: the suppression is counted even when the outro
-                // question keeps the dispatch alive for a probe.
+                // As above: the suppression is counted even when the outro or
+                // codec question keeps the dispatch alive for a probe.
                 if thumb_suppressed {
                     self.note_suppressed_visuals(&path);
                 }
-                if outro_work.is_none() {
+                if outro_work.is_none() && !codec_work {
                     return Ok(());
                 }
             }
@@ -2323,6 +2381,7 @@ impl ScanContext {
                     frames_stored,
                     video_duration,
                     outro_work,
+                    codec_work,
                     stored_content_end_ms,
                     &timers,
                 )
@@ -2353,6 +2412,7 @@ impl ScanContext {
                         visual_verdicts: Vec::new(),
                         visuals_scan_error: None,
                         outro: None,
+                        codecs: None,
                         replace_visuals: false,
                     })
                 }
@@ -2413,6 +2473,38 @@ impl ScanContext {
                     "failed to read the visuals negative cache; probing anyway"
                 );
                 Some(pending)
+            }
+        }
+    }
+
+    /// The codec dispatch question, answered against the index alone
+    /// (docs/video-transcoding-design.md §6).
+    ///
+    /// `None` means nothing to probe: the file is not a video, or the item
+    /// already carries a `video_codec`. There is no config gate — a codec name
+    /// is scan metadata like width and height, not a feature — and no
+    /// negative-cache consult, because the pass writes no markers; see
+    /// [`codec_pass_for`] for why a failure is simply retried.
+    async fn pending_codec_work(
+        &mut self,
+        sha256: &str,
+        mime_type: &str,
+        path: &Path,
+    ) -> Option<PendingCodecItem> {
+        if !mime_type.starts_with("video") {
+            return None;
+        }
+        match item_codec_pending(&mut self.conn, sha256).await {
+            Ok(pending) => pending,
+            // Advisory, like every other read on this path: without the answer
+            // the file is simply left alone this run.
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to read the codec state; skipping the probe"
+                );
+                None
             }
         }
     }
@@ -3111,6 +3203,86 @@ pub(crate) struct OutroRecord {
     pub(crate) content_end_ms: Option<i64>,
 }
 
+/// One probe's answer about a file's stream codecs
+/// (docs/video-transcoding-design.md §6). Written to `items`, never to the
+/// ledger — a failed ffprobe records nothing at all.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CodecRecord {
+    /// `items.video_codec`, sentinels included. Never empty: the column is the
+    /// backfill's termination predicate, so there is no "probed but no answer"
+    /// state to represent.
+    pub(crate) video_codec: String,
+    /// `items.audio_codec`, `None` for a container with no audio stream.
+    pub(crate) audio_codec: Option<String>,
+}
+
+/// Whether the codec pass has to spawn ffprobe, or the answer already follows
+/// from the item's own metadata: a container with no video stream is `'none'`
+/// and nothing else.
+///
+/// The same metadata question [`outro_needs_probe`] asks, and deliberately its
+/// own function rather than a call into it — the codec columns are scan
+/// metadata like width/height and must carry no dependency on the outro
+/// feature, which is switchable. The reasoning about `None` is the one
+/// documented there: `extract_item_metadata` leaves `video_tracks` unset
+/// rather than storing a zero, and every ffprobe failure keeps the file out of
+/// the index entirely, so an indexed `video/` item with no track count really
+/// did have no video stream.
+fn codec_needs_probe(video_tracks: Option<i64>) -> bool {
+    video_tracks.unwrap_or(0) > 0
+}
+
+/// The codec record a container with no video stream earns without any probe.
+///
+/// Recorded rather than left NULL for the same reason the outro's shortcut
+/// records one: without a stored value the dispatcher asks about the file on
+/// every scan forever. `audio_codec` stays `None` — reading it would cost the
+/// very ffprobe run this shortcut exists to avoid, and NULL there is the
+/// column's accepted ambiguity anyway (see the migration).
+fn codec_record_without_a_probe() -> CodecRecord {
+    CodecRecord {
+        video_codec: CODEC_NONE.to_string(),
+        audio_codec: None,
+    }
+}
+
+/// The codec stage of a *backfill* pass: one ffprobe run over an item that was
+/// indexed before these columns existed.
+///
+/// Blocking, like every other generator on this path, so the caller is inside
+/// `spawn_blocking`.
+///
+/// A failure returns `None` and is retried on the next scan, with no marker
+/// written. That is the deliberate fallback documented in
+/// `docs/video-transcoding-implementation.md` §2 A3: guarding permanent
+/// corruption through `visual_attempts` would need a `VisualKind::Codec`
+/// variant, a process-version constant for a pass that *has* no version (a
+/// codec name is a fact, not a detector verdict), a converter from the
+/// metadata phase's failure vocabulary into the visuals one, and a marker
+/// delete on the success path — well past the containment the plan allowed for.
+/// The cost of doing without is one ffprobe per scan for a file that has rotted
+/// since it was indexed; the outro pass, which probes the same population with
+/// two ffmpeg starts instead of one, measured 0.37% failures.
+fn codec_pass_for(path: &Path, mime_type: &str) -> Option<CodecRecord> {
+    match extract_media_info(path) {
+        Ok(info) => {
+            let (video_codec, audio_codec) = media_codecs(&info, mime_type);
+            // `None` is unreachable: the dispatcher only asks about `video/`
+            // items. Falling through rather than defaulting keeps the sentinel
+            // honest — nothing may claim a file was examined as a video when
+            // it was not.
+            video_codec.map(|video_codec| CodecRecord {
+                video_codec,
+                audio_codec,
+            })
+        }
+        Err(err) => {
+            tracing::debug!(path = %path.display(), error = ?err, "codec probe failed");
+            None
+        }
+    }
+}
+
 /// What the outro stage of one pass concluded. Exactly one half is ever
 /// populated: a probe either produces a verdict or owes a marker.
 #[derive(Default)]
@@ -3567,6 +3739,8 @@ fn extract_item_metadata(
         audio_tracks: None,
         video_tracks: None,
         subtitle_tracks: None,
+        video_codec: None,
+        audio_codec: None,
     };
 
     if mime_type.starts_with("image") {
@@ -3583,6 +3757,9 @@ fn extract_item_metadata(
 
     if mime_type.starts_with("video") || mime_type.starts_with("audio") {
         let info = extract_media_info(path)?;
+        // Before the track counts are folded away: the codecs come from the
+        // streams themselves, and this is the only pass that sees them.
+        (metadata.video_codec, metadata.audio_codec) = media_codecs(&info, mime_type);
         if mime_type.starts_with("video") {
             if let Some(video) = info.video_track {
                 metadata.width = video.width.map(|width| width as i64);
@@ -3951,9 +4128,22 @@ fn generate_backfill_visuals(
     frames_stored: bool,
     video_duration: f64,
     outro: Option<OutroBackfill>,
+    needs_codecs: bool,
     stored_content_end_ms: Option<i64>,
     timers: &ScanTimers,
 ) -> BackfillResult {
+    // Independent of everything below — it reads stream headers and produces
+    // no visual — so it runs first and under the metadata timer, which is the
+    // phase it belongs to and the one the new-item path charges the identical
+    // ffprobe run to.
+    let codecs = if needs_codecs {
+        let metadata_span = timers.metadata.start();
+        let codecs = codec_pass_for(path, mime_type);
+        drop(metadata_span);
+        codecs
+    } else {
+        None
+    };
     // Inside the thumbgen span, and first within it: everything below samples
     // frames, and design §7 requires detection to have happened by then. The
     // ~85ms of process spawn belongs to the visuals phase it clamps rather
@@ -4105,6 +4295,7 @@ fn generate_backfill_visuals(
         visual_verdicts: verdicts,
         visuals_scan_error: audit.and_then(|failure| backfill_scan_error(path, mime_type, failure)),
         outro: outro_record,
+        codecs,
         replace_visuals,
     }
 }
@@ -5431,7 +5622,6 @@ struct FfprobeStream {
     #[allow(dead_code)]
     index: Option<u64>,
     codec_type: Option<String>,
-    #[allow(dead_code)]
     codec_name: Option<String>,
     duration: Option<String>,
     width: Option<u64>,
@@ -5459,12 +5649,16 @@ struct FfprobeOutput {
 
 struct AudioTrack {
     duration: f64,
+    /// ffprobe's `codec_name` for this stream, absent when it reported none.
+    codec_name: Option<String>,
 }
 
 struct VideoTrack {
     duration: f64,
     width: Option<u64>,
     height: Option<u64>,
+    /// See [`AudioTrack::codec_name`].
+    codec_name: Option<String>,
 }
 
 struct SubtitleTrack;
@@ -5473,6 +5667,41 @@ struct MediaInfo {
     audio_tracks: Vec<AudioTrack>,
     video_track: Option<VideoTrack>,
     subtitle_tracks: Vec<SubtitleTrack>,
+}
+
+/// `items.video_codec` for a container ffprobe found no video stream in.
+pub(crate) const CODEC_NONE: &str = "none";
+
+/// `items.video_codec`/`audio_codec` for a stream that exists but that ffprobe
+/// reported no `codec_name` for. Distinct from [`CODEC_NONE`]: there *is*
+/// something to decode here, this build just cannot name it — so a client must
+/// treat it as "may need transcoding", not "unplayable".
+pub(crate) const CODEC_UNKNOWN: &str = "unknown";
+
+/// The two codec columns for one probed file, per the sentinel convention in
+/// `migrations/index/20260809120000_item_codecs.sql`.
+///
+/// The single place either column is derived, shared by the new-item metadata
+/// phase and the backfill probe so the two can never disagree about what a
+/// missing stream means.
+///
+/// `video_codec` is `None` only for a non-video mime: an audio file records
+/// its audio codec and leaves the video column NULL, because `'none'` there
+/// would claim the file was examined *as a video*, and the backfill's
+/// termination predicate is that column.
+fn media_codecs(info: &MediaInfo, mime_type: &str) -> (Option<String>, Option<String>) {
+    let audio_codec = info
+        .audio_tracks
+        .first()
+        .map(|track| track.codec_name.clone().unwrap_or(CODEC_UNKNOWN.to_string()));
+    if !mime_type.starts_with("video") {
+        return (None, audio_codec);
+    }
+    let video_codec = match &info.video_track {
+        Some(video) => video.codec_name.clone().unwrap_or(CODEC_UNKNOWN.to_string()),
+        None => CODEC_NONE.to_string(),
+    };
+    (Some(video_codec), audio_codec)
 }
 
 fn extract_media_info(path: &Path) -> Result<MediaInfo, FileProcessError> {
@@ -5537,6 +5766,7 @@ fn extract_media_info(path: &Path) -> Result<MediaInfo, FileProcessError> {
             Some("audio") => {
                 audio_tracks.push(AudioTrack {
                     duration: stream_duration(&stream),
+                    codec_name: stream.codec_name,
                 });
             }
             Some("video") => {
@@ -5544,6 +5774,7 @@ fn extract_media_info(path: &Path) -> Result<MediaInfo, FileProcessError> {
                     duration: stream_duration(&stream),
                     width: stream.width,
                     height: stream.height,
+                    codec_name: stream.codec_name,
                 });
             }
             Some("subtitle") => {
@@ -5907,8 +6138,14 @@ pub(crate) fn override_mime_from_content(record: &mut ScanErrorRecord, path: &Pa
 /// rather than fail. Lives outside `mod tests` because the extraction-side
 /// sampler has tests that clamp the same fixture through an ffmpeg invocation
 /// of its own.
+///
+/// `vcodec` overrides the encoder, for the codec-column tests that need a
+/// container whose stream is *not* h264. `Some("libx265")` also stamps the
+/// `hvc1` tag, which is what an mp4 needs before a browser will look at the
+/// stream at all — and, on a build without libx265, is exactly the case the
+/// `false` return exists for.
 #[cfg(test)]
-pub(crate) fn write_clip(path: &Path, card_seconds: Option<u32>) -> bool {
+pub(crate) fn write_clip(path: &Path, card_seconds: Option<u32>, vcodec: Option<&str>) -> bool {
     if !crate::media_tools::ffmpeg_available() {
         return false;
     }
@@ -5934,9 +6171,14 @@ pub(crate) fn write_clip(path: &Path, card_seconds: Option<u32>) -> bool {
             command.args(["-i", "color=c=0x404040:s=576x1024:d=7:r=30"]);
         }
     }
-    command
-        .args(["-pix_fmt", "yuv420p", "-crf", "18"])
-        .arg(path);
+    command.args(["-pix_fmt", "yuv420p", "-crf", "18"]);
+    if let Some(vcodec) = vcodec {
+        command.args(["-c:v", vcodec]);
+        if vcodec == "libx265" {
+            command.args(["-tag:v", "hvc1"]);
+        }
+    }
+    command.arg(path);
     matches!(command.status(), Ok(status) if status.success())
 }
 
@@ -8121,7 +8363,7 @@ LIMIT 1
     async fn frame_sampling_stays_inside_the_content_range() {
         let dir = tempfile::TempDir::new().unwrap();
         let clip = dir.path().join("card.mp4");
-        if !write_clip(&clip, Some(2)) {
+        if !write_clip(&clip, Some(2), None) {
             return;
         }
 
@@ -8201,7 +8443,7 @@ LIMIT 1
         let test_env = test_data_dir();
         let mut env = visuals_env(test_env.path(), &["media-outro-positive"]).await;
         let clip = env.media_dirs[0].join("card.mp4");
-        if !write_clip(&clip, Some(2)) {
+        if !write_clip(&clip, Some(2), None) {
             return;
         }
 
@@ -8256,7 +8498,7 @@ LIMIT 1
         let test_env = test_data_dir();
         let mut env = visuals_env(test_env.path(), &["media-outro-negative"]).await;
         let clip = env.media_dirs[0].join("plain.mp4");
-        if !write_clip(&clip, None) {
+        if !write_clip(&clip, None, None) {
             return;
         }
 
@@ -8311,7 +8553,7 @@ LIMIT 1
         let test_env = test_data_dir();
         let mut env = visuals_env(test_env.path(), &["media-outro-restored"]).await;
         let clip = env.media_dirs[0].join("card.mp4");
-        if !write_clip(&clip, Some(2)) {
+        if !write_clip(&clip, Some(2), None) {
             return;
         }
 
@@ -8446,6 +8688,8 @@ LIMIT 1
             audio_tracks: Some(1),
             video_tracks: Some(1),
             subtitle_tracks: Some(0),
+            video_codec: Some("h264".to_string()),
+            audio_codec: Some("aac".to_string()),
         };
         let path = Path::new("never-opened.mp4");
         assert!(
@@ -8499,6 +8743,11 @@ LIMIT 1
                     audio_tracks: Some(1),
                     video_tracks: Some(video_tracks),
                     subtitle_tracks: Some(0),
+                    // Deliberately unprobed: these items stand in for a library
+                    // indexed before the codec columns existed, which is what
+                    // the backfill dispatcher is about.
+                    video_codec: None,
+                    audio_codec: None,
                 }),
                 blurhash: blurhash.clone(),
             },
@@ -8562,6 +8811,246 @@ LIMIT 1
         );
     }
 
+    async fn codec_columns(
+        conn: &mut sqlx::SqliteConnection,
+        sha256: &str,
+    ) -> (Option<String>, Option<String>) {
+        sqlx::query_as("SELECT video_codec, audio_codec FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_one(conn)
+            .await
+            .unwrap()
+    }
+
+    /// Stamps an item's codec columns directly, standing in for "a previous
+    /// scan already probed this file".
+    async fn set_item_codec_columns(env: &VisualsEnv, sha256: &str, video_codec: Option<&str>) {
+        let mut conn = env.write().await;
+        sqlx::query("UPDATE items SET video_codec = ?1 WHERE sha256 = ?2")
+            .bind(video_codec)
+            .bind(sha256)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // The scan path, against real media: the codecs ffprobe reports at the
+    // metadata phase reach the `items` row, verbatim and per stream. Two
+    // encoders because a single one cannot tell "the column is written" from
+    // "the column is hardcoded to what libx264 happens to produce" — and hevc
+    // is the case the whole feature exists for (an HEVC-in-mp4 file passes
+    // today's container-mime check and then plays as a black frame).
+    #[tokio::test]
+    async fn scanned_videos_record_their_stream_codecs() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-codecs"]).await;
+        let plain = env.media_dirs[0].join("plain.mp4");
+        if !write_clip(&plain, None, None) {
+            return;
+        }
+        let hevc = env.media_dirs[0].join("hevc.mp4");
+        // A build without libx265 skips that half rather than failing; the
+        // h264 half still pins the wiring.
+        let hevc_written = write_clip(&hevc, None, Some("libx265"));
+
+        env.scan().await;
+
+        let mut conn = env.read().await;
+        async fn sha_of(conn: &mut sqlx::SqliteConnection, name: &str) -> String {
+            sqlx::query_scalar::<_, String>(
+                "SELECT items.sha256 FROM items \
+                 JOIN files ON files.item_id = items.id WHERE files.filename = ?1",
+            )
+            .bind(name)
+            .fetch_one(conn)
+            .await
+            .unwrap()
+        }
+        let plain_sha = sha_of(&mut conn, "plain.mp4").await;
+        assert_eq!(
+            codec_columns(&mut conn, &plain_sha).await,
+            (Some("h264".to_string()), None),
+            "the video codec is stored verbatim, and a stream-less audio \
+             column stays NULL rather than claiming 'none'"
+        );
+
+        if hevc_written {
+            let hevc_sha = sha_of(&mut conn, "hevc.mp4").await;
+            assert_eq!(
+                codec_columns(&mut conn, &hevc_sha).await.0,
+                Some("hevc".to_string()),
+                "the column follows the stream, not the container mime"
+            );
+        }
+    }
+
+    // The backfill's whole point: an item indexed before these columns existed
+    // is a video with every visual it needs, and the codec question is the only
+    // thing left that can dispatch it. A stored thumbnail, a stored blurhash
+    // and a stored outro verdict silence the other three questions, so a
+    // written codec here can only have come from the fourth.
+    #[tokio::test]
+    async fn a_pending_video_gets_its_codecs_backfilled() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-codec-backfill"]).await;
+        let clip = env.media_dirs[0].join("clip.mp4");
+        if !write_clip(&clip, None, None) {
+            return;
+        }
+        let sha256 = "sha_codec_pending";
+        seed_video_item(
+            &env,
+            &clip,
+            sha256,
+            1,
+            Some("LEHV6nWB2yk8pyo0adR*".to_string()),
+        )
+        .await;
+        set_outro_kind(&env, sha256, Some("none/1")).await;
+        let thumbnail = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+            .expect("an 8x8 image encodes");
+        call_index_db_writer(&env.index_db, |reply| {
+            IndexDbWriterMessage::StoreThumbnails {
+                sha256: sha256.to_string(),
+                mime_type: "video/mp4".to_string(),
+                process_version: THUMBNAIL_PROCESS_VERSION,
+                thumbnails: vec![thumbnail.clone()],
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let mut conn = env.read().await;
+            assert_eq!(codec_columns(&mut conn, sha256).await, (None, None));
+        }
+
+        env.scan().await;
+
+        let mut conn = env.read().await;
+        assert_eq!(
+            codec_columns(&mut conn, sha256).await,
+            (Some("h264".to_string()), None)
+        );
+    }
+
+    // The metadata shortcut, and the reason the fixture is deliberately not a
+    // container: a container with no video stream is `'none'` and nothing else,
+    // decided from the indexed track count without a worker or an ffprobe. If
+    // this ever went through the probe it would fail on these bytes and write
+    // nothing at all, leaving the column NULL — so the stored `'none'` is the
+    // assertion that no probe ran.
+    #[tokio::test]
+    async fn a_track_less_video_settles_its_codecs_without_a_probe() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-codec-trackless"]).await;
+        let clip = env.media_dirs[0].join("clip.mp4");
+        fs::write(&clip, b"not a container, and never opened").unwrap();
+        let sha256 = "sha_codec_trackless";
+        seed_video_item(&env, &clip, sha256, 0, None).await;
+
+        env.scan().await;
+
+        let mut conn = env.read().await;
+        assert_eq!(
+            codec_columns(&mut conn, sha256).await,
+            (Some(CODEC_NONE.to_string()), None),
+            "settled from the item's own metadata, so the unreadable bytes \
+             were never opened"
+        );
+    }
+
+    // Termination: a stored `video_codec` is the whole backfill predicate, so
+    // an item that carries one is never asked again. The stored value is a lie
+    // about this file on purpose — a second probe would overwrite it with the
+    // truth, which is the only way to see the re-dispatch from the outside.
+    #[tokio::test]
+    async fn an_already_probed_video_is_never_probed_again() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-codec-settled"]).await;
+        let clip = env.media_dirs[0].join("clip.mp4");
+        if !write_clip(&clip, None, None) {
+            return;
+        }
+        let sha256 = "sha_codec_settled";
+        seed_video_item(
+            &env,
+            &clip,
+            sha256,
+            1,
+            Some("LEHV6nWB2yk8pyo0adR*".to_string()),
+        )
+        .await;
+        set_item_codec_columns(&env, sha256, Some(CODEC_NONE)).await;
+
+        env.scan().await;
+
+        let mut conn = env.read().await;
+        assert_eq!(
+            codec_columns(&mut conn, sha256).await.0,
+            Some(CODEC_NONE.to_string()),
+            "an h264 stream sits in this file; only a re-probe could have \
+             replaced the stored answer"
+        );
+    }
+
+    // The sentinel rules, at the one function that decides them for both the
+    // new-item and the backfill path.
+    #[test]
+    fn codec_sentinels_follow_the_streams_and_the_mime() {
+        let video = |codec_name: Option<&str>| VideoTrack {
+            duration: 7.0,
+            width: Some(8),
+            height: Some(8),
+            codec_name: codec_name.map(str::to_string),
+        };
+        let audio = |codec_name: Option<&str>| AudioTrack {
+            duration: 7.0,
+            codec_name: codec_name.map(str::to_string),
+        };
+        let info = |video_track, audio_tracks| MediaInfo {
+            audio_tracks,
+            video_track,
+            subtitle_tracks: Vec::new(),
+        };
+
+        // A named stream is stored verbatim, and the audio column takes the
+        // *first* stream of several.
+        assert_eq!(
+            media_codecs(
+                &info(
+                    Some(video(Some("hevc"))),
+                    vec![audio(Some("aac")), audio(Some("ac3"))]
+                ),
+                "video/mp4"
+            ),
+            (Some("hevc".to_string()), Some("aac".to_string()))
+        );
+        // A stream ffprobe named no codec for exists all the same: `unknown`,
+        // never `none`.
+        assert_eq!(
+            media_codecs(&info(Some(video(None)), vec![audio(None)]), "video/mp4"),
+            (
+                Some(CODEC_UNKNOWN.to_string()),
+                Some(CODEC_UNKNOWN.to_string())
+            )
+        );
+        // No video stream in a video container: `none`, which is what
+        // terminates the backfill. No audio stream: NULL, the accepted
+        // ambiguity.
+        assert_eq!(
+            media_codecs(&info(None, Vec::new()), "video/mp4"),
+            (Some(CODEC_NONE.to_string()), None)
+        );
+        // An audio file records its audio codec and leaves the video column
+        // NULL: `'none'` there would claim it was examined as a video, and
+        // that column is the backfill's termination predicate.
+        assert_eq!(
+            media_codecs(&info(None, vec![audio(Some("mp3"))]), "audio/mpeg"),
+            (None, Some("mp3".to_string()))
+        );
+    }
+
     // What a pass may and may not conclude. The line that keeps this table
     // small is the served-directly predicate: most images legitimately have no
     // stored thumbnail, and marking every one of them would put a row in the
@@ -8578,6 +9067,8 @@ LIMIT 1
             audio_tracks: Some(1),
             video_tracks: Some(video_tracks),
             subtitle_tracks: Some(0),
+            video_codec: Some("h264".to_string()),
+            audio_codec: Some("aac".to_string()),
         };
 
         // A video with no video track: both kinds conclude a permanent

@@ -5929,6 +5929,8 @@
           "blurhash",
           "outro_kind",
           "content_end_ms",
+          "video_codec",
+          "audio_codec",
           "data_id",
           "language",
           "language_confidence",
@@ -7246,9 +7248,18 @@
           "blurhash",
           "outro_kind",
           "content_end_ms",
+          "video_codec",
+          "audio_codec",
           "time_added"
         ],
         "properties": {
+          "audio_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The *first* audio stream's codec name (`aac`, `opus`, `ac3`, ...), or\n`unknown` when a stream exists that ffprobe named no codec for. `null`\nconflates \"no audio stream\" with \"not probed yet\" — deliberately, since\nneither is a reason to veto playback. Never gated, as above."
+          },
           "audio_tracks": {
             "type": [
               "integer",
@@ -7320,6 +7331,13 @@
           },
           "type": {
             "type": "string"
+          },
+          "video_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The video stream's codec name as ffprobe reports it (`h264`, `hevc`,\n`av1`, ...), with two in-band sentinels: `none` means the container was\nprobed and has no video stream, `unknown` means a video stream exists\nbut ffprobe named no codec. `null` means the item has not been probed\nyet — an existing library fills in over its next few scans, so a client\nmust keep whatever it did before these columns existed as the `null`\nbehaviour.\n\nUnlike the outro fields this is never gated: a codec name is an\nobjective property of the file, like `duration` or `width`."
           },
           "video_tracks": {
             "type": [
@@ -7993,6 +8011,13 @@
       "MatchValue": {
         "type": "object",
         "properties": {
+          "audio_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See [`MatchValues::audio_codec`]."
+          },
           "audio_tracks": {
             "type": [
               "integer",
@@ -8178,6 +8203,13 @@
               "null"
             ]
           },
+          "video_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See [`MatchValues::video_codec`]."
+          },
           "video_tracks": {
             "type": [
               "integer",
@@ -8197,6 +8229,17 @@
       "MatchValues": {
         "type": "object",
         "properties": {
+          "audio_codec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OneOrMany_String",
+                "description": "The first audio stream's codec name, on the same terms as\n[`MatchValues::video_codec`]."
+              }
+            ]
+          },
           "audio_tracks": {
             "oneOf": [
               {
@@ -8478,6 +8521,17 @@
               }
             ]
           },
+          "video_codec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OneOrMany_String",
+                "description": "The video stream's codec name as ffprobe reports it, with the in-band\nsentinels `none` (probed, no video stream) and `unknown` (a stream\nffprobe named no codec for). NULL — never probed — matches nothing, so\n\"find every HEVC file\" is `eq: { \"video_codec\": \"hevc\" }` and stays\ncorrect while a library is still filling in."
+              }
+            ]
+          },
           "video_tracks": {
             "oneOf": [
               {
@@ -8723,6 +8777,8 @@
           "blurhash",
           "outro_kind",
           "content_end_ms",
+          "video_codec",
+          "audio_codec",
           "data_id",
           "language",
           "language_confidence",
@@ -10005,6 +10061,13 @@
           "item_id"
         ],
         "properties": {
+          "audio_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Audio Codec\n\nThe *first* audio stream's codec name (`aac`, `opus`, `ac3`, ...), or\n`unknown` when a stream exists that ffprobe named no codec for. Absent\nfor a file with no audio stream as well as for one not yet probed —\nthe column does not distinguish them. Never withheld, as above."
+          },
           "audio_tracks": {
             "type": [
               "integer",
@@ -10202,6 +10265,13 @@
               "string",
               "null"
             ]
+          },
+          "video_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Video Codec\n\nThe video stream's codec name as ffprobe reports it (`h264`, `hevc`,\n`av1`, ...), with two in-band sentinels: `none` means the container was\nprobed and has no video stream, `unknown` means a video stream exists\nbut ffprobe named no codec. Absent when the item has not been probed\nyet or the column was not selected.\n\nUnlike the outro fields this is never withheld: a codec name is an\nobjective property of the file, like `duration` or `width`."
           },
           "video_tracks": {
             "type": [

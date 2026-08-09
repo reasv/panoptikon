@@ -1472,6 +1472,8 @@ fn column_name(col: Column) -> &'static str {
         Column::Blurhash => "blurhash",
         Column::OutroKind => "outro_kind",
         Column::ContentEndMs => "content_end_ms",
+        Column::VideoCodec => "video_codec",
+        Column::AudioCodec => "audio_codec",
         Column::DataId => "data_id",
         Column::Language => "language",
         Column::LanguageConfidence => "language_confidence",
@@ -1507,6 +1509,8 @@ fn order_by_name(field: OrderByField) -> &'static str {
         OrderByField::Blurhash => "blurhash",
         OrderByField::OutroKind => "outro_kind",
         OrderByField::ContentEndMs => "content_end_ms",
+        OrderByField::VideoCodec => "video_codec",
+        OrderByField::AudioCodec => "audio_codec",
         OrderByField::DataId => "data_id",
         OrderByField::Language => "language",
         OrderByField::LanguageConfidence => "language_confidence",
@@ -1543,6 +1547,8 @@ fn get_column_expr(column: Column) -> Expr {
         Column::Blurhash => Expr::col((Items::Table, Items::Blurhash)),
         Column::OutroKind => Expr::col((Items::Table, Items::OutroKind)),
         Column::ContentEndMs => Expr::col((Items::Table, Items::ContentEndMs)),
+        Column::VideoCodec => Expr::col((Items::Table, Items::VideoCodec)),
+        Column::AudioCodec => Expr::col((Items::Table, Items::AudioCodec)),
         Column::DataId => Expr::col((ItemData::Table, ItemData::Id)),
         Column::Language => Expr::col((ExtractedText::Table, ExtractedText::Language)),
         Column::LanguageConfidence => {
@@ -1593,6 +1599,8 @@ fn get_order_by_expr(field: OrderByField, seed: i64) -> Expr {
         OrderByField::Blurhash => Expr::col((Items::Table, Items::Blurhash)),
         OrderByField::OutroKind => Expr::col((Items::Table, Items::OutroKind)),
         OrderByField::ContentEndMs => Expr::col((Items::Table, Items::ContentEndMs)),
+        OrderByField::VideoCodec => Expr::col((Items::Table, Items::VideoCodec)),
+        OrderByField::AudioCodec => Expr::col((Items::Table, Items::AudioCodec)),
         OrderByField::DataId => Expr::col((ItemData::Table, ItemData::Id)),
         OrderByField::Language => Expr::col((ExtractedText::Table, ExtractedText::Language)),
         OrderByField::LanguageConfidence => {
@@ -2189,6 +2197,8 @@ enum Items {
     Blurhash,
     OutroKind,
     ContentEndMs,
+    VideoCodec,
+    AudioCodec,
 }
 
 #[derive(sea_query::Iden)]

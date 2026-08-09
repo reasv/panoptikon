@@ -170,6 +170,24 @@ pub(crate) struct ItemRecordResponse {
     /// value is null.
     #[schema(required)]
     content_end_ms: Option<i64>,
+    /// The video stream's codec name as ffprobe reports it (`h264`, `hevc`,
+    /// `av1`, ...), with two in-band sentinels: `none` means the container was
+    /// probed and has no video stream, `unknown` means a video stream exists
+    /// but ffprobe named no codec. `null` means the item has not been probed
+    /// yet — an existing library fills in over its next few scans, so a client
+    /// must keep whatever it did before these columns existed as the `null`
+    /// behaviour.
+    ///
+    /// Unlike the outro fields this is never gated: a codec name is an
+    /// objective property of the file, like `duration` or `width`.
+    #[schema(required)]
+    video_codec: Option<String>,
+    /// The *first* audio stream's codec name (`aac`, `opus`, `ac3`, ...), or
+    /// `unknown` when a stream exists that ffprobe named no codec for. `null`
+    /// conflates "no audio stream" with "not probed yet" — deliberately, since
+    /// neither is a reason to veto playback. Never gated, as above.
+    #[schema(required)]
+    audio_codec: Option<String>,
     time_added: String,
 }
 
@@ -668,6 +686,11 @@ async fn map_item_record(index_db: &str, item: &ItemRecord) -> ItemRecordRespons
         blurhash: item.blurhash.clone(),
         outro_kind: serve_outro.then(|| item.outro_kind.clone()).flatten(),
         content_end_ms: serve_outro.then_some(item.content_end_ms).flatten(),
+        // Ungated, and deliberately outside the `serve_outro` pair above:
+        // `detect_outros` switches off a *feature*, while a codec name is a
+        // fact about the file in the same class as `duration`.
+        video_codec: item.video_codec.clone(),
+        audio_codec: item.audio_codec.clone(),
         time_added: item.time_added.clone(),
     }
 }
@@ -719,6 +742,8 @@ mod tests {
             blurhash: None,
             outro_kind: None,
             content_end_ms: None,
+            video_codec: None,
+            audio_codec: None,
             time_added: "2024-01-01T00:00:00".to_string(),
         };
         let file = FileRecord {
@@ -1085,6 +1110,36 @@ mod tests {
         // Everything else is untouched by the gate.
         assert_eq!(gated.sha256, item.sha256);
         assert_eq!(gated.size, item.size);
+    }
+
+    /// The codec columns are *not* gated: `detect_outros` switches off a
+    /// feature, while a codec name is a fact about the file in the class of
+    /// `duration`. Pinned against the toggle that sits next to them in the
+    /// same mapper, because the obvious mistake is to fold them into the
+    /// existing `serve_outro` pair — which would blank a client's whole
+    /// playability decision for every database that turned outro detection
+    /// off.
+    #[tokio::test]
+    async fn codec_fields_survive_the_outro_gate() {
+        let _env = crate::test_utils::test_data_dir();
+        let file_path = temp_path("codec_gate");
+        let (mut item, _file) = test_records(&file_path);
+        item.outro_kind = Some("tiktok_card/1".to_string());
+        item.content_end_ms = Some(8000);
+        item.video_codec = Some("hevc".to_string());
+        item.audio_codec = Some("aac".to_string());
+
+        crate::test_utils::write_detect_outros_config("items-codec-off", false);
+        let gated = map_item_record("items-codec-off", &item).await;
+        assert_eq!(gated.outro_kind, None, "the premise: the gate is closed");
+        assert_eq!(gated.content_end_ms, None);
+        assert_eq!(gated.video_codec.as_deref(), Some("hevc"));
+        assert_eq!(gated.audio_codec.as_deref(), Some("aac"));
+
+        crate::test_utils::write_detect_outros_config("items-codec-on", true);
+        let served = map_item_record("items-codec-on", &item).await;
+        assert_eq!(served.video_codec.as_deref(), Some("hevc"));
+        assert_eq!(served.audio_codec.as_deref(), Some("aac"));
     }
 
     /// The wiring, not the helper: `item_meta` must consult the request's

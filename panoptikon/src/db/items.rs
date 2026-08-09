@@ -38,6 +38,13 @@ pub(crate) struct ItemRecord {
     pub outro_kind: Option<String>,
     /// Where the item's real content ends, when an outro was found.
     pub content_end_ms: Option<i64>,
+    /// `items.video_codec`, sentinels included (`none`, `unknown`); `None` when
+    /// the item was never probed. See
+    /// `migrations/index/20260809120000_item_codecs.sql`.
+    pub video_codec: Option<String>,
+    /// `items.audio_codec`; `None` covers both "no audio stream" and "never
+    /// probed" (the column's accepted ambiguity).
+    pub audio_codec: Option<String>,
     pub time_added: String,
 }
 
@@ -165,6 +172,8 @@ fn item_metadata_query(
         items.blurhash AS blurhash,
         items.outro_kind AS outro_kind,
         items.content_end_ms AS content_end_ms,
+        items.video_codec AS video_codec,
+        items.audio_codec AS audio_codec,
         items.time_added AS time_added,
         files.id AS file_id,
         files.path AS path,
@@ -302,6 +311,14 @@ pub(crate) async fn get_item_metadata_unchecked(
             tracing::error!(error = %err, "failed to read content end");
             ApiError::internal("Failed to get item")
         })?;
+        let video_codec: Option<String> = row.try_get("video_codec").map_err(|err| {
+            tracing::error!(error = %err, "failed to read video codec");
+            ApiError::internal("Failed to get item")
+        })?;
+        let audio_codec: Option<String> = row.try_get("audio_codec").map_err(|err| {
+            tracing::error!(error = %err, "failed to read audio codec");
+            ApiError::internal("Failed to get item")
+        })?;
         let time_added: String = row.try_get("time_added").map_err(|err| {
             tracing::error!(error = %err, "failed to read time_added");
             ApiError::internal("Failed to get item")
@@ -339,6 +356,8 @@ pub(crate) async fn get_item_metadata_unchecked(
                 blurhash,
                 outro_kind,
                 content_end_ms,
+                video_codec,
+                audio_codec,
                 time_added,
             });
         }
