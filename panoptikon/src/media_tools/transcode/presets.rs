@@ -10,6 +10,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use utoipa::ToSchema;
 
 /// Ceiling on a preset id. Ids travel in request bodies and in the presets
 /// DTO; the identifier charset is the same one database and policy names use.
@@ -21,7 +22,7 @@ const MAX_FPS_MAX: f64 = 240.0;
 
 /// Output container. Fixes the file extension, the MIME type the artifact is
 /// served with, and whether an audio stream is possible at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Container {
     Mp4,
@@ -71,7 +72,7 @@ impl Container {
 /// decent CRF, `Fast` is the validated hardware encoder when there is one
 /// (design §5 — hardware encoders are meaningfully worse per bit, so export
 /// quality never rides on them).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
     Quality,
@@ -80,7 +81,7 @@ pub enum Channel {
 
 /// Where the UI may offer a preset. Presets carry their own surfaces so a
 /// user-declared profile appears in the right dropdowns with no client change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Surface {
     Playback,
@@ -120,15 +121,6 @@ pub(crate) struct ResolvedPreset {
     pub(crate) channel: Channel,
     #[serde(skip)]
     pub(crate) surfaces: Vec<Surface>,
-}
-
-impl ResolvedPreset {
-    /// Whether the UI may offer this preset on `surface`. Consumer is
-    /// `GET /api/video/presets` (phase 1 step 8).
-    #[allow(dead_code)]
-    pub(crate) fn has_surface(&self, surface: Surface) -> bool {
-        self.surfaces.contains(&surface)
-    }
 }
 
 /// `[transcode.profiles.<name>]`: a patch over a built-in, or a whole new
@@ -296,9 +288,6 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
 /// (a built-in it patched was retired). Such a profile is dropped with a
 /// warning rather than taking the whole preset list down with it.
 ///
-/// Consumers are the transcode routes (phase 1 step 8); config load reaches
-/// only the validation half below.
-#[allow(dead_code)]
 pub(crate) fn resolve_presets(
     profiles: Option<&BTreeMap<String, TranscodeProfileConfig>>,
 ) -> Vec<ResolvedPreset> {
@@ -510,7 +499,7 @@ mod tests {
         assert_eq!(playback.quality, QualityMode::Crf(23));
         assert_eq!(playback.max_height, Some(1080));
         assert_eq!(playback.channel, Channel::Fast);
-        assert!(playback.has_surface(Surface::Playback));
+        assert!(playback.surfaces.contains(&Surface::Playback));
 
         let clip = find_preset(&presets, "clip").unwrap();
         assert_eq!(clip.quality, QualityMode::Crf(18));
@@ -522,7 +511,7 @@ mod tests {
         let webp = find_preset(&presets, "webp-anim").unwrap();
         assert_eq!(webp.container, Container::Webp);
         assert_eq!(webp.acodec, None);
-        assert!(webp.has_surface(Surface::Clip) && webp.has_surface(Surface::Mosaic));
+        assert!(webp.surfaces.contains(&Surface::Clip) && webp.surfaces.contains(&Surface::Mosaic));
         let webm = find_preset(&presets, "mosaic-webm").unwrap();
         assert_eq!(webm.vcodec, "vp9");
         assert_eq!(webm.acodec.as_deref(), Some("opus"));
@@ -585,13 +574,13 @@ mod tests {
         let presets = builtin_presets();
         let clip_ids: Vec<&str> = presets
             .iter()
-            .filter(|preset| preset.has_surface(Surface::Clip))
+            .filter(|preset| preset.surfaces.contains(&Surface::Clip))
             .map(|preset| preset.id.as_str())
             .collect();
         assert_eq!(clip_ids, ["clip", "clip-fast", "webp-anim"]);
         let playback_ids: Vec<&str> = presets
             .iter()
-            .filter(|preset| preset.has_surface(Surface::Playback))
+            .filter(|preset| preset.surfaces.contains(&Surface::Playback))
             .map(|preset| preset.id.as_str())
             .collect();
         assert_eq!(playback_ids, ["playback"]);
@@ -601,7 +590,8 @@ mod tests {
         assert!(
             find_preset(&resolved, "mosaic-webm")
                 .unwrap()
-                .has_surface(Surface::Clip)
+                .surfaces
+                .contains(&Surface::Clip)
         );
     }
 

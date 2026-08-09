@@ -77,7 +77,6 @@ pub(crate) fn hwaccel_values() -> String {
 /// The hardware encoder the fast channel uses, or `None` for `libx264`.
 /// Probed once per process: both the listing and the validation encode spawn
 /// ffmpeg, and the answer cannot change while the process runs.
-#[allow(dead_code)] // Consumer is run.rs (phase 1 step 6); tests cover it here.
 pub(crate) fn fast_h264_encoder() -> Option<&'static str> {
     static ENCODER: OnceLock<Option<&'static str>> = OnceLock::new();
     *ENCODER.get_or_init(|| {

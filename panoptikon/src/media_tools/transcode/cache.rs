@@ -10,12 +10,6 @@
 //! The pool is standalone rather than one of `db/connection.rs`'s: this
 //! database has no relationship to any index or user-data DB, no attachments,
 //! and its own migrator.
-// The cache lands ahead of the two things that call it: the worker pool
-// (pool.rs) commits and negative-caches, and `GET /api/video/artifact` looks
-// up. Until they exist the surface is exercised only by this module's tests,
-// which is not liveness as far as the bin target's dead-code analysis is
-// concerned. Remove this allow with pool.rs.
-#![allow(dead_code)]
 
 use anyhow::{Context, Result, bail};
 use sqlx::migrate::Migrator;
@@ -74,6 +68,10 @@ pub(crate) struct CachedArtifact {
     pub(crate) path: PathBuf,
     pub(crate) mime_type: String,
     pub(crate) size_bytes: i64,
+    /// The preset that produced it. Carried so the serving path can name the
+    /// download without re-deriving anything from the key, which encodes the
+    /// *hash* of the settings, not the settings.
+    pub(crate) preset: String,
 }
 
 /// The row to insert once an encode has produced its bytes.
@@ -165,12 +163,14 @@ impl TranscodeCache {
     /// and "the row is there but the file is not", which reconciliation would
     /// have cleaned up anyway.
     pub(crate) async fn lookup(&self, key: &str) -> Option<CachedArtifact> {
-        let row = sqlx::query("SELECT file_name, mime_type, size_bytes FROM artifacts WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|err| tracing::warn!(error = %err, "transcode cache lookup failed"))
-            .ok()??;
+        let row = sqlx::query(
+            "SELECT file_name, mime_type, size_bytes, preset FROM artifacts WHERE key = ?",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| tracing::warn!(error = %err, "transcode cache lookup failed"))
+        .ok()??;
         let file_name: String = row.get(0);
         let path = self.dir.join(&file_name);
         if !tokio::fs::metadata(&path)
@@ -187,6 +187,7 @@ impl TranscodeCache {
             path,
             mime_type: row.get(1),
             size_bytes: row.get(2),
+            preset: row.get(3),
         })
     }
 
@@ -292,6 +293,7 @@ impl TranscodeCache {
             path,
             mime_type: new.mime_type.to_string(),
             size_bytes,
+            preset: new.preset.to_string(),
         })
     }
 
@@ -395,6 +397,34 @@ impl TranscodeCache {
         Ok(())
     }
 
+    /// Empties the cache: every **unpinned** artifact and, optionally, the
+    /// recorded verdicts. Pinned rows survive by definition — they are the
+    /// share-link guarantee, and an admin clear is not a revocation.
+    /// Returns how many artifacts were removed.
+    pub(crate) async fn clear(&self, include_failures: bool) -> Result<usize> {
+        let rows = sqlx::query("SELECT key, file_name FROM artifacts WHERE pinned = 0")
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list the artifacts to clear")?;
+        let mut removed = 0usize;
+        for row in rows {
+            let key: String = row.get(0);
+            let file_name: String = row.get(1);
+            // File first, then the row: an orphan file is swept, an orphan
+            // row would 404 every request for it.
+            let _ = tokio::fs::remove_file(self.dir.join(&file_name)).await;
+            self.delete_row(&key).await?;
+            removed += 1;
+        }
+        if include_failures {
+            sqlx::query("DELETE FROM transcode_failures")
+                .execute(&self.pool)
+                .await
+                .context("failed to clear the transcode verdicts")?;
+        }
+        Ok(removed)
+    }
+
     async fn delete_row(&self, key: &str) -> Result<()> {
         sqlx::query("DELETE FROM artifacts WHERE key = ?")
             .bind(key)
@@ -441,7 +471,10 @@ impl TranscodeCache {
         self.evict(None).await
     }
 
-    async fn sweep_stale_temp_files(&self) {
+    /// Removes `.tmp-*` leftovers from crashed encodes. Runs at open and,
+    /// opportunistically, after every finished job: a gateway that stays up
+    /// for weeks would otherwise never sweep at all.
+    pub(crate) async fn sweep_stale_temp_files(&self) {
         let dir = self.dir.clone();
         if let Err(err) = tokio::task::spawn_blocking(move || sweep_stale_temps(&dir)).await {
             tracing::warn!(error = %err, "the transcode cache temporary sweep failed");

@@ -145,6 +145,16 @@ allow = [
         "GET",
     ], path_prefix = "/api/items/" },
 
+    # Serving an already-encoded rendition (and listing the presets) is safe
+    # for a public profile; POST /api/video/transcode, which spawns ffmpeg, is
+    # deliberately not granted.
+    { methods = [
+        "GET",
+    ], path = "/api/video/artifact" },
+    { methods = [
+        "GET",
+    ], path = "/api/video/presets" },
+
     { methods = [
         "GET",
         "POST",

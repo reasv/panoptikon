@@ -549,6 +549,23 @@ async fn async_main() -> anyhow::Result<()> {
                     .delete(api::search_cache::clear_result_cache)
                     .put(api::search_cache::resize_result_cache),
             )
+            .route("/api/video/transcode", post(api::video::video_transcode))
+            .route("/api/video/artifact", get(api::video::video_artifact))
+            .route(
+                "/api/video/jobs/{job_id}",
+                get(api::video::video_job).delete(api::video::video_job_cancel),
+            )
+            .route(
+                "/api/video/jobs/{job_id}/events",
+                get(api::video::video_job_events),
+            )
+            .route("/api/video/presets", get(api::video::video_presets))
+            .route(
+                "/api/video/cache",
+                get(api::video::get_transcode_cache)
+                    .delete(api::video::clear_transcode_cache)
+                    .put(api::video::resize_transcode_cache),
+            )
             .route("/api/search/tags", get(api::search::get_tags))
             .route("/api/search/tags/top", get(api::search::get_top_tags))
             .route("/api/search/stats", get(api::search::get_stats))
@@ -714,6 +731,76 @@ mod route_tests {
                 "/api/relay/pairing-operations/{operation_id}/cancel",
                 axum::routing::delete(api::relay::cancel_pairing_operation),
             );
+    }
+
+    /// `/api/video/jobs/{job_id}` and its `/events` child are the one place
+    /// in the video surface where a path parameter is followed by a literal
+    /// segment. Both shapes must reach their own handler, and the job id must
+    /// not swallow `events`.
+    #[tokio::test]
+    async fn video_job_routes_do_not_shadow_the_events_route() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app: Router = Router::new()
+            .route("/api/video/transcode", post(|| async { "submit" }))
+            .route("/api/video/artifact", get(|| async { "artifact" }))
+            .route(
+                "/api/video/jobs/{job_id}",
+                get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    format!("job {id}")
+                })
+                .delete(|| async { "cancel" }),
+            )
+            .route(
+                "/api/video/jobs/{job_id}/events",
+                get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    format!("events {id}")
+                }),
+            )
+            .route("/api/video/presets", get(|| async { "presets" }));
+
+        async fn call(app: &Router, method: &str, path: &str) -> (StatusCode, String) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("route");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            (status, String::from_utf8(body.to_vec()).expect("utf8"))
+        }
+
+        assert_eq!(
+            call(&app, "GET", "/api/video/jobs/abc").await,
+            (StatusCode::OK, "job abc".to_string())
+        );
+        assert_eq!(
+            call(&app, "GET", "/api/video/jobs/abc/events").await,
+            (StatusCode::OK, "events abc".to_string())
+        );
+        assert_eq!(
+            call(&app, "DELETE", "/api/video/jobs/abc").await,
+            (StatusCode::OK, "cancel".to_string())
+        );
+        assert_eq!(
+            call(&app, "GET", "/api/video/presets").await,
+            (StatusCode::OK, "presets".to_string())
+        );
+        // The artifact route is a sibling, not a job id.
+        assert_eq!(
+            call(&app, "GET", "/api/video/artifact").await,
+            (StatusCode::OK, "artifact".to_string())
+        );
     }
 
     /// The pinboard content search is a literal segment sitting where every

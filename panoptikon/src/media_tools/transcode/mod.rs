@@ -7,7 +7,9 @@
 
 pub(crate) mod cache;
 pub(crate) mod hw;
+pub(crate) mod pool;
 pub(crate) mod presets;
+pub(crate) mod run;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -33,11 +35,22 @@ const PARAMS_HASH_HEX_LEN: usize = 32;
 /// fixture test guards all three; changing any of them requires a
 /// [`TRANSCODER_VERSION`] bump.
 #[derive(Debug, Clone, Serialize)]
-#[allow(dead_code)] // Consumers are run.rs/pool.rs (phase 1 steps 6-7).
 pub(crate) struct TranscodeParams {
     pub(crate) source_sha256: String,
     /// The *resolved* preset, so editing a profile re-keys its artifacts.
     pub(crate) preset: ResolvedPreset,
+    /// The concrete encoder invocation the preset resolved to on this host
+    /// (`libx264-medium`, `h264_nvenc`, `libvpx-vp9`, ...), decided at submit
+    /// time by [`run::resolve_encoder`].
+    ///
+    /// It is in the key because the key's promise is *same key, same bytes*:
+    /// the fast channel resolves to a hardware encoder on one machine and to
+    /// `libx264 -preset veryfast` on the next, and the same preset at the same
+    /// trim would otherwise name two visibly different files. An hwaccel flip
+    /// (probe result changing, `[transcode] hwaccel` edited) must re-key for
+    /// exactly the same reason — and the x264 `-preset` rides along in the
+    /// identity because it, too, changes the output bytes.
+    pub(crate) encoder: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) start_cs: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,21 +58,36 @@ pub(crate) struct TranscodeParams {
     pub(crate) transcoder_version: i64,
 }
 
-#[allow(dead_code)] // Consumers are run.rs/pool.rs (phase 1 steps 6-7).
 impl TranscodeParams {
     pub(crate) fn new(
         source_sha256: impl Into<String>,
         preset: ResolvedPreset,
+        encoder: String,
         start_cs: Option<i64>,
         end_cs: Option<i64>,
     ) -> Self {
         Self {
             source_sha256: source_sha256.into(),
             preset,
+            encoder,
             start_cs,
             end_cs,
             transcoder_version: TRANSCODER_VERSION,
         }
+    }
+
+    /// [`Self::new`] with the encoder resolved against this host's hardware
+    /// probe. **Blocking**: the first call may spawn ffmpeg twice (listing
+    /// plus a validation encode), so callers on the async runtime go through
+    /// `spawn_blocking`.
+    pub(crate) fn resolve(
+        source_sha256: impl Into<String>,
+        preset: ResolvedPreset,
+        start_cs: Option<i64>,
+        end_cs: Option<i64>,
+    ) -> Self {
+        let encoder = run::resolve_encoder(&preset, hw::fast_h264_encoder());
+        Self::new(source_sha256, preset, encoder, start_cs, end_cs)
     }
 
     /// Digest of the canonical JSON, hex, truncated.
@@ -90,11 +118,24 @@ impl TranscodeParams {
 mod tests {
     use super::*;
     use presets::{builtin_presets, find_preset};
+    use run::{ENCODER_X264_FAST, ENCODER_X264_QUALITY};
+
+    /// See [`params_hash_is_stable`]. Nothing has shipped that used a
+    /// different value, so folding the encoder into the params re-pinned this
+    /// constant without a `TRANSCODER_VERSION` bump; any later change does
+    /// need one.
+    const PINNED_CLIP_PARAMS_HASH: &str = "07672bfec5a36e1edb925a803788d3b7";
 
     fn clip_params(start_cs: Option<i64>, end_cs: Option<i64>) -> TranscodeParams {
         let presets = builtin_presets();
         let preset = find_preset(&presets, "clip").expect("the clip preset ships").clone();
-        TranscodeParams::new("a".repeat(64), preset, start_cs, end_cs)
+        TranscodeParams::new(
+            "a".repeat(64),
+            preset,
+            ENCODER_X264_QUALITY.to_string(),
+            start_cs,
+            end_cs,
+        )
     }
 
     /// PINNED FIXTURE. This hash is the identity of every artifact on every
@@ -112,13 +153,12 @@ mod tests {
         let params = clip_params(None, None);
         assert_eq!(
             serde_json::to_string(&params).unwrap(),
-            r#"{"source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","preset":{"id":"clip","container":"mp4","vcodec":"h264","acodec":"aac","quality":{"crf":18},"max_height":null,"fps_max":null,"channel":"quality"},"transcoder_version":1}"#
+            r#"{"source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","preset":{"id":"clip","container":"mp4","vcodec":"h264","acodec":"aac","quality":{"crf":18},"max_height":null,"fps_max":null,"channel":"quality"},"encoder":"libx264-medium","transcoder_version":1}"#
         );
-        assert_eq!(params.params_hash(), "c68524fa9035eab926b45693355f53c3");
+        assert_eq!(params.params_hash(), PINNED_CLIP_PARAMS_HASH);
         assert_eq!(
             params.cache_key(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-\
-             c68524fa9035eab926b45693355f53c3"
+            format!("{}-{PINNED_CLIP_PARAMS_HASH}", "a".repeat(64))
         );
         assert_eq!(
             params.artifact_file_name(),
@@ -154,12 +194,14 @@ mod tests {
     fn resolved_settings_key_but_presentation_does_not() {
         let presets = builtin_presets();
         let clip = find_preset(&presets, "clip").unwrap();
-        let baseline = TranscodeParams::new("sha", clip.clone(), None, None).cache_key();
+        let quality = ENCODER_X264_QUALITY.to_string();
+        let baseline =
+            TranscodeParams::new("sha", clip.clone(), quality.clone(), None, None).cache_key();
 
         let mut retuned = clip.clone();
         retuned.quality = presets::QualityMode::Crf(20);
         assert_ne!(
-            TranscodeParams::new("sha", retuned, None, None).cache_key(),
+            TranscodeParams::new("sha", retuned, quality.clone(), None, None).cache_key(),
             baseline
         );
 
@@ -167,14 +209,26 @@ mod tests {
         relabelled.label = "Clip (renamed)".to_string();
         relabelled.surfaces = vec![presets::Surface::Mosaic];
         assert_eq!(
-            TranscodeParams::new("sha", relabelled, None, None).cache_key(),
+            TranscodeParams::new("sha", relabelled, quality.clone(), None, None).cache_key(),
             baseline
         );
+
+        // The host's encoder decision is part of the identity: the same
+        // preset resolved against a validated hardware encoder produces
+        // visibly different bytes, so it must not share a key.
+        for encoder in [ENCODER_X264_FAST, "h264_nvenc"] {
+            assert_ne!(
+                TranscodeParams::new("sha", clip.clone(), encoder.to_string(), None, None)
+                    .cache_key(),
+                baseline,
+                "{encoder} must re-key"
+            );
+        }
 
         // Two presets that differ only by id are still different artifacts.
         let fast = find_preset(&presets, "clip-fast").unwrap();
         assert_ne!(
-            TranscodeParams::new("sha", fast.clone(), None, None).cache_key(),
+            TranscodeParams::new("sha", fast.clone(), quality, None, None).cache_key(),
             baseline
         );
     }

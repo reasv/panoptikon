@@ -12,3 +12,4 @@ pub(crate) mod relay;
 pub(crate) mod search;
 pub(crate) mod search_cache;
 pub(crate) mod utils;
+pub(crate) mod video;

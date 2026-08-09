@@ -44,6 +44,12 @@ pub(crate) struct ClientCapabilities {
     /// granting read-only board access would report `pinboards: false` while
     /// the library search still works.
     pub pinboard_search: bool,
+    /// POST /api/video/transcode
+    ///
+    /// The write probe of the video surface: a policy may serve already
+    /// encoded artifacts (`GET /api/video/artifact`) while denying new
+    /// conversions, so this is deliberately not probed off the GET.
+    pub video_transcode: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -81,6 +87,7 @@ fn derive_capabilities(settings: &Settings, policy: &PolicyConfig) -> ClientCapa
         inference: allows(Method::POST, "/api/inference/predict/group/probe"),
         pinboards: allows(Method::POST, "/api/pinboards"),
         pinboard_search: allows(Method::POST, "/api/pinboards/search"),
+        video_transcode: allows(Method::POST, "/api/video/transcode"),
     }
 }
 
@@ -253,6 +260,7 @@ disable_backend_open = true
         assert!(!caps.inference);
         assert!(!caps.pinboards);
         assert!(!caps.pinboard_search);
+        assert!(!caps.video_transcode);
         assert_eq!(
             response.client,
             serde_json::json!({ "search_throttle_ms": 1500, "disable_backend_open": true })
@@ -279,6 +287,7 @@ disable_backend_open = true
                 && caps.inference
                 && caps.pinboards
                 && caps.pinboard_search
+                && caps.video_transcode
         );
         assert_eq!(
             response.client,
