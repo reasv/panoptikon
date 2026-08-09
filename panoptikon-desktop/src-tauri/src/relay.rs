@@ -353,6 +353,9 @@ pub struct RelayStatusView {
     pub instances: Vec<RelayInstanceView>,
     pub commands: FileActionCommands,
     pub pending_actions: Vec<PendingActionView>,
+    /// Current share-cache ceiling in bytes, so the control UI can populate the
+    /// "Share cache limit" field (rendered in MB) on load.
+    pub share_cache_max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -716,6 +719,7 @@ impl RelayState {
                     ),
                 })
                 .collect(),
+            share_cache_max_bytes: config.share_cache_max_bytes,
         }
     }
 
@@ -739,6 +743,12 @@ impl RelayState {
     pub async fn set_enabled(&self, enabled: bool) -> anyhow::Result<()> {
         let mut config = self.config.write().await;
         config.enabled = enabled;
+        save_config(&self.config_path, &config)
+    }
+
+    pub async fn set_share_cache_max_bytes(&self, max_bytes: u64) -> anyhow::Result<()> {
+        let mut config = self.config.write().await;
+        config.share_cache_max_bytes = max_bytes;
         save_config(&self.config_path, &config)
     }
 
@@ -3842,6 +3852,37 @@ mod tests {
         assert_eq!(
             load_config(&path, false).unwrap().share_cache_max_bytes,
             123
+        );
+    }
+
+    /// The share-cache ceiling set through the control command is persisted to
+    /// `relay.toml` and reflected back by `status()` (bytes), which is how the
+    /// control UI populates its "Share cache limit" field on load.
+    #[tokio::test]
+    async fn set_share_cache_max_bytes_persists_and_surfaces_in_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+
+        assert_eq!(
+            fixture.state.status().await.share_cache_max_bytes,
+            default_share_cache_max_bytes()
+        );
+
+        fixture
+            .state
+            .set_share_cache_max_bytes(256 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture.state.status().await.share_cache_max_bytes,
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            load_config(&temp.path().join("relay.toml"), false)
+                .unwrap()
+                .share_cache_max_bytes,
+            256 * 1024 * 1024
         );
     }
 

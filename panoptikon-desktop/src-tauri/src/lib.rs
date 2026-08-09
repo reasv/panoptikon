@@ -160,7 +160,7 @@ pub fn run() {
             choose_file_action_application, choose_file_action_test_file, test_file_action,
             get_server_configuration, set_server_configuration,
             get_search_cache_stats, clear_search_result_cache, set_search_cache_size,
-            set_relay_enabled,
+            set_relay_enabled, set_share_cache_max_bytes,
             updates::get_update_state, updates::check_for_updates,
             updates::open_update_window, updates::close_update_window,
             updates::open_update_link, updates::set_automatic_update_checks,
@@ -212,10 +212,7 @@ pub fn run() {
                 match action {
                     RelayAction::OpenFile => host_open::open_path(&opener, &path)?,
                     RelayAction::RevealInFolder => opener.opener().reveal_item_in_dir(path)?,
-                    // macOS main-thread dispatch: Step 4
-                    RelayAction::CopyToClipboard => {
-                        panoptikon_clipboard::copy_files_to_clipboard(&[&path])?
-                    }
+                    RelayAction::CopyToClipboard => copy_files_to_clipboard_on_host(&opener, &path)?,
                 }
                 Ok(())
             });
@@ -1404,6 +1401,24 @@ async fn set_relay_enabled(
     }
     Ok(())
 }
+/// Sets the Relay share-cache ceiling. `size_mb` is megabytes (matching the
+/// control UI field); it is converted to bytes for `share_cache_max_bytes`,
+/// which governs both the eviction target and the action-time
+/// `file_too_large` admission check.
+#[tauri::command]
+async fn set_share_cache_max_bytes(
+    window: WebviewWindow,
+    app: AppHandle,
+    size_mb: u64,
+) -> Result<(), String> {
+    validate_control(&window)?;
+    let max_bytes = size_mb.saturating_mul(1024 * 1024);
+    app.state::<Arc<RelayState>>()
+        .set_share_cache_max_bytes(max_bytes)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 async fn relay_pending(
     window: WebviewWindow,
@@ -1589,9 +1604,10 @@ async fn local_file_commands(
     Ok(relay::FileActionCommands {
         open_file: parse("file"),
         reveal_in_folder: parse("folder"),
-        // Mirroring the clipboard verb into the local Server's
-        // `[open] clipboard_*` keys is Step 4, together with its editor row.
-        copy_to_clipboard: relay::CommandSpec::default(),
+        // The clipboard verb mirrors the server's `[open] clipboard_*` keys,
+        // symmetrically with file/folder (Step 2's precedence: program+args =
+        // direct, command = shell).
+        copy_to_clipboard: parse("clipboard"),
     })
 }
 
@@ -1601,7 +1617,11 @@ async fn set_local_file_commands(
     commands: relay::FileActionCommands,
 ) -> Result<(), String> {
     validate_control(&window)?;
-    for command in [&commands.open_file, &commands.reveal_in_folder] {
+    for command in [
+        &commands.open_file,
+        &commands.reveal_in_folder,
+        &commands.copy_to_clipboard,
+    ] {
         if !command.program.trim().is_empty() && !command.shell_command.trim().is_empty() {
             return Err("choose either a direct executable or shell mode, not both".into());
         }
@@ -1652,6 +1672,7 @@ async fn set_local_file_commands(
     };
     write("file", &commands.open_file);
     write("folder", &commands.reveal_in_folder);
+    write("clipboard", &commands.copy_to_clipboard);
     let mut document = panoptikon_config::TomlDocument::parse(&text).map_err(|e| e.to_string())?;
     document
         .patch_values(&before, &after)
@@ -2083,6 +2104,39 @@ fn execute_file_action_command(
     Ok(())
 }
 
+/// Places OS-native file references on the clipboard for the default (no custom
+/// command) `copy_to_clipboard` action.
+///
+/// On macOS the AppKit pasteboard is main-thread-hostile, and this runs on an
+/// axum worker thread, so the write is dispatched to the main thread via
+/// `run_on_main_thread` (§0.10). That call is fire-and-forget and only reports
+/// whether the dispatch itself was accepted, so the clipboard write's own
+/// `Result` is bridged back over a one-shot channel and returned to the relay
+/// action handler, which turns any error into a `Failed` action. Other
+/// platforms' clipboard backends are thread-agnostic and write directly.
+#[cfg(target_os = "macos")]
+fn copy_files_to_clipboard_on_host(app: &AppHandle, path: &std::path::Path) -> anyhow::Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+    // The write runs on the main thread, outside the relay handler's
+    // `catch_unwind`, so the macOS clipboard backend must stay panic-free
+    // (return `Err`, never panic) — a panic here would unwind through tao
+    // rather than become a `Failed` action.
+    app.run_on_main_thread(move || {
+        let _ = tx.send(panoptikon_clipboard::copy_files_to_clipboard(&[&path]));
+    })
+    .map_err(|error| {
+        anyhow::anyhow!("failed to dispatch the clipboard write to the main thread: {error}")
+    })?;
+    rx.recv()
+        .map_err(|_| anyhow::anyhow!("the clipboard write did not report a result"))?
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_files_to_clipboard_on_host(_app: &AppHandle, path: &std::path::Path) -> anyhow::Result<()> {
+    panoptikon_clipboard::copy_files_to_clipboard(&[path])
+}
+
 fn expanded_file_action_preview(
     command: &relay::CommandSpec,
     path: &std::path::Path,
@@ -2401,6 +2455,7 @@ mod tests {
             "clear_search_result_cache",
             "set_search_cache_size",
             "set_relay_enabled",
+            "set_share_cache_max_bytes",
             "get_update_state",
             "check_for_updates",
             "open_update_window",

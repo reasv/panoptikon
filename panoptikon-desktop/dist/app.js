@@ -137,13 +137,17 @@ function updateCommandCard(box) {
 }
 function commandEditor(container, commands) {
   container.replaceChildren();
-  for (const [key, label] of [['open_file', 'Open File'], ['reveal_in_folder', 'Show in Folder']]) {
+  for (const [key, label] of [['open_file', 'Open File'], ['reveal_in_folder', 'Show in Folder'], ['copy_to_clipboard', 'Copy to Clipboard']]) {
     const spec = commands[key] || { mode: 'system_default', program: '', args: [], shell_command: '' };
     const box = document.createElement('fieldset'); box.dataset.command = key; box.className = 'command-card';
     const legend = document.createElement('legend'); legend.textContent = label;
     const methodLabel = document.createElement('label'); methodLabel.className = 'method-field'; methodLabel.textContent = 'Method';
     const mode = document.createElement('select'); mode.dataset.field = 'mode';
-    for (const [value, text] of [['system_default','System default'], ['specific_application','Choose an application'], ['custom_direct','Executable from PATH'], ['custom_shell','Shell command (advanced)']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; mode.append(option); }
+    // "Choose an application" is meaningless for a clipboard write, so the
+    // clipboard verb offers only System default / Custom (direct) / Custom
+    // (shell). Custom modes still require a path placeholder (readCommand).
+    const modeOptions = [['system_default','System default'], ['specific_application','Choose an application'], ['custom_direct','Executable from PATH'], ['custom_shell','Shell command (advanced)']].filter(([value]) => key !== 'copy_to_clipboard' || value !== 'specific_application');
+    for (const [value, text] of modeOptions) { const option = document.createElement('option'); option.value = value; option.textContent = text; mode.append(option); }
     mode.value = spec.mode || (spec.shell_command ? 'custom_shell' : spec.program ? 'custom_direct' : 'system_default'); methodLabel.append(mode);
     const methodHelp = document.createElement('p'); methodHelp.dataset.role = 'method-help'; methodHelp.className = 'method-help muted';
 
@@ -187,6 +191,11 @@ function readCommand(box) {
   const args = ['specific_application', 'custom_direct'].includes(mode) ? parseArguments(box.querySelector('[data-field=args]').value) : [];
   if (mode !== 'system_default' && !program && !shell_command) throw new Error('Choose an application or enter a command.');
   if (mode !== 'system_default' && ![program, shell_command, ...args].some(value => /\{(?:path|folder|filename)\}/.test(value))) throw new Error('Each custom action must use at least one path placeholder.');
+  // The relay quotes the clipboard command's placeholders automatically (its
+  // {filename} is remote-supplied), so a quote in the template would be
+  // rejected on save. Surface a friendly message before the round-trip; the
+  // backend remains the enforcer.
+  if (box.dataset.command === 'copy_to_clipboard' && mode === 'custom_shell' && /["']/.test(shell_command)) throw new Error("The clipboard command's placeholders are quoted automatically; remove the quotes from your shell command.");
   return { mode, program, shell_command, args };
 }
 function readCommands(container) { const result = {}; for (const box of container.querySelectorAll('[data-command]')) result[box.dataset.command] = readCommand(box); return result; }
@@ -403,6 +412,9 @@ async function refresh() {
     await refreshSearchCacheStats();
     const relayStatus = await invoke('relay_status');
     byId('relay-enabled').checked = relayStatus.enabled;
+    // Don't clobber the field while the user is editing it. share_cache_max_bytes
+    // is bytes; the field is MB.
+    if (document.activeElement !== byId('share-cache-size')) byId('share-cache-size').value = Math.round(relayStatus.share_cache_max_bytes / 1048576);
     if (!byId('file-commands').children.length) commandEditor(byId('file-commands'), await invoke('file_action_commands'));
     if (!byId('relay-instances').contains(document.activeElement)) byId('relay-instances').replaceChildren(...relayStatus.instances.map(mappingEditor));
   } catch (error) { fail(error); }
@@ -525,6 +537,17 @@ byId('clear-search-cache').addEventListener('click', async () => {
     renderSearchCacheStats(await invoke('clear_search_result_cache'));
     searchCacheStatus('Search result cache cleared.', true);
   } catch (error) { searchCacheStatus(String(error), false); }
+});
+byId('apply-share-cache-size').addEventListener('click', async () => {
+  const button = byId('apply-share-cache-size');
+  const status = byId('share-cache-status');
+  try {
+    const size = positiveInteger('share-cache-size', 'Share cache limit', 0, 1048576);
+    button.disabled = true; button.textContent = 'Applying…';
+    await invoke('set_share_cache_max_bytes', { sizeMb: size });
+    status.textContent = 'Share cache limit saved.'; status.className = 'command-status success';
+  } catch (error) { status.textContent = String(error); status.className = 'command-status inline-error'; }
+  finally { button.disabled = false; button.textContent = 'Apply now'; }
 });
 byId('save-file-commands').addEventListener('click', async () => { try { await invoke('set_file_action_commands', { commands: readCommands(byId('file-commands')) }); byId('file-command-status').textContent = 'File-opening settings saved.'; } catch (error) { fail(error); } });
 window.__TAURI__?.event?.listen('desktop-state', refresh);

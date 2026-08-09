@@ -85,9 +85,25 @@ Relay support to one action without the other.
 - In Relay mode, Relay maps the indexed path and runs its configured
   Show in Folder command on the browser device.
 
-When an item has multiple file records, the selected record's exact path MUST
-be sent. Implementations MUST NOT silently substitute the first file record
-when the user acted on another one.
+### 3.3 Copy File
+
+Copy File places an OS-native *file reference* (not the bytes) on the clipboard
+of the device the browser runs on, so the user can paste the file into a file
+manager, chat client, or editor.
+
+- In server-host mode, Copy File uses `POST /api/open/clipboard/{sha256}`, which
+  writes the clipboard on the Panoptikon server host exactly as Open File runs
+  its command there.
+- In restricted/browser mode with no Relay, Copy File is unavailable and the UI
+  offers a browser download instead.
+- In Relay mode, Relay makes the file available on the browser device and copies
+  it to that device's clipboard, per section 16.
+
+Copy File is a **share action**, not a location action: it acts on the file's
+*bytes*, so — unlike Open File and Show in Folder — a missing path mapping does
+not block it. Section 16 defines how the bytes are made available. The Open
+File / Show in Folder parity requirement in this section does not extend to Copy
+File; a Relay MAY advertise Copy File without it.
 
 ## 4. Server policy and zero-impact behavior
 
@@ -135,8 +151,14 @@ details. A successful response contains at least:
 
 - protocol identifier and version;
 - a stable, random Relay ID;
-- whether privileged Relay actions are enabled; and
-- compatibility information needed by the browser integration.
+- whether privileged Relay actions are enabled;
+- compatibility information needed by the browser integration; and
+- an optional `features` array advertising capabilities beyond the base
+  protocol. A Relay that supports Copy File advertises `copy_to_clipboard`;
+  a client MUST enable relay-copy only when that value is present, and MUST
+  treat an omitted `features` field as the empty array. This lets a new UI
+  degrade to a browser download against an older Relay instead of sending an
+  action verb that Relay would reject.
 
 The Relay ID MUST be unguessable and MUST remain stable across Desktop
 restarts unless the user explicitly resets Relay identity.
@@ -269,9 +291,11 @@ Relay. When the user selects the pairing entry:
 4. The pairing window displays the requesting Panoptikon origin, suggested
    roots, and the capabilities to be granted: submitting server paths covered
    by locally approved mappings to the local Open File and Show in Folder
-   commands. It also lets the user copy, replace, narrow, or broaden each
-   suggested root and choose initial local folders for any roots they want to
-   map now.
+   commands, and receiving file copies for the clipboard (Copy File). It also
+   lets the user copy, replace, narrow, or broaden each suggested root and
+   choose initial local folders for any roots they want to map now. Mapping is
+   optional — Copy File works with no folders mapped, materializing the bytes
+   per section 16.
 5. The user approves or rejects the request locally, including any selected
    initial mappings in the approval.
 6. On approval, Relay creates the per-server credential and makes it claimable
@@ -567,8 +591,13 @@ pairing record.
 - Every privileged request requires both an allowed Origin and a valid
   credential.
 - Pairing always requires explicit approval in the trusted Desktop UI.
-- Pairing approval identifies the requesting Panoptikon origin and the two
-  local capabilities being granted.
+- Pairing approval identifies the requesting Panoptikon origin and the local
+  capabilities being granted (Open File, Show in Folder, and Copy File).
+  Existing pairings approved under earlier wording that named only Open File
+  and Show in Folder inherit Copy File without re-approval: it is the same risk
+  class, since a paired origin can already drive a configured local command,
+  and it never executes outside the loopback boundary. This inheritance MUST be
+  noted wherever the capability set is documented for the user.
 - Server-side credentials use permission-restricted Server-owned storage and
   are returned only through policy-authorized, `Cache-Control: no-store` APIs.
 - Credential responses and browser session state MUST NOT enter SSR caches,
@@ -636,7 +665,105 @@ The implementation is not complete until automated and manual tests cover:
 22. Narrow-window, keyboard-only, screen-reader, and high-latency pairing and
     mapping flows.
 
-## 16. Implementation boundaries
+## 16. File-copy (clipboard) materialization
+
+Copy File through Relay acts on the file's bytes rather than a local path, so it
+has a materialization protocol that Open File and Show in Folder do not. The
+client submits a Copy File action to Relay; the outcome depends on whether Relay
+can reach the bytes locally.
+
+### 16.1 Action resolution
+
+The client MUST include the file's `sha256`, `filename`, and `size` on a Copy
+File action. `size` MAY be `0`: zero-byte files are legitimate and there is no
+`size > 0` requirement; an absent `size` and an explicit `0` are equivalent.
+
+Relay resolves the action in this order:
+
+1. **Mapped and present.** If a locally approved mapping resolves the path and
+   the file exists there, Relay copies that real file to the clipboard. No bytes
+   are transferred and nothing is cached.
+2. **Already cached.** If Relay already holds the declared `sha256` in its share
+   cache (and the cached size matches), it copies the cached file and refreshes
+   the entry's last-use time. No bytes are transferred.
+3. **Bytes required.** Otherwise Relay first checks `size` against its share-cache
+   ceiling. A file that could never fit MUST be refused **before any record is
+   created**, with **413** `file_too_large` and `details: {size, max}`; the
+   client falls back to a browser download. If it could fit, Relay records the
+   action in the `PendingBytes` state and answers **409** `bytes_required` with
+   `details` carrying the `action_id`, `sha256`, and `filename`. Copy File MUST
+   NOT enter the missing-mapping recovery flow (section 9.2); a share action
+   never prompts for a mapping.
+
+### 16.2 Byte upload
+
+On `bytes_required`, the client uploads the file bytes to
+`POST /v1/files/{action_id}`, authenticated identically to other Relay actions
+(allowed Origin plus valid credential). The upload:
+
+- MUST target an action currently in `PendingBytes`; an upload against any other
+  state answers **409** with the record's current status, and a second
+  concurrent upload for the same `action_id` answers **409**
+  `upload_in_progress`.
+- is size-checked against the declared `size` (plus a small fixed slack) and
+  answers **413** `upload_too_large`, or **400** `size_mismatch`, on a breach or
+  disagreement.
+- is hash-verified: Relay hashes the stream as it writes and MUST reject a digest
+  that does not match the record's declared `sha256` with **400** `hash_mismatch`.
+  The share cache is content-addressed and its entries are handed to local
+  commands by path, so storing unverified bytes under a claimed digest would
+  poison every later action resolving to that digest.
+
+On any of `upload_too_large`, `size_mismatch`, or `hash_mismatch` the record
+stays `PendingBytes`, so a re-fetch and re-upload is the correct repair. A cache
+or IO failure answers **500** `upload_failed` with a fixed opaque message; the
+real error is logged locally only, never returned to the origin, which has no
+business learning this host's filesystem layout or disk state.
+
+On a verified upload Relay moves the file into its content-addressed share
+cache, transitions the record to `Executing`, runs the configured Copy File
+command (or the default clipboard write) on the browser device, and transitions
+the record to `Complete` or `Failed`. The client observes the outcome by polling
+`GET /v1/actions/{action_id}` exactly as it does for other Relay actions; no push
+channel is required.
+
+### 16.3 Share cache
+
+Relay stores materialized bytes in a content-addressed share cache bounded by a
+user-configurable ceiling (default 5 GiB, editable in Desktop settings). Entries
+are evicted oldest-last-use-first when the total exceeds the ceiling, but a small
+ring of the most recently handed-out cache paths is never evicted: one of them
+may be sitting on the system clipboard, where eviction would turn a later paste
+into a silent no-op. In-flight upload temporaries are swept on an age guard, not
+by eviction. Copies satisfied from a mapping or an existing cache entry store
+nothing, so the ceiling governs only bytes Relay must newly store.
+
+### 16.4 Action-record lifetime
+
+Copy File records share the Relay action store but need lifetime rules the
+location verbs do not:
+
+- `PendingBytes` has its own longer TTL than ordinary finished records — a
+  multi-gigabyte upload can legitimately take a while — but it still expires, so
+  an abandoned browser tab cannot pin a record forever. When the upload
+  completes, the record's age is reset so the finished record ages out on the
+  ordinary TTL.
+- `Executing` is exempt from every TTL: the local command's runtime is not
+  Relay's to predict, and dropping the record mid-command would strand the
+  polling client. Its bound is startup recovery instead — on load, any record
+  still `Executing` is demoted to a `Failed` "interrupted" result, since nothing
+  can report on a command whose process died.
+
+Action records are persisted to a `relay-actions.toml` sidecar beside the main
+Relay configuration, never inside it. Records are the only Relay state whose
+*shape* grows with the protocol (each new verb or record state adds an enum
+variant), so keeping them out of the main configuration file ensures that an
+older binary reading that file — a downgrade or a second install — cannot fail
+to parse an unknown variant and quarantine the pairings along with it. A sidecar
+that fails to parse is quarantined on its own and Relay starts with no actions;
+pairings are never at risk from action-state parse errors.
+
+## 17. Implementation boundaries
 
 This specification deliberately does not prescribe:
 
