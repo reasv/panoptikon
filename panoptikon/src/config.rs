@@ -5,6 +5,8 @@ use serde::de::{self, SeqAccess, Visitor};
 use std::sync::OnceLock;
 use std::{collections::BTreeMap, env, fmt, path::PathBuf};
 
+use crate::media_tools::transcode::presets::TranscodeProfileConfig;
+
 pub const MAX_DB_NAME_LEN: usize = 64;
 pub const MAX_USERNAME_LEN: usize = 64;
 pub const CONFIG_PATH_ENV: &str = "PANOPTIKON_CONFIG_PATH";
@@ -42,6 +44,8 @@ pub struct Settings {
     pub search: SearchConfig,
     #[serde(default)]
     pub jobs: JobsConfig,
+    #[serde(default)]
+    pub transcode: TranscodeConfig,
     #[serde(default)]
     pub rulesets: BTreeMap<String, RuleSetConfig>,
     #[serde(default)]
@@ -428,6 +432,123 @@ impl Default for JobsConfig {
     }
 }
 
+/// `[transcode]`: backend video transcoding
+/// (docs/video-transcoding-design.md). Host-level like `[jobs]`: the encoders
+/// and the artifact cache are properties of the machine, not of an index
+/// database, so nothing here is per-DB.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranscodeConfig {
+    /// Concurrent ffmpeg transcodes. Bounds both CPU and the hardware
+    /// encoder's own session limit; transcodes run outside the (strictly
+    /// serial) job queue, so this is their only bound.
+    #[serde(default = "default_transcode_max_concurrent_jobs")]
+    pub max_concurrent_jobs: usize,
+    /// Artifact cache directory. Absent — or the empty string, which is what
+    /// a `${VAR:-}` template substitutes to — means
+    /// `<data_folder>/transcode-cache`.
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    /// Byte budget for the artifact cache, in megabytes. Runtime-adjustable
+    /// via `PUT /api/video/cache`; this value is what the cache starts with
+    /// (and returns to) at process startup.
+    #[serde(default = "default_transcode_cache_size_mb")]
+    pub cache_size_mb: u64,
+    /// Ceiling on the artifact cache budget, in megabytes. Bounds both
+    /// `cache_size_mb` and the runtime resize endpoint.
+    #[serde(default = "default_transcode_cache_size_max_mb")]
+    pub cache_size_max_mb: u64,
+    /// Hardware encoder policy for the fast channel: `"auto"` probes,
+    /// `"off"` always uses libx264, or name one candidate encoder (either
+    /// spelling, `nvenc` or `h264_nvenc`).
+    #[serde(default = "default_transcode_hwaccel")]
+    pub hwaccel: String,
+    /// Encoding profiles. Absent means the built-in presets; an explicit
+    /// empty table means none at all; entries are merged by name over the
+    /// built-ins (the `[vector_quants]` tri-state).
+    #[serde(default)]
+    pub profiles: Option<BTreeMap<String, TranscodeProfileConfig>>,
+    /// Maximum items in one animated-mosaic composition.
+    #[serde(default = "default_max_mosaic_inputs")]
+    pub max_mosaic_inputs: usize,
+    /// Admission-time ceiling on the memory a mosaic's loop buffers may need.
+    #[serde(default = "default_max_mosaic_loop_mb")]
+    pub max_mosaic_loop_mb: u64,
+    /// Hard cap on animated-image (WebP) output length; those decode entirely
+    /// into memory in the browser.
+    #[serde(default = "default_max_animated_image_seconds")]
+    pub max_animated_image_seconds: u64,
+    /// Hard cap on real video output length.
+    #[serde(default = "default_max_output_seconds")]
+    pub max_output_seconds: u64,
+    /// Compositions with more inputs than this are dispatched exclusively
+    /// (nothing else runs alongside them).
+    #[serde(default = "default_compose_light_threshold")]
+    pub compose_light_threshold: usize,
+}
+
+fn default_transcode_max_concurrent_jobs() -> usize {
+    1
+}
+
+fn default_transcode_cache_size_mb() -> u64 {
+    8192
+}
+
+fn default_transcode_cache_size_max_mb() -> u64 {
+    262_144
+}
+
+fn default_transcode_hwaccel() -> String {
+    "auto".to_string()
+}
+
+fn default_max_mosaic_inputs() -> usize {
+    12
+}
+
+fn default_max_mosaic_loop_mb() -> u64 {
+    512
+}
+
+fn default_max_animated_image_seconds() -> u64 {
+    30
+}
+
+fn default_max_output_seconds() -> u64 {
+    300
+}
+
+fn default_compose_light_threshold() -> usize {
+    2
+}
+
+impl Default for TranscodeConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_jobs: default_transcode_max_concurrent_jobs(),
+            cache_dir: None,
+            cache_size_mb: default_transcode_cache_size_mb(),
+            cache_size_max_mb: default_transcode_cache_size_max_mb(),
+            hwaccel: default_transcode_hwaccel(),
+            profiles: None,
+            max_mosaic_inputs: default_max_mosaic_inputs(),
+            max_mosaic_loop_mb: default_max_mosaic_loop_mb(),
+            max_animated_image_seconds: default_max_animated_image_seconds(),
+            max_output_seconds: default_max_output_seconds(),
+            compose_light_threshold: default_compose_light_threshold(),
+        }
+    }
+}
+
+impl TranscodeConfig {
+    /// The artifact cache directory, defaulted against the data folder.
+    pub(crate) fn resolved_cache_dir(&self) -> PathBuf {
+        self.cache_dir
+            .clone()
+            .unwrap_or_else(|| runtime().data_folder.join("transcode-cache"))
+    }
+}
+
 /// Process-global copy of the config values needed deep inside code that has
 /// no `Settings` handle (DB path resolution, job helpers, the open API).
 /// Installed exactly once by `main` right after config load; the defaults
@@ -451,6 +572,9 @@ pub struct RuntimeConfig {
     /// The venv interpreter `media_tools` probes for static-ffmpeg —
     /// the same one that runs inference workers.
     pub venv_python: PathBuf,
+    /// Carried whole: the transcode worker pool and the artifact cache live
+    /// far from any `Settings` handle.
+    pub transcode: TranscodeConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -471,6 +595,7 @@ impl Default for RuntimeConfig {
             html_renderer_args: Vec::new(),
             thumbnail_font: None,
             venv_python: crate::resources::default_worker_python(crate::resources::py_source_mode()),
+            transcode: TranscodeConfig::default(),
         }
     }
 }
@@ -537,6 +662,7 @@ impl Settings {
             html_renderer_args: self.jobs.html_renderer_args.clone(),
             thumbnail_font: self.jobs.thumbnail_font.clone(),
             venv_python: self.inference_local.resolved_python(),
+            transcode: self.transcode.clone(),
         }
     }
 }
@@ -894,7 +1020,7 @@ impl Settings {
         }
 
         let mut settings: Settings = builder.build()?.try_deserialize()?;
-        settings.normalize_empty_tool_paths();
+        settings.normalize_empty_paths();
         let loopback_synthesized = settings.apply_inference_default();
         settings.validate(loopback_synthesized)?;
         Ok(settings)
@@ -916,17 +1042,19 @@ impl Settings {
         addrs
     }
 
-    /// Empty-string tool paths mean "unset": the shipped configs template
-    /// these keys as `${VAR:-}`, which substitutes to `""` when the
-    /// variable is not set, and an empty path must behave exactly like an
-    /// absent key (fall through to the built-in search order).
-    fn normalize_empty_tool_paths(&mut self) {
+    /// Empty-string paths mean "unset": the shipped configs template these
+    /// keys as `${VAR:-}`, which substitutes to `""` when the variable is not
+    /// set, and an empty path must behave exactly like an absent key (fall
+    /// through to the built-in search order, or to the derived default in
+    /// `transcode.cache_dir`'s case).
+    fn normalize_empty_paths(&mut self) {
         for slot in [
             &mut self.jobs.ffmpeg,
             &mut self.jobs.ffprobe,
             &mut self.jobs.pdfium,
             &mut self.jobs.html_renderer,
             &mut self.jobs.thumbnail_font,
+            &mut self.transcode.cache_dir,
         ] {
             if slot
                 .as_ref()
@@ -947,6 +1075,7 @@ impl Settings {
         self.validate_policies()?;
         self.validate_inference_endpoints()?;
         self.validate_ui()?;
+        self.validate_transcode()?;
         if loopback_synthesized {
             self.validate_loopback_inference_policy()?;
         }
@@ -1217,6 +1346,49 @@ impl Settings {
         }
         self.upstreams.ui.local_bind_addr()?;
         Ok(())
+    }
+
+    /// `[transcode]`: the limits that would otherwise fail far from their
+    /// cause — a zero worker bound stalls every job forever, an unrecognized
+    /// `hwaccel` would silently mean "software" months after it was typed,
+    /// and an incomplete profile only surfaces at the first request for it.
+    fn validate_transcode(&self) -> Result<()> {
+        use crate::media_tools::transcode::{hw, presets};
+
+        let transcode = &self.transcode;
+        if transcode.cache_size_mb > transcode.cache_size_max_mb {
+            anyhow::bail!(
+                "transcode.cache_size_mb ({}) exceeds transcode.cache_size_max_mb ({})",
+                transcode.cache_size_mb,
+                transcode.cache_size_max_mb
+            );
+        }
+        if hw::parse_hwaccel(&transcode.hwaccel).is_none() {
+            anyhow::bail!(
+                "transcode.hwaccel '{}' is invalid: expected one of {}",
+                transcode.hwaccel,
+                hw::hwaccel_values()
+            );
+        }
+        for (key, value) in [
+            ("max_concurrent_jobs", transcode.max_concurrent_jobs as u64),
+            ("max_mosaic_inputs", transcode.max_mosaic_inputs as u64),
+            ("max_mosaic_loop_mb", transcode.max_mosaic_loop_mb),
+            (
+                "max_animated_image_seconds",
+                transcode.max_animated_image_seconds,
+            ),
+            ("max_output_seconds", transcode.max_output_seconds),
+            (
+                "compose_light_threshold",
+                transcode.compose_light_threshold as u64,
+            ),
+        ] {
+            if value == 0 {
+                anyhow::bail!("transcode.{key} must be at least 1");
+            }
+        }
+        presets::validate_profiles(transcode.profiles.as_ref())
     }
 
     fn validate_inference_endpoints(&self) -> Result<()> {
@@ -2560,6 +2732,130 @@ allow = "*"
                 "'{reserved}': {text}"
             );
         }
+    }
+
+    /// `[transcode]` defaults, the empty-string `cache_dir` convention, and
+    /// the profiles tri-state as it arrives from TOML (absent / explicit
+    /// empty table / entries).
+    #[test]
+    fn transcode_config_parses_and_defaults() {
+        let _guard = env_lock();
+
+        // Section absent: every key is the built-in default, and the runtime
+        // slice carries the same values.
+        let settings = load_from(MINIMAL).unwrap();
+        let transcode = &settings.transcode;
+        assert_eq!(transcode.max_concurrent_jobs, 1);
+        assert_eq!(transcode.cache_dir, None);
+        assert_eq!(transcode.cache_size_mb, 8192);
+        assert_eq!(transcode.cache_size_max_mb, 262_144);
+        assert_eq!(transcode.hwaccel, "auto");
+        assert!(transcode.profiles.is_none(), "absent means the built-ins");
+        assert_eq!(transcode.max_mosaic_inputs, 12);
+        assert_eq!(transcode.max_mosaic_loop_mb, 512);
+        assert_eq!(transcode.max_animated_image_seconds, 30);
+        assert_eq!(transcode.max_output_seconds, 300);
+        assert_eq!(transcode.compose_light_threshold, 2);
+        let runtime = settings.runtime_config();
+        assert_eq!(runtime.transcode.cache_size_mb, transcode.cache_size_mb);
+        assert_eq!(
+            RuntimeConfig::default().transcode.hwaccel,
+            transcode.hwaccel
+        );
+
+        // Explicit values, including the `${VAR:-}` empty-string cache_dir
+        // that must normalize back to "unset".
+        let settings = load_from(&format!(
+            r#"{MINIMAL}
+[transcode]
+max_concurrent_jobs = 3
+cache_dir = ""
+cache_size_mb = 512
+cache_size_max_mb = 1024
+hwaccel = "nvenc"
+max_output_seconds = 60
+"#
+        ))
+        .unwrap();
+        assert_eq!(settings.transcode.max_concurrent_jobs, 3);
+        assert_eq!(
+            settings.transcode.cache_dir, None,
+            "an empty cache_dir falls through to the data-folder default"
+        );
+        assert_eq!(settings.transcode.cache_size_mb, 512);
+        assert_eq!(settings.transcode.hwaccel, "nvenc");
+        assert_eq!(settings.transcode.max_output_seconds, 60);
+
+        let settings = load_from(&format!(
+            "{MINIMAL}\n[transcode]\ncache_dir = \"D:/cache/transcode\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.transcode.cache_dir,
+            Some(PathBuf::from("D:/cache/transcode"))
+        );
+
+        // Tri-state, as TOML expresses it.
+        let settings = load_from(&format!("{MINIMAL}\n[transcode]\nprofiles = {{}}\n")).unwrap();
+        assert_eq!(
+            settings.transcode.profiles.map(|profiles| profiles.len()),
+            Some(0),
+            "an explicit empty table is not the same as an absent one"
+        );
+        let settings = load_from(&format!(
+            r#"{MINIMAL}
+[transcode.profiles.small-share]
+container = "mp4"
+vcodec = "h264"
+crf = 28
+surfaces = ["clip"]
+"#
+        ))
+        .unwrap();
+        let profiles = settings.transcode.profiles.expect("entries parse");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles["small-share"].crf, Some(28));
+    }
+
+    /// `[transcode]` misconfigurations fail at load rather than months later
+    /// at the first transcode request.
+    #[test]
+    fn transcode_validation_errors() {
+        let expect_err = |body: String, needle: &str| {
+            let err = load_from(&body).expect_err(needle);
+            let text = format!("{err:#}");
+            assert!(text.contains(needle), "expected '{needle}' in: {text}");
+        };
+
+        expect_err(
+            format!("{MINIMAL}\n[transcode]\nmax_concurrent_jobs = 0\n"),
+            "transcode.max_concurrent_jobs must be at least 1",
+        );
+        expect_err(
+            format!("{MINIMAL}\n[transcode]\nmax_mosaic_inputs = 0\n"),
+            "transcode.max_mosaic_inputs must be at least 1",
+        );
+        expect_err(
+            format!("{MINIMAL}\n[transcode]\ncache_size_mb = 4096\ncache_size_max_mb = 1024\n"),
+            "exceeds transcode.cache_size_max_mb",
+        );
+        expect_err(
+            format!("{MINIMAL}\n[transcode]\nhwaccel = \"cuda\"\n"),
+            "transcode.hwaccel 'cuda' is invalid",
+        );
+        // The profile completeness check runs through config load.
+        expect_err(
+            format!("{MINIMAL}\n[transcode.profiles.novel]\ncrf = 20\n"),
+            "container is required",
+        );
+        expect_err(
+            format!("{MINIMAL}\n[transcode.profiles.novel]\ncontainer = \"avi\"\nvcodec = \"h264\"\n"),
+            "enum Container does not have variant constructor avi",
+        );
+
+        // Patching a built-in needs nothing else.
+        load_from(&format!("{MINIMAL}\n[transcode.profiles.clip]\ncrf = 14\n"))
+            .expect("a patch of a built-in is complete by inheritance");
     }
 
     /// `${VAR}` without a default and with the variable unset fails config

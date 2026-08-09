@@ -5606,6 +5606,15 @@ pub(crate) fn current_iso_timestamp() -> String {
         .unwrap_or_else(|_| OffsetDateTime::now_utc().format(iso_format()).unwrap())
 }
 
+/// [`current_iso_timestamp`] shifted back by `ago`, in the same format, so the
+/// two compare as strings — which is how stored timestamps are windowed in SQL.
+pub(crate) fn iso_timestamp_ago(ago: std::time::Duration) -> String {
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    let then = now - ago;
+    then.format(iso_format())
+        .unwrap_or_else(|_| OffsetDateTime::now_utc().format(iso_format()).unwrap())
+}
+
 fn iso_format() -> &'static [FormatItem<'static>] {
     static ISO_FORMAT: std::sync::OnceLock<Vec<FormatItem<'static>>> = std::sync::OnceLock::new();
     ISO_FORMAT.get_or_init(|| {

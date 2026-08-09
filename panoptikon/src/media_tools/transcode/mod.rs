@@ -1,0 +1,181 @@
+//! Backend video transcoding (docs/video-transcoding-design.md): the artifact
+//! identity every other part of the feature is keyed by.
+//!
+//! One transcode = one plain finished file in a content-addressed disk cache
+//! ([`cache`]), described by a preset ([`presets`]) and, for the fast channel,
+//! an encoder chosen by the hardware probe ([`hw`]).
+
+pub(crate) mod cache;
+pub(crate) mod hw;
+pub(crate) mod presets;
+
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use presets::ResolvedPreset;
+
+/// Bumped on **any** change that can alter output bytes for the same request:
+/// preset defaults, ffmpeg argument construction, the params serialization
+/// below. It rides in the hash, so a bump re-keys every artifact — old files
+/// simply age out of the cache and old negative-cache rows are orphaned.
+pub(crate) const TRANSCODER_VERSION: i64 = 1;
+
+/// Hex characters of the params digest kept in the cache key. 128 bits of a
+/// SHA-256, which is collision-free at any cache size that fits on a disk.
+const PARAMS_HASH_HEX_LEN: usize = 32;
+
+/// Everything that decides the bytes of an artifact.
+///
+/// The serialization *is* the cache key input, so this type is a contract, not
+/// a convenience: fields hash in declaration order, absent bounds hash as
+/// absent (never as `0`/duration, which would collide a trimmed clip with an
+/// untrimmed one), and presentation-only preset fields are skipped. A pinned
+/// fixture test guards all three; changing any of them requires a
+/// [`TRANSCODER_VERSION`] bump.
+#[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)] // Consumers are run.rs/pool.rs (phase 1 steps 6-7).
+pub(crate) struct TranscodeParams {
+    pub(crate) source_sha256: String,
+    /// The *resolved* preset, so editing a profile re-keys its artifacts.
+    pub(crate) preset: ResolvedPreset,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) start_cs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) end_cs: Option<i64>,
+    pub(crate) transcoder_version: i64,
+}
+
+#[allow(dead_code)] // Consumers are run.rs/pool.rs (phase 1 steps 6-7).
+impl TranscodeParams {
+    pub(crate) fn new(
+        source_sha256: impl Into<String>,
+        preset: ResolvedPreset,
+        start_cs: Option<i64>,
+        end_cs: Option<i64>,
+    ) -> Self {
+        Self {
+            source_sha256: source_sha256.into(),
+            preset,
+            start_cs,
+            end_cs,
+            transcoder_version: TRANSCODER_VERSION,
+        }
+    }
+
+    /// Digest of the canonical JSON, hex, truncated.
+    pub(crate) fn params_hash(&self) -> String {
+        let canonical =
+            serde_json::to_string(self).expect("TranscodeParams is a plain serializable struct");
+        let mut digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+        digest.truncate(PARAMS_HASH_HEX_LEN);
+        digest
+    }
+
+    /// `<source sha256>-<params hash>`: content-addressed on both halves, so
+    /// the artifact URL can be served `immutable` with no mtime caveat.
+    pub(crate) fn cache_key(&self) -> String {
+        format!("{}-{}", self.source_sha256, self.params_hash())
+    }
+
+    pub(crate) fn artifact_file_name(&self) -> String {
+        format!("{}.{}", self.cache_key(), self.preset.container.ext())
+    }
+
+    pub(crate) fn mime_type(&self) -> &'static str {
+        self.preset.container.mime_type()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use presets::{builtin_presets, find_preset};
+
+    fn clip_params(start_cs: Option<i64>, end_cs: Option<i64>) -> TranscodeParams {
+        let presets = builtin_presets();
+        let preset = find_preset(&presets, "clip").expect("the clip preset ships").clone();
+        TranscodeParams::new("a".repeat(64), preset, start_cs, end_cs)
+    }
+
+    /// PINNED FIXTURE. This hash is the identity of every artifact on every
+    /// user's disk: if it changes, previously cached bytes are served for a
+    /// different request or re-encoded for no reason.
+    ///
+    /// A failure here means the `TranscodeParams`/`ResolvedPreset`
+    /// serialization or the built-in `clip` preset moved. That is allowed —
+    /// but it is exactly the change that requires bumping
+    /// `TRANSCODER_VERSION` (and re-pinning this fixture), never a silent
+    /// re-record.
+    #[test]
+    fn params_hash_is_stable() {
+        assert_eq!(TRANSCODER_VERSION, 1, "re-pin the fixture below on a bump");
+        let params = clip_params(None, None);
+        assert_eq!(
+            serde_json::to_string(&params).unwrap(),
+            r#"{"source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","preset":{"id":"clip","container":"mp4","vcodec":"h264","acodec":"aac","quality":{"crf":18},"max_height":null,"fps_max":null,"channel":"quality"},"transcoder_version":1}"#
+        );
+        assert_eq!(params.params_hash(), "c68524fa9035eab926b45693355f53c3");
+        assert_eq!(
+            params.cache_key(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-\
+             c68524fa9035eab926b45693355f53c3"
+        );
+        assert_eq!(
+            params.artifact_file_name(),
+            format!("{}.mp4", params.cache_key())
+        );
+        assert_eq!(params.mime_type(), "video/mp4");
+    }
+
+    /// Absent bounds hash as absent. Without the `skip_serializing_if` an
+    /// untrimmed clip would serialize `"start_cs":null` — harmless on its own,
+    /// but the rule it protects is that no bound is ever normalized to `0` or
+    /// to the duration, which would collide a trimmed artifact with an
+    /// untrimmed one.
+    #[test]
+    fn trim_bounds_key_separately_from_their_absence() {
+        let untrimmed = clip_params(None, None).cache_key();
+        let from_zero = clip_params(Some(0), None).cache_key();
+        let bounded = clip_params(Some(0), Some(500)).cache_key();
+        let other_end = clip_params(Some(0), Some(501)).cache_key();
+        assert_ne!(untrimmed, from_zero);
+        assert_ne!(from_zero, bounded);
+        assert_ne!(bounded, other_end);
+
+        // Identical bounds are the same artifact, whatever produced them (the
+        // outro cut resolves to explicit centiseconds for exactly this).
+        assert_eq!(bounded, clip_params(Some(0), Some(500)).cache_key());
+    }
+
+    /// The key covers the *resolved* preset, not its id: patching a profile
+    /// must not serve the bytes the old settings produced. Presentation-only
+    /// fields must not, or renaming a preset would orphan its artifacts.
+    #[test]
+    fn resolved_settings_key_but_presentation_does_not() {
+        let presets = builtin_presets();
+        let clip = find_preset(&presets, "clip").unwrap();
+        let baseline = TranscodeParams::new("sha", clip.clone(), None, None).cache_key();
+
+        let mut retuned = clip.clone();
+        retuned.quality = presets::QualityMode::Crf(20);
+        assert_ne!(
+            TranscodeParams::new("sha", retuned, None, None).cache_key(),
+            baseline
+        );
+
+        let mut relabelled = clip.clone();
+        relabelled.label = "Clip (renamed)".to_string();
+        relabelled.surfaces = vec![presets::Surface::Mosaic];
+        assert_eq!(
+            TranscodeParams::new("sha", relabelled, None, None).cache_key(),
+            baseline
+        );
+
+        // Two presets that differ only by id are still different artifacts.
+        let fast = find_preset(&presets, "clip-fast").unwrap();
+        assert_ne!(
+            TranscodeParams::new("sha", fast.clone(), None, None).cache_key(),
+            baseline
+        );
+    }
+}

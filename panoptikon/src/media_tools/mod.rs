@@ -13,6 +13,7 @@
 //! first-use download) never blocks the async runtime.
 
 pub(crate) mod outro;
+pub(crate) mod transcode;
 /// Driver for the outro-detector equivalence harness of design §12
 /// (`tools/outro-equivalence`). `cfg(test)` so the shipped binary gains no
 /// surface — and the only form with access to `outro`'s `pub(crate)` items,

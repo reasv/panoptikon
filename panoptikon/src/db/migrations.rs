@@ -25,7 +25,7 @@ static STORAGE_MIGRATOR: LazyLock<Migrator> =
 static USER_DATA_MIGRATOR: LazyLock<Migrator> =
     LazyLock::new(|| normalize_line_endings(sqlx::migrate!("migrations/user_data")));
 
-fn normalize_line_endings(raw: Migrator) -> Migrator {
+pub(crate) fn normalize_line_endings(raw: Migrator) -> Migrator {
     let migrations: Vec<Migration> = raw
         .migrations
         .iter()
