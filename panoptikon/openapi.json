@@ -5239,7 +5239,7 @@
           "video"
         ],
         "summary": "Serve a cached transcode artifact",
-        "description": "Serves a finished rendition by `key` (primary form) or by the `(id, id_type, preset, start_cs, end_cs)` that produced it. Supports Range requests. **Never starts a job**: a miss is a 404 whose body names the live job when one exists. Responses are `immutable` — the URL is content-addressed on both the source hash and the resolved settings.",
+        "description": "Serves a finished rendition by `key` (primary form) or by the `(id, id_type, preset, start_cs, end_cs)` that produced it. Supports Range requests. **Never starts a job**: a miss is a 404 whose body names the live job when one exists. The `key=` form is `immutable` — that URL is content-addressed on both the source hash and the resolved settings — while the resolvable form is `no-cache`, so its ETag revalidates: the same parameters name different bytes after a profile edit.",
         "operationId": "video_artifact",
         "parameters": [
           {
@@ -5392,6 +5392,9 @@
           },
           "422": {
             "description": "Above the configured ceiling"
+          },
+          "500": {
+            "description": "The eviction pass behind the resize failed"
           }
         }
       },

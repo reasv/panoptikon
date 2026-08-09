@@ -43,6 +43,11 @@ const TERMINAL_CAPACITY: usize = 512;
 /// mailbox (and every SSE stream behind it) is better served by a rate the UI
 /// can actually render.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+/// Bound on waiting for running encodes at shutdown. Their cancel flags are
+/// already set and the runner's watchdog kills the child within a poll
+/// interval, so in practice this is milliseconds; past it the pool stops
+/// regardless rather than holding the process open.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 /// A finished artifact, as every client-facing shape refers to it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
@@ -188,6 +193,9 @@ pub(crate) enum PoolMsg {
         id: Uuid,
         outcome: JobOutcome,
     },
+    /// Settles the queue, flags every running encode, and replies once the
+    /// last of them has actually finished — so nothing relies on the runtime
+    /// being dropped to reap an ffmpeg child.
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -255,6 +263,10 @@ pub(crate) struct PoolState {
     /// it finishes.
     exclusive_running: bool,
     shutting_down: bool,
+    /// Held from [`PoolMsg::Shutdown`] until the last running encode reports
+    /// back, which is what makes the shutdown wait bounded by the encodes
+    /// rather than by a guess.
+    drained: Option<oneshot::Sender<()>>,
 }
 
 impl Actor for TranscodePool {
@@ -280,6 +292,7 @@ impl Actor for TranscodePool {
             running: 0,
             exclusive_running: false,
             shutting_down: false,
+            drained: None,
         })
     }
 
@@ -328,18 +341,30 @@ impl Actor for TranscodePool {
                 // Queued jobs never started, so they end here; running ones
                 // are asked to stop and end through their own completion.
                 for id in std::mem::take(&mut state.queued) {
-                    if let Some(entry) = state.jobs.get(&id) {
-                        entry.publish(TranscodeJobEvent::Failed {
-                            error: "server is shutting down".to_string(),
-                            cancelled: true,
-                        });
-                        state.by_key.remove(&entry.key);
+                    let Some(entry) = state.jobs.get(&id) else {
+                        continue;
+                    };
+                    entry.publish(TranscodeJobEvent::Failed {
+                        error: "server is shutting down".to_string(),
+                        cancelled: true,
+                    });
+                    let key = entry.key.clone();
+                    if state.by_key.get(&key) == Some(&id) {
+                        state.by_key.remove(&key);
                     }
+                    // Terminal like any other settled job: a client that was
+                    // mid-request must still be able to read the verdict.
+                    state.terminal.push_back((id, Instant::now()));
+                    prune_terminal(state);
                 }
                 for entry in state.jobs.values() {
                     entry.cancel.store(true, Ordering::Relaxed);
                 }
-                let _ = reply.send(());
+                if state.running == 0 {
+                    let _ = reply.send(());
+                } else {
+                    state.drained = Some(reply);
+                }
             }
         }
         Ok(())
@@ -470,6 +495,7 @@ fn dispatch(state: &mut PoolState, myself: &ActorRef<PoolMsg>) {
         }
         state.queued.pop_front();
         if !start_job(state, myself, id) {
+            fail_undispatchable(state, id);
             continue;
         }
         state.running += 1;
@@ -500,6 +526,26 @@ fn start_job(state: &mut PoolState, myself: &ActorRef<PoolMsg>, id: Uuid) -> boo
         let _ = actor.cast(PoolMsg::Finished { id, outcome });
     });
     true
+}
+
+/// Settles a job the dispatch could not start. Defensive: nothing takes an
+/// entry's `pending` or removes it while it is queued, so this is unreachable
+/// today — but silently dropping such a job would hold its key forever and
+/// leave its client watching a channel that never moves again.
+fn fail_undispatchable(state: &mut PoolState, id: Uuid) {
+    let Some(entry) = state.jobs.get(&id) else {
+        return;
+    };
+    entry.publish(TranscodeJobEvent::Failed {
+        error: "job vanished before dispatch".to_string(),
+        cancelled: false,
+    });
+    let key = entry.key.clone();
+    if state.by_key.get(&key) == Some(&id) {
+        state.by_key.remove(&key);
+    }
+    state.terminal.push_back((id, Instant::now()));
+    prune_terminal(state);
 }
 
 /// The whole off-actor half of a job: encode, then publish the artifact.
@@ -641,6 +687,12 @@ fn finish_job(state: &mut PoolState, myself: &ActorRef<PoolMsg>, id: Uuid, outco
     state.running = state.running.saturating_sub(1);
     state.terminal.push_back((id, Instant::now()));
     prune_terminal(state);
+    // The last encode to stop is what releases the shutdown wait.
+    if state.running == 0
+        && let Some(drained) = state.drained.take()
+    {
+        let _ = drained.send(());
+    }
     dispatch(state, myself);
 }
 
@@ -652,17 +704,23 @@ fn cancel_job(state: &mut PoolState, id: Uuid) -> bool {
         return false;
     }
     entry.cancel.store(true, Ordering::Relaxed);
+    // The key is free the moment the cancel lands, running or not: this job
+    // is doomed, so a later submit for it must create a fresh one rather than
+    // join a job whose only remaining outcome is `cancelled`. Two encodes of
+    // one key overlapping is safe on disk — each writes its own nonce-named
+    // temporary, the publish renames over whatever is there, and the row is
+    // an upsert.
+    let key = entry.key.clone();
+    if state.by_key.get(&key) == Some(&id) {
+        state.by_key.remove(&key);
+    }
     if let Some(at) = state.queued.iter().position(|queued| *queued == id) {
         // A queued job has no child to kill, so it settles here and now.
         state.queued.remove(at);
-        let key = entry.key.clone();
         entry.publish(TranscodeJobEvent::Failed {
             error: "cancelled".to_string(),
             cancelled: true,
         });
-        if state.by_key.get(&key) == Some(&id) {
-            state.by_key.remove(&key);
-        }
         state.terminal.push_back((id, Instant::now()));
         prune_terminal(state);
         rebroadcast_positions(state);
@@ -738,6 +796,12 @@ pub(crate) async fn ensure_pool() -> ApiResult<ActorRef<PoolMsg>> {
             tracing::error!(error = ?err, "failed to start the transcode pool");
             ApiError::internal("Failed to start the transcode pool")
         })?;
+        // The hardware probe spawns ffmpeg twice on its first call and is
+        // cached for the life of the process. Warming it here keeps that cost
+        // off whichever request happens to be first, rather than off none.
+        tokio::task::spawn_blocking(|| {
+            let _ = super::hw::fast_h264_encoder();
+        });
         Ok(actor)
     })
     .await
@@ -745,15 +809,21 @@ pub(crate) async fn ensure_pool() -> ApiResult<ActorRef<PoolMsg>> {
 }
 
 /// Stops the pool: queued jobs settle as cancelled, running encodes are told
-/// to stop (their children are killed by the runner). No-op when no transcode
-/// was ever requested. Used at process shutdown.
+/// to stop (their children are killed by the runner's watchdog), and the wait
+/// runs until the last of them has reported back. No-op when no transcode was
+/// ever requested. Used at process shutdown.
 pub(crate) async fn shutdown_transcode_pool() {
     let Some(pool) = POOL.get() else {
         return;
     };
     let (reply, rx) = oneshot::channel();
-    if pool.cast(PoolMsg::Shutdown { reply }).is_ok() {
-        let _ = rx.await;
+    if pool.cast(PoolMsg::Shutdown { reply }).is_ok()
+        && tokio::time::timeout(SHUTDOWN_DRAIN, rx).await.is_err()
+    {
+        tracing::warn!(
+            grace_secs = SHUTDOWN_DRAIN.as_secs(),
+            "transcodes did not stop within the shutdown grace; stopping the pool anyway"
+        );
     }
     pool.stop(None);
 }
@@ -1116,6 +1186,18 @@ mod tests {
         assert!(matches!(resubmitted, SubmitOutcome::Created(_)));
 
         assert!(pool.cancel(&job_id(&running)).await);
+        // A *running* job frees its key at the cancel too, not at its later
+        // completion: the encode is doomed, so joining it would hand the new
+        // client a job whose only outcome is "cancelled".
+        let after_cancel = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        assert!(
+            matches!(after_cancel, SubmitOutcome::Created(_)),
+            "a cancelled running job is not joinable, got {}",
+            after_cancel.as_str()
+        );
+        assert_ne!(job_id(&after_cancel), job_id(&running));
+        assert!(pool.cancel(&job_id(&after_cancel)).await);
+
         assert_eq!(
             pool.await_terminal(&job_id(&running)).await,
             TranscodeJobEvent::Failed {

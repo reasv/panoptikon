@@ -13,15 +13,20 @@
 //! first non-UTF-8 byte), kill-and-reap on drop, and — unlike the outro
 //! probe, whose children last milliseconds — `process_tree` console
 //! detachment plus die-with-parent, because an encode can outlive a gateway
-//! crash by minutes.
+//! crash by minutes. The one addition is a cancellation watchdog: an encode
+//! lasts long enough for a client to change its mind, and the reader thread
+//! cannot notice that on its own while blocked on a pipe.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use super::TranscodeParams;
 use super::presets::{Channel, Container, QualityMode, ResolvedPreset};
@@ -39,6 +44,15 @@ const STDERR_TAIL_LINES: usize = 20;
 /// nvenc's `-cq` is coarser than x264's CRF at the same number; the design's
 /// tuning table compensates by asking for `crf + 3`.
 const NVENC_CQ_OFFSET: i64 = 3;
+
+/// Worst (highest) value on the h264 CRF scale, for encoders whose own knob
+/// runs on a different one.
+const H264_CRF_MAX: i64 = 51;
+
+/// How often the cancellation watchdog re-reads the flag. Cancelling is a
+/// human action, so a fifth of a second is invisible to the client; the
+/// thread exists at all because the progress reader can block indefinitely.
+const CANCEL_POLL: Duration = Duration::from_millis(200);
 
 /// Everything one encode needs. `params` is the artifact's identity, and the
 /// only thing besides the paths that reaches the command line.
@@ -115,7 +129,13 @@ fn is_h264(vcodec: &str) -> bool {
 
 /// Seconds as ffmpeg wants them, from centiseconds. Never a float: printing
 /// `0.1 * cs` puts binary rounding error into a cut boundary.
+///
+/// A negative input cannot arrive today (the API rejects negative bounds and
+/// rejects `end <= start`), and is clamped rather than trusted: integer
+/// division and remainder would print `-1.-23`, which ffmpeg parses as a seek
+/// to somewhere else entirely instead of failing.
 fn seconds(cs: i64) -> String {
+    let cs = cs.max(0);
     format!("{}.{:02}", cs / 100, cs % 100)
 }
 
@@ -241,11 +261,23 @@ fn video_args(encoder: &str, quality: QualityMode) -> Vec<OsString> {
             args.extend(crf_or_bitrate(quality, "-global_quality", 0));
         }
         "h264_mf" => {
-            // MediaFoundation exposes no quality scale worth mapping a CRF
-            // onto; it runs at its own defaults unless given a bitrate.
             codec("h264_mf");
-            if let QualityMode::BitrateKbps(kbps) = quality {
-                args.extend(["-b:v".to_string(), format!("{kbps}k")]);
+            match quality {
+                // MediaFoundation's quality-targeted VBR mode. Its `-quality`
+                // is a 0-100 scale on which *higher* is better, the inverse of
+                // x264's 0-51 CRF, so the value is mapped linearly (crf 0 →
+                // 100, crf 51 → 0). Without this the encoder runs at its own
+                // default and two presets differing only by CRF would produce
+                // identical bytes under different cache keys.
+                QualityMode::Crf(crf) => args.extend([
+                    "-rate_control".to_string(),
+                    "quality".to_string(),
+                    "-quality".to_string(),
+                    mf_quality(crf).to_string(),
+                ]),
+                QualityMode::BitrateKbps(kbps) => {
+                    args.extend(["-b:v".to_string(), format!("{kbps}k")])
+                }
             }
         }
         "libwebp_anim" => {
@@ -277,6 +309,12 @@ fn video_args(encoder: &str, quality: QualityMode) -> Vec<OsString> {
         }
     }
     args.into_iter().map(OsString::from).collect()
+}
+
+/// An h264 CRF (0-51, lower is better) on MediaFoundation's `-quality` scale
+/// (0-100, higher is better).
+fn mf_quality(crf: i64) -> i64 {
+    (H264_CRF_MAX - crf.clamp(0, H264_CRF_MAX)) * 100 / H264_CRF_MAX
 }
 
 /// `key <value>` for a CRF-style scale (offset applied and clamped to a
@@ -358,20 +396,48 @@ fn parse_clock(value: &str) -> Option<f64> {
     (total.is_finite() && total >= 0.0).then_some(total)
 }
 
+/// The running child, shared with the cancellation watchdog. The two threads
+/// never contend for it: the reader below hands it over for the whole encode
+/// and only touches it again after the watchdog has been joined.
+#[derive(Clone)]
+struct ChildHandle(Arc<Mutex<Child>>);
+
+impl ChildHandle {
+    fn new(child: Child) -> Self {
+        Self(Arc::new(Mutex::new(child)))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Child> {
+        // A poisoned lock means the other thread panicked mid-kill, which
+        // makes reaping the child more necessary, not less.
+        self.0.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// The kill ladder, and the only one: the process group first (the spawn
+    /// made the child its own group leader, so this reaps ffmpeg's own
+    /// descendants), then the child, then the reap. The pid cannot have been
+    /// recycled here — an exited child nobody has waited for is a zombie
+    /// still holding it.
+    fn kill(&self) {
+        let mut child = self.lock();
+        kill_process_group_pid(Some(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn wait(&self) -> std::io::Result<ExitStatus> {
+        self.lock().wait()
+    }
+}
+
 /// The spawned encode, so a panic or an early return cannot leave an ffmpeg
 /// running against a temporary file nobody will ever claim.
 struct EncodeChild {
-    child: Child,
+    child: ChildHandle,
     stderr: Option<JoinHandle<String>>,
 }
 
 impl EncodeChild {
-    fn kill(&mut self) {
-        kill_process_group_pid(Some(self.child.id()));
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-
     fn stderr_tail(&mut self) -> String {
         self.stderr
             .take()
@@ -382,20 +448,28 @@ impl EncodeChild {
 
 impl Drop for EncodeChild {
     fn drop(&mut self) {
-        // Both are no-ops once the child has been reaped: std makes `kill`
-        // after a successful `wait` a no-op rather than a signal to whoever
-        // inherited the pid.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Deliberately *not* the kill ladder: by the time this runs the child
+        // may already have been reaped, and a process-group kill on a pid the
+        // OS has since handed out would hit an unrelated tree. Both calls
+        // below are no-ops once std has seen the child exit.
+        let mut child = self.child.lock();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
 /// Runs one encode to completion, blocking the calling thread.
 ///
 /// `on_progress` is called at ffmpeg's own update rate (roughly twice a
-/// second); throttling for consumers is the caller's business. `cancel` is
-/// polled on every progress line, which is also the only place the child can
-/// be interrupted — nothing here waits on anything else.
+/// second); throttling for consumers is the caller's business.
+///
+/// `cancel` is honoured by a watchdog thread rather than by the progress loop
+/// alone. The loop's own check is only an early exit: ffmpeg writes no
+/// `-progress` line at all until it starts producing output, so a source it
+/// stalls on (or an encode that outlives the client) would leave the reader
+/// blocked on a pipe forever and the pool slot held with it. The watchdog is
+/// what turns the flag into an EOF, and it is joined on every exit path, so
+/// nothing here relies on the runtime being torn down to reap a child.
 pub(crate) fn run_encode(
     spec: &EncodeJobSpec,
     cancel: &AtomicBool,
@@ -421,29 +495,49 @@ pub(crate) fn run_encode(
     let stderr = child.stderr.take().expect("stderr was piped");
     let drain = std::thread::spawn(move || drain_stderr(stderr));
     let mut child = EncodeChild {
-        child,
+        child: ChildHandle::new(child),
         stderr: Some(drain),
     };
 
     let mut progress = ProgressReader::new(expected_output_seconds(spec));
     let mut reader = BufReader::new(stdout);
-    let mut raw: Vec<u8> = Vec::new();
-    loop {
-        raw.clear();
-        match reader.read_until(b'\n', &mut raw) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
+    // Scoped so the watchdog can borrow `cancel`, and so the scope's join is
+    // what gives the child back to this thread before it is waited on.
+    std::thread::scope(|scope| {
+        let (stop, stopped) = channel::<()>();
+        let watched = child.child.clone();
+        scope.spawn(move || {
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    watched.kill();
+                    return;
+                }
+                if !matches!(stopped.recv_timeout(CANCEL_POLL), Err(RecvTimeoutError::Timeout)) {
+                    return;
+                }
+            }
+        });
+
+        let mut raw: Vec<u8> = Vec::new();
+        loop {
+            raw.clear();
+            match reader.read_until(b'\n', &mut raw) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let line = String::from_utf8_lossy(&raw);
+            if let Some(update) = progress.feed(&line) {
+                on_progress(update.fraction);
+            }
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
         }
-        let line = String::from_utf8_lossy(&raw);
-        if let Some(update) = progress.feed(&line) {
-            on_progress(update.fraction);
-        }
-        if cancel.load(Ordering::Relaxed) {
-            child.kill();
-            return Err(EncodeError::Cancelled);
-        }
-    }
+        // Wakes the watchdog out of its poll; the scope then joins it, which
+        // is also what waits for a kill already in flight.
+        drop(stop);
+    });
 
     let status = match child.child.wait() {
         Ok(status) => status,
@@ -559,6 +653,16 @@ mod tests {
         assert!(!args.contains(&"-t".to_string()));
     }
 
+    /// A bound that somehow went negative is clamped, never printed: the
+    /// remainder of a negative divisor would spell `-1.-23`, which ffmpeg
+    /// reads as a seek to somewhere else rather than as an error.
+    #[test]
+    fn seconds_never_prints_a_negative_bound() {
+        assert_eq!(seconds(0), "0.00");
+        assert_eq!(seconds(1234), "12.34");
+        assert_eq!(seconds(-1), "0.00");
+    }
+
     /// The scale cap is inserted only for presets that carry one, and its
     /// expression is escaped for ffmpeg's parser (the comma inside `min()`
     /// would otherwise read as a filter separator).
@@ -615,6 +719,47 @@ mod tests {
             "nvenc's scale is coarser, so the tuning table asks for crf + 3"
         );
         assert!(!args.contains(&"-crf".to_string()));
+    }
+
+    /// Every hardware branch maps the preset's quality onto something its
+    /// encoder understands — the invariant that keeps two presets differing
+    /// only by CRF from producing identical bytes under different keys.
+    /// MediaFoundation is the awkward one: its scale is inverted and runs to
+    /// 100, so the CRF is remapped rather than passed through.
+    #[test]
+    fn every_encoder_maps_the_presets_quality() {
+        let args_for = |encoder: &str, quality| {
+            let mut spec = spec_for("clip-fast", None, None);
+            spec.params.encoder = encoder.to_string();
+            spec.params.preset.quality = quality;
+            args_of(&spec)
+        };
+
+        // clip-fast is crf 23, so 51 - 23 = 28 of the scale's 51 steps, which
+        // is 54 of MediaFoundation's 100.
+        let mf = args_for("h264_mf", QualityMode::Crf(23));
+        assert_eq!(mf[at(&mf, "-c:v") + 1], "h264_mf");
+        assert_eq!(mf[at(&mf, "-rate_control") + 1], "quality");
+        assert_eq!(mf[at(&mf, "-quality") + 1], "54");
+        // The ends of the scale, and its direction.
+        assert_eq!(mf_quality(0), 100);
+        assert_eq!(mf_quality(51), 0);
+        assert_eq!(mf_quality(-5), 100, "a bound outside the scale clamps");
+        assert_eq!(mf_quality(80), 0);
+        assert!(mf_quality(18) > mf_quality(28), "lower crf is higher quality");
+
+        // A bitrate profile still reaches it as a bitrate, with no quality
+        // mode to contradict it.
+        let mf = args_for("h264_mf", QualityMode::BitrateKbps(2500));
+        assert_eq!(mf[at(&mf, "-b:v") + 1], "2500k");
+        assert!(!mf.contains(&"-rate_control".to_string()));
+
+        // The other vendor branches, for the same reason.
+        let amf = args_for("h264_amf", QualityMode::Crf(23));
+        assert_eq!(amf[at(&amf, "-rc") + 1], "cqp");
+        assert_eq!(amf[at(&amf, "-qp_i") + 1], "23");
+        let qsv = args_for("h264_qsv", QualityMode::Crf(23));
+        assert_eq!(qsv[at(&qsv, "-global_quality") + 1], "23");
     }
 
     /// A hardware H.264 encoder may never serve a non-h264 preset: the probe
@@ -758,9 +903,25 @@ mod tests {
         assert_eq!(expected_output_seconds(&unknown), None);
     }
 
+    /// The container's own duration, for the trim-window assertion below.
+    fn probe_duration_seconds(path: &std::path::Path) -> Option<f64> {
+        let output = Command::new(crate::media_tools::ffprobe())
+            .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+            .arg(path)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    }
+
     /// End to end against the real toolchain: a lavfi fixture is trimmed to a
     /// playback rendition, progress advances monotonically to completion, and
-    /// the output exists. Skips (never fails) where there is no ffmpeg.
+    /// the output is exactly the requested window long — which is the only
+    /// mechanical proof that the `-ss`/`-t` pair means what the argument test
+    /// above asserts it spells. Skips (never fails) where there is no ffmpeg.
     #[test]
     fn encodes_a_fixture_clip_with_monotone_progress() {
         if !crate::media_tools::ffmpeg_available() {
@@ -772,13 +933,16 @@ mod tests {
             return;
         }
 
+        // A window well clear of a rounding: the fixture is 7s, so 1.0s-4.5s
+        // exercises both bounds and leaves 2.5s of source unencoded.
+        let (start_cs, end_cs) = (100, 450);
         let preset = preset("playback");
         let encoder = resolve_encoder(&preset, None);
         let output = dir.path().join("out.mp4");
         let spec = EncodeJobSpec {
             input: source,
             output: output.clone(),
-            params: TranscodeParams::new("sha", preset, encoder, Some(100), Some(300)),
+            params: TranscodeParams::new("sha", preset, encoder, Some(start_cs), Some(end_cs)),
             source_duration_s: Some(7.0),
         };
 
@@ -802,6 +966,15 @@ mod tests {
             "progress is monotone: {seen:?}"
         );
         assert!(seen.iter().all(|value| (0.0..=1.0).contains(value)));
+
+        let expected = ((end_cs - start_cs) as f64) / 100.0;
+        let duration = probe_duration_seconds(&output).expect("the artifact has a duration");
+        // Two frames at the fixture's 30 fps: the boundary frame may land
+        // either side of the cut, and the container rounds its duration field.
+        assert!(
+            (duration - expected).abs() <= 2.0 / 30.0,
+            "the artifact is the trim window long: {duration} vs {expected}"
+        );
     }
 
     /// A cancellation set before the spawn never starts ffmpeg at all, and a

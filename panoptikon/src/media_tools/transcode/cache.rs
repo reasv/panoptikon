@@ -11,7 +11,7 @@
 //! database has no relationship to any index or user-data DB, no attachments,
 //! and its own migrator.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -84,6 +84,17 @@ pub(crate) struct NewArtifact<'a> {
     pub(crate) file_name: &'a str,
     pub(crate) mime_type: &'a str,
     pub(crate) transcoder_version: i64,
+}
+
+/// Why a resize was refused. The two cases are different answers to the
+/// client: the requested size being over the configured ceiling is the
+/// client's own number and is echoed back with a 422, while a failure of the
+/// eviction pass behind it is this machine's problem — and its `anyhow` chain
+/// names the cache directory, which no HTTP response should carry.
+#[derive(Debug)]
+pub(crate) enum ResizeError {
+    AboveCeiling(String),
+    Internal(anyhow::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,16 +312,19 @@ impl TranscodeCache {
     /// (the TOML value is what a restart returns to), exactly like the search
     /// result cache. A request above the configured ceiling is refused rather
     /// than silently clamped, so the resize route can answer 422.
-    pub(crate) async fn set_budget_mb(&self, size_mb: u64) -> Result<()> {
+    pub(crate) async fn set_budget_mb(
+        &self,
+        size_mb: u64,
+    ) -> std::result::Result<(), ResizeError> {
         let requested = mb_to_bytes(size_mb);
         if requested > self.limit_bytes {
-            bail!(
+            return Err(ResizeError::AboveCeiling(format!(
                 "size_mb {size_mb} exceeds the transcode.cache_size_max_mb ceiling of {} MB",
                 self.limit_mb()
-            );
+            )));
         }
         self.budget_bytes.store(requested, Ordering::Relaxed);
-        self.evict(None).await
+        self.evict(None).await.map_err(ResizeError::Internal)
     }
 
     pub(crate) fn budget_bytes(&self) -> u64 {
@@ -978,12 +992,16 @@ mod tests {
         cache.set_budget_mb(0).await.unwrap();
         assert!(keys(&cache).await.is_empty(), "a zero budget empties it");
 
-        // Over the ceiling is refused, so the resize route can answer 422.
+        // Over the ceiling is refused, and refused *distinguishably*: the
+        // route answers 422 only for this case, never for a failed eviction.
         let err = cache
             .set_budget_mb(64)
             .await
             .expect_err("the ceiling is enforced, not clamped to");
-        assert!(format!("{err:#}").contains("cache_size_max_mb"), "{err:#}");
+        let ResizeError::AboveCeiling(detail) = &err else {
+            panic!("expected a ceiling rejection, got {err:?}");
+        };
+        assert!(detail.contains("cache_size_max_mb"), "{detail}");
         assert_eq!(cache.budget_bytes(), 0, "a refused resize changes nothing");
 
         cache.set_budget_mb(2).await.unwrap();

@@ -32,7 +32,7 @@ use crate::api_error::ApiError;
 use crate::config::{PolicyConfig, Settings};
 use crate::db::items::{FileRecord, ItemIdentifierType, ItemRecord, get_item_metadata_unchecked};
 use crate::db::{DbConnection, ReadOnlyNoUserData};
-use crate::media_tools::transcode::cache::CacheStats;
+use crate::media_tools::transcode::cache::{CacheStats, ResizeError};
 use crate::media_tools::transcode::pool::{
     self, ArtifactRef, JobWeight, SubmitOutcome, SubmitRequest, TranscodeJobSnapshot,
 };
@@ -45,10 +45,18 @@ use crate::proxy::ProxyState;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
-/// An artifact URL names the exact bytes it serves: the key hashes the source
-/// content *and* every setting that produced the file, so unlike the
+/// The `key=` form's URL names the exact bytes it serves: the key hashes the
+/// source content *and* every setting that produced the file, so unlike the
 /// item-file path there is no mtime-drift caveat to weaken this.
 const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// The resolvable form's URL is **not** content-addressed: the same
+/// `(id, preset, bounds)` names different bytes after a profile edit or a
+/// hardware-encoder flip, both of which re-key the artifact. `no-cache` keeps
+/// the body cacheable but forces the revalidation the ETag (the key) answers
+/// in one round trip — where `immutable` would be a year-long promise no
+/// server could ever recall.
+const CACHE_REVALIDATE: &str = "public, no-cache";
 
 /// SSE keep-alive interval. Comments, not events: they exist so a relay or
 /// proxy that buffers `text/event-stream` still sees traffic.
@@ -270,8 +278,9 @@ pub async fn video_transcode(
     description = "Serves a finished rendition by `key` (primary form) or by the \
         `(id, id_type, preset, start_cs, end_cs)` that produced it. Supports Range requests. \
         **Never starts a job**: a miss is a 404 whose body names the live job when one exists. \
-        Responses are `immutable` — the URL is content-addressed on both the source hash and \
-        the resolved settings.",
+        The `key=` form is `immutable` — that URL is content-addressed on both the source hash \
+        and the resolved settings — while the resolvable form is `no-cache`, so its ETag \
+        revalidates: the same parameters name different bytes after a profile edit.",
     params(DbQueryParams, ArtifactQuery),
     responses(
         (status = 200, description = "Artifact contents"),
@@ -292,6 +301,7 @@ pub async fn video_artifact(
             key,
             stem: None,
             trimmed: false,
+            cache_control: CACHE_IMMUTABLE,
         },
         None => {
             let (Some(id), Some(id_type), Some(preset)) =
@@ -303,18 +313,19 @@ pub async fn video_artifact(
             };
             let preset = policy_preset(&state.settings, &context, preset)?;
             validate_bounds(query.start_cs, query.end_cs)?;
-            let source = resolve_source(&mut db, id, id_type).await?;
-            let params = resolve_params(
-                source.item.sha256.clone(),
-                preset,
-                query.start_cs,
-                query.end_cs,
-            )
-            .await?;
+            // Deliberately not [`resolve_source`]: this handler can never
+            // start a job, so whether any of the item's files is still
+            // readable says nothing about whether the artifact is cached, and
+            // statting a dropped network mount here would stall the response
+            // for the timeout with no question it could answer.
+            let identity = resolve_identity(&mut db, id, id_type).await?;
+            let params =
+                resolve_params(identity.sha256, preset, query.start_cs, query.end_cs).await?;
             ArtifactTarget {
                 key: params.cache_key(),
-                stem: file_stem(&source.file),
+                stem: identity.stem,
                 trimmed: query.start_cs.is_some() || query.end_cs.is_some(),
+                cache_control: CACHE_REVALIDATE,
             }
         }
     };
@@ -366,7 +377,7 @@ pub async fn video_artifact(
             size,
             mime_type: artifact.mime_type.clone(),
             etag: format!("\"{}\"", artifact.key),
-            cache_control: CACHE_IMMUTABLE,
+            cache_control: target.cache_control,
             last_modified: None,
             content_disposition_type: "inline",
             filename,
@@ -538,7 +549,8 @@ pub async fn get_transcode_cache() -> ApiResult<Json<TranscodeCacheStats>> {
     request_body = TranscodeCacheResize,
     responses(
         (status = 200, description = "Artifact cache stats after resizing", body = TranscodeCacheStats),
-        (status = 422, description = "Above the configured ceiling")
+        (status = 422, description = "Above the configured ceiling"),
+        (status = 500, description = "The eviction pass behind the resize failed")
     )
 )]
 pub async fn resize_transcode_cache(
@@ -548,7 +560,15 @@ pub async fn resize_transcode_cache(
     cache
         .set_budget_mb(body.size_mb)
         .await
-        .map_err(|err| unprocessable(format!("{err:#}")))?;
+        .map_err(|err| match err {
+            ResizeError::AboveCeiling(detail) => unprocessable(detail),
+            // The chain names the cache directory, so it is logged rather
+            // than echoed.
+            ResizeError::Internal(err) => {
+                tracing::error!(error = ?err, "failed to resize the transcode cache");
+                ApiError::internal("Failed to resize the transcode artifact cache")
+            }
+        })?;
     get_transcode_cache().await
 }
 
@@ -585,11 +605,21 @@ struct ArtifactTarget {
     /// carries no path).
     stem: Option<String>,
     trimmed: bool,
+    /// Whether this URL is a promise about bytes ([`CACHE_IMMUTABLE`]) or a
+    /// name that can come to mean different bytes ([`CACHE_REVALIDATE`]).
+    cache_control: &'static str,
 }
 
 struct ResolvedSource {
     item: ItemRecord,
     file: FileRecord,
+}
+
+/// What the artifact-serving path needs out of the index database: the hash
+/// the key is built from, and a name for the download.
+struct ResolvedIdentity {
+    sha256: String,
+    stem: Option<String>,
 }
 
 fn unprocessable(detail: impl Into<String>) -> ApiError {
@@ -637,6 +667,24 @@ async fn resolve_source(
         }
     }
     Err(ApiError::not_found("No readable file found for item"))
+}
+
+/// The item's identity, with no filesystem access at all. Used by the GET
+/// path, which needs the hash to compute a cache key and a file name to hang
+/// on the download — never a file it could hand to ffmpeg.
+async fn resolve_identity(
+    db: &mut DbConnection<ReadOnlyNoUserData>,
+    id: &str,
+    id_type: ItemIdentifierType,
+) -> ApiResult<ResolvedIdentity> {
+    let metadata = get_item_metadata_unchecked(&mut db.conn, id, id_type).await?;
+    let Some(item) = metadata.item else {
+        return Err(ApiError::not_found("Item not found"));
+    };
+    Ok(ResolvedIdentity {
+        sha256: item.sha256,
+        stem: metadata.files.first().and_then(file_stem),
+    })
 }
 
 /// Builds the artifact identity, resolving the encoder against this host's
@@ -1206,6 +1254,104 @@ transcode_presets = ["playback"]
         assert_eq!(
             headers[header::CONTENT_DISPOSITION],
             "inline; filename=\"abcdef0123-clip-fast.mp4\""
+        );
+        cache.clear(true).await.unwrap();
+    }
+
+    /// The other artifact form, and the difference that matters: an
+    /// `(id, preset, bounds)` URL is a *name*, not a promise about bytes —
+    /// editing a profile or flipping the hardware probe makes the same URL
+    /// resolve to a different artifact — so it revalidates instead of being
+    /// `immutable`, which no server could ever recall. It also resolves the
+    /// item without touching the filesystem: a GET starts no job, so the
+    /// source file's existence is not its question.
+    #[tokio::test]
+    async fn the_resolvable_artifact_form_revalidates_and_never_stats_the_source() {
+        let _env = crate::test_utils::test_data_dir();
+        /// Spelled in full so the lookup takes the exact match rather than the
+        /// prefix-range branch.
+        const SHA: &str = "b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4";
+
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        sqlx::query(
+            "INSERT INTO items (id, sha256, md5, type, duration, time_added) \
+             VALUES (1, ?, 'md5_1', 'video/mp4', 12.0, '2024-01-01T00:00:00')",
+        )
+        .bind(SHA)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
+            .bind("2024-01-01T00:00:00")
+            .bind(r"C:\gone")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        // A path that does not exist: the handler must still answer.
+        sqlx::query(
+            "INSERT INTO files (id, sha256, item_id, path, filename, last_modified, scan_id, available) \
+             VALUES (10, ?, 1, 'C:\\gone\\holiday.mp4', 'holiday.mp4', '2024-01-02T00:00:00', 1, 1)",
+        )
+        .bind(SHA)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        // Held so the shared-cache in-memory databases outlive the call.
+        let _attached = (storage_conn, user_data_conn);
+
+        let settings = test_settings();
+        let state = test_state(&settings);
+        let preset = policy_preset(&settings, &test_context("local"), "clip").unwrap();
+        let key = TranscodeParams::resolve(SHA.to_string(), preset, None, None).cache_key();
+
+        let cache = pool::transcode_cache().await.unwrap();
+        let temp = cache.temp_path("mp4");
+        std::fs::write(&temp, b"0123456789").unwrap();
+        cache
+            .commit(
+                NewArtifact {
+                    key: &key,
+                    source_sha256: SHA,
+                    params_hash: "hash",
+                    preset: "clip",
+                    file_name: &format!("{key}.mp4"),
+                    mime_type: "video/mp4",
+                    transcoder_version: 1,
+                },
+                &temp,
+            )
+            .await
+            .unwrap();
+
+        let hit = video_artifact(
+            State(state),
+            Extension(test_context("local")),
+            DbConnection::<ReadOnlyNoUserData>::for_tests(index_conn, "test", "test"),
+            Query(ArtifactQuery {
+                key: None,
+                id: Some(SHA.to_string()),
+                id_type: Some(ItemIdentifierType::Sha256),
+                preset: Some("clip".to_string()),
+                start_cs: None,
+                end_cs: None,
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("the artifact is served without the source file existing");
+        assert_eq!(hit.status(), StatusCode::OK);
+        assert_eq!(hit.headers()[header::ETAG], format!("\"{key}\""));
+        assert_eq!(hit.headers()[header::CACHE_CONTROL], CACHE_REVALIDATE);
+        assert_ne!(CACHE_REVALIDATE, CACHE_IMMUTABLE);
+        // The item's own file names the download, unlike the `key=` form.
+        assert_eq!(
+            hit.headers()[header::CONTENT_DISPOSITION],
+            "inline; filename=\"holiday-clip.mp4\""
         );
         cache.clear(true).await.unwrap();
     }
