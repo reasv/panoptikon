@@ -22,8 +22,70 @@ effectiveEnd   = userTrim.end                        if the user set an end boun
                = null                                otherwise
 ```
 
-- **`cutPoint` splits the timeline discrepancy** (the midpoint of the two
-  pure anchors). The browser's timeline disagrees with ffprobe's in *both*
+`cutPoint` has three tiers, in precedence order: **measured (probe) >
+midpoint > start-anchored fallback**.
+
+- **Measured: the rVFC end probe** (`ui/lib/videoEndProbe.ts`). The midpoint
+  below is a *guess* at how the browser/ffprobe discrepancy splits between
+  front and back, and field validation measured ±2 frames of per-file scatter
+  around it. Measuring the video track's true end in the browser's own
+  timeline removes the guess:
+
+  ```
+  K        = serverDuration − content_end_ms/1000   (both ffprobe video seconds:
+                                                     the card length, a difference
+                                                     INSIDE one timeline, exact)
+  cutPoint = probedVideoEnd − K − guard             (browser seconds)
+  ```
+
+  No browser duration appears, so no origin shift and no tail padding can
+  enter — and the `|delta| ≥ 1` sanity test is irrelevant to this tier.
+  `probedVideoEnd` is the `mediaTime` of the **last presented video frame**,
+  read from `requestVideoFrameCallback` on a throwaway offscreen `<video>`
+  (created, never inserted, never the player's element; seeked to `duration`,
+  which clamps to the seekable end). A frame's presentation timestamp is its
+  *start*, so the measurement runs **up to one frame early** — the safe
+  direction, smaller than the jitter the 60 ms guard already covers, which is
+  why the guard is **unchanged**.
+  - **Chromium-only**: Firefox has no `requestVideoFrameCallback`, so the
+    probe resolves null there and the midpoint stays in charge. Every failure
+    path (no rVFC, media `error`, unusable duration, a ~4 s timeout) resolves
+    null the same way.
+  - **Playout nudge**: if the seek completes and no frame is composited
+    within ~700 ms (a paused, never-inserted element may simply not present),
+    the probe seeks to ~0.4 s before the end and **plays, muted**, keeping
+    the maximum `mediaTime` across ticks and resolving it at `ended`. It is
+    the one part of the mechanism with a side effect (a fraction of a second
+    of offscreen decode) and only runs after the cheap path has already
+    failed; an autoplay-policy rejection resolves the best tick seen or null.
+  - **Once per sha per session, successes only**: a module-level promise
+    cache keyed by the item's sha256 — *not* the URL, which carries the
+    selected databases as query params — so concurrent mounts share one
+    in-flight probe, and a **concurrency cap of 4** (LIFO, so the most
+    recently mounted — most likely visible — item is served first) keeps a
+    pinboard that mounts dozens of eligible TikToks from range-fetching
+    dozens of file tails at once. Only a *number* is a session verdict: a
+    null may mean "slow NAS tail read once" or "404 under the currently
+    selected database", so null-resolving probes are evicted on settle and
+    the next mount retries.
+  - **Asymmetric sanity, all rejections fall through**: a probe result that
+    is non-finite, not greater than `K`, more than a second away from
+    `serverDuration` (the measured end *is* `serverDuration` plus the
+    track's browser delay, and a second of delay is the same
+    two-different-files threshold as the midpoint's `|delta|` bound), **or
+    whose cut lands inside the freeze band**, falls *through* to the
+    midpoint — where inconsistent durations instead make the item ineligible
+    outright. A failed independent measurement says nothing about the two
+    durations, so it must never kill a feature that worked without it.
+  - The cut therefore refines **twice** — fallback → midpoint at
+    `loadedmetadata`, midpoint → measured when the probe lands. Both are safe
+    for the same reason (`useVideoTrim` re-runs its loop effect on an end
+    change without touching the playhead; a playhead already past the refined
+    cut is covered by the documented "reasserts at loop boundaries"
+    semantics).
+- **`cutPoint` splits the timeline discrepancy** when there is no
+  measurement (the midpoint of the two pure anchors). The browser's timeline
+  disagrees with ffprobe's in *both*
   directions, and two field rounds on one file measured both: an origin
   shift at the front (mp4 edit lists / audio priming delay the video track)
   made the pure start-anchored cut 0.11–0.14 s **early** (cut 11.14 vs a
