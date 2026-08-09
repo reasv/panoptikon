@@ -181,6 +181,59 @@ async fn open_file(path: &FsPath) -> ApiResult<()> {
     )))
 }
 
+/// Whether the clipboard write is known to have finished by the time
+/// [`copy_to_clipboard`] returns, which is what the response message may
+/// claim.
+enum ClipboardWrite {
+    /// The native crate wrote the clipboard before returning.
+    Completed,
+    /// A custom program or command was handed the path; its own outcome is
+    /// not observed here (a direct program is only spawned, and an empty
+    /// template is a deliberate no-op).
+    Attempted,
+}
+
+/// Place an OS-native reference to the file on the host's clipboard, so that
+/// pasting it elsewhere attaches the file itself.
+///
+/// Precedence mirrors [`open_file`]: `open.clipboard_program` (direct exec,
+/// no shell) beats `open.clipboard_command` (shell template), and both beat
+/// the built-in native write. Both custom forms expand the same `{path}`,
+/// `{folder}` and `{filename}` placeholders as the other verbs.
+async fn copy_to_clipboard(path: &FsPath) -> ApiResult<ClipboardWrite> {
+    if let Some(program) = crate::config::runtime()
+        .open
+        .clipboard_program
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    {
+        execute_direct_command(
+            &program,
+            &crate::config::runtime().open.clipboard_args,
+            path,
+        )
+        .await?;
+        return Ok(ClipboardWrite::Attempted);
+    }
+    if let Some(custom_cmd) = crate::config::runtime().open.clipboard_command.clone() {
+        execute_custom_command("open.clipboard_command", &custom_cmd, path).await?;
+        return Ok(ClipboardWrite::Attempted);
+    }
+
+    // The native write is blocking (and on Windows pumps a message loop), so
+    // it goes to a blocking thread rather than the async worker. macOS
+    // pasteboard writes normally belong on the main thread, but this process
+    // has no AppKit run loop to dispatch to — headless when run bare, and a
+    // separate process from Tauri when run under the Desktop app — so there is
+    // no UI thread here to race.
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || panoptikon_clipboard::copy_files_to_clipboard(&[owned]))
+        .await
+        .map_err(|err| ApiError::internal(format!("clipboard task failed: {err}")))?
+        .map_err(|err| ApiError::internal(format!("{err:#}")))?;
+    Ok(ClipboardWrite::Completed)
+}
+
 /// Open the given path in the file explorer and select the file, works on Windows, macOS, and Linux.
 ///
 /// `path`: The path to the file to be shown in the file explorer.
@@ -285,11 +338,17 @@ async fn show_in_fm(path: &FsPath) -> ApiResult<()> {
     )))
 }
 
-async fn get_correct_path(
+/// Resolves the on-disk path for a hash, honouring an optional path hint when
+/// the same content is indexed under several paths.
+///
+/// The inner `Err` is "no such file", kept apart from the outer one (a failed
+/// database read) because the handler families report it with different
+/// status codes.
+async fn resolve_path(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
     path: Option<String>,
-) -> ApiResult<String> {
+) -> ApiResult<Result<String, String>> {
     let trimmed_path = path
         .as_deref()
         .map(str::trim)
@@ -308,19 +367,30 @@ async fn get_correct_path(
                 available = %available,
                 "open path not found"
             );
-            return Err(ApiError::internal(format!(
-                "404: File {path} not found in {available}"
-            )));
+            return Ok(Err(format!("File {path} not found in {available}")));
         }
-        return Ok(path.to_string());
+        return Ok(Ok(path.to_string()));
     }
 
     let files = get_existing_files_for_sha256(conn, sha256).await?;
     if let Some(file) = files.first() {
-        return Ok(file.path.clone());
+        return Ok(Ok(file.path.clone()));
     }
 
-    Err(ApiError::internal("404: File not found"))
+    Ok(Err("File not found".to_string()))
+}
+
+/// The `open`/`folder` handlers' historical error shape: a 500 whose body
+/// merely *says* 404. Preserved verbatim for them; new endpoints use the real
+/// status instead.
+async fn get_correct_path(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    path: Option<String>,
+) -> ApiResult<String> {
+    resolve_path(conn, sha256, path)
+        .await?
+        .map_err(|reason| ApiError::internal(format!("404: {reason}")))
 }
 
 #[utoipa::path(
@@ -378,5 +448,40 @@ pub async fn show_in_file_manager(
     Ok(Json(OpenResponse {
         path: path.clone(),
         message: format!("Attempting to open: {path}"),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "copy_file_to_clipboard_on_host",
+    path = "/api/open/clipboard/{sha256}",
+    tag = "open",
+    summary = "Copy a file to the host system's clipboard",
+    description = "Place an OS-native reference to the file on the clipboard of the machine running the server, so that pasting it into a file manager, a chat client or an upload form attaches the original file.\nOnly the path travels; the file's contents are never read.\nThe write targets the *server's* clipboard, so this is only useful when the server and the browser share a machine (or when a custom open.clipboard_command forwards it elsewhere).\nThis is a potentially dangerous operation, as a custom command can execute arbitrary code.",
+    params(
+        DbQueryParams,
+        ("sha256" = String, Path),
+        OpenQuery
+    ),
+    responses(
+        (status = 200, description = "File copied to the host clipboard", body = OpenResponse)
+    )
+)]
+pub async fn copy_file_to_clipboard_on_host(
+    Path(sha256): Path<String>,
+    Query(query): Query<OpenQuery>,
+    mut db: DbConnection<ReadOnly>,
+) -> ApiResult<Json<OpenResponse>> {
+    let path = resolve_path(&mut db.conn, &sha256, query.path)
+        .await?
+        .map_err(ApiError::not_found)?;
+    let message = match copy_to_clipboard(FsPath::new(&path)).await? {
+        ClipboardWrite::Completed => format!("Copied to clipboard: {path}"),
+        // Hedged like the sibling verbs: a custom command owns the outcome.
+        ClipboardWrite::Attempted => format!("Attempting to copy to clipboard: {path}"),
+    };
+    Ok(Json(OpenResponse {
+        path: path.clone(),
+        message,
     }))
 }

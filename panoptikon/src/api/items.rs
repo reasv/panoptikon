@@ -14,9 +14,7 @@ use tokio_util::io::ReaderStream;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::api::db_params::DbQueryParams;
-use crate::api::utils::{
-    content_disposition_value, iso_to_system_time, serve_outro_metadata, strip_non_latin1_chars,
-};
+use crate::api::utils::{content_disposition_value, iso_to_system_time, serve_outro_metadata};
 use crate::api_error::ApiError;
 use crate::db::items::{
     ExtractedTextRecord, FileRecord, ItemIdentifierType, ItemRecord, get_all_tags_for_item,
@@ -454,15 +452,6 @@ pub async fn item_thumbnail(
     }
 }
 
-fn display_filename(file: &FileRecord) -> String {
-    let filename = strip_non_latin1_chars(&file.filename);
-    if filename.is_empty() {
-        file.filename.clone()
-    } else {
-        filename
-    }
-}
-
 async fn thumbnail_response(
     conn: &mut sqlx::SqliteConnection,
     item: &ItemRecord,
@@ -471,7 +460,7 @@ async fn thumbnail_response(
     request_headers: &HeaderMap,
     content_addressed: bool,
 ) -> ApiResult<Response<Body>> {
-    let original_filename = display_filename(&files[0]);
+    let original_filename = files[0].filename.clone();
     let original_filename_no_ext = Path::new(&original_filename)
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -666,7 +655,10 @@ async fn try_file_response(
     request_headers: &HeaderMap,
     content_addressed: bool,
 ) -> ApiResult<Response<Body>> {
-    let filename = display_filename(file);
+    // The indexed name verbatim: `content_disposition_value` owns the Latin-1
+    // downgrade, and pre-stripping here would cost the `filename*` parameter
+    // the very characters it exists to carry.
+    let filename = file.filename.clone();
     let mut file_handle = open_file_with_timeout(&file.path).await?;
     // The size on disk is authoritative for range math; the DB value can be
     // stale if the file changed since the last scan.

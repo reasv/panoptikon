@@ -177,10 +177,18 @@ Modify: `panoptikon/src/api/open.rs`, `panoptikon/src/config.rs`,
 ### Step 2.2 — RFC 5987 filename fix (independent)
 
 Modify `content_disposition_value` (panoptikon/src/api/utils.rs:234):
-emit `inline; filename="<latin1-fallback>"; filename*=UTF-8''<pct-encoded>`
-when the name is not pure Latin-1/ASCII; unchanged output for plain ASCII
-names (don't churn every response). Unit tests: ASCII passthrough,
-CJK/emoji name, quote/backslash escaping in the fallback.
+emit `inline; filename="<latin1-fallback>"; filename*=UTF-8''<pct-encoded>`;
+unchanged output for plain printable-ASCII names (don't churn every
+response). As implemented, the gate is **any non-ASCII character**, not
+"not pure Latin-1": a raw Latin-1 byte such as `é` sitting in the quoted
+string is ambiguous to browsers, so `filename*` is emitted for every
+non-ASCII name and the fallback keeps the Latin-1 byte only as a legacy
+approximation. Control characters (`< 0x20`, `0x7F`, tab included) are
+**dropped from the quoted fallback** — `HeaderValue` rejects them, so one
+`\n` in a name would otherwise cost the whole `Content-Disposition`
+header — and they also trip the gate, so `filename*` carries the exact
+name. Unit tests: ASCII passthrough, CJK/emoji name, quote/backslash
+escaping in the fallback, embedded control character.
 
 ## 3. Phase 3 — relay + desktop
 

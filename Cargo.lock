@@ -4222,6 +4222,7 @@ dependencies = [
  "md-5 0.10.6",
  "mime_guess",
  "notify",
+ "panoptikon-clipboard",
  "panoptikon-config",
  "pdfium-render",
  "ractor",

@@ -207,11 +207,18 @@ file_program = "mpv"
 file_args = ["{path}"]
 folder_program = "my-file-manager"
 folder_args = ["--select", "{path}"]
+clipboard_program = "my-clipboard-tool"
+clipboard_args = ["--file", "{path}"]
 ```
 
-The existing `file_command` and `folder_command` keys remain available as
-explicit shell-command templates. All forms support `{path}`, `{folder}`, and
-`{filename}`. Panoptikon Desktop exposes one shared **File opening on this
+`clipboard_program`/`clipboard_args` (and the shell form `clipboard_command`)
+are used by `POST /api/open/clipboard/{sha256}` to copy a file reference to the
+host's clipboard, overriding the built-in native clipboard write; they take the
+same placeholders, and an empty string is a no-op like the other verbs.
+
+The existing `file_command`, `folder_command` and `clipboard_command` keys
+remain available as explicit shell-command templates. All forms support
+`{path}`, `{folder}`, and `{filename}`. Panoptikon Desktop exposes one shared **File opening on this
 computer** editor for its local Server and Relay actions, including native
 application and test-file pickers, command-line-style argument entry backed by
 structured direct arguments, a copyable placeholder reference, expanded
@@ -773,6 +780,9 @@ level = "${LOGLEVEL:-INFO}"  # RUST_LOG takes precedence when set
 # [open]                     # custom /api/open commands; {path} {folder}
 # file_command = "mpv {path}"          #   {filename} placeholders; "" = no-op
 # folder_command = "explorer {folder}" # (was: show in file manager)
+# clipboard_program = "my-clipboard-tool"   # copy a file reference to the
+# clipboard_args = ["--file", "{path}"]     #   host clipboard; overrides the
+# clipboard_command = "my-clipboard-shell {path}"  # built-in native write
 
 [server]
 host = "127.0.0.1"
