@@ -22,22 +22,32 @@ effectiveEnd   = userTrim.end                        if the user set an end boun
                = null                                otherwise
 ```
 
-- **`cutPoint` is END-anchored.** The card is appended at the *end* of the
-  file, and the browser's timeline routinely disagrees with ffprobe's about
-  where zero is (mp4 edit lists, audio priming ≈ 0.05–0.15 s). Anchoring the
-  cut to the start converts that disagreement into cut error — field
-  validation on real TikToks measured the cut at 11.14 s against a card that
-  actually began at 11.40 s, 260 ms early. The card's *length* is the same
-  number in either origin, so it is what travels between the two timelines:
+- **`cutPoint` splits the timeline discrepancy** (the midpoint of the two
+  pure anchors). The browser's timeline disagrees with ffprobe's in *both*
+  directions, and two field rounds on one file measured both: an origin
+  shift at the front (mp4 edit lists / audio priming delay the video track)
+  made the pure start-anchored cut 0.11–0.14 s **early** (cut 11.14 vs a
+  card at ~11.40–11.43), and tail padding at the back (the audio track
+  outlives the video) made the pure end-anchored cut 0.11–0.14 s **late**
+  (cut 11.48, card flash) — on a file whose browser duration exceeds
+  ffprobe's by 0.25 s. The two pure anchors bracket the real boundary (the
+  card's last frame cannot outlive the browser timeline; origin shifts are
+  non-negative), and nothing in the metadata says how the discrepancy is
+  apportioned, so the cut takes the midpoint:
 
   ```
-  card     = serverDuration − content_end_ms/1000     (both ffprobe seconds)
-  cutPoint = browserDuration − card − guard           (both browser seconds)
+  delta    = browserDuration − serverDuration          (browser minus ffprobe)
+  cutPoint = content_end_ms/1000 + delta/2 − guard     (browser seconds)
   ```
 
+  Exact on the validated file (~11.36, 45–75 ms before the transition,
+  inside the guard's margin); error bounded by `|delta|/2` instead of
+  `|delta|`; degenerates to the start-anchored cut when the timelines agree.
   `serverDuration` is the item's indexed `duration` field; `browserDuration`
   is the `<video>` element's own, known only from `loadedmetadata` onward.
-  Rounded to centiseconds (the storage resolution of the trim codec).
+  Rounded to centiseconds (the storage resolution of the trim codec). This
+  is the metadata precision floor — beyond it, per-video refinement is the
+  click-park + frame-step workflow (§4).
 - **Fallback**: with either duration unusable — null, NaN, *or zero or
   negative* (a stored duration of 0 is as unknown as none at all) —
   `cutPoint = content_end_ms/1000 − guard`, the start-anchored original. It
@@ -51,19 +61,19 @@ effectiveEnd   = userTrim.end                        if the user set an end boun
   than its card) plus an origin shift — and when it happens the state is
   internally consistent: button, cyan marker, tail dimming and the effective
   end all appear or vanish together.
-- **Card sanity guard**: `card ≤ 0` (content ends at or past the file end)
-  makes the item ineligible outright — not a fallback, since the numbers are
-  already known to disagree. The other degenerate direction (a card as long
-  as the whole browser timeline) needs no guard of its own: it computes a
-  cut at or below `−guard`, which the eligibility floor already rejects.
+- **Sanity guards**: `card ≤ 0` (content ends at or past the file end, with
+  `card = serverDuration − content_end_ms/1000`) or `|delta| ≥ 1 s` (a
+  second of duration disagreement is not padding to split but two files'
+  worth of metadata) make the item ineligible outright — not a fallback,
+  since the numbers are already known to disagree.
 - The guard is **60 ms**. It covers the card's audio bang, which leads the
   first card frame by up to 60 ms (detection design §2.3/§10). It was 150 ms
   in the first implementation and the field round cut it: 150 ms costs 4–5
   visible frames on *every* video to cover a lead whose median is 10 ms, and
-  with the systematic offset now handled by the end anchor and a per-video
-  escape hatch in the drag/step workflow (§4), there is nothing left for the
-  extra 90 ms to absorb. Accepted trade-off: on a maximum-lead file about one
-  rAF tick of bang transient can leak.
+  with the systematic offset now handled by the midpoint anchor and a
+  per-video escape hatch in the drag/step workflow (§4), there is nothing
+  left for the extra 90 ms to absorb. Accepted trade-off: on a maximum-lead
+  file about one rAF tick of bang transient can leak.
 - **Eligibility**: item has `content_end_ms` non-null AND
   `cutPoint > FREEZE_EPS` (0.02 s, `lib/videoTrim.ts`). A cut point inside
   the freeze band means the item is treated as having no outro: `{start:
