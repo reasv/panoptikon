@@ -1371,6 +1371,7 @@ impl Settings {
             );
         }
         for (key, value) in [
+            ("cache_size_mb", transcode.cache_size_mb),
             ("max_concurrent_jobs", transcode.max_concurrent_jobs as u64),
             ("max_mosaic_inputs", transcode.max_mosaic_inputs as u64),
             ("max_mosaic_loop_mb", transcode.max_mosaic_loop_mb),
@@ -2838,6 +2839,10 @@ surfaces = ["clip"]
         expect_err(
             format!("{MINIMAL}\n[transcode]\ncache_size_mb = 4096\ncache_size_max_mb = 1024\n"),
             "exceeds transcode.cache_size_max_mb",
+        );
+        expect_err(
+            format!("{MINIMAL}\n[transcode]\ncache_size_mb = 0\n"),
+            "transcode.cache_size_mb must be at least 1",
         );
         expect_err(
             format!("{MINIMAL}\n[transcode]\nhwaccel = \"cuda\"\n"),

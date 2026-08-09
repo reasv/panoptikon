@@ -85,7 +85,13 @@ pub(crate) fn fast_h264_encoder() -> Option<&'static str> {
         // Config load rejected anything else, so an unparseable value here can
         // only come from a RuntimeConfig built outside Settings::validate.
         let setting = parse_hwaccel(&configured).unwrap_or(Hwaccel::Auto);
-        let chosen = select_encoder(setting, &listed_encoders(&encoder_listing()?), validate_encoder);
+        // `off` must answer without touching the toolchain: the listing below
+        // spawns ffmpeg, which is the cost the setting exists to avoid.
+        let chosen = if setting == Hwaccel::Off {
+            None
+        } else {
+            select_encoder(setting, &listed_encoders(&encoder_listing()?), validate_encoder)
+        };
         match chosen {
             Some(encoder) => tracing::info!(encoder, "hardware H.264 encoder validated"),
             None => tracing::info!(
@@ -107,12 +113,11 @@ fn select_encoder(
     let wanted: &[&'static str] = match setting {
         Hwaccel::Off => return None,
         Hwaccel::Auto => &CANDIDATES,
-        Hwaccel::Named(name) => std::slice::from_ref(
-            CANDIDATES
-                .iter()
-                .find(|candidate| **candidate == name)
-                .expect("Hwaccel::Named only ever holds a candidate"),
-        ),
+        // A name outside the candidate list is unreachable through
+        // `parse_hwaccel`; a value built any other way falls back to libx264.
+        Hwaccel::Named(name) => {
+            std::slice::from_ref(CANDIDATES.iter().find(|candidate| **candidate == name)?)
+        }
     };
     wanted
         .iter()
@@ -331,6 +336,11 @@ Encoders:
             select_encoder(Hwaccel::Named("h264_qsv"), &listed, |_| true),
             None,
             "an unlisted encoder is not tried"
+        );
+        assert_eq!(
+            select_encoder(Hwaccel::Named("h264_vaapi"), &listed, |_| true),
+            None,
+            "a name outside the candidate list is libx264, not a panic"
         );
     }
 

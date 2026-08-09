@@ -15,11 +15,6 @@ use std::collections::BTreeMap;
 /// DTO; the identifier charset is the same one database and policy names use.
 const MAX_PRESET_ID_LEN: usize = 64;
 
-/// Widest rate-control value any supported encoder accepts: x264 stops at 51
-/// and vp9 at 63, but libwebp's `-q:v` is a 0-100 quality scale, and
-/// [`QualityMode::Crf`] carries that one too (see `webp-anim` below).
-const MAX_QUALITY_VALUE: i64 = 100;
-
 /// Ceiling on a profile's frame-rate cap. Well past anything a browser plays;
 /// it exists so a typo cannot ask ffmpeg for an absurd `-fpsmax`.
 const MAX_FPS_MAX: f64 = 240.0;
@@ -56,6 +51,19 @@ impl Container {
     /// rather than something ffmpeg silently drops.
     fn carries_audio(self) -> bool {
         !matches!(self, Container::Webp)
+    }
+
+    /// Widest rate-control value the encoder behind this container accepts:
+    /// x264 stops at 51 and vp9 at 63, while libwebp's `-q:v` is a 0-100
+    /// quality scale that [`QualityMode::Crf`] carries too. A value past the
+    /// scale is not clamped by ffmpeg, it is a different picture than the one
+    /// the user asked for.
+    fn max_crf(self) -> i64 {
+        match self {
+            Container::Mp4 => 51,
+            Container::Webm => 63,
+            Container::Webp => 100,
+        }
     }
 }
 
@@ -351,14 +359,16 @@ fn resolve_one(
     patch: &TranscodeProfileConfig,
     base: Option<&ResolvedPreset>,
 ) -> Result<ResolvedPreset> {
+    // The container decides the CRF scale, so it is resolved first and the
+    // range is checked against the *resolved* quality: a patch that only
+    // changes the container inherits a value from a different scale.
+    let container = patch
+        .container
+        .or_else(|| base.map(|preset| preset.container))
+        .context("container is required")?;
     let quality = match (patch.crf, patch.bitrate_kbps) {
         (Some(_), Some(_)) => bail!("crf and bitrate_kbps are mutually exclusive"),
-        (Some(crf), None) => {
-            if !(0..=MAX_QUALITY_VALUE).contains(&crf) {
-                bail!("crf must be between 0 and {MAX_QUALITY_VALUE}");
-            }
-            Some(QualityMode::Crf(crf))
-        }
+        (Some(crf), None) => Some(QualityMode::Crf(crf)),
         (None, Some(kbps)) => {
             if kbps <= 0 {
                 bail!("bitrate_kbps must be positive");
@@ -368,10 +378,6 @@ fn resolve_one(
         (None, None) => None,
     };
 
-    let container = patch
-        .container
-        .or_else(|| base.map(|preset| preset.container))
-        .context("container is required")?;
     let vcodec = patch
         .vcodec
         .clone()
@@ -383,6 +389,15 @@ fn resolve_one(
     let quality = quality
         .or_else(|| base.map(|preset| preset.quality))
         .context("crf or bitrate_kbps is required")?;
+    if let QualityMode::Crf(crf) = quality {
+        let max = container.max_crf();
+        if !(0..=max).contains(&crf) {
+            bail!(
+                "crf must be between 0 and {max} for container {}",
+                container.ext()
+            );
+        }
+    }
 
     let acodec = resolve_acodec(patch, base)?;
     if acodec.is_some() && !container.carries_audio() {
@@ -435,6 +450,9 @@ fn resolve_acodec(
     base: Option<&ResolvedPreset>,
 ) -> Result<Option<String>> {
     if patch.audio == Some(false) {
+        if patch.acodec.is_some() {
+            bail!("audio = false contradicts the acodec set in the same profile");
+        }
         return Ok(None);
     }
     if let Some(acodec) = patch.acodec.as_deref() {
@@ -591,12 +609,13 @@ mod tests {
     /// the contradictory combinations are refused instead of being guessed at.
     #[test]
     fn validation_rejects_incomplete_and_contradictory_profiles() {
-        let expect_err = |body: &str, needle: &str| {
-            let map = profiles(&[("novel", body)]);
+        let expect_err_named = |name: &str, body: &str, needle: &str| {
+            let map = profiles(&[(name, body)]);
             let err = validate_profiles(Some(&map)).expect_err(needle);
             let text = format!("{err:#}");
             assert!(text.contains(needle), "expected '{needle}' in: {text}");
         };
+        let expect_err = |body: &str, needle: &str| expect_err_named("novel", body, needle);
 
         expect_err("vcodec = \"h264\"\ncrf = 20", "container is required");
         expect_err("container = \"mp4\"\ncrf = 20", "vcodec is required");
@@ -608,10 +627,38 @@ mod tests {
             "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 20\nbitrate_kbps = 900",
             "mutually exclusive",
         );
+        // The CRF scale is the container's: x264 stops at 51, vp9 at 63, and
+        // libwebp's `-q:v` runs to 100.
         expect_err(
-            "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 200",
-            "crf must be between",
+            "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 52",
+            "crf must be between 0 and 51 for container mp4",
         );
+        expect_err(
+            "container = \"webm\"\nvcodec = \"vp9\"\ncrf = 64",
+            "crf must be between 0 and 63 for container webm",
+        );
+        expect_err(
+            "container = \"webp\"\nvcodec = \"libwebp_anim\"\ncrf = 101",
+            "crf must be between 0 and 100 for container webp",
+        );
+        expect_err(
+            "container = \"mp4\"\nvcodec = \"h264\"\ncrf = -1",
+            "crf must be between 0 and 51 for container mp4",
+        );
+        validate_profiles(Some(&profiles(&[
+            ("a", "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 51"),
+            ("b", "container = \"webm\"\nvcodec = \"vp9\"\ncrf = 63"),
+            ("c", "container = \"webp\"\nvcodec = \"libwebp_anim\"\ncrf = 100"),
+        ])))
+        .expect("the top of each scale is in range");
+        // Switching a built-in's container revalidates the inherited value
+        // against the new scale (webp-anim's 75 is not an x264 CRF).
+        expect_err_named(
+            "webp-anim",
+            "container = \"mp4\"\nvcodec = \"h264\"",
+            "crf must be between 0 and 51 for container mp4",
+        );
+
         expect_err(
             "container = \"webp\"\nvcodec = \"libwebp_anim\"\ncrf = 75\nacodec = \"aac\"",
             "cannot carry an audio stream",
@@ -619,6 +666,12 @@ mod tests {
         expect_err(
             "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 20\naudio = true",
             "audio = true needs an acodec",
+        );
+        // The other half of the audio contradiction: dropping the stream and
+        // naming a codec for it in the same entry.
+        expect_err(
+            "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 20\naudio = false\nacodec = \"aac\"",
+            "audio = false contradicts",
         );
 
         // A patch of a built-in needs nothing at all beyond what it changes.

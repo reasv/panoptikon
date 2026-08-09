@@ -2,7 +2,7 @@
 //! SQLite index (docs/video-transcoding-design.md §3).
 //!
 //! Write order is the whole correctness argument. The encoder writes into
-//! `.tmp-<pid>-<key>.<ext>`, the file is fsynced and renamed into place, and
+//! `.tmp-<pid>-<nonce>.<ext>`, the file is fsynced and renamed into place, and
 //! only then is the row inserted — an orphan *file* is swept, whereas an
 //! orphan *row* would 404 every request for an artifact that looks cached.
 //! Startup reconciles both directions and sweeps abandoned temporaries.
@@ -17,7 +17,7 @@
 // concerned. Remove this allow with pool.rs.
 #![allow(dead_code)]
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -43,8 +43,14 @@ const HOT_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const EVICT_BATCH: i64 = 32;
 
 /// How old an abandoned `.tmp-*` file must be before the sweeper removes it.
-/// Young ones may belong to an encode running in another process right now.
+/// Young ones may belong to an encode running right now, here or in another
+/// process; age is the only signal, since a pid is reused after a crash.
 const STALE_TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How old an artifact file no row claims must be before reconciliation
+/// removes it. A publish is a rename followed by an insert, so a file that
+/// another process is committing right now is briefly rowless.
+const UNCLAIMED_ARTIFACT_MIN_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// A second failure settles the verdict; the first only records it. ffmpeg
 /// does its own file I/O, where a corrupt file and a dropped mount are
@@ -139,16 +145,20 @@ impl TranscodeCache {
             limit_bytes,
         };
         cache.reconcile().await?;
-        cache.sweep_stale_temp_files();
+        cache.sweep_stale_temp_files().await;
         Ok(cache)
     }
 
     /// Where an encode writes before [`commit`](Self::commit) renames it into
-    /// place. Pid-tagged so concurrent processes never collide on it and the
-    /// sweeper can tell a live temporary from an abandoned one.
-    pub(crate) fn temp_path(&self, key: &str, ext: &str) -> PathBuf {
-        self.dir
-            .join(format!("{TEMP_PREFIX}{}-{key}.{ext}", std::process::id()))
+    /// place. The nonce, not the key, is what makes it unique: two encodes of
+    /// the same key (a retry racing the job that abandoned it, or two
+    /// processes) must not share a temporary. Nothing reads the name back.
+    pub(crate) fn temp_path(&self, ext: &str) -> PathBuf {
+        self.dir.join(format!(
+            "{TEMP_PREFIX}{}-{}.{ext}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ))
     }
 
     /// Looks a key up, recording the hit. `None` covers both "never encoded"
@@ -163,7 +173,10 @@ impl TranscodeCache {
             .ok()??;
         let file_name: String = row.get(0);
         let path = self.dir.join(&file_name);
-        if !path.is_file() {
+        if !tokio::fs::metadata(&path)
+            .await
+            .is_ok_and(|meta| meta.is_file())
+        {
             tracing::warn!(key, "cached artifact row without a file; dropping the row");
             let _ = self.delete_row(key).await;
             return None;
@@ -192,13 +205,11 @@ impl TranscodeCache {
         }
     }
 
-    /// Publishes a finished encode: fsync, rename, then the row. Runs an
-    /// eviction pass, which can never choose the artifact just written.
-    pub(crate) async fn commit(
-        &self,
-        new: NewArtifact<'_>,
-        temp: &Path,
-    ) -> Result<CachedArtifact> {
+    /// The filesystem half of [`commit`](Self::commit): fsync and rename.
+    /// Separated so its caller can clean the temporary up on any failure —
+    /// once this returns `Ok` the temporary is gone, having become the
+    /// artifact.
+    async fn publish(&self, temp: &Path, file_name: &str) -> Result<(PathBuf, i64)> {
         // Opened for write, not read: `sync_all` needs write access on
         // Windows (a read handle fails it with ERROR_ACCESS_DENIED).
         let file = tokio::fs::OpenOptions::new()
@@ -219,10 +230,29 @@ impl TranscodeCache {
             .with_context(|| format!("failed to flush the encoded file {}", temp.display()))?;
         drop(file);
 
-        let path = self.dir.join(new.file_name);
+        let path = self.dir.join(file_name);
         tokio::fs::rename(temp, &path)
             .await
             .with_context(|| format!("failed to publish the artifact {}", path.display()))?;
+        Ok((path, size_bytes))
+    }
+
+    /// Publishes a finished encode: fsync, rename, then the row. Runs an
+    /// eviction pass, which can never choose the artifact just written.
+    pub(crate) async fn commit(
+        &self,
+        new: NewArtifact<'_>,
+        temp: &Path,
+    ) -> Result<CachedArtifact> {
+        let (path, size_bytes) = match self.publish(temp, new.file_name).await {
+            Ok(published) => published,
+            Err(err) => {
+                // Everything up to the rename leaves the temporary behind,
+                // and no one else will claim it for a day.
+                let _ = tokio::fs::remove_file(temp).await;
+                return Err(err);
+            }
+        };
 
         let now = current_iso_timestamp();
         sqlx::query(
@@ -265,12 +295,19 @@ impl TranscodeCache {
         })
     }
 
-    /// The byte budget, in megabytes. Clamped to the configured ceiling and
-    /// applied immediately; not persisted (the TOML value is what a restart
-    /// returns to), exactly like the search result cache.
+    /// The byte budget, in megabytes. Applied immediately and not persisted
+    /// (the TOML value is what a restart returns to), exactly like the search
+    /// result cache. A request above the configured ceiling is refused rather
+    /// than silently clamped, so the resize route can answer 422.
     pub(crate) async fn set_budget_mb(&self, size_mb: u64) -> Result<()> {
-        self.budget_bytes
-            .store(mb_to_bytes(size_mb).min(self.limit_bytes), Ordering::Relaxed);
+        let requested = mb_to_bytes(size_mb);
+        if requested > self.limit_bytes {
+            bail!(
+                "size_mb {size_mb} exceeds the transcode.cache_size_max_mb ceiling of {} MB",
+                self.limit_mb()
+            );
+        }
+        self.budget_bytes.store(requested, Ordering::Relaxed);
         self.evict(None).await
     }
 
@@ -374,17 +411,17 @@ impl TranscodeCache {
             .fetch_all(&self.pool)
             .await
             .context("failed to read the artifact index")?;
-        let mut claimed: HashSet<String> = HashSet::new();
-        let mut orphan_rows: Vec<String> = Vec::new();
-        for row in rows {
-            let key: String = row.get(0);
-            let file_name: String = row.get(1);
-            if self.dir.join(&file_name).is_file() {
-                claimed.insert(file_name);
-            } else {
-                orphan_rows.push(key);
-            }
-        }
+        let indexed: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+
+        let dir = self.dir.clone();
+        let (orphan_rows, orphan_files) =
+            tokio::task::spawn_blocking(move || scan_for_orphans(&dir, indexed))
+                .await
+                .context("the transcode cache reconciliation scan failed")?;
+
         for key in &orphan_rows {
             self.delete_row(key).await?;
         }
@@ -393,24 +430,6 @@ impl TranscodeCache {
                 rows = orphan_rows.len(),
                 "dropped transcode cache rows whose artifact file was gone"
             );
-        }
-
-        let mut orphan_files = 0usize;
-        if let Ok(entries) = std::fs::read_dir(&self.dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                // `.tmp-*` belongs to the sweeper (it may be a live encode);
-                // cache.db and its WAL sidecars are the index itself.
-                if name.starts_with(TEMP_PREFIX) || name.starts_with(DB_FILE_NAME) {
-                    continue;
-                }
-                if !entry.metadata().is_ok_and(|meta| meta.is_file()) || claimed.contains(&name) {
-                    continue;
-                }
-                if std::fs::remove_file(entry.path()).is_ok() {
-                    orphan_files += 1;
-                }
-            }
         }
         if orphan_files > 0 {
             tracing::info!(
@@ -422,37 +441,19 @@ impl TranscodeCache {
         self.evict(None).await
     }
 
-    /// Removes `.tmp-*` leftovers from crashed encodes: not this process's,
-    /// and old enough that no other process can still be writing them.
-    fn sweep_stale_temp_files(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return;
-        };
-        let own_prefix = format!("{TEMP_PREFIX}{}-", std::process::id());
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(TEMP_PREFIX) || name.starts_with(&own_prefix) {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            if !meta.is_file() {
-                continue;
-            }
-            let stale = meta
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age >= STALE_TEMP_MAX_AGE);
-            if stale {
-                let _ = std::fs::remove_file(entry.path());
-            }
+    async fn sweep_stale_temp_files(&self) {
+        let dir = self.dir.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || sweep_stale_temps(&dir)).await {
+            tracing::warn!(error = %err, "the transcode cache temporary sweep failed");
         }
     }
 
     /// Byte-budgeted LRU with the MFU nudge. `protect` is the key of an
-    /// artifact that must survive this pass — the one just committed, which is
-    /// by definition the least recently *used* entry even though it is the
-    /// one the caller is about to serve.
+    /// artifact that must survive this pass. It is the entry just committed,
+    /// which recency alone would already spare — the case this excludes is the
+    /// artifact that is on its own bigger than the whole budget, where the
+    /// pass must warn rather than delete the bytes the caller is about to
+    /// serve.
     async fn evict(&self, protect: Option<&str>) -> Result<()> {
         let budget = self.budget_bytes();
         let mut used = self.used_bytes().await?;
@@ -536,6 +537,76 @@ fn mb_to_bytes(mb: u64) -> u64 {
     mb.saturating_mul(1024 * 1024)
 }
 
+/// The filesystem half of [`TranscodeCache::reconcile`], as one blocking pass
+/// over the directory: stats every indexed file, then removes the files no row
+/// claims. Returns the keys whose file is gone and how many files it removed.
+fn scan_for_orphans(dir: &Path, indexed: Vec<(String, String)>) -> (Vec<String>, usize) {
+    let mut claimed: HashSet<String> = HashSet::new();
+    let mut orphan_rows: Vec<String> = Vec::new();
+    for (key, file_name) in indexed {
+        if dir.join(&file_name).is_file() {
+            claimed.insert(file_name);
+        } else {
+            orphan_rows.push(key);
+        }
+    }
+
+    let mut orphan_files = 0usize;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (orphan_rows, orphan_files);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `.tmp-*` belongs to the sweeper (it may be a live encode);
+        // cache.db and its WAL sidecars are the index itself.
+        if name.starts_with(TEMP_PREFIX) || name.starts_with(DB_FILE_NAME) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() || claimed.contains(&name) {
+            continue;
+        }
+        // Another process publishes by renaming into place and only then
+        // inserting the row; a young rowless file may be inside that window.
+        let settled = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= UNCLAIMED_ARTIFACT_MIN_AGE);
+        if settled && std::fs::remove_file(entry.path()).is_ok() {
+            orphan_files += 1;
+        }
+    }
+    (orphan_rows, orphan_files)
+}
+
+/// Removes `.tmp-*` leftovers from crashed encodes. Age is the whole test:
+/// this process's own pid is no evidence of a live encode, because a crashed
+/// run's pid can be handed back out.
+fn sweep_stale_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(TEMP_PREFIX) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_TEMP_MAX_AGE);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,10 +619,14 @@ mod tests {
         cache
     }
 
-    /// Writes `bytes` through the real temp-file protocol and commits it.
-    async fn commit(cache: &TranscodeCache, key: &str, bytes: &[u8]) -> CachedArtifact {
-        let temp = cache.temp_path(key, "mp4");
-        std::fs::write(&temp, bytes).unwrap();
+    /// Writes `bytes` into `temp` and commits it under `key`.
+    async fn commit_temp(
+        cache: &TranscodeCache,
+        key: &str,
+        bytes: &[u8],
+        temp: &Path,
+    ) -> Result<CachedArtifact> {
+        std::fs::write(temp, bytes).unwrap();
         cache
             .commit(
                 NewArtifact {
@@ -563,10 +638,15 @@ mod tests {
                     mime_type: "video/mp4",
                     transcoder_version: 1,
                 },
-                &temp,
+                temp,
             )
             .await
-            .unwrap()
+    }
+
+    /// Writes `bytes` through the real temp-file protocol and commits it.
+    async fn commit(cache: &TranscodeCache, key: &str, bytes: &[u8]) -> CachedArtifact {
+        let temp = cache.temp_path("mp4");
+        commit_temp(cache, key, bytes, &temp).await.unwrap()
     }
 
     async fn touch(cache: &TranscodeCache, key: &str, last_access: &str, hit_count: i64) {
@@ -594,8 +674,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache_with_budget(dir.path(), 1024).await;
 
-        let temp = cache.temp_path("k1", "mp4");
-        let artifact = commit(&cache, "k1", b"0123456789").await;
+        let temp = cache.temp_path("mp4");
+        let artifact = commit_temp(&cache, "k1", b"0123456789", &temp)
+            .await
+            .unwrap();
         assert!(!temp.exists(), "the temporary is renamed, not copied");
         assert!(artifact.path.is_file());
         assert_eq!(artifact.size_bytes, 10);
@@ -628,6 +710,40 @@ mod tests {
         assert!(keys(&cache).await.is_empty());
     }
 
+    /// A commit that cannot publish takes its temporary with it: nothing else
+    /// would remove it for a day, and the encode that wrote it is over.
+    #[tokio::test]
+    async fn a_failed_commit_removes_its_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_budget(dir.path(), 1024).await;
+
+        // A directory where the artifact should land: the rename cannot win.
+        std::fs::create_dir(dir.path().join("blocked.mp4")).unwrap();
+        let temp = cache.temp_path("mp4");
+        let err = commit_temp(&cache, "blocked", &[0u8; 10], &temp)
+            .await
+            .expect_err("publishing over a directory fails");
+        assert!(format!("{err:#}").contains("failed to publish"), "{err:#}");
+        assert!(!temp.exists(), "the temporary does not outlive the commit");
+        assert!(keys(&cache).await.is_empty(), "and no row was written");
+    }
+
+    /// Two encodes of the same key never share a temporary, so a retry cannot
+    /// overwrite the file another attempt is still writing.
+    #[tokio::test]
+    async fn temp_paths_are_unique_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_budget(dir.path(), 1024).await;
+        let first = cache.temp_path("mp4");
+        let second = cache.temp_path("mp4");
+        assert_ne!(first, second);
+        for path in [&first, &second] {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with(TEMP_PREFIX), "{name}");
+            assert!(name.ends_with(".mp4"), "{name}");
+        }
+    }
+
     /// LRU order decides victims, and the artifact that was just committed is
     /// never one of them however far over budget the commit puts the cache.
     #[tokio::test]
@@ -658,18 +774,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache_with_budget(dir.path(), 25).await;
 
+        // The hot entry is the *older* of the two, so plain LRU would take it
+        // and leave "cold": only the nudge produces the opposite verdict.
         commit(&cache, "hot", &[0u8; 10]).await;
-        touch(&cache, "hot", &current_iso_timestamp(), HOT_HIT_COUNT).await;
+        touch(
+            &cache,
+            "hot",
+            &iso_timestamp_ago(Duration::from_secs(3 * 24 * 60 * 60)),
+            HOT_HIT_COUNT,
+        )
+        .await;
         commit(&cache, "cold", &[0u8; 10]).await;
-        // Colder than the hot one but *newer* than the eviction cursor would
-        // pick if the nudge were ignored.
-        touch(&cache, "cold", "2024-01-01T00:00:00", 0).await;
+        touch(&cache, "cold", &current_iso_timestamp(), 0).await;
 
+        // 30 bytes against 25: exactly one entry goes.
         commit(&cache, "new", &[0u8; 10]).await;
         assert_eq!(
             keys(&cache).await,
             ["hot", "new"],
-            "the hot entry outranks an older-but-cold one"
+            "the hot entry outranks a colder-but-newer one; LRU alone would \
+             have evicted it instead"
         );
 
         // Now only hot entries remain besides the protected commit: the
@@ -697,10 +821,22 @@ mod tests {
         assert!(pinned.path.is_file());
     }
 
+    /// Backdates a file's mtime by `age`, so an age guard sees it as settled.
+    fn backdate(path: &Path, age: Duration) {
+        let when = std::time::SystemTime::now() - age;
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
     /// Reconciliation closes both halves of a crash: a row whose file never
-    /// landed, and a file whose row never did.
+    /// landed, and a file whose row never did — the latter only once the file
+    /// is too old to be another process's publish still on its way to a row.
     #[tokio::test]
-    async fn reconciliation_drops_orphan_rows_and_orphan_files() {
+    async fn reconciliation_drops_orphan_rows_and_settled_orphan_files() {
         let dir = tempfile::tempdir().unwrap();
         {
             let cache = cache_with_budget(dir.path(), 1024).await;
@@ -709,50 +845,51 @@ mod tests {
             std::fs::remove_file(&lost.path).unwrap();
             assert!(kept.path.is_file());
         }
-        // A file nobody claims, and a temporary, which reconciliation must
-        // leave to the sweeper.
-        std::fs::write(dir.path().join("unclaimed.mp4"), b"junk").unwrap();
+        // Two files nobody claims — one from a crash, one that may be mid
+        // publish right now — and a temporary, which is the sweeper's.
+        let abandoned = dir.path().join("unclaimed-old.mp4");
+        let publishing = dir.path().join("unclaimed-new.mp4");
+        for path in [&abandoned, &publishing] {
+            std::fs::write(path, b"junk").unwrap();
+        }
+        backdate(&abandoned, UNCLAIMED_ARTIFACT_MIN_AGE + Duration::from_secs(60));
         let temp = dir.path().join(format!(".tmp-{}-live.mp4", std::process::id()));
         std::fs::write(&temp, b"encoding").unwrap();
 
         let cache = cache_with_budget(dir.path(), 1024).await;
         assert_eq!(keys(&cache).await, ["kept"]);
-        assert!(!dir.path().join("unclaimed.mp4").exists());
+        assert!(!abandoned.exists(), "a settled rowless file is an orphan");
+        assert!(
+            publishing.is_file(),
+            "a fresh rowless file may be a publish that has not inserted yet"
+        );
         assert!(dir.path().join("kept.mp4").is_file());
         assert!(temp.is_file(), "an in-progress encode is not an orphan file");
     }
 
-    /// The sweeper only takes temporaries that cannot belong to a running
-    /// encode: another process's, and old enough.
+    /// The sweeper's only test is age: a pid is reused after a crash, so even
+    /// this process's own prefix proves nothing about a running encode.
     #[tokio::test]
-    async fn sweeper_spares_own_and_young_temporaries() {
+    async fn sweeper_takes_old_temporaries_whatever_the_pid() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = TranscodeCache {
-            dir: dir.path().to_path_buf(),
-            pool: SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
-            budget_bytes: AtomicU64::new(0),
-            limit_bytes: 0,
-        };
 
-        let own = cache.temp_path("mine", "mp4");
-        let young = dir.path().join(".tmp-999999-young.mp4");
-        let old = dir.path().join(".tmp-999999-old.mp4");
+        let own_old = dir.path().join(format!(".tmp-{}-old.mp4", std::process::id()));
+        let own_young = dir
+            .path()
+            .join(format!(".tmp-{}-young.mp4", std::process::id()));
+        let other_old = dir.path().join(".tmp-999999-old.mp4");
         let artifact = dir.path().join("artifact.mp4");
-        for path in [&own, &young, &old, &artifact] {
+        for path in [&own_old, &own_young, &other_old, &artifact] {
             std::fs::write(path, b"x").unwrap();
         }
-        let stale = std::time::SystemTime::now() - STALE_TEMP_MAX_AGE - Duration::from_secs(60);
-        std::fs::File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(stale))
-            .unwrap();
+        for path in [&own_old, &other_old] {
+            backdate(path, STALE_TEMP_MAX_AGE + Duration::from_secs(60));
+        }
 
-        cache.sweep_stale_temp_files();
-        assert!(own.is_file(), "this process's temporary is a live encode");
-        assert!(young.is_file(), "a young temporary may still be written");
-        assert!(!old.exists(), "an abandoned temporary is swept");
+        sweep_stale_temps(dir.path());
+        assert!(!own_old.exists(), "our own pid does not spare an old one");
+        assert!(!other_old.exists(), "an abandoned temporary is swept");
+        assert!(own_young.is_file(), "a young temporary may still be written");
         assert!(artifact.is_file(), "the sweeper only touches temporaries");
     }
 
@@ -790,8 +927,8 @@ mod tests {
         );
     }
 
-    /// The budget is runtime-resizable and clamped to the configured ceiling,
-    /// and shrinking it evicts immediately.
+    /// The budget is runtime-resizable, shrinking it evicts immediately, and
+    /// the configured ceiling is a rejection rather than a silent clamp.
     #[tokio::test]
     async fn resizing_the_budget_evicts_and_respects_the_ceiling() {
         let dir = tempfile::tempdir().unwrap();
@@ -808,8 +945,15 @@ mod tests {
         cache.set_budget_mb(0).await.unwrap();
         assert!(keys(&cache).await.is_empty(), "a zero budget empties it");
 
-        // Over the ceiling clamps rather than failing.
-        cache.set_budget_mb(64).await.unwrap();
+        // Over the ceiling is refused, so the resize route can answer 422.
+        let err = cache
+            .set_budget_mb(64)
+            .await
+            .expect_err("the ceiling is enforced, not clamped to");
+        assert!(format!("{err:#}").contains("cache_size_max_mb"), "{err:#}");
+        assert_eq!(cache.budget_bytes(), 0, "a refused resize changes nothing");
+
+        cache.set_budget_mb(2).await.unwrap();
         assert_eq!(cache.budget_bytes(), 2 * 1024 * 1024);
     }
 }
