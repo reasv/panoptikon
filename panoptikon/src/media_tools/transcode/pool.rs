@@ -765,13 +765,24 @@ static POOL: OnceCell<ActorRef<PoolMsg>> = OnceCell::const_new();
 pub(crate) async fn transcode_cache() -> ApiResult<Arc<TranscodeCache>> {
     CACHE
         .get_or_try_init(|| async {
-            TranscodeCache::open_from_config()
+            let cache = TranscodeCache::open_from_config()
                 .await
                 .map(Arc::new)
                 .map_err(|err| {
                     tracing::error!(error = %err, "failed to open the transcode artifact cache");
                     ApiError::internal("Failed to open the transcode artifact cache")
-                })
+                })?;
+            // The hardware probe spawns ffmpeg twice on its first call and is
+            // cached for the life of the process. Warmed here rather than
+            // alongside the pool because the pool starts only when something
+            // *encodes*: after a restart, a GET whose artifact is already
+            // cached resolves through this function alone, and the encoder
+            // identity it needs to name that artifact would otherwise be
+            // probed on the request's own thread.
+            tokio::task::spawn_blocking(|| {
+                let _ = super::hw::fast_h264_encoder();
+            });
+            Ok(cache)
         })
         .await
         .map(Arc::clone)
@@ -796,12 +807,6 @@ pub(crate) async fn ensure_pool() -> ApiResult<ActorRef<PoolMsg>> {
             tracing::error!(error = ?err, "failed to start the transcode pool");
             ApiError::internal("Failed to start the transcode pool")
         })?;
-        // The hardware probe spawns ffmpeg twice on its first call and is
-        // cached for the life of the process. Warming it here keeps that cost
-        // off whichever request happens to be first, rather than off none.
-        tokio::task::spawn_blocking(|| {
-            let _ = super::hw::fast_h264_encoder();
-        });
         Ok(actor)
     })
     .await

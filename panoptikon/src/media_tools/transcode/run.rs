@@ -512,8 +512,22 @@ pub(crate) fn run_encode(
                     watched.kill();
                     return;
                 }
-                if !matches!(stopped.recv_timeout(CANCEL_POLL), Err(RecvTimeoutError::Timeout)) {
-                    return;
+                match stopped.recv_timeout(CANCEL_POLL) {
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    // The reader loop is over. Usually that means the encode
+                    // finished on its own and there is nothing left to kill —
+                    // but the reader breaks on the cancel flag too, and when it
+                    // observes the flag *first* the sender is dropped before
+                    // the check above ever reads it. Returning here without
+                    // re-reading the flag would leave ffmpeg running and the
+                    // `wait()` below blocked until the encode completed, which
+                    // is the exact stall this thread exists to prevent.
+                    _ => {
+                        if cancel.load(Ordering::Relaxed) {
+                            watched.kill();
+                        }
+                        return;
+                    }
                 }
             }
         });
@@ -974,6 +988,88 @@ mod tests {
         assert!(
             (duration - expected).abs() <= 2.0 / 30.0,
             "the artifact is the trim window long: {duration} vs {expected}"
+        );
+    }
+
+    /// A source whose *encode* lasts minutes but whose *production* costs
+    /// nothing: one small clip stream-copied end to end. Building a long source
+    /// by generating one would cost the test the very seconds the assertion
+    /// below is measured in.
+    fn loop_clip(seed: &std::path::Path, output: &std::path::Path, times: u32) -> bool {
+        let status = Command::new(crate::media_tools::ffmpeg())
+            .args(["-y", "-v", "error", "-stream_loop"])
+            .arg(times.to_string())
+            .arg("-i")
+            .arg(seed)
+            .args(["-c", "copy"])
+            .arg(output)
+            .stdin(Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
+    }
+
+    /// The watchdog's raced path. The progress reader breaks on the cancel flag
+    /// too, and when it observes the flag *first* it drops the stop sender, so
+    /// the watchdog wakes on a disconnect rather than on its own poll. It must
+    /// still kill the child there: nothing else will, and the `wait()` after
+    /// the scope would then block until the encode finished on its own — for
+    /// this fixture, minutes.
+    ///
+    /// The ordering is forced rather than hoped for. The flag is set from
+    /// inside the progress callback, which runs *on the reader thread*, so the
+    /// reader's own check of it is nanoseconds away while the watchdog is
+    /// parked in a `CANCEL_POLL` wait.
+    ///
+    /// `run_encode` blocks, so it runs on a thread of its own and the assertion
+    /// is a bounded wait: a regression fails in seconds rather than hanging for
+    /// the length of the encode. Skips (never fails) where there is no ffmpeg.
+    #[test]
+    fn a_cancel_the_reader_notices_first_still_kills_ffmpeg() {
+        /// Enough copies of a 7s clip that the encode cannot plausibly finish
+        /// inside the budget below on any machine.
+        const LOOPS: u32 = 400;
+        /// Generous next to the sub-second return this is really asserting;
+        /// the point is only that it is far short of the encode.
+        const BUDGET: Duration = Duration::from_secs(15);
+
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("seed.mp4");
+        if !crate::jobs::files::write_clip(&seed, None, None) {
+            return;
+        }
+        let source = dir.path().join("long.mp4");
+        if !loop_clip(&seed, &source, LOOPS) {
+            return;
+        }
+
+        let preset = preset("clip");
+        let encoder = resolve_encoder(&preset, None);
+        let spec = EncodeJobSpec {
+            input: source,
+            output: dir.path().join("out.mp4"),
+            params: TranscodeParams::new("sha", preset, encoder, None, None),
+            source_duration_s: None,
+        };
+
+        let (report, finished) = channel();
+        std::thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            let started = std::time::Instant::now();
+            let outcome = run_encode(&spec, &cancel, &mut |_| {
+                cancel.store(true, Ordering::Relaxed);
+            });
+            let _ = report.send((outcome, started.elapsed()));
+        });
+
+        let (outcome, elapsed) = finished.recv_timeout(BUDGET).unwrap_or_else(|_| {
+            panic!("run_encode did not return within {BUDGET:?} of the cancellation: the watchdog left ffmpeg running")
+        });
+        assert!(
+            matches!(outcome, Err(EncodeError::Cancelled)),
+            "cancelling is the client's own doing, so it is a verdict on nothing: {outcome:?} after {elapsed:?}"
         );
     }
 

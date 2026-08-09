@@ -408,16 +408,14 @@ pub(crate) async fn set_outro_verdict(
     Ok(result.rows_affected())
 }
 
-/// A video whose stream codecs have never been recorded
-/// (docs/video-transcoding-design.md §6), and the one thing the dispatcher
-/// needs to decide whether a probe is worth spawning.
-pub(crate) struct PendingCodecItem {
-    pub video_tracks: Option<i64>,
-}
-
 /// The scan dispatcher's codec question: "is this content a video whose
-/// codecs nothing has recorded?" `None` means there is nothing to do — the
+/// codecs nothing has recorded?" `false` means there is nothing to do — the
 /// item is not a video, already carries a `video_codec`, or is not indexed.
+///
+/// The whole answer, deliberately: nothing about the item's stored metadata
+/// narrows it further. A video row with no video *track* still owes its
+/// `audio_codec`, which only the probe can name (see `pending_codec_work` in
+/// `jobs::files`).
 ///
 /// Scoped to the `video/` range, and phrased exactly like
 /// [`get_pending_outro_item`] — same half-open comparison rather than a LIKE
@@ -428,10 +426,10 @@ pub(crate) struct PendingCodecItem {
 pub(crate) async fn item_codec_pending(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
-) -> ApiResult<Option<PendingCodecItem>> {
-    let row: Option<(Option<i64>,)> = sqlx::query_as(
+) -> ApiResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
         r#"
-SELECT video_tracks
+SELECT 1
 FROM items
 WHERE sha256 = ?1
   AND video_codec IS NULL
@@ -445,7 +443,7 @@ WHERE sha256 = ?1
         tracing::error!(error = %err, "failed to read an item's codec state");
         ApiError::internal("Failed to query item")
     })?;
-    Ok(row.map(|(video_tracks,)| PendingCodecItem { video_tracks }))
+    Ok(row.is_some())
 }
 
 /// Stores one item's stream codecs.
@@ -457,6 +455,17 @@ WHERE sha256 = ?1
 /// `video_codec` is never null — the sentinels are what terminate the backfill,
 /// so a caller with no answer must not call this at all. `audio_codec` is
 /// legitimately `None` for a container with no audio stream.
+///
+/// The column carries no version, deliberately: a `codec_name` is a fact about
+/// the file's streams, not a detector's verdict, so there is nothing for a
+/// later build to disagree with and nothing to re-examine on a bump. What
+/// *could* change is the selection policy — which stream of several counts as
+/// the file's video track (see `content_video_stream` in `jobs::files`). If it
+/// ever does, recovery is a migration that NULLs the affected rows, which puts
+/// them straight back into the backfill population the next scan walks; the
+/// manual form of the same thing is
+/// `UPDATE items SET video_codec = NULL WHERE ...`. Adding a version column
+/// instead would buy nothing that re-entering the population does not.
 pub(crate) async fn set_item_codecs(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
@@ -950,17 +959,15 @@ VALUES
         .await
         .unwrap();
 
-        let pending = item_codec_pending(&mut dbs.index_conn, "sha_video")
-            .await
-            .unwrap()
-            .expect("an unprobed video is work");
-        assert_eq!(pending.video_tracks, Some(1));
+        assert!(
+            item_codec_pending(&mut dbs.index_conn, "sha_video")
+                .await
+                .unwrap(),
+            "an unprobed video is work"
+        );
         for sha in ["sha_audio", "sha_image", "sha_missing"] {
             assert!(
-                item_codec_pending(&mut dbs.index_conn, sha)
-                    .await
-                    .unwrap()
-                    .is_none(),
+                !item_codec_pending(&mut dbs.index_conn, sha).await.unwrap(),
                 "{sha} must never be dispatched for a codec probe"
             );
         }
@@ -973,10 +980,9 @@ VALUES
             1
         );
         assert!(
-            item_codec_pending(&mut dbs.index_conn, "sha_video")
+            !item_codec_pending(&mut dbs.index_conn, "sha_video")
                 .await
                 .unwrap()
-                .is_none()
         );
         let stored: (Option<String>, Option<String>) =
             sqlx::query_as("SELECT video_codec, audio_codec FROM items WHERE sha256 = 'sha_video'")
