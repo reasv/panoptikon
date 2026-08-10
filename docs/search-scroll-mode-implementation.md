@@ -1,10 +1,52 @@
 # Search scroll mode — implementation plan
 
-Status: PLANNED 2026-08-10, not implemented. Companion to
-`docs/search-scroll-mode-design.md` (the design is authoritative for *what*;
-this doc is authoritative for *how*, and for the contract deltas in §0
-settled during planning). Four phases on one branch, each a safe cut point.
-All work is in the `ui` submodule; **no backend changes**.
+Status: IMPLEMENTED 2026-08-10 on ui branch `scroll-mode` (12 commits +
+merge of rust-ui's file-action work; unmerged to rust-ui pending runtime
+QA). Companion to `docs/search-scroll-mode-design.md` (the design is
+authoritative for *what*; this doc is authoritative for *how*, and for the
+contract deltas in §0 settled during planning). Four phases on one branch,
+each a safe cut point. All work is in the `ui` submodule; **no backend
+changes**.
+
+## Implementation outcome (deltas settled during implementation)
+
+Adversarial review per step forced these refinements beyond §0; the code's
+comments are authoritative for each:
+
+1. **`ResultsSource` grew**: `getBlock` (chunk-wise scans), `errorAt` +
+   `retryRange` (terminal chunk-error recovery; the gallery renders an
+   error frame with Retry), `queryIdentity` (the supersession-gate
+   comparand — partsKey in scroll mode, the results array in pages mode,
+   so the gallery's turn gates keep byte-identical pages-mode semantics
+   while unrelated chunk landings can't cancel a pending advance), and a
+   `rowsIdentity` whose value derives from row-array references via a
+   WeakMap (never timestamps — structural sharing makes no-op refetches
+   identity-stable). `fetchItem` is contractually NON-observing.
+2. **The chunk store freezes all four request fields together**:
+   `useSearch`'s committed value widened to full `SearchRequestParts`, and
+   the wanted-set tag derives from `buildChunkRequest(parts, 0)`'s hash so
+   a `page_size` relabel tears down nothing. Enabled contract:
+   `searchEnabled && !pinboardMaximized` — deliberately NOT
+   `queryEnabled`, so scroll browsing continues on the committed set
+   during withheld edits.
+3. **Highlight lattice**: the live page indicator derives from the LAST
+   item of the top visible row (clamped; last-row-visible → last item),
+   while the `top` URL anchor keeps its first-item contract — two answers
+   to two questions. `countSettled` (count freshness mirrors
+   `resultsAreStale`) gates every anchor decision.
+4. **The anchor follows the position in the gallery**: manual navigation
+   (arrows, filmstrip clicks) writes the scroll anchor alongside `gi` in
+   scroll mode, exactly as the auto-advance chain does — that is what
+   makes close-restores-at-the-item hold across any distance.
+5. **Save-as-default is one combined action** ("Save current view as
+   default" in the toggle's caret menu, writing `vm` + `page_size` from
+   the sanitized stored result) — supersedes the separate page-size-
+   control affordance this plan listed; `pageSize.tsx` untouched.
+6. **Known limits, accepted**: browser element-height cap bounds the
+   addressable scroll space (~a few hundred thousand items; the scrubber
+   still reaches everything); a terminally-errored chunk renders
+   skeletons in the grid with no retry affordance (the gallery has one);
+   count keeps `keepPreviousData` across re-searches by design.
 
 ## 0. Contract deltas settled during planning
 
