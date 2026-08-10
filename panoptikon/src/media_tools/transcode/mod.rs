@@ -6,6 +6,7 @@
 //! an encoder chosen by the hardware probe ([`hw`]).
 
 pub(crate) mod cache;
+pub(crate) mod compose;
 pub(crate) mod hw;
 pub(crate) mod pool;
 pub(crate) mod presets;

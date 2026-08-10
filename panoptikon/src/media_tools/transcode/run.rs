@@ -29,6 +29,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use super::TranscodeParams;
+use super::compose::{ComposeParams, ComposeSource, FilterPlan};
 use super::presets::{Channel, Container, QualityMode, ResolvedPreset};
 use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_process_group_pid};
 
@@ -66,6 +67,50 @@ pub(crate) struct EncodeJobSpec {
     /// Source duration, for turning `out_time` into a fraction. `None` only
     /// costs the progress percentage — never the encode.
     pub(crate) source_duration_s: Option<f64>,
+}
+
+/// The composition equivalent: N inputs and one filtergraph instead of one
+/// input and a preset's filters.
+///
+/// The graph itself is *not* carried here. It depends on each source's real
+/// stream geometry, which costs an ffprobe per input to learn — a price this
+/// keeps off the request path (and off every cache hit) by paying it once, in
+/// [`run_compose`], after the job has actually been dispatched.
+#[derive(Debug, Clone)]
+pub(crate) struct ComposeJobSpec {
+    /// Source paths, parallel to `params.doc.items`.
+    pub(crate) sources: Vec<PathBuf>,
+    pub(crate) output: PathBuf,
+    pub(crate) params: ComposeParams,
+}
+
+/// One dispatched job, of either kind. The pool treats the two identically —
+/// same queue, same cancellation, same progress channel — so the distinction
+/// lives here rather than in the actor.
+#[derive(Debug, Clone)]
+pub(crate) enum EncodeTask {
+    Single(Box<EncodeJobSpec>),
+    Compose(Box<ComposeJobSpec>),
+}
+
+/// What an *injected* runner can see of a task without knowing its kind. The
+/// real runner matches on the enum instead, so these exist only for the pool's
+/// actor tests.
+#[cfg(test)]
+impl EncodeTask {
+    pub(crate) fn output(&self) -> &std::path::Path {
+        match self {
+            EncodeTask::Single(spec) => &spec.output,
+            EncodeTask::Compose(spec) => &spec.output,
+        }
+    }
+
+    pub(crate) fn cache_key(&self) -> String {
+        match self {
+            EncodeTask::Single(spec) => spec.params.cache_key(),
+            EncodeTask::Compose(spec) => spec.params.cache_key(),
+        }
+    }
 }
 
 /// Why an encode produced no artifact. The variants map to different
@@ -134,7 +179,7 @@ fn is_h264(vcodec: &str) -> bool {
 /// rejects `end <= start`), and is clamped rather than trusted: integer
 /// division and remainder would print `-1.-23`, which ffmpeg parses as a seek
 /// to somewhere else entirely instead of failing.
-fn seconds(cs: i64) -> String {
+pub(super) fn seconds(cs: i64) -> String {
     let cs = cs.max(0);
     format!("{}.{:02}", cs / 100, cs % 100)
 }
@@ -209,6 +254,48 @@ pub(crate) fn build_args(spec: &EncodeJobSpec) -> Vec<OsString> {
     args.push(OsString::from("-pix_fmt"));
     args.push(OsString::from("yuv420p"));
     args.push(OsString::from("-y"));
+    args.push(spec.output.clone().into_os_string());
+    args
+}
+
+/// The argument vector for a composition: the plan's inputs and graph, then
+/// the same encoder settings a single-file job of that preset would get.
+///
+/// Everything specific to *this* composition is in the plan; everything
+/// specific to the preset is shared with [`build_args`], which is what keeps a
+/// mosaic and a clip of the same preset from drifting apart in quality.
+pub(crate) fn build_compose_args(spec: &ComposeJobSpec, plan: &FilterPlan) -> Vec<OsString> {
+    let preset = &spec.params.preset;
+    let mut args: Vec<OsString> = Vec::new();
+    macro_rules! push {
+        ($($value:expr),+ $(,)?) => {{ $(args.push(OsString::from($value));)+ }};
+    }
+
+    push!("-nostdin", "-hide_banner", "-nostats", "-v", "error");
+    for input in &plan.inputs {
+        for arg in &input.args {
+            args.push(OsString::from(arg));
+        }
+        push!("-i");
+        args.push(input.path.clone().into_os_string());
+    }
+    push!("-progress", "pipe:1", "-filter_complex", &plan.filter_complex);
+    for arg in &plan.output_args {
+        args.push(OsString::from(arg));
+    }
+
+    for arg in video_args(&spec.params.encoder, preset.quality) {
+        args.push(arg);
+    }
+    // `-an` is already in the plan's output args when the graph produced no
+    // audio, so an audio codec here would contradict it.
+    if plan.has_audio && let Some(acodec) = &preset.acodec {
+        push!("-c:a", acodec.as_str());
+    }
+    if preset.container == Container::Mp4 {
+        push!("-movflags", "+faststart", "-avoid_negative_ts", "make_zero");
+    }
+    push!("-y");
     args.push(spec.output.clone().into_os_string());
     args
 }
@@ -458,7 +545,70 @@ impl Drop for EncodeChild {
     }
 }
 
-/// Runs one encode to completion, blocking the calling thread.
+/// Runs one single-file encode to completion, blocking the calling thread.
+pub(crate) fn run_encode(
+    spec: &EncodeJobSpec,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(Option<f32>),
+) -> Result<(), EncodeError> {
+    run_ffmpeg(
+        &build_args(spec),
+        expected_output_seconds(spec),
+        cancel,
+        on_progress,
+    )
+}
+
+/// One composition, end to end: probe the inputs, build the graph from what
+/// they turned out to be, and run it.
+///
+/// The probe is where a source rectangle is clamped to the stream it crops and
+/// where an item marked audible loses its audio if the file has none — both of
+/// which would otherwise fail the whole graph rather than one item. It runs
+/// here, on the job's own thread, so a cache hit never pays for it.
+pub(crate) fn run_compose(
+    spec: &ComposeJobSpec,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(Option<f32>),
+) -> Result<(), EncodeError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(EncodeError::Cancelled);
+    }
+    let sources: Vec<ComposeSource> = spec
+        .sources
+        .iter()
+        .map(|path| ComposeSource {
+            path: path.clone(),
+            // A cancellation mid-probe skips the rest: the run below refuses
+            // to start anyway, and each probe is its own child process.
+            probe: (!cancel.load(Ordering::Relaxed))
+                .then(|| super::compose::probe_source(path))
+                .flatten(),
+        })
+        .collect();
+    let plan = super::compose::build_filtergraph(&spec.params, &sources);
+    run_ffmpeg(
+        &build_compose_args(spec, &plan),
+        Some(spec.params.target_seconds()),
+        cancel,
+        on_progress,
+    )
+}
+
+/// The pool's entry point: whichever kind of job was dispatched.
+pub(crate) fn run_task(
+    task: &EncodeTask,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(Option<f32>),
+) -> Result<(), EncodeError> {
+    match task {
+        EncodeTask::Single(spec) => run_encode(spec, cancel, on_progress),
+        EncodeTask::Compose(spec) => run_compose(spec, cancel, on_progress),
+    }
+}
+
+/// One ffmpeg child, whatever produced its argument vector, run to completion
+/// on the calling thread. `expected_seconds` is the progress denominator.
 ///
 /// `on_progress` is called at ffmpeg's own update rate (roughly twice a
 /// second); throttling for consumers is the caller's business.
@@ -470,8 +620,9 @@ impl Drop for EncodeChild {
 /// blocked on a pipe forever and the pool slot held with it. The watchdog is
 /// what turns the flag into an EOF, and it is joined on every exit path, so
 /// nothing here relies on the runtime being torn down to reap a child.
-pub(crate) fn run_encode(
-    spec: &EncodeJobSpec,
+fn run_ffmpeg(
+    args: &[OsString],
+    expected_seconds: Option<f64>,
     cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(Option<f32>),
 ) -> Result<(), EncodeError> {
@@ -479,10 +630,9 @@ pub(crate) fn run_encode(
         return Err(EncodeError::Cancelled);
     }
 
-    let args = build_args(spec);
     let mut command = Command::new(crate::media_tools::ffmpeg());
     command
-        .args(&args)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -499,7 +649,7 @@ pub(crate) fn run_encode(
         stderr: Some(drain),
     };
 
-    let mut progress = ProgressReader::new(expected_output_seconds(spec));
+    let mut progress = ProgressReader::new(expected_seconds);
     let mut reader = BufReader::new(stdout);
     // Scoped so the watchdog can borrow `cancel`, and so the scope's join is
     // what gives the child back to this thread before it is waited on.
@@ -859,6 +1009,88 @@ mod tests {
         // artifact, not a failure.
         assert_eq!(mp4[at(&mp4, "-map") + 1], "0:v:0");
         assert!(mp4.contains(&"0:a:0?".to_string()));
+    }
+
+    /// The composition command line, pinned. Its inputs and graph come from
+    /// the plan; everything after them is the *same* encoder settings a
+    /// single-file job of that preset would get, which is what keeps a mosaic
+    /// and a clip of one preset from drifting apart in quality.
+    #[test]
+    fn the_composition_command_line_is_pinned() {
+        use crate::media_tools::transcode::compose::{FilterPlan, InputSpec};
+
+        let preset = preset("mosaic-mp4");
+        let encoder = resolve_encoder(&preset, None);
+        let doc = crate::media_tools::transcode::compose::ResolvedCompose {
+            canvas_w: 640,
+            canvas_h: 480,
+            background: "0x101820".to_string(),
+            fps: 25,
+            target_cs: 800,
+            items: Vec::new(),
+        };
+        let spec = ComposeJobSpec {
+            sources: vec![PathBuf::from("a.mp4")],
+            output: PathBuf::from("out.tmp"),
+            params: crate::media_tools::transcode::compose::ComposeParams::new(
+                doc, preset, encoder,
+            ),
+        };
+        let plan = FilterPlan {
+            inputs: vec![InputSpec {
+                args: vec!["-ss".to_string(), "2.00".to_string()],
+                path: PathBuf::from("a.mp4"),
+            }],
+            filter_complex: "[0:v:0]null[vout]".to_string(),
+            output_args: vec![
+                "-map".to_string(),
+                "[vout]".to_string(),
+                "-an".to_string(),
+                "-sn".to_string(),
+                "-dn".to_string(),
+                "-pix_fmt".to_string(),
+                "yuv420p".to_string(),
+            ],
+            has_audio: false,
+        };
+        let args: Vec<String> = build_compose_args(&spec, &plan)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-nostdin", "-hide_banner", "-nostats", "-v", "error",
+                "-ss", "2.00",
+                "-i", "a.mp4",
+                "-progress", "pipe:1",
+                "-filter_complex", "[0:v:0]null[vout]",
+                "-map", "[vout]", "-an", "-sn", "-dn", "-pix_fmt", "yuv420p",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-movflags", "+faststart",
+                "-avoid_negative_ts", "make_zero",
+                "-y", "out.tmp",
+            ]
+        );
+
+        // A graph that produced audio gets the preset's codec; the `-an` above
+        // and a `-c:a` would contradict each other, so exactly one appears.
+        let plan = FilterPlan {
+            output_args: vec![
+                "-map".to_string(),
+                "[vout]".to_string(),
+                "-map".to_string(),
+                "[aout]".to_string(),
+            ],
+            has_audio: true,
+            ..plan
+        };
+        let args: Vec<String> = build_compose_args(&spec, &plan)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[at(&args, "-c:a") + 1], "aac");
+        assert!(!args.contains(&"-an".to_string()));
     }
 
     /// A bitrate profile reaches every encoder family as a bitrate, and the

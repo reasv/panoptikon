@@ -550,6 +550,7 @@ async fn async_main() -> anyhow::Result<()> {
                     .put(api::search_cache::resize_result_cache),
             )
             .route("/api/video/transcode", post(api::video::video_transcode))
+            .route("/api/video/compose", post(api::video::video_compose))
             .route("/api/video/artifact", get(api::video::video_artifact))
             .route(
                 "/api/video/jobs/{job_id}",

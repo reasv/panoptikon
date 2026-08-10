@@ -5433,6 +5433,80 @@
         }
       }
     },
+    "/api/video/compose": {
+      "post": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Create or join a composition job",
+        "description": "Renders a composition document — a canvas, a frame rate, an output length policy and a list of placed items — into one animated artifact. A sibling of `/api/video/transcode` rather than a variant of it: a composition is addressed by the hash of its document, not by an item, and is strictly heavier work, so a policy can allow one and deny the other. The response envelope, the jobs/SSE routes and the artifact route are identical to the single-file path; a single-item save is simply a composition with one item.",
+        "operationId": "video_compose",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComposeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The composition was already cached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeSubmitResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A job was created or joined",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeSubmitResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "An item is not in this database, or has no readable file"
+          },
+          "422": {
+            "description": "Unknown preset, or a document the composition limits refuse: too many items, a canvas that is odd/too large/taller than the preset renders, a destination rectangle outside the canvas or on an odd pixel, a span whose end is not after its start, an unusable frame rate or length cap, or loop buffers over `max_mosaic_loop_mb` (the message carries the estimate)"
+          }
+        }
+      }
+    },
     "/api/video/jobs/{job_id}": {
       "get": {
         "tags": [
@@ -5821,6 +5895,27 @@
           }
         }
       },
+      "Canvas": {
+        "type": "object",
+        "required": [
+          "w",
+          "h"
+        ],
+        "properties": {
+          "background": {
+            "type": "string",
+            "description": "`#RRGGBB`, `#RRGGBBAA` or the `0x` spelling of either. Normalized\nbefore it reaches a filtergraph, which is not decoration: the value is\ninterpolated into a filter argument, where an unvalidated string could\nspell further filters."
+          },
+          "h": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "w": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "Channel": {
         "type": "string",
         "description": "Which encoder family a preset draws from: `Quality` is software x264 at a\ndecent CRF, `Fast` is the validated hardware encoder when there is one\n(design §5 — hardware encoders are meaningfully worse per bit, so export\nquality never rides on them).",
@@ -5968,6 +6063,123 @@
           },
           "sql": {
             "type": "string"
+          }
+        }
+      },
+      "ComposeItem": {
+        "type": "object",
+        "required": [
+          "sha256",
+          "src",
+          "dest",
+          "time"
+        ],
+        "properties": {
+          "audio": {
+            "type": "boolean",
+            "description": "Whether this item's audio is mixed in. The client sets it to\n`playing && !muted`; it is forced off for a still, an image, or a\ncontainer that carries no audio at all."
+          },
+          "dest": {
+            "$ref": "#/components/schemas/Rect"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Item content hash; resolved against the request's index database."
+          },
+          "src": {
+            "$ref": "#/components/schemas/Rect"
+          },
+          "time": {
+            "$ref": "#/components/schemas/ItemTime"
+          },
+          "transform": {
+            "$ref": "#/components/schemas/Transform"
+          }
+        }
+      },
+      "ComposeLength": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The longest span plays exactly once; everything shorter loops to fill.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "longest_loop_once"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A fixed length, whatever the items are.",
+            "required": [
+              "seconds",
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "cap"
+                ]
+              },
+              "seconds": {
+                "type": "number",
+                "format": "double"
+              }
+            }
+          }
+        ],
+        "description": "How long the output runs."
+      },
+      "ComposeOutput": {
+        "type": "object",
+        "required": [
+          "preset",
+          "length"
+        ],
+        "properties": {
+          "length": {
+            "$ref": "#/components/schemas/ComposeLength"
+          },
+          "preset": {
+            "type": "string",
+            "description": "Preset id from `GET /api/video/presets`."
+          }
+        }
+      },
+      "ComposeRequest": {
+        "type": "object",
+        "description": "The composition document as it arrives.",
+        "required": [
+          "canvas",
+          "fps",
+          "output",
+          "items"
+        ],
+        "properties": {
+          "canvas": {
+            "$ref": "#/components/schemas/Canvas"
+          },
+          "fps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Output frame rate, 1-60, then capped by the preset.",
+            "minimum": 0
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ComposeItem"
+            }
+          },
+          "output": {
+            "$ref": "#/components/schemas/ComposeOutput"
           }
         }
       },
@@ -7365,6 +7577,71 @@
             "format": "int64"
           }
         }
+      },
+      "ItemTime": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A playing range. `end_cs` is **required**: the client always knows the\nduration, and with both bounds the target length is arithmetic rather\nthan a probe of every input before the job can even be keyed.",
+            "required": [
+              "start_cs",
+              "end_cs",
+              "kind"
+            ],
+            "properties": {
+              "end_cs": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "span"
+                ]
+              },
+              "start_cs": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "One frame of a video, held for the whole output.",
+            "required": [
+              "at_cs",
+              "kind"
+            ],
+            "properties": {
+              "at_cs": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "still"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A still image file, held for the whole output.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "image"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What an item is showing. Replaces the design's separate \"playing\" and\n\"muted\" flags (§0.5): a span *is* playing, a still and an image are\nstopped, so no combination of fields can contradict another."
       },
       "Items": {
         "type": "object",
@@ -9564,6 +9841,34 @@
           }
         }
       },
+      "Rect": {
+        "type": "object",
+        "description": "A rectangle. Source rectangles are in the source's own pixels *before* its\ndisplay orientation is applied; destination rectangles are in output pixels\non the canvas.",
+        "required": [
+          "x",
+          "y",
+          "w",
+          "h"
+        ],
+        "properties": {
+          "h": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "w": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "x": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "y": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "RenamePinboardRequest": {
         "type": "object",
         "properties": {
@@ -11380,6 +11685,21 @@
           "outcome": {
             "type": "string",
             "description": "`hit` | `created` | `joined` | `known_failure`."
+          }
+        }
+      },
+      "Transform": {
+        "type": "object",
+        "description": "The display transform of the dihedral group of order 8: `flip_h` applied\nafter `quarter_turns` clockwise rotations. The same decomposition the\npinboard stores per pin, passed through verbatim.",
+        "properties": {
+          "flip_h": {
+            "type": "boolean"
+          },
+          "quarter_turns": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0-3 clockwise quarter turns.",
+            "minimum": 0
           }
         }
       },

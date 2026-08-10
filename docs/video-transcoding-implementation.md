@@ -537,6 +537,47 @@ Order: S1→S2→S3→S4 → U1→U2(+U6)→U3→U4 / U5 → U7.
 
 ### Server
 
+> **Implemented 2026-08-10** (C1-C4). Deltas settled while building, which
+> the text below already reflects:
+>
+> 1. **`index_db` is the usual query parameter**, not a body field: the
+>    `DbConnection<ReadOnlyNoUserData>` extractor is what selects the
+>    database on every other route, and a body field it ignored would be a
+>    lie in the schema.
+> 2. **Canvas caps are code constants** (`MIN_CANVAS_SIDE` 16,
+>    `MAX_CANVAS_SIDE` 4096, `MAX_CANVAS_AREA` 3840×2160) — there is no
+>    `max_canvas_side` config key, and §0.4's presets envelope was frozen
+>    without one. They bound client-authored geometry, which costs the same
+>    on every deployment.
+> 3. **Destination rectangles must be even** in position *and* size
+>    (`dest_not_even`), for the same reason the canvas must be: `overlay`
+>    refuses odd offsets in 4:2:0, and an odd-sized item has no chroma
+>    plane to place. The UI half (C6) must round its solved rectangles.
+> 4. **A preset's `max_height` refuses an over-tall canvas**
+>    (`canvas_over_preset_height`) rather than silently rescaling it: a
+>    rescale would move every rectangle the client placed, which is exactly
+>    the pixel-for-pixel guarantee C5 exists to keep. (The graph still
+>    carries the preset's `scale=-2:'min(ih,H)'` for any preset whose cap a
+>    document slips past.)
+> 5. **A stills-only document resolves to a 1 s target**
+>    (`STILLS_ONLY_TARGET_CS`) under `longest_loop_once` — a frozen mosaic
+>    is a legitimate thing to ask for, and the alternative is a
+>    zero-length file or a rejection.
+> 6. **The graph is built at job start, not at admission.** It needs each
+>    source's real stream geometry, which is an ffprobe per input; paying
+>    that on the request path would charge it to every cache hit too.
+>    `resolve_compose` (admission) is therefore pure arithmetic over the
+>    document, and `build_filtergraph` (dispatch) is where the source rect
+>    is clamped, a cover-art stream is skipped, and an item marked audible
+>    whose file has no audio track loses its chain rather than failing the
+>    whole graph.
+> 7. **Rejection reasons are named in code and logged**, not sent: an
+>    `ApiError` carries only `detail`, and the detail is the message the
+>    user acts on (the memory guard's estimate above all).
+> 8. Artifact naming: `mosaic-{n}items.<ext>` on the `ArtifactRef`,
+>    `mosaic.<ext>` where only the key is known (the serving path), since a
+>    composition key records no item count.
+
 **C1. `media_tools/transcode/compose.rs`** — document + validation.
 Request: `{index_db?, canvas{w,h,background}, fps, output{preset,
 length: longest_loop_once | cap{seconds}}, items[]}`; item:
@@ -579,17 +620,52 @@ item order → `format=yuv420p` (mp4/webm) / `yuva420p` (webp). Audio
 `asetpts, [aloop,] atrim=end=target, aresample=async=1` →
 `amix=inputs=M:duration=longest:dropout_transition=0` (default
 normalization on; revisit with `alimiter` if too quiet). Single-item save
-emits the simplified no-overlay graph (canvas = crop size, preset-capped).
+emits the simplified no-overlay graph, and only when the item covers the
+whole canvas.
+
+Worked 2-item example — 640×480 canvas on `#101820` at 25 fps,
+`longest_loop_once`; item 0 a rotated audible span (2.00-10.00 s of a
+1080×1920 source, into 320×480 at the origin), item 1 a frozen frame
+(a 400×300 crop at 100,50 into 320×240 at 320,120). It resolves to an
+800 cs target and this graph, which is pinned by
+`the_worked_example_builds_the_documented_filtergraph`:
+
+```
+[0:v:0]setpts=PTS-STARTPTS,crop=1080:1920:0:0,transpose=1,scale=320:480:flags=lanczos,fps=25,trim=end=8.00,setpts=PTS-STARTPTS[v0];
+[0:a:0]asetpts=PTS-STARTPTS,atrim=end=8.00,aresample=async=1[a0];
+[1:v:0]trim=end_frame=1,crop=400:300:100:50,scale=320:240:flags=lanczos,loop=-1:size=1,setpts=N/(25*TB),trim=end=8.00[v1];
+color=c=0x101820:s=640x480:r=25:d=8.00[base];
+[base][v0]overlay=0:0[o0];[o0][v1]overlay=320:120,format=yuv420p[vout];
+[a0]amix=inputs=1:duration=longest:dropout_transition=0[aout]
+```
+
+(one chain per line for reading; the real string has no newlines. Stream
+labels are `[i:v:n]` rather than `[i:v]`: `n` is the probe's content video
+stream, so a file whose first video stream is cover art composes the
+other one.)
 
 **C3. Fixture e2e** (gated on `ffmpeg_available()`): two lavfi clips →
-2-item compose (span cropped+rotated + still); ffprobe dims/duration,
-pixel-assert colors inside dest rects and background outside (the
-`corner_is_card` precedent); repeat webp (`nb_frames > 1`) and webm.
+2-item compose (span cropped+rotated + still); dims/duration, pixel-assert
+colors inside dest rects and background outside (the `corner_is_card`
+precedent); repeated for webp and webm. Two toolchain facts the fixture
+had to be built around: libwebp's animation encoder **collapses a run of
+identical frames into one still image**, so the span fixture alternates
+two shades rather than being flat; and ffprobe's `webp_pipe` demuxer
+cannot read an animated WebP at all (`image data not found`, zero-sized
+stream), so the WebP assertions read the RIFF chunks directly (`VP8X`
+canvas size, `ANMF` count) and decode the first frame with the `image`
+crate.
 
 **C4. Route + pool**: `POST /api/video/compose` (join/dedup by doc hash,
-same job envelope); heavy-compose exclusivity per Phase 1 job weights;
+same job envelope); heavy-compose exclusivity per Phase 1 job weights
+(`items > compose_light_threshold` → `JobWeight::Exclusive`);
 `artifact?key=` already exists (§0.2); no separate capability (the
-`/api/video/` POST rules cover it).
+`/api/video/` POST rules cover it), and the shipped `restricted_demo`
+rulesets grant only the two GETs, so they inherit nothing. The pool's
+`SubmitRequest` carries a `JobRequest::{Single, Compose}` and `run.rs` an
+`EncodeTask` of the same two shapes: queue, dedup map, cancellation,
+progress and publish are shared code, and the single-file argument vector
+is byte-identical to Phase 1's (its pinned argv test is unchanged).
 
 ### UI
 

@@ -27,7 +27,9 @@ use uuid::Uuid;
 
 use super::TranscodeParams;
 use super::cache::{CachedArtifact, NewArtifact, TranscodeCache};
-use super::run::{self, EncodeError, EncodeJobSpec};
+use super::compose::{self, ComposeParams};
+use super::presets::ResolvedPreset;
+use super::run::{self, ComposeJobSpec, EncodeError, EncodeJobSpec, EncodeTask};
 use crate::api_error::ApiError;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -127,21 +129,125 @@ pub(crate) enum JobWeight {
     Exclusive,
 }
 
+/// What is to be encoded: one file with a preset, or a composition of many.
+///
+/// Everything the pool does with a job — key it, dedup it, name its download,
+/// publish its artifact — goes through the accessors below, so the two kinds
+/// share the queue, the event channels and the cache without the actor ever
+/// matching on them.
+#[derive(Debug, Clone)]
+pub(crate) enum JobRequest {
+    Single {
+        params: Box<TranscodeParams>,
+        source_path: PathBuf,
+        source_duration_s: Option<f64>,
+    },
+    Compose {
+        params: Box<ComposeParams>,
+        /// Source paths, parallel to the document's items.
+        sources: Vec<PathBuf>,
+    },
+}
+
+impl JobRequest {
+    pub(crate) fn cache_key(&self) -> String {
+        match self {
+            JobRequest::Single { params, .. } => params.cache_key(),
+            JobRequest::Compose { params, .. } => params.cache_key(),
+        }
+    }
+
+    fn params_hash(&self) -> String {
+        match self {
+            JobRequest::Single { params, .. } => params.params_hash(),
+            JobRequest::Compose { params, .. } => params.params_hash(),
+        }
+    }
+
+    /// The `source_sha256` column of the artifact row. A composition has as
+    /// many sources as it has items and no one of them names it, so it records
+    /// the same sentinel its key is prefixed with.
+    fn source_sha256(&self) -> String {
+        match self {
+            JobRequest::Single { params, .. } => params.source_sha256.clone(),
+            JobRequest::Compose { .. } => compose::COMPOSE_KEY_PREFIX.to_string(),
+        }
+    }
+
+    fn preset(&self) -> &ResolvedPreset {
+        match self {
+            JobRequest::Single { params, .. } => &params.preset,
+            JobRequest::Compose { params, .. } => &params.preset,
+        }
+    }
+
+    fn transcoder_version(&self) -> i64 {
+        match self {
+            JobRequest::Single { params, .. } => params.transcoder_version,
+            JobRequest::Compose { params, .. } => params.transcoder_version,
+        }
+    }
+
+    fn artifact_file_name(&self) -> String {
+        match self {
+            JobRequest::Single { params, .. } => params.artifact_file_name(),
+            JobRequest::Compose { params, .. } => params.artifact_file_name(),
+        }
+    }
+
+    fn mime_type(&self) -> &'static str {
+        match self {
+            JobRequest::Single { params, .. } => params.mime_type(),
+            JobRequest::Compose { params, .. } => params.mime_type(),
+        }
+    }
+
+    /// The name a download of this job's artifact carries. A composition has
+    /// no source stem to build one from, so its scheme is fixed.
+    fn download_file_name(&self, stem: Option<&str>) -> String {
+        match self {
+            JobRequest::Single { params, .. } => params.download_file_name(stem),
+            JobRequest::Compose { params, .. } => params.download_file_name(),
+        }
+    }
+
+    /// The dispatched form, once the cache has named the temporary to write.
+    fn into_task(self, output: PathBuf) -> EncodeTask {
+        match self {
+            JobRequest::Single {
+                params,
+                source_path,
+                source_duration_s,
+            } => EncodeTask::Single(Box::new(EncodeJobSpec {
+                input: source_path,
+                output,
+                params: *params,
+                source_duration_s,
+            })),
+            JobRequest::Compose { params, sources } => {
+                EncodeTask::Compose(Box::new(ComposeJobSpec {
+                    sources,
+                    output,
+                    params: *params,
+                }))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SubmitRequest {
-    pub(crate) params: TranscodeParams,
-    pub(crate) source_path: PathBuf,
-    pub(crate) source_duration_s: Option<f64>,
+    pub(crate) job: JobRequest,
     pub(crate) weight: JobWeight,
     /// Stem the download name is built from, decided by the caller.
     ///
-    /// Deliberately *not* derived from [`Self::source_path`]: that path is
-    /// whichever of the item's files turned out to be readable, so naming a
-    /// download after it would make the name depend on which copy of the same
-    /// content answered — including on whether a network mount happened to be
-    /// up. The API layer passes the item's first file's stem for both this and
-    /// the artifact route's `Content-Disposition`, so one item names its
-    /// downloads one way.
+    /// Deliberately *not* derived from the source path: that path is whichever
+    /// of the item's files turned out to be readable, so naming a download
+    /// after it would make the name depend on which copy of the same content
+    /// answered — including on whether a network mount happened to be up. The
+    /// API layer passes the item's first file's stem for both this and the
+    /// artifact route's `Content-Disposition`, so one item names its downloads
+    /// one way. Compositions ignore it: they have no single source.
     pub(crate) download_stem: Option<String>,
 }
 
@@ -171,7 +277,7 @@ impl SubmitOutcome {
 /// dedup, cancellation, retention) is testable without a toolchain.
 pub(crate) type EncodeRunner = Arc<
     dyn Fn(
-            EncodeJobSpec,
+            EncodeTask,
             Arc<AtomicBool>,
             Box<dyn FnMut(Option<f32>) + Send>,
         ) -> Result<(), EncodeError>
@@ -180,8 +286,8 @@ pub(crate) type EncodeRunner = Arc<
 >;
 
 pub(crate) fn ffmpeg_runner() -> EncodeRunner {
-    Arc::new(|spec, cancel, mut progress| {
-        run::run_encode(&spec, &cancel, &mut |value| progress(value))
+    Arc::new(|task, cancel, mut progress| {
+        run::run_task(&task, &cancel, &mut |value| progress(value))
     })
 }
 
@@ -234,9 +340,7 @@ pub(crate) enum JobOutcome {
 /// What a queued job still needs to be dispatched. Taken (not cloned) at
 /// dispatch, so a job cannot be started twice.
 struct PendingEncode {
-    params: TranscodeParams,
-    source_path: PathBuf,
-    source_duration_s: Option<f64>,
+    job: JobRequest,
     download_stem: Option<String>,
 }
 
@@ -402,7 +506,7 @@ async fn submit_job(
     myself: &ActorRef<PoolMsg>,
     request: SubmitRequest,
 ) -> SubmitOutcome {
-    let key = request.params.cache_key();
+    let key = request.job.cache_key();
 
     // Bytes on disk answer outright (and count as a hit, which is what keeps
     // a warm rendition out of the eviction pass).
@@ -410,7 +514,7 @@ async fn submit_job(
         return SubmitOutcome::Hit(ArtifactRef::new(
             &artifact,
             request
-                .params
+                .job
                 .download_file_name(request.download_stem.as_deref()),
         ));
     }
@@ -463,9 +567,7 @@ async fn submit_job(
         cancel: Arc::new(AtomicBool::new(false)),
         events,
         pending: Some(PendingEncode {
-            params: request.params,
-            source_path: request.source_path,
-            source_duration_s: request.source_duration_s,
+            job: request.job,
             download_stem: request.download_stem,
         }),
     };
@@ -589,15 +691,10 @@ async fn run_one(
     pending: PendingEncode,
     cancel: Arc<AtomicBool>,
 ) -> JobOutcome {
-    let params = pending.params;
+    let job = pending.job;
     let download_stem = pending.download_stem;
-    let temp = cache.temp_path(params.preset.container.ext());
-    let spec = EncodeJobSpec {
-        input: pending.source_path,
-        output: temp.clone(),
-        params: params.clone(),
-        source_duration_s: pending.source_duration_s,
-    };
+    let temp = cache.temp_path(job.preset().container.ext());
+    let task = job.clone().into_task(temp.clone());
 
     let mut last_sent = Instant::now() - PROGRESS_INTERVAL;
     let progress_actor = actor.clone();
@@ -615,11 +712,10 @@ async fn run_one(
         });
     });
 
-    let encode_spec = spec.clone();
-    let encoded = tokio::task::spawn_blocking(move || runner(encode_spec, cancel, progress)).await;
+    let encoded = tokio::task::spawn_blocking(move || runner(task, cancel, progress)).await;
 
     let outcome = match encoded {
-        Ok(Ok(())) => publish(&cache, &params, download_stem.as_deref(), &temp).await,
+        Ok(Ok(())) => publish(&cache, &job, download_stem.as_deref(), &temp).await,
         Ok(Err(EncodeError::Cancelled)) => JobOutcome::Failed {
             error: "cancelled".to_string(),
             cancelled: true,
@@ -638,11 +734,11 @@ async fn run_one(
             // whether a later submit is short-circuited.
             if let Err(err) = cache
                 .record_failure(
-                    &params.cache_key(),
-                    &params.source_sha256,
-                    &params.preset.id,
+                    &job.cache_key(),
+                    &job.source_sha256(),
+                    &job.preset().id,
                     &detail,
-                    params.transcoder_version,
+                    job.transcoder_version(),
                 )
                 .await
             {
@@ -671,27 +767,28 @@ async fn run_one(
 
 async fn publish(
     cache: &TranscodeCache,
-    params: &TranscodeParams,
+    job: &JobRequest,
     download_stem: Option<&str>,
     temp: &std::path::Path,
 ) -> JobOutcome {
-    let key = params.cache_key();
-    let file_name = params.artifact_file_name();
+    let key = job.cache_key();
+    let file_name = job.artifact_file_name();
+    let source_sha256 = job.source_sha256();
     let new = NewArtifact {
         key: &key,
-        source_sha256: &params.source_sha256,
-        params_hash: &params.params_hash(),
-        preset: &params.preset.id,
+        source_sha256: &source_sha256,
+        params_hash: &job.params_hash(),
+        preset: &job.preset().id,
         file_name: &file_name,
-        mime_type: params.mime_type(),
-        transcoder_version: params.transcoder_version,
+        mime_type: job.mime_type(),
+        transcoder_version: job.transcoder_version(),
     };
     match cache.commit(new, temp).await {
         // The same name a cache hit for this key would have carried: both
         // sides build it from the caller's stem, never from the encode input.
         Ok(artifact) => JobOutcome::Done(ArtifactRef::new(
             &artifact,
-            params.download_file_name(download_stem),
+            job.download_file_name(download_stem),
         )),
         // A cache that cannot store the bytes is this machine's problem, not
         // a verdict on the file: deliberately not recorded as a failure.
@@ -956,11 +1053,14 @@ mod tests {
 
     fn request(params: TranscodeParams, weight: JobWeight) -> SubmitRequest {
         SubmitRequest {
-            params,
-            // Deliberately a different name from the stem below: the download
-            // name follows the caller's stem, never the encode input.
-            source_path: PathBuf::from("readable-copy.mp4"),
-            source_duration_s: Some(10.0),
+            job: JobRequest::Single {
+                params: Box::new(params),
+                // Deliberately a different name from the stem below: the
+                // download name follows the caller's stem, never the encode
+                // input.
+                source_path: PathBuf::from("readable-copy.mp4"),
+                source_duration_s: Some(10.0),
+            },
             weight,
             download_stem: Some("source".to_string()),
         }
@@ -968,9 +1068,9 @@ mod tests {
 
     /// A runner that writes a byte to the output and returns immediately.
     fn instant_runner() -> EncodeRunner {
-        Arc::new(|spec: EncodeJobSpec, _cancel, mut progress| {
+        Arc::new(|task: EncodeTask, _cancel, mut progress| {
             progress(Some(0.5));
-            std::fs::write(&spec.output, b"artifact").expect("write the fixture artifact");
+            std::fs::write(task.output(), b"artifact").expect("write the fixture artifact");
             Ok(())
         })
     }
@@ -1003,15 +1103,15 @@ mod tests {
         started: tokio::sync::mpsc::UnboundedSender<String>,
         gate: Arc<Gate>,
     ) -> EncodeRunner {
-        Arc::new(move |spec: EncodeJobSpec, cancel: Arc<AtomicBool>, _progress| {
-            let _ = started.send(spec.params.cache_key());
+        Arc::new(move |task: EncodeTask, cancel: Arc<AtomicBool>, _progress| {
+            let _ = started.send(task.cache_key());
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
                     return Err(EncodeError::Cancelled);
                 }
                 if gate.take() {
-                    std::fs::write(&spec.output, b"artifact").expect("write the artifact");
+                    std::fs::write(task.output(), b"artifact").expect("write the artifact");
                     return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -1334,6 +1434,90 @@ mod tests {
         pool.await_terminal(&job_id(&after)).await;
     }
 
+    /// A composition through the actor: keyed by its document, published under
+    /// the fixed composition name, and — at the weight the API gives a mosaic
+    /// past the light threshold — holding the pool while it runs.
+    #[tokio::test]
+    async fn a_composition_is_keyed_by_its_document_and_holds_the_pool() {
+        use crate::media_tools::transcode::compose::{
+            ComposeItem, ItemTime, Rect, ResolvedCompose, Transform,
+        };
+
+        let doc = ResolvedCompose {
+            canvas_w: 320,
+            canvas_h: 240,
+            background: "0x000000".to_string(),
+            fps: 25,
+            target_cs: 500,
+            items: (0..2)
+                .map(|index| ComposeItem {
+                    sha256: "a".repeat(64),
+                    src: Rect {
+                        x: 0,
+                        y: 0,
+                        w: 320,
+                        h: 240,
+                    },
+                    transform: Transform::default(),
+                    dest: Rect {
+                        x: index * 160,
+                        y: 0,
+                        w: 160,
+                        h: 240,
+                    },
+                    time: ItemTime::Image,
+                    audio: false,
+                })
+                .collect(),
+        };
+        let preset = find_preset(&builtin_presets(), "mosaic-mp4")
+            .expect("a built-in")
+            .clone();
+        let compose = SubmitRequest {
+            job: JobRequest::Compose {
+                params: Box::new(ComposeParams::new(
+                    doc,
+                    preset,
+                    ENCODER_X264_QUALITY.to_string(),
+                )),
+                sources: vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")],
+            },
+            weight: JobWeight::Exclusive,
+            // Deliberately set: a composition has no single source, so its
+            // name must ignore this.
+            download_stem: Some("some-pin".to_string()),
+        };
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(Gate::default());
+        let pool = TestPool::new(parked_runner(started_tx, Arc::clone(&gate)), 2).await;
+        let heavy = pool.submit(compose.clone()).await;
+        let light = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let key = started_rx.recv().await.expect("the composition started");
+        assert!(key.starts_with("compose-"), "{key}");
+        assert_eq!(
+            pool.snapshot(&job_id(&light)).await.unwrap().event,
+            TranscodeJobEvent::Queued { position: 1 },
+            "the composition holds the pool despite the free slot"
+        );
+
+        gate.release(2);
+        let event = pool.await_terminal(&job_id(&heavy)).await;
+        let TranscodeJobEvent::Done { artifact } = event else {
+            panic!("expected a published composition, got {event:?}");
+        };
+        assert_eq!(artifact.key, key);
+        assert_eq!(artifact.filename, "mosaic-2items.mp4");
+        assert_eq!(artifact.mime_type, "video/mp4");
+        pool.await_terminal(&job_id(&light)).await;
+
+        // The document is the identity: the same one submitted again is a hit.
+        match pool.submit(compose).await {
+            SubmitOutcome::Hit(hit) => assert_eq!(hit.key, artifact.key),
+            other => panic!("expected a cache hit, got {}", other.as_str()),
+        }
+    }
+
     /// Terminal jobs are retained for late joiners, but only so many: the ring
     /// is what keeps the map from being a leak.
     #[tokio::test]
@@ -1428,9 +1612,11 @@ mod tests {
 
         let pool = TestPool::new(ffmpeg_runner(), 1).await;
         let request = SubmitRequest {
-            params: params("playback", Some(100)),
-            source_path: source,
-            source_duration_s: Some(7.0),
+            job: JobRequest::Single {
+                params: Box::new(params("playback", Some(100))),
+                source_path: source,
+                source_duration_s: Some(7.0),
+            },
             weight: JobWeight::Light,
             download_stem: Some("source".to_string()),
         };
@@ -1443,7 +1629,7 @@ mod tests {
         };
         assert_eq!(artifact.mime_type, "video/mp4");
         assert!(artifact.size_bytes > 0);
-        assert_eq!(artifact.key, request.params.cache_key());
+        assert_eq!(artifact.key, request.job.cache_key());
 
         match pool.submit(request).await {
             SubmitOutcome::Hit(hit) => assert_eq!(hit.key, artifact.key),

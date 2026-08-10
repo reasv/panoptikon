@@ -35,8 +35,11 @@ use crate::db::files::get_item_content_end_ms;
 use crate::db::items::{FileRecord, ItemIdentifierType, ItemRecord, get_item_metadata_unchecked};
 use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::media_tools::transcode::cache::{CacheStats, ResizeError};
+use crate::media_tools::transcode::compose::{
+    self, ComposeLimits, ComposeParams, ComposeRequest, ResolvedCompose,
+};
 use crate::media_tools::transcode::pool::{
-    self, ArtifactRef, JobWeight, SubmitOutcome, SubmitRequest, TranscodeJobSnapshot,
+    self, ArtifactRef, JobRequest, JobWeight, SubmitOutcome, SubmitRequest, TranscodeJobSnapshot,
 };
 use crate::media_tools::transcode::presets::{
     Channel, Container, ResolvedPreset, Surface, find_preset, resolve_presets,
@@ -315,9 +318,11 @@ pub async fn video_transcode(
 
     let params = resolve_params(source.item.sha256.clone(), preset, body.start_cs, end_cs).await?;
     let outcome = pool::submit(SubmitRequest {
-        params,
-        source_path: source.file.path.clone().into(),
-        source_duration_s: source.item.duration,
+        job: JobRequest::Single {
+            params: Box::new(params),
+            source_path: source.file.path.clone().into(),
+            source_duration_s: source.item.duration,
+        },
         // Single-file jobs never need the pool to themselves; compositions do.
         weight: JobWeight::Light,
         // Not the encode input's stem: see [`download_stem`].
@@ -325,6 +330,13 @@ pub async fn video_transcode(
     })
     .await?;
 
+    Ok(submit_response(outcome))
+}
+
+/// The response every submit produces: 200 for bytes that already existed,
+/// 202 for a job to follow. Shared by both routes, so `transcode` and
+/// `compose` are one envelope to a client (§0.1).
+fn submit_response(outcome: SubmitOutcome) -> Response<Body> {
     let (status, body) = match outcome {
         SubmitOutcome::Hit(artifact) => (
             StatusCode::OK,
@@ -348,7 +360,67 @@ pub async fn video_transcode(
             },
         ),
     };
-    Ok((status, Json(body)).into_response())
+    (status, Json(body)).into_response()
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "video_compose",
+    path = "/api/video/compose",
+    tag = "video",
+    summary = "Create or join a composition job",
+    description = "Renders a composition document — a canvas, a frame rate, an output length \
+        policy and a list of placed items — into one animated artifact. A sibling of \
+        `/api/video/transcode` rather than a variant of it: a composition is addressed by the \
+        hash of its document, not by an item, and is strictly heavier work, so a policy can \
+        allow one and deny the other. The response envelope, the jobs/SSE routes and the \
+        artifact route are identical to the single-file path; a single-item save is simply a \
+        composition with one item.",
+    params(DbQueryParams),
+    request_body = ComposeRequest,
+    responses(
+        (status = 200, description = "The composition was already cached", body = TranscodeSubmitResponse),
+        (status = 202, description = "A job was created or joined", body = TranscodeSubmitResponse),
+        (status = 404, description = "An item is not in this database, or has no readable file"),
+        (status = 422, description = "Unknown preset, or a document the composition limits \
+            refuse: too many items, a canvas that is odd/too large/taller than the preset \
+            renders, a destination rectangle outside the canvas or on an odd pixel, a span \
+            whose end is not after its start, an unusable frame rate or length cap, or loop \
+            buffers over `max_mosaic_loop_mb` (the message carries the estimate)")
+    )
+)]
+pub async fn video_compose(
+    State(state): State<Arc<ProxyState>>,
+    axum::Extension(context): axum::Extension<PolicyContext>,
+    mut db: DbConnection<ReadOnlyNoUserData>,
+    Json(body): Json<ComposeRequest>,
+) -> ApiResult<Response<Body>> {
+    let preset = policy_preset(&state.settings, &context, &body.output.preset)?;
+    let doc = compose::resolve_compose(&body, &preset, ComposeLimits::from_config())
+        .map_err(compose_rejection)?;
+
+    // Every item's own file, by the same readability rule the single-file path
+    // uses: handing ffmpeg a path on a dropped mount would produce a *verdict*
+    // on a composition that is perfectly fine.
+    let mut sources = Vec::with_capacity(doc.items.len());
+    for item in &doc.items {
+        sources.push(resolve_item_path(&mut db, &item.sha256).await?);
+    }
+    drop(db);
+
+    let weight = compose_weight(doc.items.len());
+    let params = resolve_compose_params(doc, preset).await?;
+    let outcome = pool::submit(SubmitRequest {
+        job: JobRequest::Compose {
+            params: Box::new(params),
+            sources,
+        },
+        weight,
+        // A composition has no source stem; its download name is fixed.
+        download_stem: None,
+    })
+    .await?;
+    Ok(submit_response(outcome))
 }
 
 #[utoipa::path(
@@ -454,13 +526,20 @@ pub async fn video_artifact(
         .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("bin");
-    let filename = transcode_file_name(
-        target.stem.as_deref(),
-        source_sha_of(&target.key),
-        target.trimmed,
-        &artifact.preset,
-        ext,
-    );
+    // A composition key names no source and no trim, so the single-file naming
+    // rule has nothing to work with: it gets the same fixed scheme the
+    // `ArtifactRef` carries, minus the item count the key does not record.
+    let filename = if compose::is_compose_key(&target.key) {
+        compose::compose_file_name(None, ext)
+    } else {
+        transcode_file_name(
+            target.stem.as_deref(),
+            source_sha_of(&target.key),
+            target.trimmed,
+            &artifact.preset,
+            ext,
+        )
+    };
     serve_file(
         FileServeSpec {
             file,
@@ -905,21 +984,88 @@ async fn resolve_source(
     // Taken before the readability loop consumes the list: the name is the
     // item's, the input is whichever copy answered.
     let download_stem = download_stem(&metadata.files);
-    for file in metadata.files {
+    let Some(file) = first_readable_file(metadata.files).await else {
+        return Err(ApiError::not_found("No readable file found for item"));
+    };
+    Ok(ResolvedSource {
+        item,
+        file,
+        download_stem,
+    })
+}
+
+/// The encode input for one composition item.
+///
+/// Its two failures name the hash, unlike the single-file path's: a mosaic of
+/// a dozen pins answered with a bare "Item not found" tells the client nothing
+/// about which pin to drop.
+async fn resolve_item_path(
+    db: &mut DbConnection<ReadOnlyNoUserData>,
+    sha256: &str,
+) -> ApiResult<std::path::PathBuf> {
+    let metadata =
+        get_item_metadata_unchecked(&mut db.conn, sha256, ItemIdentifierType::Sha256).await?;
+    if metadata.item.is_none() {
+        return Err(ApiError::not_found(format!(
+            "Composition item {sha256} is not in this database"
+        )));
+    }
+    first_readable_file(metadata.files)
+        .await
+        .map(|file| std::path::PathBuf::from(file.path))
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "No readable file for composition item {sha256}"
+            ))
+        })
+}
+
+/// The first of an item's files that is on this machine right now.
+async fn first_readable_file(files: Vec<FileRecord>) -> Option<FileRecord> {
+    for file in files {
         let readable = tokio::time::timeout(FILE_IO_TIMEOUT, tokio::fs::metadata(&file.path))
             .await
             .ok()
             .and_then(Result::ok)
             .is_some_and(|meta| meta.is_file());
         if readable {
-            return Ok(ResolvedSource {
-                item,
-                file,
-                download_stem,
-            });
+            return Some(file);
         }
     }
-    Err(ApiError::not_found("No readable file found for item"))
+    None
+}
+
+/// A refused composition, as an HTTP answer. The rule's name is logged rather
+/// than sent: the client shows the message, which already carries every number
+/// needed to fix the document.
+fn compose_rejection(rejection: compose::ComposeRejection) -> ApiError {
+    tracing::debug!(reason = rejection.reason, "composition refused");
+    unprocessable(rejection.detail)
+}
+
+/// Compositions past the light threshold take the pool to themselves: their
+/// filtergraph holds every item's loop buffer at once, so pairing one with
+/// anything else is how a host runs out of memory.
+fn compose_weight(items: usize) -> JobWeight {
+    if items > crate::config::runtime().transcode.compose_light_threshold {
+        JobWeight::Exclusive
+    } else {
+        JobWeight::Light
+    }
+}
+
+/// Builds a composition's identity, resolving the encoder against this host's
+/// hardware probe. Off the async runtime, exactly like [`resolve_params`].
+async fn resolve_compose_params(
+    doc: ResolvedCompose,
+    preset: ResolvedPreset,
+) -> ApiResult<ComposeParams> {
+    tokio::task::spawn_blocking(move || ComposeParams::resolve(doc, preset))
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "the encoder probe task failed");
+            ApiError::internal("Failed to resolve the transcode encoder")
+        })
 }
 
 /// The item's identity, with no filesystem access at all. Used by the GET
@@ -2295,6 +2441,258 @@ transcode_presets = ["playback"]
             assert_eq!(body_json(response).await["outcome"], "hit");
         }
         cache.clear(true).await.unwrap();
+    }
+
+    const MOSAIC_A: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+    const MOSAIC_B: &str = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+
+    /// Two items, each with a readable file: a composition resolves every one
+    /// of its items before it can be keyed.
+    async fn compose_fixture_db(
+        dir: &std::path::Path,
+    ) -> (DbConnection<ReadOnlyNoUserData>, RetainedDbs) {
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
+            .bind("2024-01-01T00:00:00")
+            .bind(r"C:\gone")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        for (id, sha) in [(1, MOSAIC_A), (2, MOSAIC_B)] {
+            let source = dir.join(format!("pin-{id}.mp4"));
+            std::fs::write(&source, b"not really a video").unwrap();
+            sqlx::query(
+                "INSERT INTO items (id, sha256, md5, type, duration, time_added) \
+                 VALUES (?, ?, ?, 'video/mp4', 12.0, '2024-01-01T00:00:00')",
+            )
+            .bind(id)
+            .bind(sha)
+            .bind(format!("md5_{id}"))
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO files \
+                 (id, sha256, item_id, path, filename, last_modified, scan_id, available) \
+                 VALUES (?, ?, ?, ?, ?, '2024-01-02T00:00:00', 1, 1)",
+            )
+            .bind(10 + id)
+            .bind(sha)
+            .bind(id)
+            .bind(source.to_string_lossy().into_owned())
+            .bind(format!("pin-{id}.mp4"))
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        }
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        (
+            DbConnection::<ReadOnlyNoUserData>::for_tests(index_conn, "compose", "test"),
+            (storage_conn, user_data_conn),
+        )
+    }
+
+    fn compose_body(items: Vec<serde_json::Value>) -> ComposeRequest {
+        serde_json::from_value(serde_json::json!({
+            "canvas": { "w": 320, "h": 240, "background": "#101820" },
+            "fps": 25,
+            "output": { "preset": "mosaic-mp4", "length": { "mode": "longest_loop_once" } },
+            "items": items,
+        }))
+        .expect("the fixture document deserializes")
+    }
+
+    fn compose_item(sha: &str, dest: (i64, i64, i64, i64), time: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "sha256": sha,
+            "src": { "x": 0, "y": 0, "w": 640, "h": 480 },
+            "transform": { "quarter_turns": 1, "flip_h": false },
+            "dest": { "x": dest.0, "y": dest.1, "w": dest.2, "h": dest.3 },
+            "time": time,
+            "audio": true,
+        })
+    }
+
+    /// The compose route end to end against the index database: every item is
+    /// resolved, the document is keyed as a whole, and the answer is the
+    /// *same* envelope the single-file route returns — which is what lets one
+    /// client follow both through one jobs/SSE/artifact path (§0.1).
+    #[tokio::test]
+    async fn the_compose_route_keys_the_document_and_shares_the_transcode_envelope() {
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let body = compose_body(vec![
+            compose_item(
+                MOSAIC_A,
+                (0, 0, 160, 240),
+                serde_json::json!({ "kind": "span", "start_cs": 0, "end_cs": 500 }),
+            ),
+            compose_item(
+                MOSAIC_B,
+                (160, 0, 160, 240),
+                serde_json::json!({ "kind": "still", "at_cs": 50 }),
+            ),
+        ]);
+
+        // The key the handler will compute, built the way the handler builds
+        // it, and pre-filled so this test is about the route rather than about
+        // ffmpeg.
+        let preset = policy_preset(&settings, &test_context("local"), "mosaic-mp4").unwrap();
+        let doc = compose::resolve_compose(&body, &preset, ComposeLimits::from_config())
+            .expect("a valid document");
+        assert_eq!(doc.target_cs, 500, "the longest span plays once");
+        let key = ComposeParams::resolve(doc, preset).cache_key();
+        assert!(key.starts_with("compose-"), "{key}");
+
+        let cache = pool::transcode_cache().await.unwrap();
+        let temp = cache.temp_path("mp4");
+        std::fs::write(&temp, b"0123456789").unwrap();
+        cache
+            .commit(
+                NewArtifact {
+                    key: &key,
+                    source_sha256: "compose",
+                    params_hash: "hash",
+                    preset: "mosaic-mp4",
+                    file_name: &format!("{key}.mp4"),
+                    mime_type: "video/mp4",
+                    transcoder_version: 1,
+                },
+                &temp,
+            )
+            .await
+            .unwrap();
+
+        let (db, _attached) = compose_fixture_db(fixtures.path()).await;
+        let response = video_compose(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            db,
+            Json(body),
+        )
+        .await
+        .expect("the cached composition answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["outcome"], "hit");
+        assert_eq!(json["artifact"]["key"], key);
+        assert_eq!(json["artifact"]["url"], format!("/api/video/artifact?key={key}"));
+        // No source stem exists for a composition, so the name is fixed.
+        assert_eq!(json["artifact"]["filename"], "mosaic-2items.mp4");
+
+        // And the artifact route serves that key like any other, naming the
+        // download from the key alone.
+        let served = video_artifact(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            unused_db().await,
+            Query(ArtifactQuery {
+                key: Some(key.clone()),
+                id: None,
+                id_type: None,
+                preset: None,
+                start_cs: None,
+                end_cs: None,
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("a composition is an artifact like any other");
+        assert_eq!(served.status(), StatusCode::OK);
+        // The key records no item count, so the served name is the bare form.
+        assert_eq!(
+            served.headers()[header::CONTENT_DISPOSITION],
+            "inline; filename=\"mosaic.mp4\""
+        );
+        assert_eq!(served.headers()[header::CACHE_CONTROL], CACHE_IMMUTABLE);
+        cache.clear(true).await.unwrap();
+    }
+
+    /// A composition an item cannot be found for is a 404 that *names* the
+    /// item: a mosaic of a dozen pins answered with a bare "Item not found"
+    /// tells the client nothing about which pin to drop.
+    #[tokio::test]
+    async fn a_missing_composition_item_is_named_in_the_404() {
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let missing = "c3".repeat(32);
+        let body = compose_body(vec![
+            compose_item(
+                MOSAIC_A,
+                (0, 0, 160, 240),
+                serde_json::json!({ "kind": "span", "start_cs": 0, "end_cs": 500 }),
+            ),
+            compose_item(&missing, (160, 0, 160, 240), serde_json::json!({ "kind": "image" })),
+        ]);
+        let (db, _attached) = compose_fixture_db(fixtures.path()).await;
+        let err = video_compose(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            db,
+            Json(body),
+        )
+        .await
+        .expect_err("rejected");
+        assert!(err.detail().contains(&missing), "{}", err.detail());
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The document-level rejections, which all land before any item is
+    /// resolved — the connection below would fail any query it was handed.
+    #[tokio::test]
+    async fn a_refused_composition_never_reaches_the_items() {
+        let settings = test_settings();
+        let span = serde_json::json!({ "kind": "span", "start_cs": 0, "end_cs": 500 });
+        let ok = compose_item(MOSAIC_A, (0, 0, 160, 240), span.clone());
+
+        let mut odd_dest = compose_body(vec![ok.clone()]);
+        odd_dest.items[0].dest.x = 15;
+        let mut outside = compose_body(vec![ok.clone()]);
+        outside.items[0].dest.w = 400;
+        let mut frozen_span = compose_body(vec![compose_item(
+            MOSAIC_A,
+            (0, 0, 160, 240),
+            serde_json::json!({ "kind": "span", "start_cs": 500, "end_cs": 500 }),
+        )]);
+        frozen_span.fps = 25;
+        let mut unknown_preset = compose_body(vec![ok.clone()]);
+        unknown_preset.output.preset = "nonexistent".to_string();
+        let mut odd_canvas = compose_body(vec![ok.clone()]);
+        odd_canvas.canvas.h = 241;
+        let mut huge = compose_body(vec![ok]);
+        huge.canvas.background = "not-a-colour".to_string();
+
+        for body in [odd_dest, outside, frozen_span, unknown_preset, odd_canvas, huge] {
+            let err = video_compose(
+                State(test_state(&settings)),
+                Extension(test_context("local")),
+                unused_db().await,
+                Json(body),
+            )
+            .await
+            .expect_err("rejected before any item is looked up");
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+    }
+
+    /// The pool weight: a composition past the light threshold runs alone,
+    /// because its filtergraph holds every item's loop buffer at once. The
+    /// exclusivity itself is the pool's own contract, tested there.
+    #[test]
+    fn compositions_past_the_threshold_take_the_pool_to_themselves() {
+        let threshold = crate::config::runtime().transcode.compose_light_threshold;
+        assert_eq!(compose_weight(1), JobWeight::Light);
+        assert_eq!(compose_weight(threshold), JobWeight::Light);
+        assert_eq!(compose_weight(threshold + 1), JobWeight::Exclusive);
     }
 
     /// The SSE contract, on the stream itself: the first event is the current
