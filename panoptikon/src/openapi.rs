@@ -51,6 +51,7 @@ impl Modify for JsonValueSchema {
         crate::api::video::clear_transcode_cache,
         crate::api::open::open_file_on_host,
         crate::api::open::show_in_file_manager,
+        crate::api::open::copy_file_to_clipboard_on_host,
         crate::api::jobs::queue_status,
         crate::api::jobs::enqueue_data_extraction,
         crate::api::jobs::enqueue_delete_extracted_data,

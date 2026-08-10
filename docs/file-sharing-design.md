@@ -369,6 +369,12 @@ bearing and must not be repurposed.
   mountless remotes (video-in-mpv case).
 - Multi-item copy: CF_HDROP and its peers are lists; wiring pinboard
   selection to a multi-file clipboard write is a natural extension.
+- Linux dual-target clipboard: an in-process selection owner can offer
+  `text/uri-list` *and* `x-special/gnome-copied-files` at once, which is
+  the only way to serve GNOME file managers and chat clients/browsers from
+  one copy. `wl-copy`/`xclip` cannot — one MIME type per invocation — so
+  v1 always publishes `text/uri-list` and Nautilus/Nemo/Caja paste nothing
+  from it.
 - Drag-out revisit, gated on the validation bar above.
 
 ## Validation checklist (implementation-time)

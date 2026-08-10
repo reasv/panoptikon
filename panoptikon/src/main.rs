@@ -537,6 +537,10 @@ async fn async_main() -> anyhow::Result<()> {
                 "/api/open/folder/{sha256}",
                 post(api::open::show_in_file_manager),
             )
+            .route(
+                "/api/open/clipboard/{sha256}",
+                post(api::open::copy_file_to_clipboard_on_host),
+            )
             .route("/api/search/pql", post(api::search::search_pql))
             .route("/api/search/pql/build", post(api::search::search_pql_build))
             .route(

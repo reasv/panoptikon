@@ -96,9 +96,18 @@ impl Default for LoggingConfig {
 
 /// `[open]`: custom commands for the local `/api/open/*` endpoints.
 /// `{path}`, `{folder}`, and `{filename}` placeholders expand to the target
-/// file's quoted full path, parent directory, and file name. Absent: the
-/// platform default (`start`/`open`/`xdg-open`, `explorer /select` etc.).
+/// file's full path, parent directory, and file name. Absent: the
+/// platform default (`start`/`open`/`xdg-open`, `explorer /select`, the
+/// built-in native clipboard write, etc.).
 /// An explicit empty string makes the endpoint a no-op.
+///
+/// The `*_program`/`*_args` forms need no quoting at all — each value becomes
+/// one argv entry. In the shell (`*_command`) forms the executor supplies the
+/// quoting: `file_command`/`folder_command` wrap each value in `"…"` (their
+/// long-standing behaviour), and `clipboard_command` quotes each value for the
+/// host shell, which means a `clipboard_command` template must not add quotes
+/// of its own — the same rule Panoptikon Desktop's editor enforces for the
+/// clipboard action it shares with the relay.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OpenConfig {
     /// Executable for direct (non-shell) "open file" customization.
@@ -119,6 +128,17 @@ pub struct OpenConfig {
     /// Arguments passed directly to `folder_program`.
     #[serde(default)]
     pub folder_args: Vec<String>,
+    /// Executable for direct (non-shell) "copy file to clipboard"
+    /// customization.
+    #[serde(default)]
+    pub clipboard_program: Option<String>,
+    /// Arguments passed directly to `clipboard_program`.
+    #[serde(default)]
+    pub clipboard_args: Vec<String>,
+    /// Command template for "copy file to clipboard". Absent: the built-in
+    /// native clipboard write (`panoptikon-clipboard`).
+    #[serde(default)]
+    pub clipboard_command: Option<String>,
 }
 
 /// `[inference_local]`: the in-process inferio orchestrator (design doc §3).
@@ -2322,6 +2342,9 @@ allow = "*"
         assert_eq!(settings.logging.level, "INFO");
         assert_eq!(settings.open.file_command, None);
         assert_eq!(settings.open.folder_command, None);
+        assert_eq!(settings.open.clipboard_command, None);
+        assert_eq!(settings.open.clipboard_program, None);
+        assert!(settings.open.clipboard_args.is_empty());
         assert!(!settings.jobs.atomic_extraction_jobs);
         assert_eq!(settings.jobs.image_decode_memory_limit_mb, 8192);
 
@@ -2392,6 +2415,44 @@ image_decode_memory_limit_mb = 2048
         assert!(runtime.atomic_extraction_jobs);
         assert_eq!(runtime.image_decode_memory_limit_mb, 2048);
         assert_eq!(runtime.open.file_command.as_deref(), Some("mpv {path}"));
+    }
+
+    /// The clipboard verb's keys parse like the other two `[open]` verbs —
+    /// a direct program with its own argv, or a shell template — and reach
+    /// the runtime config, which is what the endpoint reads.
+    #[test]
+    fn open_clipboard_keys_parse() {
+        let _guard = env_lock();
+        let settings = load_from(&format!(
+            r#"
+{MINIMAL}
+[open]
+clipboard_program = "my-clipboard-tool"
+clipboard_args = ["--file", "{{path}}"]
+clipboard_command = "my-clipboard-shell {{path}}"
+"#
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.open.clipboard_program.as_deref(),
+            Some("my-clipboard-tool")
+        );
+        assert_eq!(settings.open.clipboard_args, vec!["--file", "{path}"]);
+        assert_eq!(
+            settings.open.clipboard_command.as_deref(),
+            Some("my-clipboard-shell {path}")
+        );
+
+        let runtime = settings.runtime_config();
+        assert_eq!(
+            runtime.open.clipboard_program.as_deref(),
+            Some("my-clipboard-tool")
+        );
+        assert_eq!(runtime.open.clipboard_args, vec!["--file", "{path}"]);
+        assert_eq!(
+            runtime.open.clipboard_command.as_deref(),
+            Some("my-clipboard-shell {path}")
+        );
     }
 
     /// There is no env override layer: PANOPTIKON__* variables (the removed

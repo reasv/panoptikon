@@ -1,3 +1,8 @@
 [workspace]
-members = ["panoptikon", "panoptikon-config", "panoptikon-desktop/src-tauri"]
+members = [
+    "panoptikon",
+    "panoptikon-clipboard",
+    "panoptikon-config",
+    "panoptikon-desktop/src-tauri",
+]
 resolver = "2"

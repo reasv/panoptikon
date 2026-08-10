@@ -71,7 +71,7 @@ function requestCard(item, state) {
     details.append(term, detail);
   }
   card.append(details);
-  const rootsTitle = document.createElement('p'); rootsTitle.className = 'muted'; rootsTitle.textContent = 'These server folders are suggestions. Edit them as needed, match available folders on this computer, or leave them blank.'; card.append(rootsTitle);
+  const rootsTitle = document.createElement('p'); rootsTitle.className = 'muted'; rootsTitle.textContent = 'Mapping these server folders to local folders is optional: it lets Relay open files and reveal folders in place. Copying files to the clipboard also works with no folders mapped — the file is sent to this computer instead, as long as it fits the share cache limit in Settings. Edit them, match available folders on this computer, or leave them blank.'; card.append(rootsTitle);
   const mappings = selectedMappings.get(item.id) ?? new Map(); selectedMappings.set(item.id, mappings);
   const roots = document.createElement('div'); roots.className = 'pairing-mappings';
   if (!item.roots.length) { const empty = document.createElement('p'); empty.className = 'muted'; empty.textContent = 'No folder hints were supplied. You can add mappings later in Settings.'; roots.append(empty); }

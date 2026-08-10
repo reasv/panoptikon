@@ -231,15 +231,21 @@ async fn stat_config(config_path: &Path) -> ConfigStat {
     }
 }
 
-/// A `Content-Disposition` header value, both halves of RFC 6266.
+/// Builds a `Content-Disposition` value naming `filename` — both halves of
+/// RFC 6266.
 ///
-/// The quoted `filename=` is the fallback every client understands, so it
-/// stays Latin-1 and now escapes the two characters a `quoted-string` gives
-/// meaning to: an unescaped `"` in a file name ends the value early and hands
-/// the rest of the name to the parser as stray parameters, which is a silently
-/// truncated download rather than an ugly one. `filename*` carries the real
-/// name whenever the fallback cannot (anything non-ASCII, or a name that had
-/// to be escaped at all), percent-encoded per RFC 5987.
+/// The quoted `filename=` parameter is Latin-1 only, so any name the quoted
+/// form cannot carry verbatim additionally gets an RFC 8187
+/// `filename*=UTF-8''…` — the form every current browser prefers, and the only
+/// one that can carry the name intact. That is every non-ASCII name (a raw
+/// Latin-1 byte such as `é` is ambiguous to browsers, so ASCII is the bar, not
+/// Latin-1) plus any name holding a control character, which
+/// [`latin1_fallback`] has to drop, plus any name that had to be escaped at
+/// all. A plain printable-ASCII name keeps the historical single-parameter
+/// *form*; names carrying `"` or `\` gain both the escape and `filename*` —
+/// unescaped, a `"` ends the value early and hands the rest of the name to the
+/// parser as stray parameters, which is a silently truncated download rather
+/// than an ugly one.
 ///
 /// This names a *download*, not the response's identity: the UI's
 /// `<a download>` attribute remains the authoritative UTF-8 name (house
@@ -248,32 +254,73 @@ pub(crate) fn content_disposition_value(kind: &str, filename: &str) -> Option<he
     let mut value = Vec::new();
     value.extend_from_slice(kind.as_bytes());
     value.extend_from_slice(b"; filename=\"");
-    value.extend_from_slice(&quoted_fallback_bytes(filename));
-    value.extend_from_slice(b"\"");
-    if !is_plain_ascii(filename) {
+    value.extend_from_slice(&latin1_fallback(filename));
+    value.push(b'"');
+    // `filename*` whenever the quoted form is not the plain, unambiguous
+    // article: anything non-ASCII or control (which the fallback drops), and
+    // also anything that had to be *escaped* — the escape is lossless, but
+    // enough user agents mishandle `\"` inside a quoted-string that the name is
+    // only reliably delivered by the encoded form.
+    let fallback_is_degraded = filename
+        .chars()
+        .any(|ch| !ch.is_ascii() || is_dropped_control(ch) || ch == '"' || ch == '\\');
+    if fallback_is_degraded {
+        // The bidi controls are stripped from this form too — it is the one
+        // that carries the name intact, so it is also the one a spoofed name
+        // would reach the user through.
+        let displayable: String = filename
+            .chars()
+            .filter(|ch| !is_bidi_control(*ch))
+            .collect();
         value.extend_from_slice(b"; filename*=UTF-8''");
-        value.extend_from_slice(rfc5987_encode(filename).as_bytes());
+        value.extend_from_slice(percent_encode_attr_chars(&displayable).as_bytes());
     }
     header::HeaderValue::from_bytes(&value).ok()
 }
 
-/// Whether the quoted fallback can carry this name verbatim: printable ASCII
-/// with nothing a `quoted-string` would have to escape.
-fn is_plain_ascii(filename: &str) -> bool {
-    filename
-        .chars()
-        .all(|ch| ch.is_ascii() && !ch.is_ascii_control() && ch != '"' && ch != '\\')
+/// Characters dropped from *both* forms of the name.
+///
+/// C0 and DEL because `HeaderValue` refuses them, so the quoted fallback
+/// cannot contain them. Tab is included: it is legal in a header value but
+/// meaningless in a filename.
+///
+/// The bidi overrides and isolates because a name built around them renders
+/// deceptively rather than merely oddly: `photo\u{202E}gnp.exe` displays as
+/// `photoexe.png` in a download UI, which is an extension spoof, not a
+/// filename. Byte-exact fidelity is a priority here and this is the deliberate
+/// exception to it — they are display directives, not part of the name, and
+/// dropping them changes nothing about which file was served. (Before RFC 8187
+/// support they never left the server anyway: the Latin-1 fallback drops
+/// everything above U+00FF.)
+fn is_dropped_control(ch: char) -> bool {
+    let code = ch as u32;
+    code < 0x20 || code == 0x7F || is_bidi_control(ch)
 }
 
-/// The `quoted-string` half: Latin-1 (nothing else has a representation
-/// there), control characters dropped — a raw newline would make the whole
-/// header unconstructible, and dropping the header loses the name entirely —
-/// and `"`/`\` backslash-escaped.
-fn quoted_fallback_bytes(filename: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(filename.len() + 2);
-    for ch in filename.chars() {
+/// The Unicode bidirectional formatting controls: the embeddings and
+/// overrides (U+202A-U+202E) and the isolates (U+2066-U+2069).
+fn is_bidi_control(ch: char) -> bool {
+    matches!(ch as u32, 0x202A..=0x202E | 0x2066..=0x2069)
+}
+
+/// The quoted-string fallback for legacy clients: characters outside Latin-1
+/// have no representation there and are dropped, and `"`/`\` are escaped so a
+/// name containing them cannot end the parameter early.
+///
+/// Control characters are dropped too. `HeaderValue` rejects them outright, so
+/// a single `\n` in a filename would otherwise cost the *entire* header — the
+/// download would lose its name and its `attachment` disposition. Dropping
+/// them keeps the header, and `filename*` (which %-encodes them) still carries
+/// the exact name for anything that reads it. Tab is dropped with the rest: it
+/// is legal in a header value but meaningless in a filename.
+fn latin1_fallback(value: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len());
+    for ch in value.chars() {
         let code = ch as u32;
-        if !(0x20..=0xFF).contains(&code) || code == 0x7F {
+        if code > 0xFF {
+            continue;
+        }
+        if is_dropped_control(ch) {
             continue;
         }
         if ch == '"' || ch == '\\' {
@@ -284,28 +331,22 @@ fn quoted_fallback_bytes(filename: &str) -> Vec<u8> {
     out
 }
 
-/// RFC 5987 `ext-value`: `attr-char` passes through, everything else — spaces,
-/// quotes, `%`, and every byte of a non-ASCII character's UTF-8 — is
-/// percent-encoded.
-fn rfc5987_encode(filename: &str) -> String {
-    let mut out = String::with_capacity(filename.len());
-    for byte in filename.as_bytes() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
-            )
-        {
-            out.push(*byte as char);
+/// Percent-encodes the UTF-8 bytes over RFC 8187's `attr-char` set.
+fn percent_encode_attr_chars(value: &str) -> String {
+    const EXTRA: &[u8] = b"!#$&+-.^_`|~";
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || EXTRA.contains(&byte) {
+            out.push(byte as char);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)] as char);
+            out.push(HEX[usize::from(byte & 0x0F)] as char);
         }
     }
     out
-}
-
-pub(crate) fn strip_non_latin1_chars(input: &str) -> String {
-    input.chars().filter(|ch| (*ch as u32) <= 0xFF).collect()
 }
 
 pub(crate) fn iso_to_system_time(value: &str) -> Option<SystemTime> {
@@ -369,6 +410,150 @@ mod tests {
 
     fn config_path(index_db: &str) -> std::path::PathBuf {
         SystemConfigStore::from_env().config_path(index_db)
+    }
+
+    fn disposition_bytes(kind: &str, filename: &str) -> Vec<u8> {
+        content_disposition_value(kind, filename)
+            .expect("a valid header value")
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// Only for cases whose output is pure ASCII — the Latin-1 fallback is not
+    /// UTF-8 in general, so the byte-level assertion is used where it matters.
+    fn disposition(kind: &str, filename: &str) -> String {
+        String::from_utf8_lossy(&disposition_bytes(kind, filename)).into_owned()
+    }
+
+    /// The overwhelmingly common case must not grow a second parameter: an
+    /// ASCII name is representable in the quoted form, so nothing is added.
+    #[test]
+    fn ascii_names_keep_the_historical_single_parameter_form() {
+        assert_eq!(
+            disposition("inline", "file.png"),
+            r#"inline; filename="file.png""#
+        );
+        assert_eq!(
+            disposition("attachment", "My Vacation (2024) [1].mp4"),
+            r#"attachment; filename="My Vacation (2024) [1].mp4""#
+        );
+    }
+
+    /// A name with no ASCII at all survives only in `filename*`; the quoted
+    /// fallback is left empty rather than mangled, because Latin-1 has no
+    /// character for any of it.
+    #[test]
+    fn cjk_name_travels_in_the_extended_parameter() {
+        assert_eq!(
+            disposition("inline", "写真.jpg"),
+            "inline; filename=\".jpg\"; filename*=UTF-8''%E5%86%99%E7%9C%9F.jpg"
+        );
+    }
+
+    #[test]
+    fn emoji_name_is_percent_encoded_over_its_utf8_bytes() {
+        assert_eq!(
+            disposition("attachment", "🎉.png"),
+            "attachment; filename=\".png\"; filename*=UTF-8''%F0%9F%8E%89.png"
+        );
+    }
+
+    /// Mixed scripts are exactly where the old single-parameter output lost
+    /// data silently: the ASCII part still reads, and the rest now arrives.
+    /// Latin-1-but-not-ASCII characters (`é`) stay in the fallback as their
+    /// single Latin-1 byte while the extended form spells them in UTF-8.
+    #[test]
+    fn mixed_name_keeps_a_readable_fallback_and_the_full_name() {
+        let mut expected = b"inline; filename=\"caf".to_vec();
+        expected.push(0xE9); // Latin-1 'é', deliberately not UTF-8
+        expected.extend_from_slice(
+            b"  01.jpg\"; filename*=UTF-8''caf%C3%A9%20%E5%86%99%E7%9C%9F%2001.jpg",
+        );
+        assert_eq!(disposition_bytes("inline", "café 写真 01.jpg"), expected);
+    }
+
+    /// Quotes and backslashes would otherwise end the quoted string early and
+    /// let the rest of the name be read as header syntax. They are escaped in
+    /// the fallback *and* earn a `filename*`: the escape is lossless, but
+    /// enough user agents mishandle `\"` inside a quoted-string that the
+    /// encoded form is the only one that reliably delivers such a name.
+    #[test]
+    fn quotes_and_backslashes_are_escaped_and_also_encoded() {
+        assert_eq!(
+            disposition("attachment", r#"a"b\c.png"#),
+            r#"attachment; filename="a\"b\\c.png"; filename*=UTF-8''a%22b%5Cc.png"#
+        );
+    }
+
+    /// A control character in the name must not cost the whole header.
+    /// `HeaderValue` rejects them, so the quoted fallback drops them and the
+    /// response keeps its disposition and a usable name; `filename*` still
+    /// spells the byte out, so nothing is actually lost.
+    #[test]
+    fn control_characters_are_dropped_from_the_fallback_not_the_header() {
+        let value = content_disposition_value("attachment", "evil\nname.png")
+            .expect("a control character does not destroy the header");
+        let bytes = value.as_bytes();
+        assert!(
+            !bytes.iter().any(|byte| *byte < 0x20 || *byte == 0x7F),
+            "no control byte survives into the header"
+        );
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        assert!(
+            text.starts_with(r#"attachment; filename="evilname.png""#),
+            "the quoted fallback reads without the control character: {text}"
+        );
+        assert!(
+            text.contains("filename*=UTF-8''evil%0Aname.png"),
+            "the extended parameter carries the exact name: {text}"
+        );
+    }
+
+    /// A right-to-left override makes a name *render* as a different one:
+    /// `photo\u{202E}gnp.exe` shows up as `photoexe.png` in a download UI, so
+    /// the executable extension is what the user does not see. The control is
+    /// non-ASCII, so it would otherwise ride through `filename*` verbatim —
+    /// the one parameter browsers actually prefer. Both forms drop it, and the
+    /// rest of the name is untouched.
+    #[test]
+    fn bidi_overrides_are_dropped_from_both_forms() {
+        let value = disposition("attachment", "photo\u{202E}gnp.exe");
+        assert_eq!(
+            value,
+            "attachment; filename=\"photognp.exe\"; filename*=UTF-8''photognp.exe"
+        );
+        assert!(
+            !value.contains("%E2%80%AE"),
+            "the override is not percent-encoded through: {value}"
+        );
+    }
+
+    /// The isolates spoof the same way, and a name that is *only* an isolate
+    /// plus ASCII must still produce a usable header.
+    #[test]
+    fn bidi_isolates_are_dropped_too() {
+        assert_eq!(
+            disposition("inline", "a\u{2066}b\u{2069}c\u{202A}d.png"),
+            "inline; filename=\"abcd.png\"; filename*=UTF-8''abcd.png"
+        );
+    }
+
+    /// Only the bidi controls are dropped from `filename*`: other control
+    /// characters are still spelled out there, because that parameter is the
+    /// only place the exact name survives.
+    #[test]
+    fn non_bidi_controls_still_reach_the_extended_parameter() {
+        assert!(
+            disposition("attachment", "a\u{202E}b\tc.png").contains("filename*=UTF-8''ab%09c.png"),
+            "the tab is encoded, the override is gone"
+        );
+    }
+
+    /// The disposition type is passed through untouched in both forms.
+    #[test]
+    fn disposition_type_is_passed_through() {
+        assert!(disposition("attachment", "写真.jpg").starts_with("attachment; "));
+        assert!(disposition("inline", "写真.jpg").starts_with("inline; "));
     }
 
     /// A config that cannot be parsed must not take the request with it: the

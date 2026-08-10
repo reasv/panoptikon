@@ -1,28 +1,35 @@
 //! Origin-bound loopback Relay v1. The HTTP surface is intentionally small:
 //! discovery, expiring local-approval pairing, and two authenticated actions.
 
-use crate::settings::atomic_write;
+use crate::{settings::atomic_write, share_cache::ShareCache};
 use anyhow::{Context as _, bail};
 use argon2::{
     Argon2, PasswordHash, PasswordHasher as _, PasswordVerifier as _, password_hash::SaltString,
 };
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
+    body::Body,
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine as _;
+use http_body_util::BodyExt as _;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::{
+    io::AsyncWriteExt as _,
+    sync::{Mutex, RwLock, oneshot},
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -32,9 +39,35 @@ const RATE_LIMIT: usize = 5;
 const MAX_PENDING: usize = 10;
 const MAX_ACTION_RECORDS: usize = 1024;
 const ACTION_TTL_SECS: i64 = 10 * 60;
+/// A record parked waiting for its bytes lives far longer than a finished one:
+/// the browser may be fetching a multi-gigabyte original, and the user may take
+/// their time. It is still bounded — an abandoned tab must not leave a record
+/// behind forever.
+const PENDING_BYTES_TTL_SECS: i64 = 60 * 60;
 const PRODUCTION_DEFAULT_BIND: &str = "127.0.0.1:16341";
 const DEVELOPMENT_DEFAULT_BIND: &str = "127.0.0.1:17601";
 const LEGACY_DEFAULT_BIND: &str = "127.0.0.1:17600";
+/// Filename of the action-state sidecar, written beside `relay.toml`.
+const ACTIONS_FILE_NAME: &str = "relay-actions.toml";
+/// Default share cache ceiling. A tunable: the key is omitted from `relay.toml`
+/// while it holds this value, so an install that never changed it tracks the
+/// code default and a later change to that default reaches it. Writing the key
+/// out unconditionally would instead freeze today's number on disk forever.
+const DEFAULT_SHARE_CACHE_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Slack allowed above an upload's declared `size` before the relay hangs up.
+const UPLOAD_SIZE_SLACK: u64 = 1024 * 1024;
+/// Longest browser-supplied filename accepted with a share verb; 255 is the
+/// per-component ceiling of every filesystem the relay writes its cache to.
+const MAX_SHARE_FILENAME_LEN: usize = 255;
+/// Optional relay capabilities, advertised by `GET /v1/health`. A relay that
+/// omits the field entirely predates capability advertisement and must be
+/// treated by clients as advertising nothing.
+const RELAY_FEATURES: &[&str] = &["copy_to_clipboard"];
+/// The single opaque message a failed local action reports to the origin and
+/// stores in its record. The detailed error is logged locally only: the
+/// clipboard backend formats `path.display()` into its errors, and a remote
+/// origin has no business learning this host's filesystem layout.
+const GENERIC_ACTION_FAILURE: &str = "The local action failed.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
@@ -48,8 +81,32 @@ pub struct RelayConfig {
     pub instances: Vec<RelayInstance>,
     #[serde(default)]
     pub commands: FileActionCommands,
+    #[serde(
+        default = "default_share_cache_max_bytes",
+        skip_serializing_if = "is_default_share_cache_max"
+    )]
+    pub share_cache_max_bytes: u64,
     #[serde(default)]
     pairing_operations: Vec<PairingOperation>,
+    /// Live action records. Persisted to the `relay-actions.toml` sidecar, not
+    /// to `relay.toml` — see [`ActionsFile`]. `#[serde(default)]` still reads
+    /// them out of a legacy `relay.toml` once, so an upgrade absorbs rather
+    /// than drops whatever was in flight.
+    #[serde(default, skip_serializing)]
+    actions: Vec<ActionRecord>,
+}
+
+/// The action-state sidecar.
+///
+/// Action records are the only part of the Relay's state whose *shape* grows
+/// with the protocol: every new verb or record state adds an enum variant that
+/// an older binary cannot deserialize. Keeping them in `relay.toml` would mean
+/// that downgrading — or running an older build once from a second install —
+/// quarantines the whole file and silently destroys every pairing. The sidecar
+/// contains nothing but disposable state, so the worst case of a parse failure
+/// is a handful of forgotten in-flight actions.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ActionsFile {
     #[serde(default)]
     actions: Vec<ActionRecord>,
 }
@@ -62,6 +119,7 @@ impl Default for RelayConfig {
             bind: default_bind(),
             instances: Vec::new(),
             commands: FileActionCommands::default(),
+            share_cache_max_bytes: default_share_cache_max_bytes(),
             pairing_operations: Vec::new(),
             actions: Vec::new(),
         }
@@ -72,12 +130,22 @@ fn relay_enabled_by_default() -> bool {
     true
 }
 
+fn default_share_cache_max_bytes() -> u64 {
+    DEFAULT_SHARE_CACHE_MAX_BYTES
+}
+
+fn is_default_share_cache_max(value: &u64) -> bool {
+    *value == DEFAULT_SHARE_CACHE_MAX_BYTES
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FileActionCommands {
     #[serde(default)]
     pub open_file: CommandSpec,
     #[serde(default)]
     pub reveal_in_folder: CommandSpec,
+    #[serde(default)]
+    pub copy_to_clipboard: CommandSpec,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -119,9 +187,102 @@ fn default_bind() -> String {
     PRODUCTION_DEFAULT_BIND.into()
 }
 
-pub fn load_config(path: &Path, development: bool) -> anyhow::Result<RelayConfig> {
+/// Path of the action sidecar belonging to a `relay.toml`.
+fn actions_path(config_path: &Path) -> PathBuf {
+    config_path.with_file_name(ACTIONS_FILE_NAME)
+}
+
+/// A unique `.toml.invalid-*` sibling for quarantining an unparseable file.
+/// The nanosecond component — plus a counter fallback — keeps two quarantines
+/// in the same second (of one file, or of `relay.toml` and its sidecar) from
+/// silently clobbering each other.
+fn quarantine_path(path: &Path) -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let base = format!("toml.invalid-{}-{}", now.as_secs(), now.subsec_nanos());
+    let mut candidate = path.with_extension(&base);
+    let mut counter = 0u32;
+    while candidate.exists() {
+        counter += 1;
+        candidate = path.with_extension(format!("{base}-{counter}"));
+    }
+    candidate
+}
+
+/// Reads the action sidecar, quarantining it — and only it — when it cannot be
+/// parsed. Losing every pairing because an action record grew a field the
+/// running binary does not know is exactly what the sidecar exists to prevent.
+fn load_actions(path: &Path) -> Vec<ActionRecord> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    match toml::from_str::<ActionsFile>(&text) {
+        Ok(file) => file.actions,
+        Err(error) => {
+            let quarantine = quarantine_path(path);
+            match std::fs::rename(path, &quarantine) {
+                Ok(()) => tracing::warn!(
+                    %error,
+                    quarantine = %quarantine.display(),
+                    "Relay action state was invalid and was quarantined; in-flight actions were dropped"
+                ),
+                Err(rename_error) => tracing::warn!(
+                    %error, %rename_error,
+                    "Relay action state was invalid and could not be quarantined"
+                ),
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// A command that was running when the process died can never be observed
+/// again, so leaving the record `Executing` would make a polling browser wait
+/// forever against a state the TTL deliberately never prunes.
+fn recover_interrupted_actions(actions: &mut [ActionRecord]) -> bool {
+    let mut recovered = false;
+    for action in actions {
+        if matches!(action.state, ActionRecordState::Executing) {
+            action.state = ActionRecordState::Failed {
+                code: "interrupted".into(),
+                message: "Interrupted by a Desktop restart".into(),
+            };
+            recovered = true;
+        }
+    }
+    recovered
+}
+
+/// Whether a `copy_to_clipboard` shell template quotes its own placeholders.
+///
+/// The relay quotes that verb's substituted values itself because its
+/// `{filename}` is remote-supplied, so a quote in the template closes the
+/// automatic quoting and hands the attacker-authored tail to the shell. The
+/// test is on the shell string alone rather than on `mode`, because
+/// `command_for`/`spawn_file_action_command` dispatch on a non-empty shell
+/// string — `mode` is cosmetic at execution time.
+fn clipboard_template_quotes_itself(command: &CommandSpec) -> bool {
+    !command.shell_command.trim().is_empty() && command.shell_command.contains(['"', '\''])
+}
+
+/// Reads `relay.toml`.
+///
+/// `warnings` collects user-visible repairs made while loading (currently the
+/// clipboard-template demotion below), which the caller surfaces as startup
+/// warnings. Failures to *persist* a repair are logged and swallowed: see the
+/// save sites for why an error must never reach the caller.
+pub fn load_config(
+    path: &Path,
+    development: bool,
+    warnings: &mut Vec<String>,
+) -> anyhow::Result<RelayConfig> {
+    let sidecar = actions_path(path);
     if !path.exists() {
-        return Ok(RelayConfig::desktop_default(development));
+        let mut config = RelayConfig::desktop_default(development);
+        config.actions = load_actions(&sidecar);
+        recover_interrupted_actions(&mut config.actions);
+        return Ok(config);
     }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read Relay settings '{}'", path.display()))?;
@@ -129,6 +290,27 @@ pub fn load_config(path: &Path, development: bool) -> anyhow::Result<RelayConfig
         Ok(config) => {
             let mut config: RelayConfig = config;
             let mut migrated = false;
+            // A `relay.toml` written before the split may still carry actions.
+            // The sidecar is authoritative once it exists; otherwise the
+            // embedded records are absorbed and rewritten to their new home.
+            if sidecar.exists() {
+                config.actions = load_actions(&sidecar);
+            } else if !config.actions.is_empty() {
+                // Best effort: a sidecar write failure must never propagate out
+                // of `load_config`, or the caller falls back to an empty config
+                // and the next save overwrites `relay.toml`, destroying every
+                // pairing. The in-memory absorption still stands; only its
+                // persistence is skipped. Mirrors `persist_pruned`.
+                if let Err(error) = save_actions(&sidecar, &config.actions) {
+                    tracing::warn!(%error, path = %sidecar.display(), "failed to persist migrated Relay actions");
+                }
+                migrated = true;
+            }
+            if recover_interrupted_actions(&mut config.actions) {
+                if let Err(error) = save_actions(&sidecar, &config.actions) {
+                    tracing::warn!(%error, path = %sidecar.display(), "failed to persist recovered Relay actions");
+                }
+            }
             if config.bind == LEGACY_DEFAULT_BIND {
                 config.bind = RelayConfig::desktop_default(development).bind;
                 migrated = true;
@@ -136,6 +318,7 @@ pub fn load_config(path: &Path, development: bool) -> anyhow::Result<RelayConfig
             for command in [
                 &mut config.commands.open_file,
                 &mut config.commands.reveal_in_folder,
+                &mut config.commands.copy_to_clipboard,
             ] {
                 if command.mode == CommandMode::SystemDefault {
                     if !command.shell_command.trim().is_empty() {
@@ -147,21 +330,45 @@ pub fn load_config(path: &Path, development: bool) -> anyhow::Result<RelayConfig
                     }
                 }
             }
+            // `set_commands` is not the only writer into `commands`: this
+            // function deserializes whatever is on disk verbatim and then
+            // promotes it above, so a hand-edited `relay.toml` — or one
+            // restored from a machine running a pre-fix build — would arm the
+            // exact injection `set_commands` refuses. Demote rather than
+            // `bail!`: propagating an error here makes the caller fall back to
+            // `desktop_default()` and lose every pairing.
+            if clipboard_template_quotes_itself(&config.commands.copy_to_clipboard) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "the Relay clipboard command quoted its own placeholders and was reset to the system default"
+                );
+                warnings.push(format!(
+                    "The Relay clipboard command in '{}' quoted its own placeholders, which the Relay quotes automatically. It was reset to the system default; re-enter it without quotes.",
+                    path.display()
+                ));
+                config.commands.copy_to_clipboard = CommandSpec::default();
+                migrated = true;
+            }
             if migrated
                 || !text
                     .lines()
                     .any(|line| line.trim_start().starts_with("relay_id"))
             {
-                save_config(path, &config)?;
+                // Best effort, for the same reason as the sidecar writes
+                // above: propagating a write failure makes the caller fall
+                // back to `RelayConfig::desktop_default()`, discarding every
+                // instance, credential hash and mapping — and the next
+                // `save_config` then overwrites the good file on disk. The
+                // in-memory configuration is already correct; only its
+                // rewrite is skipped, and the next successful save converges.
+                if let Err(error) = save_config(path, &config) {
+                    tracing::warn!(%error, path = %path.display(), "failed to persist migrated Relay settings");
+                }
             }
             Ok(config)
         }
         Err(error) => {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let quarantine = path.with_extension(format!("toml.invalid-{stamp}"));
+            let quarantine = quarantine_path(path);
             std::fs::rename(path, &quarantine)?;
             bail!(
                 "Relay settings '{}' are invalid and were quarantined as '{}': {error}",
@@ -196,6 +403,9 @@ pub struct RelayStatusView {
     pub instances: Vec<RelayInstanceView>,
     pub commands: FileActionCommands,
     pub pending_actions: Vec<PendingActionView>,
+    /// Current share-cache ceiling in bytes, so the control UI can populate the
+    /// "Share cache limit" field (rendered in MB) on load.
+    pub share_cache_max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -263,29 +473,139 @@ struct ActionRecord {
 #[serde(tag = "status", rename_all = "snake_case")]
 enum ActionRecordState {
     PendingMapping,
+    /// A share verb with no local copy of the bytes yet. Invisible to the
+    /// mapping window by construction: only `PendingMapping` reaches it.
+    PendingBytes {
+        sha256: String,
+        filename: String,
+        size: u64,
+    },
     Executing,
     Complete,
-    Failed { code: String, message: String },
+    Failed {
+        code: String,
+        message: String,
+    },
 }
 
 type ActionHandler =
     Arc<dyn Fn(RelayAction, PathBuf, CommandSpec) -> anyhow::Result<()> + Send + Sync>;
 type AttentionHandler = Arc<dyn Fn() + Send + Sync>;
 
+/// How many recently handed-out cache paths are protected from eviction. One
+/// per clipboard the user could plausibly still paste from; a small ring keeps
+/// the protection from becoming a second, unbounded cache.
+const MAX_HELD_CACHE_PATHS: usize = 8;
+
 pub struct RelayState {
     config: RwLock<RelayConfig>,
     config_path: PathBuf,
+    actions_path: PathBuf,
+    share_cache: ShareCache,
     attempts: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// Action ids with an upload currently streaming to disk, mapped to the
+    /// size that upload declared. Guards against two concurrent uploads for
+    /// one action, marks their temporary files as live for the cache sweep,
+    /// and bounds the total bytes that may be in flight at once.
+    uploads: std::sync::Mutex<HashMap<Uuid, u64>>,
+    /// The single cache path most recently handed to a local command. The OS
+    /// clipboard holds exactly one entry, so this one is protected from
+    /// eviction unconditionally rather than through the bounded ring below.
+    pinned_cache_path: std::sync::Mutex<Option<PathBuf>>,
+    /// Cache paths recently handed to a local command. One of them may be
+    /// sitting on the system clipboard right now, where eviction would turn a
+    /// later paste into a silent no-op. Best effort: bounded, and the current
+    /// clipboard entry is pinned separately above.
+    held_cache_paths: std::sync::Mutex<VecDeque<PathBuf>>,
     action_handler: ActionHandler,
     pairing_attention_handler: AttentionHandler,
     mapping_attention_handler: AttentionHandler,
 }
 
+/// Releases an upload claim — and the in-flight bytes it reserved — on every
+/// exit path of `upload_file`, including early returns and panics.
+struct UploadClaim {
+    state: Arc<RelayState>,
+    action_id: Uuid,
+}
+
+impl Drop for UploadClaim {
+    fn drop(&mut self) {
+        self.state.uploads_lock().remove(&self.action_id);
+    }
+}
+
+/// Why an upload could not claim its slot.
+#[derive(Debug)]
+enum ClaimRefusal {
+    /// Another upload for the same action is already streaming.
+    InProgress,
+    /// Admitting this upload would push the total declared bytes currently
+    /// streaming past the share-cache ceiling. Carries the bytes already
+    /// claimed, for the response's details.
+    Capacity { in_flight: u64 },
+}
+
+/// Removes an in-flight upload's temporary file unless the upload finished and
+/// disarmed the guard.
+///
+/// The explicit error paths are not enough on their own: an axum handler future
+/// is dropped when the browser disconnects, and a graceful shutdown mid-upload
+/// drops it too. A leaked temporary counts toward the eviction total forever —
+/// eviction only removes cache *entries* — so enough debris would evict every
+/// real entry and still not fit.
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Called once the temporary file has been renamed into the cache and is
+    /// no longer ours to remove.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %self.path.display(), "failed to remove an abandoned Relay share upload");
+            }
+        }
+    }
+}
+
+/// Location verbs (`OpenFile`, `RevealInFolder`) act on the real file at its
+/// real path and prompt for a mapping when none resolves. Share verbs
+/// (`CopyToClipboard`) act on the bytes: a mapping is a silent optimization
+/// and its absence materializes a cache copy instead of prompting.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayAction {
     OpenFile,
     RevealInFolder,
+    CopyToClipboard,
+}
+
+impl RelayAction {
+    fn is_share_verb(self) -> bool {
+        matches!(self, RelayAction::CopyToClipboard)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,11 +618,52 @@ struct PairingRequest {
     roots: Vec<String>,
 }
 
+/// `sha256`/`filename`/`size` describe the *bytes* and are required by share
+/// verbs only; location verbs ignore them entirely.
 #[derive(Debug, Deserialize)]
 struct ActionRequest {
     action_id: Uuid,
     action: RelayAction,
     path: String,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+/// Validated share metadata of a `copy_to_clipboard` request.
+struct ShareMetadata {
+    sha256: String,
+    filename: String,
+    size: u64,
+}
+
+fn share_metadata(request: &ActionRequest) -> Result<ShareMetadata, &'static str> {
+    let sha256 = request.sha256.as_deref().unwrap_or_default();
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("sha256 must be 64 lowercase hexadecimal characters");
+    }
+    let filename = request.filename.as_deref().unwrap_or_default().trim();
+    if filename.is_empty() || filename.len() > MAX_SHARE_FILENAME_LEN {
+        return Err("filename must be non-empty and at most 255 bytes");
+    }
+    // Zero is a legitimate size: empty files exist, and every downstream rule
+    // (the upload ceiling, the size match, the cache lookup) handles 0 without
+    // a special case. Only a *missing* size is a protocol error, and serde
+    // already defaulted that to zero — an absent field and an explicit `0` are
+    // indistinguishable here and both mean "no bytes".
+    let size = request.size.unwrap_or_default();
+    Ok(ShareMetadata {
+        sha256: sha256.to_owned(),
+        filename: filename.to_owned(),
+        size,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,20 +681,29 @@ struct Health {
     version: &'static str,
     pairing: bool,
     relay_id: Uuid,
+    /// Optional capabilities beyond protocol v1. Clients treat an absent
+    /// field (an older relay) as an empty list.
+    features: &'static [&'static str],
 }
 
 impl RelayState {
     pub fn new(
         config: RelayConfig,
         config_path: PathBuf,
+        share_cache_root: PathBuf,
         action_handler: ActionHandler,
         pairing_attention_handler: AttentionHandler,
         mapping_attention_handler: AttentionHandler,
     ) -> Self {
         Self {
+            actions_path: actions_path(&config_path),
             config: RwLock::new(config),
             config_path,
+            share_cache: ShareCache::new(share_cache_root),
             attempts: Mutex::new(HashMap::new()),
+            uploads: std::sync::Mutex::new(HashMap::new()),
+            pinned_cache_path: std::sync::Mutex::new(None),
+            held_cache_paths: std::sync::Mutex::new(VecDeque::new()),
             action_handler,
             pairing_attention_handler,
             mapping_attention_handler,
@@ -344,14 +714,165 @@ impl RelayState {
         self.config.read().await.clone()
     }
 
+    /// A poisoned claim set only means some upload task panicked; the set
+    /// itself is a plain id/size map and stays usable.
+    fn uploads_lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, u64>> {
+        self.uploads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn in_flight_uploads(&self) -> HashSet<Uuid> {
+        self.uploads_lock().keys().copied().collect()
+    }
+
+    /// Claims the upload slot for `action_id` and reserves `size` bytes against
+    /// the global in-flight budget.
+    ///
+    /// The per-file admission check in `action()` bounds one upload; without a
+    /// budget nothing bounds their number, and a thousand parked actions could
+    /// stream terabytes to disk before a single eviction pass ran. `budget` is
+    /// the share-cache ceiling: the relay never has more bytes arriving than it
+    /// is willing to keep.
+    fn claim_upload(
+        self: &Arc<Self>,
+        action_id: Uuid,
+        size: u64,
+        budget: u64,
+    ) -> Result<UploadClaim, ClaimRefusal> {
+        let mut uploads = self.uploads_lock();
+        if uploads.contains_key(&action_id) {
+            return Err(ClaimRefusal::InProgress);
+        }
+        let in_flight = uploads
+            .values()
+            .copied()
+            .fold(0u64, |total, size| total.saturating_add(size));
+        if in_flight.saturating_add(size) > budget {
+            return Err(ClaimRefusal::Capacity { in_flight });
+        }
+        uploads.insert(action_id, size);
+        Ok(UploadClaim {
+            state: self.clone(),
+            action_id,
+        })
+    }
+
+    /// Records a cache path as live so eviction cannot pull it out from under
+    /// a clipboard entry. The newest path is also pinned on its own: the OS
+    /// clipboard holds exactly one entry, and losing *that* one to ring
+    /// pressure is the precise failure the ring exists to prevent.
+    fn hold_cache_path(&self, path: &Path) {
+        *self
+            .pinned_cache_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_path_buf());
+        let mut held = self
+            .held_cache_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.retain(|item| item != path);
+        held.push_back(path.to_path_buf());
+        while held.len() > MAX_HELD_CACHE_PATHS {
+            held.pop_front();
+        }
+    }
+
+    /// Forgets a cache path that is no longer live — its bytes are about to be
+    /// removed, so protecting them from eviction would only pin a file nothing
+    /// can reach.
+    fn release_cache_path(&self, path: &Path) {
+        let mut pinned = self
+            .pinned_cache_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pinned.as_deref() == Some(path) {
+            *pinned = None;
+        }
+        drop(pinned);
+        self.held_cache_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|item| item != path);
+    }
+
+    /// Removes a just-inserted cache entry whose action disappeared underneath
+    /// it — a revoke that completed while the upload was streaming. The bytes
+    /// were never handed to a local command, so nothing can be pasting them,
+    /// and leaving them would keep revoked content cached and pinned.
+    fn discard_cache_entry(&self, path: &Path) {
+        self.release_cache_path(path);
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "failed to discard an orphaned Relay share cache entry");
+            }
+        }
+        if let Some(parent) = path.parent() {
+            // Only succeeds once the hash directory is empty, which is exactly
+            // when it should disappear.
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
+    fn held_cache_paths(&self) -> Vec<PathBuf> {
+        let pinned = self
+            .pinned_cache_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut paths: Vec<PathBuf> = pinned.into_iter().collect();
+        for path in self
+            .held_cache_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+        paths
+    }
+
+    /// Runs a configured local command, converting a panic in the handler into
+    /// an ordinary failed action. Without this a panicking clipboard backend
+    /// would leave the record `Executing` — a state the TTL never prunes — and
+    /// the browser polling it forever.
+    fn run_handler(
+        &self,
+        action: RelayAction,
+        path: PathBuf,
+        command: CommandSpec,
+    ) -> anyhow::Result<()> {
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            (self.action_handler)(action, path, command)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("the local action crashed")))
+    }
+
+    fn persist_actions(&self, config: &RelayConfig) -> anyhow::Result<()> {
+        save_actions(&self.actions_path, &config.actions)
+    }
+
+    /// Persists whatever a `prune_config` pass may have dropped. Pruning
+    /// touches both files, and neither loss is worth failing a request over.
+    fn persist_pruned(&self, config: &RelayConfig) {
+        if let Err(error) = save_config(&self.config_path, config) {
+            tracing::warn!(%error, "failed to persist Relay state garbage collection");
+        }
+        if let Err(error) = self.persist_actions(config) {
+            tracing::warn!(%error, "failed to persist Relay action garbage collection");
+        }
+    }
+
     /// Return only fields safe to expose to the bundled control UI. In
     /// particular, credential hashes never cross the Rust command boundary.
     pub async fn status(&self) -> RelayStatusView {
         let mut config = self.config.write().await;
-        if prune_config(&mut config) {
-            if let Err(error) = save_config(&self.config_path, &config) {
-                tracing::warn!(%error, "failed to persist Relay state garbage collection");
-            }
+        if prune_config(&mut config, &self.in_flight_uploads()) {
+            self.persist_pruned(&config);
         }
         RelayStatusView {
             enabled: config.enabled,
@@ -388,6 +909,7 @@ impl RelayState {
                     ),
                 })
                 .collect(),
+            share_cache_max_bytes: config.share_cache_max_bytes,
         }
     }
 
@@ -405,7 +927,7 @@ impl RelayState {
                 };
             }
         }
-        save_config(&self.config_path, &config)
+        self.persist_actions(&config)
     }
 
     pub async fn set_enabled(&self, enabled: bool) -> anyhow::Result<()> {
@@ -414,8 +936,34 @@ impl RelayState {
         save_config(&self.config_path, &config)
     }
 
+    pub async fn set_share_cache_max_bytes(&self, max_bytes: u64) -> anyhow::Result<()> {
+        {
+            let mut config = self.config.write().await;
+            config.share_cache_max_bytes = max_bytes;
+            save_config(&self.config_path, &config)?;
+        }
+        // Eviction otherwise runs only inside `insert`, so lowering the ceiling
+        // would reclaim nothing until the next unmapped copy — and setting it
+        // to 0 (which refuses every new upload) would strand the existing cache
+        // with no way to clear it.
+        self.share_cache
+            .enforce_limit(max_bytes, &self.held_cache_paths());
+        Ok(())
+    }
+
+    /// Empties the share cache, keeping only what a paste may still need: the
+    /// pinned/held clipboard paths and temporary files belonging to uploads
+    /// still streaming. Returns the bytes it could not reclaim.
+    pub fn clear_share_cache(&self) -> u64 {
+        self.share_cache.enforce_limit(0, &self.held_cache_paths())
+    }
+
     pub async fn set_commands(&self, commands: FileActionCommands) -> anyhow::Result<()> {
-        for command in [&commands.open_file, &commands.reveal_in_folder] {
+        for (command, is_clipboard) in [
+            (&commands.open_file, false),
+            (&commands.reveal_in_folder, false),
+            (&commands.copy_to_clipboard, true),
+        ] {
             let contains_placeholder = command
                 .args
                 .iter()
@@ -456,6 +1004,20 @@ impl RelayState {
                     if !contains_placeholder {
                         bail!("custom actions must include a path placeholder");
                     }
+                    // The clipboard verb's placeholder values are quoted
+                    // automatically because its `{filename}` is remote-supplied
+                    // (it rides in on the upload). A quote in the template
+                    // itself would close that automatic quoting and hand the
+                    // attacker-authored filename tail to the shell unquoted, so
+                    // a correct clipboard template never quotes its own
+                    // placeholders. Location verbs are Raw-substituted and quote
+                    // their placeholders themselves, so this applies only here.
+                    if is_clipboard && clipboard_template_quotes_itself(command) {
+                        bail!(
+                            "the clipboard command's placeholders are quoted automatically; \
+                             remove the quotes from your shell command"
+                        );
+                    }
                 }
             }
         }
@@ -466,8 +1028,8 @@ impl RelayState {
 
     pub async fn pending(&self) -> Vec<PendingPairingView> {
         let mut config = self.config.write().await;
-        if prune_config(&mut config) {
-            let _ = save_config(&self.config_path, &config);
+        if prune_config(&mut config, &self.in_flight_uploads()) {
+            self.persist_pruned(&config);
         }
         let now = unix_now();
         config
@@ -552,7 +1114,7 @@ impl RelayState {
         mappings: Vec<PathMapping>,
     ) -> anyhow::Result<()> {
         let mut config = self.config.write().await;
-        prune_config(&mut config);
+        prune_config(&mut config, &self.in_flight_uploads());
         let Some(index) = config
             .pairing_operations
             .iter()
@@ -661,7 +1223,10 @@ impl RelayState {
         if config.instances.len() == old_len {
             bail!("Relay instance not found");
         }
-        save_config(&self.config_path, &config)
+        // Revocation changes both halves of the split state: the instance list
+        // in `relay.toml` and that instance's actions in the sidecar.
+        save_config(&self.config_path, &config)?;
+        self.persist_actions(&config)
     }
 
     pub async fn replace_mappings(
@@ -783,26 +1348,90 @@ impl RelayState {
                 bail!("mapped path is unavailable");
             }
             config.actions[index].state = ActionRecordState::Executing;
-            let command = match record.action {
-                RelayAction::OpenFile => config.commands.open_file.clone(),
-                RelayAction::RevealInFolder => config.commands.reveal_in_folder.clone(),
-            };
-            save_config(&self.config_path, &config)?;
+            let command = command_for(&config.commands, record.action);
+            // A persist failure here must not strand the record in `Executing`,
+            // which the TTL never prunes: roll it back to a bounded `Failed`
+            // before propagating the error.
+            if let Err(error) = self.persist_actions(&config) {
+                config.actions[index].state = ActionRecordState::Failed {
+                    code: "command_failed".into(),
+                    message: GENERIC_ACTION_FAILURE.into(),
+                };
+                return Err(error);
+            }
             (record.action, path, command)
         };
-        let result = (self.action_handler)(action, path, command);
+        let result = self.run_handler(action, path, command);
         let mut config = self.config.write().await;
         if let Some(record) = config.actions.iter_mut().find(|item| item.id == action_id) {
             record.state = match &result {
                 Ok(()) => ActionRecordState::Complete,
-                Err(error) => ActionRecordState::Failed {
-                    code: "command_failed".into(),
-                    message: error.to_string(),
-                },
+                Err(error) => {
+                    // The detailed error stays in the local log; the origin and
+                    // the persisted record get only the generic message.
+                    tracing::warn!(%error, %action_id, "Relay action failed");
+                    ActionRecordState::Failed {
+                        code: "command_failed".into(),
+                        message: GENERIC_ACTION_FAILURE.into(),
+                    }
+                }
             };
-            save_config(&self.config_path, &config)?;
+            self.persist_actions(&config)?;
         }
         result
+    }
+
+    /// Records the outcome of a handler invocation on an `Executing` record
+    /// and answers the browser with the record's new state. Shared by the
+    /// immediate action path and the upload path so both report failures
+    /// identically.
+    async fn complete_action(
+        &self,
+        action_id: Uuid,
+        result: anyhow::Result<()>,
+        origin: &str,
+    ) -> Response {
+        let mut config = self.config.write().await;
+        if let Some(record) = config.actions.iter_mut().find(|item| item.id == action_id) {
+            record.state = match &result {
+                Ok(()) => ActionRecordState::Complete,
+                Err(error) => {
+                    // The detailed error — which may embed this host's local
+                    // path — is logged locally only; the persisted record and
+                    // the polled status endpoint see only the generic message.
+                    tracing::warn!(%error, %action_id, "Relay action failed");
+                    ActionRecordState::Failed {
+                        code: "command_failed".into(),
+                        message: GENERIC_ACTION_FAILURE.into(),
+                    }
+                }
+            };
+        }
+        if let Err(error) = self.persist_actions(&config) {
+            tracing::warn!(%error, "failed to persist the Relay action outcome");
+        }
+        drop(config);
+        match result {
+            Ok(()) => with_cors(StatusCode::NO_CONTENT.into_response(), origin),
+            Err(error) => {
+                tracing::warn!(%error, "Relay action failed");
+                structured_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "command_failed",
+                    "local action failed",
+                    Some(origin),
+                    serde_json::json!({"action_id": action_id}),
+                )
+            }
+        }
+    }
+}
+
+fn command_for(commands: &FileActionCommands, action: RelayAction) -> CommandSpec {
+    match action {
+        RelayAction::OpenFile => commands.open_file.clone(),
+        RelayAction::RevealInFolder => commands.reveal_in_folder.clone(),
+        RelayAction::CopyToClipboard => commands.copy_to_clipboard.clone(),
     }
 }
 
@@ -880,6 +1509,17 @@ pub fn router(state: Arc<RelayState>) -> Router {
             "/v1/actions/{id}",
             get(action_status).options(action_options),
         )
+        // Uploads are streamed to disk and bounded by the action's declared
+        // size, so axum's 2 MiB default body limit — which the JSON routes
+        // keep — must not apply here. Raw `Body` extraction already bypasses
+        // it; disabling it explicitly keeps that independent of axum's
+        // internals.
+        .route(
+            "/v1/files/{id}",
+            post(upload_file)
+                .options(action_options)
+                .layer(DefaultBodyLimit::disable()),
+        )
         .with_state(state)
 }
 
@@ -890,6 +1530,7 @@ async fn health(State(state): State<Arc<RelayState>>, headers: HeaderMap) -> Res
         version: env!("CARGO_PKG_VERSION"),
         pairing: true,
         relay_id,
+        features: RELAY_FEATURES,
     })
     .into_response();
     let origin = headers
@@ -977,7 +1618,7 @@ async fn request_pairing(
     // recovered without eventually throttling its own idempotent retries.
     {
         let mut config = state.config.write().await;
-        if prune_config(&mut config) {
+        if prune_config(&mut config, &state.in_flight_uploads()) {
             if let Err(save_error) = save_config(&state.config_path, &config) {
                 return error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1035,7 +1676,7 @@ async fn request_pairing(
         values.push_back(now);
     }
     let mut config = state.config.write().await;
-    prune_config(&mut config);
+    prune_config(&mut config, &state.in_flight_uploads());
     if let Some(existing) = config
         .pairing_operations
         .iter()
@@ -1120,7 +1761,7 @@ async fn pairing_status(
         Err(response) => return response,
     };
     let mut config = state.config.write().await;
-    if prune_config(&mut config) {
+    if prune_config(&mut config, &state.in_flight_uploads()) {
         let _ = save_config(&state.config_path, &config);
     }
     let Some(item) = config.pairing_operations.iter().find(|item| item.id == id) else {
@@ -1331,6 +1972,22 @@ async fn action(
             Some(&origin),
         );
     }
+    let share = if request.action.is_share_verb() {
+        match share_metadata(&request) {
+            Ok(share) => Some(share),
+            Err(message) => {
+                return structured_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_share_metadata",
+                    message,
+                    Some(&origin),
+                    serde_json::json!({"action_id": request.action_id}),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let credential = match bearer_credential(&headers) {
         Some(value) => value,
         _ => {
@@ -1343,13 +2000,25 @@ async fn action(
             );
         }
     };
-    let mut config = state.config.write().await;
-    prune_config(&mut config);
-    let instance = config.instances.iter().find(|item| {
-        item.origins.iter().any(|allowed| allowed == &origin)
-            && verify_credential(&item.credential_hash, credential)
-    });
-    let Some(instance) = instance else {
+    // Argon2 verification is deliberately expensive and `/v1/actions` carries
+    // no rate limit of its own, so the configuration lock is released across
+    // it — and across the filesystem probing below. Holding the *write* lock
+    // there would let any local process stall the status UI, revocation,
+    // mapping edits and upload completion. Mirrors `auth_check` and
+    // `upload_file`.
+    let candidates = {
+        let config = state.config.read().await;
+        config
+            .instances
+            .iter()
+            .filter(|item| item.origins.iter().any(|allowed| allowed == &origin))
+            .map(|item| (item.id, item.credential_hash.clone(), item.mappings.clone()))
+            .collect::<Vec<_>>()
+    };
+    let Some((instance_id, credential_hash, mappings)) = candidates
+        .into_iter()
+        .find(|(_, hash, _)| verify_credential(hash, credential))
+    else {
         return structured_error(
             StatusCode::UNAUTHORIZED,
             "invalid_credential",
@@ -1358,8 +2027,42 @@ async fn action(
             serde_json::json!({}),
         );
     };
-    let instance_id = instance.id;
-    let mappings = instance.mappings.clone();
+    // Blocking IO, also outside every lock: `exists()` and the cache lookup can
+    // each stall on a cold disk or an unresponsive network mount.
+    let mapped = map_path(&request.path, &mappings);
+    let mapped_exists = mapped.as_ref().is_ok_and(|path| path.exists());
+    let share_local = share.as_ref().and_then(|share| {
+        mapped
+            .as_ref()
+            .ok()
+            .filter(|_| mapped_exists)
+            .cloned()
+            .or_else(|| {
+                state
+                    .share_cache
+                    .lookup(&share.sha256, &share.filename, share.size)
+            })
+    });
+    let mut config = state.config.write().await;
+    prune_config(&mut config, &state.in_flight_uploads());
+    // A revoke may have completed while Argon2 ran. Re-check the verified
+    // instance under the write lock, exactly as `auth_check` re-checks under
+    // its second read lock, so a pre-revocation snapshot cannot authorize an
+    // action after the revoke command has returned.
+    let still_paired = config.instances.iter().any(|item| {
+        item.id == instance_id
+            && item.credential_hash == credential_hash
+            && item.origins.iter().any(|allowed| allowed == &origin)
+    });
+    if !still_paired {
+        return structured_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credential",
+            "Relay credential is invalid or revoked",
+            Some(&origin),
+            serde_json::json!({}),
+        );
+    }
     if let Some(existing) = config
         .actions
         .iter()
@@ -1377,14 +2080,96 @@ async fn action(
         }
         return action_record_response(existing, &origin);
     }
-    if config.actions.len() >= MAX_ACTION_RECORDS {
+    if config.actions.len() >= MAX_ACTION_RECORDS && !evict_oldest_action(&mut config, &state) {
+        // Only reachable when every retained record is executing or has an
+        // upload streaming into it — i.e. a thousand simultaneous in-flight
+        // actions. Refusing is correct there; refusing merely because a
+        // thousand *finished* records accumulated would not be.
         return error(
             StatusCode::TOO_MANY_REQUESTS,
-            "too many retained Relay actions",
+            "too many Relay actions are in flight",
             Some(&origin),
         );
     }
-    let mapped = match map_path(&request.path, &mappings) {
+    // Share verbs move bytes, not locations: a resolved mapping is a silent
+    // optimization and a miss materializes a cache copy. They never create a
+    // `PendingMapping` record and never foreground the mapping window.
+    if let Some(share) = share {
+        let command = command_for(&config.commands, request.action);
+        let max_bytes = config.share_cache_max_bytes;
+        let Some(path) = share_local else {
+            // Admission control, decided before a record exists: a file that
+            // could never fit the cache must not park in `PendingBytes` and
+            // then fail after the browser has uploaded gigabytes. The client
+            // falls back to a plain download on this code. A resolved mapping
+            // or an existing cache entry is exempt — the ceiling governs what
+            // the Relay stores, and those paths store nothing.
+            //
+            // A ceiling of 0 disables caching outright rather than admitting
+            // zero-byte uploads, which is what the Desktop setting promises.
+            if max_bytes == 0 || share.size > max_bytes {
+                return structured_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "file_too_large",
+                    "the file is larger than the Relay's share cache limit",
+                    Some(&origin),
+                    serde_json::json!({"action_id": request.action_id, "size": share.size, "max": max_bytes}),
+                );
+            }
+            config.actions.push(ActionRecord {
+                id: request.action_id,
+                instance_id,
+                action: request.action,
+                remote_path: request.path.clone(),
+                created_unix: unix_now(),
+                state: ActionRecordState::PendingBytes {
+                    sha256: share.sha256.clone(),
+                    filename: share.filename.clone(),
+                    size: share.size,
+                },
+            });
+            if let Err(error_value) = state.persist_actions(&config) {
+                tracing::warn!(%error_value, "failed to persist a parked Relay share action");
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the Relay could not record this action",
+                    Some(&origin),
+                );
+            }
+            return bytes_required(request.action_id, &share.sha256, &share.filename, &origin);
+        };
+        config.actions.push(ActionRecord {
+            id: request.action_id,
+            instance_id,
+            action: request.action,
+            remote_path: request.path,
+            created_unix: unix_now(),
+            state: ActionRecordState::Executing,
+        });
+        if let Err(error_value) = state.persist_actions(&config) {
+            tracing::warn!(%error_value, "failed to persist a Relay share action");
+            // Drop the record just pushed: leaving it `Executing` would pin it
+            // forever under the state the TTL never prunes.
+            config.actions.retain(|item| item.id != request.action_id);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the Relay could not record this action",
+                Some(&origin),
+            );
+        }
+        drop(config);
+        // A cache hit is about to become a clipboard entry; protect it from
+        // eviction for as long as the ring holds it.
+        if path.starts_with(state.share_cache.root()) {
+            state.hold_cache_path(&path);
+        }
+        tracing::info!(%instance_id, action = ?request.action, "Relay share action authorized");
+        let result = state.run_handler(request.action, path, command);
+        return state
+            .complete_action(request.action_id, result, &origin)
+            .await;
+    }
+    let mapped = match mapped {
         Ok(path) => path,
         Err(_) => {
             config.actions.push(ActionRecord {
@@ -1395,10 +2180,11 @@ async fn action(
                 created_unix: unix_now(),
                 state: ActionRecordState::PendingMapping,
             });
-            if let Err(error_value) = save_config(&state.config_path, &config) {
+            if let Err(error_value) = state.persist_actions(&config) {
+                tracing::warn!(%error_value, "failed to persist a parked Relay action");
                 return error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    &error_value.to_string(),
+                    "the Relay could not record this action",
                     Some(&origin),
                 );
             }
@@ -1413,7 +2199,7 @@ async fn action(
             );
         }
     };
-    if !mapped.exists() {
+    if !mapped_exists {
         return structured_error(
             StatusCode::NOT_FOUND,
             "mapped_path_unavailable",
@@ -1422,10 +2208,7 @@ async fn action(
             serde_json::json!({"path":request.path}),
         );
     }
-    let command = match request.action {
-        RelayAction::OpenFile => config.commands.open_file.clone(),
-        RelayAction::RevealInFolder => config.commands.reveal_in_folder.clone(),
-    };
+    let command = command_for(&config.commands, request.action);
     config.actions.push(ActionRecord {
         id: request.action_id,
         instance_id,
@@ -1434,50 +2217,69 @@ async fn action(
         created_unix: unix_now(),
         state: ActionRecordState::Executing,
     });
-    if let Err(error_value) = save_config(&state.config_path, &config) {
+    if let Err(error_value) = state.persist_actions(&config) {
+        tracing::warn!(%error_value, "failed to persist a Relay action");
+        // Drop the record just pushed: leaving it `Executing` would pin it
+        // forever under the state the TTL never prunes.
+        config.actions.retain(|item| item.id != request.action_id);
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &error_value.to_string(),
+            "the Relay could not record this action",
             Some(&origin),
         );
     }
     drop(config);
     tracing::info!(%instance_id, action = ?request.action, "Relay action authorized");
-    match (state.action_handler)(request.action, mapped, command) {
-        Ok(()) => {
-            let mut config = state.config.write().await;
-            if let Some(record) = config
-                .actions
-                .iter_mut()
-                .find(|item| item.id == request.action_id)
-            {
-                record.state = ActionRecordState::Complete;
-            }
-            let _ = save_config(&state.config_path, &config);
-            with_cors(StatusCode::NO_CONTENT.into_response(), &origin)
+    let result = state.run_handler(request.action, mapped, command);
+    state
+        .complete_action(request.action_id, result, &origin)
+        .await
+}
+
+/// Index of the oldest record that may be dropped to make room.
+///
+/// `terminal_only` restricts the search to records nothing is waiting on. A
+/// `PendingMapping` may be on screen in the mapping window right now (evicting
+/// it silently discards the folder the user is choosing) and a `PendingBytes`
+/// may be in the window between its `bytes_required` 409 and the upload that
+/// answers it (evicting it turns that upload into a bare 404), so both are
+/// candidates only when nothing has finished.
+fn oldest_evictable_action(
+    config: &RelayConfig,
+    in_flight: &HashSet<Uuid>,
+    terminal_only: bool,
+) -> Option<usize> {
+    config
+        .actions
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            !matches!(item.state, ActionRecordState::Executing)
+                && !in_flight.contains(&item.id)
+                && (!terminal_only
+                    || matches!(
+                        item.state,
+                        ActionRecordState::Complete | ActionRecordState::Failed { .. }
+                    ))
+        })
+        .min_by_key(|(_, item)| item.created_unix)
+        .map(|(index, _)| index)
+}
+
+/// Makes room for one more action record by dropping the oldest finished one,
+/// falling back to the oldest record that is neither running a local command
+/// nor receiving an upload. Returns `false` only when every retained record is
+/// one of those.
+fn evict_oldest_action(config: &mut RelayConfig, state: &RelayState) -> bool {
+    let in_flight = state.in_flight_uploads();
+    let oldest = oldest_evictable_action(config, &in_flight, true)
+        .or_else(|| oldest_evictable_action(config, &in_flight, false));
+    match oldest {
+        Some(index) => {
+            config.actions.remove(index);
+            true
         }
-        Err(error_value) => {
-            tracing::warn!(%instance_id, error = %error_value, "Relay action failed");
-            let mut config = state.config.write().await;
-            if let Some(record) = config
-                .actions
-                .iter_mut()
-                .find(|item| item.id == request.action_id)
-            {
-                record.state = ActionRecordState::Failed {
-                    code: "command_failed".into(),
-                    message: error_value.to_string(),
-                };
-            }
-            let _ = save_config(&state.config_path, &config);
-            structured_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "command_failed",
-                "local action failed",
-                Some(&origin),
-                serde_json::json!({}),
-            )
-        }
+        None => false,
     }
 }
 
@@ -1530,6 +2332,342 @@ async fn action_status(
     action_record_response(record, &origin)
 }
 
+enum UploadFailure {
+    /// More bytes arrived than the action declared, plus slack.
+    TooLarge,
+    /// The browser's request body ended early or errored.
+    Stream(String),
+    /// The relay could not write its own cache. Carries the real error for
+    /// the local log only — the origin is told nothing about this host's
+    /// filesystem.
+    Io(std::io::Error),
+}
+
+/// What arrived on the wire: the byte count and the hash of those exact bytes.
+struct UploadDigest {
+    written: u64,
+    sha256: String,
+}
+
+/// Streams a request body to `temp`, refusing to write more than `ceiling` and
+/// hashing every byte on the way past.
+///
+/// The file handle is always dropped before returning so the caller can
+/// delete the temporary file on Windows, where an open handle blocks removal.
+async fn stream_to_temp(
+    mut body: Body,
+    temp: &Path,
+    ceiling: u64,
+) -> Result<UploadDigest, UploadFailure> {
+    // `create_new` rather than `create`: two writers must never share one
+    // temporary file. The in-flight claim set makes that unreachable, and this
+    // turns "unreachable" into "impossible".
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp)
+        .await
+        .map_err(UploadFailure::Io)?;
+    let mut written: u64 = 0;
+    let mut hasher = Sha256::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| UploadFailure::Stream(error.to_string()))?;
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        written = written.saturating_add(chunk.len() as u64);
+        if written > ceiling {
+            return Err(UploadFailure::TooLarge);
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(UploadFailure::Io)?;
+    }
+    file.sync_all().await.map_err(UploadFailure::Io)?;
+    Ok(UploadDigest {
+        written,
+        sha256: hex_digest(hasher.finalize().as_slice()),
+    })
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// `POST /v1/files/{id}` — the browser-push leg of a share verb, reached only
+/// after the action parked in `PendingBytes`.
+///
+/// Every failure leaves the record in `PendingBytes` and removes the partial
+/// temporary file, so the browser can simply retry the upload.
+async fn upload_file(
+    State(state): State<Arc<RelayState>>,
+    AxumPath(raw_id): AxumPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let origin = match validated_origin(&headers, None) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    // The id is extracted as a string and parsed here rather than through
+    // `Path<Uuid>`: axum's own rejection is a bare 400 with no CORS header,
+    // which a browser reports as an opaque network failure instead of a
+    // readable error.
+    let Ok(id) = Uuid::parse_str(&raw_id) else {
+        return structured_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_action_id",
+            "the action id is not a UUID",
+            Some(&origin),
+            serde_json::json!({}),
+        );
+    };
+    let credential = match bearer_credential(&headers) {
+        Some(value) => value,
+        None => {
+            return structured_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credential",
+                "Relay credential is required",
+                Some(&origin),
+                serde_json::json!({}),
+            );
+        }
+    };
+    // Argon2 verification is deliberately expensive; the configuration lock is
+    // released before it runs so that a revoke or a mapping edit is never
+    // blocked behind an upload's authentication.
+    let credential_hash = {
+        let config = state.config.read().await;
+        let Some(record) = config.actions.iter().find(|item| item.id == id) else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "Relay action not found",
+                Some(&origin),
+            );
+        };
+        config
+            .instances
+            .iter()
+            .find(|item| {
+                item.id == record.instance_id && item.origins.iter().any(|value| value == &origin)
+            })
+            .map(|item| item.credential_hash.clone())
+    };
+    let authorized = credential_hash
+        .as_deref()
+        .is_some_and(|hash| verify_credential(hash, credential));
+    if !authorized {
+        return structured_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credential",
+            "Relay credential is invalid or revoked",
+            Some(&origin),
+            serde_json::json!({}),
+        );
+    }
+    let (sha256, filename, size, max_bytes) = {
+        let config = state.config.read().await;
+        let Some(record) = config.actions.iter().find(|item| item.id == id) else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "Relay action not found",
+                Some(&origin),
+            );
+        };
+        match &record.state {
+            ActionRecordState::PendingBytes {
+                sha256,
+                filename,
+                size,
+            } => (
+                sha256.clone(),
+                filename.clone(),
+                *size,
+                config.share_cache_max_bytes,
+            ),
+            // Any other state answers with the record's own status, which is
+            // also the idempotent answer to a retried upload.
+            _ => return action_record_response(record, &origin),
+        }
+    };
+    // The ceiling may have been lowered to 0 — caching disabled — after this
+    // record parked. Refuse before the bytes move, with the same code the
+    // action-time admission check uses, so the client falls back to a download.
+    if max_bytes == 0 {
+        return structured_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file_too_large",
+            "the Relay's share cache is disabled",
+            Some(&origin),
+            serde_json::json!({"action_id": id, "size": size, "max": max_bytes}),
+        );
+    }
+    // Claimed after the state check so a retry against a finished action still
+    // gets its idempotent answer rather than a spurious conflict. The guard
+    // releases the claim — and the bytes it reserved — on every exit path below.
+    let _claim = match state.claim_upload(id, size, max_bytes) {
+        Ok(claim) => claim,
+        Err(ClaimRefusal::InProgress) => {
+            return structured_error(
+                StatusCode::CONFLICT,
+                "upload_in_progress",
+                "another upload for this action is already in progress",
+                Some(&origin),
+                serde_json::json!({"action_id": id}),
+            );
+        }
+        Err(ClaimRefusal::Capacity { in_flight }) => {
+            return structured_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "upload_capacity_exhausted",
+                "too many Relay share uploads are already in flight",
+                Some(&origin),
+                serde_json::json!({"action_id": id, "size": size, "in_flight": in_flight, "max": max_bytes}),
+            );
+        }
+    };
+
+    // The guard removes the temporary file unless the upload completes and
+    // disarms it: an axum handler future is dropped outright when the browser
+    // disconnects, so the explicit error paths below cannot be the only
+    // cleanup.
+    let mut temp = TempFileGuard::new(state.share_cache.new_temp_path(id));
+    if let Err(error_value) = tokio::fs::create_dir_all(state.share_cache.root()).await {
+        tracing::warn!(error = %error_value, path = %state.share_cache.root().display(), "failed to create the Relay share cache directory");
+        return upload_storage_failed(id, &origin);
+    }
+    let digest = match stream_to_temp(body, temp.path(), size.saturating_add(UPLOAD_SIZE_SLACK))
+        .await
+    {
+        Ok(digest) => digest,
+        Err(failure) => {
+            return match failure {
+                UploadFailure::TooLarge => structured_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "upload_too_large",
+                    "the upload is larger than the declared file size",
+                    Some(&origin),
+                    serde_json::json!({"action_id": id, "size": size}),
+                ),
+                UploadFailure::Stream(message) => structured_error(
+                    StatusCode::BAD_REQUEST,
+                    "upload_failed",
+                    &message,
+                    Some(&origin),
+                    serde_json::json!({"action_id": id}),
+                ),
+                UploadFailure::Io(error_value) => {
+                    tracing::warn!(error = %error_value, path = %temp.path().display(), "failed to write a Relay share upload");
+                    upload_storage_failed(id, &origin)
+                }
+            };
+        }
+    };
+    if digest.written != size {
+        return structured_error(
+            StatusCode::BAD_REQUEST,
+            "size_mismatch",
+            "the upload did not match the declared file size",
+            Some(&origin),
+            serde_json::json!({"action_id": id, "size": size, "received": digest.written}),
+        );
+    }
+    // The cache is content-addressed and its entries are handed to local
+    // commands by path. Trusting the origin's `sha256` without checking it
+    // would let one action poison the entry every later action resolves to.
+    if digest.sha256 != sha256 {
+        return structured_error(
+            StatusCode::BAD_REQUEST,
+            "hash_mismatch",
+            "the upload did not match the declared file hash",
+            Some(&origin),
+            serde_json::json!({"action_id": id, "sha256": sha256}),
+        );
+    }
+    let path = match state.share_cache.insert(
+        temp.path(),
+        &sha256,
+        &filename,
+        max_bytes,
+        &state.held_cache_paths(),
+        &state.in_flight_uploads(),
+    ) {
+        Ok(path) => path,
+        Err(error_value) => {
+            tracing::warn!(error = %error_value, "failed to store a Relay share upload in the cache");
+            return upload_storage_failed(id, &origin);
+        }
+    };
+    // The bytes are in the cache under their own name now; the guard has
+    // nothing left to remove.
+    temp.disarm();
+    state.hold_cache_path(&path);
+
+    let (action, command) = {
+        let mut config = state.config.write().await;
+        let found = config.actions.iter().position(|item| item.id == id);
+        let Some(index) = found else {
+            // The record disappeared while the bytes were streaming — a revoke
+            // that completed mid-upload. Nothing was handed to a local command,
+            // so drop the entry rather than leave revoked content cached and
+            // pinned against eviction.
+            drop(config);
+            state.discard_cache_entry(&path);
+            return error(
+                StatusCode::NOT_FOUND,
+                "Relay action not found",
+                Some(&origin),
+            );
+        };
+        let record = &mut config.actions[index];
+        record.state = ActionRecordState::Executing;
+        // The long `PendingBytes` TTL ends here: from now on the record ages
+        // out like any other finished action.
+        record.created_unix = unix_now();
+        let action = record.action;
+        let command = command_for(&config.commands, action);
+        if let Err(error_value) = state.persist_actions(&config) {
+            tracing::warn!(%error_value, "failed to persist a Relay upload transition");
+            // Roll the record back off `Executing` — the one state the TTL
+            // never prunes — to a bounded `Failed` before returning.
+            if let Some(record) = config.actions.iter_mut().find(|item| item.id == id) {
+                record.state = ActionRecordState::Failed {
+                    code: "command_failed".into(),
+                    message: GENERIC_ACTION_FAILURE.into(),
+                };
+            }
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the Relay could not record this action",
+                Some(&origin),
+            );
+        }
+        (action, command)
+    };
+    tracing::info!(action_id = %id, action = ?action, "Relay share upload complete");
+    let result = state.run_handler(action, path, command);
+    state.complete_action(id, result, &origin).await
+}
+
+/// One opaque answer for every way the Relay's own storage can fail. The real
+/// `io::Error` and its path stay in the local log: a remote origin has no
+/// business learning this machine's directory layout or disk state.
+fn upload_storage_failed(action_id: Uuid, origin: &str) -> Response {
+    structured_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "upload_failed",
+        "the Relay could not store the upload",
+        Some(origin),
+        serde_json::json!({"action_id": action_id}),
+    )
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1537,7 +2675,15 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-fn prune_config(config: &mut RelayConfig) -> bool {
+/// Drops expired pairing operations and action records.
+///
+/// `in_flight` are the action ids currently receiving an upload. A parked
+/// record's `created_unix` is only refreshed once its upload *completes*, so an
+/// upload that legitimately outruns [`PENDING_BYTES_TTL_SECS`] (a slow link, a
+/// multi-gigabyte original) would otherwise have its record pruned mid-flight:
+/// the bytes still land in the cache and the final lookup 404s, wasting the
+/// whole transfer.
+fn prune_config(config: &mut RelayConfig, in_flight: &HashSet<Uuid>) -> bool {
     let now = unix_now();
     let old_operations = config.pairing_operations.len();
     config.pairing_operations.retain(|item| match item.state {
@@ -1550,9 +2696,24 @@ fn prune_config(config: &mut RelayConfig) -> bool {
         PairingOperationState::ApprovedUnconfirmed { .. } => true,
     });
     let old_actions = config.actions.len();
-    config
-        .actions
-        .retain(|item| item.created_unix + ACTION_TTL_SECS > now);
+    // A multi-gigabyte materialization can legitimately outlive the ordinary
+    // action TTL, so a record waiting for its bytes gets a longer one of its
+    // own rather than no expiry at all — an abandoned browser tab must not
+    // pin a record forever. `created_unix` is refreshed when the upload
+    // completes, so the finished record ages out normally.
+    //
+    // `Executing` is the one genuinely unbounded state: the local command's
+    // runtime is not ours to predict, and dropping the record mid-command
+    // would strand the browser polling it. Its recovery is not a TTL but
+    // `recover_interrupted_actions`, which demotes anything still `Executing`
+    // at startup.
+    config.actions.retain(|item| match &item.state {
+        ActionRecordState::Executing => true,
+        ActionRecordState::PendingBytes { .. } => {
+            in_flight.contains(&item.id) || item.created_unix + PENDING_BYTES_TTL_SECS > now
+        }
+        _ => item.created_unix + ACTION_TTL_SECS > now,
+    });
     old_operations != config.pairing_operations.len() || old_actions != config.actions.len()
 }
 
@@ -1593,11 +2754,25 @@ fn bearer_credential(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// The share-verb counterpart of `mapping_required`: the relay has no local
+/// copy of these bytes and the browser must push them to
+/// `POST /v1/files/{action_id}`.
+fn bytes_required(action_id: Uuid, sha256: &str, filename: &str, origin: &str) -> Response {
+    structured_error(
+        StatusCode::CONFLICT,
+        "bytes_required",
+        "Upload the file to complete this action",
+        Some(origin),
+        serde_json::json!({"action_id": action_id, "sha256": sha256, "filename": filename}),
+    )
+}
+
 fn action_record_response(record: &ActionRecord, origin: &str) -> Response {
     match &record.state {
         ActionRecordState::PendingMapping => with_cors((StatusCode::CONFLICT, Json(serde_json::json!({
             "error": { "code": "mapping_required", "message": "Choose the local folder corresponding to this server path", "details": { "path": record.remote_path, "instance_id": record.instance_id, "action_id": record.id } }
         }))).into_response(), origin),
+        ActionRecordState::PendingBytes { sha256, filename, .. } => bytes_required(record.id, sha256, filename, origin),
         ActionRecordState::Executing => with_cors(
             (StatusCode::ACCEPTED, Json(serde_json::json!({"status":"executing"}))).into_response(),
             origin,
@@ -1692,8 +2867,19 @@ fn verify_credential(hash: &str, credential: &str) -> bool {
     })
 }
 
+/// Writes `relay.toml`. Action records are excluded by
+/// `#[serde(skip_serializing)]` and belong to [`save_actions`].
 fn save_config(path: &Path, config: &RelayConfig) -> anyhow::Result<()> {
     atomic_write(path, toml::to_string_pretty(config)?.as_bytes())
+}
+
+/// Writes the action sidecar. Same atomic, owner-private write as
+/// `relay.toml`, and the same directory.
+fn save_actions(path: &Path, actions: &[ActionRecord]) -> anyhow::Result<()> {
+    let file = ActionsFile {
+        actions: actions.to_vec(),
+    };
+    atomic_write(path, toml::to_string_pretty(&file)?.as_bytes())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1814,14 +3000,171 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::ServiceExt as _;
 
+    /// `load_config` for tests that do not care about the repair warnings it
+    /// may report; the tests that do call `load_config` directly.
+    fn load(path: &Path) -> anyhow::Result<RelayConfig> {
+        load_config(path, false, &mut Vec::new())
+    }
+
     fn test_state(temp: &tempfile::TempDir) -> Arc<RelayState> {
         Arc::new(RelayState::new(
             RelayConfig::desktop_default(false),
             temp.path().join("relay.toml"),
+            temp.path().join("share-cache"),
             Arc::new(|_, _, _| Ok(())),
             Arc::new(|| {}),
             Arc::new(|| {}),
         ))
+    }
+
+    const TEST_CREDENTIAL: &str = "test-credential";
+    const TEST_ORIGIN: &str = "https://remote.example";
+    /// The bytes every share test uploads, and their real digest. The relay
+    /// verifies the hash of what arrives, so a fixture whose declared sha256
+    /// is decorative would only ever exercise the rejection path.
+    const FIXTURE: &[u8] = b"fixture";
+    const TEST_SHA: &str = "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d";
+    /// A syntactically valid digest that matches no fixture.
+    const WRONG_SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn the_fixture_digest_is_the_real_one() {
+        assert_eq!(hex_digest(Sha256::digest(FIXTURE).as_slice()), TEST_SHA);
+    }
+
+    struct ShareFixture {
+        state: Arc<RelayState>,
+        /// Paths the action handler was invoked with, in order.
+        calls: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        /// Times the mapping window was asked for attention. A share verb
+        /// must never raise it.
+        mapping_attention: Arc<AtomicUsize>,
+    }
+
+    fn share_fixture(temp: &tempfile::TempDir, mappings: Vec<PathMapping>) -> ShareFixture {
+        share_fixture_with(temp, mappings, default_share_cache_max_bytes(), None)
+    }
+
+    fn share_fixture_with(
+        temp: &tempfile::TempDir,
+        mappings: Vec<PathMapping>,
+        share_cache_max_bytes: u64,
+        handler: Option<ActionHandler>,
+    ) -> ShareFixture {
+        let salt = SaltString::encode_b64(b"0123456789abcdef").unwrap();
+        let credential_hash = Argon2::default()
+            .hash_password(TEST_CREDENTIAL.as_bytes(), &salt)
+            .unwrap()
+            .to_string();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let mapping_attention = Arc::new(AtomicUsize::new(0));
+        let attention = mapping_attention.clone();
+        let state = Arc::new(RelayState::new(
+            RelayConfig {
+                relay_id: Uuid::new_v4(),
+                enabled: true,
+                bind: default_bind(),
+                instances: vec![RelayInstance {
+                    id: Uuid::new_v4(),
+                    name: "remote".into(),
+                    server_url: TEST_ORIGIN.into(),
+                    origins: vec![TEST_ORIGIN.into()],
+                    credential_hash,
+                    mappings,
+                }],
+                commands: FileActionCommands::default(),
+                share_cache_max_bytes,
+                pairing_operations: Vec::new(),
+                actions: Vec::new(),
+            },
+            temp.path().join("relay.toml"),
+            temp.path().join("share-cache"),
+            handler.unwrap_or_else(|| {
+                Arc::new(move |_, path: PathBuf, _| {
+                    recorded.lock().unwrap().push(path);
+                    Ok(())
+                })
+            }),
+            Arc::new(|| {}),
+            Arc::new(move || {
+                attention.fetch_add(1, Ordering::Release);
+            }),
+        ));
+        ShareFixture {
+            state,
+            calls,
+            mapping_attention,
+        }
+    }
+
+    fn authorized(method: &str, uri: String) -> axum::http::request::Builder {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::ORIGIN, TEST_ORIGIN)
+            .header(header::AUTHORIZATION, format!("Bearer {TEST_CREDENTIAL}"))
+    }
+
+    fn copy_request(action_id: Uuid, path: &str, filename: &str, size: u64) -> Request<Body> {
+        copy_request_with_sha(action_id, path, filename, size, TEST_SHA)
+    }
+
+    fn copy_request_with_sha(
+        action_id: Uuid,
+        path: &str,
+        filename: &str,
+        size: u64,
+        sha256: &str,
+    ) -> Request<Body> {
+        authorized("POST", "/v1/actions".into())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "action_id": action_id,
+                    "action": "copy_to_clipboard",
+                    "path": path,
+                    "sha256": sha256,
+                    "filename": filename,
+                    "size": size,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn upload_request(action_id: Uuid, bytes: Vec<u8>) -> Request<Body> {
+        authorized("POST", format!("/v1/files/{action_id}"))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(bytes))
+            .unwrap()
+    }
+
+    fn action_status_request(action_id: Uuid) -> Request<Body> {
+        authorized("GET", format!("/v1/actions/{action_id}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Temporary upload files still present in the cache root. Names are
+    /// unique per attempt, so "the temp was cleaned up" is a statement about
+    /// the directory rather than about one predictable path.
+    fn leftover_temp_files(state: &RelayState) -> Vec<PathBuf> {
+        std::fs::read_dir(state.share_cache.root())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-"))
+            })
+            .collect()
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     fn pairing_request(origin: &str, name: &str) -> Request<Body> {
@@ -1864,6 +3207,7 @@ mod tests {
         let state = Arc::new(RelayState::new(
             RelayConfig::desktop_default(false),
             temp.path().join("relay.toml"),
+            temp.path().join("share-cache"),
             Arc::new(|_, _, _| Ok(())),
             Arc::new(move || {
                 attention.fetch_add(1, Ordering::Release);
@@ -2008,7 +3352,7 @@ mod tests {
         let path = temp.path().join("relay.toml");
         std::fs::write(&path, "bind = '127.0.0.1:17600'\n").unwrap();
 
-        let migrated = load_config(&path, false).unwrap();
+        let migrated = load(&path).unwrap();
         assert_eq!(migrated.bind, PRODUCTION_DEFAULT_BIND);
         assert!(
             std::fs::read_to_string(&path)
@@ -2017,7 +3361,7 @@ mod tests {
         );
 
         std::fs::write(&path, "bind = '127.0.0.1:18000'\n").unwrap();
-        let custom = load_config(&path, false).unwrap();
+        let custom = load(&path).unwrap();
         assert_eq!(custom.bind, "127.0.0.1:18000");
     }
 
@@ -2280,10 +3624,12 @@ mod tests {
                     }],
                 }],
                 commands: FileActionCommands::default(),
+                share_cache_max_bytes: default_share_cache_max_bytes(),
                 pairing_operations: Vec::new(),
                 actions: Vec::new(),
             },
             temp.path().join("relay.toml"),
+            temp.path().join("share-cache"),
             Arc::new(move |_, _, _| {
                 invoked_for_action.store(true, Ordering::Release);
                 Ok(())
@@ -2349,10 +3695,12 @@ mod tests {
                     mappings: Vec::new(),
                 }],
                 commands: FileActionCommands::default(),
+                share_cache_max_bytes: default_share_cache_max_bytes(),
                 pairing_operations: Vec::new(),
                 actions: Vec::new(),
             },
             temp.path().join("relay.toml"),
+            temp.path().join("share-cache"),
             Arc::new(move |_, _, _| {
                 invoked_for_action.store(true, Ordering::Release);
                 Ok(())
@@ -2399,5 +3747,1268 @@ mod tests {
             .unwrap();
         assert!(invoked.load(Ordering::Acquire));
         assert!(state.status().await.pending_actions.is_empty());
+    }
+
+    /// Capability advertisement: a client that sees no `features` array is
+    /// talking to a relay that predates share verbs.
+    #[tokio::test]
+    async fn health_advertises_the_clipboard_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let request = Request::builder()
+            .uri("/v1/health")
+            .body(Body::empty())
+            .unwrap();
+        let health = json_body(router(state).oneshot(request).await.unwrap()).await;
+        assert_eq!(health["features"], serde_json::json!(["copy_to_clipboard"]));
+    }
+
+    /// A share verb whose path maps to an existing local file is executed
+    /// against the real file: nothing is cached and no bytes move.
+    #[tokio::test]
+    async fn share_verb_uses_a_resolved_mapping_without_caching() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("fixture.bin");
+        std::fs::write(&file, b"fixture").unwrap();
+        let fixture = share_fixture(
+            &temp,
+            vec![PathMapping {
+                remote: "/remote".into(),
+                local: temp.path().display().to_string(),
+            }],
+        );
+
+        let response = router(fixture.state.clone())
+            .oneshot(copy_request(
+                Uuid::new_v4(),
+                "/remote/fixture.bin",
+                "fixture.bin",
+                7,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            TEST_ORIGIN
+        );
+        assert_eq!(*fixture.calls.lock().unwrap(), vec![file]);
+        assert!(
+            !fixture.state.share_cache.root().exists(),
+            "a mapped share verb must not materialize a cache copy"
+        );
+        assert_eq!(fixture.mapping_attention.load(Ordering::Acquire), 0);
+    }
+
+    /// Without a mapping and without cached bytes the action parks in
+    /// `PendingBytes`: never a mapping prompt, invisible to the mapping
+    /// window, and idempotent for a repeated action id.
+    #[tokio::test]
+    async fn share_verb_without_bytes_parks_and_repeats_the_same_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+        let action_id = Uuid::new_v4();
+        let request = || copy_request(action_id, "/unmapped/fixture.bin", "fixture.bin", 7);
+
+        for _ in 0..2 {
+            let response = router(fixture.state.clone())
+                .oneshot(request())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["code"], "bytes_required");
+            assert_eq!(body["error"]["details"]["action_id"], action_id.to_string());
+            assert_eq!(body["error"]["details"]["sha256"], TEST_SHA);
+            assert_eq!(body["error"]["details"]["filename"], "fixture.bin");
+        }
+        assert!(fixture.calls.lock().unwrap().is_empty());
+        assert_eq!(fixture.mapping_attention.load(Ordering::Acquire), 0);
+        assert!(
+            fixture.state.status().await.pending_actions.is_empty(),
+            "PendingBytes must stay invisible to the mapping window"
+        );
+
+        // Share metadata is mandatory for the verb.
+        let invalid = authorized("POST", "/v1/actions".into())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"action_id": Uuid::new_v4(), "action": "copy_to_clipboard", "path": "/unmapped/fixture.bin"})
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = router(fixture.state).oneshot(invalid).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "invalid_share_metadata"
+        );
+    }
+
+    /// The upload completes the parked action against the cache copy, and the
+    /// next action for the same content is served from that copy directly.
+    #[tokio::test]
+    async fn upload_completes_the_action_and_the_next_one_hits_the_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+        let action_id = Uuid::new_v4();
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(copy_request(
+                    action_id,
+                    "/unmapped/fixture.bin",
+                    "fixture.bin",
+                    7
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let response = router(fixture.state.clone())
+            .oneshot(upload_request(action_id, FIXTURE.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            TEST_ORIGIN
+        );
+        let cached = fixture
+            .state
+            .share_cache
+            .entry_path(TEST_SHA, "fixture.bin");
+        assert_eq!(std::fs::read(&cached).unwrap(), FIXTURE);
+        assert_eq!(*fixture.calls.lock().unwrap(), vec![cached.clone()]);
+        assert!(leftover_temp_files(&fixture.state).is_empty());
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(action_status_request(action_id))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        // Same content, new action: the cache answers immediately.
+        let repeat = Uuid::new_v4();
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(copy_request(
+                    repeat,
+                    "/unmapped/other/fixture.bin",
+                    "fixture.bin",
+                    7
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(*fixture.calls.lock().unwrap(), vec![cached.clone(), cached]);
+    }
+
+    /// An upload larger than the declared size plus slack is refused, the
+    /// partial file is removed, and the record stays uploadable.
+    #[tokio::test]
+    async fn oversize_upload_is_refused_and_the_action_stays_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+        let action_id = Uuid::new_v4();
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(copy_request(
+                    action_id,
+                    "/unmapped/fixture.bin",
+                    "fixture.bin",
+                    7
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let oversize = vec![b'x'; (UPLOAD_SIZE_SLACK + 8) as usize];
+        let response = router(fixture.state.clone())
+            .oneshot(upload_request(action_id, oversize))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "upload_too_large"
+        );
+        assert!(leftover_temp_files(&fixture.state).is_empty());
+        assert!(
+            !fixture
+                .state
+                .share_cache
+                .entry_path(TEST_SHA, "fixture.bin")
+                .exists()
+        );
+        assert!(fixture.calls.lock().unwrap().is_empty());
+
+        // Still `PendingBytes`, so the browser can retry the upload.
+        let status = router(fixture.state.clone())
+            .oneshot(action_status_request(action_id))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(status).await["error"]["code"], "bytes_required");
+
+        // A short body is equally rejected and equally retryable.
+        let short = router(fixture.state.clone())
+            .oneshot(upload_request(action_id, b"frag".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(short.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(short).await["error"]["code"], "size_mismatch");
+        assert!(leftover_temp_files(&fixture.state).is_empty());
+    }
+
+    /// Uploads are bound to the credential and to a `PendingBytes` record;
+    /// a location verb awaiting a mapping still answers `mapping_required`.
+    #[tokio::test]
+    async fn upload_rejects_unknown_actions_bad_credentials_and_wrong_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(upload_request(Uuid::new_v4(), b"x".to_vec()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // A malformed id is answered by us, not by axum's extractor: the
+        // rejection must still carry CORS or the browser sees only an opaque
+        // network failure.
+        let malformed = authorized("POST", "/v1/files/not-a-uuid".into())
+            .body(Body::from("x"))
+            .unwrap();
+        let response = router(fixture.state.clone())
+            .oneshot(malformed)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            TEST_ORIGIN
+        );
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "invalid_action_id"
+        );
+
+        // Location verbs are untouched by the share flow: still a mapping
+        // prompt, still a `PendingMapping` record.
+        let open_id = Uuid::new_v4();
+        let open = authorized("POST", "/v1/actions".into())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"action_id": open_id, "action": "open_file", "path": "/unmapped/fixture.bin"})
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = router(fixture.state.clone()).oneshot(open).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "mapping_required"
+        );
+        assert_eq!(fixture.mapping_attention.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.state.status().await.pending_actions.len(), 1);
+
+        let wrong_state = router(fixture.state.clone())
+            .oneshot(upload_request(open_id, b"x".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(wrong_state.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(wrong_state).await["error"]["code"],
+            "mapping_required"
+        );
+
+        let unauthorized = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/files/{open_id}"))
+            .header(header::ORIGIN, TEST_ORIGIN)
+            .header(header::AUTHORIZATION, "Bearer wrong-credential")
+            .body(Body::from("x"))
+            .unwrap();
+        assert_eq!(
+            router(fixture.state)
+                .oneshot(unauthorized)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    fn parked_record(created_unix: i64) -> ActionRecord {
+        ActionRecord {
+            id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            action: RelayAction::CopyToClipboard,
+            remote_path: "/remote/fixture.bin".into(),
+            created_unix,
+            state: ActionRecordState::PendingBytes {
+                sha256: TEST_SHA.into(),
+                filename: "fixture.bin".into(),
+                size: FIXTURE.len() as u64,
+            },
+        }
+    }
+
+    /// A materialization may legitimately outlive the ordinary action TTL, so
+    /// a parked record gets a longer one of its own — but it does expire.
+    /// Only `Executing` is unbounded, and startup recovery is what ends it.
+    #[test]
+    fn parked_records_get_a_longer_ttl_and_only_executing_is_unbounded() {
+        let mut config = RelayConfig::default();
+        let record = |state, created_unix| ActionRecord {
+            created_unix,
+            state,
+            ..parked_record(0)
+        };
+        let past_action_ttl = unix_now() - ACTION_TTL_SECS - 1;
+        let past_pending_ttl = unix_now() - PENDING_BYTES_TTL_SECS - 1;
+        let parked = |created_unix| ActionRecordState::PendingBytes {
+            sha256: TEST_SHA.into(),
+            filename: "fixture.bin".into(),
+            size: created_unix as u64,
+        };
+        config.actions = vec![
+            // Survives the short TTL...
+            record(parked(1), past_action_ttl),
+            // ...but not its own.
+            record(parked(2), past_pending_ttl),
+            record(ActionRecordState::Executing, past_pending_ttl),
+            record(ActionRecordState::Complete, past_action_ttl),
+            record(ActionRecordState::PendingMapping, past_action_ttl),
+        ];
+
+        assert!(prune_config(&mut config, &HashSet::new()));
+
+        let states: Vec<&ActionRecordState> =
+            config.actions.iter().map(|item| &item.state).collect();
+        assert_eq!(states.len(), 2);
+        assert!(matches!(
+            states[0],
+            ActionRecordState::PendingBytes { size: 1, .. }
+        ));
+        assert!(matches!(states[1], ActionRecordState::Executing));
+    }
+
+    /// An interrupted command can never report back, so a record left
+    /// `Executing` by a crash is demoted at load rather than pinned forever in
+    /// the one state the TTL does not touch.
+    #[test]
+    fn executing_records_are_demoted_to_interrupted_on_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("relay.toml");
+        std::fs::write(&path, "bind = '127.0.0.1:16341'\n").unwrap();
+        let mut executing = parked_record(unix_now());
+        executing.state = ActionRecordState::Executing;
+        save_actions(
+            &actions_path(&path),
+            &[executing, parked_record(unix_now())],
+        )
+        .unwrap();
+
+        let loaded = load(&path).unwrap();
+
+        assert_eq!(loaded.actions.len(), 2);
+        assert!(matches!(
+            &loaded.actions[0].state,
+            ActionRecordState::Failed { code, .. } if code == "interrupted"
+        ));
+        assert!(matches!(
+            loaded.actions[1].state,
+            ActionRecordState::PendingBytes { .. }
+        ));
+        // The demotion is durable: a second crash must not resurrect it.
+        let reloaded = load(&path).unwrap();
+        assert!(matches!(
+            &reloaded.actions[0].state,
+            ActionRecordState::Failed { code, .. } if code == "interrupted"
+        ));
+    }
+
+    /// Action state lives in its own file so that a record shape an older
+    /// binary cannot parse costs at most the in-flight actions — never the
+    /// pairings, which are what `relay.toml` exists to hold.
+    #[test]
+    fn actions_round_trip_through_the_sidecar_and_never_reach_relay_toml() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("relay.toml");
+        let sidecar = actions_path(&path);
+        assert_eq!(sidecar, temp.path().join("relay-actions.toml"));
+
+        let mut config = RelayConfig::desktop_default(false);
+        config.actions = vec![parked_record(unix_now())];
+        save_config(&path, &config).unwrap();
+        save_actions(&sidecar, &config.actions).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("actions"),
+            "relay.toml must not carry action state: {written}"
+        );
+        // The tunable ceiling is likewise absent while it holds its default,
+        // so a later change to that default still reaches this install.
+        assert!(!written.contains("share_cache_max_bytes"));
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.actions.len(), 1);
+        assert_eq!(loaded.actions[0].id, config.actions[0].id);
+
+        // A changed ceiling *is* written, and read back.
+        config.share_cache_max_bytes = 123;
+        save_config(&path, &config).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("123"));
+        assert_eq!(load(&path).unwrap().share_cache_max_bytes, 123);
+    }
+
+    /// The share-cache ceiling set through the control command is persisted to
+    /// `relay.toml` and reflected back by `status()` (bytes), which is how the
+    /// control UI populates its "Share cache limit" field on load.
+    #[tokio::test]
+    async fn set_share_cache_max_bytes_persists_and_surfaces_in_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+
+        assert_eq!(
+            fixture.state.status().await.share_cache_max_bytes,
+            default_share_cache_max_bytes()
+        );
+
+        fixture
+            .state
+            .set_share_cache_max_bytes(256 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture.state.status().await.share_cache_max_bytes,
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            load(&temp.path().join("relay.toml"))
+                .unwrap()
+                .share_cache_max_bytes,
+            256 * 1024 * 1024
+        );
+    }
+
+    /// An unparseable sidecar is quarantined on its own. The pairings survive.
+    #[test]
+    fn a_corrupt_sidecar_costs_only_the_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("relay.toml");
+        let instance_id = Uuid::new_v4();
+        let mut config = RelayConfig::desktop_default(false);
+        config.instances.push(RelayInstance {
+            id: instance_id,
+            name: "remote".into(),
+            server_url: TEST_ORIGIN.into(),
+            origins: vec![TEST_ORIGIN.into()],
+            credential_hash: "hash".into(),
+            mappings: Vec::new(),
+        });
+        save_config(&path, &config).unwrap();
+        std::fs::write(actions_path(&path), "actions = [ this is not toml").unwrap();
+
+        let loaded = load(&path).unwrap();
+
+        assert!(loaded.actions.is_empty());
+        assert_eq!(loaded.instances.len(), 1);
+        assert_eq!(loaded.instances[0].id, instance_id);
+        assert!(!actions_path(&path).exists(), "the sidecar was quarantined");
+        assert!(
+            std::fs::read_dir(temp.path()).unwrap().any(|entry| {
+                let name = entry.unwrap().file_name();
+                name.to_string_lossy()
+                    .starts_with("relay-actions.toml.invalid-")
+            }),
+            "the quarantined copy is kept"
+        );
+    }
+
+    /// A `relay.toml` written before the split still carries its actions;
+    /// loading absorbs them into the sidecar and strips them from the config.
+    #[test]
+    fn a_legacy_relay_toml_absorbs_its_embedded_actions() {
+        /// `relay.toml` exactly as builds before the split wrote it.
+        #[derive(Serialize)]
+        struct LegacyConfig {
+            relay_id: Uuid,
+            bind: String,
+            actions: Vec<ActionRecord>,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("relay.toml");
+        let legacy = parked_record(unix_now());
+        let action_id = legacy.id;
+        std::fs::write(
+            &path,
+            toml::to_string_pretty(&LegacyConfig {
+                relay_id: Uuid::new_v4(),
+                bind: default_bind(),
+                actions: vec![legacy],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load(&path).unwrap();
+
+        assert_eq!(loaded.actions.len(), 1);
+        assert_eq!(loaded.actions[0].id, action_id);
+        assert!(actions_path(&path).exists(), "the sidecar was written");
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("actions"),
+            "the legacy stanza was rewritten away"
+        );
+        // Re-loading now reads the sidecar and finds the same record.
+        assert_eq!(load(&path).unwrap().actions[0].id, action_id);
+    }
+
+    /// The relay stores what it is told to store only if the bytes hash to the
+    /// declared digest; otherwise the entry every later action resolves to
+    /// would be whatever one origin decided to put there.
+    #[tokio::test]
+    async fn an_upload_whose_bytes_do_not_match_the_declared_hash_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+        let action_id = Uuid::new_v4();
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(copy_request_with_sha(
+                    action_id,
+                    "/unmapped/fixture.bin",
+                    "fixture.bin",
+                    FIXTURE.len() as u64,
+                    WRONG_SHA,
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let response = router(fixture.state.clone())
+            .oneshot(upload_request(action_id, FIXTURE.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["error"]["code"], "hash_mismatch");
+        assert!(fixture.calls.lock().unwrap().is_empty());
+        assert!(
+            !fixture
+                .state
+                .share_cache
+                .entry_path(WRONG_SHA, "fixture.bin")
+                .exists(),
+            "nothing may be stored under a digest the bytes do not have"
+        );
+        assert!(
+            std::fs::read_dir(fixture.state.share_cache.root())
+                .map(|entries| entries.count())
+                .unwrap_or_default()
+                == 0,
+            "the partial temporary file is removed"
+        );
+
+        // Still `PendingBytes`, so the correct bytes can still be pushed.
+        let status = router(fixture.state.clone())
+            .oneshot(action_status_request(action_id))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(status).await["error"]["code"], "bytes_required");
+    }
+
+    /// Two uploads for one action would race over the same record and the same
+    /// destination. The second is refused while the first is streaming.
+    #[tokio::test]
+    async fn a_second_concurrent_upload_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+        let action_id = Uuid::new_v4();
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(copy_request(
+                    action_id,
+                    "/unmapped/fixture.bin",
+                    "fixture.bin",
+                    FIXTURE.len() as u64
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        // Stand in for an upload that is mid-stream.
+        let claim = fixture
+            .state
+            .claim_upload(
+                action_id,
+                FIXTURE.len() as u64,
+                default_share_cache_max_bytes(),
+            )
+            .expect("first claim");
+        let response = router(fixture.state.clone())
+            .oneshot(upload_request(action_id, FIXTURE.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            TEST_ORIGIN
+        );
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "upload_in_progress"
+        );
+
+        // The claim is released on every exit path, so the retry succeeds.
+        drop(claim);
+        assert!(fixture.state.in_flight_uploads().is_empty());
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(upload_request(action_id, FIXTURE.to_vec()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    /// A file that could never fit the cache is refused before the browser
+    /// uploads it — and before a record exists to upload against.
+    #[tokio::test]
+    async fn a_file_larger_than_the_cache_ceiling_is_refused_at_action_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture_with(&temp, Vec::new(), 1024, None);
+        let action_id = Uuid::new_v4();
+
+        let response = router(fixture.state.clone())
+            .oneshot(copy_request(
+                action_id,
+                "/unmapped/huge.bin",
+                "huge.bin",
+                4096,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            TEST_ORIGIN
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "file_too_large");
+        assert_eq!(body["error"]["details"]["size"], 4096);
+        assert_eq!(body["error"]["details"]["max"], 1024);
+        // No record was created, so the id remains free for the fallback.
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(action_status_request(action_id))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // A file that fits still parks normally, and a zero-byte file — no
+        // longer a validation error — is an ordinary small file.
+        for (name, size) in [("fits.bin", 512u64), ("empty.bin", 0)] {
+            let response = router(fixture.state.clone())
+                .oneshot(copy_request(Uuid::new_v4(), "/unmapped/x.bin", name, size))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(json_body(response).await["error"]["code"], "bytes_required");
+        }
+    }
+
+    /// The record cap evicts the oldest finished record instead of refusing
+    /// new work, and only refuses when everything retained is in flight.
+    #[tokio::test]
+    async fn the_record_cap_evicts_before_it_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+        let now = unix_now();
+        {
+            let mut config = fixture.state.config.write().await;
+            config.actions = (0..MAX_ACTION_RECORDS)
+                .map(|index| ActionRecord {
+                    // All fresh enough to survive pruning, so the cap — not
+                    // the TTL — is what the request runs into. One is older
+                    // than the rest and is the one that must go.
+                    created_unix: now - if index == 0 { ACTION_TTL_SECS / 2 } else { 0 },
+                    state: ActionRecordState::Complete,
+                    ..parked_record(0)
+                })
+                .collect();
+        }
+        let oldest = fixture.state.config.read().await.actions[0].id;
+
+        let action_id = Uuid::new_v4();
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(copy_request(action_id, "/unmapped/a.bin", "a.bin", 7))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let config = fixture.state.config.read().await;
+        assert_eq!(config.actions.len(), MAX_ACTION_RECORDS);
+        assert!(
+            !config.actions.iter().any(|item| item.id == oldest),
+            "the oldest evictable record made room"
+        );
+        assert!(config.actions.iter().any(|item| item.id == action_id));
+        drop(config);
+
+        // With every record executing there is nothing to evict, and the
+        // relay says so rather than dropping live work.
+        {
+            let mut config = fixture.state.config.write().await;
+            for action in &mut config.actions {
+                action.state = ActionRecordState::Executing;
+            }
+        }
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(copy_request(Uuid::new_v4(), "/unmapped/b.bin", "b.bin", 7))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    /// A panicking local command is an ordinary failed action, not a record
+    /// stuck in the one state that never expires.
+    #[tokio::test]
+    async fn a_panicking_action_handler_fails_the_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture_with(
+            &temp,
+            Vec::new(),
+            default_share_cache_max_bytes(),
+            Some(Arc::new(|_, _, _| panic!("the clipboard backend exploded"))),
+        );
+        let action_id = Uuid::new_v4();
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(copy_request(
+                    action_id,
+                    "/unmapped/fixture.bin",
+                    "fixture.bin",
+                    FIXTURE.len() as u64
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let response = router(fixture.state.clone())
+            .oneshot(upload_request(action_id, FIXTURE.to_vec()))
+            .await
+            .unwrap();
+        std::panic::set_hook(previous);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json_body(response).await["error"]["code"], "command_failed");
+        let config = fixture.state.config.read().await;
+        let record = config
+            .actions
+            .iter()
+            .find(|item| item.id == action_id)
+            .unwrap();
+        assert!(matches!(
+            &record.state,
+            // The stored message is the fixed generic string, never the
+            // detailed error (which for the clipboard verb embeds a local path).
+            ActionRecordState::Failed { code, message }
+                if code == "command_failed" && message == GENERIC_ACTION_FAILURE
+        ));
+        assert!(fixture.state.in_flight_uploads().is_empty());
+    }
+
+    fn shell_spec(shell_command: &str) -> CommandSpec {
+        CommandSpec {
+            mode: CommandMode::CustomShell,
+            shell_command: shell_command.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The clipboard verb quotes its own (remote-authored) placeholder values,
+    /// so a `CustomShell` template that adds quotes of its own would close that
+    /// quoting and expose the filename tail to the shell. It is rejected — but
+    /// only for the clipboard verb; location verbs quote their placeholders
+    /// themselves and are Raw-substituted.
+    #[tokio::test]
+    async fn clipboard_custom_shell_rejects_its_own_quotes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+
+        for template in ["myclip --name \"{path}\"", "mytool '{filename}'"] {
+            let commands = FileActionCommands {
+                copy_to_clipboard: shell_spec(template),
+                ..Default::default()
+            };
+            assert!(
+                state.set_commands(commands).await.is_err(),
+                "a quoted clipboard template must be rejected: {template}"
+            );
+        }
+
+        // The identical double-quoted template is accepted for a location verb.
+        let location = FileActionCommands {
+            open_file: shell_spec("xdg-open \"{path}\""),
+            ..Default::default()
+        };
+        state.set_commands(location).await.unwrap();
+
+        // A quote-free clipboard template is accepted.
+        let clean = FileActionCommands {
+            copy_to_clipboard: shell_spec("myclip --path {path}"),
+            ..Default::default()
+        };
+        state.set_commands(clean).await.unwrap();
+    }
+
+    /// `set_commands` is not the only writer into `commands`: `load_config`
+    /// deserializes `relay.toml` verbatim and promotes specs itself, so a
+    /// hand-edited file — or one restored from a machine running an older
+    /// build — never passes that validation. A clipboard template that quotes
+    /// its own placeholders is demoted at load. Demoted, never `bail!`ed: an
+    /// error here drops the caller back to an empty configuration and destroys
+    /// every pairing.
+    #[test]
+    fn a_quoted_clipboard_template_on_disk_is_demoted_and_the_pairings_survive() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("relay.toml");
+        let instance_id = Uuid::new_v4();
+        let mut config = RelayConfig::desktop_default(false);
+        config.instances.push(RelayInstance {
+            id: instance_id,
+            name: "remote".into(),
+            server_url: TEST_ORIGIN.into(),
+            origins: vec![TEST_ORIGIN.into()],
+            credential_hash: "hash".into(),
+            mappings: vec![PathMapping {
+                remote: "/remote".into(),
+                local: "/local".into(),
+            }],
+        });
+        // `mode` left at the default, so the load-time
+        // SystemDefault→CustomShell promotion runs first and the check has to
+        // see the promoted spec.
+        config.commands.copy_to_clipboard = CommandSpec {
+            shell_command: "myclip \"{path}\" & calc".into(),
+            ..Default::default()
+        };
+        config.commands.open_file = shell_spec("xdg-open \"{path}\"");
+        save_config(&path, &config).unwrap();
+
+        let mut warnings = Vec::new();
+        let loaded = load_config(&path, false, &mut warnings).unwrap();
+
+        assert!(loaded.commands.copy_to_clipboard.shell_command.is_empty());
+        assert_eq!(
+            loaded.commands.copy_to_clipboard.mode,
+            CommandMode::SystemDefault
+        );
+        // The location verb quotes its own placeholders by design and is left
+        // exactly as configured...
+        assert_eq!(
+            loaded.commands.open_file.shell_command,
+            "xdg-open \"{path}\""
+        );
+        // ...and the pairing, its credential and its mapping all survive.
+        assert_eq!(loaded.instances.len(), 1);
+        assert_eq!(loaded.instances[0].id, instance_id);
+        assert_eq!(loaded.instances[0].credential_hash, "hash");
+        assert_eq!(loaded.instances[0].mappings.len(), 1);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+        // The correction was persisted, so the next load is clean and silent.
+        let mut second = Vec::new();
+        let reloaded = load_config(&path, false, &mut second).unwrap();
+        assert!(reloaded.commands.copy_to_clipboard.shell_command.is_empty());
+        assert!(second.is_empty(), "{second:?}");
+    }
+
+    /// Admission bounds one file; nothing bounded how many uploads could
+    /// stream at once. The total declared bytes in flight are capped at the
+    /// share-cache ceiling, and the budget is released with the claim.
+    #[tokio::test]
+    async fn a_new_upload_is_refused_when_the_in_flight_bytes_are_exhausted() {
+        let temp = tempfile::tempdir().unwrap();
+        // Two fixture-sized uploads fit individually but not together.
+        let ceiling = FIXTURE.len() as u64 + 1;
+        let fixture = share_fixture_with(&temp, Vec::new(), ceiling, None);
+        let action_id = Uuid::new_v4();
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(copy_request(
+                    action_id,
+                    "/unmapped/fixture.bin",
+                    "fixture.bin",
+                    FIXTURE.len() as u64
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        // Stand in for a different action already streaming its bytes.
+        let other = fixture
+            .state
+            .claim_upload(Uuid::new_v4(), FIXTURE.len() as u64, ceiling)
+            .expect("the first upload claims its bytes");
+
+        let response = router(fixture.state.clone())
+            .oneshot(upload_request(action_id, FIXTURE.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "upload_capacity_exhausted"
+        );
+        assert!(leftover_temp_files(&fixture.state).is_empty());
+
+        drop(other);
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(upload_request(action_id, FIXTURE.to_vec()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    /// A ceiling of 0 disables the share cache, which is what the Desktop
+    /// setting's help text promises. The copy is refused up front — the client
+    /// downloads instead — rather than parking a record that would admit a
+    /// zero-byte upload.
+    #[tokio::test]
+    async fn a_zero_ceiling_refuses_every_unmapped_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture_with(&temp, Vec::new(), 0, None);
+
+        let response = router(fixture.state.clone())
+            .oneshot(copy_request(
+                Uuid::new_v4(),
+                "/unmapped/empty.bin",
+                "empty.bin",
+                0,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(json_body(response).await["error"]["code"], "file_too_large");
+        assert!(fixture.state.config.read().await.actions.is_empty());
+    }
+
+    fn cache_bytes(root: &Path) -> u64 {
+        let mut total = 0;
+        for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            for file in std::fs::read_dir(entry.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                total += file.metadata().map(|item| item.len()).unwrap_or_default();
+            }
+        }
+        total
+    }
+
+    /// Eviction otherwise runs only inside an insert, so lowering the ceiling
+    /// would reclaim nothing until the next unmapped copy — and a ceiling of 0
+    /// (which refuses every new copy) would strand the existing cache with no
+    /// way to empty it.
+    #[tokio::test]
+    async fn lowering_the_ceiling_evicts_and_clearing_empties_the_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+        std::fs::create_dir_all(fixture.state.share_cache.root()).unwrap();
+        for index in 0..3u8 {
+            let sha: String = std::iter::repeat_n(char::from(b'a' + index), 64).collect();
+            let entry = fixture.state.share_cache.entry_path(&sha, "big.bin");
+            std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+            std::fs::write(&entry, vec![b'x'; 1024]).unwrap();
+        }
+        let root = fixture.state.share_cache.root().to_path_buf();
+        assert_eq!(cache_bytes(&root), 3072);
+
+        fixture.state.set_share_cache_max_bytes(2048).await.unwrap();
+        assert_eq!(cache_bytes(&root), 2048);
+
+        assert_eq!(fixture.state.clear_share_cache(), 0);
+        assert_eq!(cache_bytes(&root), 0);
+    }
+
+    /// A slow upload legitimately outlives the parked-record TTL —
+    /// `created_unix` is only refreshed once the upload *completes* — so
+    /// pruning must not delete the record its bytes are landing against.
+    #[tokio::test]
+    async fn pruning_exempts_a_parked_record_whose_upload_is_streaming() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let expired = unix_now() - PENDING_BYTES_TTL_SECS - 1;
+        let streaming = parked_record(expired);
+        let abandoned = parked_record(expired);
+        let (streaming_id, abandoned_id) = (streaming.id, abandoned.id);
+        let mut config = RelayConfig::default();
+        config.actions = vec![streaming, abandoned];
+
+        let _claim = state
+            .claim_upload(streaming_id, 0, default_share_cache_max_bytes())
+            .expect("claim the upload");
+        assert!(prune_config(&mut config, &state.in_flight_uploads()));
+
+        assert!(
+            config.actions.iter().any(|item| item.id == streaming_id),
+            "a record receiving bytes must survive its TTL"
+        );
+        assert!(
+            !config.actions.iter().any(|item| item.id == abandoned_id),
+            "an abandoned parked record still expires"
+        );
+    }
+
+    /// The cap must not drop a record something is waiting on: a
+    /// `PendingMapping` may be on screen in the mapping window (evicting it
+    /// discards the folder the user is choosing) and a `PendingBytes` may be
+    /// between its 409 and the upload that answers it. Finished records go
+    /// first, even when they are newer.
+    #[tokio::test]
+    async fn the_record_cap_prefers_finished_records_over_pending_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let mut pending_mapping = parked_record(1);
+        pending_mapping.state = ActionRecordState::PendingMapping;
+        let pending_bytes = parked_record(2);
+        let mut finished = parked_record(1_000_000);
+        finished.state = ActionRecordState::Complete;
+        let (mapping_id, bytes_id, finished_id) =
+            (pending_mapping.id, pending_bytes.id, finished.id);
+        let mut config = RelayConfig::default();
+        config.actions = vec![pending_mapping, pending_bytes, finished];
+
+        assert!(evict_oldest_action(&mut config, &state));
+        assert!(
+            !config.actions.iter().any(|item| item.id == finished_id),
+            "the finished record is what made room"
+        );
+        assert!(config.actions.iter().any(|item| item.id == mapping_id));
+        assert!(config.actions.iter().any(|item| item.id == bytes_id));
+
+        // With nothing finished left, the oldest pending record is the
+        // fallback: refusing new work outright would be worse.
+        assert!(evict_oldest_action(&mut config, &state));
+        assert!(!config.actions.iter().any(|item| item.id == mapping_id));
+    }
+
+    /// The system clipboard holds exactly one file, so the most recently
+    /// handed-out path is pinned outright. Later copies fill the best-effort
+    /// ring behind it but can never push the live one out of the keep set.
+    #[test]
+    fn the_most_recent_cache_path_is_never_pushed_out_of_the_keep_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        for index in 0..MAX_HELD_CACHE_PATHS + 4 {
+            state.hold_cache_path(&temp.path().join(format!("entry-{index}.bin")));
+        }
+
+        let live = temp
+            .path()
+            .join(format!("entry-{}.bin", MAX_HELD_CACHE_PATHS + 3));
+        let held = state.held_cache_paths();
+        assert_eq!(held.first(), Some(&live), "{held:?}");
+        assert!(held.len() <= MAX_HELD_CACHE_PATHS + 1, "{held:?}");
+
+        // Releasing it — its bytes are going away — unpins it, so eviction is
+        // not blocked by a path nothing can reach.
+        state.release_cache_path(&live);
+        assert!(!state.held_cache_paths().contains(&live));
+    }
+
+    /// A revoke that completes while bytes are streaming leaves the upload
+    /// with no record to report against. The entry it just inserted must not
+    /// stay on disk — and pinned against eviction — holding content for a
+    /// pairing that no longer exists.
+    #[test]
+    fn a_discarded_cache_entry_is_removed_and_unpinned() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let entry = state.share_cache.entry_path(TEST_SHA, "fixture.bin");
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(&entry, FIXTURE).unwrap();
+        state.hold_cache_path(&entry);
+
+        state.discard_cache_entry(&entry);
+
+        assert!(!entry.exists());
+        assert!(
+            !entry.parent().unwrap().exists(),
+            "the emptied hash directory goes with it"
+        );
+        assert!(!state.held_cache_paths().contains(&entry));
+    }
+
+    /// `evict_oldest_action` skips a record whose upload is streaming even when
+    /// it is the oldest: dropping it would pull the destination out from under
+    /// the in-flight write.
+    #[tokio::test]
+    async fn evict_refuses_an_in_flight_upload_even_when_it_is_oldest() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let uploading = Uuid::new_v4();
+        let mut oldest = parked_record(1);
+        oldest.id = uploading;
+        let mut newer = parked_record(1_000_000);
+        newer.state = ActionRecordState::Complete;
+        let newer_id = newer.id;
+
+        let mut config = RelayConfig::default();
+        config.actions = vec![oldest, newer];
+
+        // Stand in for an upload mid-stream against the oldest record.
+        let _claim = state
+            .claim_upload(uploading, 0, default_share_cache_max_bytes())
+            .expect("claim the upload");
+
+        assert!(evict_oldest_action(&mut config, &state));
+        assert!(
+            config.actions.iter().any(|item| item.id == uploading),
+            "the in-flight upload must survive eviction"
+        );
+        assert!(
+            !config.actions.iter().any(|item| item.id == newer_id),
+            "the newer evictable record is what made room"
+        );
+    }
+
+    /// The share-cache ceiling governs only what the Relay *stores*. A file
+    /// larger than the ceiling still copies when a mapping resolves it to a
+    /// real local file: no 413, and nothing is cached.
+    #[tokio::test]
+    async fn an_oversize_file_still_copies_through_a_resolved_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("big.bin");
+        let bytes = vec![b'x'; 4096];
+        std::fs::write(&file, &bytes).unwrap();
+        let sha = hex_digest(Sha256::digest(&bytes).as_slice());
+        let fixture = share_fixture_with(
+            &temp,
+            vec![PathMapping {
+                remote: "/remote".into(),
+                local: temp.path().display().to_string(),
+            }],
+            1024,
+            None,
+        );
+        let action_id = Uuid::new_v4();
+
+        let response = router(fixture.state.clone())
+            .oneshot(copy_request_with_sha(
+                action_id,
+                "/remote/big.bin",
+                "big.bin",
+                4096,
+                &sha,
+            ))
+            .await
+            .unwrap();
+
+        // Executed, not refused — even though 4096 > the 1024 ceiling.
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(*fixture.calls.lock().unwrap(), vec![file]);
+        assert!(
+            !fixture.state.share_cache.root().exists(),
+            "a mapped share verb caches nothing, so the ceiling never applies"
+        );
+        // The action completed (a Complete audit record, never a PendingBytes
+        // one that would have needed an upload).
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(action_status_request(action_id))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    /// An upload that fails on an early-return path (here `hash_mismatch`)
+    /// releases its claim, so the corrected bytes are admitted rather than
+    /// bounced with `upload_in_progress`.
+    #[tokio::test]
+    async fn a_failed_upload_releases_its_claim_for_the_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = share_fixture(&temp, Vec::new());
+        let action_id = Uuid::new_v4();
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(copy_request(
+                    action_id,
+                    "/unmapped/fixture.bin",
+                    "fixture.bin",
+                    FIXTURE.len() as u64
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        // Same length as the fixture, different bytes: passes the size check,
+        // fails the hash check — an early return between claim and release.
+        let wrong = router(fixture.state.clone())
+            .oneshot(upload_request(action_id, b"badbyte".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(wrong).await["error"]["code"], "hash_mismatch");
+        assert!(
+            fixture.state.in_flight_uploads().is_empty(),
+            "the claim must be released on the hash_mismatch return"
+        );
+
+        // The corrected bytes are admitted, not refused as a second upload.
+        assert_eq!(
+            router(fixture.state.clone())
+                .oneshot(upload_request(action_id, FIXTURE.to_vec()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
     }
 }

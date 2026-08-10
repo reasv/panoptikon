@@ -22,8 +22,13 @@ file = ""
 level = "${LOGLEVEL:-INFO}"
 
 # "Open file / show in folder" cannot reach a file manager from inside a
-# container; make the endpoints no-ops. Use Panoptikon Relay on the client
-# machine instead (see the README).
+# container, so both are disabled here as no-ops. Use Panoptikon Relay on the
+# client machine instead (see the README).
+#
+# The clipboard verb (POST /api/open/clipboard/{sha256}) is deliberately NOT
+# disabled: in a container it fails with a clear "no graphical session" error,
+# which is more honest than a silent no-op. Client-side copy goes through the
+# Relay anyway, never through this endpoint.
 [open]
 file_command = ""
 folder_command = ""

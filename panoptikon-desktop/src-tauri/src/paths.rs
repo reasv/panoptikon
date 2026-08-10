@@ -10,6 +10,7 @@ pub struct DesktopPaths {
     pub update_changelog: PathBuf,
     pub relay_settings: PathBuf,
     pub relay_secrets: PathBuf,
+    pub share_cache: PathBuf,
     pub server_root: PathBuf,
     pub desktop_log: PathBuf,
     pub bootstrap_log: PathBuf,
@@ -22,6 +23,10 @@ impl DesktopPaths {
             update_changelog: local_data_dir.join("update-changelog.json"),
             relay_settings: config_dir.join("relay.toml"),
             relay_secrets: config_dir.join("relay-secrets.toml"),
+            // Relay-managed file copies: bulk, disposable, and machine-local,
+            // so they live beside the local Server data rather than next to
+            // relay.toml in the (roaming) configuration directory.
+            share_cache: local_data_dir.join("share-cache"),
             server_root: local_data_dir.join("server"),
             desktop_log: log_dir.join("panoptikon-desktop.log"),
             bootstrap_log: log_dir.join("bootstrap.log"),

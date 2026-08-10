@@ -5,6 +5,7 @@ mod paths;
 mod relay;
 mod server_config;
 mod settings;
+mod share_cache;
 mod supervisor;
 mod updates;
 
@@ -159,7 +160,7 @@ pub fn run() {
             choose_file_action_application, choose_file_action_test_file, test_file_action,
             get_server_configuration, set_server_configuration,
             get_search_cache_stats, clear_search_result_cache, set_search_cache_size,
-            set_relay_enabled,
+            set_relay_enabled, set_share_cache_max_bytes, clear_share_cache,
             updates::get_update_state, updates::check_for_updates,
             updates::open_update_window, updates::close_update_window,
             updates::open_update_link, updates::set_automatic_update_checks,
@@ -190,7 +191,7 @@ pub fn run() {
                     SettingsDocument::defaults(paths.desktop_settings.clone())?
                 }
             };
-            let relay_config = match relay::load_config(&paths.relay_settings, development) {
+            let relay_config = match relay::load_config(&paths.relay_settings, development, &mut startup_warnings) {
                 Ok(config) => config,
                 Err(error) => {
                     startup_warnings.push(error.to_string());
@@ -206,11 +207,12 @@ pub fn run() {
             let opener = app.handle().clone();
             let action_handler = Arc::new(move |action: RelayAction, path: std::path::PathBuf, command: relay::CommandSpec| {
                 if !command.program.trim().is_empty() || !command.shell_command.trim().is_empty() {
-                    return execute_file_action_command(&command, &path);
+                    return execute_file_action_command(&command, &path, action);
                 }
                 match action {
                     RelayAction::OpenFile => host_open::open_path(&opener, &path)?,
                     RelayAction::RevealInFolder => opener.opener().reveal_item_in_dir(path)?,
+                    RelayAction::CopyToClipboard => copy_files_to_clipboard_on_host(&opener, &path)?,
                 }
                 Ok(())
             });
@@ -229,6 +231,7 @@ pub fn run() {
             let relay_state = Arc::new(RelayState::new(
                 relay_config,
                 paths.relay_settings.clone(),
+                paths.share_cache.clone(),
                 action_handler,
                 pairing_attention_handler,
                 mapping_attention_handler,
@@ -1398,6 +1401,53 @@ async fn set_relay_enabled(
     }
     Ok(())
 }
+/// Smallest useful share-cache ceiling. Below this the cache would evict a
+/// typical original before the clipboard could be pasted; 0 remains available
+/// and means "disabled".
+const MIN_SHARE_CACHE_MB: u64 = 64;
+/// Matches the control UI's field maximum (1 TiB).
+const MAX_SHARE_CACHE_MB: u64 = 1024 * 1024;
+
+/// Sets the Relay share-cache ceiling. `size_mb` is megabytes (matching the
+/// control UI field); it is converted to bytes for `share_cache_max_bytes`,
+/// which governs both the eviction target and the action-time
+/// `file_too_large` admission check. Lowering it reclaims disk immediately.
+#[tauri::command]
+async fn set_share_cache_max_bytes(
+    window: WebviewWindow,
+    app: AppHandle,
+    size_mb: u64,
+) -> Result<(), String> {
+    validate_control(&window)?;
+    if size_mb != 0 && !(MIN_SHARE_CACHE_MB..=MAX_SHARE_CACHE_MB).contains(&size_mb) {
+        return Err(format!(
+            "The share cache limit must be 0 (disabled) or between {MIN_SHARE_CACHE_MB} and {MAX_SHARE_CACHE_MB} MB."
+        ));
+    }
+    let max_bytes = size_mb.saturating_mul(1024 * 1024);
+    app.state::<Arc<RelayState>>()
+        .set_share_cache_max_bytes(max_bytes)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Empties the Relay share cache on demand, the counterpart of the search
+/// cache's Clear button. Paths that may be on the system clipboard right now,
+/// and uploads still streaming, survive by design.
+#[tauri::command]
+async fn clear_share_cache(window: WebviewWindow, app: AppHandle) -> Result<String, String> {
+    validate_control(&window)?;
+    let remaining = app.state::<Arc<RelayState>>().clear_share_cache();
+    Ok(if remaining == 0 {
+        "Share cache cleared.".to_string()
+    } else {
+        format!(
+            "Share cache cleared, except {:.1} MB still in use by a recent copy or an upload in progress.",
+            remaining as f64 / (1024.0 * 1024.0)
+        )
+    })
+}
+
 #[tauri::command]
 async fn relay_pending(
     window: WebviewWindow,
@@ -1583,6 +1633,10 @@ async fn local_file_commands(
     Ok(relay::FileActionCommands {
         open_file: parse("file"),
         reveal_in_folder: parse("folder"),
+        // The clipboard verb mirrors the server's `[open] clipboard_*` keys,
+        // symmetrically with file/folder (Step 2's precedence: program+args =
+        // direct, command = shell).
+        copy_to_clipboard: parse("clipboard"),
     })
 }
 
@@ -1592,7 +1646,11 @@ async fn set_local_file_commands(
     commands: relay::FileActionCommands,
 ) -> Result<(), String> {
     validate_control(&window)?;
-    for command in [&commands.open_file, &commands.reveal_in_folder] {
+    for command in [
+        &commands.open_file,
+        &commands.reveal_in_folder,
+        &commands.copy_to_clipboard,
+    ] {
         if !command.program.trim().is_empty() && !command.shell_command.trim().is_empty() {
             return Err("choose either a direct executable or shell mode, not both".into());
         }
@@ -1643,6 +1701,7 @@ async fn set_local_file_commands(
     };
     write("file", &commands.open_file);
     write("folder", &commands.reveal_in_folder);
+    write("clipboard", &commands.copy_to_clipboard);
     let mut document = panoptikon_config::TomlDocument::parse(&text).map_err(|e| e.to_string())?;
     document
         .patch_values(&before, &after)
@@ -1828,6 +1887,21 @@ fn command_configured(command: &relay::CommandSpec) -> bool {
         || !command.args.is_empty()
 }
 
+/// The Relay's spec for a verb when it has one, otherwise the Server's.
+///
+/// Merging per verb rather than all-or-nothing matters because the editor
+/// round-trips whatever it renders: with a Relay `open_file` configured, an
+/// all-or-nothing short circuit would render a hand-written server
+/// `clipboard_program`/`clipboard_args` as "System default" and the next Save
+/// would delete those documented keys.
+fn preferred_command(relay: relay::CommandSpec, server: relay::CommandSpec) -> relay::CommandSpec {
+    if command_configured(&relay) {
+        relay
+    } else {
+        server
+    }
+}
+
 #[tauri::command]
 async fn file_action_commands(
     window: WebviewWindow,
@@ -1835,12 +1909,31 @@ async fn file_action_commands(
 ) -> Result<relay::FileActionCommands, String> {
     validate_control(&window)?;
     let relay_commands = app.state::<Arc<RelayState>>().config().await.commands;
-    if command_configured(&relay_commands.open_file)
+    let any_relay_command = command_configured(&relay_commands.open_file)
         || command_configured(&relay_commands.reveal_in_folder)
-    {
-        return Ok(relay_commands);
-    }
-    local_file_commands(window, app).await
+        || command_configured(&relay_commands.copy_to_clipboard);
+    let server_commands = match local_file_commands(window.clone(), app.clone()).await {
+        Ok(commands) => commands,
+        // The Relay's own settings are still worth showing when the Server's
+        // configuration cannot be read; only a wholly unconfigured editor has
+        // nothing to fall back on and must report the failure.
+        Err(error) if any_relay_command => {
+            tracing::warn!(%error, "failed to read Server file-opening settings; showing Relay settings only");
+            return Ok(relay_commands);
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(relay::FileActionCommands {
+        open_file: preferred_command(relay_commands.open_file, server_commands.open_file),
+        reveal_in_folder: preferred_command(
+            relay_commands.reveal_in_folder,
+            server_commands.reveal_in_folder,
+        ),
+        copy_to_clipboard: preferred_command(
+            relay_commands.copy_to_clipboard,
+            server_commands.copy_to_clipboard,
+        ),
+    })
 }
 
 #[tauri::command]
@@ -1911,24 +2004,46 @@ async fn test_file_action(
     app: AppHandle,
     command: relay::CommandSpec,
     path: String,
+    // Which verb's row is being tested. Absent from older callers of this
+    // command, and the location verbs are the ones that existed then, so the
+    // fallback substitutes raw exactly as they do.
+    action: Option<RelayAction>,
 ) -> Result<FileActionTestResult, String> {
     validate_control(&window)?;
+    let action = action.unwrap_or(RelayAction::OpenFile);
     let path = std::path::PathBuf::from(path);
     if !path.exists() {
         return Err("the selected test file does not exist".into());
     }
     if !command_configured(&command) {
-        host_open::open_path(&app, &path).map_err(|error| error.to_string())?;
-        return Ok(FileActionTestResult {
-            status: "started",
-            exit_code: None,
-            message: "Opened with the system default application".into(),
-            preview: "System default".into(),
-        });
+        // Each verb's own default, so the test reports what the action would
+        // actually do. Claiming "Opened with the system default application"
+        // for a clipboard test would describe an open as a copy.
+        return match action {
+            RelayAction::CopyToClipboard => {
+                copy_files_to_clipboard_on_host(&app, &path).map_err(|error| error.to_string())?;
+                Ok(FileActionTestResult {
+                    status: "exited",
+                    exit_code: None,
+                    message: "Copied the file to the clipboard".into(),
+                    preview: "System default".into(),
+                })
+            }
+            RelayAction::OpenFile | RelayAction::RevealInFolder => {
+                host_open::open_path(&app, &path).map_err(|error| error.to_string())?;
+                Ok(FileActionTestResult {
+                    status: "started",
+                    exit_code: None,
+                    message: "Opened with the system default application".into(),
+                    preview: "System default".into(),
+                })
+            }
+        };
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let preview = expanded_file_action_preview(&command, &path);
-        let mut child = spawn_file_action_command(&command, &path).map_err(|e| e.to_string())?;
+        let preview = expanded_file_action_preview(&command, &path, action);
+        let mut child =
+            spawn_file_action_command(&command, &path, action).map_err(|e| e.to_string())?;
         for _ in 0..10 {
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                 return Ok(FileActionTestResult {
@@ -1978,24 +2093,186 @@ async fn choose_relay_folder_inner(window: WebviewWindow) -> Result<Option<Strin
         .map(|path| path.to_string_lossy().into_owned()))
 }
 
+/// How `{path}`/`{folder}`/`{filename}` are substituted into a **shell**
+/// command string. Direct (non-shell) modes are unaffected either way: their
+/// values become individual argv entries, so no shell ever re-reads them.
+///
+/// The distinction exists because the two verb families differ in *who
+/// authored the value*. A location verb (`open_file`, `reveal_in_folder`) acts
+/// on a file that already exists on this machine at a path the user's own
+/// mapping produced; its documented configurations quote the placeholders
+/// themselves, and quoting them for the user would rewrite every existing
+/// command. The clipboard verb acts on bytes the browser pushed, and its
+/// `{filename}` component is *remote-supplied* — it arrives with the upload —
+/// which makes it the one placeholder value an attacker can author. It is
+/// quoted, and its specs must therefore not add quotes of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Substitution {
+    Raw,
+    Quoted,
+}
+
+fn shell_substitution(action: RelayAction) -> Substitution {
+    match action {
+        RelayAction::CopyToClipboard => Substitution::Quoted,
+        RelayAction::OpenFile | RelayAction::RevealInFolder => Substitution::Raw,
+    }
+}
+
+/// POSIX single-quoting: everything inside `'…'` is literal, and the only
+/// character that cannot appear there is `'` itself, which is closed, escaped
+/// and reopened.
+fn quote_posix(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// `cmd.exe` quoting.
+///
+/// Inside a double-quoted region cmd stops treating `& | < > ^ ( )` as syntax,
+/// so wrapping is enough for all of them. Two characters need more:
+///
+/// * `"` would close the region and hand the rest of the value to the parser.
+///   It cannot be escaped for cmd, so it is dropped — no Windows path may
+///   contain one, and the share cache's filename sanitizer already removes it,
+///   which makes this a backstop rather than a lossy transform.
+/// * `%` still expands `%NAME%` inside quotes and cannot be escaped there
+///   either, so it is left alone here. It does not need handling at this layer:
+///   the only remote-authored value is the clipboard filename, and the share
+///   cache's sanitizer already maps `%` to `_` in the name the relay stores, so
+///   the cache copy this command re-reads can no longer contain a `%`. A local
+///   path the user's own mapping produced is trusted as before.
+fn quote_cmd(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', ""))
+}
+
+fn quote_shell_value(value: &str) -> String {
+    if cfg!(windows) {
+        quote_cmd(value)
+    } else {
+        quote_posix(value)
+    }
+}
+
+/// Expands `{path}`/`{folder}`/`{filename}` in one left-to-right pass.
+///
+/// Single-pass is a security property, not a style choice. Substituting the
+/// three placeholders in sequence — `replace().replace().replace()` — runs each
+/// pass over text the previous one already emitted, so a *value* containing the
+/// literal text `{filename}` is spliced in by the `{path}` pass and then
+/// substituted again by the `{filename}` pass. `{`, `}` and `&` are all legal
+/// filename characters, and the clipboard verb's filename is authored by
+/// whoever uploaded it, so that second substitution would inject a fresh quote
+/// pair into an already-quoted region and hand the rest of the name to the
+/// shell as syntax. Emitting a replacement and continuing *after* the token
+/// makes that unreachable: substituted text is never rescanned.
+fn substitute_placeholders(
+    template: &str,
+    path: &std::path::Path,
+    substitution: Substitution,
+) -> String {
+    let folder = path.parent().unwrap_or(path).to_string_lossy().into_owned();
+    let filename = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let value = |raw: String| match substitution {
+        Substitution::Raw => raw,
+        Substitution::Quoted => quote_shell_value(&raw),
+    };
+    let replacements = [
+        ("{path}", value(path.to_string_lossy().into_owned())),
+        ("{folder}", value(folder)),
+        ("{filename}", value(filename)),
+    ];
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        output.push_str(&rest[..open]);
+        rest = &rest[open..];
+        match replacements.iter().find_map(|(token, replacement)| {
+            rest.strip_prefix(token).map(|tail| (replacement, tail))
+        }) {
+            Some((replacement, tail)) => {
+                output.push_str(replacement);
+                rest = tail;
+            }
+            // Not a placeholder: emit the brace and resume after it, so a
+            // literal `{` in the template cannot swallow the rest of the scan.
+            None => {
+                output.push('{');
+                rest = &rest[1..];
+            }
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
 fn execute_file_action_command(
     command: &relay::CommandSpec,
     path: &std::path::Path,
+    action: RelayAction,
 ) -> anyhow::Result<()> {
-    spawn_file_action_command(command, path)?;
+    spawn_file_action_command(command, path, action)?;
     Ok(())
 }
 
-fn expanded_file_action_preview(command: &relay::CommandSpec, path: &std::path::Path) -> String {
-    let folder = path.parent().unwrap_or(path).to_string_lossy();
-    let filename = path.file_name().unwrap_or_default().to_string_lossy();
-    let replace = |value: &str| {
-        value
-            .replace("{path}", &path.to_string_lossy())
-            .replace("{folder}", &folder)
-            .replace("{filename}", &filename)
-    };
+/// Places OS-native file references on the clipboard for the default (no custom
+/// command) `copy_to_clipboard` action.
+///
+/// On macOS the AppKit pasteboard is main-thread-hostile, and this runs on an
+/// axum worker thread, so the write is dispatched to the main thread via
+/// `run_on_main_thread` (§0.10). That call is fire-and-forget and only reports
+/// whether the dispatch itself was accepted, so the clipboard write's own
+/// `Result` is bridged back over a one-shot channel and returned to the relay
+/// action handler, which turns any error into a `Failed` action. Other
+/// platforms' clipboard backends are thread-agnostic and write directly.
+#[cfg(target_os = "macos")]
+fn copy_files_to_clipboard_on_host(app: &AppHandle, path: &std::path::Path) -> anyhow::Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+    // The write runs on the main thread, outside the relay handler's
+    // `catch_unwind`, so the macOS clipboard backend must stay fault-free
+    // (return `Err`, never panic). A Rust panic is not silently lost — `tx` is
+    // moved into the closure, so unwinding drops it, `rx` reports a closed
+    // channel and the action does become `Failed` — but it unwinds through
+    // tao's main loop, which is a process-stability problem rather than a
+    // handled error. objc2's generated bindings can panic on an unexpected nil
+    // return, and an Objective-C exception is not a Rust panic at all: nothing
+    // here would catch it.
+    app.run_on_main_thread(move || {
+        let _ = tx.send(panoptikon_clipboard::copy_files_to_clipboard(&[&path]));
+    })
+    .map_err(|error| {
+        anyhow::anyhow!("failed to dispatch the clipboard write to the main thread: {error}")
+    })?;
+    // Bounded: `run_handler` is called straight from an async axum handler, so
+    // an unbounded wait on a main thread that is inside a modal panel — or
+    // otherwise wedged — would pin a tokio worker indefinitely.
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                anyhow::anyhow!("the clipboard write did not complete within 30 seconds")
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                anyhow::anyhow!("the clipboard write did not report a result")
+            }
+        })?
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_files_to_clipboard_on_host(_app: &AppHandle, path: &std::path::Path) -> anyhow::Result<()> {
+    panoptikon_clipboard::copy_files_to_clipboard(&[path])
+}
+
+fn expanded_file_action_preview(
+    command: &relay::CommandSpec,
+    path: &std::path::Path,
+    action: RelayAction,
+) -> String {
     if !command.program.trim().is_empty() {
+        let replace = |value: &str| substitute_placeholders(value, path, Substitution::Raw);
         let mut parts = vec![format!("\"{}\"", replace(&command.program))];
         parts.extend(
             command
@@ -2005,32 +2282,54 @@ fn expanded_file_action_preview(command: &relay::CommandSpec, path: &std::path::
         );
         return parts.join(" ");
     }
-    replace(&command.shell_command)
+    substitute_placeholders(&command.shell_command, path, shell_substitution(action))
 }
 
 fn spawn_file_action_command(
     command: &relay::CommandSpec,
     path: &std::path::Path,
+    action: RelayAction,
 ) -> anyhow::Result<std::process::Child> {
-    let folder = path.parent().unwrap_or(path).to_string_lossy();
-    let filename = path.file_name().unwrap_or_default().to_string_lossy();
-    let replace = |value: &str| {
-        value
-            .replace("{path}", &path.to_string_lossy())
-            .replace("{folder}", &folder)
-            .replace("{filename}", &filename)
-    };
     if !command.program.trim().is_empty() {
+        // Direct modes hand every value to the OS as its own argv entry, so
+        // there is no shell to quote for.
+        let replace = |value: &str| substitute_placeholders(value, path, Substitution::Raw);
         return Ok(host_env::command(replace(&command.program))
             .args(command.args.iter().map(|arg| replace(arg)))
             .spawn()?);
     }
-    let shell = replace(&command.shell_command);
-    if cfg!(windows) {
-        Ok(host_env::command("cmd").args(["/C", &shell]).spawn()?)
-    } else {
-        Ok(host_env::command("sh").args(["-c", &shell]).spawn()?)
-    }
+    let substitution = shell_substitution(action);
+    let shell = substitute_placeholders(&command.shell_command, path, substitution);
+    spawn_shell(&shell)
+}
+
+/// `Command::args` escapes for `CommandLineToArgvW`, which cmd.exe does not
+/// implement: it turns a template's `"` into `\"`, which cmd passes through to
+/// the child as a literal quote character and then splits the value on its
+/// spaces anyway — so a documented `mytool "{path}"` command breaks for any
+/// path containing a space. `raw_arg` writes the command line verbatim
+/// instead, and the extra outer pair is exactly what cmd's documented `/C`
+/// rule strips back off — measured against `cmd.exe` on Windows 11 for quoted
+/// and unquoted programs, values with spaces, and `& ^ | < > ( )`.
+///
+/// A template with no `"` of its own produced the same wire bytes under
+/// `Command::args` (it wrapped the whole line in quotes for its spaces and had
+/// nothing to escape, bar doubling a trailing backslash), so quote-free
+/// configurations parse exactly as before.
+#[cfg(windows)]
+fn spawn_shell(shell: &str) -> anyhow::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt as _;
+
+    let mut command = host_env::command("cmd");
+    command.raw_arg("/C").raw_arg(format!("\"{shell}\""));
+    Ok(command.spawn()?)
+}
+
+#[cfg(not(windows))]
+fn spawn_shell(shell: &str) -> anyhow::Result<std::process::Child> {
+    // `sh -c` receives the script as one argv entry, so nothing re-parses it
+    // on the way.
+    Ok(host_env::command("sh").args(["-c", shell]).spawn()?)
 }
 
 #[tauri::command]
@@ -2051,9 +2350,200 @@ async fn quit_inner(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        local_browser_url, pythonpath_without_appdir, should_use_macos_accessory_policy,
-        update_menu_label,
+        RelayAction, Substitution, expanded_file_action_preview, local_browser_url,
+        pythonpath_without_appdir, shell_substitution, should_use_macos_accessory_policy,
+        substitute_placeholders, update_menu_label,
     };
+
+    /// The clipboard verb's filename is authored by whoever uploaded it, so a
+    /// name that reads as shell syntax must survive substitution as a name.
+    /// The location verbs keep their raw substitution: their commands are
+    /// documented with the user's own quoting, and re-quoting would rewrite
+    /// every configuration that already works.
+    #[test]
+    fn only_the_clipboard_verb_quotes_its_substituted_values() {
+        let hostile = std::path::Path::new(if cfg!(windows) {
+            "C:\\cache\\ab\\a$(id)&calc `whoami`.png"
+        } else {
+            "/cache/ab/a$(id)&calc `whoami`.png"
+        });
+        let spec = super::relay::CommandSpec {
+            mode: super::relay::CommandMode::CustomShell,
+            shell_command: "mytool {path}".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            shell_substitution(RelayAction::CopyToClipboard),
+            Substitution::Quoted
+        );
+        let quoted = substitute_placeholders(&spec.shell_command, hostile, Substitution::Quoted);
+        let value = quoted.strip_prefix("mytool ").unwrap();
+        if cfg!(windows) {
+            // Inside a cmd double-quoted region `& ^ | < > ( )` are inert, and
+            // the value carries no `"` of its own to close the region with.
+            assert!(value.starts_with('"') && value.ends_with('"'), "{quoted}");
+            assert_eq!(value.matches('"').count(), 2, "{quoted}");
+        } else {
+            // Inside POSIX single quotes everything is literal, and the value
+            // carries no unescaped `'` to close them with.
+            assert!(value.starts_with('\'') && value.ends_with('\''), "{quoted}");
+            assert_eq!(
+                value[1..value.len() - 1].matches('\'').count(),
+                0,
+                "{quoted}"
+            );
+        }
+        assert!(value.contains("a$(id)&calc"), "the name survives: {quoted}");
+
+        // A quote in the value cannot terminate the quoting either.
+        let sneaky = std::path::Path::new(if cfg!(windows) {
+            "C:\\cache\\a\" && calc && rem \".png"
+        } else {
+            "/cache/a' ; id ; echo '.png"
+        });
+        let quoted = substitute_placeholders("mytool {path}", sneaky, Substitution::Quoted);
+        let value = quoted.strip_prefix("mytool ").unwrap();
+        if cfg!(windows) {
+            assert_eq!(value.matches('"').count(), 2, "{quoted}");
+        } else {
+            assert!(value.starts_with('\'') && value.ends_with('\''), "{quoted}");
+            assert!(value.contains("'\\''"), "{quoted}");
+        }
+
+        // Location verbs are untouched, through the same code path.
+        assert_eq!(shell_substitution(RelayAction::OpenFile), Substitution::Raw);
+        assert_eq!(
+            shell_substitution(RelayAction::RevealInFolder),
+            Substitution::Raw
+        );
+        assert_eq!(
+            expanded_file_action_preview(&spec, hostile, RelayAction::OpenFile),
+            format!("mytool {}", hostile.display())
+        );
+    }
+
+    /// Substitution is a single left-to-right pass, so a placeholder *value*
+    /// that itself reads as a placeholder is never expanded a second time.
+    ///
+    /// This is the clipboard verb's whole exposure: its filename arrives with
+    /// the upload, and `{`, `}` and `&` are all legal filename characters that
+    /// the share cache's sanitizer does not strip. Under a sequential
+    /// `replace().replace().replace()` the `{filename}` spliced in by the
+    /// `{path}` pass was expanded again by the `{filename}` pass, injecting a
+    /// fresh quote pair that ended the quoted region and left the rest of the
+    /// name — `&calc&` here — outside it as live `cmd` syntax.
+    #[test]
+    fn substitution_never_rescans_the_values_it_emitted() {
+        let hostile = std::path::Path::new(if cfg!(windows) {
+            "C:\\cache\\ab\\a{filename}&calc&b{folder}{path}.png"
+        } else {
+            "/cache/ab/a{filename};id;b{folder}{path}.png"
+        });
+        let quote = if cfg!(windows) { '"' } else { '\'' };
+
+        for template in ["myclip {path}", "myclip {folder}", "myclip {filename}"] {
+            let quoted = substitute_placeholders(template, hostile, Substitution::Quoted);
+            let value = quoted.strip_prefix("myclip ").unwrap();
+            // Exactly one region: the value cannot contribute a quote of its
+            // own, and no second pass can splice one in either.
+            assert_eq!(value.matches(quote).count(), 2, "{template}: {quoted}");
+            assert!(
+                value.starts_with(quote) && value.ends_with(quote),
+                "{quoted}"
+            );
+        }
+        assert_eq!(
+            substitute_placeholders("myclip {path}", hostile, Substitution::Quoted),
+            format!("myclip {quote}{}{quote}", hostile.display())
+        );
+        // The location verbs' raw substitution is likewise emitted once.
+        assert_eq!(
+            substitute_placeholders("mytool {path}", hostile, Substitution::Raw),
+            format!("mytool {}", hostile.display())
+        );
+        // A brace that begins no placeholder is passed through and does not
+        // swallow the rest of the scan.
+        assert_eq!(
+            substitute_placeholders("mytool {unknown} {path}", hostile, Substitution::Raw),
+            format!("mytool {{unknown}} {}", hostile.display())
+        );
+    }
+
+    /// The shipped control window must test and preview each row as its own
+    /// verb. `test_file_action` falls back to `OpenFile` when no `action` is
+    /// passed, so a Test button that omits it runs — and previews — the
+    /// clipboard row with the location verbs' raw substitution, contradicting
+    /// the contract the tests above assert.
+    #[test]
+    fn the_control_window_tests_and_previews_each_verb_as_itself() {
+        let control_js = include_str!("../../dist/app.js");
+        assert!(control_js.contains("action: box.dataset.command"));
+        assert!(control_js.contains("box.dataset.command === 'copy_to_clipboard')"));
+        // Single pass in the preview too, for the same reason as the Rust side.
+        assert!(!control_js.contains("replaceAll('{path}'"));
+        assert!(control_js.contains("function expandPlaceholders("));
+    }
+
+    /// End-to-end through a real `cmd.exe`: a location verb's raw substitution
+    /// hands the template's own quoting to cmd verbatim, so a documented
+    /// `mytool "{path}"` command must survive a path containing spaces — the
+    /// `"` reaches cmd as a quote (not the `\"` that `Command::args` used to
+    /// produce), the external program receives the path as one argument, and
+    /// redirection outside the quotes stays live shell syntax.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_spawn_preserves_template_quoting_around_spacey_paths() {
+        let dir =
+            std::env::temp_dir().join(format!("panoptikon spawn test {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("a b.txt");
+        std::fs::write(&input, "needle\r\n").unwrap();
+        let output = dir.join("out file.txt");
+
+        let shell = substitute_placeholders(
+            "findstr needle \"{path}\" > \"{out}\"",
+            &input,
+            Substitution::Raw,
+        )
+        .replace("{out}", &output.to_string_lossy());
+        let status = super::spawn_shell(&shell).unwrap().wait().unwrap();
+
+        assert!(status.success(), "{shell}");
+        let captured = std::fs::read_to_string(&output).unwrap();
+        assert!(captured.contains("needle"), "{captured}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The settings "test" for the clipboard verb must build the exact command
+    /// line production runs: it threads the verb through so the preview (and the
+    /// spawn beside it) substitutes `Quoted`, not the location verbs' `Raw`.
+    #[test]
+    fn the_clipboard_test_command_matches_the_production_quoted_line() {
+        let path = std::path::Path::new(if cfg!(windows) {
+            "C:\\cache\\ab\\a & b.png"
+        } else {
+            "/cache/ab/a & b.png"
+        });
+        let spec = super::relay::CommandSpec {
+            mode: super::relay::CommandMode::CustomShell,
+            shell_command: "myclip {path}".into(),
+            ..Default::default()
+        };
+
+        // The test preview equals the production quoted substitution...
+        let production = substitute_placeholders(&spec.shell_command, path, Substitution::Quoted);
+        assert_eq!(
+            expanded_file_action_preview(&spec, path, RelayAction::CopyToClipboard),
+            production
+        );
+        // ...and is genuinely the quoted form, not the raw one a location verb
+        // would have produced from the same template.
+        assert_ne!(
+            production,
+            substitute_placeholders(&spec.shell_command, path, Substitution::Raw)
+        );
+    }
 
     #[test]
     fn macos_accessory_policy_requires_a_tray_and_no_visible_windows() {
@@ -2181,6 +2671,8 @@ mod tests {
             "clear_search_result_cache",
             "set_search_cache_size",
             "set_relay_enabled",
+            "set_share_cache_max_bytes",
+            "clear_share_cache",
             "get_update_state",
             "check_for_updates",
             "open_update_window",

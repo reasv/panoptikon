@@ -6,6 +6,38 @@ Desktop release notes.
 
 ## [Unreleased]
 
+- **You can now copy an indexed file itself to the clipboard, not just its
+  path.** Gallery and pinboard items gained a share button whose primary action
+  is Copy when Panoptikon can reach the file and Download when it cannot; the
+  gallery also accepts Ctrl+C. The right-click menu always offers the other
+  verb.
+  - When the browser and the Panoptikon Server run on the same computer, the
+    Server writes the clipboard directly.
+  - When they do not, an approved Panoptikon Desktop does it. If the file sits
+    in a folder you already mapped for Relay, Desktop copies that local file
+    and nothing is transferred. Otherwise the browser sends the file to Desktop,
+    which keeps it in a size-capped share cache (default 5 GB, adjustable — with
+    a Clear button — under Integration → Relay). A file larger than that limit
+    falls back to a download instead.
+  - Desktop's file-opening settings gained a third action, "Copy to Clipboard",
+    with the same System default / executable / shell-command choices as Open
+    File and Show in Folder. The Server has matching `clipboard_program`,
+    `clipboard_args`, and `clipboard_command` keys in its `[open]` section. In a
+    clipboard shell command the placeholders are quoted for you, so the command
+    must not add quotes of its own.
+  - On Linux the built-in copy uses `wl-copy` or `xclip` and offers the file as
+    `text/uri-list`, which browsers, chat clients, Dolphin, Thunar and PCManFM
+    accept. GNOME-family file managers (Nautilus, Nemo, Caja) only paste from
+    their own clipboard flavour and will not accept it; a custom clipboard
+    command is the way around that.
+  - Endpoints paired with Relay before this release gained Copy File without
+    re-approval, alongside the Open File and Show in Folder permissions they
+    already had.
+- **Custom shell commands on Windows now keep the quotes you wrote.** A
+  file-opening or folder-revealing command such as `mytool "{path}"` previously
+  reached `cmd.exe` with escaped quotes and was then split on the spaces in the
+  path, so it failed for any path containing a space. The command line is now
+  passed through verbatim. Commands without quotes of their own are unaffected.
 - **The Desktop startup splash now uses the correct dark-background logo.**
   Its white border and wordmark no longer depend on the embedded WebView's
   appearance reporting.

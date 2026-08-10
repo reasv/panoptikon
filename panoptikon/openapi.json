@@ -3500,6 +3500,70 @@
         }
       }
     },
+    "/api/open/clipboard/{sha256}": {
+      "post": {
+        "tags": [
+          "open"
+        ],
+        "summary": "Copy a file to the host system's clipboard",
+        "description": "Place an OS-native reference to the file on the clipboard of the machine running the server, so that pasting it into a file manager, a chat client or an upload form attaches the original file.\nOnly the path travels; the file's contents are never read.\nThe write targets the *server's* clipboard, so this is only useful when the server and the browser share a machine (or when a custom open.clipboard_command forwards it elsewhere).\nThis is a potentially dangerous operation, as a custom command can execute arbitrary code.",
+        "operationId": "copy_file_to_clipboard_on_host",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "sha256",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File copied to the host clipboard",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/open/file/{sha256}": {
       "post": {
         "tags": [

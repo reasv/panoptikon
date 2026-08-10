@@ -21,12 +21,18 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Val
 #[derive(Debug, Clone)]
 pub struct TomlDocument {
     document: DocumentMut,
+    // `toml_edit` renders LF regardless of the source's line endings, so a
+    // CRLF file would be silently rewritten wholesale on the first save (the
+    // callers' `rendered != source` no-op guards would never hold again).
+    // Remember the style and re-apply it on render, like `DotenvDocument`.
+    crlf: bool,
 }
 
 impl TomlDocument {
     pub fn parse(source: &str) -> Result<Self> {
         Ok(Self {
             document: DocumentMut::from_str(source).context("invalid TOML document")?,
+            crlf: source.contains("\r\n"),
         })
     }
 
@@ -64,7 +70,14 @@ impl TomlDocument {
 
 impl std::fmt::Display for TomlDocument {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.document.fmt(formatter)
+        if self.crlf {
+            // Normalize before expanding so any `\r\n` toml_edit did carry
+            // through (e.g. inside multi-line strings) is not doubled.
+            let rendered = self.document.to_string().replace("\r\n", "\n");
+            formatter.write_str(&rendered.replace('\n', "\r\n"))
+        } else {
+            self.document.fmt(formatter)
+        }
     }
 }
 
@@ -772,6 +785,29 @@ mod tests {
             source.replace("port = 6342", "port = 7777")
         );
         assert!(!document.to_string().contains("absent_default"));
+    }
+
+    /// A CRLF source (a Windows-authored or autocrlf-checked-out file) must
+    /// render back as CRLF, edited and unedited alike — otherwise the callers'
+    /// `rendered != source` no-op guards trip on every save and rewrite the
+    /// whole user-owned file to LF.
+    #[test]
+    fn toml_render_preserves_the_source_line_ending_style() {
+        let crlf = "# heading\r\n[server]\r\nport = 6342\r\n";
+        let document = TomlDocument::parse(crlf).unwrap();
+        assert_eq!(document.to_string(), crlf);
+
+        let mut document = TomlDocument::parse(crlf).unwrap();
+        document
+            .patch_values(
+                &toml::from_str("[server]\nport = 6342").unwrap(),
+                &toml::from_str("[server]\nport = 7777").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(document.to_string(), crlf.replace("6342", "7777"));
+
+        let lf = "# heading\n[server]\nport = 6342\n";
+        assert_eq!(TomlDocument::parse(lf).unwrap().to_string(), lf);
     }
 
     #[test]
