@@ -117,10 +117,25 @@ pattern as `FileActionTargetMenu` on the open buttons):
   ("Pair with desktop…"), making the share button a second doorway into
   the existing pairing flow.
 
+> **Amended 2026-08-10 (post-release UX round):** the alternates menu is
+> gone. Its Radix trigger kept focus after closing, which pinned the grid
+> overlay visible until a second outside click; and both of its entries
+> have homes elsewhere (Download is a first-class button, pairing stays
+> reachable via the open buttons' relay badge). The grid card no longer
+> shows a flat three-button row either — Copy, Download, Open File and
+> Open Folder now form a collapsed `FileActionCluster`: only the
+> last-used verb (persisted, default Copy) shows on card hover; hovering
+> it expands the others into a 2x2 corner square with Download in the
+> diagonal slot. The gallery filmstrip thumbnails carry the same cluster
+> in their free bottom-right corner (expanding leftward/upward). The
+> header keeps the single adaptive ShareButton, menu-free. "Copy share
+> link" will need a new home when it lands.
+
 Placements:
 
-- **Search grid card**: joins the hover overlay button stack on each
-  thumbnail (`SearchResultImage.tsx`), alongside OpenFile/OpenFolder.
+- **Search grid card**: the `FileActionCluster` (see amendment above) on
+  each thumbnail (`SearchResultImage.tsx`) — collapsed to the last-used
+  verb, expanding to all four on hover.
   One click from a search result, no need to open the gallery.
 - **Gallery header**: the header is currently symmetric — left cluster
   `Bookmark · OpenFile · OpenFolder · Prev`, right cluster
