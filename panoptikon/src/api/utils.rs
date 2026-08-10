@@ -239,9 +239,10 @@ async fn stat_config(config_path: &Path) -> ConfigStat {
 /// one that can carry the name intact. That is every non-ASCII name (a raw
 /// Latin-1 byte such as `é` is ambiguous to browsers, so ASCII is the bar, not
 /// Latin-1) plus any name holding a control character, which
-/// [`latin1_fallback`] has to drop. A plain printable-ASCII name produces
-/// exactly the historical single-parameter output, so the common response is
-/// unchanged byte for byte.
+/// [`latin1_fallback`] has to drop. A plain printable-ASCII name keeps the
+/// historical single-parameter *form*; the only difference within it is that
+/// `"` and `\` are now escaped rather than emitted raw, which is the bug fix
+/// that stops such a name ending the parameter early.
 pub(crate) fn content_disposition_value(kind: &str, filename: &str) -> Option<header::HeaderValue> {
     let mut value = Vec::new();
     value.extend_from_slice(kind.as_bytes());
@@ -252,18 +253,42 @@ pub(crate) fn content_disposition_value(kind: &str, filename: &str) -> Option<he
         .chars()
         .any(|ch| !ch.is_ascii() || is_dropped_control(ch));
     if fallback_is_lossy {
+        // The bidi controls are stripped from this form too — it is the one
+        // that carries the name intact, so it is also the one a spoofed name
+        // would reach the user through.
+        let displayable: String = filename
+            .chars()
+            .filter(|ch| !is_bidi_control(*ch))
+            .collect();
         value.extend_from_slice(b"; filename*=UTF-8''");
-        value.extend_from_slice(percent_encode_attr_chars(filename).as_bytes());
+        value.extend_from_slice(percent_encode_attr_chars(&displayable).as_bytes());
     }
     header::HeaderValue::from_bytes(&value).ok()
 }
 
-/// Characters `HeaderValue` refuses, and which the quoted fallback therefore
-/// cannot contain. Tab is included: it is legal in a header value but
+/// Characters dropped from *both* forms of the name.
+///
+/// C0 and DEL because `HeaderValue` refuses them, so the quoted fallback
+/// cannot contain them. Tab is included: it is legal in a header value but
 /// meaningless in a filename.
+///
+/// The bidi overrides and isolates because a name built around them renders
+/// deceptively rather than merely oddly: `photo\u{202E}gnp.exe` displays as
+/// `photoexe.png` in a download UI, which is an extension spoof, not a
+/// filename. Byte-exact fidelity is a priority here and this is the deliberate
+/// exception to it — they are display directives, not part of the name, and
+/// dropping them changes nothing about which file was served. (Before RFC 8187
+/// support they never left the server anyway: the Latin-1 fallback drops
+/// everything above U+00FF.)
 fn is_dropped_control(ch: char) -> bool {
     let code = ch as u32;
-    code < 0x20 || code == 0x7F
+    code < 0x20 || code == 0x7F || is_bidi_control(ch)
+}
+
+/// The Unicode bidirectional formatting controls: the embeddings and
+/// overrides (U+202A-U+202E) and the isolates (U+2066-U+2069).
+fn is_bidi_control(ch: char) -> bool {
+    matches!(ch as u32, 0x202A..=0x202E | 0x2066..=0x2069)
 }
 
 /// The quoted-string fallback for legacy clients: characters outside Latin-1
@@ -466,6 +491,46 @@ mod tests {
         assert!(
             text.contains("filename*=UTF-8''evil%0Aname.png"),
             "the extended parameter carries the exact name: {text}"
+        );
+    }
+
+    /// A right-to-left override makes a name *render* as a different one:
+    /// `photo\u{202E}gnp.exe` shows up as `photoexe.png` in a download UI, so
+    /// the executable extension is what the user does not see. The control is
+    /// non-ASCII, so it would otherwise ride through `filename*` verbatim —
+    /// the one parameter browsers actually prefer. Both forms drop it, and the
+    /// rest of the name is untouched.
+    #[test]
+    fn bidi_overrides_are_dropped_from_both_forms() {
+        let value = disposition("attachment", "photo\u{202E}gnp.exe");
+        assert_eq!(
+            value,
+            "attachment; filename=\"photognp.exe\"; filename*=UTF-8''photognp.exe"
+        );
+        assert!(
+            !value.contains("%E2%80%AE"),
+            "the override is not percent-encoded through: {value}"
+        );
+    }
+
+    /// The isolates spoof the same way, and a name that is *only* an isolate
+    /// plus ASCII must still produce a usable header.
+    #[test]
+    fn bidi_isolates_are_dropped_too() {
+        assert_eq!(
+            disposition("inline", "a\u{2066}b\u{2069}c\u{202A}d.png"),
+            "inline; filename=\"abcd.png\"; filename*=UTF-8''abcd.png"
+        );
+    }
+
+    /// Only the bidi controls are dropped from `filename*`: other control
+    /// characters are still spelled out there, because that parameter is the
+    /// only place the exact name survives.
+    #[test]
+    fn non_bidi_controls_still_reach_the_extended_parameter() {
+        assert!(
+            disposition("attachment", "a\u{202E}b\tc.png").contains("filename*=UTF-8''ab%09c.png"),
+            "the tab is encoded, the override is gone"
         );
     }
 

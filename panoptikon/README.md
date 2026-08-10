@@ -218,7 +218,26 @@ same placeholders, and an empty string is a no-op like the other verbs.
 
 The existing `file_command`, `folder_command` and `clipboard_command` keys
 remain available as explicit shell-command templates. All forms support
-`{path}`, `{folder}`, and `{filename}`. Panoptikon Desktop exposes one shared **File opening on this
+`{path}`, `{folder}`, and `{filename}`.
+
+**Quoting is the executor's job in every form.** The `*_program`/`*_args`
+forms pass each value to the operating system as its own argument, so quoting
+does not arise. In the shell forms the placeholders are substituted already
+quoted, so a template writes `mpv {path}`, never `mpv "{path}"`:
+
+| key | substituted as |
+| --- | --- |
+| `file_command`, `folder_command` | wrapped in `"…"` (unchanged behaviour; on Linux/macOS a `"` or `\` inside the value is escaped so it cannot break out) |
+| `clipboard_command` | quoted for the host shell — `'…'` on Linux/macOS, `"…"` on Windows |
+
+`clipboard_command` follows the same convention as Panoptikon Desktop's
+clipboard action, so one template behaves identically in both. Adding your own
+quotes around a placeholder produces a broken command; the server config is
+hand-edited and nothing validates it at save time, so this is the one rule to
+remember. Placeholder text appearing inside a *filename* is never re-expanded,
+whatever the form.
+
+Panoptikon Desktop exposes one shared **File opening on this
 computer** editor for its local Server and Relay actions, including native
 application and test-file pickers, command-line-style argument entry backed by
 structured direct arguments, a copyable placeholder reference, expanded
@@ -783,6 +802,8 @@ level = "${LOGLEVEL:-INFO}"  # RUST_LOG takes precedence when set
 # clipboard_program = "my-clipboard-tool"   # copy a file reference to the
 # clipboard_args = ["--file", "{path}"]     #   host clipboard; overrides the
 # clipboard_command = "my-clipboard-shell {path}"  # built-in native write
+                             # placeholders are quoted automatically in the
+                             #   shell forms: do not add your own quotes
 
 [server]
 host = "127.0.0.1"

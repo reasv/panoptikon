@@ -92,10 +92,18 @@ impl Default for LoggingConfig {
 
 /// `[open]`: custom commands for the local `/api/open/*` endpoints.
 /// `{path}`, `{folder}`, and `{filename}` placeholders expand to the target
-/// file's quoted full path, parent directory, and file name. Absent: the
+/// file's full path, parent directory, and file name. Absent: the
 /// platform default (`start`/`open`/`xdg-open`, `explorer /select`, the
 /// built-in native clipboard write, etc.).
 /// An explicit empty string makes the endpoint a no-op.
+///
+/// The `*_program`/`*_args` forms need no quoting at all — each value becomes
+/// one argv entry. In the shell (`*_command`) forms the executor supplies the
+/// quoting: `file_command`/`folder_command` wrap each value in `"…"` (their
+/// long-standing behaviour), and `clipboard_command` quotes each value for the
+/// host shell, which means a `clipboard_command` template must not add quotes
+/// of its own — the same rule Panoptikon Desktop's editor enforces for the
+/// clipboard action it shares with the relay.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OpenConfig {
     /// Executable for direct (non-shell) "open file" customization.
