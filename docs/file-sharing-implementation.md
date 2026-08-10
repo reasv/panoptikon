@@ -194,14 +194,20 @@ silent.
     be escaped there either, but the expansion is of a *local* environment
     variable and lands inside the quoted region, so it cannot break out,
     and rewriting it would corrupt legitimate names like `100%.png` into
-    paths that do not exist. The clipboard verb's shell is also spawned
+    paths that do not exist. On Windows *every* `CustomShell` verb is spawned
     with `raw_arg("/C")` + `raw_arg("\"<shell>\"")` rather than
     `args(["/C", …])`: `Command::args` escapes for `CommandLineToArgvW`,
-    which cmd does not implement, and would pass our quotes to the child as
-    literal characters while still splitting the value on spaces — making
-    the quoting inert *and* breaking the path. Only the quoting verb takes
-    that spawn path; switching the location verbs to it would change how
-    every already-configured `open_file` command line is parsed.
+    which cmd does not implement, and would pass the template's quotes to
+    the child as literal characters while still splitting the value on
+    spaces — making the clipboard verb's quoting inert *and* breaking a
+    documented location command like `mytool "{path}"` for any path
+    containing a space. The location verbs were moved onto this path too
+    (commit af480cd) after measuring against `cmd.exe` on Windows 11: a
+    quote-free template produces the same wire bytes either way, and a
+    template with quotes of its own now reaches cmd as quotes instead of
+    `\"`. Substitution is a single left-to-right pass, so a placeholder
+    *value* that contains the literal text `{filename}` can never be
+    substituted a second time and inject quotes of its own.
 21. **Share cache housekeeping.** Temporary files are swept on
     `ShareCache` construction and at the start of every insert: a `.tmp-*`
     file is removed only if its action id is *not* in the in-flight claim

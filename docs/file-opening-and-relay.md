@@ -683,13 +683,17 @@ Relay resolves the action in this order:
 1. **Mapped and present.** If a locally approved mapping resolves the path and
    the file exists there, Relay copies that real file to the clipboard. No bytes
    are transferred and nothing is cached.
-2. **Already cached.** If Relay already holds the declared `sha256` in its share
-   cache (and the cached size matches), it copies the cached file and refreshes
-   the entry's last-use time. No bytes are transferred.
+2. **Already cached.** If Relay already holds this file in its share cache, it
+   copies the cached file and refreshes the entry's last-use time. No bytes are
+   transferred. The cache is keyed by `sha256` *and* the sanitized `filename`
+   (the name rides along in the entry path so whatever consumes the pasted file
+   sees the real name), and the cached size must match, so the same content
+   offered under a different filename is a miss and is uploaded again.
 3. **Bytes required.** Otherwise Relay first checks `size` against its share-cache
    ceiling. A file that could never fit MUST be refused **before any record is
    created**, with **413** `file_too_large` and `details: {size, max}`; the
-   client falls back to a browser download. If it could fit, Relay records the
+   client falls back to a browser download. A ceiling of `0` disables the cache
+   entirely and refuses every unmapped copy with the same code. If it could fit, Relay records the
    action in the `PendingBytes` state and answers **409** `bytes_required` with
    `details` carrying the `action_id`, `sha256`, and `filename`. Copy File MUST
    NOT enter the missing-mapping recovery flow (section 9.2); a share action
@@ -702,9 +706,12 @@ On `bytes_required`, the client uploads the file bytes to
 (allowed Origin plus valid credential). The upload:
 
 - MUST target an action currently in `PendingBytes`; an upload against any other
-  state answers **409** with the record's current status, and a second
-  concurrent upload for the same `action_id` answers **409**
-  `upload_in_progress`.
+  state answers with that record's current status — the same 204/202/409/500
+  answers `GET /v1/actions/{id}` gives — which is also the idempotent answer to
+  a retried upload. A second concurrent upload for the same `action_id` answers
+  **409** `upload_in_progress`, and an upload that would push the total declared
+  bytes currently streaming past the share-cache ceiling answers **429**
+  `upload_capacity_exhausted`.
 - is size-checked against the declared `size` (plus a small fixed slack) and
   answers **413** `upload_too_large`, or **400** `size_mismatch`, on a breach or
   disagreement.
@@ -734,9 +741,15 @@ user-configurable ceiling (default 5 GiB, editable in Desktop settings). Entries
 are evicted oldest-last-use-first when the total exceeds the ceiling, but a small
 ring of the most recently handed-out cache paths is never evicted: one of them
 may be sitting on the system clipboard, where eviction would turn a later paste
-into a silent no-op. In-flight upload temporaries are swept on an age guard, not
-by eviction. Copies satisfied from a mapping or an existing cache entry store
-nothing, so the ceiling governs only bytes Relay must newly store.
+into a silent no-op. The single most recent of those is pinned unconditionally —
+the OS clipboard holds exactly one entry — and the rest of the ring is best
+effort. In-flight upload temporaries are swept on an age guard, not by eviction,
+and are removed as soon as their upload ends however it ends, including a client
+disconnect. Copies satisfied from a mapping or an existing cache entry store
+nothing, so the ceiling governs only bytes Relay must newly store. It also bounds
+what may be arriving at once: the total declared size of the uploads currently
+streaming may not exceed the ceiling. Lowering the ceiling evicts down to it
+immediately, and Desktop offers an explicit "Clear share cache" action.
 
 ### 16.4 Action-record lifetime
 
@@ -745,9 +758,15 @@ location verbs do not:
 
 - `PendingBytes` has its own longer TTL than ordinary finished records — a
   multi-gigabyte upload can legitimately take a while — but it still expires, so
-  an abandoned browser tab cannot pin a record forever. When the upload
-  completes, the record's age is reset so the finished record ages out on the
-  ordinary TTL.
+  an abandoned browser tab cannot pin a record forever. A record whose upload is
+  actually streaming is exempt while it streams (its age is only reset when the
+  upload completes, so an upload that outruns the TTL must not have its record
+  pruned out from under it). When the upload completes, the record's age is
+  reset so the finished record ages out on the ordinary TTL.
+- The record cap evicts finished records (`Complete`/`Failed`) first, and falls
+  back to pending ones only when nothing has finished: a `PendingMapping` may be
+  on screen in the mapping window, and a `PendingBytes` may be between its
+  `bytes_required` answer and the upload that satisfies it.
 - `Executing` is exempt from every TTL: the local command's runtime is not
   Relay's to predict, and dropping the record mid-command would strand the
   polling client. Its bound is startup recovery instead — on load, any record

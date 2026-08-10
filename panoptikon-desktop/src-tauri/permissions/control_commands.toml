@@ -27,6 +27,7 @@ commands.allow = [
   "set_search_cache_size",
   "set_relay_enabled",
   "set_share_cache_max_bytes",
+  "clear_share_cache",
   "get_update_state",
   "check_for_updates",
   "open_update_window",

@@ -172,6 +172,17 @@ impl ShareCache {
         }
     }
 
+    /// Brings the cache down to `max_bytes` outside an insert.
+    ///
+    /// Eviction otherwise happens only when something is stored, so lowering
+    /// the ceiling (or clearing the cache with a ceiling of 0) needs a way to
+    /// reclaim what is already on disk. Returns the bytes still occupied
+    /// afterwards — held clipboard paths and in-flight temporaries survive by
+    /// design, so this is not always 0 even for a 0 ceiling.
+    pub fn enforce_limit(&self, max_bytes: u64, keep: &[PathBuf]) -> u64 {
+        self.evict(max_bytes, keep, Path::new(""))
+    }
+
     /// Removes oldest-first until the cache fits in `max_bytes`.
     ///
     /// Temporary files in the root count toward the total — they are real
@@ -179,14 +190,16 @@ impl ShareCache {
     /// is [`sweep_temps`](Self::sweep_temps)' age-guarded job. Per-entry IO
     /// errors skip that entry rather than abandoning the pass, so one
     /// unreadable directory cannot disable eviction entirely.
-    fn evict(&self, max_bytes: u64, keep: &[PathBuf], inserted: &Path) {
+    /// Returns the bytes still occupying the cache when the pass ends.
+    fn evict(&self, max_bytes: u64, keep: &[PathBuf], inserted: &Path) -> u64 {
         let mut entries: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
         let mut total: u64 = 0;
         let directory = match fs::read_dir(&self.root) {
             Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return 0,
             Err(error) => {
                 tracing::warn!(%error, path = %self.root.display(), "failed to read the Relay share cache");
-                return;
+                return 0;
             }
         };
         for item in directory.flatten() {
@@ -244,6 +257,7 @@ impl ShareCache {
                 }
             }
         }
+        total
     }
 }
 
