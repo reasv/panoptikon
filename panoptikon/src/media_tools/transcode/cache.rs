@@ -171,6 +171,17 @@ impl TranscodeCache {
     }
 
     pub(crate) async fn open(dir: PathBuf, budget_mb: u64, limit_mb: u64) -> Result<Self> {
+        // Absolutized ONCE, so every path this cache ever hands out inherits
+        // it. A relative configured dir (the default `data/transcode-cache`
+        // under a relative data folder) would otherwise leak into
+        // `artifact.path`, `ArtifactRef.path` and the share entries — and the
+        // clipboard write hard-rejects relative paths, so the very first
+        // artifact copy on such a deployment failed with "only absolute paths
+        // can be copied". `std::path::absolute`, not `canonicalize`: the
+        // latter's `\\?\` verbatim prefix would ride into clipboard paste
+        // consumers and the relay's mapping hints, which expect plain paths.
+        let dir = std::path::absolute(&dir)
+            .with_context(|| format!("failed to absolutize the cache dir {}", dir.display()))?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create transcode cache dir {}", dir.display()))?;
         let options = SqliteConnectOptions::new()
@@ -1227,6 +1238,42 @@ mod tests {
             .fetch_all(&cache.pool)
             .await
             .unwrap()
+    }
+
+    /// A RELATIVE configured dir (the shipped default is
+    /// `data/transcode-cache` under a relative data folder) must be
+    /// absolutized at open: every path the cache hands out inherits `dir`,
+    /// and the clipboard write hard-rejects relative paths — the first
+    /// runtime QA of the artifact copy failed exactly this way.
+    #[tokio::test]
+    async fn a_relative_cache_dir_is_absolutized_at_open() {
+        // Relative on purpose, and nonce-named because it is resolved against
+        // the process cwd, which every parallel test in this binary shares.
+        let rel = PathBuf::from(format!(
+            "target/rel-cache-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        assert!(rel.is_relative());
+        let cache = TranscodeCache::open(rel.clone(), 64, 1024).await.unwrap();
+
+        assert!(cache.dir.is_absolute(), "open absolutizes: {}", cache.dir.display());
+        assert!(cache.temp_path("mp4").is_absolute());
+        let temp = cache.temp_path("mp4");
+        let artifact = commit_temp(&cache, "relkey", b"0123456789", &temp)
+            .await
+            .unwrap();
+        assert!(artifact.path.is_absolute(), "{}", artifact.path.display());
+        assert!(cache.share_target(&artifact, Some("name.mp4")).is_absolute());
+        let shared = cache
+            .materialize_share(&artifact, Some("name.mp4"))
+            .await
+            .unwrap();
+        assert!(shared.is_absolute(), "{}", shared.display());
+
+        // The pool must be dropped before the directory can go on Windows.
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&rel);
     }
 
     /// The write protocol end to end: the temporary is consumed by the
