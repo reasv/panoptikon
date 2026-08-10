@@ -461,9 +461,14 @@ Depends on Phase 2 (regenerated `panoptikon.d.ts`) and Phase 3 (protocol).
   `disableBackendOpen`). Resolution (design §resolution order, grounded
   in clientConfig semantics):
   1. relay paired ∧ `canCopyFiles` → `relayShare`;
-  2. `desktopManaged && !disableBackendOpen` →
+  2. `!disableBackendOpen` (config loaded) →
      `$api.useMutation("post", "/api/open/clipboard/{sha256}")`;
   3. else → `downloadURL(getFileURL(...), downloadFileName(...))`.
+  (Amended 2026-08-10: this step originally wrote the gate as
+  `desktopManaged && !disableBackendOpen`, narrowing the design's
+  "Desktop-managed local (or backend open actions available)" — which
+  wrongly excluded a bare local gateway, the deployment where Open/Reveal
+  already fall back to the backend. Backend-open availability is the gate.)
   Returns `{ primaryVerb: "copy" | "download", execute, download,
   canPair, pairRelay }`. `size` and `filename` come from the item record
   (`files[0]` via the existing `getPath` item fetch when not passed).
