@@ -3500,6 +3500,51 @@
         }
       }
     },
+    "/api/open/clipboard/artifact": {
+      "post": {
+        "tags": [
+          "open"
+        ],
+        "summary": "Copy a cached transcode artifact to the host system's clipboard",
+        "description": "Place an OS-native reference to a finished rendition (a clip, a converted video, a mosaic) on the clipboard of the machine running the server, so that pasting it into a file manager, a chat client or an upload form attaches that file.\nThe artifact is stored under its content-addressed `<key>.<ext>` name, which is useless to paste, so the path handed to the clipboard is a hardlinked view of the same bytes under a human file name; it is created on demand and removed with the artifact.\nThe write targets the *server's* clipboard, so this is only useful when the server and the browser share a machine (or when a custom open.clipboard_command forwards it elsewhere).\nThis is a potentially dangerous operation, as a custom command can execute arbitrary code.",
+        "operationId": "copy_artifact_to_clipboard_on_host",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "query",
+            "description": "The artifact cache key, exactly as `ArtifactRef.key` carries it.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "The download name the client was handed on `ArtifactRef.filename`.\n\nOptional: without it the artifact's stored name is used. It is\nre-sanitized inside `materialize_share` (single path component,\nlength-capped), so a hostile value degrades to a safe name rather\nthan escaping the share directory.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Artifact copied to the host clipboard",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No cached artifact for this key"
+          }
+        }
+      }
+    },
     "/api/open/clipboard/{sha256}": {
       "post": {
         "tags": [
@@ -5813,7 +5858,8 @@
           "mime_type",
           "size_bytes",
           "url",
-          "filename"
+          "filename",
+          "path"
         ],
         "properties": {
           "filename": {
@@ -5826,6 +5872,17 @@
           },
           "mime_type": {
             "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "The artifact's absolute path on the machine running this server.\n\nThe relay's mapping hint: when server and relay share a filesystem it\ncan take the file directly instead of streaming it back over HTTP.\n\nA deliberate, gated exposure of a server-side path. `ArtifactRef` only\nrides the `POST /api/video/transcode` and `POST /api/video/compose`\nresponses and the job snapshot/SSE shapes those two produce, all of\nwhich sit behind the `video_transcode`/`video_compose` capabilities —\na policy that grants either is already trusted with starting ffmpeg on\nthis host. The one artifact shape a *read-only* profile can reach is\n`GET /api/video/artifact`'s 404 body, whose `job` can never be `Done`:\nthe pool frees a key's `by_key` entry in the same actor message that\npublishes the terminal event, so a snapshot found by key is always\nstill queued or running."
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Lowercase hex sha256 of the artifact's **own** bytes (not the source\nhash the key carries), as computed at publish time.\n\nA receiver that was handed the bytes out-of-band — the Desktop relay,\nwhich uploads an artifact on the browser's behalf — verifies them\nagainst this. `None` for a row committed before the column existed;\nevery consumer must read that as \"no integrity claim\", never as a\nmismatch."
           },
           "size_bytes": {
             "type": "integer",
@@ -6258,7 +6315,8 @@
         "enum": [
           "mp4",
           "webm",
-          "webp"
+          "webp",
+          "avif"
         ]
       },
       "ContinuousFilescanConfig": {

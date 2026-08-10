@@ -537,6 +537,14 @@ async fn async_main() -> anyhow::Result<()> {
                 "/api/open/folder/{sha256}",
                 post(api::open::show_in_file_manager),
             )
+            // Ahead of the `{sha256}` capture below only for readability:
+            // matchit prefers a literal segment over a parameter regardless
+            // of registration order, so `.../clipboard/artifact` can never be
+            // read as a file hash named "artifact".
+            .route(
+                "/api/open/clipboard/artifact",
+                post(api::open::copy_artifact_to_clipboard_on_host),
+            )
             .route(
                 "/api/open/clipboard/{sha256}",
                 post(api::open::copy_file_to_clipboard_on_host),

@@ -74,6 +74,31 @@ pub(crate) struct ArtifactRef {
     /// this can cost is the stem of one of several files with the same
     /// content.
     pub(crate) filename: String,
+    /// Lowercase hex sha256 of the artifact's **own** bytes (not the source
+    /// hash the key carries), as computed at publish time.
+    ///
+    /// A receiver that was handed the bytes out-of-band — the Desktop relay,
+    /// which uploads an artifact on the browser's behalf — verifies them
+    /// against this. `None` for a row committed before the column existed;
+    /// every consumer must read that as "no integrity claim", never as a
+    /// mismatch.
+    pub(crate) sha256: Option<String>,
+    /// The artifact's absolute path on the machine running this server.
+    ///
+    /// The relay's mapping hint: when server and relay share a filesystem it
+    /// can take the file directly instead of streaming it back over HTTP.
+    ///
+    /// A deliberate, gated exposure of a server-side path. `ArtifactRef` only
+    /// rides the `POST /api/video/transcode` and `POST /api/video/compose`
+    /// responses and the job snapshot/SSE shapes those two produce, all of
+    /// which sit behind the `video_transcode`/`video_compose` capabilities —
+    /// a policy that grants either is already trusted with starting ffmpeg on
+    /// this host. The one artifact shape a *read-only* profile can reach is
+    /// `GET /api/video/artifact`'s 404 body, whose `job` can never be `Done`:
+    /// the pool frees a key's `by_key` entry in the same actor message that
+    /// publishes the terminal event, so a snapshot found by key is always
+    /// still queued or running.
+    pub(crate) path: String,
 }
 
 impl ArtifactRef {
@@ -84,6 +109,8 @@ impl ArtifactRef {
             size_bytes: artifact.size_bytes,
             url: format!("/api/video/artifact?key={}", artifact.key),
             filename,
+            sha256: artifact.sha256.clone(),
+            path: artifact.path.to_string_lossy().into_owned(),
         }
     }
 }

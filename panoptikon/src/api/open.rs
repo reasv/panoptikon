@@ -1,7 +1,7 @@
 use axum::{Json, extract::Path};
 use axum_extra::extract::Query;
 use serde::{Deserialize, Serialize};
-use std::path::Path as FsPath;
+use std::path::{Path as FsPath, PathBuf};
 use tokio::process::Command;
 use utoipa::{IntoParams, ToSchema};
 
@@ -22,6 +22,20 @@ pub(crate) struct OpenQuery {
 pub(crate) struct OpenResponse {
     path: String,
     message: String,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct ClipboardArtifactQuery {
+    /// The artifact cache key, exactly as `ArtifactRef.key` carries it.
+    key: String,
+    /// The download name the client was handed on `ArtifactRef.filename`.
+    ///
+    /// Optional: without it the artifact's stored name is used. It is
+    /// re-sanitized inside `materialize_share` (single path component,
+    /// length-capped), so a hostile value degrades to a safe name rather
+    /// than escaping the share directory.
+    name: Option<String>,
 }
 
 /// The shell that re-reads a substituted command line, and therefore the
@@ -655,6 +669,85 @@ pub async fn copy_file_to_clipboard_on_host(
     }))
 }
 
+/// Resolve a cached transcode artifact to a path that carries a *human* file
+/// name, materializing that name if it does not exist yet.
+///
+/// Split out of the handler below so the half that can fail on this machine's
+/// filesystem is testable without writing to a real clipboard: the clipboard
+/// half reads `config::runtime()`, a process-global `OnceLock` that no test
+/// can point at a benign program for its own duration.
+///
+/// Takes the whole query rather than two positional `&str`s: `key` and `name`
+/// are the same type, and a swapped call site would 404 its way past every
+/// test (an empty-name lookup misses with the very detail the miss test pins).
+async fn artifact_share_path(query: &ClipboardArtifactQuery) -> ApiResult<PathBuf> {
+    let key = query.key.as_str();
+    // A present-but-blank `name=` means "no name", exactly as `resolve_path`
+    // treats its `path` — otherwise `Some("")` would shadow the stored
+    // download name and the paste would carry the content-addressed one.
+    let download_name = query
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let cache = crate::media_tools::transcode::pool::transcode_cache().await?;
+    // Also counts as a hit, which is wanted: an artifact the user is actively
+    // handing to another application is not a good eviction victim.
+    let Some(artifact) = cache.lookup(key).await else {
+        // Same wording as the artifact route's miss, so a client that sees
+        // one recognizes the other.
+        return Err(ApiError::not_found("No cached artifact for this key"));
+    };
+    cache
+        .materialize_share(&artifact, download_name)
+        .await
+        .map_err(|err| {
+            // The chain names the cache directory, so it is logged and not
+            // returned — the same rule `ResizeError` documents in cache.rs.
+            tracing::error!(error = ?err, key, "failed to materialize a share entry");
+            ApiError::internal("Failed to prepare the file for the clipboard")
+        })
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "copy_artifact_to_clipboard_on_host",
+    path = "/api/open/clipboard/artifact",
+    tag = "open",
+    summary = "Copy a cached transcode artifact to the host system's clipboard",
+    description = "Place an OS-native reference to a finished rendition (a clip, a converted \
+video, a mosaic) on the clipboard of the machine running the server, so that pasting it into a \
+file manager, a chat client or an upload form attaches that file.\nThe artifact is stored under \
+its content-addressed `<key>.<ext>` name, which is useless to paste, so the path handed to the \
+clipboard is a hardlinked view of the same bytes under a human file name; it is created on \
+demand and removed with the artifact.\nThe write targets the *server's* clipboard, so this is \
+only useful when the server and the browser share a machine (or when a custom \
+open.clipboard_command forwards it elsewhere).\nThis is a potentially dangerous operation, as a \
+custom command can execute arbitrary code.",
+    params(ClipboardArtifactQuery),
+    responses(
+        (status = 200, description = "Artifact copied to the host clipboard", body = OpenResponse),
+        (status = 404, description = "No cached artifact for this key")
+    )
+)]
+pub async fn copy_artifact_to_clipboard_on_host(
+    Query(query): Query<ClipboardArtifactQuery>,
+) -> ApiResult<Json<OpenResponse>> {
+    // No `DbConnection`: the transcode cache is process-global and keyed by
+    // content, so nothing here reads an index.
+    let share_path = artifact_share_path(&query).await?;
+    let path = share_path.to_string_lossy().into_owned();
+    let message = match copy_to_clipboard(&share_path).await? {
+        ClipboardWrite::Completed => format!("Copied to clipboard: {path}"),
+        // Hedged like the sibling verbs: a custom command owns the outcome.
+        ClipboardWrite::Attempted => format!("Attempting to copy to clipboard: {path}"),
+    };
+    Ok(Json(OpenResponse {
+        path: path.clone(),
+        message,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,5 +1055,171 @@ mod tests {
             .is_empty(),
             "and it expands to nothing, so no process is spawned"
         );
+    }
+
+    // --- the artifact clipboard verb ----------------------------------------
+    //
+    // Only the resolution half is exercised end-to-end. The write itself
+    // reads `config::runtime()`, a process-global `OnceLock` installed by
+    // whichever test runs first, so no test can point `clipboard_program` at
+    // a benign command for its own duration — a success test through the
+    // handler would write to the developer's real clipboard. Hence
+    // [`artifact_share_path`]: everything that can fail on this machine lives
+    // there, and the handler adds only the (already covered) clipboard call.
+
+    use axum::Router;
+    use axum::body::Body as AxumBody;
+    use axum::http::{Request, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    use crate::media_tools::transcode::cache::NewArtifact;
+    use crate::media_tools::transcode::pool;
+
+    /// Commits ten known bytes under `key` and hands back the cache directory
+    /// they landed in.
+    async fn commit_artifact(key: &str, download_name: &str) -> PathBuf {
+        let cache = pool::transcode_cache().await.expect("the cache opens");
+        let temp = cache.temp_path("mp4");
+        std::fs::write(&temp, b"0123456789").unwrap();
+        let artifact = cache
+            .commit(
+                NewArtifact {
+                    key,
+                    source_sha256: "sha",
+                    params_hash: "hash",
+                    preset: "clip",
+                    file_name: &format!("{key}.mp4"),
+                    download_name,
+                    mime_type: "video/mp4",
+                    transcoder_version: 1,
+                },
+                &temp,
+            )
+            .await
+            .unwrap();
+        artifact.path.parent().unwrap().to_path_buf()
+    }
+
+    /// The query as the handler would have parsed it, so the seam tests speak
+    /// the same named-field language and cannot swap `key` for `name`.
+    fn share_query(key: &str, name: Option<&str>) -> ClipboardArtifactQuery {
+        ClipboardArtifactQuery {
+            key: key.to_string(),
+            name: name.map(str::to_string),
+        }
+    }
+
+    /// A key nothing has encoded is a 404 — and the literal `artifact`
+    /// segment reaches this handler rather than being read as a file hash by
+    /// the `{sha256}` sibling registered next to it (matchit prefers the
+    /// literal, whatever the registration order). A misrouted request would
+    /// land on the sibling, which answers 400 for the missing db params.
+    #[tokio::test]
+    async fn the_artifact_clipboard_verb_404s_on_an_unknown_key() {
+        let _env = crate::test_utils::test_data_dir();
+        let app = Router::new()
+            .route(
+                "/api/open/clipboard/{sha256}",
+                post(copy_file_to_clipboard_on_host),
+            )
+            .route(
+                "/api/open/clipboard/artifact",
+                post(copy_artifact_to_clipboard_on_host),
+            );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/open/clipboard/artifact?key=nothing-here")
+                    .body(AxumBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["detail"]
+                .as_str()
+                .unwrap()
+                .contains("No cached artifact"),
+            "the miss wording mirrors the artifact route: {json}"
+        );
+    }
+
+    /// The resolution half: the caller's name wins over the stored one, the
+    /// entry carries the artifact's bytes, and a name that spells a traversal
+    /// stays a single component inside `share/<key>/`.
+    #[tokio::test]
+    async fn the_artifact_clipboard_verb_materializes_a_named_view() {
+        let _env = crate::test_utils::test_data_dir();
+        let key = "open-clipboard-artifact-named";
+        commit_artifact(key, "stored-name.mp4").await;
+
+        let path = artifact_share_path(&share_query(key, Some("My Clip.mp4")))
+            .await
+            .expect("a cached artifact materializes");
+        assert_eq!(path.file_name().unwrap(), "My Clip.mp4");
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), key);
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789");
+
+        // Present-but-blank is "no name": the stored download name must win,
+        // not the content-addressed on-disk fallback a `Some("")` would buy.
+        let blank = artifact_share_path(&share_query(key, Some("   ")))
+            .await
+            .expect("a blank name falls back to the stored one");
+        assert_eq!(blank.file_name().unwrap(), "stored-name.mp4");
+
+        let hostile = artifact_share_path(&share_query(key, Some("../../evil.mp4")))
+            .await
+            .expect("a hostile name degrades rather than failing");
+        assert_eq!(
+            hostile.parent().unwrap(),
+            path.parent().unwrap(),
+            "still one component inside share/<key>: {}",
+            hostile.display()
+        );
+    }
+
+    /// The failure body must not name the cache. `materialize_share`'s
+    /// `anyhow` chain embeds absolute paths (it is written for the log), so
+    /// the handler answers with a fixed sentence instead — the same rule
+    /// `ResizeError` documents in cache.rs.
+    #[tokio::test]
+    async fn a_share_failure_never_names_the_cache_directory() {
+        let _env = crate::test_utils::test_data_dir();
+        let key = "open-clipboard-artifact-blocked";
+        let cache_dir = commit_artifact(key, "stored-name.mp4").await;
+
+        // A *file* where the entry's directory has to go: `create_dir_all`
+        // fails on it deterministically, on every platform.
+        let blocker = cache_dir.join("share").join(key);
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let error = artifact_share_path(&share_query(key, Some("My Clip.mp4")))
+            .await
+            .expect_err("the share entry cannot be created");
+        let detail = error.detail().to_string();
+        assert!(
+            !detail.contains(&*cache_dir.to_string_lossy()),
+            "the cache path leaked into the body: {detail}"
+        );
+        assert!(
+            !detail.contains(key) && !detail.contains("share"),
+            "nothing about the store's layout belongs in the body: {detail}"
+        );
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let _ = std::fs::remove_file(&blocker);
     }
 }

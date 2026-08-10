@@ -438,9 +438,8 @@ impl TranscodeCache {
     /// owns it. Charging them would make the budget depend on which filesystem
     /// the cache landed on, for a quantity that cannot outlive the artifacts
     /// the budget already covers.
-    // Exercised by the tests below; the HTTP route that hands the path to the
-    // host clipboard is the next step of this feature.
-    #[allow(dead_code)]
+    // Called by `POST /api/open/clipboard/artifact`, which hands the path it
+    // returns to the host clipboard.
     pub(crate) async fn materialize_share(
         &self,
         artifact: &CachedArtifact,
