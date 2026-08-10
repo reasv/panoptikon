@@ -303,6 +303,22 @@ trim (`vt`) stays keyed by the *original* item sha throughout.
   Original come from `/api/video/presets` surface-tagged `clip`. On **pins**
   the top-right is occupied (Select/Find) — clip actions go in the existing
   kebab / context menu instead.
+- **"Web version" row (added 2026-08-10):** a needs-transcode item's playback
+  rendition already sits in the artifact cache, but no clip row can reach it
+  (different preset ⇒ different cache key) — so its download menus gain one
+  row for it — above the divider with "Original file" in the player surface's
+  menu (both name files that exist, not work); on pins, next to "Download
+  original" as "Download web version", frozen at menu-open so a job finishing
+  mid-open cannot shift rows under the cursor (the surface menu needs no
+  freeze: it can only exist once the rendition does). Gate = the playback
+  store reading `done` (only the
+  playback path writes that key, and only for needs-transcode items — so no
+  playability plumbing, and in the gallery the menu itself only mounts once
+  the rendition exists) + the policy exposing the `playback` preset. The row
+  still runs the `POST /api/video/transcode` flow (`preset=playback`, no
+  trim) rather than linking the stored artifact URL: eviction turns a direct
+  link into a 404 body saved as `.mp4`, while the re-POST is a hit or a fast
+  self-heal. Pure logic: `webVersionRow` in `lib/videoClip.ts`.
 
 ### Pinboard save + animated mosaic
 
