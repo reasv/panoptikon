@@ -211,9 +211,12 @@ Entering pages mode must prefetch the target page before the URL commit
 the current page's rows already cover the viewport and chunk fetches take
 over.
 
-Where the toggle lives is a UI decision (candidate: beside the pagination
-bar, since that is the component whose behavior it changes); it is not a
-sidebar option buried under Advanced.
+The toggle lives in the results header's right-hand cell, beside the
+pinboard-library button (`ui/app/search/SearchPage.tsx:468-470`) — not in
+the pagination footer, which must stay centered and keep its width on
+small viewports, and not a sidebar option buried under Advanced. The
+header renders whenever the grid does, so the toggle stays available even
+when the pagination bar is hidden (short result sets).
 
 ### 6. Fixed row heights — exact jumps
 
