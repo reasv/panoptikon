@@ -81,19 +81,23 @@ silent.
    the custom clipboard command is the escape hatch beyond that.
    Windows/macOS are native (CF_HDROP; NSPasteboard).
 
-   **One MIME type per invocation.** Neither tool can advertise two
-   flavours in a single run (`wl-copy --type` / `xclip -t` take one
-   value), and no single flavour is universal: GNOME-family file
-   managers (Nautilus, Nemo, Caja) paste files *only* from
-   `x-special/gnome-copied-files`, while Dolphin, Thunar, PCManFM,
-   browsers and chat clients read `text/uri-list`. The type is therefore
-   selected from `XDG_CURRENT_DESKTOP`: a case-insensitive match on
-   `GNOME`, `Cinnamon`, `X-Cinnamon`, `MATE` or `Unity` ⇒
-   `x-special/gnome-copied-files` with a `copy\n<uri>` LF-separated
-   payload and no trailing newline; anything else (or an unset variable)
-   ⇒ `text/uri-list` with CRLF-terminated URIs. Selection and framing
-   live in one pure function pair so they are unit-testable off-platform
-   (`panoptikon-clipboard/src/payload.rs`).
+   **One MIME type per invocation — always `text/uri-list`.** Neither tool
+   can advertise two flavours in a single run (`wl-copy --type` /
+   `xclip -t` take one value), and no single flavour is universal:
+   GNOME-family file managers (Nautilus, Nemo, Caja) paste files *only*
+   from `x-special/gnome-copied-files`, while Dolphin, Thunar, PCManFM,
+   browsers and chat clients read `text/uri-list`. Implementation first
+   picked the flavour from `XDG_CURRENT_DESKTOP`; that was **reversed**
+   during review. Choosing the GNOME flavour buys Nautilus paste at the
+   cost of pasting into Discord, Element and browser upload forms — the
+   feature's primary purpose — silently doing nothing, and the custom
+   clipboard command cannot rescue those users because the relay rejects
+   clipboard templates containing quotes (a security fix) and that payload
+   needs them. So: `text/uri-list` with CRLF-terminated URIs on every
+   desktop, GNOME file managers documented as not accepting it, and the
+   framing kept as a pure function so it stays unit-testable off-platform
+   (`panoptikon-clipboard/src/payload.rs`). Serving both consumers needs an
+   in-process dual-target selection owner (design doc, future work).
 10. **macOS pasteboard on main thread.** In the desktop app the clipboard
     write is dispatched via `app_handle.run_on_main_thread` (AppKit
     pasteboard calls are main-thread-hostile); the shared crate stays

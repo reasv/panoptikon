@@ -11,6 +11,13 @@
 //! macOS the caller owns the dispatch (e.g. Tauri's
 //! `AppHandle::run_on_main_thread`); this crate does not dispatch for you.
 //!
+//! **How long a copy survives differs by platform.** `CF_HDROP` and
+//! `NSPasteboard` entries are owned by the window system and outlive the
+//! process that wrote them. On Linux and the BSDs an X11/Wayland selection is
+//! owned by a *live process*, and here that process is the spawned
+//! `wl-copy`/`xclip` helper: quitting the Desktop app or restarting the
+//! service takes its children with it and the clipboard goes empty.
+//!
 //! Every error message is user-presentable: they surface verbatim in UI toasts
 //! and in HTTP 500 bodies.
 
@@ -61,6 +68,15 @@ mod uri;
 /// validation may still leave the clipboard empty, because `CF_HDROP` and
 /// `NSPasteboard` writes both clear the previous contents before placing the
 /// new ones. Callers must not assume the prior clipboard survives an error.
+///
+/// Existence is checked before the write, not held across it: a path deleted
+/// or replaced in between still reaches the clipboard, and the paste then
+/// fails or lands the replacement. Only references travel, so what a paste
+/// resolves to is always whatever is at the path *at paste time* — a check
+/// here could not change that. Directories are accepted deliberately; copying
+/// a folder is what Explorer and Finder do.
+///
+/// Neither the existence check nor the write reads file contents.
 pub fn copy_files_to_clipboard<P: AsRef<Path>>(paths: &[P]) -> anyhow::Result<()> {
     let paths: Vec<&Path> = paths.iter().map(AsRef::as_ref).collect();
 
@@ -95,6 +111,10 @@ pub fn copy_files_to_clipboard<P: AsRef<Path>>(paths: &[P]) -> anyhow::Result<()
 ///
 /// A successful probe is not a guarantee, and it never reads or writes clipboard
 /// contents (on Windows it does briefly open and close the clipboard itself).
+///
+/// Nothing in the workspace calls this yet; it exists as the honest probe for a
+/// future capability check, and it validates exactly what a write would do —
+/// the same resolved helper binary on Linux, the same pasteboard on macOS.
 pub fn clipboard_available() -> Result<(), String> {
     imp::available()
 }
@@ -128,8 +148,27 @@ mod tests {
         assert!(err.contains("does not exist"), "{err}");
     }
 
-    /// Clobbers the real clipboard, so it never runs unattended:
-    /// `cargo test -p panoptikon-clipboard -- --ignored`.
+    #[test]
+    fn reports_paths_the_os_cannot_even_look_at() {
+        // An interior NUL cannot be handed to the OS, so `try_exists` answers
+        // neither true nor false.
+        #[cfg(windows)]
+        let unreadable = std::path::PathBuf::from("C:\\panoptikon\0nul.bin");
+        #[cfg(not(windows))]
+        let unreadable = std::path::PathBuf::from("/panoptikon\0nul.bin");
+
+        let err = copy_files_to_clipboard(&[&unreadable])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not be read"), "{err}");
+    }
+
+    /// Windows only: it round-trips `CF_HDROP` through the real clipboard,
+    /// which it clobbers, so it never runs unattended:
+    /// `cargo test -p panoptikon-clipboard -- --ignored`. The macOS path must
+    /// not run here at all — libtest hands tests to spawned threads and
+    /// `NSPasteboard` is main-thread only.
+    #[cfg(windows)]
     #[test]
     #[ignore = "writes to the real system clipboard"]
     fn smoke_writes_a_real_file_reference() {
@@ -142,12 +181,8 @@ mod tests {
         }
         copy_files_to_clipboard(&[&file]).unwrap();
 
-        #[cfg(windows)]
-        {
-            let pasted: Vec<String> =
-                clipboard_win::get_clipboard(clipboard_win::formats::FileList)
-                    .expect("CF_HDROP should be readable back");
-            assert_eq!(pasted, vec![file.to_str().unwrap().to_owned()]);
-        }
+        let pasted: Vec<String> = clipboard_win::get_clipboard(clipboard_win::formats::FileList)
+            .expect("CF_HDROP should be readable back");
+        assert_eq!(pasted, vec![file.to_str().unwrap().to_owned()]);
     }
 }

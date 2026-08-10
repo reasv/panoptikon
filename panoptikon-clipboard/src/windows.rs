@@ -13,8 +13,9 @@ use clipboard_win::raw::set_file_list_with;
 /// paints a paste menu is routine, so retry before giving up.
 const OPEN_ATTEMPTS: u32 = 10;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(30);
-/// `Clipboard::new_attempts(n)` makes one attempt plus `n` retries, so every
-/// outer attempt is really six calls to `OpenClipboard`.
+/// `Clipboard::new_attempts(n)` makes one attempt plus `n` retries, but its
+/// retries only yield the thread (`Sleep(0)`), so the wall-clock effort is the
+/// outer loop's: `OPEN_ATTEMPTS` tries spaced by `OPEN_RETRY_DELAY`.
 const OPEN_INNER_RETRIES: usize = 5;
 
 pub(crate) fn copy_files(paths: &[&Path]) -> anyhow::Result<()> {
@@ -54,7 +55,6 @@ fn open() -> anyhow::Result<Clipboard> {
         }
     }
 
-    let total = OPEN_ATTEMPTS * (OPEN_INNER_RETRIES as u32 + 1);
     // `ErrorCode` renders whatever `GetLastError()` last returned, which is
     // "The operation completed successfully." when the failure left it at 0 —
     // worse than saying nothing, so drop the detail in that case.
@@ -63,7 +63,7 @@ fn open() -> anyhow::Result<Clipboard> {
         .map(|err| format!(" ({err})"))
         .unwrap_or_default();
     bail!(
-        "Could not open the Windows clipboard after {total} attempts{detail}; \
+        "The Windows clipboard stayed busy for about a third of a second{detail}; \
          another application may be holding it open. Please try again."
     )
 }
