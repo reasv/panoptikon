@@ -15,13 +15,13 @@
 //! detachment plus die-with-parent, because an encode can outlive a gateway
 //! crash by minutes. The one addition is a watchdog thread: an encode lasts
 //! long enough for a client to change its mind, and long enough for a decoder
-//! to stop producing anything at all — and the reader thread, blocked on a
-//! pipe, cannot notice either on its own.
+//! to stop producing anything at all — the watchdog is what turns either into
+//! a kill the poll loop then observes as an exit.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
@@ -53,22 +53,27 @@ const H264_CRF_MAX: i64 = 51;
 
 /// How often the watchdog re-reads the cancel flag and the activity clock.
 /// Cancelling is a human action, so a fifth of a second is invisible to the
-/// client; the thread exists at all because the progress reader can block
-/// indefinitely.
+/// client; the thread exists at all because only a kill can stop a child that
+/// has stopped producing output.
 const CANCEL_POLL: Duration = Duration::from_millis(200);
 
-/// How long ffmpeg may write **nothing at all** to stdout before the watchdog
-/// kills it.
+/// How long ffmpeg may write **nothing at all** to its progress file before
+/// the watchdog kills it.
 ///
 /// Cancellation used to be the only escape from a decoder that never
 /// terminates — the `-loop 1` animated-image hang class, where the demuxer
 /// produces an endless stream nothing downstream ever bounds. A job like that
-/// held its pool slot until a human noticed, or forever. `-progress pipe:1`
-/// prints a block roughly twice a second for the whole of a healthy encode, so
-/// two minutes of silence is orders of magnitude past any legitimate pause
+/// held its pool slot until a human noticed, or forever. `-progress` prints a
+/// block roughly twice a second for the whole of a healthy encode, so two
+/// minutes of silence is orders of magnitude past any legitimate pause
 /// (container probing, a slow first read off a network mount) while still being
 /// a bound.
 const STALL_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How often the progress file is polled for new bytes. Half of ffmpeg's own
+/// update cadence, so no update waits long, and cheap: each poll is one open
+/// and a read past the last seen offset.
+const PROGRESS_POLL: Duration = Duration::from_millis(250);
 
 /// Everything one encode needs. `params` is the artifact's identity, and the
 /// only thing besides the paths that reaches the command line.
@@ -247,7 +252,9 @@ pub(crate) fn build_args(spec: &EncodeJobSpec) -> Vec<OsString> {
         push!("-t", seconds(end_cs - spec.params.start_cs.unwrap_or(0)));
     }
 
-    push!("-progress", "pipe:1", "-map", "0:v:0");
+    push!("-progress");
+    args.push(progress_path(&spec.output).into_os_string());
+    push!("-map", "0:v:0");
     if preset.acodec.is_some() {
         // Trailing `?`: a video with no audio stream must produce a silent
         // artifact, not an error.
@@ -311,7 +318,9 @@ pub(crate) fn build_compose_args(spec: &ComposeJobSpec, plan: &FilterPlan) -> Ve
         push!("-i");
         args.push(input.path.clone().into_os_string());
     }
-    push!("-progress", "pipe:1", "-filter_complex", &plan.filter_complex);
+    push!("-progress");
+    args.push(progress_path(&spec.output).into_os_string());
+    push!("-filter_complex", &plan.filter_complex);
     for arg in &plan.output_args {
         args.push(OsString::from(arg));
     }
@@ -485,6 +494,25 @@ fn crf_or_bitrate(quality: QualityMode, crf_key: &str, offset: i64) -> Vec<Strin
     }
 }
 
+/// Where one job's `-progress` stream goes: a sibling of its temporary
+/// output, which the run deletes on every exit path and the cache's
+/// `.tmp-*` age sweep catches after a crash.
+///
+/// A FILE, never `pipe:1`, and that is a bug fix rather than a preference:
+/// on Windows, opening the progress stream through ffmpeg's `pipe:` protocol
+/// breaks *input* reading on SMB mounts for any mp4 whose probe must
+/// read-through to reach its moov atom — the demuxer stops at the first 32 KiB
+/// buffer and fails with "moov atom not found" on files that decode fine
+/// without the flag. Deterministic on ffmpeg 7.1 and 8.0.1 Windows builds,
+/// gone the moment the same progress stream targets a file; the upstream
+/// mechanism is undiagnosed (same family as the 2022-05 ffmpeg-user "moov
+/// atom not found on network storage" regression report).
+pub(crate) fn progress_path(output: &Path) -> PathBuf {
+    let mut name = output.as_os_str().to_os_string();
+    name.push(".progress");
+    PathBuf::from(name)
+}
+
 /// One `-progress` update.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ProgressUpdate {
@@ -493,7 +521,7 @@ pub(crate) struct ProgressUpdate {
     pub(crate) fraction: Option<f32>,
 }
 
-/// Turns `-progress pipe:1` key=value lines into fractions.
+/// Turns `-progress` key=value lines into fractions.
 ///
 /// ffmpeg prints the output clock three ways per block. `out_time_ms` is the
 /// trap: it has carried **microseconds** since the key was introduced (it is
@@ -615,6 +643,12 @@ impl ChildHandle {
     fn wait(&self) -> std::io::Result<ExitStatus> {
         self.lock().wait()
     }
+
+    /// Whether the child has exited, without blocking. `wait` after a positive
+    /// answer still returns the status — std caches it on the `Child`.
+    fn has_exited(&self) -> bool {
+        matches!(self.lock().try_wait(), Ok(Some(_)))
+    }
 }
 
 /// The spawned encode, so a panic or an early return cannot leave an ffmpeg
@@ -653,6 +687,7 @@ pub(crate) fn run_encode(
 ) -> Result<(), EncodeError> {
     run_ffmpeg(
         &build_args(spec),
+        &progress_path(&spec.output),
         expected_output_seconds(spec),
         cancel,
         on_progress,
@@ -717,6 +752,7 @@ pub(crate) fn run_compose(
     let plan = super::compose::build_filtergraph(&spec.params, &sources);
     run_ffmpeg(
         &build_compose_args(spec, &plan),
+        &progress_path(&spec.output),
         Some(spec.params.target_seconds()),
         cancel,
         on_progress,
@@ -738,22 +774,27 @@ pub(crate) fn run_task(
 /// One ffmpeg child, whatever produced its argument vector, run to completion
 /// on the calling thread. `expected_seconds` is the progress denominator.
 ///
+/// `progress_file` is where the vector's `-progress` points (see
+/// [`progress_path`] for why it is a file rather than stdout). The reader
+/// tails it: each poll reads whatever accumulated past the last seen offset,
+/// so no update is lost to the polling cadence, only delayed by it.
+///
 /// `on_progress` is called at ffmpeg's own update rate (roughly twice a
 /// second); throttling for consumers is the caller's business.
 ///
-/// `cancel` is honoured by a watchdog thread rather than by the progress loop
-/// alone. The loop's own check is only an early exit: ffmpeg writes no
-/// `-progress` line at all until it starts producing output, so a source it
-/// stalls on (or an encode that outlives the client) would leave the reader
-/// blocked on a pipe forever and the pool slot held with it. The watchdog is
-/// what turns the flag into an EOF, and it is joined on every exit path, so
-/// nothing here relies on the runtime being torn down to reap a child.
+/// `cancel` is honoured by a watchdog thread as well as by the poll loop's
+/// own check: ffmpeg writes no `-progress` block at all until it starts
+/// producing output, so a source it stalls on (or an encode that outlives the
+/// client) would otherwise hold the pool slot forever. The watchdog is joined
+/// on every exit path, so nothing here relies on the runtime being torn down
+/// to reap a child.
 ///
 /// The same watchdog carries the [`STALL_DEADLINE`], against an activity clock
-/// the reader stamps on every line: cancellation used to be the *only* escape
-/// from a child that never terminates.
+/// the reader stamps whenever the file grows: cancellation used to be the
+/// *only* escape from a child that never terminates.
 fn run_ffmpeg(
     args: &[OsString],
+    progress_file: &Path,
     expected_seconds: Option<f64>,
     cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(Option<f32>),
@@ -761,19 +802,22 @@ fn run_ffmpeg(
     if cancel.load(Ordering::Relaxed) {
         return Err(EncodeError::Cancelled);
     }
+    // A leftover from a previous attempt of this temporary would replay stale
+    // updates into the offsets below; ffmpeg truncates on open, but only once
+    // it gets that far.
+    let _ = std::fs::remove_file(progress_file);
 
     let mut command = Command::new(crate::media_tools::ffmpeg());
     command
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped());
     detach_from_console(&mut command);
     die_with_parent(&mut command);
     let mut child = command.spawn().map_err(EncodeError::Spawn)?;
     let _job = JobGuard::assign(&child);
 
-    let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let drain = std::thread::spawn(move || drain_stderr(stderr));
     let mut child = EncodeChild {
@@ -782,9 +826,8 @@ fn run_ffmpeg(
     };
 
     let mut progress = ProgressReader::new(expected_seconds);
-    let mut reader = BufReader::new(stdout);
     // The activity clock the stall deadline is measured against: milliseconds
-    // since `spawned`, stamped by the reader on every line it gets. Started at
+    // since `spawned`, stamped whenever the progress file grows. Started at
     // zero rather than at "never", so the deadline also covers the stretch
     // before ffmpeg's first `-progress` block.
     let spawned = Instant::now();
@@ -834,24 +877,39 @@ fn run_ffmpeg(
             }
         });
 
-        let mut raw: Vec<u8> = Vec::new();
+        // The tail: bytes past `seen` are new, and a partial trailing line
+        // carries over until its newline arrives (ffmpeg writes blocks, not
+        // lines, so a read can end mid-key).
+        let mut seen: u64 = 0;
+        let mut carry: Vec<u8> = Vec::new();
         loop {
-            raw.clear();
-            match reader.read_until(b'\n', &mut raw) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
+            // Exit read BEFORE the drain below: everything the child wrote is
+            // in the file once it has exited, so this iteration's read is the
+            // final one and nothing is left behind by breaking afterwards.
+            let exited = child.child.has_exited();
+            if let Ok(mut file) = std::fs::File::open(progress_file)
+                && file.seek(SeekFrom::Start(seen)).is_ok()
+            {
+                let mut fresh: Vec<u8> = Vec::new();
+                if file.read_to_end(&mut fresh).is_ok() && !fresh.is_empty() {
+                    seen += fresh.len() as u64;
+                    // Any growth at all, not only a line the parser
+                    // recognizes: a child that is writing is alive.
+                    last_activity.store(spawned.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    carry.extend_from_slice(&fresh);
+                    while let Some(end) = carry.iter().position(|&byte| byte == b'\n') {
+                        let line = String::from_utf8_lossy(&carry[..end]).into_owned();
+                        carry.drain(..=end);
+                        if let Some(update) = progress.feed(&line) {
+                            on_progress(update.fraction);
+                        }
+                    }
+                }
             }
-            // Any output at all, not only a line the progress parser
-            // recognizes: a child that is writing is a child that is alive.
-            last_activity.store(spawned.elapsed().as_millis() as u64, Ordering::Relaxed);
-            let line = String::from_utf8_lossy(&raw);
-            if let Some(update) = progress.feed(&line) {
-                on_progress(update.fraction);
-            }
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.load(Ordering::Relaxed) || exited {
                 break;
             }
+            std::thread::sleep(PROGRESS_POLL);
         }
         // Wakes the watchdog out of its poll; the scope then joins it, which
         // is also what waits for a kill already in flight.
@@ -862,12 +920,16 @@ fn run_ffmpeg(
         Ok(status) => status,
         Err(err) => {
             let tail = child.stderr_tail();
+            let _ = std::fs::remove_file(progress_file);
             return Err(EncodeError::Failed(format!(
                 "waiting for ffmpeg failed: {err}: {tail}"
             )));
         }
     };
     let tail = child.stderr_tail();
+    // The child is gone either way, so its progress sidecar is trash now; a
+    // crash that skips this is what the cache's aged `.tmp-*` sweep is for.
+    let _ = std::fs::remove_file(progress_file);
     if cancel.load(Ordering::Relaxed) {
         return Err(EncodeError::Cancelled);
     }
@@ -994,7 +1056,7 @@ mod tests {
                 "-ss", "1.00",
                 "-i", "in.mp4",
                 "-t", "6.94",
-                "-progress", "pipe:1",
+                "-progress", "out.tmp.progress",
                 "-map", "0:v:0",
                 "-map", "0:a:0?",
                 "-sn", "-dn",
@@ -1276,7 +1338,7 @@ mod tests {
                 "-nostdin", "-hide_banner", "-nostats", "-v", "error",
                 "-ss", "2.00",
                 "-i", "a.mp4",
-                "-progress", "pipe:1",
+                "-progress", "out.tmp.progress",
                 "-filter_complex", "[0:v:0]null[vout]",
                 "-map", "[vout]", "-an", "-sn", "-dn", "-pix_fmt", "yuv420p",
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
@@ -1321,7 +1383,9 @@ mod tests {
         let args = args_of(&spec);
         assert_eq!(args[at(&args, "-y") + 1], "out.tmp");
         assert_eq!(args[at(&args, "-i") + 1], "in.mp4");
-        assert_eq!(args[at(&args, "-progress") + 1], "pipe:1");
+        // A file sibling of the output, never `pipe:1`: the pipe protocol
+        // breaks SMB input reads on Windows (see `progress_path`).
+        assert_eq!(args[at(&args, "-progress") + 1], "out.tmp.progress");
         assert_eq!(args[at(&args, "-pix_fmt") + 1], "yuv420p");
         assert!(args.contains(&"-sn".to_string()) && args.contains(&"-dn".to_string()));
         assert!(preset("clip").surfaces.contains(&Surface::Clip));
