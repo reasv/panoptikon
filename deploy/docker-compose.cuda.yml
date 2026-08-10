@@ -55,7 +55,13 @@ services:
       # 1000; bind-mounted media must be readable by that uid.
       # - /path/to/your/pictures:/media/pictures:ro
       # - /path/to/your/videos:/media/videos:ro
-    # environment:
+    environment:
+      # "video" makes the NVIDIA runtime inject libnvidia-encode so video
+      # transcoding can use nvenc; the runtime's default (compute,utility)
+      # omits it and nvenc silently falls back to software. The image also
+      # bakes this ENV, but stating it here keeps older published images
+      # working and documents the requirement.
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
     #   - LOGLEVEL=DEBUG
 
 volumes:
