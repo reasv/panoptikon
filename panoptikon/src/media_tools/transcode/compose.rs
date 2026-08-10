@@ -229,7 +229,11 @@ impl ComposeParams {
     /// [`Self::new`] with the encoder resolved against this host's hardware
     /// probe. **Blocking**, like its single-file twin.
     pub(crate) fn resolve(doc: ResolvedCompose, preset: ResolvedPreset) -> Self {
-        let encoder = super::run::resolve_encoder(&preset, super::hw::fast_h264_encoder());
+        let encoder = super::run::resolve_encoder(
+            &preset,
+            super::hw::fast_h264_encoder(),
+            super::hw::av1_software_encoder(),
+        );
         Self::new(doc, preset, encoder)
     }
 
@@ -615,7 +619,7 @@ fn resolve_target_cs(
         ComposeLength::LongestLoopOnce => longest_span_cs(items).unwrap_or(STILLS_ONLY_TARGET_CS),
     };
     let cap_seconds = match preset.container {
-        Container::Webp => limits.max_animated_image_seconds,
+        Container::Webp | Container::Avif => limits.max_animated_image_seconds,
         Container::Mp4 | Container::Webm => limits.max_output_seconds,
     };
     let cap_cs = (cap_seconds as i64).saturating_mul(100);
@@ -920,9 +924,11 @@ pub(crate) fn build_filtergraph(params: &ComposeParams, sources: &[ComposeSource
 
     let format = match container {
         // Animated WebP keeps an alpha plane: the canvas background may be
-        // translucent, and a yuv420p output would bake it onto black.
+        // translucent, and a yuv420p output would bake it onto black. AVIF
+        // does not get one: SVT-AV1 has no alpha support, so a translucent
+        // canvas bakes there exactly as it does for mp4/webm.
         Container::Webp => "yuva420p",
-        Container::Mp4 | Container::Webm => "yuv420p",
+        Container::Mp4 | Container::Webm | Container::Avif => "yuv420p",
     };
     // No preset height cap here, unlike the single-file argument builder:
     // `canvas_over_preset_height` already refused every canvas taller than the
@@ -1170,7 +1176,7 @@ mod tests {
     use crate::media_tools::transcode::presets::{builtin_presets, find_preset};
 
     /// See [`compose_params_hash_is_stable`].
-    const PINNED_COMPOSE_PARAMS_HASH: &str = "935d70a87811b1031c8df4434fd46be4";
+    const PINNED_COMPOSE_PARAMS_HASH: &str = "c2ed5277270ebab041cf21d364be29ca";
 
     fn preset(id: &str) -> ResolvedPreset {
         find_preset(&builtin_presets(), id)
@@ -1275,7 +1281,7 @@ mod tests {
     /// `TRANSCODER_VERSION` and re-pinning this constant.
     #[test]
     fn compose_params_hash_is_stable() {
-        assert_eq!(TRANSCODER_VERSION, 1, "re-pin the fixture below on a bump");
+        assert_eq!(TRANSCODER_VERSION, 2, "re-pin the fixture below on a bump");
         let params = params_for(&worked_example(), "mosaic-mp4");
         assert_eq!(
             serde_json::to_string(&params.doc).unwrap(),
@@ -2345,6 +2351,8 @@ mod tests {
 
     /// `width,height,duration,frames` of an artifact. `-count_frames` rather
     /// than the container's own `nb_frames`: an animated WebP records none.
+    /// The stream with the most frames, not `v:0`: an animated AVIF's first
+    /// video stream is its one-frame cover still, the animation is `v:1`.
     fn probe_artifact(path: &Path) -> Option<(i64, i64, f64, i64)> {
         let output = Command::new(crate::media_tools::ffprobe())
             .args([
@@ -2352,7 +2360,7 @@ mod tests {
                 "error",
                 "-count_frames",
                 "-select_streams",
-                "v:0",
+                "v",
                 "-show_entries",
                 "stream=width,height,nb_read_frames:format=duration",
                 "-of",
@@ -2363,7 +2371,13 @@ mod tests {
             .output()
             .ok()?;
         let data: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        let stream = data.get("streams")?.as_array()?.first()?;
+        let stream = data.get("streams")?.as_array()?.iter().max_by_key(|stream| {
+            stream
+                .get("nb_read_frames")
+                .and_then(|value| value.as_str())
+                .and_then(|text| text.parse::<i64>().ok())
+                .unwrap_or(0)
+        })?;
         let number = |value: Option<&serde_json::Value>| -> f64 {
             value
                 .and_then(|value| match value {
@@ -2383,9 +2397,16 @@ mod tests {
     /// One frame of an artifact, decoded, so the assertions can be about
     /// pixels rather than about ffmpeg's exit code.
     fn frame_of(path: &Path, at: &str, into: &Path) -> Option<image::DynamicImage> {
-        let status = Command::new(crate::media_tools::ffmpeg())
+        let mut command = Command::new(crate::media_tools::ffmpeg());
+        command
             .args(["-y", "-v", "error", "-ss", at, "-i"])
-            .arg(path)
+            .arg(path);
+        if path.extension().is_some_and(|ext| ext == "avif") {
+            // The animation track; default selection lands on the one-frame
+            // cover still, and a seek past it decodes nothing at all.
+            command.args(["-map", "0:v:1"]);
+        }
+        let status = command
             .args(["-frames:v", "1"])
             .arg(into)
             .stdin(Stdio::null())
@@ -2486,11 +2507,20 @@ mod tests {
         for (preset_id, ext) in [
             ("mosaic-mp4", "mp4"),
             ("webp-anim", "webp"),
+            ("avif-anim", "avif"),
             ("mosaic-webm", "webm"),
         ] {
+            // The real probe, not a pinned encoder: this test spawns the real
+            // toolchain, and which AV1 encoder it has is the host's business
+            // (a build with none skips the avif round, like no-ffmpeg skips
+            // the test).
+            let av1 = super::super::hw::av1_software_encoder();
+            if preset_id == "avif-anim" && av1.is_none() {
+                continue;
+            }
             let document = fixture_document(preset_id);
             let preset = preset(preset_id);
-            let encoder = super::super::run::resolve_encoder(&preset, None);
+            let encoder = super::super::run::resolve_encoder(&preset, None, av1);
             let doc = resolve_compose(&document, &preset, limits()).expect("a valid document");
             let params = ComposeParams::new(doc, preset, encoder);
             let output = dir.path().join(format!("mosaic.{ext}"));
@@ -2565,7 +2595,11 @@ mod tests {
         name: &str,
     ) -> PathBuf {
         let preset = preset(&document.output.preset);
-        let encoder = super::super::run::resolve_encoder(&preset, None);
+        let encoder = super::super::run::resolve_encoder(
+            &preset,
+            None,
+            super::super::hw::av1_software_encoder(),
+        );
         let doc = resolve_compose(document, &preset, limits()).expect("a valid document");
         let output = dir.join(format!("{name}.{}", preset.container.ext()));
         let spec = super::super::run::ComposeJobSpec {

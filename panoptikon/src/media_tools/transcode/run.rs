@@ -160,7 +160,18 @@ impl std::error::Error for EncodeError {}
 /// it to a VP9 or WebP profile would produce h264 bytes in a webm/webp
 /// container. For those the channel is expressive of nothing this function can
 /// act on, so they get their software encoder either way.
-pub(crate) fn resolve_encoder(preset: &ResolvedPreset, hw: Option<&str>) -> String {
+///
+/// `av1` is [`hw::av1_software_encoder`]'s answer: the `av1` codec family is
+/// the one whose preferred encoder (SVT-AV1) is genuinely missing from common
+/// builds, so it resolves to whatever the toolchain has. With no answer the
+/// preferred name stands, and a build with no AV1 encoder at all fails the
+/// encode with ffmpeg's own "Unknown encoder" rather than something invented
+/// here.
+pub(crate) fn resolve_encoder(
+    preset: &ResolvedPreset,
+    hw: Option<&str>,
+    av1: Option<&str>,
+) -> String {
     if is_h264(&preset.vcodec) {
         return match preset.channel {
             Channel::Quality => ENCODER_X264_QUALITY.to_string(),
@@ -173,6 +184,7 @@ pub(crate) fn resolve_encoder(preset: &ResolvedPreset, hw: Option<&str>) -> Stri
         "vp9" => "libvpx-vp9".to_string(),
         "vp8" => "libvpx".to_string(),
         "hevc" | "h265" => "libx265".to_string(),
+        "av1" => av1.unwrap_or("libsvtav1").to_string(),
         // A profile naming an encoder outright (`libwebp_anim`, `libsvtav1`,
         // ...) is taken at its word: the encoder table below is a convenience
         // for codec *families*, not a whitelist.
@@ -265,6 +277,11 @@ pub(crate) fn build_args(spec: &EncodeJobSpec) -> Vec<OsString> {
         // and a trimmed cut can start at a negative timestamp.
         push!("-movflags", "+faststart", "-avoid_negative_ts", "make_zero");
     }
+    if preset.container == Container::Avif {
+        // The avif *muxer's* loop count (webp's rides in its encoder branch):
+        // 0 loops forever, matching the gif-substitute purpose.
+        push!("-loop", "0");
+    }
 
     args.push(OsString::from("-pix_fmt"));
     args.push(OsString::from("yuv420p"));
@@ -309,6 +326,9 @@ pub(crate) fn build_compose_args(spec: &ComposeJobSpec, plan: &FilterPlan) -> Ve
     }
     if preset.container == Container::Mp4 {
         push!("-movflags", "+faststart", "-avoid_negative_ts", "make_zero");
+    }
+    if preset.container == Container::Avif {
+        push!("-loop", "0");
     }
     push!("-y");
     args.push(spec.output.clone().into_os_string());
@@ -385,9 +405,46 @@ fn video_args(encoder: &str, quality: QualityMode) -> Vec<OsString> {
         "libwebp_anim" => {
             codec("libwebp_anim");
             // libwebp's knob is `-q:v` on a 0-100 quality scale, which
-            // `QualityMode::Crf` carries for this container.
+            // `QualityMode::Crf` carries for this container. The method
+            // (`-compression_level`) stays at its default of 4: measured on
+            // animation-like content, 6 was ~10x slower for <1% size.
             args.extend(crf_or_bitrate(quality, "-q:v", 0));
             args.extend(["-loop".to_string(), "0".to_string()]);
+        }
+        "libsvtav1" => {
+            codec("libsvtav1");
+            // Speed preset 6 of 13: measured on animation-like 720p content
+            // it is still ~2x faster than the webp-anim encode, so the
+            // quality-leaning middle of SVT's range is affordable even on
+            // the fast channel.
+            args.extend(["-preset".to_string(), "6".to_string()]);
+            args.extend(crf_or_bitrate(quality, "-crf", 0));
+        }
+        "libaom-av1" => {
+            codec("libaom-av1");
+            // The AV1 fallback for builds without SVT-AV1 (static_ffmpeg's
+            // "essentials" win32 build, notably). cpu-used 8 + row-mt is what
+            // makes libaom interactive: measured at webp-anim's own encode
+            // speed on the very build this branch exists for.
+            args.extend([
+                "-cpu-used".to_string(),
+                "8".to_string(),
+                "-row-mt".to_string(),
+                "1".to_string(),
+            ]);
+            match quality {
+                // Constant quality needs the explicit zero bitrate, exactly
+                // as it does for libaom's libvpx ancestor below.
+                QualityMode::Crf(crf) => args.extend([
+                    "-crf".to_string(),
+                    crf.to_string(),
+                    "-b:v".to_string(),
+                    "0".to_string(),
+                ]),
+                QualityMode::BitrateKbps(kbps) => {
+                    args.extend(["-b:v".to_string(), format!("{kbps}k")])
+                }
+            }
         }
         "libvpx-vp9" | "libvpx" => {
             codec(encoder);
@@ -872,7 +929,7 @@ mod tests {
 
     fn spec_for(id: &str, start_cs: Option<i64>, end_cs: Option<i64>) -> EncodeJobSpec {
         let preset = preset(id);
-        let encoder = resolve_encoder(&preset, None);
+        let encoder = resolve_encoder(&preset, None, None);
         EncodeJobSpec {
             input: PathBuf::from("in.mp4"),
             output: PathBuf::from("out.tmp"),
@@ -992,18 +1049,21 @@ mod tests {
     /// replaces libx264 only on the fast channel.
     #[test]
     fn channel_and_hardware_probe_select_the_encoder() {
-        assert_eq!(resolve_encoder(&preset("clip"), None), ENCODER_X264_QUALITY);
         assert_eq!(
-            resolve_encoder(&preset("clip"), Some("h264_nvenc")),
+            resolve_encoder(&preset("clip"), None, None),
+            ENCODER_X264_QUALITY
+        );
+        assert_eq!(
+            resolve_encoder(&preset("clip"), Some("h264_nvenc"), None),
             ENCODER_X264_QUALITY,
             "the quality channel never rides on a hardware encoder"
         );
         assert_eq!(
-            resolve_encoder(&preset("clip-fast"), None),
+            resolve_encoder(&preset("clip-fast"), None, None),
             ENCODER_X264_FAST
         );
         assert_eq!(
-            resolve_encoder(&preset("clip-fast"), Some("h264_nvenc")),
+            resolve_encoder(&preset("clip-fast"), Some("h264_nvenc"), None),
             "h264_nvenc"
         );
 
@@ -1013,7 +1073,7 @@ mod tests {
         assert_eq!(quality[at(&quality, "-crf") + 1], "18");
 
         let mut fast = spec_for("clip-fast", None, None);
-        fast.params.encoder = resolve_encoder(&fast.params.preset, Some("h264_nvenc"));
+        fast.params.encoder = resolve_encoder(&fast.params.preset, Some("h264_nvenc"), None);
         let args = args_of(&fast);
         assert_eq!(args[at(&args, "-c:v") + 1], "h264_nvenc");
         assert_eq!(args[at(&args, "-preset") + 1], "p4");
@@ -1064,6 +1124,19 @@ mod tests {
         assert_eq!(amf[at(&amf, "-qp_i") + 1], "23");
         let qsv = args_for("h264_qsv", QualityMode::Crf(23));
         assert_eq!(qsv[at(&qsv, "-global_quality") + 1], "23");
+
+        // The AV1 fallback: constant quality needs the explicit zero bitrate
+        // (libvpx semantics), and cpu-used 8 + row-mt is what makes libaom
+        // usable interactively.
+        let aom = args_for("libaom-av1", QualityMode::Crf(30));
+        assert_eq!(aom[at(&aom, "-c:v") + 1], "libaom-av1");
+        assert_eq!(aom[at(&aom, "-cpu-used") + 1], "8");
+        assert_eq!(aom[at(&aom, "-row-mt") + 1], "1");
+        assert_eq!(aom[at(&aom, "-crf") + 1], "30");
+        assert_eq!(aom[at(&aom, "-b:v") + 1], "0");
+        let aom_rate = args_for("libaom-av1", QualityMode::BitrateKbps(900));
+        assert_eq!(aom_rate[at(&aom_rate, "-b:v") + 1], "900k");
+        assert!(!aom_rate.contains(&"-crf".to_string()));
     }
 
     /// A hardware H.264 encoder may never serve a non-h264 preset: the probe
@@ -1071,14 +1144,38 @@ mod tests {
     /// write h264 bytes into the wrong container.
     #[test]
     fn non_h264_presets_ignore_the_hardware_encoder() {
-        for id in ["webp-anim", "mosaic-webm"] {
+        for id in ["webp-anim", "avif-anim", "mosaic-webm"] {
             let preset = preset(id);
-            let with_hw = resolve_encoder(&preset, Some("h264_nvenc"));
-            assert_eq!(with_hw, resolve_encoder(&preset, None));
+            let with_hw = resolve_encoder(&preset, Some("h264_nvenc"), None);
+            assert_eq!(with_hw, resolve_encoder(&preset, None, None));
             assert!(!with_hw.starts_with("h264_"), "{id} resolved to {with_hw}");
         }
-        assert_eq!(resolve_encoder(&preset("webp-anim"), None), "libwebp_anim");
-        assert_eq!(resolve_encoder(&preset("mosaic-webm"), None), "libvpx-vp9");
+        assert_eq!(
+            resolve_encoder(&preset("webp-anim"), None, None),
+            "libwebp_anim"
+        );
+        assert_eq!(
+            resolve_encoder(&preset("mosaic-webm"), None, None),
+            "libvpx-vp9"
+        );
+        // The av1 family follows the probe's ladder: SVT-AV1 preferred, the
+        // toolchain's actual encoder when the probe answered (static_ffmpeg's
+        // "essentials" builds carry only libaom), and the preferred name when
+        // it could not — that path fails the encode with ffmpeg's own message.
+        assert_eq!(resolve_encoder(&preset("avif-anim"), None, None), "libsvtav1");
+        assert_eq!(
+            resolve_encoder(&preset("avif-anim"), None, Some("libsvtav1")),
+            "libsvtav1"
+        );
+        assert_eq!(
+            resolve_encoder(&preset("avif-anim"), None, Some("libaom-av1")),
+            "libaom-av1"
+        );
+        // The hardware slot never leaks into the av1 family either way.
+        assert_eq!(
+            resolve_encoder(&preset("avif-anim"), Some("h264_nvenc"), Some("libaom-av1")),
+            "libaom-av1"
+        );
         // Even a webp profile on the fast channel (which `webp-anim` is).
         assert_eq!(preset("webp-anim").channel, Channel::Fast);
     }
@@ -1090,7 +1187,8 @@ mod tests {
     fn container_specific_arguments() {
         let webp = args_of(&spec_for("webp-anim", None, None));
         assert_eq!(webp[at(&webp, "-c:v") + 1], "libwebp_anim");
-        assert_eq!(webp[at(&webp, "-q:v") + 1], "75");
+        assert_eq!(webp[at(&webp, "-q:v") + 1], "85");
+        assert_eq!(webp[at(&webp, "-fpsmax") + 1], "30");
         assert_eq!(webp[at(&webp, "-loop") + 1], "0");
         assert!(!webp.contains(&"-crf".to_string()));
         assert!(!webp.contains(&"-movflags".to_string()));
@@ -1099,6 +1197,15 @@ mod tests {
             !webp.contains(&"0:a:0?".to_string()),
             "and maps no audio stream"
         );
+
+        let avif = args_of(&spec_for("avif-anim", None, None));
+        assert_eq!(avif[at(&avif, "-c:v") + 1], "libsvtav1");
+        assert_eq!(avif[at(&avif, "-preset") + 1], "6");
+        assert_eq!(avif[at(&avif, "-crf") + 1], "30");
+        assert_eq!(avif[at(&avif, "-fpsmax") + 1], "30");
+        assert_eq!(avif[at(&avif, "-loop") + 1], "0");
+        assert!(!avif.contains(&"-movflags".to_string()));
+        assert!(avif.contains(&"-an".to_string()), "avif carries no audio");
 
         let webm = args_of(&spec_for("mosaic-webm", None, None));
         assert_eq!(webm[at(&webm, "-c:v") + 1], "libvpx-vp9");
@@ -1126,7 +1233,7 @@ mod tests {
         use crate::media_tools::transcode::compose::{FilterPlan, InputSpec};
 
         let preset = preset("mosaic-mp4");
-        let encoder = resolve_encoder(&preset, None);
+        let encoder = resolve_encoder(&preset, None, None);
         let doc = crate::media_tools::transcode::compose::ResolvedCompose {
             canvas_w: 640,
             canvas_h: 480,
@@ -1323,7 +1430,7 @@ mod tests {
         // exercises both bounds and leaves 2.5s of source unencoded.
         let (start_cs, end_cs) = (100, 450);
         let preset = preset("playback");
-        let encoder = resolve_encoder(&preset, None);
+        let encoder = resolve_encoder(&preset, None, None);
         let output = dir.path().join("out.mp4");
         let spec = EncodeJobSpec {
             input: source,
@@ -1418,7 +1525,7 @@ mod tests {
         }
 
         let preset = preset("clip");
-        let encoder = resolve_encoder(&preset, None);
+        let encoder = resolve_encoder(&preset, None, None);
         let spec = EncodeJobSpec {
             input: source,
             output: dir.path().join("out.mp4"),

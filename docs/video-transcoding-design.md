@@ -205,10 +205,38 @@ the fast channel (throwaway quality, latency matters).
 
 Built-ins (initial set): `playback` (h264+aac mp4, cap 1080p, fast),
 `clip` (quality) / `clip-fast`, `webp-anim`, `mosaic-mp4` (quality) /
-`mosaic-mp4-fast`, `mosaic-webm`. Animated AVIF is deliberately deferred
+`mosaic-mp4-fast`, `mosaic-webm`. Animated AVIF was deliberately deferred
 (libaom animation encode is punishingly slow); webm (vp9+opus) is in — no
 availability problem, just slower encodes than x264, which the channel model
 already expresses.
+
+*Amended 2026-08-10*: the animated-image presets were retuned and extended
+once their purpose was stated (gif-substitute pastes into Discord/Matrix,
+where size headroom is ample and quality is what shows):
+
+- `webp-anim` moved from libwebp's photo default to `q 85` (+27 % size,
+  measured zero encode-time cost) and gained `fps_max 30` (halves 60 fps
+  sources cleanly; a 24-cap would judder 30 fps content). libwebp's
+  `-compression_level 6` was measured ~10x slower for <1 % size and stays at
+  its default of 4. The retune bumped `TRANSCODER_VERSION` to 2.
+- `avif-anim` (av1 in `image/avif`, crf 30, SVT-AV1 speed preset 6, cap
+  720p/30 fps) joins as a **secondary** option: SVT-AV1 answers the original
+  libaom speed objection (measured *faster* than the webp encode at half the
+  size), and the user's own Matrix client renders animated AVIF. It stays
+  second because far fewer destinations animate it — Discord in particular
+  does not. The `av1` codec family resolves through a probe ladder
+  (`hw::av1_software_encoder`): SVT-AV1 when the toolchain has it, else
+  libaom at `cpu-used 8 -row-mt 1` — static_ffmpeg's win32 "essentials"
+  build ships only libaom, and at those flags it measures at webp-anim's
+  own encode speed. Listing suffices for software encoders (no driver to
+  validate); a build with neither fails the encode with ffmpeg's own
+  "Unknown encoder", and the host's choice re-keys artifacts exactly as the
+  hardware h264 slot does. The ladder is the safety net, not the fix: the
+  provisioning gap that made it necessary is
+  docs/ffmpeg-provisioning-design.md. Both animated-image containers share the audio ban, the
+  `max_animated_image_seconds` cap, and the fps cap; AVIF additionally has no
+  alpha (SVT-AV1 limitation), so translucent mosaic backgrounds bake as they
+  do for mp4/webm.
 
 `GET /api/video/presets` returns the resolved, policy-filtered list
 (id + label + surface tags) — this is how **user-declared custom presets

@@ -493,8 +493,8 @@ pub struct TranscodeConfig {
     /// Admission-time ceiling on the memory a mosaic's loop buffers may need.
     #[serde(default = "default_max_mosaic_loop_mb")]
     pub max_mosaic_loop_mb: u64,
-    /// Hard cap on animated-image (WebP) output length; those decode entirely
-    /// into memory in the browser.
+    /// Hard cap on animated-image (WebP/AVIF) output length; those decode
+    /// entirely into memory in the browser.
     #[serde(default = "default_max_animated_image_seconds")]
     pub max_animated_image_seconds: u64,
     /// Hard cap on real video output length.

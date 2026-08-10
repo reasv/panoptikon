@@ -28,6 +28,7 @@ pub enum Container {
     Mp4,
     Webm,
     Webp,
+    Avif,
 }
 
 impl Container {
@@ -36,6 +37,7 @@ impl Container {
             Container::Mp4 => "mp4",
             Container::Webm => "webm",
             Container::Webp => "webp",
+            Container::Avif => "avif",
         }
     }
 
@@ -44,14 +46,22 @@ impl Container {
             Container::Mp4 => "video/mp4",
             Container::Webm => "video/webm",
             Container::Webp => "image/webp",
+            Container::Avif => "image/avif",
         }
     }
 
-    /// Whether the container can carry an audio stream at all. Animated WebP
-    /// cannot, so a profile pairing it with an `acodec` is a config error
-    /// rather than something ffmpeg silently drops.
+    /// Whether the container can carry an audio stream at all. The animated
+    /// image containers cannot, so a profile pairing one with an `acodec` is a
+    /// config error rather than something ffmpeg silently drops.
     fn carries_audio(self) -> bool {
-        !matches!(self, Container::Webp)
+        !self.is_animated_image()
+    }
+
+    /// The all-frames-in-one-image-file containers, which the animated-image
+    /// length cap applies to (video containers stream and seek; these decode
+    /// whole).
+    pub(crate) fn is_animated_image(self) -> bool {
+        matches!(self, Container::Webp | Container::Avif)
     }
 
     /// Widest rate-control value the encoder behind this container accepts:
@@ -62,7 +72,7 @@ impl Container {
     fn max_crf(self) -> i64 {
         match self {
             Container::Mp4 => 51,
-            Container::Webm => 63,
+            Container::Webm | Container::Avif => 63,
             Container::Webp => 100,
         }
     }
@@ -162,8 +172,8 @@ pub struct TranscodeProfileConfig {
 /// installs — at the cost of re-keying their artifacts, which is what
 /// `TRANSCODER_VERSION` is for.
 pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
-    /// id, label, container, vcodec, acodec, quality, max_height, channel,
-    /// surfaces. No built-in caps frame rate, so `fps_max` is not in the row.
+    /// id, label, container, vcodec, acodec, quality, max_height, fps_max,
+    /// channel, surfaces.
     type Row = (
         &'static str,
         &'static str,
@@ -172,11 +182,12 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
         Option<&'static str>,
         QualityMode,
         Option<i64>,
+        Option<f64>,
         Channel,
         &'static [Surface],
     );
 
-    const TABLE: [Row; 7] = [
+    const TABLE: [Row; 8] = [
         (
             "playback",
             "Playback",
@@ -185,6 +196,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             Some("aac"),
             QualityMode::Crf(23),
             Some(1080),
+            None,
             Channel::Fast,
             &[Surface::Playback],
         ),
@@ -195,6 +207,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             "h264",
             Some("aac"),
             QualityMode::Crf(18),
+            None,
             None,
             Channel::Quality,
             &[Surface::Clip],
@@ -207,6 +220,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             Some("aac"),
             QualityMode::Crf(23),
             None,
+            None,
             Channel::Fast,
             &[Surface::Clip],
         ),
@@ -216,10 +230,30 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             Container::Webp,
             "libwebp_anim",
             None,
-            // libwebp's `-q:v` 0-100 quality scale rides in `Crf`; the
-            // container decides how run.rs spells it.
-            QualityMode::Crf(75),
+            // libwebp's `-q:v` 0-100 quality scale rides in `Crf`. 85, not
+            // the libwebp default of 75: lossy WebP is intra-only VP8, so on
+            // video content 75 blocks visibly, and the gif-substitute use
+            // (Discord/Matrix paste) has size headroom to spend on quality.
+            QualityMode::Crf(85),
             Some(720),
+            // Halves 60 fps sources cleanly; 24/25/30 pass through untouched
+            // (a 24-cap would judder 30 fps content).
+            Some(30.0),
+            Channel::Fast,
+            &[Surface::Clip, Surface::Mosaic],
+        ),
+        (
+            "avif-anim",
+            "Animated AVIF",
+            Container::Avif,
+            "av1",
+            None,
+            // A real inter-coded video codec in an image container, so it
+            // beats webp-anim on both size and quality; second in the lineup
+            // only because far fewer destinations animate it.
+            QualityMode::Crf(30),
+            Some(720),
+            Some(30.0),
             Channel::Fast,
             &[Surface::Clip, Surface::Mosaic],
         ),
@@ -230,6 +264,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             "h264",
             Some("aac"),
             QualityMode::Crf(18),
+            None,
             None,
             Channel::Quality,
             &[Surface::Mosaic],
@@ -242,6 +277,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             Some("aac"),
             QualityMode::Crf(23),
             None,
+            None,
             Channel::Fast,
             &[Surface::Mosaic],
         ),
@@ -253,6 +289,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             Some("opus"),
             QualityMode::Crf(32),
             None,
+            None,
             Channel::Quality,
             &[Surface::Mosaic],
         ),
@@ -261,7 +298,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
     TABLE
         .iter()
         .map(
-            |(id, label, container, vcodec, acodec, quality, max_height, channel, surfaces)| {
+            |(id, label, container, vcodec, acodec, quality, max_height, fps_max, channel, surfaces)| {
                 ResolvedPreset {
                     id: (*id).to_string(),
                     label: (*label).to_string(),
@@ -270,7 +307,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
                     acodec: acodec.map(str::to_string),
                     quality: *quality,
                     max_height: *max_height,
-                    fps_max: None,
+                    fps_max: *fps_max,
                     channel: *channel,
                     surfaces: surfaces.to_vec(),
                 }
@@ -488,6 +525,7 @@ mod tests {
                 "clip",
                 "clip-fast",
                 "webp-anim",
+                "avif-anim",
                 "mosaic-mp4",
                 "mosaic-mp4-fast",
                 "mosaic-webm",
@@ -506,12 +544,29 @@ mod tests {
         assert_eq!(clip.channel, Channel::Quality);
         assert_eq!(clip.max_height, None);
 
-        // Animated WebP has no audio track at all, and mosaic-webm is the one
-        // built-in that is not h264/aac.
+        // The animated-image presets carry no audio track and are the only
+        // frame-rate-capped built-ins; mosaic-webm is the one built-in that is
+        // not h264/aac.
         let webp = find_preset(&presets, "webp-anim").unwrap();
         assert_eq!(webp.container, Container::Webp);
         assert_eq!(webp.acodec, None);
+        assert_eq!(webp.quality, QualityMode::Crf(85));
+        assert_eq!(webp.fps_max, Some(30.0));
         assert!(webp.surfaces.contains(&Surface::Clip) && webp.surfaces.contains(&Surface::Mosaic));
+        let avif = find_preset(&presets, "avif-anim").unwrap();
+        assert_eq!(avif.container, Container::Avif);
+        assert_eq!(avif.vcodec, "av1");
+        assert_eq!(avif.acodec, None);
+        assert_eq!(avif.quality, QualityMode::Crf(30));
+        assert_eq!(avif.max_height, Some(720));
+        assert_eq!(avif.fps_max, Some(30.0));
+        assert_eq!(avif.surfaces, webp.surfaces);
+        assert!(
+            presets
+                .iter()
+                .all(|preset| preset.container.is_animated_image() == preset.fps_max.is_some()),
+            "the animated-image presets are exactly the fps-capped ones"
+        );
         let webm = find_preset(&presets, "mosaic-webm").unwrap();
         assert_eq!(webm.vcodec, "vp9");
         assert_eq!(webm.acodec.as_deref(), Some("opus"));
@@ -577,7 +632,7 @@ mod tests {
             .filter(|preset| preset.surfaces.contains(&Surface::Clip))
             .map(|preset| preset.id.as_str())
             .collect();
-        assert_eq!(clip_ids, ["clip", "clip-fast", "webp-anim"]);
+        assert_eq!(clip_ids, ["clip", "clip-fast", "webp-anim", "avif-anim"]);
         let playback_ids: Vec<&str> = presets
             .iter()
             .filter(|preset| preset.surfaces.contains(&Surface::Playback))
@@ -632,6 +687,10 @@ mod tests {
             "crf must be between 0 and 100 for container webp",
         );
         expect_err(
+            "container = \"avif\"\nvcodec = \"av1\"\ncrf = 64",
+            "crf must be between 0 and 63 for container avif",
+        );
+        expect_err(
             "container = \"mp4\"\nvcodec = \"h264\"\ncrf = -1",
             "crf must be between 0 and 51 for container mp4",
         );
@@ -639,10 +698,11 @@ mod tests {
             ("a", "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 51"),
             ("b", "container = \"webm\"\nvcodec = \"vp9\"\ncrf = 63"),
             ("c", "container = \"webp\"\nvcodec = \"libwebp_anim\"\ncrf = 100"),
+            ("d", "container = \"avif\"\nvcodec = \"av1\"\ncrf = 63"),
         ])))
         .expect("the top of each scale is in range");
         // Switching a built-in's container revalidates the inherited value
-        // against the new scale (webp-anim's 75 is not an x264 CRF).
+        // against the new scale (webp-anim's 85 is not an x264 CRF).
         expect_err_named(
             "webp-anim",
             "container = \"mp4\"\nvcodec = \"h264\"",

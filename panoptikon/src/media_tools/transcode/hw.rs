@@ -102,6 +102,31 @@ pub(crate) fn fast_h264_encoder() -> Option<&'static str> {
     })
 }
 
+/// Software AV1 encoders, in preference order: SVT-AV1 is ~2x faster than
+/// libaom at the settings run.rs pins for each, but plenty of real builds
+/// ship without it — static_ffmpeg's win32 "essentials" build, notably,
+/// carries only libaom.
+pub(crate) const AV1_CANDIDATES: [&str; 2] = ["libsvtav1", "libaom-av1"];
+
+/// The software AV1 encoder this toolchain has, or `None` for a build with
+/// neither. Probed once per process, like [`fast_h264_encoder`], but from the
+/// listing alone: these are linked libraries, not drivers, so a listed name
+/// runs and the one-frame validation encode would prove nothing.
+pub(crate) fn av1_software_encoder() -> Option<&'static str> {
+    static ENCODER: OnceLock<Option<&'static str>> = OnceLock::new();
+    *ENCODER.get_or_init(|| {
+        let listed = listed_encoders(&encoder_listing()?);
+        let chosen = AV1_CANDIDATES
+            .into_iter()
+            .find(|candidate| listed.iter().any(|name| name == candidate));
+        match chosen {
+            Some(encoder) => tracing::info!(encoder, "software AV1 encoder selected"),
+            None => tracing::info!("this ffmpeg has no software AV1 encoder; av1 presets will fail"),
+        }
+        chosen
+    })
+}
+
 /// The selection policy, separated from the two ffmpeg spawns so it can be
 /// tested without a toolchain.
 fn select_encoder(

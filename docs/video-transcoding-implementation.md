@@ -833,4 +833,5 @@ Order: C1→C2→C3→C4 strictly; C5-C6 parallel with C1-C4; C7-C8 need C4.
 - The relay SSE-buffering open item (design §10) is covered defensively
   either way: 10 s keep-alives server-side, poll fallback client-side.
 - Deferred beyond this plan: VAAPI encoder support (§0.6), tee-streaming
-  playback, share links (pinning lifecycle), animated AVIF.
+  playback, share links (pinning lifecycle), animated AVIF — since landed
+  2026-08-10 as the `avif-anim` built-in via SVT-AV1 (design §5 amendment).
