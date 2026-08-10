@@ -45,6 +45,35 @@ pdfium = "${PDFIUM_PATH:-}"
 html_renderer = "${HTML_RENDERER_PATH:-}"
 thumbnail_font = "${PANOPTIKON_FONT:-}"
 
+# Backend video transcoding (docs/video-transcoding-design.md). Tunable
+# defaults live in serde; comment them so upgrades track code defaults.
+# nixpkgs ffmpeg carries nvenc, VAAPI and AMF (QSV needs ffmpeg-full); "auto"
+# falls back to libx264 when none validates.
+# [transcode]
+# max_concurrent_jobs = 1
+# cache_dir = ""                       # empty = <data_folder>/transcode-cache
+# cache_size_mb = 8192
+# cache_size_max_mb = 262144           # ceiling for PUT /api/video/cache
+# hwaccel = "auto"                     # "auto" | "off" | h264_nvenc | h264_amf | h264_qsv | h264_videotoolbox | h264_mf
+# max_mosaic_inputs = 12
+# max_mosaic_loop_mb = 512
+# max_animated_image_seconds = 30
+# max_output_seconds = 300
+# compose_light_threshold = 2
+
+# Custom encoding profiles merge by name over the built-ins; a name matching
+# no built-in must give at least container, vcodec and a rate control. Absent
+# = the built-in presets, an explicit empty table = none at all.
+# [transcode.profiles.small-share]
+# label = "Small (share)"
+# container = "mp4"                    # mp4 | webm | webp
+# vcodec = "h264"                      # codec family, not the encoder
+# acodec = "aac"                       # or audio = false for no audio track
+# crf = 28                             # or bitrate_kbps = 2500
+# max_height = 720                     # 0 = uncapped
+# channel = "fast"                     # quality | fast
+# surfaces = ["clip"]                  # playback | clip | mosaic
+
 [rulesets.allow_all]
 allow_all = true
 
@@ -64,6 +93,16 @@ allow = [
     { methods = [
         "GET",
     ], path_prefix = "/api/items/" },
+
+    # Serving an already-encoded rendition (and listing the presets) is safe
+    # for a public profile; POST /api/video/transcode, which spawns ffmpeg, is
+    # deliberately not granted.
+    { methods = [
+        "GET",
+    ], path = "/api/video/artifact" },
+    { methods = [
+        "GET",
+    ], path = "/api/video/presets" },
 
     { methods = [
         "GET",

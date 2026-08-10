@@ -18,6 +18,7 @@ use std::time::Duration;
 use crate::db::index_writer;
 use crate::inferio::manager::ModelManager;
 use crate::jobs::{continuous_scan, cron, queue};
+use crate::media_tools::transcode;
 use crate::ui::UiServerHandle;
 
 /// Upper bound on the actor-coordination part of shutdown. Generous because a
@@ -149,6 +150,10 @@ pub(crate) async fn run_cleanup(
         if let Some(queue_id) = queue::shutdown_job_queue().await {
             tracing::info!(queue_id, "cancelled running job for shutdown");
         }
+        // Transcodes run outside the job queue, so they need their own stop:
+        // queued jobs settle as cancelled and running ffmpeg children are
+        // killed. No-op when nothing ever asked for a transcode.
+        transcode::pool::shutdown_transcode_pool().await;
         let flushed = index_writer::flush_all_writers().await;
         if flushed > 0 {
             tracing::info!(writers = flushed, "index DB writers drained");

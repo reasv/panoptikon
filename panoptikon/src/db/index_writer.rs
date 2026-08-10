@@ -32,7 +32,7 @@ use crate::db::{
     files::{
         FileScanData, FileUpsertResult, delete_file_by_path, delete_files_not_allowed,
         delete_item_if_orphan, delete_items_without_files, rename_file_path, set_blurhash,
-        set_outro_verdict, update_file_data,
+        set_item_codecs, set_outro_verdict, update_file_data,
     },
     folders::{
         add_folder_to_database, delete_files_not_under_included_folders,
@@ -150,6 +150,15 @@ pub(crate) enum IndexDbWriterMessage {
         sha256: String,
         outro_kind: String,
         content_end_ms: Option<i64>,
+        reply: Reply<u64>,
+    },
+    /// One item's stream codecs (docs/video-transcoding-design.md §6). Unlike
+    /// [`Self::SetOutroVerdict`] this carries no marker delete: the codec pass
+    /// writes nothing to the negative cache, so there is nothing to retire.
+    SetItemCodecs {
+        sha256: String,
+        video_codec: String,
+        audio_codec: Option<String>,
         reply: Reply<u64>,
     },
     RenameFilePath {
@@ -691,6 +700,22 @@ impl Actor for IndexDbWriter {
                     .with_transaction(move |conn| {
                         Box::pin(async move {
                             set_outro_verdict(conn, &sha256, &outro_kind, content_end_ms).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::SetItemCodecs {
+                sha256,
+                video_codec,
+                audio_codec,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            set_item_codecs(conn, &sha256, &video_codec, audio_codec.as_deref())
+                                .await
                         })
                     })
                     .await;

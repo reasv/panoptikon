@@ -1,19 +1,20 @@
 use axum::{
     Json,
     body::Body,
-    http::{HeaderMap, Response, StatusCode, header},
+    http::{HeaderMap, Response, header},
 };
 use axum_extra::extract::Query;
 
 use serde::{Deserialize, Serialize};
-use std::io::SeekFrom;
 use std::path::Path;
-use std::time::{Duration, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
+use std::time::UNIX_EPOCH;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::api::db_params::DbQueryParams;
+use crate::api::http_file::{
+    FILE_IO_TIMEOUT, FileServeSpec, if_none_match_matches, not_modified_response,
+    open_file_with_timeout, serve_file,
+};
 use crate::api::utils::{
     content_disposition_value, iso_to_system_time, serve_outro_metadata, strip_non_latin1_chars,
 };
@@ -30,10 +31,8 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 
 const PLACEHOLDER_PNG: &[u8] = include_bytes!("assets/placeholder.png");
 
-/// Ceiling on opening/statting a file before giving up on it. Indexed files
-/// can live on network shares; a hung mount must not stall requests (or, with
-/// no timeout, tokio's blocking pool) indefinitely.
-const FILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// 404 detail for a file row whose file cannot be opened.
+const NO_FILE_FOUND: &str = "No file found for item";
 
 /// Minimum sha256 prefix length (hex chars) still treated as
 /// content-addressed for caching. The pinboard stores 10-char prefixes as
@@ -59,36 +58,6 @@ const CACHE_REVALIDATE: &str = "public, no-cache";
 /// ...) can be re-pointed, so those responses must always revalidate.
 fn is_content_addressed(id_type: ItemIdentifierType, id: &str) -> bool {
     matches!(id_type, ItemIdentifierType::Sha256) && id.len() >= MIN_IMMUTABLE_SHA256_PREFIX
-}
-
-fn if_none_match_matches(header_value: &str, etag: &str) -> bool {
-    header_value.trim() == "*"
-        || header_value
-            .split(',')
-            .map(|candidate| candidate.trim().trim_start_matches("W/"))
-            .any(|candidate| candidate == etag)
-}
-
-fn not_modified_response(
-    etag: &str,
-    cache_control: &str,
-    last_modified: Option<&str>,
-) -> Response<Body> {
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = StatusCode::NOT_MODIFIED;
-    let headers = response.headers_mut();
-    if let Ok(value) = header::HeaderValue::from_str(etag) {
-        headers.insert(header::ETAG, value);
-    }
-    if let Ok(value) = header::HeaderValue::from_str(cache_control) {
-        headers.insert(header::CACHE_CONTROL, value);
-    }
-    if let Some(last_modified) = last_modified {
-        if let Ok(value) = header::HeaderValue::from_str(last_modified) {
-            headers.insert(header::LAST_MODIFIED, value);
-        }
-    }
-    response
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -201,6 +170,24 @@ pub(crate) struct ItemRecordResponse {
     /// value is null.
     #[schema(required)]
     content_end_ms: Option<i64>,
+    /// The video stream's codec name as ffprobe reports it (`h264`, `hevc`,
+    /// `av1`, ...), with two in-band sentinels: `none` means the container was
+    /// probed and has no video stream, `unknown` means a video stream exists
+    /// but ffprobe named no codec. `null` means the item has not been probed
+    /// yet — an existing library fills in over its next few scans, so a client
+    /// must keep whatever it did before these columns existed as the `null`
+    /// behaviour.
+    ///
+    /// Unlike the outro fields this is never gated: a codec name is an
+    /// objective property of the file, like `duration` or `width`.
+    #[schema(required)]
+    video_codec: Option<String>,
+    /// The *first* audio stream's codec name (`aac`, `opus`, `ac3`, ...), or
+    /// `unknown` when a stream exists that ffprobe named no codec for. `null`
+    /// conflates "no audio stream" with "not probed yet" — deliberately, since
+    /// neither is a reason to veto playback. Never gated, as above.
+    #[schema(required)]
+    audio_codec: Option<String>,
     time_added: String,
 }
 
@@ -531,88 +518,6 @@ async fn thumbnail_response(
     )
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum RangeOutcome {
-    /// No usable Range header: serve the whole file with 200.
-    Full,
-    /// A single satisfiable byte range (inclusive): serve 206.
-    Partial { start: u64, end: u64 },
-    /// Range header was valid but no requested range overlaps the file: 416.
-    Unsatisfiable,
-}
-
-/// Parses a `Range` request header against a resource of `size` bytes.
-///
-/// Handles all RFC 9110 byte-range forms: `start-end`, `start-`, and the
-/// suffix form `-N`. Out-of-bounds ends are clamped. Multiple ranges are
-/// accepted syntactically, but if more than one is satisfiable the header is
-/// ignored (full 200) rather than answered with multipart/byteranges, which
-/// RFC 9110 permits. Malformed headers are ignored entirely.
-fn parse_range_header(value: &str, size: u64) -> RangeOutcome {
-    let trimmed = value.trim();
-    let Some(specs) = trimmed
-        .get(..6)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("bytes="))
-        .map(|_| &trimmed[6..])
-    else {
-        return RangeOutcome::Full;
-    };
-
-    let mut satisfiable = Vec::new();
-    let mut any_valid = false;
-    for spec in specs.split(',') {
-        let spec = spec.trim();
-        if spec.is_empty() {
-            continue;
-        }
-        let Some((start_str, end_str)) = spec.split_once('-') else {
-            return RangeOutcome::Full;
-        };
-        let start_str = start_str.trim();
-        let end_str = end_str.trim();
-        if start_str.is_empty() {
-            // Suffix form: last N bytes.
-            let Ok(suffix) = end_str.parse::<u64>() else {
-                return RangeOutcome::Full;
-            };
-            any_valid = true;
-            if suffix == 0 || size == 0 {
-                continue;
-            }
-            satisfiable.push((size.saturating_sub(suffix), size - 1));
-        } else {
-            let Ok(start) = start_str.parse::<u64>() else {
-                return RangeOutcome::Full;
-            };
-            let end = if end_str.is_empty() {
-                size.checked_sub(1)
-            } else {
-                let Ok(end) = end_str.parse::<u64>() else {
-                    return RangeOutcome::Full;
-                };
-                if end < start {
-                    return RangeOutcome::Full;
-                }
-                size.checked_sub(1).map(|last| end.min(last))
-            };
-            any_valid = true;
-            match end {
-                Some(end) if start <= end => satisfiable.push((start, end)),
-                _ => {}
-            }
-        }
-    }
-
-    match satisfiable.as_slice() {
-        [(start, end)] => RangeOutcome::Partial {
-            start: *start,
-            end: *end,
-        },
-        [] if any_valid => RangeOutcome::Unsatisfiable,
-        _ => RangeOutcome::Full,
-    }
-}
-
 /// Serves the first candidate file that can actually be opened. Candidates
 /// are ordered by `available` DESC in the DB; a missing or hung file falls
 /// through to the next instead of failing the request (previously every
@@ -620,11 +525,11 @@ fn parse_range_header(value: &str, size: u64) -> RangeOutcome {
 async fn file_response(
     item: &ItemRecord,
     files: &[FileRecord],
-    content_disposition_type: &str,
+    content_disposition_type: &'static str,
     request_headers: &HeaderMap,
     content_addressed: bool,
 ) -> ApiResult<Response<Body>> {
-    let mut last_error = ApiError::not_found("No file found for item");
+    let mut last_error = ApiError::not_found(NO_FILE_FOUND);
     for file in files {
         match try_file_response(
             item,
@@ -645,29 +550,15 @@ async fn file_response(
     Err(last_error)
 }
 
-async fn open_file_with_timeout(path: &str) -> ApiResult<tokio::fs::File> {
-    match tokio::time::timeout(FILE_IO_TIMEOUT, tokio::fs::File::open(path)).await {
-        Ok(Ok(file)) => Ok(file),
-        Ok(Err(err)) => {
-            tracing::error!(error = %err, "failed to open file");
-            Err(ApiError::not_found("No file found for item"))
-        }
-        Err(_) => {
-            tracing::error!(path = %path, "timed out opening file");
-            Err(ApiError::internal("Timed out opening file"))
-        }
-    }
-}
-
 async fn try_file_response(
     item: &ItemRecord,
     file: &FileRecord,
-    content_disposition_type: &str,
+    content_disposition_type: &'static str,
     request_headers: &HeaderMap,
     content_addressed: bool,
 ) -> ApiResult<Response<Body>> {
     let filename = display_filename(file);
-    let mut file_handle = open_file_with_timeout(&file.path).await?;
+    let file_handle = open_file_with_timeout(&file.path, NO_FILE_FOUND).await?;
     // The size on disk is authoritative for range math; the DB value can be
     // stale if the file changed since the last scan.
     let metadata = match tokio::time::timeout(FILE_IO_TIMEOUT, file_handle.metadata()).await {
@@ -715,124 +606,20 @@ async fn try_file_response(
 
     let last_modified = iso_to_system_time(&file.last_modified).map(httpdate::fmt_http_date);
 
-    // Conditional GET: If-None-Match wins over If-Modified-Since (RFC 9110).
-    if let Some(if_none_match) = request_headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-    {
-        if if_none_match_matches(if_none_match, &etag) {
-            return Ok(not_modified_response(
-                &etag,
-                cache_control,
-                last_modified.as_deref(),
-            ));
-        }
-    } else if let Some(if_modified_since) = request_headers
-        .get(header::IF_MODIFIED_SINCE)
-        .and_then(|value| value.to_str().ok())
-    {
-        if last_modified.as_deref() == Some(if_modified_since.trim()) {
-            return Ok(not_modified_response(
-                &etag,
-                cache_control,
-                last_modified.as_deref(),
-            ));
-        }
-    }
-
-    let mut range = request_headers
-        .get(header::RANGE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| parse_range_header(value, size))
-        .unwrap_or(RangeOutcome::Full);
-
-    // If-Range: only honor the range when the validator still matches;
-    // otherwise the client's partial state is stale and it needs the full
-    // body. The validator may be either our ETag or the Last-Modified date.
-    if range != RangeOutcome::Full {
-        if let Some(if_range) = request_headers
-            .get(header::IF_RANGE)
-            .and_then(|value| value.to_str().ok())
-        {
-            let if_range = if_range.trim();
-            let matches = if if_range.starts_with('"') || if_range.starts_with("W/") {
-                if_range == etag
-            } else {
-                last_modified.as_deref() == Some(if_range)
-            };
-            if !matches {
-                range = RangeOutcome::Full;
-            }
-        }
-    }
-
-    let (status, body, content_length, content_range) = match range {
-        RangeOutcome::Full => (
-            StatusCode::OK,
-            Body::from_stream(ReaderStream::new(file_handle)),
+    serve_file(
+        FileServeSpec {
+            file: file_handle,
             size,
-            None,
-        ),
-        RangeOutcome::Partial { start, end } => {
-            file_handle
-                .seek(SeekFrom::Start(start))
-                .await
-                .map_err(|err| {
-                    tracing::error!(error = %err, "failed to seek file");
-                    ApiError::internal("Failed to read file")
-                })?;
-            let length = end - start + 1;
-            (
-                StatusCode::PARTIAL_CONTENT,
-                Body::from_stream(ReaderStream::new(file_handle.take(length))),
-                length,
-                Some(format!("bytes {start}-{end}/{size}")),
-            )
-        }
-        RangeOutcome::Unsatisfiable => (
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            Body::empty(),
-            0,
-            Some(format!("bytes */{size}")),
-        ),
-    };
-
-    let mut response = Response::new(body);
-    *response.status_mut() = status;
-    let headers = response.headers_mut();
-
-    headers.insert(
-        header::ACCEPT_RANGES,
-        header::HeaderValue::from_static("bytes"),
-    );
-    if let Ok(value) = header::HeaderValue::from_str(&item.mime_type) {
-        headers.insert(header::CONTENT_TYPE, value);
-    }
-    if let Ok(value) = header::HeaderValue::from_str(&content_length.to_string()) {
-        headers.insert(header::CONTENT_LENGTH, value);
-    }
-    if let Some(content_range) = content_range {
-        if let Ok(value) = header::HeaderValue::from_str(&content_range) {
-            headers.insert(header::CONTENT_RANGE, value);
-        }
-    }
-    if let Some(last_modified) = &last_modified {
-        if let Ok(value) = header::HeaderValue::from_str(last_modified) {
-            headers.insert(header::LAST_MODIFIED, value);
-        }
-    }
-    if let Ok(value) = header::HeaderValue::from_str(&etag) {
-        headers.insert(header::ETAG, value);
-    }
-    if let Ok(value) = header::HeaderValue::from_str(cache_control) {
-        headers.insert(header::CACHE_CONTROL, value);
-    }
-
-    if let Some(value) = content_disposition_value(content_disposition_type, &filename) {
-        headers.insert(header::CONTENT_DISPOSITION, value);
-    }
-
-    Ok(response)
+            mime_type: item.mime_type.clone(),
+            etag,
+            cache_control,
+            last_modified,
+            content_disposition_type,
+            filename,
+        },
+        request_headers,
+    )
+    .await
 }
 
 fn bytes_response(
@@ -899,6 +686,11 @@ async fn map_item_record(index_db: &str, item: &ItemRecord) -> ItemRecordRespons
         blurhash: item.blurhash.clone(),
         outro_kind: serve_outro.then(|| item.outro_kind.clone()).flatten(),
         content_end_ms: serve_outro.then_some(item.content_end_ms).flatten(),
+        // Ungated, and deliberately outside the `serve_outro` pair above:
+        // `detect_outros` switches off a *feature*, while a codec name is a
+        // fact about the file in the same class as `duration`.
+        video_codec: item.video_codec.clone(),
+        audio_codec: item.audio_codec.clone(),
         time_added: item.time_added.clone(),
     }
 }
@@ -920,6 +712,7 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use std::{
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
@@ -949,6 +742,8 @@ mod tests {
             blurhash: None,
             outro_kind: None,
             content_end_ms: None,
+            video_codec: None,
+            audio_codec: None,
             time_added: "2024-01-01T00:00:00".to_string(),
         };
         let file = FileRecord {
@@ -1317,6 +1112,36 @@ mod tests {
         assert_eq!(gated.size, item.size);
     }
 
+    /// The codec columns are *not* gated: `detect_outros` switches off a
+    /// feature, while a codec name is a fact about the file in the class of
+    /// `duration`. Pinned against the toggle that sits next to them in the
+    /// same mapper, because the obvious mistake is to fold them into the
+    /// existing `serve_outro` pair — which would blank a client's whole
+    /// playability decision for every database that turned outro detection
+    /// off.
+    #[tokio::test]
+    async fn codec_fields_survive_the_outro_gate() {
+        let _env = crate::test_utils::test_data_dir();
+        let file_path = temp_path("codec_gate");
+        let (mut item, _file) = test_records(&file_path);
+        item.outro_kind = Some("tiktok_card/1".to_string());
+        item.content_end_ms = Some(8000);
+        item.video_codec = Some("hevc".to_string());
+        item.audio_codec = Some("aac".to_string());
+
+        crate::test_utils::write_detect_outros_config("items-codec-off", false);
+        let gated = map_item_record("items-codec-off", &item).await;
+        assert_eq!(gated.outro_kind, None, "the premise: the gate is closed");
+        assert_eq!(gated.content_end_ms, None);
+        assert_eq!(gated.video_codec.as_deref(), Some("hevc"));
+        assert_eq!(gated.audio_codec.as_deref(), Some("aac"));
+
+        crate::test_utils::write_detect_outros_config("items-codec-on", true);
+        let served = map_item_record("items-codec-on", &item).await;
+        assert_eq!(served.video_codec.as_deref(), Some("hevc"));
+        assert_eq!(served.audio_codec.as_deref(), Some("aac"));
+    }
+
     /// The wiring, not the helper: `item_meta` must consult the request's
     /// **index** database config, not its user-data one. Both names are
     /// stamped with opposite toggles and the handler is run twice with them
@@ -1406,69 +1231,4 @@ mod tests {
         assert_eq!(served.content_end_ms, Some(8000));
     }
 
-    #[test]
-    fn if_none_match_matching() {
-        assert!(if_none_match_matches("\"a\"", "\"a\""));
-        assert!(if_none_match_matches("\"x\", \"a\"", "\"a\""));
-        assert!(if_none_match_matches("W/\"a\"", "\"a\""));
-        assert!(if_none_match_matches("*", "\"a\""));
-        assert!(!if_none_match_matches("\"b\"", "\"a\""));
-    }
-
-    #[test]
-    fn parse_range_header_cases() {
-        use RangeOutcome::*;
-
-        // Basic forms.
-        assert_eq!(
-            parse_range_header("bytes=0-499", 1000),
-            Partial { start: 0, end: 499 }
-        );
-        assert_eq!(
-            parse_range_header("bytes=500-", 1000),
-            Partial {
-                start: 500,
-                end: 999
-            }
-        );
-        assert_eq!(
-            parse_range_header("bytes=-300", 1000),
-            Partial {
-                start: 700,
-                end: 999
-            }
-        );
-        // End clamped to the last byte; suffix longer than the file covers it all.
-        assert_eq!(
-            parse_range_header("bytes=990-2000", 1000),
-            Partial {
-                start: 990,
-                end: 999
-            }
-        );
-        assert_eq!(
-            parse_range_header("bytes=-5000", 1000),
-            Partial { start: 0, end: 999 }
-        );
-        // Whitespace and case tolerance.
-        assert_eq!(
-            parse_range_header(" BYTES= 0 - 4 ", 1000),
-            Partial { start: 0, end: 4 }
-        );
-        // Unsatisfiable: beyond EOF, zero suffix, empty file.
-        assert_eq!(parse_range_header("bytes=1000-", 1000), Unsatisfiable);
-        assert_eq!(parse_range_header("bytes=-0", 1000), Unsatisfiable);
-        assert_eq!(parse_range_header("bytes=0-", 0), Unsatisfiable);
-        // Ignored: other units, malformed specs, inverted ranges,
-        // multiple satisfiable ranges (no multipart support).
-        assert_eq!(parse_range_header("items=0-4", 1000), Full);
-        assert_eq!(parse_range_header("bytes=abc", 1000), Full);
-        assert_eq!(parse_range_header("bytes=5-2", 1000), Full);
-        assert_eq!(parse_range_header("bytes=0-4,10-14", 1000), Full);
-        // One satisfiable range among unsatisfiable ones is still served.
-        assert_eq!(
-            parse_range_header("bytes=2000-,0-4", 1000),
-            Partial { start: 0, end: 4 }
-        );
-    }
 }

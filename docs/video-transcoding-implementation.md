@@ -102,7 +102,8 @@ pub(crate) struct TranscodeParams {      // pinned-fixture test guards drift
 pub(crate) enum TranscodeJobEvent {      // SSE payload AND snapshot body;
     Queued  { position: usize },         // generic so jobs/queue.rs can adopt it
     Running { progress: Option<f32> },
-    Done    { artifact: ArtifactRef },   // ArtifactRef { key, mime_type, size_bytes, url }
+    Done    { artifact: ArtifactRef },   // ArtifactRef { key, mime_type, size_bytes,
+                                         //               url, filename } — see §3 S3
     Failed  { error: String, cancelled: bool },
 }
 ```
@@ -246,7 +247,8 @@ including a commented `[transcode.profiles.small-share]` example.
   runtime-only; DELETE clears unpinned artifacts + failures).
 
 Capability: `video_transcode` probed off `POST /api/video/transcode`
-(client_config.rs four-edit pattern). Shipped `restricted_demo`
+(client_config.rs four-edit pattern; Phase 4 adds its `video_compose`
+sibling the same way). Shipped `restricted_demo`
 (default/docker/nixos; desktop configs have only allow_all) gains
 
 ```toml
@@ -436,9 +438,25 @@ float centiseconds.
 
 **S3. Artifact download semantics**: per §0.2 the GET never starts jobs;
 Content-Disposition `inline` with the transcode filename (server-side:
-first file's stem + `-clip` when trimmed else `-{preset_id}` + preset ext;
-pathless → `{sha[..10]}-clip.{ext}`); the `<a download>` attribute carries
-the authoritative UTF-8 name (house convention, ImageGallery.tsx:897).
+**first file's stem** + `-clip` when trimmed else `-{preset_id}` + preset
+ext; pathless → `{sha[..10]}-clip.{ext}`); the `<a download>` attribute
+carries the authoritative UTF-8 name (house convention,
+ImageGallery.tsx:897). IMPLEMENTED with one addition: because
+`ArtifactRef.url` is the `key=` form — which knows neither the source's path
+nor whether the request was trimmed — `ArtifactRef` gained a **`filename`**
+field carrying that same server-computed name, on both the cache hit and the
+SSE `Done` event. The `key=` GET keeps its hash-prefix disposition name (a
+key cannot know about trims); the resolvable GET form is unchanged. **U6 is
+therefore a pass-through**: hand `artifact.filename` to `<a download>`
+rather than re-deriving a name client-side (§0.4 precedent).
+
+"First file's stem" is literal and shared: `api/video.rs::download_stem` is
+the single source for both the resolvable GET's `Content-Disposition` and the
+stem the POST hands the pool (`SubmitRequest.download_stem`), so naming never
+depends on *which* of an item's files was readable — `resolve_source` still
+picks the encode input on exactly that basis. The header itself is RFC 6266:
+a quoted, escaped Latin-1 fallback plus `filename*=UTF-8''…` when the name
+needs it (`api/utils.rs::content_disposition_value`).
 
 **S4. Tests**: `cut=outro` resolution (guard math, NULL→404,
 `write_detect_outros_config` gate flip both ways), exclusivity 422s,
@@ -500,7 +518,10 @@ Radix `ContextMenuItem`s, `disabled={useClipBusy(sha)}`, same
 `clipRequestFor`/`exportClip` engine. Rows require resolved item + video
 mime + presets.
 
-**U6. Filename**: `transcodeFileName(path, sha, suffix, ext)` next to
+**U6. Filename**: SUPERSEDED by S3 as implemented — the server sends
+`ArtifactRef.filename`, so the client passes it through instead of deriving
+one. The original plan (kept for the rule it encodes):
+`transcodeFileName(path, sha, suffix, ext)` next to
 `downloadFileName` (lib/utils.ts:31) — stem + `-clip` (trimmed) or
 `-{presetId}` (re-encode) + preset `ext` (from the DTO, §0.4). No
 timestamp stamp: artifacts are deterministic, re-download legitimately
@@ -517,6 +538,99 @@ Order: S1→S2→S3→S4 → U1→U2(+U6)→U3→U4 / U5 → U7.
 
 ### Server
 
+> **Implemented 2026-08-10** (C1-C4). Deltas settled while building, which
+> the text below already reflects:
+>
+> 1. **`index_db` is the usual query parameter**, not a body field: the
+>    `DbConnection<ReadOnlyNoUserData>` extractor is what selects the
+>    database on every other route, and a body field it ignored would be a
+>    lie in the schema.
+> 2. **Canvas caps are code constants** (`MIN_CANVAS_SIDE` 16,
+>    `MAX_CANVAS_SIDE` 4096, `MAX_CANVAS_AREA` 3840×2160) — there is no
+>    `max_canvas_side` config key. They bound client-authored geometry,
+>    which costs the same on every deployment. They are nonetheless
+>    *published*: §0.4's presets envelope carries `min_canvas_side`,
+>    `max_canvas_side`, `max_canvas_area` and `max_compose_fps` alongside
+>    the config-backed limits, so C6 clamps against the numbers this server
+>    enforces rather than a mirrored copy. Where a limit is stored is the
+>    server's business; that the client has it is the point.
+> 3. **Destination rectangles must be even in POSITION only**
+>    (`dest_not_even`); sizes are free. `overlay` does not refuse an odd
+>    offset in 4:2:0 — it silently snaps it down onto the even chroma grid,
+>    so the item renders one pixel off the rectangle C6 solved, with nothing
+>    to say so. `scale`, by contrast, produces exactly the size it is asked
+>    for, so refusing odd sizes would only force the client to round a
+>    rectangle ffmpeg was going to honour. C6 rounds positions, not sizes.
+> 4. **A preset's `max_height` refuses an over-tall canvas**
+>    (`canvas_over_preset_height`) rather than silently rescaling it: a
+>    rescale would move every rectangle the client placed, which is exactly
+>    the pixel-for-pixel guarantee C5 exists to keep. The compose graph
+>    therefore carries **no** `scale=-2:'min(ih,H)'` tail at all (unlike the
+>    single-file argument builder): admission has already refused every
+>    document such a filter could act on, and a no-op filter in a golden
+>    string is a claim about a rule enforced somewhere else. The preset's
+>    `max_height` rides in the presets envelope so C6 can refuse the canvas
+>    before posting it.
+> 5. **A stills-only document resolves to a 1 s target**
+>    (`STILLS_ONLY_TARGET_CS`) under `longest_loop_once` — a frozen mosaic
+>    is a legitimate thing to ask for, and the alternative is a
+>    zero-length file or a rejection.
+> 6. **The graph is built at job start, not at admission.** It needs each
+>    source's real stream geometry, which is an ffprobe per input; paying
+>    that on the request path would charge it to every cache hit too.
+>    `resolve_compose` (admission) is therefore pure arithmetic over the
+>    document, and `build_filtergraph` (dispatch) is where the source rect
+>    is clamped, a cover-art stream is skipped, and an item marked audible
+>    whose file has no audio track loses its chain rather than failing the
+>    whole graph.
+> 7. **Rejection reasons are named in code and logged**, not sent: an
+>    `ApiError` carries only `detail`, and the detail is the message the
+>    user acts on (the memory guard's estimate above all).
+> 8. Artifact naming: `mosaic-{n}items.<ext>` on the `ArtifactRef`,
+>    `mosaic.<ext>` where only the key is known (the serving path), since a
+>    composition key records no item count.
+>
+> Settled by the C1-C4 review, after the text below was first written:
+>
+> 9. **An image item runs the still chain**, with no input options at all.
+>    `-loop 1 -framerate N` produces an endless demuxer stream bounded only
+>    by a downstream filter noticing — and an animated container the image2
+>    demuxer cannot decode (an animated WebP) never reaches one, so the
+>    encode *hangs* rather than failing. `trim=end_frame=1 → … →
+>    loop=-1:size=1` freezes the first decoded frame and terminates for
+>    every input, decodable or not. Images therefore also buffer one frame
+>    each in the memory guard, exactly like stills.
+> 10. **`run.rs` gained a stall deadline** (`STALL_DEADLINE`, 120 s) on the
+>    same watchdog thread that carries cancellation: the reader stamps an
+>    activity clock on every stdout line, and a child that writes nothing
+>    for two minutes is killed. Cancellation was previously the *only*
+>    escape from a child that never terminates. The result is
+>    `EncodeError::Failed` — a verdict, so negative-cacheable for single
+>    files (compositions are exempt, item 12).
+> 11. **Loop pass counts are arithmetic over durations**, `ceil(target_cs /
+>    span_cs)`, not over frame counts. `frames_for` rounds a partial frame
+>    up because a *buffer* must hold it; dividing the target by that
+>    rounded figure asks for one pass too few and produces an artifact
+>    shorter than the length its own cache key promises. The rounded count
+>    stays where it belongs, as the loop's `size` (and `aloop`'s).
+> 12. **A composition's failures are never negative-cached.** Its key hashes
+>    N inputs, so one transient failure among them would strike the whole
+>    document and two would refuse a perfectly renderable mosaic forever;
+>    there is no per-input verdict to record instead. Single files are
+>    unchanged.
+> 13. **Two rules the document alone could not decide.** A still's `at_cs`
+>    is refused at admission (`still_past_end`) when it is at or past the
+>    item's *recorded* duration, which only the index database holds — so
+>    one bad number names its own pin instead of failing the whole graph at
+>    dispatch; and at dispatch the seek is clamped to the *probed* stream's
+>    duration less one frame, for the stream whose real length disagrees.
+>    `canvas_too_large` also split into `canvas_side_too_large` and
+>    `canvas_area_too_large`: two rules with two different fixes.
+> 14. **The single-item full-canvas document normalizes its background**
+>    before hashing. That path composites onto nothing, so the colour never
+>    reaches a filter — without this, two documents producing byte-identical
+>    artifacts would sit under two keys.
+
 **C1. `media_tools/transcode/compose.rs`** — document + validation.
 Request: `{index_db?, canvas{w,h,background}, fps, output{preset,
 length: longest_loop_once | cap{seconds}}, items[]}`; item:
@@ -525,14 +639,20 @@ dims), transform{quarter_turns, flip_h}, dest{x,y,w,h} (output px),
 time: span{start_cs,end_cs} | still{at_cs} | image, audio}` (§0.5).
 `end_cs` **required** for spans (client always knows duration; target
 length = pure arithmetic, no probing). Validation with named 422 reasons:
-items 1..=`max_mosaic_inputs`; canvas even, ≤ `max_canvas_side`/area caps;
-dest inside canvas; src clamped (not rejected) to probed stream bounds;
-fps 1..=60 then preset cap; span end>start; target clamped to
-`max_animated_image_seconds` (webp) / `max_output_seconds` (mp4/webm);
-**admission-time memory guard**: `Σ loop_frames_i × dest_w × dest_h × 1.5B
-≤ max_mosaic_loop_mb` (loop_frames = 0 for the longest span, 1 for
-stills) — the estimate goes in the 422 message. Cache key =
-`sha256(canonical_json(request) ‖ resolved_preset ‖ TRANSCODER_VERSION)`.
+items 1..=`max_mosaic_inputs`; canvas even, ≤ `MAX_CANVAS_SIDE`
+(`canvas_side_too_large`) and ≤ `MAX_CANVAS_AREA` (`canvas_area_too_large`);
+dest inside canvas and at an even *position*; src clamped (not rejected) to
+probed stream bounds; fps 1..=60 then preset cap; span end>start; target
+clamped to `max_animated_image_seconds` (webp) / `max_output_seconds`
+(mp4/webm); **admission-time memory guard**: `Σ loop_frames_i × dest_w ×
+dest_h × 1.5B ≤ max_mosaic_loop_mb` (loop_frames = 0 for the longest span,
+1 for stills and images) — the estimate goes in the 422 message. The guard
+bounds the `loop` filters' buffers, which is the one part of a
+composition's footprint the document makes computable; it is not a bound on
+decoder memory. `still_past_end` is the one rule taking an argument from
+outside the document (the item's recorded duration, checked by the route).
+Cache key = `sha256(canonical_json(request) ‖ resolved_preset ‖
+TRANSCODER_VERSION)`.
 
 **C2. Filtergraph builder** — pure `build_filtergraph(...) -> FilterPlan
 {inputs, filter_complex, output_args}`, golden-string-tested. D4 table
@@ -547,11 +667,13 @@ not the trimmed segment), repeated `-i` + concat (decoder count =
 
 - span: `-ss start -to end -i f` → `setpts=PTS-STARTPTS, crop, <D4>,
   scale=dw:dh:flags=lanczos, fps=N, [loop=L:size=segframes,]
-  trim=end=target, setpts=PTS-STARTPTS`
-- still: `-ss at -i f` → `trim=end_frame=1, crop, <D4>, scale,
-  loop=-1:size=1, setpts=N/(fps*TB), trim=end=target`
-- image: `-loop 1 -framerate N -i f` → `crop, <D4>, scale,
-  trim=end=target, setpts=PTS-STARTPTS`
+  trim=end=target, setpts=PTS-STARTPTS`, where `L = ceil(target_cs /
+  span_cs) - 1` (durations, not frames — delta 11) and `segframes` is the
+  rounded-up frame count
+- still: `-ss at' -i f` → `trim=end_frame=1, crop, <D4>, scale,
+  loop=-1:size=1, setpts=N/(fps*TB), trim=end=target`, with `at'` the
+  requested timestamp clamped to the probed stream's duration less a frame
+- image: **no input options** → the still chain, verbatim (delta 9)
 
 Base `color=c=bg:s=WxH:r=fps:d=target[base]` → left-fold `overlay=x:y` in
 item order → `format=yuv420p` (mp4/webm) / `yuva420p` (webp). Audio
@@ -559,17 +681,67 @@ item order → `format=yuv420p` (mp4/webm) / `yuva420p` (webp). Audio
 `asetpts, [aloop,] atrim=end=target, aresample=async=1` →
 `amix=inputs=M:duration=longest:dropout_transition=0` (default
 normalization on; revisit with `alimiter` if too quiet). Single-item save
-emits the simplified no-overlay graph (canvas = crop size, preset-capped).
+emits the simplified no-overlay graph, and only when the item covers the
+whole canvas.
+
+Worked 2-item example — 640×480 canvas on `#101820` at 25 fps,
+`longest_loop_once`; item 0 a rotated audible span (2.00-10.00 s of a
+1080×1920 source, into 320×480 at the origin), item 1 a frozen frame
+(a 400×300 crop at 100,50 into 320×240 at 320,120). It resolves to an
+800 cs target and this graph, which is pinned by
+`the_worked_example_builds_the_documented_filtergraph`:
+
+```
+[0:v:0]setpts=PTS-STARTPTS,crop=1080:1920:0:0,transpose=1,scale=320:480:flags=lanczos,fps=25,trim=end=8.00,setpts=PTS-STARTPTS[v0];
+[0:a:0]asetpts=PTS-STARTPTS,atrim=end=8.00,aresample=async=1[a0];
+[1:v:0]trim=end_frame=1,crop=400:300:100:50,scale=320:240:flags=lanczos,loop=-1:size=1,setpts=N/(25*TB),trim=end=8.00[v1];
+color=c=0x101820:s=640x480:r=25:d=8.00[base];
+[base][v0]overlay=0:0[o0];[o0][v1]overlay=320:120,format=yuv420p[vout];
+[a0]amix=inputs=1:duration=longest:dropout_transition=0[aout]
+```
+
+(one chain per line for reading; the real string has no newlines. Stream
+labels are `[i:v:n]` rather than `[i:v]`: `n` is the probe's content video
+stream, so a file whose first video stream is cover art composes the
+other one.)
 
 **C3. Fixture e2e** (gated on `ffmpeg_available()`): two lavfi clips →
-2-item compose (span cropped+rotated + still); ffprobe dims/duration,
-pixel-assert colors inside dest rects and background outside (the
-`corner_is_card` precedent); repeat webp (`nb_frames > 1`) and webm.
+2-item compose (span cropped+rotated + still); dims/duration, pixel-assert
+colors inside dest rects and background outside (the `corner_is_card`
+precedent); repeated for webp and webm. Plus, from the review: a GIF
+image item (first frame frozen, and *terminating* — delta 9) and a span
+looping to fill a `cap{}` target (delta 11), both asserting the output's
+own duration.
+
+The span fixture is **striped**, not flat, and the item crops a proper
+sub-rectangle of it: green/red/blue/green vertical bands, cropped to
+exactly the red and blue ones and turned a quarter clockwise, so red lands
+at the top of its destination rectangle and blue at the bottom. A dropped
+crop reads green at both sample points, a moved crop changes the top one,
+and a dropped transpose reads red at both — a flat fixture passes all
+three ways of being wrong. Two toolchain facts the fixture also had to be
+built around: libwebp's animation encoder **collapses a run of identical
+frames into one still image**, so the striped clip dims halfway through;
+and ffprobe's `webp_pipe` demuxer cannot read an animated WebP at all
+(`image data not found`, zero-sized stream), so the WebP assertions walk
+the RIFF chunk list directly (`VP8X` canvas size, `ANMF` count — a walk
+rather than a byte scan, so a frame count cannot be inflated by pixel data
+that happens to spell `ANMF`) and decode the first frame with the `image`
+crate.
 
 **C4. Route + pool**: `POST /api/video/compose` (join/dedup by doc hash,
-same job envelope); heavy-compose exclusivity per Phase 1 job weights;
-`artifact?key=` already exists (§0.2); no separate capability (the
-`/api/video/` POST rules cover it).
+same job envelope); heavy-compose exclusivity per Phase 1 job weights
+(`items > compose_light_threshold` → `JobWeight::Exclusive`);
+`artifact?key=` already exists (§0.2); a **separate `video_compose`
+capability** probed off `POST /api/video/compose` (the two routes are
+separately rule-able and mean very different work, so a policy may allow
+clips while denying mosaics) — no shipped ruleset changes, and the shipped
+`restricted_demo` rulesets grant only the two GETs, so they inherit
+nothing. The pool's
+`SubmitRequest` carries a `JobRequest::{Single, Compose}` and `run.rs` an
+`EncodeTask` of the same two shapes: queue, dedup map, cancellation,
+progress and publish are shared code, and the single-file argument vector
+is byte-identical to Phase 1's (its pinned argv test is unchanged).
 
 ### UI
 
@@ -616,9 +788,38 @@ automatically; reuses extent/seamless prefs; length-policy radio rows
 rows over `only`-scoped doc; single video pin → the single-item
 transformed save (canvas = crop, offered when the result is a span —
 a stopped pin's still is already served better by the existing image
-path). Gating: `videoTranscodeEnabled` AND at least one in-scope video
-pin (metadata cache; DOM `data-playable` fallback) — a stills-only board
-shows no animated rows.
+path). Gating: `capabilities.video_compose` — **not** `video_transcode`;
+the animated rows post to `/api/video/compose`, and a policy that allows
+clips but denies mosaics must hide exactly these — AND at least one
+in-scope video pin (metadata cache; DOM `data-playable` fallback), so a
+stills-only board shows no animated rows.
+
+**C9. What the animated save gets right, and where it deliberately
+differs from the canvas one** (recorded at the final review of the UI
+half). Two divergences are ACCEPTED and will not be chased: the animated
+export has **square corners** — the canvas mosaic's rounded-corner
+clipping has no cheap filtergraph equivalent, and faking it per item
+would cost an alpha chain per input for a few pixels of styling — and it
+**skips** a pin it cannot resolve where the canvas draws a grey
+placeholder tile, because a video graph has no equivalent of "draw
+nothing here and carry on"; the omission is counted in the completion
+toast instead. Two divergences were BUGS and are fixed. (1) *Edge clip*:
+a pin the visible-extent fold (or the even canvas, or the board's right
+edge) crosses gets a shorter destination rect, and `scale` obeys whatever
+rect it is handed — so the whole frame was being squashed into it, where
+the canvas simply clips the bitmap. `clipPinDrawToCanvas`
+(lib/pinboardCompose.ts) now intersects the dest with the canvas in
+DISPLAY space and maps the retained sub-rectangle through the same
+`sourceRect` the full crop goes through, which carries the cut onto
+whichever source axis and side the pin's D4 element sends it to (a bottom
+cut is a right-of-source cut at `quarter_turns` 1); a pin left with two
+pixels or less on either axis is skipped and counted. (2) *Loop memory*:
+`check_loop_memory`'s estimate is now mirrored client-side
+(`estimateLoopBytes` + `composeTargetCs`) and run inside the builder's
+clamp loop, so a twelve-pin board of short clips comes back as a smaller
+mosaic rather than as a 422 — same "re-solve, never allocate" mechanism
+as the canvas-area clamp, reported through the same `clampedWidth`
+receipt.
 
 Order: C1→C2→C3→C4 strictly; C5-C6 parallel with C1-C4; C7-C8 need C4.
 

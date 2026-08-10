@@ -733,7 +733,7 @@ mod tests {
     fn sampling_is_clamped_only_when_a_boundary_is_supplied() {
         let dir = tempfile::TempDir::new().expect("a temp dir");
         let clip = dir.path().join("card.mp4");
-        if !write_clip(&clip, Some(2)) {
+        if !write_clip(&clip, Some(2), None) {
             return;
         }
         let path = clip.to_string_lossy().to_string();

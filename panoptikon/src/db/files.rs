@@ -19,6 +19,15 @@ pub(crate) struct ItemScanMeta {
     pub audio_tracks: Option<i64>,
     pub video_tracks: Option<i64>,
     pub subtitle_tracks: Option<i64>,
+    /// `items.video_codec`, sentinels included — see the migration
+    /// `20260809120000_item_codecs.sql` and
+    /// [`crate::jobs::files::media_codecs`], which is the only thing that
+    /// builds either of these.
+    pub video_codec: Option<String>,
+    /// `items.audio_codec`: the first audio stream's codec name, or `None`
+    /// when there is no audio stream (the accepted ambiguity with "never
+    /// probed").
+    pub audio_codec: Option<String>,
 }
 
 #[derive(Clone)]
@@ -399,6 +408,84 @@ pub(crate) async fn set_outro_verdict(
     Ok(result.rows_affected())
 }
 
+/// The scan dispatcher's codec question: "is this content a video whose
+/// codecs nothing has recorded?" `false` means there is nothing to do — the
+/// item is not a video, already carries a `video_codec`, or is not indexed.
+///
+/// The whole answer, deliberately: nothing about the item's stored metadata
+/// narrows it further. A video row with no video *track* still owes its
+/// `audio_codec`, which only the probe can name (see `pending_codec_work` in
+/// `jobs::files`).
+///
+/// Scoped to the `video/` range, and phrased exactly like
+/// [`get_pending_outro_item`] — same half-open comparison rather than a LIKE
+/// prefix, and the same predicate `idx_items_codec_pending` was written for,
+/// so the definition of "video" lives in one place. Audio items are outside
+/// it on purpose: they get their `audio_codec` at scan time going forward and
+/// are never backfilled (see the migration).
+pub(crate) async fn item_codec_pending(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+SELECT 1
+FROM items
+WHERE sha256 = ?1
+  AND video_codec IS NULL
+  AND type >= 'video/' AND type < 'video0'
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read an item's codec state");
+        ApiError::internal("Failed to query item")
+    })?;
+    Ok(row.is_some())
+}
+
+/// Stores one item's stream codecs.
+///
+/// No negative-cache delete, unlike [`set_outro_verdict`]: a failed ffprobe
+/// writes no marker for codecs at all, so there is nothing here to retire (see
+/// `pending_codec_work` in `jobs::files`).
+///
+/// `video_codec` is never null — the sentinels are what terminate the backfill,
+/// so a caller with no answer must not call this at all. `audio_codec` is
+/// legitimately `None` for a container with no audio stream.
+///
+/// The column carries no version, deliberately: a `codec_name` is a fact about
+/// the file's streams, not a detector's verdict, so there is nothing for a
+/// later build to disagree with and nothing to re-examine on a bump. What
+/// *could* change is the selection policy — which stream of several counts as
+/// the file's video track (see `content_video_stream` in `jobs::files`). If it
+/// ever does, recovery is a migration that NULLs the affected rows, which puts
+/// them straight back into the backfill population the next scan walks; the
+/// manual form of the same thing is
+/// `UPDATE items SET video_codec = NULL WHERE ...`. Adding a version column
+/// instead would buy nothing that re-entering the population does not.
+pub(crate) async fn set_item_codecs(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    video_codec: &str,
+    audio_codec: Option<&str>,
+) -> ApiResult<u64> {
+    let result =
+        sqlx::query("UPDATE items SET video_codec = ?1, audio_codec = ?2 WHERE sha256 = ?3")
+            .bind(video_codec)
+            .bind(audio_codec)
+            .bind(sha256)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, sha256, "failed to store an item's codecs");
+                ApiError::internal("Failed to store item codecs")
+            })?;
+    Ok(result.rows_affected())
+}
+
 /// Returns the item's stored pixel dimensions, used to decide whether an
 /// image would produce a thumbnail at all without decoding it again.
 pub(crate) async fn get_item_dimensions(
@@ -476,8 +563,10 @@ INSERT INTO items (
     audio_tracks,
     video_tracks,
     subtitle_tracks,
-    blurhash
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+    blurhash,
+    video_codec,
+    audio_codec
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 "#,
             )
             .bind(&data.sha256)
@@ -492,6 +581,8 @@ INSERT INTO items (
             .bind(meta.video_tracks)
             .bind(meta.subtitle_tracks)
             .bind(&data.blurhash)
+            .bind(&meta.video_codec)
+            .bind(&meta.audio_codec)
             .execute(&mut *conn)
             .await
             .map_err(|err| {
@@ -820,6 +911,8 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1
                     audio_tracks: None,
                     video_tracks: None,
                     subtitle_tracks: None,
+                    video_codec: None,
+                    audio_codec: None,
                 }),
                 blurhash: Some("bh".to_string()),
             },
@@ -843,6 +936,60 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1
                 .await
                 .unwrap();
         assert_eq!(file_row.0, 1);
+    }
+
+    // The codec backfill's population, which no scan test can reach: the
+    // dispatch question is scoped to the `video/` mime range, so an audio item
+    // with a NULL `video_codec` sits in the partial index forever and is never
+    // asked about. Widening it would put every audio file in an existing
+    // library through an ffprobe run for a column nothing reads.
+    #[tokio::test]
+    async fn the_codec_question_covers_videos_and_only_videos() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, video_tracks, time_added)
+VALUES
+    (1, 'sha_video', 'md5_1', 'video/mp4', 1, '2024-01-01T00:00:00'),
+    (2, 'sha_audio', 'md5_2', 'audio/mpeg', 0, '2024-01-01T00:00:00'),
+    (3, 'sha_image', 'md5_3', 'image/png', NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        assert!(
+            item_codec_pending(&mut dbs.index_conn, "sha_video")
+                .await
+                .unwrap(),
+            "an unprobed video is work"
+        );
+        for sha in ["sha_audio", "sha_image", "sha_missing"] {
+            assert!(
+                !item_codec_pending(&mut dbs.index_conn, sha).await.unwrap(),
+                "{sha} must never be dispatched for a codec probe"
+            );
+        }
+
+        // A stored answer — sentinel or codec name — is what terminates it.
+        assert_eq!(
+            set_item_codecs(&mut dbs.index_conn, "sha_video", "hevc", Some("aac"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !item_codec_pending(&mut dbs.index_conn, "sha_video")
+                .await
+                .unwrap()
+        );
+        let stored: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT video_codec, audio_codec FROM items WHERE sha256 = 'sha_video'")
+                .fetch_one(&mut dbs.index_conn)
+                .await
+                .unwrap();
+        assert_eq!(stored, (Some("hevc".to_string()), Some("aac".to_string())));
     }
 
     // Ensures unchanged files update scan_id and last_modified without reinserting.

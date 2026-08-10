@@ -5232,6 +5232,475 @@
           }
         }
       }
+    },
+    "/api/video/artifact": {
+      "get": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Serve a cached transcode artifact",
+        "description": "Serves a finished rendition by `key` (primary form) or by the `(id, id_type, preset, start_cs, end_cs)` that produced it. Supports Range requests. **Never starts a job**: a miss is a 404 whose body names the live job when one exists. The `key=` form is `immutable` — that URL is content-addressed on both the source hash and the resolved settings — while the resolvable form is `no-cache`, so its ETag revalidates: the same parameters name different bytes after a profile edit.",
+        "operationId": "video_artifact",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "description": "The cache key, as carried by every `ArtifactRef`. Primary form.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "query",
+            "description": "Resolvable form: the same `(id, id_type, preset, start_cs, end_cs)`\nthat produced the artifact.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ItemIdentifierType"
+            }
+          },
+          {
+            "name": "preset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start_cs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "end_cs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Artifact contents"
+          },
+          "206": {
+            "description": "Partial artifact contents (Range request)"
+          },
+          "404": {
+            "description": "Not cached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactMissResponse"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "Requested range not satisfiable"
+          },
+          "422": {
+            "description": "Unknown preset, or trim bounds that name a freeze frame rather than a clip (the resolvable form validates exactly as the POST does)"
+          }
+        }
+      }
+    },
+    "/api/video/cache": {
+      "get": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Get transcode artifact cache stats",
+        "operationId": "get_transcode_cache",
+        "responses": {
+          "200": {
+            "description": "Artifact cache stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeCacheStats"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Resize the transcode artifact cache",
+        "description": "Sets the live byte budget and evicts down to it. Sizes above the `[transcode] cache_size_max_mb` ceiling are rejected. Not persisted — the TOML value applies again at the next startup.",
+        "operationId": "resize_transcode_cache",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscodeCacheResize"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Artifact cache stats after resizing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeCacheStats"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Above the configured ceiling"
+          },
+          "500": {
+            "description": "The eviction pass behind the resize failed"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Clear the transcode artifact cache",
+        "description": "Removes every unpinned artifact (pinned rows are the share-link guarantee and survive). `include_failures` also forgets the recorded encode verdicts.",
+        "operationId": "clear_transcode_cache",
+        "parameters": [
+          {
+            "name": "include_failures",
+            "in": "query",
+            "description": "Also forget the recorded encode verdicts, so files that failed twice\nare attempted again.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Artifact cache stats after clearing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeCacheStats"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/video/compose": {
+      "post": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Create or join a composition job",
+        "description": "Renders a composition document — a canvas, a frame rate, an output length policy and a list of placed items — into one animated artifact. A sibling of `/api/video/transcode` rather than a variant of it: a composition is addressed by the hash of its document, not by an item, and is strictly heavier work, so a policy can allow one and deny the other. The response envelope, the jobs/SSE routes and the artifact route are identical to the single-file path; a single-item save is simply a composition with one item.",
+        "operationId": "video_compose",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComposeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The composition was already cached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeSubmitResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A job was created or joined",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeSubmitResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "An item is not in this database, or has no readable file"
+          },
+          "422": {
+            "description": "Unknown preset, or a document the composition limits refuse: too many items, a canvas that is odd/too large/taller than the preset renders, a destination rectangle outside the canvas or at an odd position, a span whose end is not after its start, a still frozen at or past its item's recorded length, an unusable frame rate or length cap, or loop buffers over `max_mosaic_loop_mb` (the message carries the estimate)"
+          }
+        }
+      }
+    },
+    "/api/video/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Get a transcode job snapshot",
+        "description": "The same envelope the SSE stream carries. Exists for late joiners and as the fallback when `text/event-stream` cannot get through.",
+        "operationId": "video_job",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeJobSnapshot"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Cancel a transcode job",
+        "description": "A queued job settles immediately; a running one is flagged and its ffmpeg child killed. Cancellation is never recorded as a verdict on the file.",
+        "operationId": "video_job_cancel",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job snapshot after the cancel",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeJobSnapshot"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job"
+          }
+        }
+      }
+    },
+    "/api/video/jobs/{job_id}/events": {
+      "get": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Follow a transcode job (SSE)",
+        "description": "A `text/event-stream` of job snapshots. The first event is always the current snapshot, keep-alive comments are sent every 10 seconds, and the stream ends after the terminal event — clients must close their EventSource then, or it will reconnect forever.",
+        "operationId": "video_job_events",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stream of TranscodeJobSnapshot events (text/event-stream)"
+          },
+          "404": {
+            "description": "No such job"
+          }
+        }
+      }
+    },
+    "/api/video/presets": {
+      "get": {
+        "tags": [
+          "video"
+        ],
+        "summary": "List the available transcode presets",
+        "description": "The resolved preset table (built-ins merged with `[transcode.profiles]`), filtered by the matched policy's `[policies.client] transcode_presets` when it is set. The envelope also carries the composition limits, so clients clamp against live config.",
+        "operationId": "video_presets",
+        "responses": {
+          "200": {
+            "description": "Presets and limits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodePresetsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/video/transcode": {
+      "post": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Create or join a transcode job",
+        "description": "Resolves the item, validates the preset and trim bounds, and either answers from the artifact cache (200, `outcome: \"hit\"`) or creates/joins a job (202). `cut: \"outro\"` ends the clip at the item's detected outro boundary: it excludes `end_cs`, composes with `start_cs`, and is resolved to explicit centiseconds here, so it shares its cache entry with the identical explicit trim. An item with no detected outro — including one whose index database has `detect_outros` off — is a 404.",
+        "operationId": "video_transcode",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscodeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The rendition was already cached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeSubmitResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A job was created or joined",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeSubmitResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such item, no readable file for it, or no detected outro"
+          },
+          "422": {
+            "description": "Unknown preset, an unusable trim window (bounds that name a freeze frame rather than a clip, a start bound past the end of the item, or a start bound at or past the resolved outro cut), an unknown/conflicting `cut`, or an animated-image preset asked for more than `max_animated_image_seconds` of output (including an unbounded one on an item with no recorded duration)"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5247,6 +5716,60 @@
             "items": {
               "$ref": "#/components/schemas/QueryElement"
             }
+          }
+        }
+      },
+      "ArtifactMissResponse": {
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "job": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TranscodeJobSnapshot",
+                "description": "The job already producing this artifact, when there is one. A miss is\nnever a reason to start one — `POST` is the sole job creator."
+              }
+            ]
+          }
+        }
+      },
+      "ArtifactRef": {
+        "type": "object",
+        "description": "A finished artifact, as every client-facing shape refers to it.",
+        "required": [
+          "key",
+          "mime_type",
+          "size_bytes",
+          "url",
+          "filename"
+        ],
+        "properties": {
+          "filename": {
+            "type": "string",
+            "description": "The name a download should be saved under, computed server-side from\nthe request that produced the artifact (implementation plan §3 S3).\n\nIt rides here because [`Self::url`] is the `key=` form, and that form\ncannot name a download: a key knows the source hash and the settings,\nnever the file's path or whether the request was trimmed. The client\nhangs this on its `<a download>` (the §0.4 precedent — naming inputs\nbelong to the server, so clients keep no lookup tables).\n\nA *joined* job answers with the first submitter's name. The bytes are\nidentical by construction (the key covers the source hash), so the most\nthis can cost is the stem of one of several files with the same\ncontent."
+          },
+          "key": {
+            "type": "string",
+            "description": "Cache key; also the artifact's ETag and its `?key=` query value."
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "url": {
+            "type": "string",
+            "description": "Ready-to-use URL for `GET /api/video/artifact`."
           }
         }
       },
@@ -5372,6 +5895,35 @@
           }
         }
       },
+      "Canvas": {
+        "type": "object",
+        "required": [
+          "w",
+          "h"
+        ],
+        "properties": {
+          "background": {
+            "type": "string",
+            "description": "`#RRGGBB`, `#RRGGBBAA` or the `0x` spelling of either. Normalized\nbefore it reaches a filtergraph, which is not decoration: the value is\ninterpolated into a filter argument, where an unvalidated string could\nspell further filters."
+          },
+          "h": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "w": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "Channel": {
+        "type": "string",
+        "description": "Which encoder family a preset draws from: `Quality` is software x264 at a\ndecent CRF, `Fast` is the validated hardware encoder when there is one\n(design §5 — hardware encoders are meaningfully worse per bit, so export\nquality never rides on them).",
+        "enum": [
+          "quality",
+          "fast"
+        ]
+      },
       "ClientCapabilities": {
         "type": "object",
         "description": "Coarse feature switches derived from the matched policy's ruleset. Each\ncapability is one representative probe from the real route list in\nmain.rs, evaluated with the exact rule-matching code enforcement uses\n(`policy::ruleset_allows`) — true means the probe request would pass the\nruleset gate.",
@@ -5384,7 +5936,9 @@
           "db_create",
           "inference",
           "pinboards",
-          "pinboard_search"
+          "pinboard_search",
+          "video_transcode",
+          "video_compose"
         ],
         "properties": {
           "bookmarks": {
@@ -5422,6 +5976,14 @@
           "search": {
             "type": "boolean",
             "description": "POST /api/search/pql"
+          },
+          "video_compose": {
+            "type": "boolean",
+            "description": "POST /api/video/compose\n\nSeparate from `video_transcode` because the two are separately\nrule-able and mean different work: a composition is strictly heavier\n(N decoders and their loop buffers at once, holding the pool), so a\npolicy may allow single-file clips while denying mosaics. The client's\nanimated-mosaic controls gate on this one."
+          },
+          "video_transcode": {
+            "type": "boolean",
+            "description": "POST /api/video/transcode\n\nThe write probe of the video surface: a policy may serve already\nencoded artifacts (`GET /api/video/artifact`) while denying new\nconversions, so this is deliberately not probed off the GET."
           }
         }
       },
@@ -5478,6 +6040,8 @@
           "blurhash",
           "outro_kind",
           "content_end_ms",
+          "video_codec",
+          "audio_codec",
           "data_id",
           "language",
           "language_confidence",
@@ -5506,6 +6070,132 @@
             "type": "string"
           }
         }
+      },
+      "ComposeItem": {
+        "type": "object",
+        "required": [
+          "sha256",
+          "src",
+          "dest",
+          "time"
+        ],
+        "properties": {
+          "audio": {
+            "type": "boolean",
+            "description": "Whether this item's audio is mixed in. The client sets it to\n`playing && !muted`; it is forced off for a still, an image, or a\ncontainer that carries no audio at all."
+          },
+          "dest": {
+            "$ref": "#/components/schemas/Rect"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Item content hash; resolved against the request's index database."
+          },
+          "src": {
+            "$ref": "#/components/schemas/Rect"
+          },
+          "time": {
+            "$ref": "#/components/schemas/ItemTime"
+          },
+          "transform": {
+            "$ref": "#/components/schemas/Transform"
+          }
+        }
+      },
+      "ComposeLength": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The longest span plays exactly once; everything shorter loops to fill.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "longest_loop_once"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A fixed length, whatever the items are.",
+            "required": [
+              "seconds",
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "cap"
+                ]
+              },
+              "seconds": {
+                "type": "number",
+                "format": "double"
+              }
+            }
+          }
+        ],
+        "description": "How long the output runs."
+      },
+      "ComposeOutput": {
+        "type": "object",
+        "required": [
+          "preset",
+          "length"
+        ],
+        "properties": {
+          "length": {
+            "$ref": "#/components/schemas/ComposeLength"
+          },
+          "preset": {
+            "type": "string",
+            "description": "Preset id from `GET /api/video/presets`."
+          }
+        }
+      },
+      "ComposeRequest": {
+        "type": "object",
+        "description": "The composition document as it arrives.",
+        "required": [
+          "canvas",
+          "fps",
+          "output",
+          "items"
+        ],
+        "properties": {
+          "canvas": {
+            "$ref": "#/components/schemas/Canvas"
+          },
+          "fps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Output frame rate, 1-60, then capped by the preset.",
+            "minimum": 0
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ComposeItem"
+            }
+          },
+          "output": {
+            "$ref": "#/components/schemas/ComposeOutput"
+          }
+        }
+      },
+      "Container": {
+        "type": "string",
+        "description": "Output container. Fixes the file extension, the MIME type the artifact is\nserved with, and whether an audio stream is possible at all.",
+        "enum": [
+          "mp4",
+          "webm",
+          "webp"
+        ]
       },
       "ContinuousFilescanConfig": {
         "type": "object",
@@ -6786,9 +7476,18 @@
           "blurhash",
           "outro_kind",
           "content_end_ms",
+          "video_codec",
+          "audio_codec",
           "time_added"
         ],
         "properties": {
+          "audio_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The *first* audio stream's codec name (`aac`, `opus`, `ac3`, ...), or\n`unknown` when a stream exists that ffprobe named no codec for. `null`\nconflates \"no audio stream\" with \"not probed yet\" — deliberately, since\nneither is a reason to veto playback. Never gated, as above."
+          },
           "audio_tracks": {
             "type": [
               "integer",
@@ -6861,6 +7560,13 @@
           "type": {
             "type": "string"
           },
+          "video_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The video stream's codec name as ffprobe reports it (`h264`, `hevc`,\n`av1`, ...), with two in-band sentinels: `none` means the container was\nprobed and has no video stream, `unknown` means a video stream exists\nbut ffprobe named no codec. `null` means the item has not been probed\nyet — an existing library fills in over its next few scans, so a client\nmust keep whatever it did before these columns existed as the `null`\nbehaviour.\n\nUnlike the outro fields this is never gated: a codec name is an\nobjective property of the file, like `duration` or `width`."
+          },
           "video_tracks": {
             "type": [
               "integer",
@@ -6876,6 +7582,71 @@
             "format": "int64"
           }
         }
+      },
+      "ItemTime": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A playing range. `end_cs` is **required**: the client always knows the\nduration, and with both bounds the target length is arithmetic rather\nthan a probe of every input before the job can even be keyed.",
+            "required": [
+              "start_cs",
+              "end_cs",
+              "kind"
+            ],
+            "properties": {
+              "end_cs": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "span"
+                ]
+              },
+              "start_cs": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "One frame of a video, held for the whole output.",
+            "required": [
+              "at_cs",
+              "kind"
+            ],
+            "properties": {
+              "at_cs": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "still"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A still image file, held for the whole output.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "image"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What an item is showing. Replaces the design's separate \"playing\" and\n\"muted\" flags (§0.5): a span *is* playing, a still and an image are\nstopped, so no combination of fields can contradict another."
       },
       "Items": {
         "type": "object",
@@ -7533,6 +8304,13 @@
       "MatchValue": {
         "type": "object",
         "properties": {
+          "audio_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See [`MatchValues::audio_codec`]."
+          },
           "audio_tracks": {
             "type": [
               "integer",
@@ -7718,6 +8496,13 @@
               "null"
             ]
           },
+          "video_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See [`MatchValues::video_codec`]."
+          },
           "video_tracks": {
             "type": [
               "integer",
@@ -7737,6 +8522,17 @@
       "MatchValues": {
         "type": "object",
         "properties": {
+          "audio_codec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OneOrMany_String",
+                "description": "The first audio stream's codec name, on the same terms as\n[`MatchValues::video_codec`]."
+              }
+            ]
+          },
           "audio_tracks": {
             "oneOf": [
               {
@@ -8018,6 +8814,17 @@
               }
             ]
           },
+          "video_codec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OneOrMany_String",
+                "description": "The video stream's codec name as ffprobe reports it, with the in-band\nsentinels `none` (probed, no video stream) and `unknown` (a stream\nffprobe named no codec for). NULL — never probed — matches nothing, so\n\"find every HEVC file\" is `eq: { \"video_codec\": \"hevc\" }` and stays\ncorrect while a library is still filling in."
+              }
+            ]
+          },
           "video_tracks": {
             "oneOf": [
               {
@@ -8263,6 +9070,8 @@
           "blurhash",
           "outro_kind",
           "content_end_ms",
+          "video_codec",
+          "audio_codec",
           "data_id",
           "language",
           "language_confidence",
@@ -9037,6 +9846,34 @@
           }
         }
       },
+      "Rect": {
+        "type": "object",
+        "description": "A rectangle. Source rectangles are in the source's own pixels *before* its\ndisplay orientation is applied; destination rectangles are in output pixels\non the canvas.",
+        "required": [
+          "x",
+          "y",
+          "w",
+          "h"
+        ],
+        "properties": {
+          "h": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "w": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "x": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "y": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "RenamePinboardRequest": {
         "type": "object",
         "properties": {
@@ -9545,6 +10382,13 @@
           "item_id"
         ],
         "properties": {
+          "audio_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Audio Codec\n\nThe *first* audio stream's codec name (`aac`, `opus`, `ac3`, ...), or\n`unknown` when a stream exists that ffprobe named no codec for. Absent\nfor a file with no audio stream as well as for one not yet probed —\nthe column does not distinguish them. Never withheld, as above."
+          },
           "audio_tracks": {
             "type": [
               "integer",
@@ -9742,6 +10586,13 @@
               "string",
               "null"
             ]
+          },
+          "video_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Video Codec\n\nThe video stream's codec name as ffprobe reports it (`h264`, `hevc`,\n`av1`, ...), with two in-band sentinels: `none` means the container was\nprobed and has no video stream, `unknown` means a video stream exists\nbut ffprobe named no codec. Absent when the item has not been probed\nyet or the column was not selected.\n\nUnlike the outro fields this is never withheld: a codec name is an\nobjective property of the file, like `duration` or `width`."
           },
           "video_tracks": {
             "type": [
@@ -10259,6 +11110,15 @@
           }
         }
       },
+      "Surface": {
+        "type": "string",
+        "description": "Where the UI may offer a preset. Presets carry their own surfaces so a\nuser-declared profile appears in the right dropdowns with no client change.",
+        "enum": [
+          "playback",
+          "clip",
+          "mosaic"
+        ]
+      },
       "SystemConfig": {
         "type": "object",
         "properties": {
@@ -10519,6 +11379,364 @@
           }
         }
       },
+      "TranscodeCacheResize": {
+        "type": "object",
+        "required": [
+          "size_mb"
+        ],
+        "properties": {
+          "size_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "New byte budget in megabytes. `0` empties the cache; values above the\n`[transcode] cache_size_max_mb` ceiling are rejected. Not persisted.",
+            "minimum": 0
+          }
+        }
+      },
+      "TranscodeCacheStats": {
+        "type": "object",
+        "required": [
+          "entries",
+          "pinned_entries",
+          "used_bytes",
+          "capacity_bytes",
+          "limit_bytes"
+        ],
+        "properties": {
+          "capacity_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "entries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "limit_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The `[transcode] cache_size_max_mb` ceiling, in bytes.",
+            "minimum": 0
+          },
+          "pinned_entries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "used_bytes": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TranscodeJobEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "1-based position in the queue.",
+            "required": [
+              "position",
+              "state"
+            ],
+            "properties": {
+              "position": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "queued"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`None` while the output length is unknown (a source with no recorded\nduration): the job is running, the percentage is not knowable.",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "progress": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "format": "float"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "artifact",
+              "state"
+            ],
+            "properties": {
+              "artifact": {
+                "$ref": "#/components/schemas/ArtifactRef"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "done"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "error",
+              "cancelled",
+              "state"
+            ],
+            "properties": {
+              "cancelled": {
+                "type": "boolean"
+              },
+              "error": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "failed"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Job state, as both the SSE payload and the snapshot body. Deliberately\ngeneric (no transcode-specific fields): `jobs/queue.rs`'s polled status is\nexpected to migrate onto the same envelope."
+      },
+      "TranscodeJobSnapshot": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TranscodeJobEvent"
+          },
+          {
+            "type": "object",
+            "required": [
+              "id"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "TranscodeLimits": {
+        "type": "object",
+        "description": "Composition limits, carried alongside the presets so a client builder\nclamps against what this server enforces instead of mirrored constants.\n\nDeliberately *not* only the config values: the canvas and frame-rate bounds\nare code constants (`compose.rs`), and a client that has to guess them is in\nexactly the position this envelope exists to prevent. Where a limit comes\nfrom is the server's business; that the client has the number is the point.",
+        "required": [
+          "max_mosaic_inputs",
+          "max_mosaic_loop_mb",
+          "max_animated_image_seconds",
+          "max_output_seconds",
+          "min_canvas_side",
+          "max_canvas_side",
+          "max_canvas_area",
+          "max_compose_fps"
+        ],
+        "properties": {
+          "max_animated_image_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_canvas_area": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max_canvas_side": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max_compose_fps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "max_mosaic_inputs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_mosaic_loop_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_output_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "min_canvas_side": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TranscodePresetInfo": {
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "container",
+          "ext",
+          "channel",
+          "surfaces"
+        ],
+        "properties": {
+          "channel": {
+            "$ref": "#/components/schemas/Channel"
+          },
+          "container": {
+            "$ref": "#/components/schemas/Container"
+          },
+          "ext": {
+            "type": "string",
+            "description": "File extension for the container, so clients keep no lookup table."
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "max_height": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Cap on output height in pixels; `null` keeps the source height.\n\nCarried because it is a *rejection*: a composition whose canvas is\ntaller than this is refused outright (`canvas_over_preset_height`)\nrather than rescaled, so a client that cannot see the number can only\ndiscover it by having a document turned away. Its `fps_max` twin is\ndeliberately **not** here, for the same reason inverted: an over-cap\nframe rate is silently capped, never refused, so there is nothing a\nclient could do with it but mirror a value that changes nothing."
+          },
+          "surfaces": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Surface"
+            }
+          }
+        }
+      },
+      "TranscodePresetsResponse": {
+        "type": "object",
+        "required": [
+          "presets",
+          "limits"
+        ],
+        "properties": {
+          "limits": {
+            "$ref": "#/components/schemas/TranscodeLimits"
+          },
+          "presets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TranscodePresetInfo"
+            }
+          }
+        }
+      },
+      "TranscodeRequest": {
+        "type": "object",
+        "required": [
+          "id",
+          "id_type",
+          "preset"
+        ],
+        "properties": {
+          "cut": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`\"outro\"` to end the clip at this item's detected outro boundary,\nresolved server-side. Excludes `end_cs` (the two are the same bound\nasked for two ways), composes with `start_cs`, and is a 404 when the\nitem has no detected outro or the index database has detection off.\nAny other value is rejected rather than ignored: a client that sent one\nand got a full-length file would have no way to notice."
+          },
+          "end_cs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Trim end, in centiseconds from the start of the file."
+          },
+          "id": {
+            "type": "string",
+            "description": "An item identifier (sha256 hash, file ID, path, item ID, ...)."
+          },
+          "id_type": {
+            "$ref": "#/components/schemas/ItemIdentifierType"
+          },
+          "preset": {
+            "type": "string",
+            "description": "Preset id from `GET /api/video/presets`."
+          },
+          "start_cs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Trim start, in centiseconds from the start of the file."
+          }
+        }
+      },
+      "TranscodeSubmitResponse": {
+        "type": "object",
+        "required": [
+          "outcome"
+        ],
+        "properties": {
+          "artifact": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArtifactRef"
+              }
+            ]
+          },
+          "job": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TranscodeJobSnapshot"
+              }
+            ]
+          },
+          "outcome": {
+            "type": "string",
+            "description": "`hit` | `created` | `joined` | `known_failure`."
+          }
+        }
+      },
+      "Transform": {
+        "type": "object",
+        "description": "The display transform of the dihedral group of order 8: `flip_h` applied\nafter `quarter_turns` clockwise rotations. The same decomposition the\npinboard stores per pin, passed through verbatim.",
+        "properties": {
+          "flip_h": {
+            "type": "boolean"
+          },
+          "quarter_turns": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0-3 clockwise quarter turns.",
+            "minimum": 0
+          }
+        }
+      },
       "UpdatePreviewRequest": {
         "type": "object",
         "description": "A replacement preview image for an existing version. Same field semantics\nas the preview half of [`SaveVersionRequest`]; nothing else about the\nversion can be changed.",
@@ -10750,6 +11968,10 @@
     {
       "name": "client",
       "description": "Per-policy client configuration and derived capabilities"
+    },
+    {
+      "name": "video",
+      "description": "Backend video transcoding: jobs, artifacts, presets, and the artifact cache"
     },
     {
       "name": "inference",

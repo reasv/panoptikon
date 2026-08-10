@@ -44,6 +44,20 @@ pub(crate) struct ClientCapabilities {
     /// granting read-only board access would report `pinboards: false` while
     /// the library search still works.
     pub pinboard_search: bool,
+    /// POST /api/video/transcode
+    ///
+    /// The write probe of the video surface: a policy may serve already
+    /// encoded artifacts (`GET /api/video/artifact`) while denying new
+    /// conversions, so this is deliberately not probed off the GET.
+    pub video_transcode: bool,
+    /// POST /api/video/compose
+    ///
+    /// Separate from `video_transcode` because the two are separately
+    /// rule-able and mean different work: a composition is strictly heavier
+    /// (N decoders and their loop buffers at once, holding the pool), so a
+    /// policy may allow single-file clips while denying mosaics. The client's
+    /// animated-mosaic controls gate on this one.
+    pub video_compose: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -81,6 +95,8 @@ fn derive_capabilities(settings: &Settings, policy: &PolicyConfig) -> ClientCapa
         inference: allows(Method::POST, "/api/inference/predict/group/probe"),
         pinboards: allows(Method::POST, "/api/pinboards"),
         pinboard_search: allows(Method::POST, "/api/pinboards/search"),
+        video_transcode: allows(Method::POST, "/api/video/transcode"),
+        video_compose: allows(Method::POST, "/api/video/compose"),
     }
 }
 
@@ -253,6 +269,8 @@ disable_backend_open = true
         assert!(!caps.inference);
         assert!(!caps.pinboards);
         assert!(!caps.pinboard_search);
+        assert!(!caps.video_transcode);
+        assert!(!caps.video_compose);
         assert_eq!(
             response.client,
             serde_json::json!({ "search_throttle_ms": 1500, "disable_backend_open": true })
@@ -279,6 +297,8 @@ disable_backend_open = true
                 && caps.inference
                 && caps.pinboards
                 && caps.pinboard_search
+                && caps.video_transcode
+                && caps.video_compose
         );
         assert_eq!(
             response.client,

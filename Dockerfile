@@ -93,6 +93,11 @@ COPY config/inference/example.toml config/inference/example.toml
 RUN mkdir -p data && chown -R ubuntu:ubuntu /app
 USER ubuntu
 ENV PANOPTIKON_CONFIG_PATH=/app/config/server/docker.toml
+# The NVIDIA container runtime injects driver libraries per this list; its
+# default when unset is compute,utility, which OMITS libnvidia-encode — video
+# transcoding's nvenc would silently fall back to software. Inert without the
+# NVIDIA runtime, so safe for the CPU image too.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
 # Provision the Python inference environment at build time so first boot is
 # fast: extracts the embedded Python source set to /app/runtime and creates

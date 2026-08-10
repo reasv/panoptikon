@@ -64,6 +64,17 @@ pub(crate) struct MatchValues {
     pub outro_kind: Option<OneOrMany<String>>,
     #[serde(default)]
     pub content_end_ms: Option<OneOrMany<i64>>,
+    /// The video stream's codec name as ffprobe reports it, with the in-band
+    /// sentinels `none` (probed, no video stream) and `unknown` (a stream
+    /// ffprobe named no codec for). NULL — never probed — matches nothing, so
+    /// "find every HEVC file" is `eq: { "video_codec": "hevc" }` and stays
+    /// correct while a library is still filling in.
+    #[serde(default)]
+    pub video_codec: Option<OneOrMany<String>>,
+    /// The first audio stream's codec name, on the same terms as
+    /// [`MatchValues::video_codec`].
+    #[serde(default)]
+    pub audio_codec: Option<OneOrMany<String>>,
     #[serde(default)]
     pub data_id: Option<OneOrMany<i64>>,
     #[serde(default)]
@@ -129,6 +140,12 @@ pub(crate) struct MatchValue {
     pub outro_kind: Option<String>,
     #[serde(default)]
     pub content_end_ms: Option<i64>,
+    /// See [`MatchValues::video_codec`].
+    #[serde(default)]
+    pub video_codec: Option<String>,
+    /// See [`MatchValues::audio_codec`].
+    #[serde(default)]
+    pub audio_codec: Option<String>,
     #[serde(default)]
     pub data_id: Option<i64>,
     #[serde(default)]
@@ -431,6 +448,45 @@ mod tests {
             sql.contains(r#""items"."content_end_ms" IN (1000, 2000)"#),
             "{sql}"
         );
+    }
+
+    /// Both codec columns are TEXT on `items`, take the string operators, and
+    /// resolve to their own SQLite column — the mistake a shared enum arm
+    /// would make invisible is `audio_codec` compiling to `video_codec`.
+    /// `in_` is the shape "anything this browser cannot play" wants.
+    #[test]
+    fn match_filter_matches_each_codec_column() {
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "eq": { "video_codec": "hevc" } }
+        }))
+        .expect("eq filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(sql.contains(r#""items"."video_codec" = 'hevc'"#), "{sql}");
+
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "in_": { "audio_codec": ["ac3", "eac3"] } }
+        }))
+        .expect("in_ filter");
+        let mut state = build_base_state(EntityType::File, false);
+        let context = build_begin_cte(&mut state);
+        let sql = render_filter_sql(&filter, &mut state, &context);
+        assert!(
+            sql.contains(r#""items"."audio_codec" IN ('ac3', 'eac3')"#),
+            "{sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codec_match_filter_runs_full_query() {
+        let filter: Match = serde_json::from_value(json!({
+            "match": { "eq": { "video_codec": "hevc" } }
+        }))
+        .expect("match filter");
+        run_full_pql_query(QueryElement::Match(filter), EntityType::File)
+            .await
+            .expect("codec match query");
     }
 
     #[tokio::test]
@@ -1129,6 +1185,12 @@ fn collect_match_value_fields(values: &MatchValue) -> Vec<(Column, FieldValue)> 
     if let Some(value) = values.content_end_ms {
         fields.push((Column::ContentEndMs, FieldValue::Int(value)));
     }
+    if let Some(value) = values.video_codec.clone() {
+        fields.push((Column::VideoCodec, FieldValue::String(value)));
+    }
+    if let Some(value) = values.audio_codec.clone() {
+        fields.push((Column::AudioCodec, FieldValue::String(value)));
+    }
     if let Some(value) = values.data_id {
         fields.push((Column::DataId, FieldValue::Int(value)));
     }
@@ -1250,6 +1312,18 @@ fn collect_match_values_fields(values: &MatchValues) -> Vec<(Column, FieldValues
     }
     if let Some(value) = values.content_end_ms.as_ref() {
         fields.push((Column::ContentEndMs, convert_one_or_many(value, map_int)));
+    }
+    if let Some(value) = values.video_codec.as_ref() {
+        fields.push((
+            Column::VideoCodec,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
+    }
+    if let Some(value) = values.audio_codec.as_ref() {
+        fields.push((
+            Column::AudioCodec,
+            convert_one_or_many(value, |v| FieldValue::String(v.clone())),
+        ));
     }
     if let Some(value) = values.data_id.as_ref() {
         fields.push((Column::DataId, convert_one_or_many(value, map_int)));

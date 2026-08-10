@@ -1632,6 +1632,7 @@ config.impl_class = "echo_test"
             open: Default::default(),
             search: Default::default(),
             jobs: Default::default(),
+            transcode: Default::default(),
             rulesets: Default::default(),
             policies: Vec::new(),
             inference_local: InferenceLocalConfig {

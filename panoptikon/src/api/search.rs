@@ -231,6 +231,26 @@ pub(crate) struct SearchResult {
     /// the stored boundaries even though every served value is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     content_end_ms: Option<i64>,
+    /// Video Codec
+    ///
+    /// The video stream's codec name as ffprobe reports it (`h264`, `hevc`,
+    /// `av1`, ...), with two in-band sentinels: `none` means the container was
+    /// probed and has no video stream, `unknown` means a video stream exists
+    /// but ffprobe named no codec. Absent when the item has not been probed
+    /// yet or the column was not selected.
+    ///
+    /// Unlike the outro fields this is never withheld: a codec name is an
+    /// objective property of the file, like `duration` or `width`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video_codec: Option<String>,
+    /// Audio Codec
+    ///
+    /// The *first* audio stream's codec name (`aac`, `opus`, `ac3`, ...), or
+    /// `unknown` when a stream exists that ffprobe named no codec for. Absent
+    /// for a file with no audio stream as well as for one not yet probed —
+    /// the column does not distinguish them. Never withheld, as above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_codec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1786,6 +1806,8 @@ fn map_search_result(
     result.blurhash = read_optional(row, &columns, "blurhash")?;
     result.outro_kind = read_optional(row, &columns, "outro_kind")?;
     result.content_end_ms = read_optional(row, &columns, "content_end_ms")?;
+    result.video_codec = read_optional(row, &columns, "video_codec")?;
+    result.audio_codec = read_optional(row, &columns, "audio_codec")?;
     result.data_id = read_optional(row, &columns, "data_id")?;
     result.language = read_optional(row, &columns, "language")?;
     result.language_confidence = read_optional(row, &columns, "language_confidence")?;
@@ -1884,6 +1906,8 @@ fn is_known_column(name: &str) -> bool {
             | "blurhash"
             | "outro_kind"
             | "content_end_ms"
+            | "video_codec"
+            | "audio_codec"
             | "data_id"
             | "language"
             | "language_confidence"
@@ -3409,6 +3433,160 @@ mod tests {
         let unexamined = by_sha("sha_new");
         assert_eq!(unexamined.outro_kind, None);
         assert_eq!(unexamined.content_end_ms, None);
+    }
+
+    /// Both codec columns travel the whole select → SQL → row-reader path,
+    /// sentinels and all, and a `match` filter on either one reaches the right
+    /// SQLite column. There is no serving gate to pin here — that absence is
+    /// the point, and it is what the trailing assertion on a `detect_outros`
+    /// off database checks.
+    #[tokio::test]
+    async fn codec_columns_select_and_filter() {
+        use crate::pql::model::Column as PqlColumn;
+
+        let _env = crate::test_utils::test_data_dir();
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (
+                id, sha256, md5, type, video_codec, audio_codec, time_added
+            )
+            VALUES
+                (1, 'sha_hevc', 'md5_1', 'video/mp4', 'hevc', 'aac', '2024-01-01T00:00:00'),
+                (2, 'sha_h264', 'md5_2', 'video/mp4', 'h264', NULL, '2024-01-01T00:00:00'),
+                (3, 'sha_bare', 'md5_3', 'video/mp4', 'none', NULL, '2024-01-01T00:00:00'),
+                (4, 'sha_new', 'md5_4', 'video/mp4', NULL, NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\codecs").await;
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_hevc', 1, 'C:\codecs\a.mp4', 'a.mp4', '2024-01-01T00:00:00', 1, 1),
+                (11, 'sha_h264', 2, 'C:\codecs\b.mp4', 'b.mp4', '2024-01-01T00:00:00', 1, 1),
+                (12, 'sha_bare', 3, 'C:\codecs\c.mp4', 'c.mp4', '2024-01-01T00:00:00', 1, 1),
+                (13, 'sha_new', 4, 'C:\codecs\d.mp4', 'd.mp4', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let query = PqlQuery {
+            select: vec![
+                PqlColumn::Sha256,
+                PqlColumn::VideoCodec,
+                PqlColumn::AudioCodec,
+            ],
+            page_size: 0,
+            count: false,
+            check_path: false,
+            ..PqlQuery::default()
+        };
+        let built = build_query_preprocessed(query, false).expect("build");
+        let extra_columns = built.extra_columns.clone();
+        let compiled = compile_select(built).expect("compile");
+        let rows = run_compiled_query(&mut dbs.index_conn, &compiled.sql, &compiled.params)
+            .await
+            .expect("run results query");
+        let results: Vec<SearchResult> = rows
+            .iter()
+            .map(|row| map_search_result(row, &extra_columns).expect("map result"))
+            .collect();
+        let by_sha = |sha: &str| {
+            results
+                .iter()
+                .find(|result| result.sha256.as_deref() == Some(sha))
+                .unwrap_or_else(|| panic!("{sha} in results"))
+        };
+
+        let hevc = by_sha("sha_hevc");
+        assert_eq!(hevc.video_codec.as_deref(), Some("hevc"));
+        assert_eq!(hevc.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(
+            by_sha("sha_bare").video_codec.as_deref(),
+            Some("none"),
+            "the sentinel is served as stored: probed, and there is no video"
+        );
+        let unprobed = by_sha("sha_new");
+        assert_eq!(
+            unprobed.video_codec, None,
+            "never probed stays absent, which is what a client falls back on"
+        );
+        assert_eq!(unprobed.audio_codec, None);
+
+        // "Find all HEVC", the query this exists for. The audio filter proves
+        // the second column is wired to its own SQLite column and not to the
+        // first one's.
+        let mut hevc_shas = codec_query_shas(
+            &mut dbs.index_conn,
+            serde_json::json!({
+                "query": { "match": { "eq": { "video_codec": "hevc" } } }
+            }),
+        )
+        .await;
+        hevc_shas.sort();
+        assert_eq!(hevc_shas, vec!["sha_hevc".to_string()]);
+
+        let aac_shas = codec_query_shas(
+            &mut dbs.index_conn,
+            serde_json::json!({
+                "query": { "match": { "eq": { "audio_codec": "aac" } } }
+            }),
+        )
+        .await;
+        assert_eq!(aac_shas, vec!["sha_hevc".to_string()]);
+
+        // And with the outro toggle off, which withholds `outro_kind` from
+        // every row, the codec columns still arrive: they are not part of that
+        // feature.
+        crate::test_utils::write_detect_outros_config("codecs-outro-off", false);
+        let mut served = results.clone();
+        apply_outro_gate("codecs-outro-off", &mut served).await;
+        assert_eq!(
+            served
+                .iter()
+                .find(|result| result.sha256.as_deref() == Some("sha_hevc"))
+                .and_then(|result| result.video_codec.as_deref()),
+            Some("hevc")
+        );
+    }
+
+    /// [`outro_query_shas`] for the codec columns: compiles and runs `filter`
+    /// as a whole PQL query, returning the matched sha256s in result order.
+    async fn codec_query_shas(
+        conn: &mut sqlx::SqliteConnection,
+        filter: serde_json::Value,
+    ) -> Vec<String> {
+        let mut query: PqlQuery = serde_json::from_value(filter).expect("pql query");
+        query.select = vec![
+            crate::pql::model::Column::Sha256,
+            crate::pql::model::Column::VideoCodec,
+            crate::pql::model::Column::AudioCodec,
+        ];
+        query.page_size = 0;
+        query.count = false;
+        query.check_path = false;
+        let built = build_query_preprocessed(query, false).expect("build");
+        let extra_columns = built.extra_columns.clone();
+        let compiled = compile_select(built).expect("compile");
+        let rows = run_compiled_query(conn, &compiled.sql, &compiled.params)
+            .await
+            .expect("run results query");
+        rows.iter()
+            .map(|row| {
+                map_search_result(row, &extra_columns)
+                    .expect("map result")
+                    .sha256
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// Compiles and runs `filter` as a whole PQL query, returning the matched
