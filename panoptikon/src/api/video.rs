@@ -244,7 +244,9 @@ pub(crate) struct TranscodeCacheClearParams {
         (status = 404, description = "No such item, no readable file for it, or no detected outro"),
         (status = 422, description = "Unknown preset, an unusable trim window (bounds that name a \
             freeze frame rather than a clip, a start bound past the end of the item, or a \
-            start bound at or past the resolved outro cut), or an unknown/conflicting `cut`")
+            start bound at or past the resolved outro cut), an unknown/conflicting `cut`, or an \
+            animated-image preset asked for more than `max_animated_image_seconds` of output \
+            (including an unbounded one on an item with no recorded duration)")
     )
 )]
 pub async fn video_transcode(
@@ -299,6 +301,17 @@ pub async fn video_transcode(
     {
         return Err(unprocessable("start_cs is past the end of the item"));
     }
+
+    // The animated-image cap, enforced *here* as well as in the encoder: the
+    // client hides the row it would refuse (`ui/lib/videoClip.ts` `clipRows`),
+    // and this is the half of that rule that does not depend on the client.
+    validate_animated_duration(
+        preset.container,
+        body.start_cs,
+        end_cs,
+        source.item.duration,
+        crate::config::runtime().transcode.max_animated_image_seconds,
+    )?;
 
     let params = resolve_params(source.item.sha256.clone(), preset, body.start_cs, end_cs).await?;
     let outcome = pool::submit(SubmitRequest {
@@ -814,6 +827,67 @@ fn validate_bounds(start_cs: Option<i64>, end_cs: Option<i64>) -> ApiResult<()> 
     Ok(())
 }
 
+/// How long the encode this request describes would run for, in seconds, or
+/// `None` when that is not knowable here.
+///
+/// Both bounds present is exact arithmetic. Without an end bound the answer is
+/// the item's own duration less the start bound — an *upper* bound rather than
+/// a measurement (`items.duration` is ffprobe's container duration, and the
+/// encoder may stop a little short), which is the right direction for a cap.
+/// An item with no recorded duration and no end bound is unknowable: `None`.
+fn expected_output_seconds(
+    start_cs: Option<i64>,
+    end_cs: Option<i64>,
+    duration: Option<f64>,
+) -> Option<f64> {
+    let start_s = start_cs.unwrap_or(0) as f64 / 100.0;
+    if let Some(end_cs) = end_cs {
+        return Some((end_cs as f64 / 100.0 - start_s).max(0.0));
+    }
+    duration.map(|duration| (duration - start_s).max(0.0))
+}
+
+/// The `max_animated_image_seconds` cap, applied to a *single-file* job.
+///
+/// Only the animated-image containers are capped. A long mp4 or webm is a
+/// legitimate thing to ask for — playback of a whole film is the surface's
+/// ordinary case — whereas an animated WebP is an all-frames-in-one-file
+/// format whose size grows without the bounds a video codec puts on it, which
+/// is exactly what the config value exists to bound.
+///
+/// This is the server half of a rule the client also enforces by *hiding* the
+/// row (`ui/lib/videoClip.ts`): the pair is deliberate, since neither half can
+/// be trusted alone — a hidden row is not a limit, and a 422 the user only
+/// meets after pressing a visible row is not a UI.
+fn validate_animated_duration(
+    container: Container,
+    start_cs: Option<i64>,
+    end_cs: Option<i64>,
+    duration: Option<f64>,
+    max_seconds: u64,
+) -> ApiResult<()> {
+    if container != Container::Webp {
+        return Ok(());
+    }
+    let Some(seconds) = expected_output_seconds(start_cs, end_cs, duration) else {
+        // Unbounded *and* unmeasurable: the only honest answers are to refuse
+        // or to start an encode whose length nobody can predict, and the second
+        // one spends the pool on a file that may never fit the cap anyway.
+        return Err(unprocessable(format!(
+            "this preset writes an animated image, which is capped at {max_seconds} s of \
+             output, and this item has no recorded duration to check against: give the \
+             request a trim end (end_cs, or cut=outro)"
+        )));
+    };
+    if seconds > max_seconds as f64 {
+        return Err(unprocessable(format!(
+            "an animated image may be at most {max_seconds} s long; this request asks for \
+             {seconds:.2} s. Trim the clip shorter, or pick a video preset"
+        )));
+    }
+    Ok(())
+}
+
 /// The item and the first of its files that can actually be read.
 ///
 /// The existence check is not decoration: handing ffmpeg a path on an
@@ -1153,6 +1227,71 @@ mod tests {
         let t = argv.iter().position(|arg| arg == "-t").expect("-t");
         assert_eq!(argv[ss + 1], "1.00");
         assert_eq!(argv[t + 1], "6.94");
+    }
+
+    /// The animated-image cap: what it measures, and what it deliberately does
+    /// **not** bound. A long mp4 is a legitimate request — it is how the player
+    /// gets a whole film — so the cap is a property of the container, not of
+    /// the trim.
+    #[test]
+    fn the_animated_image_cap_bounds_only_the_animated_containers() {
+        // The window itself, before any container is involved.
+        assert_eq!(expected_output_seconds(Some(100), Some(600), None), Some(5.0));
+        assert_eq!(expected_output_seconds(None, Some(600), Some(90.0)), Some(6.0));
+        // No end bound: the item's duration, less the start bound.
+        assert_eq!(expected_output_seconds(Some(1000), None, Some(45.0)), Some(35.0));
+        assert_eq!(expected_output_seconds(None, None, Some(45.0)), Some(45.0));
+        // ...and no way to know at all.
+        assert_eq!(expected_output_seconds(None, None, None), None);
+        assert_eq!(expected_output_seconds(Some(1000), None, None), None);
+
+        let webp = |start_cs, end_cs, duration| {
+            validate_animated_duration(Container::Webp, start_cs, end_cs, duration, 30)
+        };
+        // Under the cap, both ways of knowing the window.
+        assert!(webp(Some(100), Some(600), Some(600.0)).is_ok());
+        assert!(webp(None, None, Some(12.0)).is_ok());
+        assert!(webp(Some(1000), None, Some(35.0)).is_ok(), "25 s of output");
+        // Exactly at it is still a clip anyone may ask for.
+        assert!(webp(None, Some(3000), None).is_ok());
+
+        // Over it, with bounds — the message names both the limit and what was
+        // asked for, since the fix is to move a marker.
+        let err = webp(Some(100), Some(4000), Some(600.0)).expect_err("over the cap");
+        let detail = err.detail().to_string();
+        assert!(detail.contains("30"), "{detail}");
+        assert!(detail.contains("39.00"), "{detail}");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // Over it untrimmed, which is the case a client that offered the row
+        // anyway would send.
+        assert!(webp(None, None, Some(45.0)).is_err());
+        assert!(webp(Some(100), None, Some(45.0)).is_err());
+        // Unbounded *and* unmeasurable: refused rather than started blind, and
+        // the message says which bound would fix it.
+        let blind = webp(None, None, None).expect_err("nothing to check against");
+        let detail = blind.detail().to_string();
+        assert!(detail.contains("end_cs"), "{detail}");
+        assert!(detail.contains("30"), "{detail}");
+        assert_eq!(
+            blind.into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        // And the containers this cap says nothing about: a two-hour mp4 with
+        // no recorded duration is an ordinary playback request.
+        for container in [Container::Mp4, Container::Webm] {
+            assert!(validate_animated_duration(container, None, None, None, 30).is_ok());
+            assert!(
+                validate_animated_duration(container, None, None, Some(7200.0), 30).is_ok(),
+                "{container:?}"
+            );
+            assert!(
+                validate_animated_duration(container, Some(0), Some(720_000), None, 30).is_ok()
+            );
+        }
     }
 
     /// A job id that is not a UUID is a 404, not a 500: the id comes straight
@@ -1987,6 +2126,175 @@ transcode_presets = ["playback"]
                 StatusCode::UNPROCESSABLE_ENTITY
             );
         }
+    }
+
+    const WEBP_ITEM: &str = "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5";
+
+    /// One item with a readable file and the given recorded duration, which is
+    /// the only thing the animated-image cap reads off the index database.
+    async fn webp_fixture_db(
+        dir: &std::path::Path,
+        duration: Option<f64>,
+    ) -> (DbConnection<ReadOnlyNoUserData>, RetainedDbs) {
+        let source = dir.join("long-video.mp4");
+        std::fs::write(&source, b"not really a video").unwrap();
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        sqlx::query(
+            "INSERT INTO items (id, sha256, md5, type, duration, time_added) \
+             VALUES (1, ?, 'md5_1', 'video/mp4', ?, '2024-01-01T00:00:00')",
+        )
+        .bind(WEBP_ITEM)
+        .bind(duration)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
+            .bind("2024-01-01T00:00:00")
+            .bind(r"C:\gone")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO files \
+             (id, sha256, item_id, path, filename, last_modified, scan_id, available) \
+             VALUES (10, ?, 1, ?, 'long-video.mp4', '2024-01-02T00:00:00', 1, 1)",
+        )
+        .bind(WEBP_ITEM)
+        .bind(source.to_string_lossy().into_owned())
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        (
+            DbConnection::<ReadOnlyNoUserData>::for_tests(index_conn, "webp-cap", "test"),
+            (storage_conn, user_data_conn),
+        )
+    }
+
+    /// The animated-image cap through the handler: an over-long WebP is
+    /// refused *before* a job is created, an unbounded one on an item with no
+    /// recorded duration is refused rather than started blind, and neither
+    /// rejection reaches an mp4 of the same length.
+    #[tokio::test]
+    async fn an_over_long_animated_image_is_refused_before_a_job_is_created() {
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let cap = crate::config::runtime().transcode.max_animated_image_seconds;
+
+        async fn post(
+            settings: &Arc<Settings>,
+            fixtures: &std::path::Path,
+            duration: Option<f64>,
+            preset: &str,
+            start_cs: Option<i64>,
+            end_cs: Option<i64>,
+        ) -> ApiResult<Response<Body>> {
+            let (db, _attached) = webp_fixture_db(fixtures, duration).await;
+            video_transcode(
+                State(test_state(settings)),
+                Extension(test_context("local")),
+                db,
+                Json(TranscodeRequest {
+                    id: WEBP_ITEM.to_string(),
+                    id_type: ItemIdentifierType::Sha256,
+                    preset: preset.to_string(),
+                    start_cs,
+                    end_cs,
+                    cut: None,
+                }),
+            )
+            .await
+        }
+
+        // Untrimmed, on an item far longer than the cap.
+        let long = post(&settings, fixtures.path(), Some(600.0), "webp-anim", None, None)
+            .await
+            .expect_err("over the cap");
+        assert!(long.detail().contains(&cap.to_string()), "{}", long.detail());
+        assert_eq!(
+            long.into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        // Trimmed, but still over it: the window is what is measured, not the
+        // item.
+        let trimmed = post(
+            &settings,
+            fixtures.path(),
+            Some(600.0),
+            "webp-anim",
+            Some(1000),
+            Some(1000 + (cap as i64 + 5) * 100),
+        )
+        .await
+        .expect_err("over the cap");
+        assert_eq!(
+            trimmed.into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        // Unbounded and unmeasurable: an encode nobody could predict the
+        // length of is never started.
+        let blind = post(&settings, fixtures.path(), None, "webp-anim", None, None)
+            .await
+            .expect_err("no duration to check against");
+        assert!(blind.detail().contains("end_cs"), "{}", blind.detail());
+        assert_eq!(
+            blind.into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        // And the two requests that must still be accepted. Both are answered
+        // from a pre-filled cache so this test is about the gate rather than
+        // about ffmpeg: a WebP window under the cap, and an mp4 of the whole
+        // ten-minute item — playback of a long video is the ordinary case, and
+        // gains no new limit here.
+        let cache = pool::transcode_cache().await.unwrap();
+        let under_cap = (cap as i64).min(5) * 100;
+        for (preset_id, start_cs, end_cs, ext, mime) in [
+            ("webp-anim", Some(0), Some(under_cap), "webp", "image/webp"),
+            ("clip", None, None, "mp4", "video/mp4"),
+        ] {
+            let preset = policy_preset(&settings, &test_context("local"), preset_id).unwrap();
+            let key = TranscodeParams::resolve(WEBP_ITEM.to_string(), preset, start_cs, end_cs)
+                .cache_key();
+            let temp = cache.temp_path(ext);
+            std::fs::write(&temp, b"0123456789").unwrap();
+            cache
+                .commit(
+                    NewArtifact {
+                        key: &key,
+                        source_sha256: WEBP_ITEM,
+                        params_hash: "hash",
+                        preset: preset_id,
+                        file_name: &format!("{key}.{ext}"),
+                        mime_type: mime,
+                        transcoder_version: 1,
+                    },
+                    &temp,
+                )
+                .await
+                .unwrap();
+
+            let response = post(
+                &settings,
+                fixtures.path(),
+                Some(600.0),
+                preset_id,
+                start_cs,
+                end_cs,
+            )
+            .await
+            .expect("accepted");
+            assert_eq!(response.status(), StatusCode::OK, "{preset_id}");
+            assert_eq!(body_json(response).await["outcome"], "hit");
+        }
+        cache.clear(true).await.unwrap();
     }
 
     /// The SSE contract, on the stream itself: the first event is the current
