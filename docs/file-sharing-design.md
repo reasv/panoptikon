@@ -375,6 +375,49 @@ bearing and must not be repurposed.
   dangerous (edits lost to eviction) and misleading (wrong location).
 - A new server policy key for relay-side copy — unenforceable, theater.
 
+## Addendum (2026-08-10): transcoded artifacts — "Copy, don't download"
+
+Implemented after the video-transcoding feature landed (see
+docs/video-transcoding-design.md); extends the share verbs to the transcode
+artifact cache. Key decisions, in the order they were settled:
+
+- **Scope.** The video download menus (player split button, pin context menu)
+  gain a persistent browser-side toggle, "Copy, don't download"
+  (`ui lib/state/copyDelivery.ts`, zustand persist). With it on, every row —
+  Original file, Web version, clip/re-encode rows — delivers to the clipboard;
+  the split button's primary half flips to copy-original (literally the
+  adaptive share verb above). Gating is byte-identical to the share button:
+  `useCopyAvailability` is factored out of `useFileShare` and consumed by both.
+  The mode changes delivery, never row identity or labels.
+- **Server copy of artifacts.** `POST /api/open/clipboard/artifact?key=&name=`
+  under the same backend-open policy surface as the sibling. The artifact
+  cache stores files as `<key>.<ext>`; a pasted path must carry a human name,
+  so the endpoint materializes `share/<key>/<sanitized name>` as a hardlink
+  (copy fallback on link-less filesystems) and puts THAT path on the
+  clipboard. The name is the caller's per-request `ArtifactRef.filename`
+  (re-sanitized server-side), falling back to the `download_name` column
+  stamped at publish; share entries die with their artifact (eviction, clear,
+  reconcile all remove them). Known accepted limitation: the clipboard holds a
+  path, so an eviction between copy and paste breaks the paste — the copy
+  itself bumps the LRU, making this a cache-churn-in-seconds edge.
+- **Relay copy of artifacts.** No relay changes: the existing
+  `copy_to_clipboard` verb + browser-push upload. The cache stream-hashes the
+  finished encode at publish (non-fatal on error) into a `sha256` column;
+  `ArtifactRef` carries it plus `path` — the PREDICTED share-target path
+  (computed, not materialized), so a same-machine mapping that resolves lands
+  on the human-named hardlink and an unresolvable one degrades to
+  `bytes_required`. Both routes paste the same name.
+- **Delivery seam.** `exportClip({deliver?})`: one pipeline, one per-item busy
+  guard; the deliverer (`ui hooks/artifactShare.ts useArtifactDelivery`) never
+  throws, owns all receipts (a relay copy can silently become a download
+  mid-flight, and only the deliverer knows), and is awaited inside the guard.
+  An artifact the client cannot address (older gateway) downloads with an
+  announce toast, never silently.
+- **Known asymmetries.** The player surface's kebab "Download original" row
+  stays a download (the surface has no item identity, and it renders per pin —
+  wiring `useFileShare` there would duplicate mutations per pin); the File
+  submenu's "Copy file" row adapts by availability, not by this preference.
+
 ## Future work
 
 - Public share links; then relay-pull materialization (browser mints the

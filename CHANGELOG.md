@@ -6,6 +6,17 @@ Desktop release notes.
 
 ## [Unreleased]
 
+- **Transcoded videos and clips can be copied to the clipboard instead of
+  downloaded.** The video download menus (the player's top-right split button
+  and the pin context menu) gained a persistent "Copy, don't download" toggle,
+  shown whenever copy-as-file is available. With it on, the download button
+  copies the original, and every row — Original file, Web version, and the
+  clip/re-encode rows — delivers the finished file to the clipboard through
+  the same paths the share button already uses: the Server writes its own
+  clipboard directly when you browse from the same machine (nothing is
+  transferred — the file is already there), or an approved Panoptikon Desktop
+  receives the bytes otherwise. The pasted file carries its proper name, not
+  the cache's internal one.
 - **You can now copy an indexed file itself to the clipboard, not just its
   path.** Gallery and pinboard items gained a share button whose primary action
   is Copy when Panoptikon can reach the file and Download when it cannot; the
