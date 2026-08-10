@@ -1083,7 +1083,10 @@ mod tests {
         let mut update = unchanged_update(&current);
         update.lan = LanConfigurationUpdate {
             enabled: true,
-            port: 16437,
+            // Not 16437: the LAN-port availability probe binds the port, and
+            // `environment_bound_lan_port_keeps_its_reference` probes 16437
+            // concurrently under the parallel test runner.
+            port: 16439,
             allowed_databases: None,
             default_database: "default".into(),
         };
