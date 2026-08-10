@@ -385,8 +385,10 @@ Grid, scroll mode, against a large result set (>10k):
    `top` updates only on scroll-stop; no history entries.
 5. Refresh mid-set → same position; back/forward walk prior positions.
 6. Query change → back to top, `top` cleared (via `useResetPage`).
-7. Change `page_size` in scroll mode → zero network requests, page
-   labels/highlight rescale, position unchanged.
+7. Change `page_size` in scroll mode → zero chunk requests (the small
+   page-1 main query re-keys and refetches — the accepted cost of keeping
+   it enabled for SSR hydration), page labels/highlight rescale, position
+   unchanged.
 8. Mode switch, both directions, at rest and deep in the set → same
    highlighted page number before and after; pages→scroll shows the same
    items; scroll→pages lands on the containing page with local anchor.
