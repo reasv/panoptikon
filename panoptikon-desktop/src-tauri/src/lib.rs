@@ -2171,40 +2171,35 @@ fn spawn_file_action_command(
     }
     let substitution = shell_substitution(action);
     let shell = substitute_placeholders(&command.shell_command, path, substitution);
-    spawn_shell(&shell, substitution)
+    spawn_shell(&shell)
 }
 
+/// `Command::args` escapes for `CommandLineToArgvW`, which cmd.exe does not
+/// implement: it turns a template's `"` into `\"`, which cmd passes through to
+/// the child as a literal quote character and then splits the value on its
+/// spaces anyway — so a documented `mytool "{path}"` command breaks for any
+/// path containing a space. `raw_arg` writes the command line verbatim
+/// instead, and the extra outer pair is exactly what cmd's documented `/C`
+/// rule strips back off — measured against `cmd.exe` on Windows 11 for quoted
+/// and unquoted programs, values with spaces, and `& ^ | < > ( )`.
+///
+/// A template with no `"` of its own produced the same wire bytes under
+/// `Command::args` (it wrapped the whole line in quotes for its spaces and had
+/// nothing to escape, bar doubling a trailing backslash), so quote-free
+/// configurations parse exactly as before.
 #[cfg(windows)]
-fn spawn_shell(shell: &str, substitution: Substitution) -> anyhow::Result<std::process::Child> {
+fn spawn_shell(shell: &str) -> anyhow::Result<std::process::Child> {
     use std::os::windows::process::CommandExt as _;
 
     let mut command = host_env::command("cmd");
-    match substitution {
-        // `Command::args` escapes for `CommandLineToArgvW`, which cmd.exe does
-        // not implement: it turns our `"` into `\"`, which cmd passes through
-        // to the child as a literal quote character and then splits the value
-        // on its spaces anyway. Quoting would be inert. `raw_arg` writes the
-        // command line verbatim instead, and the extra outer pair is exactly
-        // what cmd's documented `/C` rule strips back off — measured against
-        // `cmd.exe` on Windows 11 for quoted and unquoted programs alike.
-        //
-        // Only the quoting verb takes this path: switching the location verbs
-        // to it would change how every already-configured `open_file` command
-        // line is parsed.
-        Substitution::Quoted => {
-            command.raw_arg("/C").raw_arg(format!("\"{shell}\""));
-        }
-        Substitution::Raw => {
-            command.args(["/C", shell]);
-        }
-    }
+    command.raw_arg("/C").raw_arg(format!("\"{shell}\""));
     Ok(command.spawn()?)
 }
 
 #[cfg(not(windows))]
-fn spawn_shell(shell: &str, _substitution: Substitution) -> anyhow::Result<std::process::Child> {
+fn spawn_shell(shell: &str) -> anyhow::Result<std::process::Child> {
     // `sh -c` receives the script as one argv entry, so nothing re-parses it
-    // on the way and both substitutions spawn identically.
+    // on the way.
     Ok(host_env::command("sh").args(["-c", shell]).spawn()?)
 }
 
@@ -2297,6 +2292,35 @@ mod tests {
             expanded_file_action_preview(&spec, hostile, RelayAction::OpenFile),
             format!("mytool {}", hostile.display())
         );
+    }
+
+    /// End-to-end through a real `cmd.exe`: a location verb's raw substitution
+    /// hands the template's own quoting to cmd verbatim, so a documented
+    /// `mytool "{path}"` command must survive a path containing spaces — the
+    /// `"` reaches cmd as a quote (not the `\"` that `Command::args` used to
+    /// produce), the external program receives the path as one argument, and
+    /// redirection outside the quotes stays live shell syntax.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_spawn_preserves_template_quoting_around_spacey_paths() {
+        let dir = std::env::temp_dir().join(format!("panoptikon spawn test {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("a b.txt");
+        std::fs::write(&input, "needle\r\n").unwrap();
+        let output = dir.join("out file.txt");
+
+        let shell = substitute_placeholders(
+            "findstr needle \"{path}\" > \"{out}\"",
+            &input,
+            Substitution::Raw,
+        )
+        .replace("{out}", &output.to_string_lossy());
+        let status = super::spawn_shell(&shell).unwrap().wait().unwrap();
+
+        assert!(status.success(), "{shell}");
+        let captured = std::fs::read_to_string(&output).unwrap();
+        assert!(captured.contains("needle"), "{captured}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The settings "test" for the clipboard verb must build the exact command
