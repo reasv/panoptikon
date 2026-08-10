@@ -5557,7 +5557,7 @@
           "video"
         ],
         "summary": "Create or join a transcode job",
-        "description": "Resolves the item, validates the preset and trim bounds, and either answers from the artifact cache (200, `outcome: \"hit\"`) or creates/joins a job (202). `cut` is reserved for the server-side outro cut and is rejected for now.",
+        "description": "Resolves the item, validates the preset and trim bounds, and either answers from the artifact cache (200, `outcome: \"hit\"`) or creates/joins a job (202). `cut: \"outro\"` ends the clip at the item's detected outro boundary: it excludes `end_cs`, composes with `start_cs`, and is resolved to explicit centiseconds here, so it shares its cache entry with the identical explicit trim. An item with no detected outro — including one whose index database has `detect_outros` off — is a 404.",
         "operationId": "video_transcode",
         "parameters": [
           {
@@ -5617,7 +5617,7 @@
             }
           },
           "404": {
-            "description": "No such item, or no readable file for it"
+            "description": "No such item, no readable file for it, or no detected outro"
           }
         }
       }
@@ -5668,9 +5668,14 @@
           "key",
           "mime_type",
           "size_bytes",
-          "url"
+          "url",
+          "filename"
         ],
         "properties": {
+          "filename": {
+            "type": "string",
+            "description": "The name a download should be saved under, computed server-side from\nthe request that produced the artifact (implementation plan §3 S3).\n\nIt rides here because [`Self::url`] is the `key=` form, and that form\ncannot name a download: a key knows the source hash and the settings,\nnever the file's path or whether the request was trimmed. The client\nhangs this on its `<a download>` (the §0.4 precedent — naming inputs\nbelong to the server, so clients keep no lookup tables).\n\nA *joined* job answers with the first submitter's name. The bytes are\nidentical by construction (the key covers the source hash), so the most\nthis can cost is the stem of one of several files with the same\ncontent."
+          },
           "key": {
             "type": "string",
             "description": "Cache key; also the artifact's ETag and its `?key=` query value."
@@ -11309,7 +11314,7 @@
               "string",
               "null"
             ],
-            "description": "Reserved for the server-side outro cut (`\"outro\"`), which arrives with\nclip export. Rejected until then rather than ignored: a client that\nsent it and got a full-length file would have no way to notice."
+            "description": "`\"outro\"` to end the clip at this item's detected outro boundary,\nresolved server-side. Excludes `end_cs` (the two are the same bound\nasked for two ways), composes with `start_cs`, and is a 404 when the\nitem has no detected outro or the index database has detection off.\nAny other value is rejected rather than ignored: a client that sent one\nand got a full-length file would have no way to notice."
           },
           "end_cs": {
             "type": [

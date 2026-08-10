@@ -439,6 +439,14 @@ Content-Disposition `inline` with the transcode filename (server-side:
 first file's stem + `-clip` when trimmed else `-{preset_id}` + preset ext;
 pathless → `{sha[..10]}-clip.{ext}`); the `<a download>` attribute carries
 the authoritative UTF-8 name (house convention, ImageGallery.tsx:897).
+IMPLEMENTED with one addition: because `ArtifactRef.url` is the `key=` form
+— which knows neither the source's path nor whether the request was
+trimmed — `ArtifactRef` gained a **`filename`** field carrying that same
+server-computed name, on both the cache hit and the SSE `Done` event. The
+`key=` GET keeps its hash-prefix disposition name (a key cannot know about
+trims); the resolvable GET form is unchanged. **U6 is therefore a
+pass-through**: hand `artifact.filename` to `<a download>` rather than
+re-deriving a name client-side (§0.4 precedent).
 
 **S4. Tests**: `cut=outro` resolution (guard math, NULL→404,
 `write_detect_outros_config` gate flip both ways), exclusivity 422s,
@@ -500,7 +508,10 @@ Radix `ContextMenuItem`s, `disabled={useClipBusy(sha)}`, same
 `clipRequestFor`/`exportClip` engine. Rows require resolved item + video
 mime + presets.
 
-**U6. Filename**: `transcodeFileName(path, sha, suffix, ext)` next to
+**U6. Filename**: SUPERSEDED by S3 as implemented — the server sends
+`ArtifactRef.filename`, so the client passes it through instead of deriving
+one. The original plan (kept for the rule it encodes):
+`transcodeFileName(path, sha, suffix, ext)` next to
 `downloadFileName` (lib/utils.ts:31) — stem + `-clip` (trimmed) or
 `-{presetId}` (re-encode) + preset `ext` (from the DTO, §0.4). No
 timestamp stamp: artifacts are deterministic, re-download legitimately

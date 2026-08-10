@@ -667,6 +667,40 @@ mod tests {
         assert!(!args.contains(&"-t".to_string()));
     }
 
+    /// The whole clip command line, pinned. The ordering assertions above say
+    /// what each piece must satisfy; this says what ffmpeg is actually handed,
+    /// so a reordering that still passes them — or a stray flag between the
+    /// input and the trim duration — is visible in the diff rather than in an
+    /// exported file.
+    #[test]
+    fn the_trimmed_clip_command_line_is_pinned() {
+        assert_eq!(
+            args_of(&spec_for("clip", Some(100), Some(794))),
+            [
+                "-nostdin", "-hide_banner", "-nostats", "-v", "error",
+                "-ss", "1.00",
+                "-i", "in.mp4",
+                "-t", "6.94",
+                "-progress", "pipe:1",
+                "-map", "0:v:0",
+                "-map", "0:a:0?",
+                "-sn", "-dn",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-c:a", "aac",
+                "-movflags", "+faststart",
+                "-avoid_negative_ts", "make_zero",
+                "-pix_fmt", "yuv420p",
+                "-y", "out.tmp",
+            ]
+        );
+
+        // A start bound alone: the same shape with no duration in it at all.
+        let open_ended = args_of(&spec_for("clip", Some(100), None));
+        let mut expected = args_of(&spec_for("clip", Some(100), Some(794)));
+        expected.drain(at(&expected, "-t")..at(&expected, "-t") + 2);
+        assert_eq!(open_ended, expected);
+    }
+
     /// A bound that somehow went negative is clamped, never printed: the
     /// remainder of a negative divisor would spell `-1.-23`, which ffmpeg
     /// reads as a seek to somewhere else rather than as an error.

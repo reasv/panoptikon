@@ -58,15 +58,30 @@ pub(crate) struct ArtifactRef {
     pub(crate) size_bytes: i64,
     /// Ready-to-use URL for `GET /api/video/artifact`.
     pub(crate) url: String,
+    /// The name a download should be saved under, computed server-side from
+    /// the request that produced the artifact (implementation plan §3 S3).
+    ///
+    /// It rides here because [`Self::url`] is the `key=` form, and that form
+    /// cannot name a download: a key knows the source hash and the settings,
+    /// never the file's path or whether the request was trimmed. The client
+    /// hangs this on its `<a download>` (the §0.4 precedent — naming inputs
+    /// belong to the server, so clients keep no lookup tables).
+    ///
+    /// A *joined* job answers with the first submitter's name. The bytes are
+    /// identical by construction (the key covers the source hash), so the most
+    /// this can cost is the stem of one of several files with the same
+    /// content.
+    pub(crate) filename: String,
 }
 
 impl ArtifactRef {
-    pub(crate) fn new(artifact: &CachedArtifact) -> Self {
+    pub(crate) fn new(artifact: &CachedArtifact, filename: String) -> Self {
         Self {
             key: artifact.key.clone(),
             mime_type: artifact.mime_type.clone(),
             size_bytes: artifact.size_bytes,
             url: format!("/api/video/artifact?key={}", artifact.key),
+            filename,
         }
     }
 }
@@ -381,7 +396,10 @@ async fn submit_job(
     // Bytes on disk answer outright (and count as a hit, which is what keeps
     // a warm rendition out of the eviction pass).
     if let Some(artifact) = state.cache.lookup(&key).await {
-        return SubmitOutcome::Hit(ArtifactRef::new(&artifact));
+        return SubmitOutcome::Hit(ArtifactRef::new(
+            &artifact,
+            download_file_name(&request.params, &request.source_path),
+        ));
     }
 
     // An in-flight job for the same key is joined rather than duplicated: two
@@ -586,7 +604,7 @@ async fn run_one(
     let encoded = tokio::task::spawn_blocking(move || runner(encode_spec, cancel, progress)).await;
 
     let outcome = match encoded {
-        Ok(Ok(())) => publish(&cache, &params, &temp).await,
+        Ok(Ok(())) => publish(&cache, &params, &spec.input, &temp).await,
         Ok(Err(EncodeError::Cancelled)) => JobOutcome::Failed {
             error: "cancelled".to_string(),
             cancelled: true,
@@ -636,9 +654,17 @@ async fn run_one(
     outcome
 }
 
+/// The download name for an artifact produced from `source_path`
+/// (implementation plan §3 S3), computed here so both a cache hit and a
+/// finished job's `Done` event carry the same one.
+fn download_file_name(params: &TranscodeParams, source_path: &std::path::Path) -> String {
+    params.download_file_name(super::path_stem(source_path).as_deref())
+}
+
 async fn publish(
     cache: &TranscodeCache,
     params: &TranscodeParams,
+    source_path: &std::path::Path,
     temp: &std::path::Path,
 ) -> JobOutcome {
     let key = params.cache_key();
@@ -653,7 +679,10 @@ async fn publish(
         transcoder_version: params.transcoder_version,
     };
     match cache.commit(new, temp).await {
-        Ok(artifact) => JobOutcome::Done(ArtifactRef::new(&artifact)),
+        Ok(artifact) => JobOutcome::Done(ArtifactRef::new(
+            &artifact,
+            download_file_name(params, source_path),
+        )),
         // A cache that cannot store the bytes is this machine's problem, not
         // a verdict on the file: deliberately not recorded as a failure.
         Err(err) => {
@@ -1078,10 +1107,19 @@ mod tests {
         assert_eq!(artifact.size_bytes, 8);
         assert_eq!(artifact.mime_type, "video/mp4");
         assert_eq!(artifact.url, format!("/api/video/artifact?key={}", artifact.key));
+        // The download name is computed from the request, not from the key:
+        // the `key=` URL above could never carry the source's own name.
+        assert_eq!(artifact.filename, "source-clip.mp4");
 
         let second = pool.submit(request(params("clip", None), JobWeight::Light)).await;
         match second {
-            SubmitOutcome::Hit(hit) => assert_eq!(hit.key, artifact.key),
+            SubmitOutcome::Hit(hit) => {
+                assert_eq!(hit.key, artifact.key);
+                assert_eq!(
+                    hit.filename, artifact.filename,
+                    "a cache hit names the download exactly as the job that filled it did"
+                );
+            }
             other => panic!("expected a cache hit, got {}", other.as_str()),
         }
         // The dedup map does not hold a finished job's key.

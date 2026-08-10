@@ -28,8 +28,10 @@ use uuid::Uuid;
 
 use crate::api::db_params::DbQueryParams;
 use crate::api::http_file::{FILE_IO_TIMEOUT, FileServeSpec, open_file_with_timeout, serve_file};
+use crate::api::utils::serve_outro_metadata;
 use crate::api_error::ApiError;
 use crate::config::{PolicyConfig, Settings};
+use crate::db::files::get_item_content_end_ms;
 use crate::db::items::{FileRecord, ItemIdentifierType, ItemRecord, get_item_metadata_unchecked};
 use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::media_tools::transcode::cache::{CacheStats, ResizeError};
@@ -39,7 +41,7 @@ use crate::media_tools::transcode::pool::{
 use crate::media_tools::transcode::presets::{
     Channel, Container, ResolvedPreset, Surface, find_preset, resolve_presets,
 };
-use crate::media_tools::transcode::TranscodeParams;
+use crate::media_tools::transcode::{TranscodeParams, transcode_file_name};
 use crate::policy::PolicyContext;
 use crate::proxy::ProxyState;
 
@@ -65,6 +67,29 @@ const SSE_KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// `[policies.client]` key restricting which presets a policy exposes.
 const CLIENT_PRESETS_KEY: &str = "transcode_presets";
 
+/// The only value `cut` accepts: the server-side outro cut.
+const CUT_OUTRO: &str = "outro";
+
+/// Lead subtracted from a detected outro boundary before it becomes an export
+/// cut, mirroring `ui/lib/videoTrim.ts` `OUTRO_GUARD_MS`. The detected content
+/// end leads the first card frame by up to 60 ms of audio bang (outro
+/// detection design §2.3/§10), and that bang belongs to the card, not to the
+/// content: an exported file must not open — or close — on it any more than
+/// playback must. Same number on both sides deliberately, so a clip exported
+/// with `cut=outro` ends exactly where the player's outro skip ended.
+const OUTRO_EXPORT_GUARD_MS: i64 = 60;
+
+/// Milliseconds per centisecond, the resolution every trim bound is carried
+/// in (the `vt` trim codec's lattice).
+const MS_PER_CS: i64 = 10;
+
+/// Shortest trim window that is still a *clip*, in centiseconds. Mirrors
+/// `ui/lib/videoTrim.ts` `FREEZE_EPS = 0.02` s, the same predicate the player
+/// uses to decide a trim is a freeze frame rather than a playing range: a
+/// window at or below it renders one frame and stops, so encoding it as a
+/// video is never what was meant.
+const FREEZE_GUARD_CS: i64 = 2;
+
 // --- request/response shapes ----------------------------------------------
 
 #[derive(Deserialize, ToSchema)]
@@ -80,9 +105,12 @@ pub(crate) struct TranscodeRequest {
     /// Trim end, in centiseconds from the start of the file.
     #[serde(default)]
     pub end_cs: Option<i64>,
-    /// Reserved for the server-side outro cut (`"outro"`), which arrives with
-    /// clip export. Rejected until then rather than ignored: a client that
-    /// sent it and got a full-length file would have no way to notice.
+    /// `"outro"` to end the clip at this item's detected outro boundary,
+    /// resolved server-side. Excludes `end_cs` (the two are the same bound
+    /// asked for two ways), composes with `start_cs`, and is a 404 when the
+    /// item has no detected outro or the index database has detection off.
+    /// Any other value is rejected rather than ignored: a client that sent one
+    /// and got a full-length file would have no way to notice.
     #[serde(default)]
     pub cut: Option<String>,
 }
@@ -195,13 +223,16 @@ pub(crate) struct TranscodeCacheClearParams {
     summary = "Create or join a transcode job",
     description = "Resolves the item, validates the preset and trim bounds, and either answers \
         from the artifact cache (200, `outcome: \"hit\"`) or creates/joins a job (202). \
-        `cut` is reserved for the server-side outro cut and is rejected for now.",
+        `cut: \"outro\"` ends the clip at the item's detected outro boundary: it excludes \
+        `end_cs`, composes with `start_cs`, and is resolved to explicit centiseconds here, so \
+        it shares its cache entry with the identical explicit trim. An item with no detected \
+        outro — including one whose index database has `detect_outros` off — is a 404.",
     params(DbQueryParams),
     request_body = TranscodeRequest,
     responses(
         (status = 200, description = "The rendition was already cached", body = TranscodeSubmitResponse),
         (status = 202, description = "A job was created or joined", body = TranscodeSubmitResponse),
-        (status = 404, description = "No such item, or no readable file for it")
+        (status = 404, description = "No such item, no readable file for it, or no detected outro")
     )
 )]
 pub async fn video_transcode(
@@ -210,15 +241,26 @@ pub async fn video_transcode(
     mut db: DbConnection<ReadOnlyNoUserData>,
     Json(body): Json<TranscodeRequest>,
 ) -> ApiResult<Response<Body>> {
-    if body.cut.is_some() {
-        return Err(ApiError::bad_request(
-            "`cut` is not supported yet; send explicit start_cs/end_cs bounds",
-        ));
-    }
+    let cut = parse_cut(body.cut.as_deref(), body.end_cs)?;
     let preset = policy_preset(&state.settings, &context, &body.preset)?;
     validate_bounds(body.start_cs, body.end_cs)?;
 
     let source = resolve_source(&mut db, &body.id, body.id_type).await?;
+    // The outro cut is resolved *here*, never carried inward: the job and
+    // cache layers only ever see explicit centiseconds, so a clip cut at the
+    // outro and the same clip asked for by hand are one artifact, and a
+    // re-detection mints a new key instead of quietly re-serving the old cut.
+    let end_cs = match cut {
+        Some(Cut::Outro) => {
+            let end_cs = resolve_outro_end_cs(&mut db, &source.item.sha256).await?;
+            // Validated exactly like a bound that arrived explicitly: an outro
+            // that lands at (or before) the start bound is a freeze frame, not
+            // a clip, whichever side computed it.
+            validate_bounds(body.start_cs, Some(end_cs))?;
+            Some(end_cs)
+        }
+        None => body.end_cs,
+    };
     drop(db);
     if let Some(start_cs) = body.start_cs
         && let Some(duration) = source.item.duration
@@ -227,13 +269,7 @@ pub async fn video_transcode(
         return Err(unprocessable("start_cs is past the end of the item"));
     }
 
-    let params = resolve_params(
-        source.item.sha256.clone(),
-        preset,
-        body.start_cs,
-        body.end_cs,
-    )
-    .await?;
+    let params = resolve_params(source.item.sha256.clone(), preset, body.start_cs, end_cs).await?;
     let outcome = pool::submit(SubmitRequest {
         params,
         source_path: source.file.path.clone().into(),
@@ -297,6 +333,12 @@ pub async fn video_artifact(
     request_headers: HeaderMap,
 ) -> ApiResult<Response<Body>> {
     let target = match query.key.clone() {
+        // A key names bytes, not a request: it carries neither the source's
+        // path nor whether the request that produced it was trimmed, so this
+        // form's `Content-Disposition` can only ever offer the hash-prefix
+        // name. That is a known limitation, not an oversight — the download
+        // name a client should use rides on `ArtifactRef::filename`, computed
+        // where the request is still known.
         Some(key) => ArtifactTarget {
             key,
             stem: None,
@@ -630,14 +672,84 @@ fn parse_job_id(value: &str) -> ApiResult<Uuid> {
     Uuid::parse_str(value).map_err(|_| ApiError::not_found("No such transcode job"))
 }
 
+/// What the request's `cut` asked for. One variant today; it is an enum so the
+/// resolution below is matched rather than string-compared at the point of
+/// use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    Outro,
+}
+
+/// The `cut` field, validated against the bound it replaces.
+///
+/// Deliberately parsed by hand rather than through a serde enum: an unknown
+/// value must fail as a *validated* 422 with a message naming what is
+/// accepted, not as a deserialization rejection of the whole body.
+fn parse_cut(cut: Option<&str>, end_cs: Option<i64>) -> ApiResult<Option<Cut>> {
+    let Some(cut) = cut else {
+        return Ok(None);
+    };
+    if cut != CUT_OUTRO {
+        return Err(unprocessable(format!(
+            "unknown cut '{cut}'; the only supported value is \"{CUT_OUTRO}\""
+        )));
+    }
+    if end_cs.is_some() {
+        // Both name the end of the clip, so honouring one would silently
+        // discard the other.
+        return Err(unprocessable(
+            "cut and end_cs are exclusive; cut=outro composes with start_cs only",
+        ));
+    }
+    Ok(Some(Cut::Outro))
+}
+
+/// The clip end this item's detected outro implies, in centiseconds.
+///
+/// Both "no outro" answers are the *same* 404 on purpose (§0.9): the
+/// `detect_outros` toggle means the whole outro feature is off for that
+/// database, and a client must not be able to tell a database with the switch
+/// off from an item that simply has no card — the same reason the item
+/// metadata is nulled rather than flagged.
+async fn resolve_outro_end_cs(
+    db: &mut DbConnection<ReadOnlyNoUserData>,
+    sha256: &str,
+) -> ApiResult<i64> {
+    let no_outro = || ApiError::not_found("No detected outro for this item");
+    let Some(content_end_ms) = get_item_content_end_ms(&mut db.conn, sha256).await? else {
+        return Err(no_outro());
+    };
+    if !serve_outro_metadata(&db.index_db, true).await {
+        return Err(no_outro());
+    }
+    Ok(outro_cut_cs(content_end_ms))
+}
+
+/// A detected content end (ms) as an export cut (cs): the audio-bang guard,
+/// then a *floor* to the centisecond lattice every trim bound lives on.
+///
+/// Floor, not the round `ui/lib/videoTrim.ts` applies to the same arithmetic:
+/// rounding can move the cut up to 5 ms later, and later is *into* the card —
+/// the one direction the guard exists to avoid. The half-centisecond it can
+/// cost is invisible; a frame of end card is not.
+fn outro_cut_cs(content_end_ms: i64) -> i64 {
+    (content_end_ms - OUTRO_EXPORT_GUARD_MS).div_euclid(MS_PER_CS)
+}
+
 fn validate_bounds(start_cs: Option<i64>, end_cs: Option<i64>) -> ApiResult<()> {
     if start_cs.is_some_and(|start| start < 0) || end_cs.is_some_and(|end| end < 0) {
         return Err(unprocessable("trim bounds must not be negative"));
     }
-    if let (Some(start), Some(end)) = (start_cs, end_cs)
-        && end <= start
+    // The floor is the freeze-frame band, not equality: a window of one or two
+    // centiseconds is a still that happens to be spelled as a range, and
+    // encoding it as a video produces a file nobody asked for.
+    if let Some(end) = end_cs
+        && end <= start_cs.unwrap_or(0) + FREEZE_GUARD_CS
     {
-        return Err(unprocessable("end_cs must be greater than start_cs"));
+        return Err(unprocessable(
+            "the trim window is a freeze frame, not a clip: end_cs must be more than \
+             0.02 s past the start bound. Save a still from the pinboard instead",
+        ));
     }
     Ok(())
 }
@@ -783,29 +895,6 @@ fn source_sha_of(key: &str) -> &str {
     key.split('-').next().unwrap_or(key)
 }
 
-/// The name a download gets (design §8 / implementation plan §3 S3): the
-/// source's stem plus `-clip` for a trimmed cut or `-<preset>` for a plain
-/// re-encode. A request that carried no path (the `key=` form) falls back to
-/// a hash prefix, which is still stable and still identifies the source.
-fn transcode_file_name(
-    stem: Option<&str>,
-    sha256: &str,
-    trimmed: bool,
-    preset_id: &str,
-    ext: &str,
-) -> String {
-    let suffix = if trimmed {
-        "-clip".to_string()
-    } else {
-        format!("-{preset_id}")
-    };
-    let base = match stem {
-        Some(stem) => stem.to_string(),
-        None => sha256.chars().take(10).collect(),
-    };
-    format!("{base}{suffix}.{ext}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,46 +938,135 @@ mod tests {
     }
 
     /// Trim bound validation, including the degenerate cases a client can
-    /// reach by dragging both markers together.
+    /// reach by dragging both markers together — and the freeze band just
+    /// above them, which is a still rather than a clip.
     #[test]
     fn trim_bounds_are_validated() {
         assert!(validate_bounds(None, None).is_ok());
-        assert!(validate_bounds(Some(0), Some(1)).is_ok());
         assert!(validate_bounds(Some(500), None).is_ok());
         assert!(validate_bounds(None, Some(500)).is_ok());
+        assert!(validate_bounds(Some(0), Some(3)).is_ok());
+        assert!(validate_bounds(Some(500), Some(503)).is_ok());
         for (start, end) in [
             (Some(-1), None),
             (None, Some(-1)),
             (Some(500), Some(500)),
             (Some(500), Some(499)),
+            // The freeze band: `end - start <= FREEZE_EPS`, the player's own
+            // predicate for a trim that shows one frame and stops.
+            (Some(0), Some(1)),
+            (Some(0), Some(2)),
+            (Some(500), Some(502)),
+            // An end bound alone is measured from zero, so the same band
+            // applies with no start bound at all.
+            (None, Some(2)),
         ] {
             let err = validate_bounds(start, end).expect_err("rejected");
             assert_eq!(
                 err.into_response().status(),
-                StatusCode::UNPROCESSABLE_ENTITY
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{start:?}..{end:?}"
+            );
+        }
+        assert!(validate_bounds(None, Some(3)).is_ok());
+    }
+
+    /// The `key=` form's fallback name is built from the key's first half.
+    #[test]
+    fn the_key_carries_its_source_hash() {
+        assert_eq!(source_sha_of("deadbeef-0011"), "deadbeef");
+        assert_eq!(source_sha_of("nodash"), "nodash");
+    }
+
+    /// `cut` accepts exactly one value, and never alongside the bound it
+    /// replaces: honouring one of two spellings of the clip's end would
+    /// silently discard the other.
+    #[test]
+    fn cut_accepts_only_the_outro_and_never_with_an_end_bound() {
+        assert_eq!(parse_cut(None, None).unwrap(), None);
+        assert_eq!(parse_cut(None, Some(500)).unwrap(), None);
+        assert_eq!(parse_cut(Some("outro"), None).unwrap(), Some(Cut::Outro));
+        // Composition with a start bound is the point: the cut names the end.
+        assert_eq!(parse_cut(Some("outro"), None).unwrap(), Some(Cut::Outro));
+        for (cut, end_cs) in [
+            (Some("intro"), None),
+            (Some("Outro"), None),
+            (Some(""), None),
+            (Some("outro"), Some(500)),
+        ] {
+            let err = parse_cut(cut, end_cs).expect_err("rejected");
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{cut:?} + {end_cs:?}"
             );
         }
     }
 
-    /// The download name: a trimmed artifact is a clip, an untrimmed one is
-    /// named after its preset, and a request that carried no path falls back
-    /// to the source hash prefix.
+    /// The guard-and-floor arithmetic, which is what makes an exported clip
+    /// end where playback's outro skip ended.
     #[test]
-    fn transcode_file_names_follow_the_request() {
-        assert_eq!(
-            transcode_file_name(Some("holiday"), "abc", true, "clip", "mp4"),
-            "holiday-clip.mp4"
-        );
-        assert_eq!(
-            transcode_file_name(Some("holiday"), "abc", false, "clip-fast", "mp4"),
-            "holiday-clip-fast.mp4"
-        );
-        assert_eq!(
-            transcode_file_name(None, "0123456789abcdef", false, "webp-anim", "webp"),
-            "0123456789-webp-anim.webp"
-        );
-        assert_eq!(source_sha_of("deadbeef-0011"), "deadbeef");
-        assert_eq!(source_sha_of("nodash"), "nodash");
+    fn the_outro_cut_guards_then_floors_to_centiseconds() {
+        assert_eq!(OUTRO_EXPORT_GUARD_MS, 60, "ui/lib/videoTrim.ts OUTRO_GUARD_MS");
+        // 8.000 s of content, minus the 60 ms audio-bang lead.
+        assert_eq!(outro_cut_cs(8000), 794);
+        // Floored, never rounded: 7.945 s must not become 7.95 s, which is
+        // 5 ms *into* the card the guard exists to stay out of.
+        assert_eq!(outro_cut_cs(8005), 794);
+        assert_eq!(outro_cut_cs(8009), 794);
+        assert_eq!(outro_cut_cs(8010), 795);
+        // A boundary inside the guard floors below zero rather than wrapping
+        // towards it; the bound validation is what rejects it.
+        assert_eq!(outro_cut_cs(60), 0);
+        assert!(outro_cut_cs(50) < 0);
+        assert!(validate_bounds(None, Some(outro_cut_cs(50))).is_err());
+    }
+
+    /// The whole point of resolving `cut=outro` at the API edge: the job and
+    /// cache layers below see nothing but centiseconds, so the outro clip and
+    /// the identical hand-trimmed one are **one** artifact — and produce one
+    /// identical ffmpeg command line.
+    #[test]
+    fn an_outro_cut_is_indistinguishable_from_the_same_explicit_trim() {
+        use crate::media_tools::transcode::run::{
+            ENCODER_X264_QUALITY, EncodeJobSpec, build_args,
+        };
+
+        let presets = builtin_presets();
+        let preset = find_preset(&presets, "clip").expect("the clip preset ships");
+        let params = |start_cs, end_cs| {
+            TranscodeParams::new(
+                "a".repeat(64),
+                preset.clone(),
+                ENCODER_X264_QUALITY.to_string(),
+                start_cs,
+                end_cs,
+            )
+        };
+        let resolved = params(Some(100), Some(outro_cut_cs(8005)));
+        let explicit = params(Some(100), Some(794));
+        assert_eq!(resolved.cache_key(), explicit.cache_key());
+        assert_ne!(resolved.cache_key(), params(Some(100), None).cache_key());
+        assert_ne!(resolved.cache_key(), params(None, None).cache_key());
+
+        let args = |params| {
+            build_args(&EncodeJobSpec {
+                input: std::path::PathBuf::from("in.mp4"),
+                output: std::path::PathBuf::from("out.tmp"),
+                params,
+                source_duration_s: Some(10.0),
+            })
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+        };
+        let argv = args(resolved);
+        assert_eq!(argv, args(explicit));
+        // The window itself: one second in, ending at the guarded outro.
+        let ss = argv.iter().position(|arg| arg == "-ss").expect("-ss");
+        let t = argv.iter().position(|arg| arg == "-t").expect("-t");
+        assert_eq!(argv[ss + 1], "1.00");
+        assert_eq!(argv[t + 1], "6.94");
     }
 
     /// A job id that is not a UUID is a 404, not a 500: the id comes straight
@@ -1354,6 +1532,123 @@ transcode_presets = ["playback"]
             "inline; filename=\"holiday-clip.mp4\""
         );
         cache.clear(true).await.unwrap();
+    }
+
+    /// `cut=outro` end to end against the index database: the guard-and-floor
+    /// arithmetic, the two ways an item can have no outro, and the
+    /// `detect_outros` toggle — which withholds the cut exactly as it
+    /// withholds the metadata, with the *same* 404, so no client can tell a
+    /// database with the switch off from an item with no card.
+    #[tokio::test]
+    async fn the_outro_cut_resolves_against_the_index_and_the_detect_outros_gate() {
+        let _env = crate::test_utils::test_data_dir();
+        const WITH_OUTRO: &str = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
+        const NO_OUTRO: &str = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
+        const INDEX_DB: &str = "video-outro-cut";
+
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        for (id, sha, content_end_ms) in [(1, WITH_OUTRO, Some(8005_i64)), (2, NO_OUTRO, None)] {
+            sqlx::query(
+                "INSERT INTO items (id, sha256, md5, type, duration, time_added, content_end_ms) \
+                 VALUES (?, ?, ?, 'video/mp4', 12.0, '2024-01-01T00:00:00', ?)",
+            )
+            .bind(id)
+            .bind(sha)
+            .bind(format!("md5_{id}"))
+            .bind(content_end_ms)
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        }
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        // Held so the shared-cache in-memory databases outlive the call.
+        let _attached = (storage_conn, user_data_conn);
+        let mut db = DbConnection::<ReadOnlyNoUserData>::for_tests(index_conn, INDEX_DB, "test");
+
+        crate::test_utils::write_detect_outros_config(INDEX_DB, true);
+        assert_eq!(
+            resolve_outro_end_cs(&mut db, WITH_OUTRO).await.unwrap(),
+            794,
+            "8.005 s of content, less the 60 ms guard, floored to centiseconds"
+        );
+
+        // The three "no outro" answers, which must be one answer.
+        let mut missing = Vec::new();
+        for sha in [NO_OUTRO, &"e3".repeat(32)] {
+            missing.push(resolve_outro_end_cs(&mut db, sha).await.expect_err("404"));
+        }
+        crate::test_utils::write_detect_outros_config(INDEX_DB, false);
+        missing.push(
+            resolve_outro_end_cs(&mut db, WITH_OUTRO)
+                .await
+                .expect_err("the gate closes over a detected outro too"),
+        );
+        let answers: Vec<(String, StatusCode)> = missing
+            .into_iter()
+            .map(|err| {
+                let detail = err.detail().to_string();
+                (detail, err.into_response().status())
+            })
+            .collect();
+        assert!(answers[0].0.contains("No detected outro"), "{answers:?}");
+        for answer in &answers {
+            assert_eq!(answer.1, StatusCode::NOT_FOUND);
+            assert_eq!(
+                answer.0, answers[0].0,
+                "a closed gate is indistinguishable from an item with no card"
+            );
+        }
+
+        // And back: the gate is read from the file's stamp, so re-enabling it
+        // takes effect on the very next request.
+        crate::test_utils::write_detect_outros_config(INDEX_DB, true);
+        assert_eq!(resolve_outro_end_cs(&mut db, WITH_OUTRO).await.unwrap(), 794);
+    }
+
+    /// The request-level rejections, which all land before the item is
+    /// resolved — the connection below would fail any query it was handed.
+    #[tokio::test]
+    async fn a_malformed_clip_request_never_reaches_the_item() {
+        let settings = test_settings();
+        let request = |start_cs, end_cs, cut: Option<&str>| TranscodeRequest {
+            id: "a".repeat(64),
+            id_type: ItemIdentifierType::Sha256,
+            preset: "clip".to_string(),
+            start_cs,
+            end_cs,
+            cut: cut.map(str::to_string),
+        };
+        let cases = [
+            // `cut` and `end_cs` are the same bound asked for twice.
+            request(Some(100), Some(500), Some("outro")),
+            // The only accepted value is "outro".
+            request(None, None, Some("intro")),
+            // A freeze frame is a still, not a clip.
+            request(Some(500), Some(501), None),
+            // An unknown preset is a rejection, not a default.
+            TranscodeRequest {
+                preset: "nonexistent".to_string(),
+                ..request(None, None, None)
+            },
+        ];
+        for body in cases {
+            let err = video_transcode(
+                State(test_state(&settings)),
+                Extension(test_context("local")),
+                unused_db().await,
+                Json(body),
+            )
+            .await
+            .expect_err("rejected before the item is looked up");
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
     }
 
     /// The SSE contract, on the stream itself: the first event is the current

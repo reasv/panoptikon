@@ -26,6 +26,11 @@ pub(crate) const TRANSCODER_VERSION: i64 = 1;
 /// SHA-256, which is collision-free at any cache size that fits on a disk.
 const PARAMS_HASH_HEX_LEN: usize = 32;
 
+/// Hex characters of the source hash used to name a download that has no path
+/// behind it. Enough to identify the source at a glance; the artifact's real
+/// identity is the key, not its file name.
+const SHA_NAME_PREFIX_LEN: usize = 10;
+
 /// Everything that decides the bytes of an artifact.
 ///
 /// The serialization *is* the cache key input, so this type is a contract, not
@@ -112,6 +117,53 @@ impl TranscodeParams {
     pub(crate) fn mime_type(&self) -> &'static str {
         self.preset.container.mime_type()
     }
+
+    /// The name a *download* of this artifact should carry, given the source's
+    /// file stem. Everything else the name is built from — the trim, the
+    /// preset, the container's extension, the hash to fall back on — is part
+    /// of the identity already.
+    pub(crate) fn download_file_name(&self, stem: Option<&str>) -> String {
+        transcode_file_name(
+            stem,
+            &self.source_sha256,
+            self.start_cs.is_some() || self.end_cs.is_some(),
+            &self.preset.id,
+            self.preset.container.ext(),
+        )
+    }
+}
+
+/// The name a download gets (design §8 / implementation plan §3 S3): the
+/// source's stem plus `-clip` for a trimmed cut or `-<preset>` for a plain
+/// re-encode. A request that carried no path (the `key=` form of the artifact
+/// route) falls back to a hash prefix, which is still stable and still
+/// identifies the source.
+pub(crate) fn transcode_file_name(
+    stem: Option<&str>,
+    sha256: &str,
+    trimmed: bool,
+    preset_id: &str,
+    ext: &str,
+) -> String {
+    let suffix = if trimmed {
+        "-clip".to_string()
+    } else {
+        format!("-{preset_id}")
+    };
+    let base = match stem {
+        Some(stem) => stem.to_string(),
+        None => sha256.chars().take(SHA_NAME_PREFIX_LEN).collect(),
+    };
+    format!("{base}{suffix}.{ext}")
+}
+
+/// The source file's stem, for [`transcode_file_name`]. `None` for a path
+/// with no usable name — the caller then names the download after the hash.
+pub(crate) fn path_stem(path: &std::path::Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_string)
+        .filter(|stem| !stem.is_empty())
 }
 
 #[cfg(test)]
@@ -185,6 +237,58 @@ mod tests {
         // Identical bounds are the same artifact, whatever produced them (the
         // outro cut resolves to explicit centiseconds for exactly this).
         assert_eq!(bounded, clip_params(Some(0), Some(500)).cache_key());
+    }
+
+    /// The download name: a trimmed artifact is a clip whatever preset made
+    /// it, an untrimmed one is named after its preset, and a request with no
+    /// usable path behind it falls back to the source hash prefix.
+    #[test]
+    fn download_names_follow_the_request() {
+        assert_eq!(
+            transcode_file_name(Some("holiday"), "abc", true, "clip", "mp4"),
+            "holiday-clip.mp4"
+        );
+        assert_eq!(
+            transcode_file_name(Some("holiday"), "abc", false, "clip-fast", "mp4"),
+            "holiday-clip-fast.mp4"
+        );
+        assert_eq!(
+            transcode_file_name(None, "0123456789abcdef", false, "webp-anim", "webp"),
+            "0123456789-webp-anim.webp"
+        );
+
+        // Through the params, which is how every caller reaches it: either
+        // bound alone is already a clip, and the preset names the rest.
+        let sha = "a".repeat(64);
+        let playback = |start_cs, end_cs| {
+            let presets = builtin_presets();
+            let preset = find_preset(&presets, "playback").expect("ships").clone();
+            TranscodeParams::new(
+                sha.clone(),
+                preset,
+                ENCODER_X264_FAST.to_string(),
+                start_cs,
+                end_cs,
+            )
+        };
+        assert_eq!(
+            playback(None, None).download_file_name(Some("holiday")),
+            "holiday-playback.mp4"
+        );
+        assert_eq!(
+            playback(Some(100), None).download_file_name(Some("holiday")),
+            "holiday-clip.mp4"
+        );
+        assert_eq!(
+            playback(None, Some(400)).download_file_name(None),
+            format!("{}-clip.mp4", &sha[..10])
+        );
+
+        assert_eq!(
+            path_stem(std::path::Path::new(r"C:\videos\holiday.mp4")).as_deref(),
+            Some("holiday")
+        );
+        assert_eq!(path_stem(std::path::Path::new("")), None);
     }
 
     /// The key covers the *resolved* preset, not its id: patching a profile
