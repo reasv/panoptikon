@@ -5502,7 +5502,7 @@
             "description": "An item is not in this database, or has no readable file"
           },
           "422": {
-            "description": "Unknown preset, or a document the composition limits refuse: too many items, a canvas that is odd/too large/taller than the preset renders, a destination rectangle outside the canvas or on an odd pixel, a span whose end is not after its start, an unusable frame rate or length cap, or loop buffers over `max_mosaic_loop_mb` (the message carries the estimate)"
+            "description": "Unknown preset, or a document the composition limits refuse: too many items, a canvas that is odd/too large/taller than the preset renders, a destination rectangle outside the canvas or at an odd position, a span whose end is not after its start, a still frozen at or past its item's recorded length, an unusable frame rate or length cap, or loop buffers over `max_mosaic_loop_mb` (the message carries the estimate)"
           }
         }
       }
@@ -5937,7 +5937,8 @@
           "inference",
           "pinboards",
           "pinboard_search",
-          "video_transcode"
+          "video_transcode",
+          "video_compose"
         ],
         "properties": {
           "bookmarks": {
@@ -5975,6 +5976,10 @@
           "search": {
             "type": "boolean",
             "description": "POST /api/search/pql"
+          },
+          "video_compose": {
+            "type": "boolean",
+            "description": "POST /api/video/compose\n\nSeparate from `video_transcode` because the two are separately\nrule-able and mean different work: a composition is strictly heavier\n(N decoders and their loop buffers at once, holding the pool), so a\npolicy may allow single-file clips while denying mosaics. The client's\nanimated-mosaic controls gate on this one."
           },
           "video_transcode": {
             "type": "boolean",
@@ -11530,17 +11535,34 @@
       },
       "TranscodeLimits": {
         "type": "object",
-        "description": "Composition limits, carried alongside the presets so a client builder\nclamps against live config instead of mirrored constants.",
+        "description": "Composition limits, carried alongside the presets so a client builder\nclamps against what this server enforces instead of mirrored constants.\n\nDeliberately *not* only the config values: the canvas and frame-rate bounds\nare code constants (`compose.rs`), and a client that has to guess them is in\nexactly the position this envelope exists to prevent. Where a limit comes\nfrom is the server's business; that the client has the number is the point.",
         "required": [
           "max_mosaic_inputs",
           "max_mosaic_loop_mb",
           "max_animated_image_seconds",
-          "max_output_seconds"
+          "max_output_seconds",
+          "min_canvas_side",
+          "max_canvas_side",
+          "max_canvas_area",
+          "max_compose_fps"
         ],
         "properties": {
           "max_animated_image_seconds": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          },
+          "max_canvas_area": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max_canvas_side": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max_compose_fps": {
+            "type": "integer",
+            "format": "int32",
             "minimum": 0
           },
           "max_mosaic_inputs": {
@@ -11556,6 +11578,10 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "min_canvas_side": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -11585,6 +11611,14 @@
           },
           "label": {
             "type": "string"
+          },
+          "max_height": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Cap on output height in pixels; `null` keeps the source height.\n\nCarried because it is a *rejection*: a composition whose canvas is\ntaller than this is refused outright (`canvas_over_preset_height`)\nrather than rescaled, so a client that cannot see the number can only\ndiscover it by having a document turned away. Its `fps_max` twin is\ndeliberately **not** here, for the same reason inverted: an over-cap\nframe rate is silently capped, never refused, so there is nothing a\nclient could do with it but mirror a value that changes nothing."
           },
           "surfaces": {
             "type": "array",

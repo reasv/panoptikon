@@ -13,20 +13,21 @@
 //! first non-UTF-8 byte), kill-and-reap on drop, and — unlike the outro
 //! probe, whose children last milliseconds — `process_tree` console
 //! detachment plus die-with-parent, because an encode can outlive a gateway
-//! crash by minutes. The one addition is a cancellation watchdog: an encode
-//! lasts long enough for a client to change its mind, and the reader thread
-//! cannot notice that on its own while blocked on a pipe.
+//! crash by minutes. The one addition is a watchdog thread: an encode lasts
+//! long enough for a client to change its mind, and long enough for a decoder
+//! to stop producing anything at all — and the reader thread, blocked on a
+//! pipe, cannot notice either on its own.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::TranscodeParams;
 use super::compose::{ComposeParams, ComposeSource, FilterPlan};
@@ -50,10 +51,24 @@ const NVENC_CQ_OFFSET: i64 = 3;
 /// runs on a different one.
 const H264_CRF_MAX: i64 = 51;
 
-/// How often the cancellation watchdog re-reads the flag. Cancelling is a
-/// human action, so a fifth of a second is invisible to the client; the
-/// thread exists at all because the progress reader can block indefinitely.
+/// How often the watchdog re-reads the cancel flag and the activity clock.
+/// Cancelling is a human action, so a fifth of a second is invisible to the
+/// client; the thread exists at all because the progress reader can block
+/// indefinitely.
 const CANCEL_POLL: Duration = Duration::from_millis(200);
+
+/// How long ffmpeg may write **nothing at all** to stdout before the watchdog
+/// kills it.
+///
+/// Cancellation used to be the only escape from a decoder that never
+/// terminates — the `-loop 1` animated-image hang class, where the demuxer
+/// produces an endless stream nothing downstream ever bounds. A job like that
+/// held its pool slot until a human noticed, or forever. `-progress pipe:1`
+/// prints a block roughly twice a second for the whole of a healthy encode, so
+/// two minutes of silence is orders of magnitude past any legitimate pause
+/// (container probing, a slow first read off a network mount) while still being
+/// a bound.
+const STALL_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Everything one encode needs. `params` is the artifact's identity, and the
 /// only thing besides the paths that reaches the command line.
@@ -483,9 +498,37 @@ fn parse_clock(value: &str) -> Option<f64> {
     (total.is_finite() && total >= 0.0).then_some(total)
 }
 
-/// The running child, shared with the cancellation watchdog. The two threads
-/// never contend for it: the reader below hands it over for the whole encode
-/// and only touches it again after the watchdog has been joined.
+/// Why the watchdog killed the child, when it did. Two very different
+/// consequences: a cancellation is the client's own doing and is recorded
+/// nowhere, while a stall is a verdict — ffmpeg was given this input and
+/// produced nothing with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillReason {
+    Cancelled,
+    Stalled,
+}
+
+/// The watchdog's whole decision, as a pure function of what it can see: the
+/// cancel flag, and how long it has been since the reader saw a byte.
+///
+/// Cancellation wins a tie deliberately. A job the client already abandoned
+/// must settle as `Cancelled` whatever else is true of it — recording a stall
+/// verdict against a file whose encode nobody waited for would let two impatient
+/// clicks suppress a rendition that was never given a chance to fail.
+fn watchdog_verdict(
+    cancelled: bool,
+    since_activity: Duration,
+    deadline: Duration,
+) -> Option<KillReason> {
+    if cancelled {
+        return Some(KillReason::Cancelled);
+    }
+    (since_activity > deadline).then_some(KillReason::Stalled)
+}
+
+/// The running child, shared with the watchdog. The two threads never contend
+/// for it: the reader below hands it over for the whole encode and only
+/// touches it again after the watchdog has been joined.
 #[derive(Clone)]
 struct ChildHandle(Arc<Mutex<Child>>);
 
@@ -577,13 +620,41 @@ pub(crate) fn run_compose(
     let sources: Vec<ComposeSource> = spec
         .sources
         .iter()
-        .map(|path| ComposeSource {
-            path: path.clone(),
+        .enumerate()
+        .map(|(index, path)| {
             // A cancellation mid-probe skips the rest: the run below refuses
             // to start anyway, and each probe is its own child process.
-            probe: (!cancel.load(Ordering::Relaxed))
-                .then(|| super::compose::probe_source(path))
-                .flatten(),
+            let probe = if cancel.load(Ordering::Relaxed) {
+                None
+            } else {
+                match super::compose::probe_source(path) {
+                    Ok(info) => Some(info),
+                    // Best-effort by design — the graph is still built — but
+                    // never silent. A failed probe is why a crop was not
+                    // clamped and why absent audio was not dropped, and both
+                    // surface later as a failure of the *whole* graph with
+                    // nothing in the log to say which input caused it.
+                    Err(error) => {
+                        tracing::warn!(
+                            file = %path.display(),
+                            sha = spec
+                                .params
+                                .doc
+                                .items
+                                .get(index)
+                                .map(|item| item.sha256.as_str())
+                                .unwrap_or_default(),
+                            error,
+                            "failed to probe a composition source"
+                        );
+                        None
+                    }
+                }
+            };
+            ComposeSource {
+                path: path.clone(),
+                probe,
+            }
         })
         .collect();
     let plan = super::compose::build_filtergraph(&spec.params, &sources);
@@ -620,6 +691,10 @@ pub(crate) fn run_task(
 /// blocked on a pipe forever and the pool slot held with it. The watchdog is
 /// what turns the flag into an EOF, and it is joined on every exit path, so
 /// nothing here relies on the runtime being torn down to reap a child.
+///
+/// The same watchdog carries the [`STALL_DEADLINE`], against an activity clock
+/// the reader stamps on every line: cancellation used to be the *only* escape
+/// from a child that never terminates.
 fn run_ffmpeg(
     args: &[OsString],
     expected_seconds: Option<f64>,
@@ -651,14 +726,34 @@ fn run_ffmpeg(
 
     let mut progress = ProgressReader::new(expected_seconds);
     let mut reader = BufReader::new(stdout);
-    // Scoped so the watchdog can borrow `cancel`, and so the scope's join is
-    // what gives the child back to this thread before it is waited on.
+    // The activity clock the stall deadline is measured against: milliseconds
+    // since `spawned`, stamped by the reader on every line it gets. Started at
+    // zero rather than at "never", so the deadline also covers the stretch
+    // before ffmpeg's first `-progress` block.
+    let spawned = Instant::now();
+    let last_activity = AtomicU64::new(0);
+    let stalled = AtomicBool::new(false);
+    // Scoped so the watchdog can borrow `cancel` and the two atomics, and so
+    // the scope's join is what gives the child back to this thread before it
+    // is waited on.
     std::thread::scope(|scope| {
         let (stop, stopped) = channel::<()>();
         let watched = child.child.clone();
+        let last_activity = &last_activity;
+        let stalled = &stalled;
         scope.spawn(move || {
+            let silence = || {
+                Duration::from_millis(
+                    (spawned.elapsed().as_millis() as u64)
+                        .saturating_sub(last_activity.load(Ordering::Relaxed)),
+                )
+            };
             loop {
-                if cancel.load(Ordering::Relaxed) {
+                let cancelled = cancel.load(Ordering::Relaxed);
+                if let Some(reason) = watchdog_verdict(cancelled, silence(), STALL_DEADLINE) {
+                    // Recorded before the kill, so the disposition below cannot
+                    // read it as an ordinary non-zero exit.
+                    stalled.store(reason == KillReason::Stalled, Ordering::Relaxed);
                     watched.kill();
                     return;
                 }
@@ -690,6 +785,9 @@ fn run_ffmpeg(
                 Ok(_) => {}
                 Err(_) => break,
             }
+            // Any output at all, not only a line the progress parser
+            // recognizes: a child that is writing is a child that is alive.
+            last_activity.store(spawned.elapsed().as_millis() as u64, Ordering::Relaxed);
             let line = String::from_utf8_lossy(&raw);
             if let Some(update) = progress.feed(&line) {
                 on_progress(update.fraction);
@@ -715,6 +813,14 @@ fn run_ffmpeg(
     let tail = child.stderr_tail();
     if cancel.load(Ordering::Relaxed) {
         return Err(EncodeError::Cancelled);
+    }
+    if stalled.load(Ordering::Relaxed) {
+        // A verdict, not a machine problem: ffmpeg was handed this input and
+        // produced nothing from it for two minutes.
+        return Err(EncodeError::Failed(format!(
+            "ffmpeg stalled: no output for {} s, so it was stopped: {tail}",
+            STALL_DEADLINE.as_secs()
+        )));
     }
     if !status.success() {
         return Err(EncodeError::Failed(format!(
@@ -1336,6 +1442,48 @@ mod tests {
         assert!(
             matches!(outcome, Err(EncodeError::Cancelled)),
             "cancelling is the client's own doing, so it is a verdict on nothing: {outcome:?} after {elapsed:?}"
+        );
+    }
+
+    /// The watchdog's decision, which is the whole of the stall bound that can
+    /// be asserted without waiting two minutes for a real one.
+    ///
+    /// Constructing a genuine stall would mean an input that decodes forever
+    /// and writes nothing — the `-loop 1` animated-image case the deadline
+    /// exists for, which the compose builder no longer emits — held for longer
+    /// than [`STALL_DEADLINE`]. A test that took two minutes to prove a
+    /// two-line predicate would not be worth its place in the suite, so the
+    /// predicate is what is pinned; the plumbing around it (the reader's stamp,
+    /// the kill, the disposition) is shared with the cancellation path the e2e
+    /// above exercises for real.
+    #[test]
+    fn the_watchdog_kills_on_a_cancel_or_a_silent_child() {
+        let deadline = Duration::from_secs(120);
+        assert_eq!(STALL_DEADLINE, deadline);
+
+        // A healthy encode: ffmpeg prints a progress block about twice a
+        // second, so the silence never approaches the deadline.
+        assert_eq!(
+            watchdog_verdict(false, Duration::from_millis(500), deadline),
+            None
+        );
+        assert_eq!(watchdog_verdict(false, deadline, deadline), None, "at it");
+        assert_eq!(
+            watchdog_verdict(false, deadline + Duration::from_millis(1), deadline),
+            Some(KillReason::Stalled)
+        );
+
+        // Cancellation is immediate, whatever the clock says.
+        assert_eq!(
+            watchdog_verdict(true, Duration::ZERO, deadline),
+            Some(KillReason::Cancelled)
+        );
+        // And it wins the tie: a job the client abandoned must not leave a
+        // stall verdict behind, or two impatient clicks would suppress a
+        // rendition that was never given a chance to fail.
+        assert_eq!(
+            watchdog_verdict(true, deadline * 10, deadline),
+            Some(KillReason::Cancelled)
         );
     }
 

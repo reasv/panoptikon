@@ -12,9 +12,11 @@
 //! drift nobody could see until an export looked wrong.
 //!
 //! What the server *does* own is admission. Every limit below bounds work that
-//! has already been paid for by the time ffmpeg reports it — the loop-memory
-//! guard in particular, which is the difference between a refused request and
-//! a host that runs out of memory halfway through an encode.
+//! has already been paid for by the time ffmpeg reports it. The loop-memory
+//! guard is the narrowest of them and is deliberately not sold as more than it
+//! is: it bounds the frames the `loop` filters hold, which is the one part of
+//! a composition's footprint the document makes computable — not the decoders,
+//! the encoder's own buffers, or anything else ffmpeg allocates.
 //!
 //! The resolved document ([`ResolvedCompose`]) is the cache key's input, so it
 //! carries every value the filtergraph reads: normalization (the background
@@ -42,16 +44,24 @@ pub(crate) const COMPOSE_KEY_PREFIX: &str = "compose";
 
 /// Smallest canvas that is still a picture. Even, like every canvas dimension:
 /// the pipeline ends in a 4:2:0 chroma format, which has no odd sizes.
-const MIN_CANVAS_SIDE: i64 = 16;
+pub(crate) const MIN_CANVAS_SIDE: i64 = 16;
 /// Widest canvas side, and the area behind it. Both are code constants rather
 /// than config: they bound a *client-authored* geometry, and every deployment
-/// pays the same decode cost for it.
-const MAX_CANVAS_SIDE: i64 = 4096;
-const MAX_CANVAS_AREA: i64 = 3840 * 2160;
+/// pays the same decode cost for it. They are still *published* (the presets
+/// envelope carries them) so a client builder clamps against the numbers this
+/// server enforces rather than against a mirrored copy.
+pub(crate) const MAX_CANVAS_SIDE: i64 = 4096;
+pub(crate) const MAX_CANVAS_AREA: i64 = 3840 * 2160;
 
 /// Frame-rate ceiling for a composition, before the preset's own cap. Beyond
 /// this the loop buffers grow without any visible gain.
-const MAX_COMPOSE_FPS: u32 = 60;
+pub(crate) const MAX_COMPOSE_FPS: u32 = 60;
+
+/// The background a document whose single item covers the whole canvas is
+/// normalized to before hashing. That path composites onto nothing, so the
+/// colour never reaches a filter: without this, two documents that produce
+/// byte-identical artifacts would sit under two keys.
+const HIDDEN_BACKGROUND: &str = "0x000000";
 
 /// What a composition of nothing but stills runs for when the length policy is
 /// `longest_loop_once`: no item contributes a duration, and a frozen mosaic is
@@ -366,6 +376,16 @@ pub(crate) fn resolve_compose(
     let fps = resolve_fps(request.fps, preset)?;
     let items = resolve_items(&request.items, canvas, preset)?;
     let target_cs = resolve_target_cs(&request.output.length, &items, preset, limits)?;
+    // The single-item full-canvas save composites onto nothing (see
+    // [`build_filtergraph`]), so its background never reaches a filter.
+    // Collapsed to one value *before* hashing, so two such documents that
+    // differ only by a colour no output pixel can carry are one artifact
+    // rather than two identical files under two keys.
+    let background = if covers_canvas(&items, canvas.w, canvas.h) {
+        HIDDEN_BACKGROUND.to_string()
+    } else {
+        background
+    };
 
     let doc = ResolvedCompose {
         canvas_w: canvas.w,
@@ -396,13 +416,13 @@ fn validate_canvas(canvas: &Canvas, preset: &ResolvedPreset) -> Resolved<()> {
     }
     if canvas.w > MAX_CANVAS_SIDE || canvas.h > MAX_CANVAS_SIDE {
         return Err(ComposeRejection::new(
-            "canvas_too_large",
+            "canvas_side_too_large",
             format!("neither canvas side may exceed {MAX_CANVAS_SIDE} px"),
         ));
     }
     if canvas.w.saturating_mul(canvas.h) > MAX_CANVAS_AREA {
         return Err(ComposeRejection::new(
-            "canvas_too_large",
+            "canvas_area_too_large",
             format!(
                 "the canvas may cover at most {MAX_CANVAS_AREA} px; this one covers {}",
                 canvas.w.saturating_mul(canvas.h)
@@ -494,16 +514,19 @@ fn validate_item(item: &ComposeItem, canvas: &Canvas) -> Resolved<()> {
             ),
         ));
     }
-    if dest.x % 2 != 0 || dest.y % 2 != 0 || dest.w % 2 != 0 || dest.h % 2 != 0 {
-        // `overlay` refuses odd offsets in 4:2:0, and an odd-sized item has no
-        // chroma plane to place: both are the same restriction the even canvas
-        // carries, one level down.
+    if dest.x % 2 != 0 || dest.y % 2 != 0 {
+        // `overlay` does not refuse an odd offset in 4:2:0 — it silently snaps
+        // it down onto the even chroma grid, so the item would render one pixel
+        // off the position the client solved, with nothing to say so. Sizes
+        // carry no such rule: `scale` produces whatever was asked for, and
+        // refusing odd ones would only force the client to round a rectangle
+        // ffmpeg was going to honour exactly.
         return Err(ComposeRejection::new(
             "dest_not_even",
             format!(
-                "destination rectangles must be even in both position and size; \
-                 got {}x{} at {},{}",
-                dest.w, dest.h, dest.x, dest.y
+                "destination rectangles must be positioned on even pixels; \
+                 got {},{}",
+                dest.x, dest.y
             ),
         ));
     }
@@ -535,6 +558,37 @@ fn validate_item(item: &ComposeItem, canvas: &Canvas) -> Resolved<()> {
             }
         }
         ItemTime::Image => {}
+    }
+    Ok(())
+}
+
+/// The one admission rule a document cannot decide on its own: a still names a
+/// timestamp inside a file whose length only the index database knows.
+///
+/// The caller resolves each item against that database anyway (it needs the
+/// path), so it hands the recorded duration back here rather than growing a
+/// second rejection vocabulary of its own. A timestamp at or past the end
+/// seeks past every frame there is, which fails the *whole* graph — one item's
+/// bad number taking a twelve-pin mosaic with it — so it is refused up front,
+/// by name, while the client can still be told which pin to fix. An item with
+/// no recorded duration cannot be judged this way, so it is not; the dispatch
+/// clamp ([`clamped_still_cs`]) is what covers it.
+pub(crate) fn validate_still_bounds(
+    item: &ComposeItem,
+    duration: Option<f64>,
+) -> Result<(), ComposeRejection> {
+    let (ItemTime::Still { at_cs }, Some(duration)) = (item.time, duration) else {
+        return Ok(());
+    };
+    if duration > 0.0 && (at_cs as f64) / 100.0 >= duration {
+        return Err(ComposeRejection::new(
+            "still_past_end",
+            format!(
+                "item {} freezes at {:.2} s, which is at or past its {duration:.2} s length",
+                item.sha256,
+                at_cs as f64 / 100.0,
+            ),
+        ));
     }
     Ok(())
 }
@@ -579,8 +633,11 @@ fn longest_span_cs(items: &[ComposeItem]) -> Option<i64> {
         .max()
 }
 
-/// Frames of `cs` centiseconds at `fps`, rounded up: a loop buffer must cover
-/// the whole segment.
+/// Frames of `cs` centiseconds at `fps`, rounded up.
+///
+/// Its ceiling is a *size* rule and nothing else: a loop buffer must hold the
+/// whole segment, so a partial frame counts as a frame. Deliberately not the
+/// input to the pass count — see [`span_loop`].
 ///
 /// Saturating, because a span bound is an attacker-supplied `i64`: an `end_cs`
 /// near the top of the range times a frame rate overflows, which in a release
@@ -594,14 +651,34 @@ fn frames_for(cs: i64, fps: u32) -> i64 {
 /// frames each pass buffers. `None` means the item plays through without a
 /// loop filter at all — the longest span, and anything already at least as
 /// long as the target.
+///
+/// The pass count is integer arithmetic over the two *durations*, never over
+/// [`frames_for`]'s frame counts: that function rounds a partial frame up, so
+/// a segment whose length is not a whole number of frames looks longer in
+/// frames than it is in time, and dividing by the rounded-up figure yields one
+/// pass too few — an output that stops short of the target it was keyed for.
+/// The rounded frame count stays where it belongs, as the buffer's `size`.
 fn span_loop(span_cs: i64, doc: &ResolvedCompose) -> Option<(i64, i64)> {
-    let segment = frames_for(span_cs, doc.fps).max(1);
-    let target = frames_for(doc.target_cs, doc.fps).max(1);
-    if segment >= target {
+    let span_cs = span_cs.max(0);
+    if span_cs == 0 || span_cs >= doc.target_cs {
         return None;
     }
-    let passes = (target + segment - 1) / segment;
-    Some((passes - 1, segment))
+    let passes = (doc.target_cs + span_cs - 1) / span_cs;
+    Some((passes - 1, frames_for(span_cs, doc.fps).max(1)))
+}
+
+/// Whether one item covers the whole canvas, in which case its own chain is
+/// the output: there is nothing to composite it onto, so neither the base
+/// colour source nor an `overlay` is built.
+fn covers_canvas(items: &[ComposeItem], canvas_w: i64, canvas_h: i64) -> bool {
+    items.len() == 1
+        && items[0].dest
+            == Rect {
+                x: 0,
+                y: 0,
+                w: canvas_w,
+                h: canvas_h,
+            }
 }
 
 /// The admission-time memory guard: every loop buffer holds decoded frames at
@@ -616,10 +693,9 @@ fn check_loop_memory(doc: &ResolvedCompose, limits: ComposeLimits) -> Resolved<(
                 Some((_, segment)) => segment.max(0) as u128,
                 None => 0,
             },
-            // One buffered frame, held by the infinite loop that freezes it.
-            ItemTime::Still { .. } => 1,
-            // Looped by the demuxer (`-loop 1`), which buffers nothing.
-            ItemTime::Image => 0,
+            // One buffered frame each, held by the infinite loop that freezes
+            // them: a still and an image run the same chain.
+            ItemTime::Still { .. } | ItemTime::Image => 1,
         };
         let pixels = (item.dest.w.max(0) as u128) * (item.dest.h.max(0) as u128);
         bytes = bytes.saturating_add(
@@ -665,7 +741,7 @@ fn normalize_color(value: &str) -> Option<String> {
 // --- source probing --------------------------------------------------------
 
 /// What one input's streams look like, as the graph builder needs them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StreamInfo {
     /// Display dimensions: the rotation metadata is applied, because ffmpeg
     /// auto-rotates on decode and the client's source rectangle is measured
@@ -677,6 +753,10 @@ pub(crate) struct StreamInfo {
     /// art (the Phase 2 `content_video_stream` rule, one layer down).
     pub(crate) video_index: usize,
     pub(crate) has_audio: bool,
+    /// The content stream's own duration, when it records one. Used to hold a
+    /// still's seek inside the stream it seeks into; `None` for the containers
+    /// (and the image demuxers) that record nothing.
+    pub(crate) duration_s: Option<f64>,
 }
 
 /// One input of a composition: the file, and what a probe found in it.
@@ -684,29 +764,37 @@ pub(crate) struct StreamInfo {
 pub(crate) struct ComposeSource {
     pub(crate) path: PathBuf,
     /// `None` when the probe failed or was skipped. The graph is still built:
-    /// the probe only clamps a source rectangle and drops audio that does not
-    /// exist, and ffmpeg's own verdict is the backstop for everything else.
+    /// the probe only clamps a source rectangle, holds a still's seek inside
+    /// the stream, and drops audio that does not exist — ffmpeg's own verdict
+    /// is the backstop for everything else.
     pub(crate) probe: Option<StreamInfo>,
 }
 
-/// ffprobe, for the two things a composition cannot ask the index database
-/// for: the exact stream geometry a crop must fit inside, and whether an item
-/// the client marked audible has an audio stream at all (a `[i:a:0]` label
-/// that matches nothing fails the whole graph).
+/// ffprobe, for the three things a composition cannot ask the index database
+/// for: the exact stream geometry a crop must fit inside, the content stream's
+/// own length, and whether an item the client marked audible has an audio
+/// stream at all (a `[i:a:0]` label that matches nothing fails the whole
+/// graph).
 ///
-/// Blocking, and best-effort: a failure returns `None` rather than an error,
-/// because none of what it learns is required to build a graph.
-pub(crate) fn probe_source(path: &Path) -> Option<StreamInfo> {
+/// Blocking, and best-effort by design — none of what it learns is *required*
+/// to build a graph — but the failure is returned rather than swallowed: it is
+/// the reason a later graph failure has no obvious cause, so the caller logs
+/// it against the item it belongs to.
+pub(crate) fn probe_source(path: &Path) -> Result<StreamInfo, String> {
     let output = Command::new(crate::media_tools::ffprobe())
         .args(["-v", "error", "-show_streams", "-of", "json"])
         .arg(path)
         .stdin(Stdio::null())
         .output()
-        .ok()?;
+        .map_err(|err| format!("ffprobe failed to start: {err}"))?;
     if !output.status.success() {
-        return None;
+        return Err(format!(
+            "ffprobe exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    parse_probe(&output.stdout)
+    parse_probe(&output.stdout).ok_or_else(|| "ffprobe found no usable video stream".to_string())
 }
 
 /// Pure half of [`probe_source`], so the stream selection has tests that need
@@ -750,11 +838,21 @@ fn parse_probe(stdout: &[u8]) -> Option<StreamInfo> {
     } else {
         (width, height)
     };
+    // ffprobe writes stream durations as decimal *strings*; a container that
+    // records none omits the key or writes "N/A".
+    let duration_s = stream
+        .get("duration")
+        .and_then(|value| match value {
+            serde_json::Value::String(text) => text.parse().ok(),
+            other => other.as_f64(),
+        })
+        .filter(|duration: &f64| duration.is_finite() && *duration > 0.0);
     Some(StreamInfo {
         width,
         height,
         video_index,
         has_audio,
+        duration_s,
     })
 }
 
@@ -807,7 +905,7 @@ pub(crate) fn build_filtergraph(params: &ComposeParams, sources: &[ComposeSource
         let source = sources.get(index);
         let probe = source.and_then(|source| source.probe);
         inputs.push(InputSpec {
-            args: input_args(item, doc.fps),
+            args: input_args(item, doc.fps, probe),
             path: source
                 .map(|source| source.path.clone())
                 .unwrap_or_default(),
@@ -826,25 +924,17 @@ pub(crate) fn build_filtergraph(params: &ComposeParams, sources: &[ComposeSource
         Container::Webp => "yuva420p",
         Container::Mp4 | Container::Webm => "yuv420p",
     };
-    let mut tail = Vec::new();
-    if let Some(max_height) = params.preset.max_height {
-        // The quotes are ffmpeg's escaping, not a shell's: the comma inside
-        // `min()` would otherwise separate two filters.
-        tail.push(format!("scale=-2:'min(ih,{max_height})'"));
-    }
-    tail.push(format!("format={format}"));
+    // No preset height cap here, unlike the single-file argument builder:
+    // `canvas_over_preset_height` already refused every canvas taller than the
+    // preset renders, so a `scale=-2:'min(ih,H)'` could only ever be a no-op —
+    // and a no-op filter in a golden string is a claim about a rule that is
+    // enforced somewhere else entirely.
+    let tail = format!("format={format}");
 
     // A single item covering the whole canvas has nothing to overlay onto:
     // its own chain *is* the output, which saves a full-canvas source and a
     // compositing pass on the commonest save of all.
-    let full_canvas = doc.items.len() == 1
-        && doc.items[0].dest
-            == Rect {
-                x: 0,
-                y: 0,
-                w: doc.canvas_w,
-                h: doc.canvas_h,
-            };
+    let full_canvas = covers_canvas(&doc.items, doc.canvas_w, doc.canvas_h);
     let mut graph = String::new();
     if full_canvas {
         let chain = chains.remove(0);
@@ -852,7 +942,7 @@ pub(crate) fn build_filtergraph(params: &ComposeParams, sources: &[ComposeSource
             .strip_suffix("[v0]")
             .expect("the video chain ends with its label")
             .to_string();
-        graph.push_str(&format!("{chain},{}[vout]", tail.join(",")));
+        graph.push_str(&format!("{chain},{tail}[vout]"));
         for extra in &chains {
             graph.push(';');
             graph.push_str(extra);
@@ -879,7 +969,7 @@ pub(crate) fn build_filtergraph(params: &ComposeParams, sources: &[ComposeSource
                 item.dest.x, item.dest.y
             ));
             if last {
-                graph.push_str(&format!(",{}[vout]", tail.join(",")));
+                graph.push_str(&format!(",{tail}[vout]"));
             } else {
                 graph.push_str(&format!("[{next}]"));
             }
@@ -921,7 +1011,7 @@ pub(crate) fn build_filtergraph(params: &ComposeParams, sources: &[ComposeSource
 }
 
 /// The input options an item needs before its `-i`.
-fn input_args(item: &ComposeItem, fps: u32) -> Vec<String> {
+fn input_args(item: &ComposeItem, fps: u32, probe: Option<StreamInfo>) -> Vec<String> {
     match item.time {
         // Input seeking, and `-to` in the input's own timeline: the decoder
         // skips everything outside the span instead of decoding and throwing
@@ -932,15 +1022,35 @@ fn input_args(item: &ComposeItem, fps: u32) -> Vec<String> {
             "-to".to_string(),
             seconds(end_cs),
         ],
-        ItemTime::Still { at_cs } => vec!["-ss".to_string(), seconds(at_cs)],
-        // A still image has one frame and no rate; the demuxer supplies both.
-        ItemTime::Image => vec![
-            "-loop".to_string(),
-            "1".to_string(),
-            "-framerate".to_string(),
-            fps.to_string(),
-        ],
+        ItemTime::Still { at_cs } => {
+            vec!["-ss".to_string(), seconds(clamped_still_cs(at_cs, fps, probe))]
+        }
+        // Deliberately none at all. `-loop 1` on an image demuxer produces an
+        // endless stream, which is only bounded by a downstream filter noticing
+        // — and an animated container the demuxer cannot decode never reaches
+        // one, so the encode hangs until it is cancelled instead of failing.
+        // The chain below freezes the first frame with the same `loop` filter a
+        // still uses, which needs no input option and ends on its own.
+        ItemTime::Image => Vec::new(),
     }
+}
+
+/// A still's seek, held inside the stream it seeks into.
+///
+/// Admission already refused a timestamp past the item's *recorded* duration
+/// ([`validate_still_bounds`]); this covers the stream whose real length
+/// disagrees with the index, and the item the index has no duration for at
+/// all. One frame short of the end rather than the end itself: a seek to the
+/// exact duration lands past the last frame, and a `trim=end_frame=1` with no
+/// frame to take fails the whole graph.
+fn clamped_still_cs(at_cs: i64, fps: u32, probe: Option<StreamInfo>) -> i64 {
+    let at_cs = at_cs.max(0);
+    let Some(duration_s) = probe.and_then(|probe| probe.duration_s) else {
+        return at_cs;
+    };
+    let duration_cs = (duration_s * 100.0).floor().clamp(0.0, i64::MAX as f64) as i64;
+    let frame_cs = (100 / i64::from(fps.max(1))).max(1);
+    at_cs.min((duration_cs - frame_cs).max(0))
 }
 
 fn video_chain(
@@ -974,19 +1084,18 @@ fn video_chain(
             filters.push(format!("trim=end={target}"));
             filters.push("setpts=PTS-STARTPTS".to_string());
         }
-        ItemTime::Still { .. } => {
-            // The seek landed on the frame; one frame is taken, frozen by an
-            // infinite loop, and given timestamps at the output rate.
+        // One chain for both, and not merely because it is shorter: an image
+        // *is* a still whose timestamp happens to be the only one there is.
+        // The first decoded frame is taken, frozen by an infinite loop, and
+        // given timestamps at the output rate — which for the image case also
+        // means an undecodable animated container fails on its first frame
+        // rather than looping forever inside the demuxer.
+        ItemTime::Still { .. } | ItemTime::Image => {
             filters.push("trim=end_frame=1".to_string());
             filters.extend(geometry);
             filters.push("loop=-1:size=1".to_string());
             filters.push(format!("setpts=N/({}*TB)", doc.fps));
             filters.push(format!("trim=end={target}"));
-        }
-        ItemTime::Image => {
-            filters.extend(geometry);
-            filters.push(format!("trim=end={target}"));
-            filters.push("setpts=PTS-STARTPTS".to_string());
         }
     }
     format!(
@@ -1258,8 +1367,16 @@ mod tests {
         };
         assert_eq!(reason(&canvas(8, 480), "mosaic-mp4"), "canvas_too_small");
         assert_eq!(reason(&canvas(641, 480), "mosaic-mp4"), "canvas_odd");
-        assert_eq!(reason(&canvas(4098, 480), "mosaic-mp4"), "canvas_too_large");
-        assert_eq!(reason(&canvas(4096, 4096), "mosaic-mp4"), "canvas_too_large");
+        // Two separate rules, and two separate fixes: a side over the cap has
+        // to shrink in that direction, an area over it in either.
+        assert_eq!(
+            reason(&canvas(4098, 480), "mosaic-mp4"),
+            "canvas_side_too_large"
+        );
+        assert_eq!(
+            reason(&canvas(4096, 4096), "mosaic-mp4"),
+            "canvas_area_too_large"
+        );
         // The preset's own height cap is refused rather than silently
         // rescaled: rescaling would move every rectangle the client placed.
         assert_eq!(
@@ -1293,9 +1410,24 @@ mod tests {
             "dest_outside_canvas"
         );
 
+        // Odd *offsets* only: `overlay` snaps those down onto the chroma grid
+        // without saying so, which renders the item a pixel off the position
+        // the client solved.
         let mut odd = item(ItemTime::Image);
         odd.dest = rect(1, 0, 320, 240);
         assert_eq!(reason(&with_item(odd), "mosaic-mp4"), "dest_not_even");
+        let mut odd = item(ItemTime::Image);
+        odd.dest = rect(0, 3, 320, 240);
+        assert_eq!(reason(&with_item(odd), "mosaic-mp4"), "dest_not_even");
+        // An odd *size* is accepted: `scale` produces exactly what it is
+        // asked for, so refusing one would only force the client to round a
+        // rectangle ffmpeg was going to honour.
+        let mut odd_size = item(ItemTime::Image);
+        odd_size.dest = rect(0, 0, 321, 241);
+        assert!(
+            resolve_compose(&with_item(odd_size), &preset("mosaic-mp4"), limits()).is_ok(),
+            "sizes are unconstrained; only positions are"
+        );
 
         assert_eq!(
             reason(
@@ -1352,6 +1484,36 @@ mod tests {
                 "{seconds}"
             );
         }
+
+        // The one rule the document alone cannot decide, which is why it is a
+        // separate call rather than part of `resolve_compose`: a still's
+        // timestamp is only past the end relative to a length the index
+        // database holds. Refused here so one bad number names its own pin,
+        // rather than failing the whole graph at dispatch.
+        let frozen = item(ItemTime::Still { at_cs: 1200 });
+        assert_eq!(
+            validate_still_bounds(&frozen, Some(12.0))
+                .expect_err("at the end is past every frame")
+                .reason,
+            "still_past_end"
+        );
+        assert_eq!(
+            validate_still_bounds(&item(ItemTime::Still { at_cs: 1500 }), Some(12.0))
+                .expect_err("past the end")
+                .reason,
+            "still_past_end"
+        );
+        assert!(validate_still_bounds(&item(ItemTime::Still { at_cs: 1199 }), Some(12.0)).is_ok());
+        assert!(
+            validate_still_bounds(&frozen, None).is_ok(),
+            "an item with no recorded duration cannot be judged this way"
+        );
+        assert!(
+            validate_still_bounds(&item(ItemTime::Span { start_cs: 0, end_cs: 9_000 }), Some(1.0))
+                .is_ok(),
+            "the rule is about stills; a span past the end simply runs short"
+        );
+        assert!(validate_still_bounds(&item(ItemTime::Image), Some(1.0)).is_ok());
 
         // And the document the whole table exists to admit.
         assert!(resolve_compose(&worked_example(), &preset("mosaic-mp4"), limits()).is_ok());
@@ -1481,8 +1643,8 @@ mod tests {
         assert!(refused.detail.contains("10 MB"), "{}", refused.detail);
         assert!(refused.detail.contains("5 MB"), "{}", refused.detail);
 
-        // Stills buffer one frame each, images none at all (the demuxer loops
-        // those), so neither can be what exhausts a host.
+        // Stills and images buffer one frame each — they run the same chain —
+        // so neither can be what exhausts a host.
         let frozen = request(
             (0..12)
                 .map(|index| {
@@ -1499,11 +1661,11 @@ mod tests {
         );
         assert!(
             resolve_compose(&frozen, &preset("mosaic-mp4"), ComposeLimits {
-                max_mosaic_loop_mb: 4,
+                max_mosaic_loop_mb: 8,
                 ..limits()
             })
             .is_ok(),
-            "six stills at 640x480 are under 2 MB together"
+            "twelve frozen items at 640x480 are one frame each, about 5 MB together"
         );
 
         // Span bounds are attacker-supplied i64s: the frame arithmetic
@@ -1609,6 +1771,106 @@ mod tests {
         assert!(plan.has_audio);
     }
 
+    /// GOLDEN. An image item runs the *still* chain, with no input options at
+    /// all.
+    ///
+    /// `-loop 1 -framerate N` — the image2 demuxer's own loop — was what this
+    /// replaced, and the reason is not tidiness: that produces an endless input
+    /// stream, bounded only by a downstream filter noticing, and an animated
+    /// container the demuxer cannot decode never reaches one. The encode then
+    /// hangs until something cancels it instead of failing. Freezing the first
+    /// decoded frame ends on its own for every input, decodable or not.
+    #[test]
+    fn an_image_item_freezes_its_first_frame_with_no_input_options() {
+        let image = ComposeItem {
+            dest: rect(0, 0, 320, 240),
+            src: rect(0, 0, 640, 480),
+            ..item(ItemTime::Image)
+        };
+        let params = params_for(
+            &request(vec![image], ComposeLength::Cap { seconds: 2.0 }),
+            "mosaic-mp4",
+        );
+        let plan = build_filtergraph(&params, &sources(1));
+        assert_eq!(
+            plan.inputs[0].args,
+            Vec::<String>::new(),
+            "no `-loop`, no `-framerate`, no seek: the chain does all of it"
+        );
+        assert_eq!(
+            plan.filter_complex,
+            "[0:v:0]trim=end_frame=1,crop=640:480:0:0,scale=320:240:flags=lanczos,\
+             loop=-1:size=1,setpts=N/(25*TB),trim=end=2.00[v0];\
+             color=c=0x101820:s=640x480:r=25:d=2.00[base];\
+             [base][v0]overlay=0:0,format=yuv420p[vout]"
+        );
+
+        // Which is, filter for filter, what a still of the same geometry gets.
+        let still = ComposeItem {
+            dest: rect(0, 0, 320, 240),
+            src: rect(0, 0, 640, 480),
+            ..item(ItemTime::Still { at_cs: 0 })
+        };
+        let still_plan = build_filtergraph(
+            &params_for(
+                &request(vec![still], ComposeLength::Cap { seconds: 2.0 }),
+                "mosaic-mp4",
+            ),
+            &sources(1),
+        );
+        assert_eq!(still_plan.filter_complex, plan.filter_complex);
+        assert_eq!(still_plan.inputs[0].args, ["-ss", "0.00"]);
+    }
+
+    /// A still's seek is held inside the stream it seeks into, one frame short
+    /// of the end: a seek to the duration itself lands past the last frame, and
+    /// a `trim=end_frame=1` with no frame to take fails the whole graph.
+    #[test]
+    fn a_stills_seek_is_clamped_to_the_probed_stream() {
+        let probe = |duration_s| {
+            Some(StreamInfo {
+                width: 640,
+                height: 480,
+                video_index: 0,
+                has_audio: false,
+                duration_s,
+            })
+        };
+        // 12.00 s at 25 fps: one frame is 4 cs, so the last seekable one is
+        // 11.96 s.
+        assert_eq!(clamped_still_cs(1500, 25, probe(Some(12.0))), 1196);
+        assert_eq!(clamped_still_cs(1200, 25, probe(Some(12.0))), 1196);
+        assert_eq!(clamped_still_cs(500, 25, probe(Some(12.0))), 500);
+        // A rate whose frame is under a centisecond still steps back by one.
+        assert_eq!(clamped_still_cs(1200, 200, probe(Some(12.0))), 1199);
+        // Nothing to clamp against leaves the timestamp alone; admission and
+        // ffmpeg's own verdict are what remain.
+        assert_eq!(clamped_still_cs(1500, 25, probe(None)), 1500);
+        assert_eq!(clamped_still_cs(1500, 25, None), 1500);
+        // Degenerate lengths floor at zero rather than going negative, which
+        // `seconds()` would print as a seek to somewhere else entirely.
+        assert_eq!(clamped_still_cs(1500, 25, probe(Some(0.01))), 0);
+        assert_eq!(clamped_still_cs(-5, 25, probe(Some(12.0))), 0);
+
+        // And it reaches the input options, which is the only place it acts.
+        let still = ComposeItem {
+            dest: rect(0, 0, 320, 240),
+            ..item(ItemTime::Still { at_cs: 5000 })
+        };
+        let params = params_for(
+            &request(vec![still], ComposeLength::Cap { seconds: 2.0 }),
+            "mosaic-mp4",
+        );
+        let plan = build_filtergraph(
+            &params,
+            &[ComposeSource {
+                path: PathBuf::from("a.mp4"),
+                probe: probe(Some(12.0)),
+            }],
+        );
+        assert_eq!(plan.inputs[0].args, ["-ss", "11.96"]);
+    }
+
     /// The loop mechanism: a span shorter than the target repeats, and the
     /// buffer it repeats is `size` frames at *destination* resolution — the
     /// same number the admission guard counted. The longest span never loops.
@@ -1660,6 +1922,46 @@ mod tests {
         );
     }
 
+    /// The pass count comes from the two *durations*, never from the rounded-up
+    /// frame counts the buffer is sized with. A 0.30 s span at 25 fps buffers 8
+    /// frames — 0.32 s of them — so dividing the target's frames by that figure
+    /// says 32 passes where the clock needs 34, and the artifact would stop a
+    /// fifth of a second short of the length its own cache key promises.
+    #[test]
+    fn the_loop_pass_count_is_measured_in_time_not_in_rounded_frames() {
+        let doc = ResolvedCompose {
+            canvas_w: 640,
+            canvas_h: 480,
+            background: "0x000000".to_string(),
+            fps: 25,
+            target_cs: 1000,
+            items: Vec::new(),
+        };
+        assert_eq!(frames_for(30, 25), 8, "a partial frame still needs a slot");
+        assert_eq!(
+            span_loop(30, &doc),
+            Some((33, 8)),
+            "ceil(1000/30) = 34 passes, buffering 8 frames each"
+        );
+        // 34 passes of the real 0.30 s segment cover the 10 s target; the 32
+        // the frame arithmetic would have asked for do not.
+        assert!(34 * 30 >= doc.target_cs && 32 * 30 < doc.target_cs);
+
+        // A segment that divides the target exactly loops no more than it must.
+        assert_eq!(span_loop(250, &doc), Some((3, 63)));
+        assert_eq!(span_loop(500, &doc), Some((1, 125)));
+        // At or past the target there is no loop filter at all.
+        assert_eq!(span_loop(1000, &doc), None);
+        assert_eq!(span_loop(4000, &doc), None);
+        // Attacker-supplied bounds: nothing here may overflow or divide by zero.
+        assert_eq!(span_loop(i64::MAX, &doc), None);
+        assert_eq!(span_loop(0, &doc), None);
+        assert_eq!(span_loop(-5, &doc), None);
+        // One centisecond against a ten-second target is the extreme the
+        // memory guard, not this function, is responsible for refusing.
+        assert_eq!(span_loop(1, &doc), Some((999, 1)));
+    }
+
     /// The single-item save: one item covering the whole canvas has nothing to
     /// composite onto, so it skips the base source and the overlay entirely.
     #[test]
@@ -1684,6 +1986,21 @@ mod tests {
         assert!(!plan.filter_complex.contains("overlay"));
         assert!(!plan.filter_complex.contains("color=c="));
         assert_eq!(plan.output_args[2], "-an", "nothing to mix");
+
+        // No colour reaches that graph, so no colour reaches the key either:
+        // two such documents produce byte-identical artifacts, and giving them
+        // two keys would encode the same file twice and store it twice.
+        let mut other_colour = request(vec![full.clone()], ComposeLength::LongestLoopOnce);
+        other_colour.canvas.background = "#ff00ff".to_string();
+        assert_eq!(resolved(&other_colour, "mosaic-mp4").background, "0x000000");
+        assert_eq!(
+            params_for(&other_colour, "mosaic-mp4").cache_key(),
+            params_for(
+                &request(vec![full.clone()], ComposeLength::LongestLoopOnce),
+                "mosaic-mp4"
+            )
+            .cache_key()
+        );
 
         // One item that does *not* fill the canvas still composites: the
         // background is part of what was asked for.
@@ -1722,6 +2039,15 @@ mod tests {
         assert!(!plan.has_audio);
         assert!(!plan.filter_complex.contains("amix"));
         assert!(plan.filter_complex.contains("format=yuva420p[vout]"));
+        // `webp-anim` renders at most 720 px tall, and this canvas is 240:
+        // `canvas_over_preset_height` refused every document the preset's own
+        // scale could have acted on, so the graph carries no such filter.
+        assert_eq!(preset("webp-anim").max_height, Some(720));
+        assert!(
+            !plan.filter_complex.contains("scale=-2"),
+            "the preset height cap is an admission rule, not a filter: {}",
+            plan.filter_complex
+        );
         assert_eq!(
             plan.output_args,
             ["-map", "[vout]", "-an", "-sn", "-dn", "-pix_fmt", "yuva420p"]
@@ -1755,6 +2081,7 @@ mod tests {
                     height: 960,
                     video_index: 0,
                     has_audio: true,
+                    duration_s: Some(30.0),
                 }),
             },
             ComposeSource {
@@ -1764,6 +2091,7 @@ mod tests {
                     height: 1080,
                     video_index: 1,
                     has_audio: false,
+                    duration_s: Some(30.0),
                 }),
             },
         ];
@@ -1791,6 +2119,7 @@ mod tests {
             height: 80,
             video_index: 0,
             has_audio: false,
+            duration_s: Some(4.0),
         };
         assert_eq!(
             clamped_src(rect(10, 10, 200, 200), Some(info)),
@@ -1814,15 +2143,33 @@ mod tests {
         let probe = |json: &str| parse_probe(json.as_bytes());
         assert_eq!(
             probe(
-                r#"{"streams":[{"codec_type":"video","width":640,"height":480},
+                r#"{"streams":[{"codec_type":"video","width":640,"height":480,"duration":"12.5"},
                     {"codec_type":"audio"}]}"#
             ),
             Some(StreamInfo {
                 width: 640,
                 height: 480,
                 video_index: 0,
-                has_audio: true
+                has_audio: true,
+                duration_s: Some(12.5),
             })
+        );
+        // ffprobe writes durations as strings; a container that records none
+        // omits the key, and neither absence nor nonsense is a length.
+        assert_eq!(
+            probe(r#"{"streams":[{"codec_type":"video","width":8,"height":8}]}"#)
+                .and_then(|info| info.duration_s),
+            None
+        );
+        assert_eq!(
+            probe(r#"{"streams":[{"codec_type":"video","width":8,"height":8,"duration":"N/A"}]}"#)
+                .and_then(|info| info.duration_s),
+            None
+        );
+        assert_eq!(
+            probe(r#"{"streams":[{"codec_type":"video","width":8,"height":8,"duration":"0"}]}"#)
+                .and_then(|info| info.duration_s),
+            None
         );
         // Cover art first: the second video stream is the one with pictures.
         assert_eq!(
@@ -1835,7 +2182,8 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 video_index: 1,
-                has_audio: false
+                has_audio: false,
+                duration_s: None,
             })
         );
         // A rotated stream decodes to its display size, which is what the
@@ -1884,17 +2232,36 @@ mod tests {
         matches!(status, Ok(status) if status.success())
     }
 
-    /// The same, in two shades of one colour. The composition must actually
-    /// *move*: libwebp's animation encoder collapses a run of identical frames
-    /// into one still image, so a fixture of flat colour would produce a
-    /// perfectly valid single-frame WebP and prove nothing about animation.
-    fn write_two_shade_clip(path: &Path, first: &str, second: &str, w: i64, h: i64) -> bool {
-        let source = |color: &str| format!("color=c={color}:s={w}x{h}:d=1.5:r=30");
+    /// A 400x300 clip of four vertical stripes — green, red, blue, green —
+    /// that dims halfway through.
+    ///
+    /// Both properties are load-bearing. The **stripes** are what make the
+    /// composed pixels distinguish a correct crop and rotation from a dropped
+    /// one: the fixture's item crops x 100..300 (exactly the red and blue
+    /// stripes) and turns it a quarter clockwise, so red lands at the *top* of
+    /// its rectangle and blue at the bottom. Drop the crop and both sample
+    /// points read green; drop the rotation and both read red; move the crop
+    /// and the top sample changes colour. A flat-coloured source would pass all
+    /// three ways of being wrong. The **dimming** is for libwebp, whose
+    /// animation encoder collapses a run of identical frames into one still
+    /// image — a flat fixture would produce a perfectly valid single-frame WebP
+    /// and prove nothing about animation.
+    fn write_striped_clip(path: &Path, w: i64, h: i64) -> bool {
+        let stripes = |base: &str, red: &str, blue: &str| {
+            format!(
+                "color=c={base}:s={w}x{h}:d=1.5:r=30,\
+                 drawbox=x={x1}:y=0:w={band}:h={h}:color={red}:t=fill,\
+                 drawbox=x={x2}:y=0:w={band}:h={h}:color={blue}:t=fill",
+                band = w / 4,
+                x1 = w / 4,
+                x2 = w / 2,
+            )
+        };
         let status = Command::new(crate::media_tools::ffmpeg())
             .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
-            .arg(source(first))
+            .arg(stripes("0x00A000", "0xE00000", "0x0000E0"))
             .args(["-f", "lavfi", "-i"])
-            .arg(source(second))
+            .arg(stripes("0x008000", "0xA00000", "0x0000A0"))
             .args([
                 "-filter_complex",
                 "[0:v][1:v]concat=n=2:v=1:a=0[out]",
@@ -1911,27 +2278,69 @@ mod tests {
         matches!(status, Ok(status) if status.success())
     }
 
-    /// `(canvas width, canvas height, animation frames)` of a WebP, read out
-    /// of its RIFF chunks.
+    /// A two-frame GIF: red, then blue. Written by ffmpeg like every other
+    /// fixture here, so the e2e below needs no committed binary.
+    fn write_two_frame_gif(path: &Path, w: i64, h: i64) -> bool {
+        let frame = |color: &str| format!("color=c={color}:s={w}x{h}:d=0.5:r=2");
+        let status = Command::new(crate::media_tools::ffmpeg())
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg(frame("0xE00000"))
+            .args(["-f", "lavfi", "-i"])
+            .arg(frame("0x0000E0"))
+            .args([
+                "-filter_complex",
+                "[0:v][1:v]concat=n=2:v=1:a=0[out]",
+                "-map",
+                "[out]",
+            ])
+            .arg(path)
+            .stdin(Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
+    }
+
+    /// `(canvas width, canvas height, animation frames)` of a WebP, read by
+    /// walking its RIFF chunk list.
     ///
     /// ffprobe is no use here: its `webp_pipe` demuxer reads still images
     /// only, and answers an *animated* file with "image data not found" and a
     /// zero-sized stream. The container's own structure is both the more
     /// direct assertion and the only one this toolchain can make.
+    ///
+    /// A chunk *walk* rather than a byte-pattern scan, which is the difference
+    /// between counting animation frames and counting the times four bytes of
+    /// compressed pixel data happen to spell `ANMF`: the frame count is the
+    /// assertion that a WebP is animated at all, so a search that can find its
+    /// needle inside a payload proves nothing.
     fn webp_shape(bytes: &[u8]) -> Option<(i64, i64, usize)> {
         if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WEBP" {
             return None;
         }
-        let frames = bytes.windows(4).filter(|window| *window == b"ANMF").count();
-        let extended = bytes
-            .windows(4)
-            .position(|window| window == b"VP8X")
-            .map(|at| at + 8)?;
-        let u24 = |at: usize| -> Option<i64> {
-            let bytes = bytes.get(at..at + 3)?;
+        let u24 = |body: &[u8], at: usize| -> Option<i64> {
+            let bytes = body.get(at..at + 3)?;
             Some(i64::from(bytes[0]) | i64::from(bytes[1]) << 8 | i64::from(bytes[2]) << 16)
         };
-        Some((u24(extended + 4)? + 1, u24(extended + 7)? + 1, frames))
+        let mut at = 12;
+        let mut frames = 0usize;
+        let mut canvas = None;
+        while at + 8 <= bytes.len() {
+            let fourcc = &bytes[at..at + 4];
+            let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
+            let body = bytes.get(at + 8..at + 8 + size)?;
+            match fourcc {
+                b"ANMF" => frames += 1,
+                // Canvas size is stored one less than it is, after a flags
+                // byte and three reserved ones.
+                b"VP8X" => canvas = Some((u24(body, 4)? + 1, u24(body, 7)? + 1)),
+                _ => {}
+            }
+            // Odd-length payloads carry a pad byte the size field does not
+            // count; skipping it would put the walk one byte off for the rest
+            // of the file.
+            at += 8 + size + (size & 1);
+        }
+        let (width, height) = canvas?;
+        Some((width, height, frames))
     }
 
     /// `width,height,duration,frames` of an artifact. `-count_frames` rather
@@ -2005,13 +2414,19 @@ mod tests {
             .then_some(name)
     }
 
-    /// The canvas the fixtures below compose onto: a red span on the left, a
-    /// blue still inset on the right, and green showing through everywhere
-    /// neither of them covers.
+    /// The canvas the fixtures below compose onto: a cropped, quarter-turned
+    /// span on the left (its red stripe rotated to the top of its rectangle
+    /// and its blue one to the bottom), a blue still inset on the right, and
+    /// green showing through everywhere neither of them covers.
+    ///
+    /// The span's source rectangle is deliberately *not* the whole frame: it
+    /// takes exactly the striped source's red and blue bands, which is what
+    /// makes the pixel assertions below fail for a dropped crop, a moved one,
+    /// or a missing transpose rather than only for a blank output.
     fn fixture_document(preset_id: &str) -> ComposeRequest {
         let span = ComposeItem {
             sha256: "a".repeat(64),
-            src: rect(0, 0, 400, 300),
+            src: rect(100, 0, 200, 300),
             transform: Transform {
                 quarter_turns: 1,
                 flip_h: false,
@@ -2060,9 +2475,9 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let red = dir.path().join("red.mp4");
+        let striped = dir.path().join("striped.mp4");
         let blue = dir.path().join("blue.mp4");
-        if !write_two_shade_clip(&red, "0xE00000", "0xA00000", 400, 300)
+        if !write_striped_clip(&striped, 400, 300)
             || !write_color_clip(&blue, "0x0000E0", 200, 200, 1.0)
         {
             return;
@@ -2080,7 +2495,7 @@ mod tests {
             let params = ComposeParams::new(doc, preset, encoder);
             let output = dir.path().join(format!("mosaic.{ext}"));
             let spec = super::super::run::ComposeJobSpec {
-                sources: vec![red.clone(), blue.clone()],
+                sources: vec![striped.clone(), blue.clone()],
                 output: output.clone(),
                 params,
             };
@@ -2118,9 +2533,16 @@ mod tests {
                 frame_of(&output, "1.0", &png)
                     .unwrap_or_else(|| panic!("{preset_id} decodes back to a frame"))
             };
+            // The first two are the crop-and-rotation assertions: with the
+            // source rectangle applied and the quarter turn after it, the red
+            // stripe is at the top of the span's rectangle and the blue one at
+            // the bottom. Without the crop both read green (the source's outer
+            // stripes rotate into those rows); without the transpose both read
+            // red (the stripes stay vertical, and x=40 is inside the red one).
             for (x, y, expected, what) in [
-                (80, 120, 'r', "the rotated span fills its rectangle"),
-                (240, 80, 'b', "the still fills its own"),
+                (40, 30, 'r', "the cropped red stripe, turned to the top"),
+                (40, 210, 'b', "and the blue one, turned to the bottom"),
+                (240, 80, 'b', "the still fills its own rectangle"),
                 (170, 230, 'g', "the background shows between them"),
                 (310, 220, 'g', "and outside them"),
             ] {
@@ -2130,6 +2552,168 @@ mod tests {
                     "{preset_id}: {what} ({x},{y})"
                 );
             }
+        }
+    }
+
+    /// One composition, run for real, and rendered from a single source
+    /// document. Shared by the two e2e assertions below, which differ only in
+    /// what they ask of the result.
+    fn compose_fixture(
+        dir: &Path,
+        document: &ComposeRequest,
+        sources: Vec<PathBuf>,
+        name: &str,
+    ) -> PathBuf {
+        let preset = preset(&document.output.preset);
+        let encoder = super::super::run::resolve_encoder(&preset, None);
+        let doc = resolve_compose(document, &preset, limits()).expect("a valid document");
+        let output = dir.join(format!("{name}.{}", preset.container.ext()));
+        let spec = super::super::run::ComposeJobSpec {
+            sources,
+            output: output.clone(),
+            params: ComposeParams::new(doc, preset, encoder),
+        };
+        super::super::run::run_compose(
+            &spec,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap_or_else(|err| panic!("{name} composes: {err}"));
+        output
+    }
+
+    /// An image item, end to end, against a source that is *animated*: a
+    /// two-frame GIF.
+    ///
+    /// This is the case the old `-loop 1 -framerate N` input options could not
+    /// survive — an endless demuxer stream, bounded only by a downstream filter
+    /// noticing, which for a container the demuxer cannot decode is never. The
+    /// chain must instead take the first decoded frame, freeze it for the whole
+    /// output, and terminate. That the *first* frame is what is held (red, not
+    /// the blue one after it) is the half of the assertion a merely-terminating
+    /// encode would not give. Skips (never fails) where there is no ffmpeg.
+    #[test]
+    fn an_animated_image_item_freezes_its_first_frame_and_terminates() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let gif = dir.path().join("two-frame.gif");
+        if !write_two_frame_gif(&gif, 64, 64) {
+            return;
+        }
+
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-mp4".to_string(),
+                length: ComposeLength::LongestLoopOnce,
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                src: rect(0, 0, 64, 64),
+                transform: Transform::default(),
+                dest: rect(20, 20, 80, 80),
+                time: ItemTime::Image,
+                audio: false,
+            }],
+        };
+        let output = compose_fixture(dir.path(), &document, vec![gif], "gif-mosaic");
+
+        let (width, height, duration, frames) =
+            probe_artifact(&output).expect("the artifact is probeable");
+        assert_eq!((width, height), (160, 120));
+        assert!(frames > 1, "a frozen image still runs as a clip: {frames}");
+        // Nothing in the document has a duration, so the stills-only target is
+        // what the output must be.
+        let expected = STILLS_ONLY_TARGET_CS as f64 / 100.0;
+        assert!(
+            (duration - expected).abs() <= 2.0 / 25.0,
+            "the frozen image runs for the resolved target: {duration} vs {expected}"
+        );
+
+        let png = dir.path().join("gif-mosaic.png");
+        let frame = frame_of(&output, "0.5", &png).expect("the artifact decodes back to a frame");
+        assert_eq!(
+            primary(&frame, 60, 60),
+            Some('r'),
+            "the *first* GIF frame is what is held, not the blue one after it"
+        );
+        assert_eq!(
+            primary(&frame, 10, 110),
+            Some('g'),
+            "and the background shows outside its rectangle"
+        );
+    }
+
+    /// The longest span looping to fill a `cap{}` target, end to end.
+    ///
+    /// The pass count is arithmetic over durations rather than over rounded-up
+    /// frame counts, and the difference is exactly this: an output that is the
+    /// length its own cache key promises, rather than one that stops short.
+    /// Skips (never fails) where there is no ffmpeg.
+    #[test]
+    fn a_span_shorter_than_the_cap_loops_to_fill_it() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let striped = dir.path().join("striped.mp4");
+        if !write_striped_clip(&striped, 400, 300) {
+            return;
+        }
+
+        // One second of source into a three-second output: the only span in
+        // the document is also the shortest, so it loops rather than defining
+        // the length.
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-mp4".to_string(),
+                length: ComposeLength::Cap { seconds: 3.0 },
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                src: rect(100, 0, 200, 300),
+                transform: Transform::default(),
+                dest: rect(0, 0, 80, 120),
+                time: ItemTime::Span {
+                    start_cs: 0,
+                    end_cs: 100,
+                },
+                audio: false,
+            }],
+        };
+        let output = compose_fixture(dir.path(), &document, vec![striped], "looped");
+
+        let (width, height, duration, _frames) =
+            probe_artifact(&output).expect("the artifact is probeable");
+        assert_eq!((width, height), (160, 120));
+        assert!(
+            (duration - 3.0).abs() <= 2.0 / 25.0,
+            "the looped span fills the whole cap: {duration} vs 3.0"
+        );
+
+        // Well past the first pass, so the pixels below are ones the loop
+        // produced rather than ones the source did.
+        let png = dir.path().join("looped.png");
+        let frame = frame_of(&output, "2.5", &png).expect("the artifact decodes back to a frame");
+        for (x, y, expected, what) in [
+            (20, 60, 'r', "the crop's red stripe"),
+            (60, 60, 'b', "and its blue one"),
+            (120, 60, 'g', "with the background beside them"),
+        ] {
+            assert_eq!(primary(&frame, x, y), Some(expected), "{what} ({x},{y})");
         }
     }
 }

@@ -169,16 +169,36 @@ pub(crate) struct TranscodePresetInfo {
     pub ext: String,
     pub channel: Channel,
     pub surfaces: Vec<Surface>,
+    /// Cap on output height in pixels; `null` keeps the source height.
+    ///
+    /// Carried because it is a *rejection*: a composition whose canvas is
+    /// taller than this is refused outright (`canvas_over_preset_height`)
+    /// rather than rescaled, so a client that cannot see the number can only
+    /// discover it by having a document turned away. Its `fps_max` twin is
+    /// deliberately **not** here, for the same reason inverted: an over-cap
+    /// frame rate is silently capped, never refused, so there is nothing a
+    /// client could do with it but mirror a value that changes nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<i64>,
 }
 
 /// Composition limits, carried alongside the presets so a client builder
-/// clamps against live config instead of mirrored constants.
+/// clamps against what this server enforces instead of mirrored constants.
+///
+/// Deliberately *not* only the config values: the canvas and frame-rate bounds
+/// are code constants (`compose.rs`), and a client that has to guess them is in
+/// exactly the position this envelope exists to prevent. Where a limit comes
+/// from is the server's business; that the client has the number is the point.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct TranscodeLimits {
     pub max_mosaic_inputs: usize,
     pub max_mosaic_loop_mb: u64,
     pub max_animated_image_seconds: u64,
     pub max_output_seconds: u64,
+    pub min_canvas_side: i64,
+    pub max_canvas_side: i64,
+    pub max_canvas_area: i64,
+    pub max_compose_fps: u32,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -384,9 +404,10 @@ fn submit_response(outcome: SubmitOutcome) -> Response<Body> {
         (status = 404, description = "An item is not in this database, or has no readable file"),
         (status = 422, description = "Unknown preset, or a document the composition limits \
             refuse: too many items, a canvas that is odd/too large/taller than the preset \
-            renders, a destination rectangle outside the canvas or on an odd pixel, a span \
-            whose end is not after its start, an unusable frame rate or length cap, or loop \
-            buffers over `max_mosaic_loop_mb` (the message carries the estimate)")
+            renders, a destination rectangle outside the canvas or at an odd position, a span \
+            whose end is not after its start, a still frozen at or past its item's recorded \
+            length, an unusable frame rate or length cap, or loop buffers over \
+            `max_mosaic_loop_mb` (the message carries the estimate)")
     )
 )]
 pub async fn video_compose(
@@ -404,7 +425,14 @@ pub async fn video_compose(
     // on a composition that is perfectly fine.
     let mut sources = Vec::with_capacity(doc.items.len());
     for item in &doc.items {
-        sources.push(resolve_item_path(&mut db, &item.sha256).await?);
+        let source = resolve_item_source(&mut db, &item.sha256).await?;
+        // The one admission rule the document could not decide on its own: a
+        // still's timestamp is only past the end relative to a length the
+        // index database holds. Refused here, by name, while the answer can
+        // still say which pin to fix — at dispatch it would fail the whole
+        // graph instead.
+        compose::validate_still_bounds(item, source.duration).map_err(compose_rejection)?;
+        sources.push(source.path);
     }
     drop(db);
 
@@ -683,6 +711,10 @@ pub async fn video_presets(
             max_mosaic_loop_mb: transcode.max_mosaic_loop_mb,
             max_animated_image_seconds: transcode.max_animated_image_seconds,
             max_output_seconds: transcode.max_output_seconds,
+            min_canvas_side: compose::MIN_CANVAS_SIDE,
+            max_canvas_side: compose::MAX_CANVAS_SIDE,
+            max_canvas_area: compose::MAX_CANVAS_AREA,
+            max_compose_fps: compose::MAX_COMPOSE_FPS,
         },
     }))
 }
@@ -785,6 +817,13 @@ struct ResolvedSource {
     /// See [`download_stem`]: the item's name for downloads, which is not the
     /// name of [`Self::file`] unless that is also the item's first file.
     download_stem: Option<String>,
+}
+
+/// What one composition item resolves to: the file ffmpeg is handed, and the
+/// item's recorded duration (`None` when the index has none).
+struct ComposeItemSource {
+    path: std::path::PathBuf,
+    duration: Option<f64>,
 }
 
 /// What the artifact-serving path needs out of the index database: the hash
@@ -994,30 +1033,30 @@ async fn resolve_source(
     })
 }
 
-/// The encode input for one composition item.
+/// The encode input for one composition item, and the recorded length the
+/// still-timestamp rule is judged against.
 ///
 /// Its two failures name the hash, unlike the single-file path's: a mosaic of
 /// a dozen pins answered with a bare "Item not found" tells the client nothing
 /// about which pin to drop.
-async fn resolve_item_path(
+async fn resolve_item_source(
     db: &mut DbConnection<ReadOnlyNoUserData>,
     sha256: &str,
-) -> ApiResult<std::path::PathBuf> {
+) -> ApiResult<ComposeItemSource> {
     let metadata =
         get_item_metadata_unchecked(&mut db.conn, sha256, ItemIdentifierType::Sha256).await?;
-    if metadata.item.is_none() {
+    let Some(item) = metadata.item else {
         return Err(ApiError::not_found(format!(
             "Composition item {sha256} is not in this database"
         )));
-    }
-    first_readable_file(metadata.files)
-        .await
-        .map(|file| std::path::PathBuf::from(file.path))
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "No readable file for composition item {sha256}"
-            ))
-        })
+    };
+    let file = first_readable_file(metadata.files).await.ok_or_else(|| {
+        ApiError::not_found(format!("No readable file for composition item {sha256}"))
+    })?;
+    Ok(ComposeItemSource {
+        path: file.path.into(),
+        duration: item.duration,
+    })
 }
 
 /// The first of an item's files that is on this machine right now.
@@ -1166,6 +1205,7 @@ fn preset_info(preset: &ResolvedPreset) -> TranscodePresetInfo {
         ext: preset.container.ext().to_string(),
         channel: preset.channel,
         surfaces: preset.surfaces.clone(),
+        max_height: preset.max_height,
     }
 }
 
@@ -1609,8 +1649,25 @@ transcode_presets = ["playback"]
         assert_eq!(json["presets"][0]["channel"], "fast");
         assert_eq!(json["presets"][0]["surfaces"][0], "playback");
         assert_eq!(json["presets"][3]["ext"], "webp");
+        // The preset's height cap rides along because it is a *rejection*: a
+        // canvas taller than it is refused rather than rescaled, so a client
+        // that cannot see it discovers it only by being turned away. Presets
+        // with no cap carry no key rather than a null.
+        assert_eq!(json["presets"][0]["max_height"], 1080);
+        assert_eq!(json["presets"][3]["max_height"], 720);
+        assert!(
+            json["presets"][1].get("max_height").is_none(),
+            "`clip` is uncapped: {}",
+            json["presets"][1]
+        );
+        // `fps_max` is deliberately absent from the DTO: an over-cap frame
+        // rate is silently capped, never refused, so there is nothing a client
+        // could do with the number.
+        assert!(json["presets"][0].get("fps_max").is_none());
+
         // The compose limits ride along, so a client builder clamps against
-        // live config rather than mirrored constants.
+        // what this server enforces rather than mirrored constants — the
+        // config-backed ones and the code constants alike.
         let transcode = &crate::config::runtime().transcode;
         assert_eq!(
             json["limits"]["max_mosaic_inputs"],
@@ -1620,6 +1677,10 @@ transcode_presets = ["playback"]
             json["limits"]["max_output_seconds"],
             transcode.max_output_seconds
         );
+        assert_eq!(json["limits"]["min_canvas_side"], compose::MIN_CANVAS_SIDE);
+        assert_eq!(json["limits"]["max_canvas_side"], compose::MAX_CANVAS_SIDE);
+        assert_eq!(json["limits"]["max_canvas_area"], compose::MAX_CANVAS_AREA);
+        assert_eq!(json["limits"]["max_compose_fps"], compose::MAX_COMPOSE_FPS);
 
         let limited = Router::new()
             .route("/api/video/presets", get(video_presets))
@@ -2641,6 +2702,44 @@ transcode_presets = ["playback"]
         .expect_err("rejected");
         assert!(err.detail().contains(&missing), "{}", err.detail());
         assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A still frozen at or past its item's recorded length is refused here,
+    /// naming the pin. It is the one admission rule the document alone cannot
+    /// decide — the length lives in the index database — and letting it
+    /// through would seek past every frame there is, failing the *whole* graph
+    /// at dispatch with nothing to say which of a dozen pins caused it.
+    #[tokio::test]
+    async fn a_still_past_its_items_length_is_refused_by_name() {
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+
+        // The fixture items are 12 s long.
+        for at_cs in [1200, 1500] {
+            let body = compose_body(vec![compose_item(
+                MOSAIC_A,
+                (0, 0, 160, 240),
+                serde_json::json!({ "kind": "still", "at_cs": at_cs }),
+            )]);
+            let (db, _attached) = compose_fixture_db(fixtures.path()).await;
+            let err = video_compose(
+                State(test_state(&settings)),
+                Extension(test_context("local")),
+                db,
+                Json(body),
+            )
+            .await
+            .expect_err("rejected");
+            assert!(err.detail().contains(MOSAIC_A), "{}", err.detail());
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "at_cs {at_cs}"
+            );
+        }
+        // The admitted side of the rule needs no case of its own: the route
+        // test above composes a still at 0.50 s of the same 12 s item.
     }
 
     /// The document-level rejections, which all land before any item is

@@ -174,6 +174,20 @@ impl JobRequest {
         }
     }
 
+    /// Whether a failed encode of this job is a verdict worth remembering.
+    ///
+    /// Only a single file's is. A composition's key hashes N inputs, so one
+    /// transient failure among them — a mount that dropped, a file replaced
+    /// mid-encode, a source another process was still writing — would put a
+    /// strike against the *whole* document, and two of those would refuse
+    /// every later attempt at a mosaic that is perfectly renderable. There is
+    /// no per-input verdict to record instead (the failure is ffmpeg's on the
+    /// graph, not on any one item), so a composition is simply always
+    /// retryable.
+    fn records_failures(&self) -> bool {
+        matches!(self, JobRequest::Single { .. })
+    }
+
     fn preset(&self) -> &ResolvedPreset {
         match self {
             JobRequest::Single { params, .. } => &params.preset,
@@ -731,16 +745,18 @@ async fn run_one(
         }
         Ok(Err(EncodeError::Failed(detail))) => {
             // ffmpeg ran and refused: the two-strike negative cache decides
-            // whether a later submit is short-circuited.
-            if let Err(err) = cache
-                .record_failure(
-                    &job.cache_key(),
-                    &job.source_sha256(),
-                    &job.preset().id,
-                    &detail,
-                    job.transcoder_version(),
-                )
-                .await
+            // whether a later submit is short-circuited — for the jobs whose
+            // failure is a verdict at all (see `records_failures`).
+            if job.records_failures()
+                && let Err(err) = cache
+                    .record_failure(
+                        &job.cache_key(),
+                        &job.source_sha256(),
+                        &job.preset().id,
+                        &detail,
+                        job.transcoder_version(),
+                    )
+                    .await
             {
                 tracing::warn!(error = %err, "failed to record a transcode verdict");
             }
@@ -1439,55 +1455,7 @@ mod tests {
     /// past the light threshold — holding the pool while it runs.
     #[tokio::test]
     async fn a_composition_is_keyed_by_its_document_and_holds_the_pool() {
-        use crate::media_tools::transcode::compose::{
-            ComposeItem, ItemTime, Rect, ResolvedCompose, Transform,
-        };
-
-        let doc = ResolvedCompose {
-            canvas_w: 320,
-            canvas_h: 240,
-            background: "0x000000".to_string(),
-            fps: 25,
-            target_cs: 500,
-            items: (0..2)
-                .map(|index| ComposeItem {
-                    sha256: "a".repeat(64),
-                    src: Rect {
-                        x: 0,
-                        y: 0,
-                        w: 320,
-                        h: 240,
-                    },
-                    transform: Transform::default(),
-                    dest: Rect {
-                        x: index * 160,
-                        y: 0,
-                        w: 160,
-                        h: 240,
-                    },
-                    time: ItemTime::Image,
-                    audio: false,
-                })
-                .collect(),
-        };
-        let preset = find_preset(&builtin_presets(), "mosaic-mp4")
-            .expect("a built-in")
-            .clone();
-        let compose = SubmitRequest {
-            job: JobRequest::Compose {
-                params: Box::new(ComposeParams::new(
-                    doc,
-                    preset,
-                    ENCODER_X264_QUALITY.to_string(),
-                )),
-                sources: vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")],
-            },
-            weight: JobWeight::Exclusive,
-            // Deliberately set: a composition has no single source, so its
-            // name must ignore this.
-            download_stem: Some("some-pin".to_string()),
-        };
-
+        let compose = compose_request(JobWeight::Exclusive);
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
         let gate = Arc::new(Gate::default());
         let pool = TestPool::new(parked_runner(started_tx, Arc::clone(&gate)), 2).await;
@@ -1593,6 +1561,97 @@ mod tests {
             other => panic!("expected a known failure, got {}", other.as_str()),
         }
         assert_eq!(outcome.as_str(), "known_failure");
+    }
+
+    /// A composition, as a submit. Two items, one document, the fixed
+    /// composition download name.
+    fn compose_request(weight: JobWeight) -> SubmitRequest {
+        use crate::media_tools::transcode::compose::{
+            ComposeItem, ItemTime, Rect, ResolvedCompose, Transform,
+        };
+
+        let doc = ResolvedCompose {
+            canvas_w: 320,
+            canvas_h: 240,
+            background: "0x000000".to_string(),
+            fps: 25,
+            target_cs: 500,
+            items: (0..2)
+                .map(|index| ComposeItem {
+                    sha256: "a".repeat(64),
+                    src: Rect {
+                        x: 0,
+                        y: 0,
+                        w: 320,
+                        h: 240,
+                    },
+                    transform: Transform::default(),
+                    dest: Rect {
+                        x: index * 160,
+                        y: 0,
+                        w: 160,
+                        h: 240,
+                    },
+                    time: ItemTime::Image,
+                    audio: false,
+                })
+                .collect(),
+        };
+        let preset = find_preset(&builtin_presets(), "mosaic-mp4")
+            .expect("a built-in")
+            .clone();
+        SubmitRequest {
+            job: JobRequest::Compose {
+                params: Box::new(ComposeParams::new(
+                    doc,
+                    preset,
+                    ENCODER_X264_QUALITY.to_string(),
+                )),
+                sources: vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")],
+            },
+            weight,
+            // Deliberately set: a composition has no single source, so its
+            // name must ignore this.
+            download_stem: Some("some-pin".to_string()),
+        }
+    }
+
+    /// A composition's failures are never recorded, however many of them there
+    /// are: its key hashes N inputs, so one transient failure among them —
+    /// a dropped mount, a file another process was still writing — would put a
+    /// strike against the whole document and two would refuse it forever.
+    /// There is no per-input verdict to record instead, so the answer is that a
+    /// composition is always retryable. Single files are unchanged, which is
+    /// what the test above asserts.
+    #[tokio::test]
+    async fn a_composition_never_earns_a_negative_verdict() {
+        let runner: EncodeRunner = Arc::new(|_spec, _cancel, _progress| {
+            Err(EncodeError::Failed("one input was unreadable".to_string()))
+        });
+        let pool = TestPool::new(runner, 1).await;
+
+        for attempt in 0..3 {
+            let outcome = pool.submit(compose_request(JobWeight::Light)).await;
+            assert!(
+                matches!(outcome, SubmitOutcome::Created(_)),
+                "attempt {attempt} must run rather than short-circuit, got {}",
+                outcome.as_str()
+            );
+            assert_eq!(
+                pool.await_terminal(&job_id(&outcome)).await,
+                TranscodeJobEvent::Failed {
+                    error: "one input was unreadable".to_string(),
+                    cancelled: false
+                }
+            );
+        }
+        assert!(
+            pool.cache
+                .known_failure(&compose_request(JobWeight::Light).job.cache_key())
+                .await
+                .is_none(),
+            "three failures, and still nothing recorded against the document"
+        );
     }
 
     /// The whole pipeline against the real toolchain: a lavfi fixture is
