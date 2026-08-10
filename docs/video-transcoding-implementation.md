@@ -794,6 +794,33 @@ clips but denies mosaics must hide exactly these — AND at least one
 in-scope video pin (metadata cache; DOM `data-playable` fallback), so a
 stills-only board shows no animated rows.
 
+**C9. What the animated save gets right, and where it deliberately
+differs from the canvas one** (recorded at the final review of the UI
+half). Two divergences are ACCEPTED and will not be chased: the animated
+export has **square corners** — the canvas mosaic's rounded-corner
+clipping has no cheap filtergraph equivalent, and faking it per item
+would cost an alpha chain per input for a few pixels of styling — and it
+**skips** a pin it cannot resolve where the canvas draws a grey
+placeholder tile, because a video graph has no equivalent of "draw
+nothing here and carry on"; the omission is counted in the completion
+toast instead. Two divergences were BUGS and are fixed. (1) *Edge clip*:
+a pin the visible-extent fold (or the even canvas, or the board's right
+edge) crosses gets a shorter destination rect, and `scale` obeys whatever
+rect it is handed — so the whole frame was being squashed into it, where
+the canvas simply clips the bitmap. `clipPinDrawToCanvas`
+(lib/pinboardCompose.ts) now intersects the dest with the canvas in
+DISPLAY space and maps the retained sub-rectangle through the same
+`sourceRect` the full crop goes through, which carries the cut onto
+whichever source axis and side the pin's D4 element sends it to (a bottom
+cut is a right-of-source cut at `quarter_turns` 1); a pin left with two
+pixels or less on either axis is skipped and counted. (2) *Loop memory*:
+`check_loop_memory`'s estimate is now mirrored client-side
+(`estimateLoopBytes` + `composeTargetCs`) and run inside the builder's
+clamp loop, so a twelve-pin board of short clips comes back as a smaller
+mosaic rather than as a 422 — same "re-solve, never allocate" mechanism
+as the canvas-area clamp, reported through the same `clampedWidth`
+receipt.
+
 Order: C1→C2→C3→C4 strictly; C5-C6 parallel with C1-C4; C7-C8 need C4.
 
 ## 5. Cross-phase notes
