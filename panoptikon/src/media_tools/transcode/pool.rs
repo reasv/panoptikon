@@ -790,22 +790,24 @@ async fn publish(
     let key = job.cache_key();
     let file_name = job.artifact_file_name();
     let source_sha256 = job.source_sha256();
+    // Computed once and used twice: the row and this response must carry the
+    // same name, or a later share of the cached artifact would disagree with
+    // the download the submitter was just handed.
+    let download_name = job.download_file_name(download_stem);
     let new = NewArtifact {
         key: &key,
         source_sha256: &source_sha256,
         params_hash: &job.params_hash(),
         preset: &job.preset().id,
         file_name: &file_name,
+        download_name: &download_name,
         mime_type: job.mime_type(),
         transcoder_version: job.transcoder_version(),
     };
     match cache.commit(new, temp).await {
         // The same name a cache hit for this key would have carried: both
         // sides build it from the caller's stem, never from the encode input.
-        Ok(artifact) => JobOutcome::Done(ArtifactRef::new(
-            &artifact,
-            job.download_file_name(download_stem),
-        )),
+        Ok(artifact) => JobOutcome::Done(ArtifactRef::new(&artifact, download_name)),
         // A cache that cannot store the bytes is this machine's problem, not
         // a verdict on the file: deliberately not recorded as a failure.
         Err(err) => {

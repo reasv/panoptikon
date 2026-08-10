@@ -984,7 +984,7 @@ fn validate_animated_duration(
     duration: Option<f64>,
     max_seconds: u64,
 ) -> ApiResult<()> {
-    if container != Container::Webp {
+    if !container.is_animated_image() {
         return Ok(());
     }
     let Some(seconds) = expected_output_seconds(start_cs, end_cs, duration) else {
@@ -1434,6 +1434,11 @@ mod tests {
         let webp = |start_cs, end_cs, duration| {
             validate_animated_duration(Container::Webp, start_cs, end_cs, duration, 30)
         };
+        // Avif is the other animated-image container, capped identically.
+        assert!(
+            validate_animated_duration(Container::Avif, None, None, Some(45.0), 30).is_err()
+        );
+        assert!(validate_animated_duration(Container::Avif, None, Some(1200), None, 30).is_ok());
         // Under the cap, both ways of knowing the window.
         assert!(webp(Some(100), Some(600), Some(600.0)).is_ok());
         assert!(webp(None, None, Some(12.0)).is_ok());
@@ -1640,6 +1645,7 @@ transcode_presets = ["playback"]
                 "clip",
                 "clip-fast",
                 "webp-anim",
+                "avif-anim",
                 "mosaic-mp4",
                 "mosaic-mp4-fast",
                 "mosaic-webm",
@@ -1730,6 +1736,7 @@ transcode_presets = ["playback"]
                     params_hash: "hash",
                     preset: "clip",
                     file_name: "api-cache-test.mp4",
+                    download_name: "api-cache-test.mp4",
                     mime_type: "video/mp4",
                     transcoder_version: 1,
                 },
@@ -1828,6 +1835,7 @@ transcode_presets = ["playback"]
                     params_hash: "hash",
                     preset: "clip-fast",
                     file_name: "abcdef0123456789-2f2f2f2f.mp4",
+                    download_name: "abcdef01-clip.mp4",
                     mime_type: "video/mp4",
                     transcoder_version: 1,
                 },
@@ -1930,6 +1938,7 @@ transcode_presets = ["playback"]
                     params_hash: "hash",
                     preset: "clip",
                     file_name: &format!("{key}.mp4"),
+                    download_name: &format!("{key}.mp4"),
                     mime_type: "video/mp4",
                     transcoder_version: 1,
                 },
@@ -2190,6 +2199,7 @@ transcode_presets = ["playback"]
                     params_hash: "hash",
                     preset: "clip",
                     file_name: &format!("{key}.mp4"),
+                    download_name: &format!("{key}.mp4"),
                     mime_type: "video/mp4",
                     transcoder_version: 1,
                 },
@@ -2480,6 +2490,7 @@ transcode_presets = ["playback"]
                         params_hash: "hash",
                         preset: preset_id,
                         file_name: &format!("{key}.{ext}"),
+                        download_name: &format!("{key}.{ext}"),
                         mime_type: mime,
                         transcoder_version: 1,
                     },
@@ -2621,6 +2632,7 @@ transcode_presets = ["playback"]
                     params_hash: "hash",
                     preset: "mosaic-mp4",
                     file_name: &format!("{key}.mp4"),
+                    download_name: &format!("{key}.mp4"),
                     mime_type: "video/mp4",
                     transcoder_version: 1,
                 },

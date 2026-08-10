@@ -282,6 +282,13 @@ fn touch(path: &Path) {
 
 /// Reduces a browser-supplied filename to one safe path component.
 ///
+/// **Mirrored by `sanitize_share_name` in the server's
+/// `panoptikon/src/media_tools/transcode/cache.rs`** (the transcode cache
+/// names its own share entries the same way, and the two must agree — a name
+/// that differs between them turns a paste into a file the user did not
+/// expect). Any rule changed here has to be changed there; the duplication is
+/// deliberate, the two crates have no dependency edge.
+///
 /// Path separators, NULs and other control characters are dropped rather than
 /// substituted, `%` is mapped to `_` (see [`strip_unsafe`]), trailing dots and
 /// spaces are trimmed (Windows silently strips them, which would desynchronize
