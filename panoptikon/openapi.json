@@ -5338,6 +5338,9 @@
           },
           "416": {
             "description": "Requested range not satisfiable"
+          },
+          "422": {
+            "description": "Unknown preset, or trim bounds that name a freeze frame rather than a clip (the resolvable form validates exactly as the POST does)"
           }
         }
       }
@@ -5618,6 +5621,9 @@
           },
           "404": {
             "description": "No such item, no readable file for it, or no detected outro"
+          },
+          "422": {
+            "description": "Unknown preset, an unusable trim window (bounds that name a freeze frame rather than a clip, a start bound past the end of the item, or a start bound at or past the resolved outro cut), or an unknown/conflicting `cut`"
           }
         }
       }

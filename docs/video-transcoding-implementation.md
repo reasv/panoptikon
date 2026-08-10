@@ -102,7 +102,8 @@ pub(crate) struct TranscodeParams {      // pinned-fixture test guards drift
 pub(crate) enum TranscodeJobEvent {      // SSE payload AND snapshot body;
     Queued  { position: usize },         // generic so jobs/queue.rs can adopt it
     Running { progress: Option<f32> },
-    Done    { artifact: ArtifactRef },   // ArtifactRef { key, mime_type, size_bytes, url }
+    Done    { artifact: ArtifactRef },   // ArtifactRef { key, mime_type, size_bytes,
+                                         //               url, filename } — see §3 S3
     Failed  { error: String, cancelled: bool },
 }
 ```
@@ -436,17 +437,25 @@ float centiseconds.
 
 **S3. Artifact download semantics**: per §0.2 the GET never starts jobs;
 Content-Disposition `inline` with the transcode filename (server-side:
-first file's stem + `-clip` when trimmed else `-{preset_id}` + preset ext;
-pathless → `{sha[..10]}-clip.{ext}`); the `<a download>` attribute carries
-the authoritative UTF-8 name (house convention, ImageGallery.tsx:897).
-IMPLEMENTED with one addition: because `ArtifactRef.url` is the `key=` form
-— which knows neither the source's path nor whether the request was
-trimmed — `ArtifactRef` gained a **`filename`** field carrying that same
-server-computed name, on both the cache hit and the SSE `Done` event. The
-`key=` GET keeps its hash-prefix disposition name (a key cannot know about
-trims); the resolvable GET form is unchanged. **U6 is therefore a
-pass-through**: hand `artifact.filename` to `<a download>` rather than
-re-deriving a name client-side (§0.4 precedent).
+**first file's stem** + `-clip` when trimmed else `-{preset_id}` + preset
+ext; pathless → `{sha[..10]}-clip.{ext}`); the `<a download>` attribute
+carries the authoritative UTF-8 name (house convention,
+ImageGallery.tsx:897). IMPLEMENTED with one addition: because
+`ArtifactRef.url` is the `key=` form — which knows neither the source's path
+nor whether the request was trimmed — `ArtifactRef` gained a **`filename`**
+field carrying that same server-computed name, on both the cache hit and the
+SSE `Done` event. The `key=` GET keeps its hash-prefix disposition name (a
+key cannot know about trims); the resolvable GET form is unchanged. **U6 is
+therefore a pass-through**: hand `artifact.filename` to `<a download>`
+rather than re-deriving a name client-side (§0.4 precedent).
+
+"First file's stem" is literal and shared: `api/video.rs::download_stem` is
+the single source for both the resolvable GET's `Content-Disposition` and the
+stem the POST hands the pool (`SubmitRequest.download_stem`), so naming never
+depends on *which* of an item's files was readable — `resolve_source` still
+picks the encode input on exactly that basis. The header itself is RFC 6266:
+a quoted, escaped Latin-1 fallback plus `filename*=UTF-8''…` when the name
+needs it (`api/utils.rs::content_disposition_value`).
 
 **S4. Tests**: `cut=outro` resolution (guard math, NULL→404,
 `write_detect_outros_config` gate flip both ways), exclusivity 422s,

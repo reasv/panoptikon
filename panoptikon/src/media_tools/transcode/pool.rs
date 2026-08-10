@@ -133,6 +133,16 @@ pub(crate) struct SubmitRequest {
     pub(crate) source_path: PathBuf,
     pub(crate) source_duration_s: Option<f64>,
     pub(crate) weight: JobWeight,
+    /// Stem the download name is built from, decided by the caller.
+    ///
+    /// Deliberately *not* derived from [`Self::source_path`]: that path is
+    /// whichever of the item's files turned out to be readable, so naming a
+    /// download after it would make the name depend on which copy of the same
+    /// content answered — including on whether a network mount happened to be
+    /// up. The API layer passes the item's first file's stem for both this and
+    /// the artifact route's `Content-Disposition`, so one item names its
+    /// downloads one way.
+    pub(crate) download_stem: Option<String>,
 }
 
 /// What a submit resolved to. Every variant except `Hit` carries a job the
@@ -227,6 +237,7 @@ struct PendingEncode {
     params: TranscodeParams,
     source_path: PathBuf,
     source_duration_s: Option<f64>,
+    download_stem: Option<String>,
 }
 
 struct JobEntry {
@@ -398,7 +409,9 @@ async fn submit_job(
     if let Some(artifact) = state.cache.lookup(&key).await {
         return SubmitOutcome::Hit(ArtifactRef::new(
             &artifact,
-            download_file_name(&request.params, &request.source_path),
+            request
+                .params
+                .download_file_name(request.download_stem.as_deref()),
         ));
     }
 
@@ -453,6 +466,7 @@ async fn submit_job(
             params: request.params,
             source_path: request.source_path,
             source_duration_s: request.source_duration_s,
+            download_stem: request.download_stem,
         }),
     };
     let snapshot = entry.snapshot();
@@ -576,6 +590,7 @@ async fn run_one(
     cancel: Arc<AtomicBool>,
 ) -> JobOutcome {
     let params = pending.params;
+    let download_stem = pending.download_stem;
     let temp = cache.temp_path(params.preset.container.ext());
     let spec = EncodeJobSpec {
         input: pending.source_path,
@@ -604,7 +619,7 @@ async fn run_one(
     let encoded = tokio::task::spawn_blocking(move || runner(encode_spec, cancel, progress)).await;
 
     let outcome = match encoded {
-        Ok(Ok(())) => publish(&cache, &params, &spec.input, &temp).await,
+        Ok(Ok(())) => publish(&cache, &params, download_stem.as_deref(), &temp).await,
         Ok(Err(EncodeError::Cancelled)) => JobOutcome::Failed {
             error: "cancelled".to_string(),
             cancelled: true,
@@ -654,17 +669,10 @@ async fn run_one(
     outcome
 }
 
-/// The download name for an artifact produced from `source_path`
-/// (implementation plan §3 S3), computed here so both a cache hit and a
-/// finished job's `Done` event carry the same one.
-fn download_file_name(params: &TranscodeParams, source_path: &std::path::Path) -> String {
-    params.download_file_name(super::path_stem(source_path).as_deref())
-}
-
 async fn publish(
     cache: &TranscodeCache,
     params: &TranscodeParams,
-    source_path: &std::path::Path,
+    download_stem: Option<&str>,
     temp: &std::path::Path,
 ) -> JobOutcome {
     let key = params.cache_key();
@@ -679,9 +687,11 @@ async fn publish(
         transcoder_version: params.transcoder_version,
     };
     match cache.commit(new, temp).await {
+        // The same name a cache hit for this key would have carried: both
+        // sides build it from the caller's stem, never from the encode input.
         Ok(artifact) => JobOutcome::Done(ArtifactRef::new(
             &artifact,
-            download_file_name(params, source_path),
+            params.download_file_name(download_stem),
         )),
         // A cache that cannot store the bytes is this machine's problem, not
         // a verdict on the file: deliberately not recorded as a failure.
@@ -817,10 +827,27 @@ pub(crate) async fn transcode_cache() -> ApiResult<Arc<TranscodeCache>> {
         .map(Arc::clone)
 }
 
+/// The runtime the process-global pool actor is started on.
+///
+/// In production that is simply the caller's — the server's runtime, which
+/// lives as long as the process. Under `cfg(test)` it is a runtime owned by
+/// the *process*, because an actor does not outlive the runtime it was spawned
+/// on and every `#[tokio::test]` builds (and drops) its own: without this, the
+/// pool would be a corpse for every test after the first one to touch it, and
+/// which test that is depends on scheduling. It stands in for exactly the
+/// property production gets for free.
+#[cfg(test)]
+fn pool_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Runtime::new().expect("a runtime for the process-global transcode pool")
+    })
+}
+
 pub(crate) async fn ensure_pool() -> ApiResult<ActorRef<PoolMsg>> {
     POOL.get_or_try_init(|| async {
         let cache = transcode_cache().await?;
-        let (actor, _handle) = Actor::spawn(
+        let start = Actor::spawn(
             Some("transcode-pool".to_string()),
             TranscodePool,
             PoolArgs {
@@ -830,9 +857,15 @@ pub(crate) async fn ensure_pool() -> ApiResult<ActorRef<PoolMsg>> {
                 terminal_ttl: TERMINAL_TTL,
                 terminal_capacity: TERMINAL_CAPACITY,
             },
-        )
-        .await
-        .map_err(|err| {
+        );
+        #[cfg(not(test))]
+        let started = start.await;
+        #[cfg(test)]
+        let started = pool_runtime()
+            .spawn(start)
+            .await
+            .expect("the pool spawn task");
+        let (actor, _handle) = started.map_err(|err| {
             tracing::error!(error = ?err, "failed to start the transcode pool");
             ApiError::internal("Failed to start the transcode pool")
         })?;
@@ -924,9 +957,12 @@ mod tests {
     fn request(params: TranscodeParams, weight: JobWeight) -> SubmitRequest {
         SubmitRequest {
             params,
-            source_path: PathBuf::from("source.mp4"),
+            // Deliberately a different name from the stem below: the download
+            // name follows the caller's stem, never the encode input.
+            source_path: PathBuf::from("readable-copy.mp4"),
             source_duration_s: Some(10.0),
             weight,
+            download_stem: Some("source".to_string()),
         }
     }
 
@@ -1108,7 +1144,9 @@ mod tests {
         assert_eq!(artifact.mime_type, "video/mp4");
         assert_eq!(artifact.url, format!("/api/video/artifact?key={}", artifact.key));
         // The download name is computed from the request, not from the key:
-        // the `key=` URL above could never carry the source's own name.
+        // the `key=` URL above could never carry the source's own name. And it
+        // follows the caller's stem rather than the encode input, whose name
+        // (`readable-copy.mp4`) is an accident of which copy was readable.
         assert_eq!(artifact.filename, "source-clip.mp4");
 
         let second = pool.submit(request(params("clip", None), JobWeight::Light)).await;
@@ -1394,6 +1432,7 @@ mod tests {
             source_path: source,
             source_duration_s: Some(7.0),
             weight: JobWeight::Light,
+            download_stem: Some("source".to_string()),
         };
 
         let first = pool.submit(request.clone()).await;

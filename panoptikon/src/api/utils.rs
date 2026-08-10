@@ -231,13 +231,77 @@ async fn stat_config(config_path: &Path) -> ConfigStat {
     }
 }
 
+/// A `Content-Disposition` header value, both halves of RFC 6266.
+///
+/// The quoted `filename=` is the fallback every client understands, so it
+/// stays Latin-1 and now escapes the two characters a `quoted-string` gives
+/// meaning to: an unescaped `"` in a file name ends the value early and hands
+/// the rest of the name to the parser as stray parameters, which is a silently
+/// truncated download rather than an ugly one. `filename*` carries the real
+/// name whenever the fallback cannot (anything non-ASCII, or a name that had
+/// to be escaped at all), percent-encoded per RFC 5987.
+///
+/// This names a *download*, not the response's identity: the UI's
+/// `<a download>` attribute remains the authoritative UTF-8 name (house
+/// convention), and this header is what a direct navigation gets.
 pub(crate) fn content_disposition_value(kind: &str, filename: &str) -> Option<header::HeaderValue> {
     let mut value = Vec::new();
     value.extend_from_slice(kind.as_bytes());
     value.extend_from_slice(b"; filename=\"");
-    value.extend_from_slice(&latin1_bytes(filename));
+    value.extend_from_slice(&quoted_fallback_bytes(filename));
     value.extend_from_slice(b"\"");
+    if !is_plain_ascii(filename) {
+        value.extend_from_slice(b"; filename*=UTF-8''");
+        value.extend_from_slice(rfc5987_encode(filename).as_bytes());
+    }
     header::HeaderValue::from_bytes(&value).ok()
+}
+
+/// Whether the quoted fallback can carry this name verbatim: printable ASCII
+/// with nothing a `quoted-string` would have to escape.
+fn is_plain_ascii(filename: &str) -> bool {
+    filename
+        .chars()
+        .all(|ch| ch.is_ascii() && !ch.is_ascii_control() && ch != '"' && ch != '\\')
+}
+
+/// The `quoted-string` half: Latin-1 (nothing else has a representation
+/// there), control characters dropped — a raw newline would make the whole
+/// header unconstructible, and dropping the header loses the name entirely —
+/// and `"`/`\` backslash-escaped.
+fn quoted_fallback_bytes(filename: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(filename.len() + 2);
+    for ch in filename.chars() {
+        let code = ch as u32;
+        if !(0x20..=0xFF).contains(&code) || code == 0x7F {
+            continue;
+        }
+        if ch == '"' || ch == '\\' {
+            out.push(b'\\');
+        }
+        out.push(code as u8);
+    }
+    out
+}
+
+/// RFC 5987 `ext-value`: `attr-char` passes through, everything else — spaces,
+/// quotes, `%`, and every byte of a non-ASCII character's UTF-8 — is
+/// percent-encoded.
+fn rfc5987_encode(filename: &str) -> String {
+    let mut out = String::with_capacity(filename.len());
+    for byte in filename.as_bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
+            out.push(*byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 pub(crate) fn strip_non_latin1_chars(input: &str) -> String {
@@ -281,19 +345,6 @@ pub(crate) fn iso_to_system_time(value: &str) -> Option<SystemTime> {
     }
 
     Some(UNIX_EPOCH + Duration::from_secs(seconds as u64))
-}
-
-fn latin1_bytes(value: &str) -> Vec<u8> {
-    value
-        .chars()
-        .filter_map(|ch| {
-            if (ch as u32) <= 0xFF {
-                Some(ch as u8)
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
@@ -395,6 +446,60 @@ mod tests {
         assert!(
             !serve_outro_metadata(index_db, true).await,
             "the rewritten file stamps differently, so it is re-read"
+        );
+    }
+
+    /// `Content-Disposition`, RFC 6266 both ways: a plain name is exactly the
+    /// old single-parameter header (the shape every pinned test expects),
+    /// while a name carrying `"`, `\` or non-ASCII characters still produces
+    /// **one constructible header** whose fallback is no longer truncated at
+    /// the quote — and gains the `filename*` that names the file for real.
+    #[test]
+    fn content_disposition_escapes_and_carries_the_utf8_name() {
+        let value = |filename: &str| {
+            let header = content_disposition_value("inline", filename)
+                .expect("the header value is constructible");
+            header.to_str().expect("ascii-safe for these cases").to_string()
+        };
+
+        assert_eq!(value("holiday-clip.mp4"), "inline; filename=\"holiday-clip.mp4\"");
+        assert_eq!(value("a b (1).mp4"), "inline; filename=\"a b (1).mp4\"");
+
+        // A quote used to end the value early, so everything after it was
+        // read as parameters and the download name was the truncated head.
+        assert_eq!(
+            value("say \"hi\".mp4"),
+            "inline; filename=\"say \\\"hi\\\".mp4\"; \
+             filename*=UTF-8''say%20%22hi%22.mp4"
+        );
+        assert_eq!(
+            value("back\\slash.mp4"),
+            "inline; filename=\"back\\\\slash.mp4\"; filename*=UTF-8''back%5Cslash.mp4"
+        );
+
+        // Non-ASCII: the fallback keeps what Latin-1 can hold, and `filename*`
+        // carries the whole name.
+        let japanese = content_disposition_value("inline", "休暇-clip.mp4")
+            .expect("a non-ASCII name still yields a header");
+        assert_eq!(
+            japanese.as_bytes(),
+            "inline; filename=\"-clip.mp4\"; \
+             filename*=UTF-8''%E4%BC%91%E6%9A%87-clip.mp4"
+                .as_bytes()
+        );
+        let accented = content_disposition_value("attachment", "café.mp4")
+            .expect("a Latin-1 name still yields a header");
+        assert_eq!(
+            accented.as_bytes(),
+            b"attachment; filename=\"caf\xE9.mp4\"; filename*=UTF-8''caf%C3%A9.mp4"
+        );
+
+        // A control character would make the header unconstructible, which
+        // would drop the name entirely; it is dropped from the fallback and
+        // encoded in `filename*` instead.
+        assert_eq!(
+            value("line\nbreak.mp4"),
+            "inline; filename=\"linebreak.mp4\"; filename*=UTF-8''line%0Abreak.mp4"
         );
     }
 
