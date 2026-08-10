@@ -3540,7 +3540,14 @@
             }
           },
           "404": {
-            "description": "No cached artifact for this key"
+            "description": "No cached artifact for this key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         }
       }
@@ -5875,7 +5882,7 @@
           },
           "path": {
             "type": "string",
-            "description": "The artifact's absolute path on the machine running this server.\n\nThe relay's mapping hint: when server and relay share a filesystem it\ncan take the file directly instead of streaming it back over HTTP.\n\nA deliberate, gated exposure of a server-side path. `ArtifactRef` only\nrides the `POST /api/video/transcode` and `POST /api/video/compose`\nresponses and the job snapshot/SSE shapes those two produce, all of\nwhich sit behind the `video_transcode`/`video_compose` capabilities —\na policy that grants either is already trusted with starting ffmpeg on\nthis host. The one artifact shape a *read-only* profile can reach is\n`GET /api/video/artifact`'s 404 body, whose `job` can never be `Done`:\nthe pool frees a key's `by_key` entry in the same actor message that\npublishes the terminal event, so a snapshot found by key is always\nstill queued or running."
+            "description": "The absolute path of this artifact's *share view* on the machine\nrunning this server — `share/<key>/<human name>`, the same path\n`POST /api/open/clipboard/artifact` resolves to for this\n[`Self::filename`].\n\nThe relay's mapping hint: when server and relay share a filesystem it\ncan take the file directly instead of streaming it back over HTTP.\n\n**It names the share view, not the raw artifact, and it may not exist\nyet.** The raw file is `<key>.<ext>`, a hash — a relay whose mapping\nresolved *that* would paste a content-addressed name while the toast\nand the server-copy route both promise the human one. Naming the share\nview instead makes both outcomes agree: a path the relay cannot resolve\n(or that has not been materialized) simply degrades to its\nbytes-required branch and the upload carries the same name, while a\nresolvable one lands on the human-named hardlink. The prediction is\nexact — `TranscodeCache::share_target` is deterministic for a given\n(artifact row, name), so a later `materialize_share` with this same\nname creates precisely this path.\n\nA deliberate, gated exposure of a server-side path. `ArtifactRef` only\nrides the `POST /api/video/transcode` and `POST /api/video/compose`\nresponses and the job snapshot/SSE shapes those two produce, all of\nwhich sit behind the `video_transcode`/`video_compose` capabilities —\na policy that grants either is already trusted with starting ffmpeg on\nthis host. The one artifact shape a *read-only* profile can reach is\n`GET /api/video/artifact`'s 404 body, whose `job` can never be `Done`:\nthe pool frees a key's `by_key` entry in the same actor message that\npublishes the terminal event, so a snapshot found by key is always\nstill queued or running."
           },
           "sha256": {
             "type": [

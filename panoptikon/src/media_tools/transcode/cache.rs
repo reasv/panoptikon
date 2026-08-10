@@ -423,6 +423,10 @@ impl TranscodeCache {
     /// unix extensions) fall back to a copy through a temporary, so a crash
     /// mid-copy can never leave a short file under the final name.
     ///
+    /// The entry's path is [`Self::share_target`]'s and nothing else's — the
+    /// two may never disagree, because `ArtifactRef::path` is that same
+    /// prediction handed out before anyone has asked for the bytes.
+    ///
     /// `download_name` is the *caller's* name for this request, and it wins
     /// over the stored one. The stored column is the first submitter's stem,
     /// and one cache key can be shared by several byte-identical sources — so
@@ -446,28 +450,7 @@ impl TranscodeCache {
         download_name: Option<&str>,
     ) -> Result<PathBuf> {
         let dir = self.share_dir(&artifact.key);
-        // Computed from the directory this entry lands in, not from the
-        // component limit alone: see [`share_name_ceiling`].
-        let ceiling = share_name_ceiling(&dir);
-        let name = download_name
-            .or(artifact.download_name.as_deref())
-            // Below the floor there is no room for a name worth reading, so
-            // the fallback below (short, and already known to fit next to the
-            // artifact) is the better answer than a two-character stem.
-            .filter(|_| ceiling >= MIN_SHARE_NAME_BYTES)
-            .and_then(|name| sanitize_share_name_within(name, ceiling))
-            // A pre-column row, or a name that sanitized away entirely: the
-            // on-disk `<key>.<ext>` is unlovely but it is a real name, and it
-            // is safe by construction (hex plus an extension).
-            .or_else(|| {
-                artifact
-                    .path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| artifact.key.clone());
-
-        let target = dir.join(&name);
+        let target = self.share_target(artifact, download_name);
         // Same key means the same bytes (the key is content-addressed on both
         // halves), so a full-size entry is already the right answer. A
         // *wrong*-size one is a truncated leftover from a crashed copy — the
@@ -499,6 +482,51 @@ impl TranscodeCache {
 
         copy_into_place(&artifact.path, &target, &dir).await?;
         Ok(target)
+    }
+
+    /// Where [`Self::materialize_share`] would put this artifact under this
+    /// name — computed, never created. No filesystem write, no directory, no
+    /// hardlink: a path that may or may not exist yet.
+    ///
+    /// It exists so the *prediction* and the *creation* cannot drift.
+    /// `ArtifactRef::path` is handed out at publish time, before anything has
+    /// asked for a share entry, and it must name the same file a later
+    /// `materialize_share` with the same name would produce — otherwise the
+    /// relay pastes the content-addressed `<key>.<ext>` while the toast and
+    /// the server-copy route both promise the human name. Deterministic for a
+    /// given (artifact row, name) pair, so the two always agree.
+    ///
+    /// The selection chain, in order: the caller's name for this request, else
+    /// the stored `download_name`, sanitized against this directory's budget;
+    /// if nothing survives, the artifact's own on-disk `<key>.<ext>`; if even
+    /// that is unreadable, the bare key.
+    pub(crate) fn share_target(
+        &self,
+        artifact: &CachedArtifact,
+        download_name: Option<&str>,
+    ) -> PathBuf {
+        let dir = self.share_dir(&artifact.key);
+        // Computed from the directory this entry lands in, not from the
+        // component limit alone: see [`share_name_ceiling`].
+        let ceiling = share_name_ceiling(&dir);
+        let name = download_name
+            .or(artifact.download_name.as_deref())
+            // Below the floor there is no room for a name worth reading, so
+            // the fallback below (short, and already known to fit next to the
+            // artifact) is the better answer than a two-character stem.
+            .filter(|_| ceiling >= MIN_SHARE_NAME_BYTES)
+            .and_then(|name| sanitize_share_name_within(name, ceiling))
+            // A pre-column row, or a name that sanitized away entirely: the
+            // on-disk `<key>.<ext>` is unlovely but it is a real name, and it
+            // is safe by construction (hex plus an extension).
+            .or_else(|| {
+                artifact
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| artifact.key.clone());
+        dir.join(name)
     }
 
     fn share_dir(&self, key: &str) -> PathBuf {
@@ -1725,6 +1753,70 @@ mod tests {
         // submitter's stem.
         let nameless = cache.materialize_share(&artifact, Some("///.")).await.unwrap();
         assert_eq!(nameless.file_name().unwrap().to_string_lossy(), "k1.mp4");
+    }
+
+    /// `share_target` is what `ArtifactRef::path` is built from, before any
+    /// share entry exists. It must name exactly the file `materialize_share`
+    /// would go on to create for the same inputs, on every arm of the
+    /// selection chain — a divergence would put a path on the wire that the
+    /// relay resolves to something other than the promised name (or to
+    /// nothing).
+    #[tokio::test]
+    async fn share_target_predicts_what_materialize_share_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_budget(dir.path(), 1024).await;
+
+        let temp = cache.temp_path("mp4");
+        let artifact = commit_named(&cache, "k1", b"share me", &temp, "first-submitter.mp4")
+            .await
+            .unwrap();
+
+        // The caller's name for this request.
+        let predicted = cache.share_target(&artifact, Some("this-request.mp4"));
+        assert!(!predicted.exists(), "the prediction writes nothing");
+        assert_eq!(
+            predicted.file_name().unwrap().to_string_lossy(),
+            "this-request.mp4"
+        );
+        assert_eq!(
+            cache
+                .materialize_share(&artifact, Some("this-request.mp4"))
+                .await
+                .unwrap(),
+            predicted
+        );
+
+        // No caller name: the stored column.
+        let predicted = cache.share_target(&artifact, None);
+        assert_eq!(
+            predicted.file_name().unwrap().to_string_lossy(),
+            "first-submitter.mp4"
+        );
+        assert_eq!(
+            cache.materialize_share(&artifact, None).await.unwrap(),
+            predicted
+        );
+
+        // A name that sanitizes away entirely: the on-disk `<key>.<ext>`.
+        let predicted = cache.share_target(&artifact, Some("///."));
+        assert_eq!(predicted.file_name().unwrap().to_string_lossy(), "k1.mp4");
+        assert_eq!(
+            cache.materialize_share(&artifact, Some("///.")).await.unwrap(),
+            predicted
+        );
+
+        // A row whose *stored* name is degenerate too: with no caller name to
+        // fall back from, both sides land on the artifact's own file name.
+        let temp = cache.temp_path("mp4");
+        let nameless = commit_named(&cache, "k2", b"unnamed", &temp, "///.")
+            .await
+            .unwrap();
+        let predicted = cache.share_target(&nameless, None);
+        assert_eq!(predicted.file_name().unwrap().to_string_lossy(), "k2.mp4");
+        assert_eq!(
+            cache.materialize_share(&nameless, None).await.unwrap(),
+            predicted
+        );
     }
 
     /// The copy fallback, which no test filesystem ever reaches through

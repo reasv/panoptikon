@@ -727,7 +727,7 @@ custom command can execute arbitrary code.",
     params(ClipboardArtifactQuery),
     responses(
         (status = 200, description = "Artifact copied to the host clipboard", body = OpenResponse),
-        (status = 404, description = "No cached artifact for this key")
+        (status = 404, description = "No cached artifact for this key", body = crate::api_error::ErrorBody)
     )
 )]
 pub async fn copy_artifact_to_clipboard_on_host(

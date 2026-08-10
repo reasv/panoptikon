@@ -83,10 +83,25 @@ pub(crate) struct ArtifactRef {
     /// every consumer must read that as "no integrity claim", never as a
     /// mismatch.
     pub(crate) sha256: Option<String>,
-    /// The artifact's absolute path on the machine running this server.
+    /// The absolute path of this artifact's *share view* on the machine
+    /// running this server — `share/<key>/<human name>`, the same path
+    /// `POST /api/open/clipboard/artifact` resolves to for this
+    /// [`Self::filename`].
     ///
     /// The relay's mapping hint: when server and relay share a filesystem it
     /// can take the file directly instead of streaming it back over HTTP.
+    ///
+    /// **It names the share view, not the raw artifact, and it may not exist
+    /// yet.** The raw file is `<key>.<ext>`, a hash — a relay whose mapping
+    /// resolved *that* would paste a content-addressed name while the toast
+    /// and the server-copy route both promise the human one. Naming the share
+    /// view instead makes both outcomes agree: a path the relay cannot resolve
+    /// (or that has not been materialized) simply degrades to its
+    /// bytes-required branch and the upload carries the same name, while a
+    /// resolvable one lands on the human-named hardlink. The prediction is
+    /// exact — `TranscodeCache::share_target` is deterministic for a given
+    /// (artifact row, name), so a later `materialize_share` with this same
+    /// name creates precisely this path.
     ///
     /// A deliberate, gated exposure of a server-side path. `ArtifactRef` only
     /// rides the `POST /api/video/transcode` and `POST /api/video/compose`
@@ -102,7 +117,17 @@ pub(crate) struct ArtifactRef {
 }
 
 impl ArtifactRef {
-    pub(crate) fn new(artifact: &CachedArtifact, filename: String) -> Self {
+    /// `cache` is here for [`Self::path`] alone: the share view's path is the
+    /// cache's to compute, and predicting it anywhere else would be the second
+    /// copy of a rule that must have exactly one.
+    pub(crate) fn new(
+        cache: &TranscodeCache,
+        artifact: &CachedArtifact,
+        filename: String,
+    ) -> Self {
+        // The *same* name this response carries, so the path names the file
+        // the client was just told it is getting.
+        let path = cache.share_target(artifact, Some(&filename));
         Self {
             key: artifact.key.clone(),
             mime_type: artifact.mime_type.clone(),
@@ -110,7 +135,7 @@ impl ArtifactRef {
             url: format!("/api/video/artifact?key={}", artifact.key),
             filename,
             sha256: artifact.sha256.clone(),
-            path: artifact.path.to_string_lossy().into_owned(),
+            path: path.to_string_lossy().into_owned(),
         }
     }
 }
@@ -553,6 +578,7 @@ async fn submit_job(
     // a warm rendition out of the eviction pass).
     if let Some(artifact) = state.cache.lookup(&key).await {
         return SubmitOutcome::Hit(ArtifactRef::new(
+            &state.cache,
             &artifact,
             request
                 .job
@@ -834,7 +860,7 @@ async fn publish(
     match cache.commit(new, temp).await {
         // The same name a cache hit for this key would have carried: both
         // sides build it from the caller's stem, never from the encode input.
-        Ok(artifact) => JobOutcome::Done(ArtifactRef::new(&artifact, download_name)),
+        Ok(artifact) => JobOutcome::Done(ArtifactRef::new(cache, &artifact, download_name)),
         // A cache that cannot store the bytes is this machine's problem, not
         // a verdict on the file: deliberately not recorded as a failure.
         Err(err) => {
@@ -1293,6 +1319,30 @@ mod tests {
         // follows the caller's stem rather than the encode input, whose name
         // (`readable-copy.mp4`) is an accident of which copy was readable.
         assert_eq!(artifact.filename, "source-clip.mp4");
+        // `path` is the *share view*, not the raw `<key>.<ext>` file: a relay
+        // that resolves it must land on the same human name the toast and the
+        // server-copy route promise.
+        let expected_share = pool
+            ._dir
+            .path()
+            .join("share")
+            .join(&artifact.key)
+            .join("source-clip.mp4");
+        assert_eq!(
+            std::path::Path::new(&artifact.path),
+            expected_share,
+            "the published path names share/<key>/<filename>"
+        );
+        // And it is a *prediction of the same rule*, not a parallel one:
+        // materializing that name creates precisely this path.
+        let cached = pool.cache.lookup(&artifact.key).await.unwrap();
+        assert_eq!(
+            pool.cache
+                .materialize_share(&cached, Some(&artifact.filename))
+                .await
+                .unwrap(),
+            expected_share
+        );
 
         let second = pool.submit(request(params("clip", None), JobWeight::Light)).await;
         match second {
@@ -1301,6 +1351,10 @@ mod tests {
                 assert_eq!(
                     hit.filename, artifact.filename,
                     "a cache hit names the download exactly as the job that filled it did"
+                );
+                assert_eq!(
+                    hit.path, artifact.path,
+                    "and points at the same share view the publishing job did"
                 );
             }
             other => panic!("expected a cache hit, got {}", other.as_str()),
