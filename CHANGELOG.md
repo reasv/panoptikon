@@ -6,6 +6,110 @@ Desktop release notes.
 
 ## [Unreleased]
 
+### Added
+
+- **Videos the browser cannot decode now play anyway.** Pressing play on such
+  a video (an HEVC capture, say) has the server convert it to a
+  browser-friendly MP4: you see your position in the conversion queue, then
+  live progress, and playback starts when the file is ready. Finished
+  conversions land in a shared on-disk cache with a configurable location and
+  size cap, so each video is converted once - not per viewer or per session.
+  - Conversion uses your GPU's hardware encoder when one actually works:
+    NVIDIA NVENC, AMD AMF, and Intel Quick Sync are validated with a real
+    one-frame test encode, because encoders often list as available but fail.
+    Software x264 is the fallback everywhere. The Docker images now request
+    the NVIDIA `video` driver capability, so NVENC works there out of the box.
+  - Every file's video and audio codec is now indexed as searchable item
+    metadata, exposed in the API and PQL; existing items are filled in by
+    their next scan.
+  - Access policies gained `video_transcode` and `video_compose` capabilities
+    gating the new `/api/video` endpoints.
+- **Any video - or any part of one - can be downloaded as a clip.** The
+  gallery player gained a download button and pin menus gained download rows:
+  export the current trim (or the whole video) as MP4, WebM, animated WebP,
+  or animated AVIF, as a quality preset or a fast preset that uses the
+  hardware encoder. If the video has a detected TikTok end card, exports cut
+  it off by default. Animated image formats are duration-capped. Custom
+  presets defined in the server config (`[transcode.profiles.<name>]`) appear
+  in the menus automatically.
+  - Animated AVIF is new alongside animated WebP: smaller files, and browsers
+    and Matrix animate it - but Discord shows it as a still, so WebP remains
+    the choice for Discord.
+  - A "Web version" row appears once a browser-playback conversion of the
+    video exists, so you can save the already-converted MP4 instead of
+    re-encoding from scratch.
+- **The video player was redesigned from scratch.** Gallery and pinboard
+  videos share one new control surface: a full-width timeline at the bottom
+  edge with a control row above it - play/pause, a volume slider that
+  remembers your level, a time readout, trim, fullscreen, and a menu with
+  playback speed (0.25x-2x), native controls, and Download original. The
+  surface fades out after a moment of cursor stillness and returns on
+  movement.
+  - Fullscreen works from the gallery and from any pin (F/Esc); arrow keys
+    keep navigating between items while fullscreen.
+  - Trimming, previously pinboard-only, now works in the gallery too: the
+    trim button opens a popover with Set start / Set end and one-frame
+    stepping. A gallery trim lives in the URL and is stamped onto any pin you
+    create from the item; later gallery edits leave the pin alone.
+  - Gallery keyboard map: Space/K play-pause, M mute, F fullscreen, I/O set
+    trim start/end (Shift clears), `,`/`.` frame-step, J/L seek 5s, `<`/`>`
+    playback speed, arrows navigate items.
+  - Clicking a playing gallery video toggles play/pause in the center strip
+    while the sides still navigate; images and idle videos keep the plain
+    navigation halves.
+- **Choose what happens when a gallery video ends.** A new player button
+  cycles between loop (the old behavior, still the default), stop, and
+  advance, which plays the next playable result when the video finishes and
+  continues across result pages.
+- **TikTok end cards are detected, kept out of thumbnails, and skipped in
+  playback.** A new TikTok Detection scan option recognizes the end card
+  TikTok appends to downloaded videos and records where the actual content
+  ends.
+  - Thumbnails and extracted analysis frames for affected videos are
+    regenerated to exclude the card, so grids stop showing black end cards.
+  - During playback the trim end defaults to the detected content end, so the
+    video loops before the card appears. A player toggle (a browser-wide
+    preference, on by default) turns the skip off, and a trim end you set
+    yourself always wins. The cut is marked on the timeline and the marker is
+    draggable. In Chromium the player measures the file's true end
+    frame-exactly with a quick probe, refining the cut shortly after load.
+  - Clip exports cut the card off by default, and the server can produce
+    outro-trimmed clips directly.
+  - `outro_kind` and `content_end_ms` are exposed as item metadata in the API
+    and PQL. Turning detection off makes both serve null everywhere at once -
+    the escape hatch if a video is misdetected.
+- **Pinboard mosaics can now be animated.** Exporting a board or selection
+  that contains videos can produce an animated WebP, MP4, or WebM instead of
+  a still: video pins play their trimmed segments in place (a playing pin
+  starts from its trim start; a stopped pin stays a freeze-frame), shorter
+  videos loop to fill the mosaic's duration, and MP4/WebM exports carry the
+  videos' audio mixed together.
+- **Pinboard image export now works on selections and single pins.**
+  Selecting pins and exporting produces a mosaic of exactly those pins, with
+  their arrangement preserved and the size presets meaning the output file's
+  width. A single pin exports its cropped picture at source resolution - an
+  uncropped image at original size downloads the exact original bytes, no
+  re-encode. Video pins export their currently displayed frame at full video
+  resolution. A new PNG option makes composites lossless, with transparent
+  gaps and letterboxing instead of the dark page background.
+- **Search results can scroll continuously instead of paging.** A toggle in
+  the results header switches the grid to one continuous list of the entire
+  result set: results load in windows around your position as you scroll, and
+  the scrollbar jumps anywhere - including into not-yet-loaded territory -
+  exactly. Switching modes keeps your place (the page you were on maps to the
+  same position in the scroll, and back), the gallery browses across the
+  whole result set, and the toggle can be saved as your default for new
+  sessions.
+- **Pinboards now know which database they belong to.** Boards record the
+  database whose content they hold when created or saved, and the pinboard
+  library (modal, sidebar, and the grid's Library tab) filters to the current
+  database's boards by default - a toggle shows everything again. Boards from
+  another database show a badge naming their owner, and opening one targets
+  that database, so it no longer opens as a grid of broken images. A board
+  whose items are all present in the current database counts as associated
+  automatically, each board has a Databases editor for correcting the record
+  by hand, and associated boards with missing files show how many of their
+  items are actually present.
 - **Transcoded videos and clips can be copied to the clipboard instead of
   downloaded.** The video download menus (the player's top-right split button
   and the pin context menu) gained a persistent "Copy, don't download" toggle,
@@ -44,6 +148,34 @@ Desktop release notes.
   - Endpoints paired with Relay before this release gained Copy File without
     re-approval, alongside the Open File and Show in Folder permissions they
     already had.
+- **Desktop releases now bundle PDFium**, so PDF support works out of the box
+  without a separately installed library.
+- **macOS now has first-class Desktop development scripts.** Developers can run
+  the isolated unpackaged app, build a dev app/DMG, and safely reset its local
+  profile with shell equivalents of the existing Windows workflows.
+
+### Changed
+
+- **HTML files are indexed only after they actually render.** HTML scanning
+  finds a Chromium-family browser on its own - Chrome, Chromium, Brave, or
+  Edge from PATH and their standard install locations (`jobs.html_renderer`
+  still overrides) - and a new HTML file is indexed only once its first
+  screenshot succeeds. A missing or failing browser now records an auditable
+  scan failure instead of silently producing a metadata-only item, and
+  installing a browser makes the blocked files eligible on the next scan
+  without a restart. Already-indexed HTML items are not removed if the
+  browser later becomes unavailable.
+- **Panoptikon Desktop now stays out of the macOS Dock while running in the
+  background.** Its Dock and application-switcher entry appears while a native
+  setup, settings, Relay, or update window is visible, then disappears when the
+  last such window closes. The menu-bar icon remains available throughout.
+- The first launch after upgrading migrates each database's schema (codec
+  columns, outro metadata, database identity) and refreshes query-planner
+  statistics; expect it to take somewhat longer than usual on large
+  databases, once.
+
+### Fixed
+
 - **Custom shell commands on Windows now keep the quotes you wrote.** A
   file-opening or folder-revealing command such as `mytool "{path}"` previously
   reached `cmd.exe` with escaped quotes and was then split on the spaces in the
@@ -57,13 +189,14 @@ Desktop release notes.
   hourly, or weekly schedules no longer wait for the next-run preview. Enabled
   custom cron expressions still require successful validation; invalid custom
   drafts are never saved when automatic runs are disabled.
-- **Panoptikon Desktop now stays out of the macOS Dock while running in the
-  background.** Its Dock and application-switcher entry appears while a native
-  setup, settings, Relay, or update window is visible, then disappears when the
-  last such window closes. The menu-bar icon remains available throughout.
-- **macOS now has first-class Desktop development scripts.** Developers can run
-  the isolated unpackaged app, build a dev app/DMG, and safely reset its local
-  profile with shell equivalents of the existing Windows workflows.
+- **Long error notifications are now readable and copyable.** Errors carrying
+  long unbroken text (file names, encoder output) used to overflow past the
+  toast's edge with no way to select the message. Error toasts now wrap
+  anything, scroll when very long, stay up 30 seconds (hovering pauses the
+  timer), and carry a Copy details button.
+- **Checkbox toggles in pinboard menus no longer close the menu**, so settings
+  like Seamless, Gravity, or Show Grid can be flipped in place.
+- Fixed scrolling in the Desktop configuration screens.
 
 ## [v0.1.8] - 2026-08-03
 
