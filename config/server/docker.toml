@@ -51,6 +51,14 @@ port = 6339
 # never mapped out of the container.
 base_url = "http://127.0.0.1:6340"
 local = true
+# Server-rendered pages call the API back through this listener. Normally the
+# x-panoptikon-policy token decides which policy an SSR call acts under, but a
+# token that ever stops verifying is ignored and selection falls back to the
+# listener the call arrived on — so this names the PUBLIC listener, making the
+# fail-open the restricted policy rather than allow_all. It is deliberately not
+# the primary listener: the synthesized loopback inference upstream dials the
+# primary, and requires it to permit /api/inference/*.
+api_endpoint = "public"
 # No UI checkout exists in the image: a nonexistent dir makes the gateway
 # fall back to the UI bundle embedded in the binary.
 dir = "no-checkout-use-embedded-bundle"

@@ -769,6 +769,25 @@ pub struct UiUpstreamConfig {
     /// When to run `next build`. Default: auto (build-staleness check).
     #[serde(default)]
     pub build: UiBuildPolicy,
+    /// Which listener the supervised UI server calls back into
+    /// (`PANOPTIKON_API_URL`), by endpoint name. Default: the primary
+    /// listener, which is what every single-listener deployment wants.
+    ///
+    /// It matters on a multi-listener deployment whose policies differ.
+    /// Server-rendered pages reach the API through this URL, and the policy
+    /// they act under is normally decided by the `x-panoptikon-policy` token
+    /// the gateway minted for the browser request that triggered the render.
+    /// A token that is absent, expired, or unverifiable is ignored and
+    /// selection falls back to the listener the SSR connected on — so this
+    /// endpoint's policy is the SSR fail-open, and it should name the most
+    /// restricted listener. Without this key the fail-open was whichever
+    /// policy the primary listener carries, and the only way to change it
+    /// was to make the restricted listener primary — which collides with the
+    /// synthesized loopback inference upstream, that requires the *primary*
+    /// listener to permit `/api/inference/*` (see
+    /// `validate_loopback_inference_policy`).
+    #[serde(default)]
+    pub api_endpoint: Option<String>,
 }
 
 /// `[upstreams.ui].build`: `next build` policy for local UI mode.
@@ -1060,6 +1079,33 @@ impl Settings {
             addrs.push((endpoint.name.clone(), format!("{}:{}", host, endpoint.port)));
         }
         addrs
+    }
+
+    /// The loopback URL the supervised UI server is given as
+    /// `PANOPTIKON_API_URL`. `[upstreams.ui] api_endpoint` names the
+    /// listener; absent (or naming the primary) means the primary listener,
+    /// which is the historical behaviour and what single-listener
+    /// deployments want. The name is validated at config load, so an unknown
+    /// one cannot reach here — falling back to the primary rather than
+    /// panicking keeps a future caller that skipped validation honest.
+    pub fn ui_api_base_url(&self) -> String {
+        let primary = || loopback_base_url(&self.server.host, self.server.port);
+        match self.upstreams.ui.api_endpoint.as_deref() {
+            None => primary(),
+            Some(PRIMARY_ENDPOINT) => primary(),
+            Some(name) => self
+                .server
+                .endpoints
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| {
+                    loopback_base_url(
+                        entry.host.as_deref().unwrap_or(&self.server.host),
+                        entry.port,
+                    )
+                })
+                .unwrap_or_else(primary),
+        }
     }
 
     /// Empty-string paths mean "unset": the shipped configs template these
@@ -1355,6 +1401,26 @@ impl Settings {
     /// Local UI mode needs a checkout to run from and a bind address it can
     /// derive from `base_url`; both are config mistakes best caught at load.
     fn validate_ui(&self) -> Result<()> {
+        // Checked even when the UI is not local: a name that matches no
+        // listener is a typo whatever the mode, and silently pointing the
+        // SSR at the wrong policy is exactly the failure this key exists to
+        // prevent.
+        if let Some(name) = self.upstreams.ui.api_endpoint.as_deref() {
+            let known = name == PRIMARY_ENDPOINT
+                || self.server.endpoints.iter().any(|entry| entry.name == name);
+            if !known {
+                anyhow::bail!(
+                    "upstreams.ui.api_endpoint references unknown endpoint '{}' (known: '{}'{})",
+                    name,
+                    PRIMARY_ENDPOINT,
+                    self.server
+                        .endpoints
+                        .iter()
+                        .map(|entry| format!(", '{}'", entry.name))
+                        .collect::<String>()
+                );
+            }
+        }
         if !self.upstreams.ui.local {
             return Ok(());
         }
@@ -1719,6 +1785,98 @@ default = "default"
 allow = "*"
 "#
         )
+    }
+
+    /// `[upstreams.ui] api_endpoint` picks which listener the supervised UI
+    /// server calls back into, so the SSR fail-open (an ignored policy token
+    /// falls back to listener matching) can be aimed at the most restricted
+    /// listener without making that listener primary — which the synthesized
+    /// loopback inference upstream forbids, since it requires the *primary*
+    /// listener to permit `/api/inference/*`.
+    #[test]
+    fn ui_api_endpoint_selects_the_listener_the_ssr_calls_back_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        let base = |api_endpoint: &str| {
+            format!(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[[server.endpoints]]
+name = "public"
+port = 9156
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6340"
+{api_endpoint}
+
+[upstreams.api]
+base_url = "http://127.0.0.1:9155"
+{}"#,
+                allow_all_policy_toml(r#""localhost", "127.0.0.1""#)
+            )
+        };
+
+        // Absent -> the primary listener, the historical behaviour.
+        std::fs::write(&path, base("")).unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(settings.ui_api_base_url(), "http://127.0.0.1:9155");
+
+        // Named extra listener -> that listener's host/port.
+        std::fs::write(&path, base(r#"api_endpoint = "public""#)).unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(settings.ui_api_base_url(), "http://127.0.0.1:9156");
+
+        // The primary may be named explicitly.
+        std::fs::write(&path, base(r#"api_endpoint = "default""#)).unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(settings.ui_api_base_url(), "http://127.0.0.1:9155");
+
+        // A name matching no listener is a hard config error: silently
+        // pointing the SSR at the wrong policy is the failure this prevents.
+        std::fs::write(&path, base(r#"api_endpoint = "typo""#)).unwrap();
+        let err = Settings::load(Some(path.clone())).unwrap_err().to_string();
+        assert!(
+            err.contains("upstreams.ui.api_endpoint references unknown endpoint 'typo'"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("'default'") && err.contains("'public'"), "{err}");
+    }
+
+    /// A wildcard bind is mapped to a loopback address for the SSR URL, the
+    /// same as for the primary listener — the UI server dials it from inside
+    /// this process's host, and `0.0.0.0` is not a destination.
+    #[test]
+    fn ui_api_endpoint_maps_wildcard_binds_to_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+host = "0.0.0.0"
+port = 9155
+
+[[server.endpoints]]
+name = "public"
+port = 9156
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6340"
+api_endpoint = "public"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:9155"
+{}"#,
+                allow_all_policy_toml(r#""localhost", "127.0.0.1""#)
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(path)).unwrap();
+        assert_eq!(settings.ui_api_base_url(), "http://127.0.0.1:9156");
     }
 
     /// Config resolution rule for local inference (documented in AGENTS.md):

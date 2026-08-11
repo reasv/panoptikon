@@ -176,6 +176,19 @@ Desktop release notes.
 
 ### Fixed
 
+- **A public Docker instance no longer renders its pages with admin authority
+  if the internal policy token ever fails.** Server-rendered pages call the API
+  back through one of the container's own listeners. Which policy they act
+  under is decided by a short-lived signed token, but a token that does not
+  verify is ignored and the policy falls back to whichever listener the call
+  arrived on — and that was always the private admin listener, because there
+  was no way to point server rendering anywhere else. The Docker image now
+  points it at the public listener, so the fallback is the restricted policy:
+  a failure degrades a page instead of escalating it. Self-hosters with a
+  single listener are unaffected. The new `[upstreams.ui] api_endpoint` key
+  names the listener and defaults to the previous behaviour; existing
+  installations keep their current config file, so change it by hand to pick
+  this up.
 - **Custom shell commands on Windows now keep the quotes you wrote.** A
   file-opening or folder-revealing command such as `mytool "{path}"` previously
   reached `cmd.exe` with escaped quotes and was then split on the spaces in the

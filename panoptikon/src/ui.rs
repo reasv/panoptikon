@@ -97,7 +97,7 @@ pub(crate) fn start(settings: &Settings) -> Result<UiServerHandle> {
         host,
         port,
         base_url: ui.base_url.clone(),
-        api_url: crate::config::loopback_base_url(&settings.server.host, settings.server.port),
+        api_url: settings.ui_api_base_url(),
         node_override: ui.node.clone(),
         build: ui.build,
     };
