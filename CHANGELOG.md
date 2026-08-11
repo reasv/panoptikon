@@ -6,6 +6,20 @@ Desktop release notes.
 
 ## [Unreleased]
 
+- **A public Docker instance no longer renders its pages with admin authority
+  if the internal policy token ever fails.** Server-rendered pages call the API
+  back through one of the container's own listeners. Which policy they act
+  under is decided by a short-lived signed token, but a token that does not
+  verify is ignored and the policy falls back to whichever listener the call
+  arrived on — and that was always the private admin listener, because there
+  was no way to point server rendering anywhere else. The Docker image now
+  points it at the public listener, so the fallback is the restricted policy:
+  a failure degrades a page instead of escalating it. Self-hosters with a
+  single listener are unaffected. The new `[upstreams.ui] api_endpoint` key
+  names the listener and defaults to the previous behaviour; existing
+  installations keep their current config file, so change it by hand to pick
+  this up.
+
 - **Transcoded videos and clips can be copied to the clipboard instead of
   downloaded.** The video download menus (the player's top-right split button
   and the pin context menu) gained a persistent "Copy, don't download" toggle,

@@ -1616,6 +1616,7 @@ config.impl_class = "echo_test"
                     dir: None,
                     node: None,
                     build: Default::default(),
+                    api_endpoint: None,
                 },
                 api: UpstreamConfig {
                     base_url: "http://127.0.0.1:6342".to_string(),

@@ -125,10 +125,19 @@ Threat model, in short: the UI process holds no authority of its own — the
 token is minted per request and expires quickly. A forged, tampered,
 expired, or absent token is silently ignored (reason logged at debug:
 `malformed`/`bad-hmac`/`expired`/`unknown-policy`) and selection falls back
-to listener/host matching, so point the SSR's API base URL at the listener
-whose policy is the most restricted one. Every request log line records the
-selection mechanism (`selected_by = token` or `listener/host`) and the
-policy name.
+to listener/host matching. Falling back is required, not a concession: the
+token is minted only on UI-bound proxied requests, so an ordinary API client
+never carries one and "absent" has to mean "select normally" — and once
+absent falls back, so must invalid, since the caller chooses which of the
+two it sends. Every request log line records the selection mechanism
+(`selected_by = token` or `listener/host`) and the policy name.
+
+For SSR that fallback is the one case where it is *wrong* rather than merely
+conservative: a server-rendered API call is a fresh connection from the UI
+server to a loopback listener, so listener matching answers "what may the UI
+process do" instead of "what may this visitor do". Point it at the most
+restricted listener with `[upstreams.ui] api_endpoint` (below), so a token
+that ever stops verifying degrades the render instead of escalating it.
 
 The HMAC key is a random 256 bits generated at gateway boot. `[server]
 policy_token_key` (64 hex chars, env-templatable) pins it — a niche option
@@ -823,6 +832,12 @@ local = true
 dir = "ui"                    # the ui/ git submodule is the standard spot
 # node = "C:/path/to/node.exe"  # default: repo venv's node, then PATH
 # build = "auto"                # "auto" | "always" | "never"
+# Which listener the UI server calls back into (PANOPTIKON_API_URL), by
+# endpoint name. Default: the primary listener. Only matters when listeners
+# carry different policies: it is the policy an SSR call falls back to when
+# its policy token is absent or does not verify, so name the most restricted
+# listener. An unknown name fails config load.
+# api_endpoint = "public"
 
 [upstreams.api]
 base_url = "http://127.0.0.1:6342"
