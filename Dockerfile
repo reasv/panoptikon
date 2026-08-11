@@ -41,6 +41,7 @@ COPY panoptikon/ panoptikon/
 # All workspace members must be present for cargo to load the workspace,
 # even though only -p panoptikon is built.
 COPY panoptikon-config/ panoptikon-config/
+COPY panoptikon-clipboard/ panoptikon-clipboard/
 COPY panoptikon-desktop/src-tauri/ panoptikon-desktop/src-tauri/
 COPY python/ python/
 COPY config/ config/
