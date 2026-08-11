@@ -5524,28 +5524,31 @@ fn extract_video_frames_into(
     // stdout is silenced, but stderr is captured so a failure can say why
     // (corrupt file, missing codec, disk full) instead of just "ffmpeg
     // failed"; it is only surfaced on a non-zero exit.
-    let mut command = Command::new(crate::media_tools::ffmpeg());
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
     if let Some(limit) = decode_limit {
-        command.arg("-t").arg(format!("{limit}"));
+        args.push("-t".into());
+        args.push(format!("{limit}").into());
     }
-    let output = command
-        .arg("-i")
-        .arg(path)
-        .arg("-vf")
-        .arg(format!("fps=1/{}", interval))
-        .arg("-vsync")
-        .arg("vfr")
-        .arg(&output_pattern)
-        .stdout(std::process::Stdio::null())
-        .output()
-        // Failing to *start* ffmpeg is never a verdict on the media: a missing
-        // toolchain is `blocked` and self-heals when it appears, anything else
-        // about this machine stays transient and is retried next scan.
-        .map_err(|err| {
-            FileProcessError::visuals_from_api_error(crate::media_tools::spawn_error(
-                "ffmpeg", &err,
-            ))
-        })?;
+    args.push("-i".into());
+    args.push(path.into());
+    args.push("-vf".into());
+    args.push(format!("fps=1/{}", interval).into());
+    args.push("-vsync".into());
+    args.push("vfr".into());
+    args.push(output_pattern.clone().into());
+    // The retry wrapper, not a bare spawn: the decode clamp above is an
+    // *input* `-t`, which is one of the triggers of the Windows/SMB
+    // input-open bug (see `media_tools::cache_wrapped_args`) — so without it
+    // a clamped video on a network mount fails to open at all.
+    let output = crate::media_tools::ffmpeg_output_with_input_retry(&args, |command| {
+        command.stdout(std::process::Stdio::null());
+    })
+    // Failing to *start* ffmpeg is never a verdict on the media: a missing
+    // toolchain is `blocked` and self-heals when it appears, anything else
+    // about this machine stays transient and is retried next scan.
+    .map_err(|err| {
+        FileProcessError::visuals_from_api_error(crate::media_tools::spawn_error("ffmpeg", &err))
+    })?;
 
     if !output.status.success() {
         let detail = stderr_tail(&output.stderr);

@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use super::TranscodeParams;
 use super::compose::{ComposeParams, ComposeSource, FilterPlan};
 use super::presets::{Channel, Container, QualityMode, ResolvedPreset};
+use crate::media_tools::{cache_wrapped_args, ffmpeg_inputs_all_exist};
 use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_process_group_pid};
 
 /// The two software-x264 invocations, named as encoder *identities* rather
@@ -498,15 +499,11 @@ fn crf_or_bitrate(quality: QualityMode, crf_key: &str, offset: i64) -> Vec<Strin
 /// output, which the run deletes on every exit path and the cache's
 /// `.tmp-*` age sweep catches after a crash.
 ///
-/// A FILE, never `pipe:1`, and that is a bug fix rather than a preference:
-/// on Windows, opening the progress stream through ffmpeg's `pipe:` protocol
-/// breaks *input* reading on SMB mounts for any mp4 whose probe must
-/// read-through to reach its moov atom — the demuxer stops at the first 32 KiB
-/// buffer and fails with "moov atom not found" on files that decode fine
-/// without the flag. Deterministic on ffmpeg 7.1 and 8.0.1 Windows builds,
-/// gone the moment the same progress stream targets a file; the upstream
-/// mechanism is undiagnosed (same family as the 2022-05 ffmpeg-user "moov
-/// atom not found on network storage" regression report).
+/// A FILE, never `pipe:1`: `-progress pipe:` is one of the two known
+/// triggers of the Windows/SMB input-open bug (see
+/// [`cache_wrapped_args`]), and unlike the other trigger — an input-side
+/// time option, which the trim seek cannot do without — it costs nothing to
+/// avoid outright.
 pub(crate) fn progress_path(output: &Path) -> PathBuf {
     let mut name = output.as_os_str().to_os_string();
     name.push(".progress");
@@ -771,6 +768,40 @@ pub(crate) fn run_task(
     }
 }
 
+/// One ffmpeg invocation, with one self-healing retry: when the child could
+/// not open an input that is really there, the same vector runs again with
+/// its inputs wrapped in the `cache:` protocol, which dodges the Windows/SMB
+/// open bug documented on [`cache_wrapped_args`]. Anything else — a missing
+/// file, a bad encoder, a mid-encode failure — keeps its first verdict.
+fn run_ffmpeg(
+    args: &[OsString],
+    progress_file: &Path,
+    expected_seconds: Option<f64>,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(Option<f32>),
+) -> Result<(), EncodeError> {
+    match run_ffmpeg_once(args, progress_file, expected_seconds, cancel, on_progress) {
+        Err(EncodeError::Failed(detail))
+            if detail.contains(crate::media_tools::FFMPEG_INPUT_OPEN_FAILURE)
+                && !cancel.load(Ordering::Relaxed)
+                && ffmpeg_inputs_all_exist(args) =>
+        {
+            tracing::warn!(
+                error = %detail,
+                "ffmpeg could not open an input; retrying through the cache: protocol"
+            );
+            run_ffmpeg_once(
+                &cache_wrapped_args(args),
+                progress_file,
+                expected_seconds,
+                cancel,
+                on_progress,
+            )
+        }
+        outcome => outcome,
+    }
+}
+
 /// One ffmpeg child, whatever produced its argument vector, run to completion
 /// on the calling thread. `expected_seconds` is the progress denominator.
 ///
@@ -792,7 +823,7 @@ pub(crate) fn run_task(
 /// The same watchdog carries the [`STALL_DEADLINE`], against an activity clock
 /// the reader stamps whenever the file grows: cancellation used to be the
 /// *only* escape from a child that never terminates.
-fn run_ffmpeg(
+fn run_ffmpeg_once(
     args: &[OsString],
     progress_file: &Path,
     expected_seconds: Option<f64>,
@@ -1690,5 +1721,60 @@ mod tests {
             }
             other => panic!("expected a verdict on the input, got {other:?}"),
         }
+    }
+
+    /// A trimmed encode end to end, through the same `run_encode` the pool
+    /// calls. `SMB_REPRO_INPUT` points it at a network path, which is the
+    /// only place the input-open bug reproduces and so the only way to
+    /// exercise the `cache:` retry for real; with no variable set it runs on
+    /// a generated local source, which proves the retry gate does not fire
+    /// on a healthy encode.
+    #[test]
+    fn a_trimmed_encode_succeeds_including_over_smb() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let input = match std::env::var("SMB_REPRO_INPUT") {
+            Ok(path) => PathBuf::from(path),
+            Err(_) => {
+                let generated = dir.path().join("src.mp4");
+                let made = std::process::Command::new(crate::media_tools::ffmpeg())
+                    .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10"])
+                    .args(["-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y"])
+                    .arg(&generated)
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false);
+                if !made {
+                    return;
+                }
+                generated
+            }
+        };
+
+        let preset = preset("clip");
+        let encoder = resolve_encoder(&preset, None, None);
+        let output = dir.path().join("out.mp4");
+        let spec = EncodeJobSpec {
+            input,
+            output: output.clone(),
+            params: TranscodeParams::new("sha", preset, encoder, Some(50), Some(200)),
+            source_duration_s: Some(3.0),
+        };
+        let mut fractions: Vec<Option<f32>> = Vec::new();
+        run_encode(&spec, &AtomicBool::new(false), &mut |fraction| {
+            fractions.push(fraction)
+        })
+        .expect("the trimmed encode produced an artifact");
+
+        assert!(
+            std::fs::metadata(&output).map(|meta| meta.len()).unwrap_or(0) > 0,
+            "the artifact has bytes"
+        );
+        // The sidecar is tailed on the retry path too, and removed whichever
+        // attempt produced the file.
+        assert!(!fractions.is_empty(), "progress was reported");
+        assert!(!progress_path(&output).exists(), "the sidecar was removed");
     }
 }

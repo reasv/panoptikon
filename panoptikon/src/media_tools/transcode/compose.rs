@@ -1176,7 +1176,7 @@ mod tests {
     use crate::media_tools::transcode::presets::{builtin_presets, find_preset};
 
     /// See [`compose_params_hash_is_stable`].
-    const PINNED_COMPOSE_PARAMS_HASH: &str = "c2ed5277270ebab041cf21d364be29ca";
+    const PINNED_COMPOSE_PARAMS_HASH: &str = "23c496d57fa1df610b212200d681aa48";
 
     fn preset(id: &str) -> ResolvedPreset {
         find_preset(&builtin_presets(), id)
@@ -1281,7 +1281,7 @@ mod tests {
     /// `TRANSCODER_VERSION` and re-pinning this constant.
     #[test]
     fn compose_params_hash_is_stable() {
-        assert_eq!(TRANSCODER_VERSION, 2, "re-pin the fixture below on a bump");
+        assert_eq!(TRANSCODER_VERSION, 3, "re-pin the fixture below on a bump");
         let params = params_for(&worked_example(), "mosaic-mp4");
         assert_eq!(
             serde_json::to_string(&params.doc).unwrap(),

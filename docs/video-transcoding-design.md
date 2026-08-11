@@ -238,6 +238,57 @@ where size headroom is ample and quality is what shows):
   alpha (SVT-AV1 limitation), so translucent mosaic backgrounds bake as they
   do for mp4/webm.
 
+*Amended 2026-08-11 — the Windows/SMB input-open bug.* Every preset failed
+on a production NAS file with `moov atom not found` / "Invalid data found
+when processing input", on files that play in the browser and thumbnail
+fine. It is not the file and not the mount. On Windows SMB mounts the
+gyan.dev ffmpeg builds (7.1 and 8.0.1; static_ffmpeg ships gyan) fail to
+open faststart mp4s — one 32 KiB read, zero seeks, then the moov it is
+sitting on is declared missing — whenever the command line carries either
+of two unrelated-looking triggers:
+
+- a `-progress pipe:N` destination, or
+- **any** input-side time option: `-ss`, `-t`, `-itsoffset`, even the no-op
+  `-itsoffset 0`.
+
+Immune: local copies of the same bytes, moov-at-end files (the seek path is
+never taken through the buggy read), output-side time options, and stdout
+piping of the encode itself. The bytes read back bit-exact through the same
+binary's rawvideo demuxer, and fftools sets the input open up identically
+either way, so the upstream mechanism is unknown; it is the same family as
+the 2022-05 ffmpeg-user "moov atom not found on network storage" report.
+
+Two consequences, because the two triggers differ in whether we need them:
+
+- `-progress` is incidental, so it moved to a **file sidecar** beside the
+  temp output, tailed by the runner (`run.rs::progress_path`). This was
+  landed first, as the whole fix — wrongly: it was verified against an
+  *untrimmed* vector, which carries no time option and so never reproduced.
+  Every trimmed export still failed, which is exactly what "all of the
+  presets fail" meant.
+- The time options are load-bearing (`-ss` is the trim fast seek; `-t` is
+  the outro decode clamp), so they keep their trigger and get an escape
+  hatch: on a failure whose stderr says `Error opening input`, the same
+  vector is retried once with every `-i` operand wrapped in ffmpeg's
+  read-only `cache:` protocol, which rebuilds the io stack under the same
+  demuxer (`media_tools::cache_wrapped_args`). Verified to open, seek and
+  produce correct trimmed output on the affected files. The temp-file cost
+  is paid only on a retry; a genuinely unreadable input fails the retry too
+  and keeps its verdict.
+
+The same trigger reaches **outside** the transcoder: scan-side and
+extraction-side frame extraction both pass the outro clamp as an input `-t`
+(deliberately, so it bounds the decode), so CLIP/thumbnail frame extraction
+was failing on every outro-clamped video on a network mount. Both go
+through the shared retry now
+(`media_tools::ffmpeg_output_with_input_retry`). Audio extraction passes
+`-t` after `-i` and is unaffected.
+
+`TRANSCODER_VERSION` went to 3 for this. Not because output bytes changed —
+they do not — but because settled two-strike *failure verdicts* are keyed
+the same way as artifacts, and orphaning those keys is the designed way to
+re-open files an older, buggier runner gave up on.
+
 `GET /api/video/presets` returns the resolved, policy-filtered list
 (id + label + surface tags) — this is how **user-declared custom presets
 appear in the UI dropdowns automatically**.

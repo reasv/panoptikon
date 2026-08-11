@@ -21,7 +21,12 @@ use presets::ResolvedPreset;
 /// preset defaults, ffmpeg argument construction, the params serialization
 /// below. It rides in the hash, so a bump re-keys every artifact — old files
 /// simply age out of the cache and old negative-cache rows are orphaned.
-pub(crate) const TRANSCODER_VERSION: i64 = 2;
+///
+/// Also bumped when a runner fix can overturn recorded failure *verdicts*
+/// (v3: the Windows/SMB input-open retry): a settled two-strike verdict is
+/// keyed like any artifact, so orphaning the keys is the designed way to
+/// re-open files an older, buggier transcoder gave up on.
+pub(crate) const TRANSCODER_VERSION: i64 = 3;
 
 /// Hex characters of the params digest kept in the cache key. 128 bits of a
 /// SHA-256, which is collision-free at any cache size that fits on a disk.
@@ -177,7 +182,7 @@ mod tests {
     /// different value, so folding the encoder into the params re-pinned this
     /// constant without a `TRANSCODER_VERSION` bump; any later change does
     /// need one.
-    const PINNED_CLIP_PARAMS_HASH: &str = "51b4d6fb1734b549f6c71931ff83dbfa";
+    const PINNED_CLIP_PARAMS_HASH: &str = "52436145f021304f2532dc05d25cc0ef";
 
     fn clip_params(start_cs: Option<i64>, end_cs: Option<i64>) -> TranscodeParams {
         let presets = builtin_presets();
@@ -202,11 +207,11 @@ mod tests {
     /// re-record.
     #[test]
     fn params_hash_is_stable() {
-        assert_eq!(TRANSCODER_VERSION, 2, "re-pin the fixture below on a bump");
+        assert_eq!(TRANSCODER_VERSION, 3, "re-pin the fixture below on a bump");
         let params = clip_params(None, None);
         assert_eq!(
             serde_json::to_string(&params).unwrap(),
-            r#"{"source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","preset":{"id":"clip","container":"mp4","vcodec":"h264","acodec":"aac","quality":{"crf":18},"max_height":null,"fps_max":null,"channel":"quality"},"encoder":"libx264-medium","transcoder_version":2}"#
+            r#"{"source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","preset":{"id":"clip","container":"mp4","vcodec":"h264","acodec":"aac","quality":{"crf":18},"max_height":null,"fps_max":null,"channel":"quality"},"encoder":"libx264-medium","transcoder_version":3}"#
         );
         assert_eq!(params.params_hash(), PINNED_CLIP_PARAMS_HASH);
         assert_eq!(
