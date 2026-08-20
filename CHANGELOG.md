@@ -8,6 +8,15 @@ Desktop release notes.
 
 ### Added
 
+- **Pinboard selections can now be moved and scaled as one group.** The new
+  Scale & Move verb (selection toolbar and context menu) draws a bounding box
+  around the selected items: drag its interior to move the whole group, drag
+  its corner handles to scale everything together proportionally, or its edge
+  handles to stretch along one axis. Items keep their relative positions and
+  sizes, the gesture stops when the smallest item reaches the minimum pin
+  size, and each release is one undo step (browser Back). Esc or a click
+  outside the box finishes the session.
+
 - **Videos the browser cannot decode now play anyway.** Pressing play on such
   a video (an HEVC capture, say) has the server convert it to a
   browser-friendly MP4: you see your position in the conversion queue, then
