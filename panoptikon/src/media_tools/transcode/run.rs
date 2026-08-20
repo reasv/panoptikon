@@ -276,7 +276,7 @@ pub(crate) fn build_args(spec: &EncodeJobSpec) -> Vec<OsString> {
         args.push(arg);
     }
     match &preset.acodec {
-        Some(acodec) => push!("-c:a", acodec.as_str()),
+        Some(acodec) => push!("-c:a", audio_encoder(acodec)),
         None => push!("-an"),
     }
 
@@ -332,7 +332,7 @@ pub(crate) fn build_compose_args(spec: &ComposeJobSpec, plan: &FilterPlan) -> Ve
     // `-an` is already in the plan's output args when the graph produced no
     // audio, so an audio codec here would contradict it.
     if plan.has_audio && let Some(acodec) = &preset.acodec {
-        push!("-c:a", acodec.as_str());
+        push!("-c:a", audio_encoder(acodec));
     }
     if preset.container == Container::Mp4 {
         push!("-movflags", "+faststart", "-avoid_negative_ts", "make_zero");
@@ -349,6 +349,23 @@ pub(crate) fn build_compose_args(spec: &ComposeJobSpec, plan: &FilterPlan) -> Ve
 /// quality onto *something* the encoder understands: silently dropping it
 /// would make two presets that differ only by CRF produce identical bytes
 /// under different cache keys.
+/// The encoder a preset's audio codec NAME selects.
+///
+/// `-c:a <codec>` makes ffmpeg pick the codec's native encoder, and for opus
+/// and vorbis the native encoder is experimental — it refuses to run without
+/// `-strict -2`, killing the whole job ("Could not open encoder before EOF")
+/// on every mainline build. The lib* wrappers are the production encoders, so
+/// the codec name is mapped here at the argument layer: preset tables and user
+/// profiles keep naming the CODEC (and cache keys hash that name), and a
+/// profile that already names an encoder passes through verbatim.
+fn audio_encoder(acodec: &str) -> &str {
+    match acodec {
+        "opus" => "libopus",
+        "vorbis" => "libvorbis",
+        other => other,
+    }
+}
+
 fn video_args(encoder: &str, quality: QualityMode) -> Vec<OsString> {
     let mut args: Vec<String> = Vec::new();
     let mut codec = |name: &str| {
@@ -1305,7 +1322,11 @@ mod tests {
         assert_eq!(webm[at(&webm, "-crf") + 1], "32");
         assert_eq!(webm[at(&webm, "-b:v") + 1], "0");
         assert!(!webm.contains(&"-movflags".to_string()));
-        assert_eq!(webm[at(&webm, "-c:a") + 1], "opus");
+        assert_eq!(
+            webm[at(&webm, "-c:a") + 1],
+            "libopus",
+            "the codec name maps to the non-experimental encoder"
+        );
 
         let mp4 = args_of(&spec_for("clip", None, None));
         assert_eq!(mp4[at(&mp4, "-movflags") + 1], "+faststart");

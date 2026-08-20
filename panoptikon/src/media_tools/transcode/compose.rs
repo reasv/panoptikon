@@ -2238,6 +2238,22 @@ mod tests {
         matches!(status, Ok(status) if status.success())
     }
 
+    /// A flat clip with a sine tone muxed in, for the audio-path assertion:
+    /// only a source that really carries a stream makes the compose open an
+    /// audio encoder.
+    fn write_tone_clip(path: &Path, w: i64, h: i64, seconds: f64) -> bool {
+        let status = Command::new(crate::media_tools::ffmpeg())
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg(format!("color=c=0x00a000:s={w}x{h}:d={seconds}:r=30"))
+            .args(["-f", "lavfi", "-i"])
+            .arg(format!("sine=frequency=440:duration={seconds}"))
+            .args(["-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-shortest"])
+            .arg(path)
+            .stdin(Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
+    }
+
     /// A 400x300 clip of four vertical stripes — green, red, blue, green —
     /// that dims halfway through.
     ///
@@ -2749,5 +2765,61 @@ mod tests {
         ] {
             assert_eq!(primary(&frame, x, y), Some(expected), "{what} ({x},{y})");
         }
+    }
+
+    /// An audible item, composed for real into webm. This is the case the
+    /// container matrix above never opens: its lavfi fixtures carry no audio
+    /// stream, so `-c:a` was never exercised — and `-c:a opus` selects
+    /// ffmpeg's native opus encoder, which is EXPERIMENTAL and refuses to run,
+    /// killing the whole job ("Could not open encoder before EOF"). The
+    /// argument layer maps the codec name to `libopus` (run.rs
+    /// `audio_encoder`); this test is what keeps that mapping honest against
+    /// the real toolchain.
+    #[test]
+    fn an_audible_item_composes_through_the_production_audio_encoder() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tone = dir.path().join("tone.mp4");
+        if !write_tone_clip(&tone, 200, 200, 2.0) {
+            return;
+        }
+
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-webm".to_string(),
+                length: ComposeLength::LongestLoopOnce,
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                src: rect(0, 0, 200, 200),
+                transform: Transform::default(),
+                dest: rect(0, 0, 120, 120),
+                time: ItemTime::Span {
+                    start_cs: 0,
+                    end_cs: 200,
+                },
+                audio: true,
+            }],
+        };
+        let output = compose_fixture(dir.path(), &document, vec![tone], "audible");
+
+        let (width, height, duration, frames) =
+            probe_artifact(&output).expect("the artifact is probeable");
+        assert_eq!((width, height), (160, 120));
+        assert!(frames > 1, "the artifact is animated: {frames} frames");
+        assert!(
+            (duration - 2.0).abs() <= 2.0 / 25.0,
+            "the span defines the length: {duration} vs 2.0"
+        );
+        let probe = probe_source(&output).expect("the artifact probes as a source");
+        assert!(probe.has_audio, "the artifact carries the mixed audio track");
     }
 }
