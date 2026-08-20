@@ -124,8 +124,13 @@ Desktop release notes.
 - **You can now copy an indexed file itself to the clipboard, not just its
   path.** Gallery and pinboard items gained a share button whose primary action
   is Copy when Panoptikon can reach the file and Download when it cannot; the
-  gallery also accepts Ctrl+C. The right-click menu always offers the other
-  verb.
+  gallery also accepts Ctrl+C.
+  - In the search grid and the gallery's filmstrip, each thumbnail's file
+    actions collapse into one corner button remembering your last-used
+    action; hovering it fans out a 2x2 cluster with Copy file, Download,
+    Open file, and Show in folder (Copy appears only when Panoptikon can
+    reach the file). Pin right-click menus carry matching Copy file and
+    Download original rows.
   - When the browser and the Panoptikon Server run on the same computer, the
     Server writes the clipboard directly.
   - When they do not, an approved Panoptikon Desktop does it. If the file sits
@@ -202,11 +207,12 @@ Desktop release notes.
   hourly, or weekly schedules no longer wait for the next-run preview. Enabled
   custom cron expressions still require successful validation; invalid custom
   drafts are never saved when automatic runs are disabled.
-- **Long error notifications are now readable and copyable.** Errors carrying
-  long unbroken text (file names, encoder output) used to overflow past the
-  toast's edge with no way to select the message. Error toasts now wrap
-  anything, scroll when very long, stay up 30 seconds (hovering pauses the
-  timer), and carry a Copy details button.
+- **Long notifications are now readable and copyable.** Toasts carrying long
+  unbroken text (file names, encoder output) used to overflow past the
+  toast's edge with no way to select the message. All toasts now wrap
+  anything, titles included; error toasts additionally scroll when very
+  long, stay up 30 seconds (hovering pauses the timer), and carry a Copy
+  details button.
 - **Checkbox toggles in pinboard menus no longer close the menu**, so settings
   like Seamless, Gravity, or Show Grid can be flipped in place.
 - Fixed scrolling in the Desktop configuration screens.
