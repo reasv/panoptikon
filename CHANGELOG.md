@@ -8,6 +8,18 @@ Desktop release notes.
 
 ### Added
 
+- **Pinboard: a Uniform layout that makes every item the same size.** The
+  new Uniform verb lays items out in identical cells in reading order -
+  available for the whole board (Layout menu) and for a selection of two or
+  more items (selection toolbar and context menu), which tiles the
+  selection's own bounding box. The cell shape is chosen automatically to
+  crop the set as little as possible, and Reroll cycles through the
+  alternative shapes. Auto-layout can now keep a board uniform as pins come
+  and go: a new "Uniform Auto-Layout" board setting switches the automatic
+  packing from the mosaic to identical cells, and can be saved as a
+  new-board default. Locked and anchored items stay exactly where they are -
+  the cells flow around them.
+
 - **Pinboard selections can now be moved and scaled as one group.** The new
   Scale & Move verb (selection toolbar and context menu) draws a bounding box
   around the selected items: drag its interior to move the whole group, drag
