@@ -193,6 +193,11 @@ Desktop release notes.
 
 ### Changed
 
+- **The scan page opens as a regular page instead of a full-screen drawer.**
+  The scan & indexing button on the search page now navigates straight to
+  the scan page, and the browser Back button returns to the search results
+  exactly as they were. The drawer covered the entire page anyway while
+  showing the same content, so nothing is lost.
 - **HTML files are indexed only after they actually render.** HTML scanning
   finds a Chromium-family browser on its own - Chrome, Chromium, Brave, or
   Edge from PATH and their standard install locations (`jobs.html_renderer`
