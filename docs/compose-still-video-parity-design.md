@@ -54,8 +54,14 @@ its thumbnail":
   shape change. (Every compose cache key changes; outputs are re-derived
   on demand, no stored verdicts exist for compositions.)
 - **Materialization**: at submit time (the API layer, which has DB
-  access), a thumbnail-source item's blob is fetched and written to a
-  per-job temp dir owned by the job spec (the webp bridge's TempDir
+  access), a thumbnail-source item's blob is fetched — **idx 0, the same
+  image the pin displays**: the pin `<img>` hits the thumbnail endpoint
+  with no `big` parameter, `big` defaults to *true*, and the endpoint's
+  video rule is `big ? idx 0 : idx 1`, so what the board shows for a video
+  is the 2×2 frame grid at idx 0, not the idx-1 single frame (composing
+  idx 1 renders a quarter of the pin's picture — the original ship of this
+  feature did exactly that) — and written to a per-job temp dir owned by
+  the job spec (the webp bridge's TempDir
   pattern: lives until the run, including its `cache:` retry, finishes);
   its path rides in `sources` like any input. Thumbnails are JPEGs —
   every ffmpeg reads them; the ordinary `Image` chain freezes the first

@@ -1120,10 +1120,14 @@ async fn resolve_item_thumbnail(
             "Composition item {sha256} is not in this database"
         )));
     };
-    // The thumbnail endpoint's own index rule (`big = false`): idx 0 of a
-    // video is the 2x2 frame grid, idx 1 the single frame the board shows.
-    let idx = if item.mime_type.starts_with("video") { 1 } else { 0 };
-    get_thumbnail_image(&mut db.conn, &item.sha256, idx)
+    // Index 0, which is what the board's pin actually displays: the pin
+    // `<img>` hits the thumbnail endpoint with no `big` parameter, `big`
+    // DEFAULTS TO TRUE, and the endpoint's video rule is `big ? 0 : 1` —
+    // idx 0 the 2x2 frame grid, idx 1 a single frame of it. Composing idx 1
+    // here rendered one quarter of the picture the pin shows (the original
+    // ship of this feature did exactly that); parity means the grid. For
+    // non-videos idx 0 is the only thumbnail there is.
+    get_thumbnail_image(&mut db.conn, &item.sha256, 0)
         .await?
         .ok_or_else(|| {
             compose_rejection(ComposeRejection::new(
@@ -2901,11 +2905,14 @@ transcode_presets = ["playback"]
     }
 
     /// The materialization path, end to end through the route: a
-    /// thumbnail-source item's blob is fetched (idx 1 — the frame the board
-    /// shows for a video, not the grid), written to the job's scratch dir,
-    /// and the document keys like any other. The pre-seeded cache hit keeps
-    /// this a route test rather than an ffmpeg one, exactly like the route
-    /// test above — the pixels themselves are compose.rs's golden.
+    /// thumbnail-source item's blob is fetched (idx 0 — the 2x2 grid, which
+    /// is what the pin `<img>` displays: it passes no `big` and `big`
+    /// defaults to true), written to the job's scratch dir, and the document
+    /// keys like any other. ONLY idx 0 is seeded: a regression back to the
+    /// idx-1 single-frame fetch finds nothing and 422s, failing this test
+    /// by name. The pre-seeded cache hit keeps this a route test rather
+    /// than an ffmpeg one, exactly like the route test above — the pixels
+    /// themselves are compose.rs's golden.
     #[tokio::test]
     async fn a_thumbnail_item_materializes_its_stored_blob_and_keys_the_document() {
         let _env = crate::test_utils::test_data_dir();
@@ -2949,7 +2956,7 @@ transcode_presets = ["playback"]
         sqlx::query(
             "INSERT INTO storage.thumbnails \
              (item_sha256, idx, item_mime_type, width, height, version, thumbnail) \
-             VALUES (?, 1, 'video/mp4', 64, 48, 1, X'FFD8FFE000104A464946')",
+             VALUES (?, 0, 'video/mp4', 64, 48, 1, X'FFD8FFE000104A464946')",
         )
         .bind(MOSAIC_A)
         .execute(&mut *db.conn)
