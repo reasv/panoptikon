@@ -213,6 +213,11 @@ Desktop release notes.
 
 ### Fixed
 
+- **Maximizing a pinboard now hides the search sidebar.** With the Advanced
+  Search Options sidebar open, maximizing a board left the sidebar standing
+  next to it, squeezing the board into the remaining width. The maximized
+  board now takes the full window; the sidebar returns when the board is
+  restored.
 - **A public Docker instance no longer renders its pages with admin authority
   if the internal policy token ever fails.** Server-rendered pages call the API
   back through one of the container's own listeners. Which policy they act
