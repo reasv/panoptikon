@@ -1942,7 +1942,7 @@ async fn resync_from_disk(state: &mut ContinuousScanSupervisorState) -> ApiResul
         }
         let args = ContinuousScanActorArgs {
             index_db: index_db.clone(),
-            user_data_db: index_db.clone(),
+            user_data_db: crate::db::info::db_defaults().1,
             data_dir: state.data_dir.clone(),
             enable_watcher: true,
         };
@@ -1986,7 +1986,7 @@ async fn sync_single_db(
 
     let args = ContinuousScanActorArgs {
         index_db: index_db.to_string(),
-        user_data_db: index_db.to_string(),
+        user_data_db: crate::db::info::db_defaults().1,
         data_dir: state.data_dir.clone(),
         enable_watcher: true,
     };

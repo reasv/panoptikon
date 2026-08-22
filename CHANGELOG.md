@@ -218,6 +218,12 @@ Desktop release notes.
 
 ### Fixed
 
+- **Continuous scanning now starts on databases without a same-named
+  user-data database.** The background scanner assumed every index database
+  had a user-data database of the same name and failed to start where none
+  existed, logging "unable to open database" errors on every retry, forever.
+  It now uses the configured default user-data database - the same one
+  scheduled cron scans have always used.
 - **Scroll browsing: the page bar under the open gallery now moves the
   gallery.** Clicking a page number (or its Previous/Next arrows) while the
   gallery was open in scroll browsing closed the gallery and dumped the view
