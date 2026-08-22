@@ -123,10 +123,31 @@ pub(crate) enum ItemTime {
     Image,
 }
 
+/// Which of an item's stored pictures the composition reads
+/// (docs/compose-still-video-parity-design.md §2).
+///
+/// `File` is the item's own file on disk — everything before this field
+/// existed. `Thumbnail` is the stored thumbnail blob the board renders for a
+/// video no `<video>` element is mounted for: it has no file path and no
+/// recorded source timestamp, so it can be neither referenced as a file nor
+/// recreated by a seek — the API layer materializes the blob to a per-job
+/// temp file instead. A thumbnail is a still image in every way, so admission
+/// requires `time.kind = image` for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ItemSource {
+    #[default]
+    File,
+    Thumbnail,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ComposeItem {
     /// Item content hash; resolved against the request's index database.
     pub(crate) sha256: String,
+    /// Where this item's pixels come from; defaults to the item's file.
+    #[serde(default)]
+    pub(crate) source: ItemSource,
     pub(crate) src: Rect,
     #[serde(default)]
     pub(crate) transform: Transform,
@@ -305,7 +326,7 @@ pub(crate) struct ComposeRejection {
 }
 
 impl ComposeRejection {
-    fn new(reason: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(reason: &'static str, detail: impl Into<String>) -> Self {
         Self {
             reason,
             detail: detail.into(),
@@ -532,6 +553,16 @@ fn validate_item(item: &ComposeItem, canvas: &Canvas) -> Resolved<()> {
                  got {},{}",
                 dest.x, dest.y
             ),
+        ));
+    }
+    if item.source == ItemSource::Thumbnail && !matches!(item.time, ItemTime::Image) {
+        // A thumbnail is a still image: it has one frame and no timeline, so
+        // a span or a still-with-a-timestamp over it is a document that
+        // contradicts itself. A correct client never builds one (the closed
+        // pin it describes is showing a picture that cannot play).
+        return Err(ComposeRejection::new(
+            "thumbnail_not_an_image",
+            "an item composed from its thumbnail must use time.kind = image",
         ));
     }
     match item.time {
@@ -1200,7 +1231,7 @@ mod tests {
     use crate::media_tools::transcode::presets::{builtin_presets, find_preset};
 
     /// See [`compose_params_hash_is_stable`].
-    const PINNED_COMPOSE_PARAMS_HASH: &str = "23c496d57fa1df610b212200d681aa48";
+    const PINNED_COMPOSE_PARAMS_HASH: &str = "fa57d59cbbfd1fbce04cc058b301af4a";
 
     fn preset(id: &str) -> ResolvedPreset {
         find_preset(&builtin_presets(), id)
@@ -1224,6 +1255,7 @@ mod tests {
     fn item(time: ItemTime) -> ComposeItem {
         ComposeItem {
             sha256: "a".repeat(64),
+            source: ItemSource::File,
             src: rect(0, 0, 640, 480),
             transform: Transform::default(),
             dest: rect(0, 0, 320, 240),
@@ -1276,6 +1308,7 @@ mod tests {
     fn worked_example() -> ComposeRequest {
         let span = ComposeItem {
             sha256: "a".repeat(64),
+            source: ItemSource::File,
             src: rect(0, 0, 1080, 1920),
             transform: Transform {
                 quarter_turns: 1,
@@ -1290,6 +1323,7 @@ mod tests {
         };
         let still = ComposeItem {
             sha256: "b".repeat(64),
+            source: ItemSource::File,
             src: rect(100, 50, 400, 300),
             transform: Transform::default(),
             dest: rect(320, 120, 320, 240),
@@ -1306,11 +1340,11 @@ mod tests {
     /// `TRANSCODER_VERSION` and re-pinning this constant.
     #[test]
     fn compose_params_hash_is_stable() {
-        assert_eq!(TRANSCODER_VERSION, 3, "re-pin the fixture below on a bump");
+        assert_eq!(TRANSCODER_VERSION, 4, "re-pin the fixture below on a bump");
         let params = params_for(&worked_example(), "mosaic-mp4");
         assert_eq!(
             serde_json::to_string(&params.doc).unwrap(),
-            r#"{"canvas_w":640,"canvas_h":480,"background":"0x101820","fps":25,"target_cs":800,"items":[{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","src":{"x":0,"y":0,"w":1080,"h":1920},"transform":{"quarter_turns":1,"flip_h":false},"dest":{"x":0,"y":0,"w":320,"h":480},"time":{"kind":"span","start_cs":200,"end_cs":1000},"audio":true},{"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","src":{"x":100,"y":50,"w":400,"h":300},"transform":{"quarter_turns":0,"flip_h":false},"dest":{"x":320,"y":120,"w":320,"h":240},"time":{"kind":"still","at_cs":150},"audio":false}]}"#
+            r#"{"canvas_w":640,"canvas_h":480,"background":"0x101820","fps":25,"target_cs":800,"items":[{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source":"file","src":{"x":0,"y":0,"w":1080,"h":1920},"transform":{"quarter_turns":1,"flip_h":false},"dest":{"x":0,"y":0,"w":320,"h":480},"time":{"kind":"span","start_cs":200,"end_cs":1000},"audio":true},{"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source":"file","src":{"x":100,"y":50,"w":400,"h":300},"transform":{"quarter_turns":0,"flip_h":false},"dest":{"x":320,"y":120,"w":320,"h":240},"time":{"kind":"still","at_cs":150},"audio":false}]}"#
         );
         assert_eq!(params.params_hash(), PINNED_COMPOSE_PARAMS_HASH);
         assert_eq!(
@@ -1346,6 +1380,14 @@ mod tests {
         let mut slower = worked_example();
         slower.fps = 24;
         assert_ne!(params_for(&slower, "mosaic-mp4").cache_key(), baseline);
+
+        // The picture's source is part of what the output shows, so it is
+        // part of the key: the same geometry over the thumbnail is a
+        // different artifact.
+        let mut thumbed = worked_example();
+        thumbed.items[1].source = ItemSource::Thumbnail;
+        thumbed.items[1].time = ItemTime::Image;
+        assert_ne!(params_for(&thumbed, "mosaic-mp4").cache_key(), baseline);
 
         let mut capped = worked_example();
         capped.output.length = ComposeLength::Cap { seconds: 8.0 };
@@ -1494,6 +1536,29 @@ mod tests {
         assert_eq!(
             reason(&with_item(item(ItemTime::Still { at_cs: -1 })), "mosaic-mp4"),
             "still_negative"
+        );
+
+        // A thumbnail is a still image: a span or a timestamped still over
+        // one is a document that contradicts itself, whatever the numbers.
+        for time in [
+            ItemTime::Span {
+                start_cs: 0,
+                end_cs: 100,
+            },
+            ItemTime::Still { at_cs: 0 },
+        ] {
+            let mut thumb = item(time);
+            thumb.source = ItemSource::Thumbnail;
+            assert_eq!(
+                reason(&with_item(thumb), "mosaic-mp4"),
+                "thumbnail_not_an_image"
+            );
+        }
+        let mut thumb = item(ItemTime::Image);
+        thumb.source = ItemSource::Thumbnail;
+        assert!(
+            resolve_compose(&with_item(thumb), &preset("mosaic-mp4"), limits()).is_ok(),
+            "an image-time thumbnail item is the one admissible combination"
         );
 
         let mut fast = request(vec![item(ItemTime::Image)], ComposeLength::LongestLoopOnce);
@@ -2266,6 +2331,18 @@ mod tests {
         matches!(status, Ok(status) if status.success())
     }
 
+    /// A flat-coloured single-frame JPEG — what a materialized thumbnail is.
+    fn write_color_jpeg(path: &Path, color: &str, w: i64, h: i64) -> bool {
+        let status = Command::new(crate::media_tools::ffmpeg())
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg(format!("color=c={color}:s={w}x{h}:d=1:r=1"))
+            .args(["-frames:v", "1", "-q:v", "2"])
+            .arg(path)
+            .stdin(Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
+    }
+
     /// A flat clip with a sine tone muxed in, for the audio-path assertion:
     /// only a source that really carries a stream makes the compose open an
     /// audio encoder.
@@ -2491,6 +2568,7 @@ mod tests {
     fn fixture_document(preset_id: &str) -> ComposeRequest {
         let span = ComposeItem {
             sha256: "a".repeat(64),
+            source: ItemSource::File,
             src: rect(100, 0, 200, 300),
             transform: Transform {
                 quarter_turns: 1,
@@ -2505,6 +2583,7 @@ mod tests {
         };
         let still = ComposeItem {
             sha256: "b".repeat(64),
+            source: ItemSource::File,
             src: rect(50, 50, 100, 100),
             transform: Transform::default(),
             dest: rect(180, 20, 120, 120),
@@ -2569,9 +2648,13 @@ mod tests {
             let params = ComposeParams::new(doc, preset, encoder);
             let output = dir.path().join(format!("mosaic.{ext}"));
             let spec = super::super::run::ComposeJobSpec {
-                sources: vec![striped.clone(), blue.clone()],
+                sources: vec![
+                    super::super::run::ComposeInput::file(striped.clone()),
+                    super::super::run::ComposeInput::file(blue.clone()),
+                ],
                 output: output.clone(),
                 params,
+                _scratch: None,
             };
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let mut seen: Vec<f32> = Vec::new();
@@ -2647,9 +2730,13 @@ mod tests {
         let doc = resolve_compose(document, &preset, limits()).expect("a valid document");
         let output = dir.join(format!("{name}.{}", preset.container.ext()));
         let spec = super::super::run::ComposeJobSpec {
-            sources,
+            sources: sources
+                .into_iter()
+                .map(super::super::run::ComposeInput::file)
+                .collect(),
             output: output.clone(),
             params: ComposeParams::new(doc, preset, encoder),
+            _scratch: None,
         };
         super::super::run::run_compose(
             &spec,
@@ -2694,6 +2781,7 @@ mod tests {
             },
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
+                source: ItemSource::File,
                 src: rect(0, 0, 64, 64),
                 transform: Transform::default(),
                 dest: rect(20, 20, 80, 80),
@@ -2721,6 +2809,101 @@ mod tests {
             primary(&frame, 60, 60),
             Some('r'),
             "the *first* GIF frame is what is held, not the blue one after it"
+        );
+        assert_eq!(
+            primary(&frame, 10, 110),
+            Some('g'),
+            "and the background shows outside its rectangle"
+        );
+    }
+
+    /// A thumbnail-source item, end to end
+    /// (docs/compose-still-video-parity-design.md §2): the composed rectangle
+    /// holds the THUMBNAIL's pixels, never the source file's frame 0.
+    ///
+    /// The item's real file is a blue clip and its materialized thumbnail a
+    /// red JPEG — the two are deliberately told apart by colour, so handing
+    /// ffmpeg the wrong input fails the assertion rather than passing by
+    /// coincidence. The spec is built exactly as the API layer builds it: the
+    /// input is the materialized JPEG with `StreamInfo` synthesized from the
+    /// stored dimensions, and the blue file appears nowhere in the sources —
+    /// which is the whole point. Skips (never fails) where there is no
+    /// ffmpeg.
+    #[test]
+    fn a_thumbnail_source_item_composes_the_thumbnails_pixels() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("item.mp4");
+        let thumb = dir.path().join("0-aaaaaaaaaa.jpg");
+        if !write_color_clip(&file, "0x0000E0", 64, 64, 1.0)
+            || !write_color_jpeg(&thumb, "0xE00000", 64, 64)
+        {
+            return;
+        }
+
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-mp4".to_string(),
+                length: ComposeLength::Cap { seconds: 2.0 },
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                source: ItemSource::Thumbnail,
+                src: rect(0, 0, 64, 64),
+                transform: Transform::default(),
+                dest: rect(20, 20, 80, 80),
+                time: ItemTime::Image,
+                audio: false,
+            }],
+        };
+        let preset = preset("mosaic-mp4");
+        let encoder = super::super::run::resolve_encoder(&preset, None, None);
+        let doc = resolve_compose(&document, &preset, limits()).expect("a valid document");
+        let output = dir.path().join("thumb-mosaic.mp4");
+        let spec = super::super::run::ComposeJobSpec {
+            sources: vec![super::super::run::ComposeInput {
+                path: thumb,
+                info: Some(StreamInfo {
+                    width: 64,
+                    height: 64,
+                    video_index: 0,
+                    has_audio: false,
+                    duration_s: None,
+                }),
+            }],
+            output: output.clone(),
+            params: ComposeParams::new(doc, preset, encoder),
+            _scratch: None,
+        };
+        super::super::run::run_compose(
+            &spec,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .expect("the thumbnail composes");
+
+        let (width, height, duration, frames) =
+            probe_artifact(&output).expect("the artifact is probeable");
+        assert_eq!((width, height), (160, 120));
+        assert!(frames > 1, "a frozen thumbnail still runs as a clip: {frames}");
+        assert!(
+            (duration - 2.0).abs() <= 2.0 / 25.0,
+            "the frozen thumbnail runs for the whole cap: {duration}"
+        );
+        let png = dir.path().join("thumb-mosaic.png");
+        let frame = frame_of(&output, "1.0", &png).expect("the artifact decodes back to a frame");
+        assert_eq!(
+            primary(&frame, 60, 60),
+            Some('r'),
+            "the THUMBNAIL's pixels, not the blue file's frame 0"
         );
         assert_eq!(
             primary(&frame, 10, 110),
@@ -2792,6 +2975,7 @@ mod tests {
             },
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
+                source: ItemSource::File,
                 src: rect(0, 0, 64, 64),
                 transform: Transform::default(),
                 dest: rect(20, 20, 80, 80),
@@ -2871,6 +3055,7 @@ mod tests {
             },
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
+                source: ItemSource::File,
                 src: rect(0, 0, 64, 64),
                 transform: Transform::default(),
                 dest: rect(20, 20, 80, 80),
@@ -3016,6 +3201,7 @@ mod tests {
             },
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
+                source: ItemSource::File,
                 src: rect(0, 0, 16, 16),
                 transform: Transform::default(),
                 dest: rect(20, 20, 80, 80),
@@ -3086,6 +3272,7 @@ mod tests {
             },
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
+                source: ItemSource::File,
                 src: rect(0, 0, 16, 16),
                 transform: Transform::default(),
                 dest: rect(20, 20, 80, 80),
@@ -3163,6 +3350,7 @@ mod tests {
             },
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
+                source: ItemSource::File,
                 src: rect(0, 0, 16, 16),
                 transform: Transform::default(),
                 dest: rect(20, 20, 80, 80),
@@ -3235,6 +3423,7 @@ mod tests {
             },
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
+                source: ItemSource::File,
                 src: rect(0, 0, 16, 16),
                 transform: Transform::default(),
                 dest: rect(20, 20, 80, 80),
@@ -3297,6 +3486,7 @@ mod tests {
             },
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
+                source: ItemSource::File,
                 src: rect(0, 0, 16, 16),
                 transform: Transform::default(),
                 dest: rect(20, 20, 80, 80),
@@ -3358,6 +3548,7 @@ mod tests {
             },
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
+                source: ItemSource::File,
                 src: rect(100, 0, 200, 300),
                 transform: Transform::default(),
                 dest: rect(0, 0, 80, 120),
@@ -3423,6 +3614,7 @@ mod tests {
             },
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
+                source: ItemSource::File,
                 src: rect(0, 0, 200, 200),
                 transform: Transform::default(),
                 dest: rect(0, 0, 120, 120),

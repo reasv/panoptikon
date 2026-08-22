@@ -247,6 +247,48 @@ LIMIT 1
     Ok(Some(bytes))
 }
 
+/// [`get_thumbnail_bytes`] with the stored geometry attached: the compose
+/// path materializes the blob to disk and synthesizes the input's
+/// `StreamInfo` from these dimensions instead of probing what it just wrote.
+pub(crate) async fn get_thumbnail_image(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    idx: i64,
+) -> ApiResult<Option<StoredImage>> {
+    let row = sqlx::query(
+        r#"
+SELECT idx, width, height, thumbnail
+FROM storage.thumbnails
+WHERE item_sha256 = ?1 AND idx = ?2
+LIMIT 1
+        "#,
+    )
+    .bind(sha256)
+    .bind(idx)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read thumbnail");
+        ApiError::internal("Failed to read thumbnail")
+    })?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let field = |name: &str, err: sqlx::Error| {
+        tracing::error!(error = %err, name, "failed to parse thumbnail row");
+        ApiError::internal("Failed to read thumbnail")
+    };
+    Ok(Some(StoredImage {
+        idx: row.try_get("idx").map_err(|err| field("idx", err))?,
+        width: row.try_get("width").map_err(|err| field("width", err))?,
+        height: row.try_get("height").map_err(|err| field("height", err))?,
+        bytes: row
+            .try_get("thumbnail")
+            .map_err(|err| field("thumbnail", err))?,
+    }))
+}
+
 pub(crate) async fn get_frames_bytes(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,

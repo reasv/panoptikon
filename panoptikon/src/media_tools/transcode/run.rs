@@ -30,7 +30,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::TranscodeParams;
-use super::compose::{ComposeParams, ComposeSource, FilterPlan};
+use super::compose::{ComposeParams, ComposeSource, FilterPlan, StreamInfo};
 use super::presets::{Channel, Container, QualityMode, ResolvedPreset};
 use crate::media_tools::{cache_wrapped_args, ffmpeg_inputs_all_exist};
 use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_process_group_pid};
@@ -90,6 +90,24 @@ pub(crate) struct EncodeJobSpec {
     pub(crate) source_duration_s: Option<f64>,
 }
 
+/// One input of a composition job, as the API layer resolved it.
+#[derive(Debug, Clone)]
+pub(crate) struct ComposeInput {
+    pub(crate) path: PathBuf,
+    /// Pre-synthesized stream info for an input that must not be probed: a
+    /// materialized thumbnail, whose geometry the index database already
+    /// records (docs/compose-still-video-parity-design.md §2). `None` is an
+    /// ordinary file, probed in [`run_compose`] like it always was.
+    pub(crate) info: Option<StreamInfo>,
+}
+
+impl ComposeInput {
+    /// An ordinary file input — every item before thumbnail sources existed.
+    pub(crate) fn file(path: PathBuf) -> Self {
+        Self { path, info: None }
+    }
+}
+
 /// The composition equivalent: N inputs and one filtergraph instead of one
 /// input and a preset's filters.
 ///
@@ -99,10 +117,16 @@ pub(crate) struct EncodeJobSpec {
 /// [`run_compose`], after the job has actually been dispatched.
 #[derive(Debug, Clone)]
 pub(crate) struct ComposeJobSpec {
-    /// Source paths, parallel to `params.doc.items`.
-    pub(crate) sources: Vec<PathBuf>,
+    /// Source inputs, parallel to `params.doc.items`.
+    pub(crate) sources: Vec<ComposeInput>,
     pub(crate) output: PathBuf,
     pub(crate) params: ComposeParams,
+    /// Owns the per-job directory the API layer materialized thumbnail blobs
+    /// into. Held (never read) so the files survive until the run — including
+    /// its `cache:` retry — has finished, the same contract the webp bridge's
+    /// TempDir carries; the `Arc` is only because job specs are cloned, and
+    /// the last clone's drop is what deletes the directory.
+    pub(crate) _scratch: Option<Arc<tempfile::TempDir>>,
 }
 
 /// One dispatched job, of either kind. The pool treats the two identically —
@@ -732,12 +756,49 @@ pub(crate) fn run_compose(
     // Every bridge's TempDir, held across the ffmpeg run below: the frames
     // and scripts must survive until the run — INCLUDING its `cache:` retry —
     // has finished, and dropping this vector afterwards is what deletes them.
+    // (The materialized-thumbnail directory needs no equivalent here: the
+    // spec itself owns it, and the spec outlives this whole function.)
     let mut bridges: Vec<super::webp_bridge::BridgedInput> = Vec::new();
-    let sources: Vec<ComposeSource> = spec
-        .sources
+    let sources = resolve_compose_sources(spec, cancel, &mut bridges);
+    let plan = super::compose::build_filtergraph(&spec.params, &sources);
+    let outcome = run_ffmpeg(
+        &build_compose_args(spec, &plan),
+        &progress_path(&spec.output),
+        Some(spec.params.target_seconds()),
+        cancel,
+        on_progress,
+    );
+    // Only now are the bridged frames done with — the retry inside
+    // `run_ffmpeg` reads them too.
+    drop(bridges);
+    outcome
+}
+
+/// Each input as the graph builder needs it: bridged, pre-synthesized, or
+/// probed. Split out of [`run_compose`] so the pre-synthesized rule has a
+/// test that spawns no toolchain.
+fn resolve_compose_sources(
+    spec: &ComposeJobSpec,
+    cancel: &AtomicBool,
+    bridges: &mut Vec<super::webp_bridge::BridgedInput>,
+) -> Vec<ComposeSource> {
+    spec.sources
         .iter()
         .enumerate()
-        .map(|(index, path)| {
+        .map(|(index, input)| {
+            // A pre-synthesized input (a materialized thumbnail) is never
+            // bridged and never probed: the index database already knows the
+            // stored image's geometry, exactly as the bridge knows its
+            // decode's — and there is nothing else a probe could learn from
+            // a JPEG this process just wrote.
+            if let Some(info) = input.info {
+                return ComposeSource {
+                    path: input.path.clone(),
+                    probe: Some(info),
+                    bridged: false,
+                };
+            }
+            let path = &input.path;
             let item = spec.params.doc.items.get(index);
             // The bridge, ahead of the probe, cheapest check first: a
             // 12-byte magic read keeps everything that is not a WebP out,
@@ -811,19 +872,7 @@ pub(crate) fn run_compose(
                 bridged: false,
             }
         })
-        .collect();
-    let plan = super::compose::build_filtergraph(&spec.params, &sources);
-    let outcome = run_ffmpeg(
-        &build_compose_args(spec, &plan),
-        &progress_path(&spec.output),
-        Some(spec.params.target_seconds()),
-        cancel,
-        on_progress,
-    );
-    // Only now are the bridged frames done with — the retry inside
-    // `run_ffmpeg` reads them too.
-    drop(bridges);
-    outcome
+        .collect()
 }
 
 /// The pool's entry point: whichever kind of job was dispatched.
@@ -1410,11 +1459,12 @@ mod tests {
             items: Vec::new(),
         };
         let spec = ComposeJobSpec {
-            sources: vec![PathBuf::from("a.mp4")],
+            sources: vec![ComposeInput::file(PathBuf::from("a.mp4"))],
             output: PathBuf::from("out.tmp"),
             params: crate::media_tools::transcode::compose::ComposeParams::new(
                 doc, preset, encoder,
             ),
+            _scratch: None,
         };
         let plan = FilterPlan {
             inputs: vec![InputSpec {
@@ -1471,6 +1521,63 @@ mod tests {
             .collect();
         assert_eq!(args[at(&args, "-c:a") + 1], "aac");
         assert!(!args.contains(&"-an".to_string()));
+    }
+
+    /// A pre-synthesized input (a materialized thumbnail) reaches the graph
+    /// builder with exactly the StreamInfo the API layer attached: never
+    /// bridged, never probed. The fixture path does not exist, so a probe
+    /// attempt could only answer `None` — `Some(info)` coming back is the
+    /// proof no probe ran.
+    #[test]
+    fn a_presynthesized_input_is_neither_bridged_nor_probed() {
+        use crate::media_tools::transcode::compose::{
+            ComposeItem, ItemSource, ItemTime, Rect, ResolvedCompose, Transform,
+        };
+
+        let info = StreamInfo {
+            width: 640,
+            height: 360,
+            video_index: 0,
+            has_audio: false,
+            duration_s: None,
+        };
+        let doc = ResolvedCompose {
+            canvas_w: 640,
+            canvas_h: 480,
+            background: "0x101820".to_string(),
+            fps: 25,
+            target_cs: 100,
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                source: ItemSource::Thumbnail,
+                src: Rect { x: 0, y: 0, w: 640, h: 360 },
+                transform: Transform::default(),
+                dest: Rect { x: 0, y: 0, w: 320, h: 240 },
+                time: ItemTime::Image,
+                audio: false,
+            }],
+        };
+        let preset = preset("mosaic-mp4");
+        let encoder = resolve_encoder(&preset, None, None);
+        let spec = ComposeJobSpec {
+            sources: vec![ComposeInput {
+                path: PathBuf::from("does-not-exist/thumb.jpg"),
+                info: Some(info),
+            }],
+            output: PathBuf::from("out.tmp"),
+            params: crate::media_tools::transcode::compose::ComposeParams::new(
+                doc, preset, encoder,
+            ),
+            _scratch: None,
+        };
+        let mut bridges = Vec::new();
+        let sources =
+            resolve_compose_sources(&spec, &AtomicBool::new(false), &mut bridges);
+        assert!(bridges.is_empty());
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].path, PathBuf::from("does-not-exist/thumb.jpg"));
+        assert!(!sources[0].bridged);
+        assert_eq!(sources[0].probe, Some(info));
     }
 
     /// A bitrate profile reaches every encoder family as a bitrate, and the

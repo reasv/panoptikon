@@ -142,6 +142,7 @@ impl Modify for JsonValueSchema {
             crate::media_tools::transcode::compose::ComposeOutput,
             crate::media_tools::transcode::compose::ComposeLength,
             crate::media_tools::transcode::compose::ComposeItem,
+            crate::media_tools::transcode::compose::ItemSource,
             crate::media_tools::transcode::compose::Canvas,
             crate::media_tools::transcode::compose::Rect,
             crate::media_tools::transcode::compose::Transform,

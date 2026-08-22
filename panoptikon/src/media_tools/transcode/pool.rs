@@ -29,7 +29,7 @@ use super::TranscodeParams;
 use super::cache::{CachedArtifact, NewArtifact, TranscodeCache};
 use super::compose::{self, ComposeParams};
 use super::presets::ResolvedPreset;
-use super::run::{self, ComposeJobSpec, EncodeError, EncodeJobSpec, EncodeTask};
+use super::run::{self, ComposeInput, ComposeJobSpec, EncodeError, EncodeJobSpec, EncodeTask};
 use crate::api_error::ApiError;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -196,8 +196,14 @@ pub(crate) enum JobRequest {
     },
     Compose {
         params: Box<ComposeParams>,
-        /// Source paths, parallel to the document's items.
-        sources: Vec<PathBuf>,
+        /// Source inputs, parallel to the document's items.
+        sources: Vec<ComposeInput>,
+        /// The per-job materialized-thumbnail directory, when any item
+        /// composes from its stored thumbnail. Rides the request into the
+        /// task so the files outlive the run (including its `cache:` retry);
+        /// a request that never runs — a cache hit, a joined duplicate, a
+        /// cancelled queue entry — cleans up simply by being dropped.
+        scratch: Option<Arc<tempfile::TempDir>>,
     },
 }
 
@@ -290,13 +296,16 @@ impl JobRequest {
                 params: *params,
                 source_duration_s,
             })),
-            JobRequest::Compose { params, sources } => {
-                EncodeTask::Compose(Box::new(ComposeJobSpec {
-                    sources,
-                    output,
-                    params: *params,
-                }))
-            }
+            JobRequest::Compose {
+                params,
+                sources,
+                scratch,
+            } => EncodeTask::Compose(Box::new(ComposeJobSpec {
+                sources,
+                output,
+                params: *params,
+                _scratch: scratch,
+            })),
         }
     }
 }
@@ -1109,6 +1118,7 @@ mod tests {
     use super::*;
     use crate::media_tools::transcode::presets::{builtin_presets, find_preset};
     use crate::media_tools::transcode::run::ENCODER_X264_QUALITY;
+    use std::sync::Mutex;
 
     fn params(preset_id: &str, start_cs: Option<i64>) -> TranscodeParams {
         let presets = builtin_presets();
@@ -1650,7 +1660,7 @@ mod tests {
     /// composition download name.
     fn compose_request(weight: JobWeight) -> SubmitRequest {
         use crate::media_tools::transcode::compose::{
-            ComposeItem, ItemTime, Rect, ResolvedCompose, Transform,
+            ComposeItem, ItemSource, ItemTime, Rect, ResolvedCompose, Transform,
         };
 
         let doc = ResolvedCompose {
@@ -1662,6 +1672,7 @@ mod tests {
             items: (0..2)
                 .map(|index| ComposeItem {
                     sha256: "a".repeat(64),
+                    source: ItemSource::File,
                     src: Rect {
                         x: 0,
                         y: 0,
@@ -1690,7 +1701,11 @@ mod tests {
                     preset,
                     ENCODER_X264_QUALITY.to_string(),
                 )),
-                sources: vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")],
+                sources: vec![
+                    ComposeInput::file(PathBuf::from("a.mp4")),
+                    ComposeInput::file(PathBuf::from("b.mp4")),
+                ],
+                scratch: None,
             },
             weight,
             // Deliberately set: a composition has no single source, so its
@@ -1734,6 +1749,57 @@ mod tests {
                 .await
                 .is_none(),
             "three failures, and still nothing recorded against the document"
+        );
+    }
+
+    /// The materialized-thumbnail scratch dir rides the job: its files are
+    /// alive for the whole run (the encode reads them), and the directory is
+    /// deleted once the job settles and the task drops — the webp bridge's
+    /// TempDir contract, one ownership level up.
+    #[tokio::test]
+    async fn the_thumbnail_scratch_dir_outlives_the_run_and_is_deleted_after() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().to_path_buf();
+        std::fs::write(path.join("0-aaaaaaaaaa.jpg"), b"jpeg bytes").unwrap();
+
+        let seen = Arc::new(Mutex::new(None));
+        let runner: EncodeRunner = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |task, _cancel, _progress| {
+                let alive = match &task {
+                    EncodeTask::Compose(spec) => spec
+                        ._scratch
+                        .as_ref()
+                        .is_some_and(|dir| dir.path().join("0-aaaaaaaaaa.jpg").is_file()),
+                    EncodeTask::Single(_) => false,
+                };
+                *seen.lock().unwrap() = Some(alive);
+                Err(EncodeError::Failed("stop here".to_string()))
+            })
+        };
+        let pool = TestPool::new(runner, 1).await;
+
+        let mut request = compose_request(JobWeight::Light);
+        match &mut request.job {
+            JobRequest::Compose { scratch: slot, .. } => *slot = Some(Arc::new(scratch)),
+            JobRequest::Single { .. } => unreachable!("compose_request builds a composition"),
+        }
+        let outcome = pool.submit(request).await;
+        pool.await_terminal(&job_id(&outcome)).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(true),
+            "the materialized files were readable during the run"
+        );
+        // The task drops on its runner thread moments after the terminal
+        // event lands; poll rather than sleep on a guess.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !path.exists(),
+            "the scratch dir is deleted once the job settles"
         );
     }
 

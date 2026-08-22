@@ -5618,7 +5618,7 @@
             "description": "An item is not in this database, or has no readable file"
           },
           "422": {
-            "description": "Unknown preset, or a document the composition limits refuse: too many items, a canvas that is odd/too large/taller than the preset renders, a destination rectangle outside the canvas or at an odd position, a span whose end is not after its start, a still frozen at or past its item's recorded length, an unusable frame rate or length cap, or loop buffers over `max_mosaic_loop_mb` (the message carries the estimate)"
+            "description": "Unknown preset, or a document the composition limits refuse: too many items, a canvas that is odd/too large/taller than the preset renders, a destination rectangle outside the canvas or at an odd position, a span whose end is not after its start, a still frozen at or past its item's recorded length, a thumbnail-source item whose time is not `image` or whose item has no stored thumbnail, an unusable frame rate or length cap, or loop buffers over `max_mosaic_loop_mb` (the message carries the estimate)"
           }
         }
       }
@@ -6218,6 +6218,10 @@
           "sha256": {
             "type": "string",
             "description": "Item content hash; resolved against the request's index database."
+          },
+          "source": {
+            "$ref": "#/components/schemas/ItemSource",
+            "description": "Where this item's pixels come from; defaults to the item's file."
           },
           "src": {
             "$ref": "#/components/schemas/Rect"
@@ -7711,6 +7715,14 @@
             "format": "int64"
           }
         }
+      },
+      "ItemSource": {
+        "type": "string",
+        "description": "Which of an item's stored pictures the composition reads\n(docs/compose-still-video-parity-design.md §2).\n\n`File` is the item's own file on disk — everything before this field\nexisted. `Thumbnail` is the stored thumbnail blob the board renders for a\nvideo no `<video>` element is mounted for: it has no file path and no\nrecorded source timestamp, so it can be neither referenced as a file nor\nrecreated by a seek — the API layer materializes the blob to a per-job\ntemp file instead. A thumbnail is a still image in every way, so admission\nrequires `time.kind = image` for it.",
+        "enum": [
+          "file",
+          "thumbnail"
+        ]
       },
       "ItemTime": {
         "oneOf": [

@@ -33,11 +33,14 @@ use crate::api_error::ApiError;
 use crate::config::{PolicyConfig, Settings};
 use crate::db::files::get_item_content_end_ms;
 use crate::db::items::{FileRecord, ItemIdentifierType, ItemRecord, get_item_metadata_unchecked};
+use crate::db::storage::{StoredImage, get_thumbnail_image};
 use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::media_tools::transcode::cache::{CacheStats, ResizeError};
 use crate::media_tools::transcode::compose::{
-    self, ComposeLimits, ComposeParams, ComposeRequest, ResolvedCompose,
+    self, ComposeLimits, ComposeParams, ComposeRejection, ComposeRequest, ItemSource,
+    ResolvedCompose, StreamInfo,
 };
+use crate::media_tools::transcode::run::ComposeInput;
 use crate::media_tools::transcode::pool::{
     self, ArtifactRef, JobRequest, JobWeight, SubmitOutcome, SubmitRequest, TranscodeJobSnapshot,
 };
@@ -418,7 +421,8 @@ fn submit_response(outcome: SubmitOutcome) -> Response<Body> {
             refuse: too many items, a canvas that is odd/too large/taller than the preset \
             renders, a destination rectangle outside the canvas or at an odd position, a span \
             whose end is not after its start, a still frozen at or past its item's recorded \
-            length, an unusable frame rate or length cap, or loop buffers over \
+            length, a thumbnail-source item whose time is not `image` or whose item has no \
+            stored thumbnail, an unusable frame rate or length cap, or loop buffers over \
             `max_mosaic_loop_mb` (the message carries the estimate)")
     )
 )]
@@ -434,17 +438,31 @@ pub async fn video_compose(
 
     // Every item's own file, by the same readability rule the single-file path
     // uses: handing ffmpeg a path on a dropped mount would produce a *verdict*
-    // on a composition that is perfectly fine.
+    // on a composition that is perfectly fine. A thumbnail-source item has no
+    // file to check: its picture is a stored blob, materialized here into a
+    // per-job temp dir that rides the job (docs/compose-still-video-parity-
+    // design.md §2) — so it composes even when every copy of the file is on a
+    // mount that is down.
     let mut sources = Vec::with_capacity(doc.items.len());
-    for item in &doc.items {
-        let source = resolve_item_source(&mut db, &item.sha256).await?;
-        // The one admission rule the document could not decide on its own: a
-        // still's timestamp is only past the end relative to a length the
-        // index database holds. Refused here, by name, while the answer can
-        // still say which pin to fix — at dispatch it would fail the whole
-        // graph instead.
-        compose::validate_still_bounds(item, source.duration).map_err(compose_rejection)?;
-        sources.push(source.path);
+    let mut scratch: Option<Arc<tempfile::TempDir>> = None;
+    for (index, item) in doc.items.iter().enumerate() {
+        match item.source {
+            ItemSource::File => {
+                let source = resolve_item_source(&mut db, &item.sha256).await?;
+                // The one admission rule the document could not decide on its
+                // own: a still's timestamp is only past the end relative to a
+                // length the index database holds. Refused here, by name,
+                // while the answer can still say which pin to fix — at
+                // dispatch it would fail the whole graph instead.
+                compose::validate_still_bounds(item, source.duration)
+                    .map_err(compose_rejection)?;
+                sources.push(ComposeInput::file(source.path));
+            }
+            ItemSource::Thumbnail => {
+                let thumb = resolve_item_thumbnail(&mut db, &item.sha256).await?;
+                sources.push(materialize_thumbnail(&mut scratch, index, item, thumb).await?);
+            }
+        }
     }
     drop(db);
 
@@ -454,6 +472,7 @@ pub async fn video_compose(
         job: JobRequest::Compose {
             params: Box::new(params),
             sources,
+            scratch,
         },
         weight,
         // A composition has no source stem; its download name is fixed.
@@ -1078,6 +1097,76 @@ async fn resolve_item_source(
     Ok(ComposeItemSource {
         path: file.path.into(),
         duration: item.duration,
+    })
+}
+
+/// The stored thumbnail a `source = thumbnail` composition item names —
+/// the SAME blob the board's thumbnail endpoint renders for the pin (the
+/// first frame of the grid for a video, the single thumbnail otherwise).
+///
+/// A missing blob is refused by name rather than substituted: a correct
+/// client only asks for a thumbnail it is looking at (the builder falls back
+/// to a file-source still when it cannot measure one), so reaching this is a
+/// stale or hostile document, and inventing a picture for it would cache an
+/// artifact of something the board never showed.
+async fn resolve_item_thumbnail(
+    db: &mut DbConnection<ReadOnlyNoUserData>,
+    sha256: &str,
+) -> ApiResult<StoredImage> {
+    let metadata =
+        get_item_metadata_unchecked(&mut db.conn, sha256, ItemIdentifierType::Sha256).await?;
+    let Some(item) = metadata.item else {
+        return Err(ApiError::not_found(format!(
+            "Composition item {sha256} is not in this database"
+        )));
+    };
+    // The thumbnail endpoint's own index rule (`big = false`): idx 0 of a
+    // video is the 2x2 frame grid, idx 1 the single frame the board shows.
+    let idx = if item.mime_type.starts_with("video") { 1 } else { 0 };
+    get_thumbnail_image(&mut db.conn, &item.sha256, idx)
+        .await?
+        .ok_or_else(|| {
+            compose_rejection(ComposeRejection::new(
+                "thumbnail_missing",
+                format!("composition item {sha256} has no stored thumbnail to compose"),
+            ))
+        })
+}
+
+/// Writes one thumbnail blob into the job's scratch dir (created on the first
+/// call) and returns it as a compose input whose `StreamInfo` is synthesized
+/// from the stored geometry — thumbnails are JPEGs, so no probe could learn
+/// more than the row already says.
+async fn materialize_thumbnail(
+    scratch: &mut Option<Arc<tempfile::TempDir>>,
+    index: usize,
+    item: &compose::ComposeItem,
+    thumb: StoredImage,
+) -> ApiResult<ComposeInput> {
+    let dir = match scratch {
+        Some(dir) => dir,
+        None => scratch.insert(Arc::new(tempfile::tempdir().map_err(|err| {
+            tracing::error!(error = %err, "failed to create the thumbnail scratch dir");
+            ApiError::internal("Failed to materialize a thumbnail")
+        })?)),
+    };
+    // The index disambiguates duplicates of one item; the sha prefix only
+    // makes a leftover dir attributable by eye.
+    let prefix: String = item.sha256.chars().take(10).collect();
+    let path = dir.path().join(format!("{index}-{prefix}.jpg"));
+    tokio::fs::write(&path, &thumb.bytes).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to write a materialized thumbnail");
+        ApiError::internal("Failed to materialize a thumbnail")
+    })?;
+    Ok(ComposeInput {
+        path,
+        info: Some(StreamInfo {
+            width: thumb.width,
+            height: thumb.height,
+            video_index: 0,
+            has_audio: false,
+            duration_s: None,
+        }),
     })
 }
 
@@ -2774,6 +2863,111 @@ transcode_presets = ["playback"]
         }
         // The admitted side of the rule needs no case of its own: the route
         // test above composes a still at 0.50 s of the same 12 s item.
+    }
+
+    /// A thumbnail-source item over an item with no stored thumbnail is
+    /// refused at submit, naming the pin. A correct client never asks (its
+    /// builder falls back to a file-source still when it cannot measure a
+    /// thumbnail), so this is the backstop for stale or hostile documents —
+    /// and it must refuse rather than invent a picture the board never
+    /// showed.
+    #[tokio::test]
+    async fn a_thumbnail_item_without_a_stored_thumbnail_is_refused_by_name() {
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let body = compose_body(vec![serde_json::json!({
+            "sha256": MOSAIC_A,
+            "source": "thumbnail",
+            "src": { "x": 0, "y": 0, "w": 64, "h": 48 },
+            "dest": { "x": 0, "y": 0, "w": 160, "h": 240 },
+            "time": { "kind": "image" },
+        })]);
+        let (db, _attached) = compose_fixture_db(fixtures.path()).await;
+        let err = video_compose(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            db,
+            Json(body),
+        )
+        .await
+        .expect_err("rejected");
+        assert!(err.detail().contains(MOSAIC_A), "{}", err.detail());
+        assert!(err.detail().contains("thumbnail"), "{}", err.detail());
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// The materialization path, end to end through the route: a
+    /// thumbnail-source item's blob is fetched (idx 1 — the frame the board
+    /// shows for a video, not the grid), written to the job's scratch dir,
+    /// and the document keys like any other. The pre-seeded cache hit keeps
+    /// this a route test rather than an ffmpeg one, exactly like the route
+    /// test above — the pixels themselves are compose.rs's golden.
+    #[tokio::test]
+    async fn a_thumbnail_item_materializes_its_stored_blob_and_keys_the_document() {
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let body = compose_body(vec![serde_json::json!({
+            "sha256": MOSAIC_A,
+            "source": "thumbnail",
+            "src": { "x": 0, "y": 0, "w": 64, "h": 48 },
+            "dest": { "x": 0, "y": 0, "w": 160, "h": 240 },
+            "time": { "kind": "image" },
+        })]);
+
+        let preset = policy_preset(&settings, &test_context("local"), "mosaic-mp4").unwrap();
+        let doc = compose::resolve_compose(&body, &preset, ComposeLimits::from_config())
+            .expect("a valid document");
+        assert_eq!(doc.items[0].source, compose::ItemSource::Thumbnail);
+        let key = ComposeParams::resolve(doc, preset).cache_key();
+
+        let cache = pool::transcode_cache().await.unwrap();
+        let temp = cache.temp_path("mp4");
+        std::fs::write(&temp, b"0123456789").unwrap();
+        cache
+            .commit(
+                NewArtifact {
+                    key: &key,
+                    source_sha256: "compose",
+                    params_hash: "hash",
+                    preset: "mosaic-mp4",
+                    file_name: &format!("{key}.mp4"),
+                    download_name: &format!("{key}.mp4"),
+                    mime_type: "video/mp4",
+                    transcoder_version: 1,
+                },
+                &temp,
+            )
+            .await
+            .unwrap();
+
+        let (mut db, _attached) = compose_fixture_db(fixtures.path()).await;
+        sqlx::query(
+            "INSERT INTO storage.thumbnails \
+             (item_sha256, idx, item_mime_type, width, height, version, thumbnail) \
+             VALUES (?, 1, 'video/mp4', 64, 48, 1, X'FFD8FFE000104A464946')",
+        )
+        .bind(MOSAIC_A)
+        .execute(&mut *db.conn)
+        .await
+        .unwrap();
+        let response = video_compose(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            db,
+            Json(body),
+        )
+        .await
+        .expect("the thumbnail materializes and the cached composition answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["outcome"], "hit");
+        assert_eq!(json["artifact"]["key"], key);
+        cache.clear(true).await.unwrap();
     }
 
     /// The document-level rejections, which all land before any item is
