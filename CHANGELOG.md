@@ -213,6 +213,14 @@ Desktop release notes.
 
 ### Fixed
 
+- **Scroll browsing: the page bar under the open gallery now moves the
+  gallery.** Clicking a page number (or its Previous/Next arrows) while the
+  gallery was open in scroll browsing closed the gallery and dumped the view
+  back into the grid. It now jumps the gallery to the first item of the
+  chosen page — the same behaviour paged browsing has always had — with the
+  position indicator following, and Back undoing the jump. Middle-clicking a
+  page number opens the new tab the same way: gallery open at that page's
+  first item.
 - **Maximizing a pinboard now hides the search sidebar.** With the Advanced
   Search Options sidebar open, maximizing a board left the sidebar standing
   next to it, squeezing the board into the remaining width. The maximized
