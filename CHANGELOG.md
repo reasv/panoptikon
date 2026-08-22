@@ -8,6 +8,17 @@ Desktop release notes.
 
 ### Added
 
+- **Animated images play in animated exports.** GIFs, animated WebPs and
+  animated AVIFs on a pinboard now render as looping clips in the animated
+  mosaic export and the single-item clip save, exactly like videos: the
+  longest animation sets the output length ("play the longest once"), and
+  shorter ones loop to fill. Previously they were frozen to their first
+  frame - and a board containing an animated WebP failed the animated
+  export outright, since no ffmpeg build can decode animated WebP; those
+  now play through a built-in decoder bridge. Existing libraries pick this
+  up automatically: the next scan measures each animated image's length
+  once, with no re-indexing needed.
+
 - **Pinboard: a Uniform layout that makes every item the same size.** The
   new Uniform verb lays items out in identical cells in reading order -
   available for the whole board (Layout menu) and for a selection of two or

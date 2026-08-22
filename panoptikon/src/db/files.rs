@@ -486,6 +486,66 @@ pub(crate) async fn set_item_codecs(
     Ok(result.rows_affected())
 }
 
+/// The scan dispatcher's animation question
+/// (docs/animated-image-spans-design.md §4): "is this a gif/webp/avif whose
+/// animation length nothing has measured?" `false` means there is nothing to
+/// do — the item is not one of the three containers, already carries a
+/// duration (0.0, the "measured: still or unparseable" verdict, terminates it
+/// exactly like a positive length), or is not indexed.
+///
+/// Scoped to the three mimes in SQL even though the dispatcher pre-filters on
+/// the walker's extension guess, so a mislabeled file (a `.gif` whose indexed
+/// type says otherwise, or vice versa) can never widen the population: the
+/// index's own `type` is what the sentinel semantics are documented against.
+pub(crate) async fn item_animation_pending(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+SELECT 1
+FROM items
+WHERE sha256 = ?1
+  AND duration IS NULL
+  AND type IN ('image/gif', 'image/webp', 'image/avif')
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read an item's animation state");
+        ApiError::internal("Failed to query item")
+    })?;
+    Ok(row.is_some())
+}
+
+/// Stores one item's measured animation length.
+///
+/// Guarded on `duration IS NULL`, which is the whole write policy
+/// (docs/animated-image-spans-design.md §4): the column holds verdicts, a
+/// verdict is written once, and neither a concurrent pass nor a re-dispatch
+/// that slipped through may overwrite one — 0.0 included. Like
+/// [`set_item_codecs`] there is no negative-cache delete: a file that could
+/// not be read records nothing at all and is simply retried.
+pub(crate) async fn set_animation_duration(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    seconds: f64,
+) -> ApiResult<u64> {
+    let result =
+        sqlx::query("UPDATE items SET duration = ?1 WHERE sha256 = ?2 AND duration IS NULL")
+            .bind(seconds)
+            .bind(sha256)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, sha256, "failed to store an animation length");
+                ApiError::internal("Failed to store an animation length")
+            })?;
+    Ok(result.rows_affected())
+}
+
 /// Returns the item's stored pixel dimensions, used to decide whether an
 /// image would produce a thumbnail at all without decoding it again.
 pub(crate) async fn get_item_dimensions(
@@ -990,6 +1050,82 @@ VALUES
                 .await
                 .unwrap();
         assert_eq!(stored, (Some("hevc".to_string()), Some("aac".to_string())));
+    }
+
+    // The animation backfill's population: only the three animated-image
+    // containers, and only while the duration column is NULL. The 0.0 verdict
+    // must terminate it exactly like a real length — and must be
+    // unoverwritable, or a re-dispatch that raced a stamp would replace one
+    // measurement with another and re-key every cached mosaic built on it.
+    #[tokio::test]
+    async fn the_animation_question_covers_unmeasured_animated_images_only() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, duration, time_added)
+VALUES
+    (1, 'sha_gif', 'md5_1', 'image/gif', NULL, '2024-01-01T00:00:00'),
+    (2, 'sha_webp', 'md5_2', 'image/webp', NULL, '2024-01-01T00:00:00'),
+    (3, 'sha_avif', 'md5_3', 'image/avif', NULL, '2024-01-01T00:00:00'),
+    (4, 'sha_png', 'md5_4', 'image/png', NULL, '2024-01-01T00:00:00'),
+    (5, 'sha_still', 'md5_5', 'image/gif', 0.0, '2024-01-01T00:00:00'),
+    (6, 'sha_video', 'md5_6', 'video/mp4', NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        for sha in ["sha_gif", "sha_webp", "sha_avif"] {
+            assert!(
+                item_animation_pending(&mut dbs.index_conn, sha)
+                    .await
+                    .unwrap(),
+                "an unmeasured {sha} is work"
+            );
+        }
+        for sha in ["sha_png", "sha_still", "sha_video", "sha_missing"] {
+            assert!(
+                !item_animation_pending(&mut dbs.index_conn, sha)
+                    .await
+                    .unwrap(),
+                "{sha} must never be dispatched for a measurement"
+            );
+        }
+
+        // A stored answer terminates it, and the NULL guard keeps it stored:
+        // a second write — whatever it claims — changes nothing.
+        assert_eq!(
+            set_animation_duration(&mut dbs.index_conn, "sha_gif", 0.75)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !item_animation_pending(&mut dbs.index_conn, "sha_gif")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            set_animation_duration(&mut dbs.index_conn, "sha_gif", 99.0)
+                .await
+                .unwrap(),
+            0,
+            "a measured item is never overwritten"
+        );
+        assert_eq!(
+            set_animation_duration(&mut dbs.index_conn, "sha_still", 42.0)
+                .await
+                .unwrap(),
+            0,
+            "and neither is a 0.0 verdict"
+        );
+        let stored: Option<f64> =
+            sqlx::query_scalar("SELECT duration FROM items WHERE sha256 = 'sha_gif'")
+                .fetch_one(&mut dbs.index_conn)
+                .await
+                .unwrap();
+        assert_eq!(stored, Some(0.75));
     }
 
     // Ensures unchanged files update scan_id and last_modified without reinserting.

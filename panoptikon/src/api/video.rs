@@ -199,6 +199,18 @@ pub(crate) struct TranscodeLimits {
     pub max_canvas_side: i64,
     pub max_canvas_area: i64,
     pub max_compose_fps: u32,
+    /// The image mimes this server can play *animation* from in a
+    /// composition, so a client may classify such an item as a compose span
+    /// instead of a frozen frame (docs/animated-image-spans-design.md §5).
+    /// Always `image/gif`, and always `image/webp` — which no ffmpeg
+    /// decodes, so the server bridges it through its own decoder
+    /// (docs/animated-webp-bridge-design.md); `image/avif` rides the decode
+    /// probe.
+    ///
+    /// A capability, not a validation: the server does not reject a span on
+    /// an unlisted container at admission (admission is probe-free and knows
+    /// no mimes) — this list exists so a correct client never builds one.
+    pub span_capable_image_mimes: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -704,6 +716,15 @@ pub async fn video_presets(
     let policy = matched_policy(&state.settings, &context)?;
     let transcode = &crate::config::runtime().transcode;
     let presets = allowed_presets(policy);
+    // The decode probes spawn the toolchain on their first run, so they go
+    // through spawn_blocking rather than stalling the async runtime; every
+    // call after the first answers from the OnceLock. A worker that dies
+    // degrades to the unconditional entry — the conservative list, same as a
+    // failed probe.
+    let span_capable_image_mimes =
+        tokio::task::spawn_blocking(crate::media_tools::transcode::hw::span_capable_image_mimes)
+            .await
+            .unwrap_or_else(|_| vec!["image/gif".to_string()]);
     Ok(Json(TranscodePresetsResponse {
         presets: presets.iter().map(preset_info).collect(),
         limits: TranscodeLimits {
@@ -715,6 +736,7 @@ pub async fn video_presets(
             max_canvas_side: compose::MAX_CANVAS_SIDE,
             max_canvas_area: compose::MAX_CANVAS_AREA,
             max_compose_fps: compose::MAX_COMPOSE_FPS,
+            span_capable_image_mimes,
         },
     }))
 }

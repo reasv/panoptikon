@@ -12,6 +12,10 @@
 //! callers are blocking job helpers, so the python probe (and a possible
 //! first-use download) never blocks the async runtime.
 
+/// Animation-length measurement for GIF/WebP/AVIF
+/// (docs/animated-image-spans-design.md §3): pure structure parsing, no
+/// ffmpeg, because it feeds the index rather than a rendition.
+pub(crate) mod animation;
 pub(crate) mod outro;
 /// Driver for the outro-detector equivalence harness of design §12
 /// (`tools/outro-equivalence`). `cfg(test)` so the shipped binary gains no
@@ -56,15 +60,35 @@ pub(crate) const FFMPEG_INPUT_OPEN_FAILURE: &str = "Error opening input";
 pub(crate) fn cache_wrapped_args<S: AsRef<OsStr>>(args: &[S]) -> Vec<OsString> {
     let mut wrapped: Vec<OsString> = Vec::with_capacity(args.len());
     let mut prefix_next = false;
+    let mut format_next = false;
+    let mut concat_demuxer = false;
     for arg in args {
         let arg = arg.as_ref();
         if prefix_next {
-            let mut prefixed = OsString::from("cache:");
-            prefixed.push(arg);
-            wrapped.push(prefixed);
-        } else {
-            wrapped.push(arg.to_os_string());
+            // A concat script is never wrapped. The demuxer resolves its
+            // relative entries against the script's own URL, so a `cache:`
+            // prefix makes it ask for `cache:frame-00001.png` — which opens
+            // nothing (verified on 7.1 and 8.0.1 both) — and the one thing
+            // that hands this function a concat input, the animated-WebP
+            // bridge, writes its script and frames to local temp where the
+            // SMB bug cannot reach anyway.
+            if concat_demuxer {
+                wrapped.push(arg.to_os_string());
+            } else {
+                let mut prefixed = OsString::from("cache:");
+                prefixed.push(arg);
+                wrapped.push(prefixed);
+            }
+            prefix_next = false;
+            concat_demuxer = false;
+            format_next = false;
+            continue;
         }
+        wrapped.push(arg.to_os_string());
+        if format_next && arg == "concat" {
+            concat_demuxer = true;
+        }
+        format_next = arg == "-f";
         prefix_next = arg == "-i";
     }
     wrapped
@@ -374,6 +398,54 @@ mod tests {
         // A vector with no inputs at all is returned unchanged.
         let args: Vec<OsString> = ["-version"].into_iter().map(OsString::from).collect();
         assert_eq!(cache_wrapped_args(&args), args);
+
+        // A `-f concat` input — the animated-WebP bridge's script — stays
+        // bare: the concat demuxer resolves its relative entries against the
+        // script's URL, and a `cache:` prefix would make it open
+        // `cache:frame-00001.png`, which is nothing. The wrap resumes for
+        // inputs after it.
+        let args: Vec<OsString> = [
+            "-f",
+            "concat",
+            "-ss",
+            "0.00",
+            "-to",
+            "1.00",
+            "-i",
+            r"C:\tmp\frames.ffconcat",
+            "-ss",
+            "1.00",
+            "-i",
+            r"Z:\b.mp4",
+            "-y",
+            "out.tmp",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let wrapped: Vec<String> = cache_wrapped_args(&args)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            wrapped,
+            [
+                "-f",
+                "concat",
+                "-ss",
+                "0.00",
+                "-to",
+                "1.00",
+                "-i",
+                r"C:\tmp\frames.ffconcat",
+                "-ss",
+                "1.00",
+                "-i",
+                r"cache:Z:\b.mp4",
+                "-y",
+                "out.tmp",
+            ]
+        );
     }
 
     /// The retry gate matches what ffmpeg actually prints when an input

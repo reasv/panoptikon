@@ -31,8 +31,9 @@ use crate::db::{
     },
     files::{
         FileScanData, FileUpsertResult, delete_file_by_path, delete_files_not_allowed,
-        delete_item_if_orphan, delete_items_without_files, rename_file_path, set_blurhash,
-        set_item_codecs, set_outro_verdict, update_file_data,
+        delete_item_if_orphan, delete_items_without_files, rename_file_path,
+        set_animation_duration, set_blurhash, set_item_codecs, set_outro_verdict,
+        update_file_data,
     },
     folders::{
         add_folder_to_database, delete_files_not_under_included_folders,
@@ -159,6 +160,16 @@ pub(crate) enum IndexDbWriterMessage {
         sha256: String,
         video_codec: String,
         audio_codec: Option<String>,
+        reply: Reply<u64>,
+    },
+    /// One item's measured animation length
+    /// (docs/animated-image-spans-design.md §4). Like [`Self::SetItemCodecs`]
+    /// it carries no marker delete — the measurement writes nothing to the
+    /// negative cache — and the write itself is guarded on `duration IS
+    /// NULL`, so it can only ever fill a gap, never replace a verdict.
+    SetAnimationDuration {
+        sha256: String,
+        seconds: f64,
         reply: Reply<u64>,
     },
     RenameFilePath {
@@ -717,6 +728,18 @@ impl Actor for IndexDbWriter {
                             set_item_codecs(conn, &sha256, &video_codec, audio_codec.as_deref())
                                 .await
                         })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::SetAnimationDuration {
+                sha256,
+                seconds,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { set_animation_duration(conn, &sha256, seconds).await })
                     })
                     .await;
                 let _ = reply.send(result);

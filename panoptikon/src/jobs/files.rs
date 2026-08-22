@@ -39,7 +39,8 @@ use crate::{
         files::{
             FileScanData, FileUpsertResult, ItemScanMeta, PendingOutroItem, get_file_by_path,
             get_item_content_end_ms, get_item_dimensions, get_item_id,
-            get_item_visual_meta, get_pending_outro_item, has_blurhash, item_codec_pending,
+            get_item_visual_meta, get_pending_outro_item, has_blurhash, item_animation_pending,
+            item_codec_pending,
         },
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
@@ -926,6 +927,13 @@ struct BackfillResult {
     /// run or the probe failed — the columns hold answers only. There is no
     /// new-item twin: those codecs ride the `items` INSERT itself.
     codecs: Option<CodecRecord>,
+    /// This file's measured animation length in seconds
+    /// (docs/animated-image-spans-design.md §4), when the backfill measured
+    /// one. `None` whenever the stage did not run or the file would not read
+    /// — the column holds verdicts only, and 0.0 *is* one ("measured: still,
+    /// or unparseable"). Like the codecs there is no new-item twin: the
+    /// measurement rides the `items` INSERT itself.
+    animation: Option<f64>,
     /// Design §7.1: this item newly turned positive *and* already had visuals,
     /// so the ones this pass produced replace them rather than filling a gap.
     /// The store guards are bypassed for exactly this case and no other.
@@ -1979,6 +1987,38 @@ impl ScanContext {
         }
     }
 
+    /// Stores one item's measured animation length
+    /// (docs/animated-image-spans-design.md §4).
+    ///
+    /// Never fails the file, for the same reason its codec twin does not: a
+    /// lost record costs one re-measure on the next scan. Empty for
+    /// everything but a gif/webp/avif this pass measured, and the emptiness
+    /// is checked before the writer is touched. The write itself is guarded
+    /// on `duration IS NULL`, so 0 affected rows also covers the item another
+    /// task measured (or that left the index) meanwhile.
+    async fn record_item_animation(&mut self, sha256: &str, seconds: Option<f64>) {
+        let Some(seconds) = seconds else {
+            return;
+        };
+        match call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::SetAnimationDuration {
+                sha256: sha256.to_string(),
+                seconds,
+                reply,
+            }
+        })
+        .await
+        {
+            Ok(0) => tracing::debug!(sha256, "no unmeasured item to store an animation length on"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                error = ?err,
+                sha256,
+                "failed to store an animation length; it will be re-measured next scan"
+            ),
+        }
+    }
+
     async fn handle_backfill(&mut self, backfill: BackfillResult) {
         self.in_flight_visuals.remove(&backfill.sha256);
 
@@ -2073,6 +2113,8 @@ impl ScanContext {
         self.record_outro_verdict(&backfill.sha256, backfill.outro.as_ref())
             .await;
         self.record_item_codecs(&backfill.sha256, backfill.codecs.as_ref())
+            .await;
+        self.record_item_animation(&backfill.sha256, backfill.animation)
             .await;
 
         if wrote_visuals {
@@ -2170,14 +2212,24 @@ impl ScanContext {
             .pending_codec_work(&sha256, &mime_type, &path)
             .await
             .is_some();
+        // The dispatcher's fifth question (docs/animated-image-spans-design.md
+        // §4): "is this a gif/webp/avif whose animation length nothing has
+        // measured?" Cut from the same cloth as the codec question — not a
+        // missing visual, so an image with every visual it needs is still
+        // work, which is exactly what backfills an existing library with no
+        // migration and no separate job. Answered from the index; a stamped
+        // value (the 0.0 verdict included) costs nothing on every scan after.
+        let animation_work = self
+            .pending_animation_work(&sha256, &mime_type, &path)
+            .await;
         if !needs_thumb && !needs_blurhash {
-            // Counted before the outro and codec questions are consulted: the
-            // marker did remove a whole visuals dispatch, whether or not a
-            // probe still owes this file a run of its own.
+            // Counted before the outro, codec and animation questions are
+            // consulted: the marker did remove a whole visuals dispatch,
+            // whether or not a probe still owes this file a run of its own.
             if thumb_suppressed {
                 self.note_suppressed_visuals(&path);
             }
-            if outro_work.is_none() && !codec_work {
+            if outro_work.is_none() && !codec_work && !animation_work {
                 return Ok(());
             }
         }
@@ -2230,7 +2282,7 @@ impl ScanContext {
                             &mime_type,
                         )
                         .await;
-                        if outro_work.is_none() && !codec_work {
+                        if outro_work.is_none() && !codec_work && !animation_work {
                             return Ok(());
                         }
                         // A probe is still owed and needs neither frames nor a
@@ -2270,12 +2322,12 @@ impl ScanContext {
             }
             no_source = no_source || thumb_suppressed;
             if no_source {
-                // As above: the suppression is counted even when the outro or
-                // codec question keeps the dispatch alive for a probe.
+                // As above: the suppression is counted even when the outro,
+                // codec or animation question keeps the dispatch alive.
                 if thumb_suppressed {
                     self.note_suppressed_visuals(&path);
                 }
-                if outro_work.is_none() && !codec_work {
+                if outro_work.is_none() && !codec_work && !animation_work {
                     return Ok(());
                 }
             }
@@ -2379,6 +2431,7 @@ impl ScanContext {
                     video_duration,
                     outro_work,
                     codec_work,
+                    animation_work,
                     stored_content_end_ms,
                     &timers,
                 )
@@ -2405,11 +2458,14 @@ impl ScanContext {
                         blurhash: None,
                         // A dead worker is no verdict on the content: the
                         // generation is retried next scan, unmarked and
-                        // unrecorded.
+                        // unrecorded. The animation length stays `None` for
+                        // the same reason — nothing was measured, so the
+                        // column stays NULL and the next scan asks again.
                         visual_verdicts: Vec::new(),
                         visuals_scan_error: None,
                         outro: None,
                         codecs: None,
+                        animation: None,
                         replace_visuals: false,
                     })
                 }
@@ -2503,6 +2559,38 @@ impl ScanContext {
                     "failed to read the codec state; skipping the probe"
                 );
                 None
+            }
+        }
+    }
+
+    /// The animation-length dispatch question, answered against the index
+    /// alone (docs/animated-image-spans-design.md §4).
+    ///
+    /// `false` means nothing to measure: the file is not one of the three
+    /// animated-image containers, or the item already carries a duration —
+    /// 0.0 included, which is the "measured: still or unparseable" verdict
+    /// and terminates the backfill exactly like a real length. Like the
+    /// codec question there is no config gate and no negative-cache consult,
+    /// because the pass writes no markers: a file that cannot be *read*
+    /// records nothing and is retried, while one that reads but does not
+    /// parse records the 0.0 verdict itself.
+    async fn pending_animation_work(&mut self, sha256: &str, mime_type: &str, path: &Path) -> bool {
+        // The mime gate first, so the overwhelmingly common case — an image
+        // that is not one of the three — costs no query at all.
+        if !crate::media_tools::animation::measures_animation(mime_type) {
+            return false;
+        }
+        match item_animation_pending(&mut self.conn, sha256).await {
+            Ok(pending) => pending,
+            // Advisory, like every other read on this path: without the answer
+            // the file is simply left alone this run.
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to read the animation state; skipping the measurement"
+                );
+                false
             }
         }
     }
@@ -3720,6 +3808,16 @@ fn extract_item_metadata(
             .map_err(|(stage, err)| FileProcessError::from_image_error(stage, err))?;
         metadata.width = Some(width as i64);
         metadata.height = Some(height as i64);
+        // The three animated-image containers also record their animation
+        // length (docs/animated-image-spans-design.md §3): a positive value is
+        // what lets the compose builder classify the item as a span, 0.0 is
+        // the measured "still or unparseable" verdict, and `None` — any other
+        // image mime, or a file that stopped reading between the header above
+        // and here — leaves the column NULL for the backfill to retry. Still
+        // no pixel decode: it is a structure walk, in the same spirit as the
+        // header read.
+        metadata.duration =
+            crate::media_tools::animation::animation_duration_seconds(path, mime_type);
         return Ok(metadata);
     }
 
@@ -4097,6 +4195,7 @@ fn generate_backfill_visuals(
     video_duration: f64,
     outro: Option<OutroBackfill>,
     needs_codecs: bool,
+    needs_animation: bool,
     stored_content_end_ms: Option<i64>,
     timers: &ScanTimers,
 ) -> BackfillResult {
@@ -4109,6 +4208,19 @@ fn generate_backfill_visuals(
         let codecs = codec_pass_for(path, mime_type);
         drop(metadata_span);
         codecs
+    } else {
+        None
+    };
+    // The animation measurement, under the same reasoning and the same timer:
+    // scan metadata, not a visual, and the phase the new-item path charges
+    // the identical structure walk to. No ffmpeg — see
+    // `media_tools::animation` for why the index must not depend on it.
+    let animation = if needs_animation {
+        let metadata_span = timers.metadata.start();
+        let animation =
+            crate::media_tools::animation::animation_duration_seconds(path, mime_type);
+        drop(metadata_span);
+        animation
     } else {
         None
     };
@@ -4264,6 +4376,7 @@ fn generate_backfill_visuals(
         visuals_scan_error: audit.and_then(|failure| backfill_scan_error(path, mime_type, failure)),
         outro: outro_record,
         codecs,
+        animation,
         replace_visuals,
     }
 }
@@ -8970,6 +9083,148 @@ LIMIT 1
             codec_columns(&mut conn, sha256).await,
             (Some("h264".to_string()), None)
         );
+    }
+
+    /// Indexes a file as an image with the given mime and duration, without
+    /// running a scan: these items stand in for a library indexed before
+    /// animation lengths were measured, which is what the fifth dispatcher
+    /// question is about. The blurhash and dimensions are stored so the
+    /// visuals questions are all answered — a small image with recorded
+    /// dimensions is served directly and needs no thumbnail — leaving the
+    /// animation question as the only thing that can dispatch.
+    async fn seed_image_item(
+        env: &VisualsEnv,
+        path: &Path,
+        sha256: &str,
+        mime_type: &str,
+        duration: Option<f64>,
+    ) {
+        let (last_modified, file_size) = get_last_modified_time_and_size(path).unwrap();
+        let scan_time = current_iso_timestamp();
+        let scan_id = call_index_db_writer(&env.index_db, |reply| {
+            IndexDbWriterMessage::AddFileScan {
+                scan_time: scan_time.clone(),
+                path: env.media_dirs[0].to_string_lossy().to_string(),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        call_index_db_writer(&env.index_db, |reply| IndexDbWriterMessage::UpdateFileData {
+            time_added: scan_time.clone(),
+            scan_id,
+            data: FileScanData {
+                sha256: sha256.to_string(),
+                last_modified: last_modified.clone(),
+                path: path.to_string_lossy().to_string(),
+                new_file_hash: true,
+                file_size: Some(file_size),
+                item_metadata: Some(ItemScanMeta {
+                    md5: "md5".to_string(),
+                    mime_type: mime_type.to_string(),
+                    width: Some(1),
+                    height: Some(1),
+                    duration,
+                    audio_tracks: None,
+                    video_tracks: None,
+                    subtitle_tracks: None,
+                    video_codec: None,
+                    audio_codec: None,
+                }),
+                blurhash: Some("LEHV6nWB2yk8pyo0adR*".to_string()),
+            },
+            reply,
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn stored_duration(env: &VisualsEnv, sha256: &str) -> Option<f64> {
+        let mut conn = env.read().await;
+        sqlx::query_scalar("SELECT duration FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    // The new-item path (docs/animated-image-spans-design.md §3): an animated
+    // GIF walks in with its measured length, a single-frame one with the 0.0
+    // verdict, and an image outside the three containers with NULL — all off
+    // the metadata phase, with no ffmpeg and no backfill involved.
+    #[tokio::test]
+    async fn a_new_animated_gif_is_indexed_with_its_animation_length() {
+        use crate::media_tools::animation::tests::gif_bytes;
+
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-animation-new"]).await;
+        fs::write(env.media_dirs[0].join("anim.gif"), gif_bytes(&[25, 50])).unwrap();
+        fs::write(env.media_dirs[0].join("still.gif"), gif_bytes(&[25])).unwrap();
+        image::RgbImage::new(4, 4)
+            .save(env.media_dirs[0].join("plain.png"))
+            .unwrap();
+
+        env.scan().await;
+
+        let mut conn = env.read().await;
+        let rows: Vec<(String, Option<f64>)> = sqlx::query_as(
+            "SELECT files.filename, items.duration FROM items \
+             JOIN files ON files.item_id = items.id ORDER BY files.filename",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("anim.gif".to_string(), Some(0.75)),
+                ("plain.png".to_string(), None),
+                ("still.gif".to_string(), Some(0.0)),
+            ],
+            "the measured length, the still verdict, and the untouched NULL"
+        );
+    }
+
+    // The backfill's whole point (design §4): an item indexed before the
+    // measurement existed is an image with every visual it needs, so the
+    // animation question is the only thing left that can dispatch it — and
+    // one scan later the column carries what the file's own structure says.
+    #[tokio::test]
+    async fn an_unmeasured_gif_already_in_the_index_gets_its_length_backfilled() {
+        use crate::media_tools::animation::tests::gif_bytes;
+
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-animation-backfill"]).await;
+        let gif = env.media_dirs[0].join("anim.gif");
+        fs::write(&gif, gif_bytes(&[25, 50])).unwrap();
+        let sha256 = "sha_animation_pending";
+        seed_image_item(&env, &gif, sha256, "image/gif", None).await;
+        assert_eq!(stored_duration(&env, sha256).await, None);
+
+        env.scan().await;
+
+        assert_eq!(stored_duration(&env, sha256).await, Some(0.75));
+    }
+
+    // The termination half: 0.0 is a *verdict*, so a measured-still item is
+    // never re-dispatched. The file on disk is genuinely animated on purpose
+    // — if any scan re-measured it, the animated answer would show up in the
+    // column, so the 0.0 surviving a rescan is the proof that both guards
+    // (the dispatch predicate and the writer's `duration IS NULL`) hold.
+    #[tokio::test]
+    async fn a_measured_still_verdict_is_never_remeasured() {
+        use crate::media_tools::animation::tests::gif_bytes;
+
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-animation-verdict"]).await;
+        let gif = env.media_dirs[0].join("anim.gif");
+        fs::write(&gif, gif_bytes(&[25, 50])).unwrap();
+        let sha256 = "sha_animation_still";
+        seed_image_item(&env, &gif, sha256, "image/gif", Some(0.0)).await;
+
+        env.scan().await;
+
+        assert_eq!(stored_duration(&env, sha256).await, Some(0.0));
     }
 
     /// A `video/`-typed container holding nothing but an audio stream — the

@@ -11673,7 +11673,8 @@
           "min_canvas_side",
           "max_canvas_side",
           "max_canvas_area",
-          "max_compose_fps"
+          "max_compose_fps",
+          "span_capable_image_mimes"
         ],
         "properties": {
           "max_animated_image_seconds": {
@@ -11711,6 +11712,13 @@
           "min_canvas_side": {
             "type": "integer",
             "format": "int64"
+          },
+          "span_capable_image_mimes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The image mimes this server can play *animation* from in a\ncomposition, so a client may classify such an item as a compose span\ninstead of a frozen frame (docs/animated-image-spans-design.md §5).\nAlways `image/gif`, and always `image/webp` — which no ffmpeg\ndecodes, so the server bridges it through its own decoder\n(docs/animated-webp-bridge-design.md); `image/avif` rides the decode\nprobe.\n\nA capability, not a validation: the server does not reject a span on\nan unlisted container at admission (admission is probe-free and knows\nno mimes) — this list exists so a correct client never builds one."
           }
         }
       },

@@ -11,6 +11,7 @@ pub(crate) mod hw;
 pub(crate) mod pool;
 pub(crate) mod presets;
 pub(crate) mod run;
+pub(crate) mod webp_bridge;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};

@@ -708,13 +708,19 @@ pub(crate) fn run_encode(
     )
 }
 
-/// One composition, end to end: probe the inputs, build the graph from what
-/// they turned out to be, and run it.
+/// One composition, end to end: bridge what ffmpeg cannot decode, probe the
+/// rest, build the graph from what they all turned out to be, and run it.
 ///
 /// The probe is where a source rectangle is clamped to the stream it crops and
 /// where an item marked audible loses its audio if the file has none — both of
 /// which would otherwise fail the whole graph rather than one item. It runs
 /// here, on the job's own thread, so a cache hit never pays for it.
+///
+/// The bridge (docs/animated-webp-bridge-design.md) runs here for the same
+/// reason: an animated WebP — which no mainline ffmpeg decodes, so it would
+/// fail the whole graph with zero frames — is decoded in Rust and substituted
+/// as an ffconcat script of PNG frames, with its `StreamInfo` synthesized
+/// from the decode instead of probed.
 pub(crate) fn run_compose(
     spec: &ComposeJobSpec,
     cancel: &AtomicBool,
@@ -723,11 +729,59 @@ pub(crate) fn run_compose(
     if cancel.load(Ordering::Relaxed) {
         return Err(EncodeError::Cancelled);
     }
+    // Every bridge's TempDir, held across the ffmpeg run below: the frames
+    // and scripts must survive until the run — INCLUDING its `cache:` retry —
+    // has finished, and dropping this vector afterwards is what deletes them.
+    let mut bridges: Vec<super::webp_bridge::BridgedInput> = Vec::new();
     let sources: Vec<ComposeSource> = spec
         .sources
         .iter()
         .enumerate()
         .map(|(index, path)| {
+            let item = spec.params.doc.items.get(index);
+            // The bridge, ahead of the probe, cheapest check first: a
+            // 12-byte magic read keeps everything that is not a WebP out,
+            // then the native-decode bypass — a toolchain that decodes
+            // animated WebP itself (a future ffmpeg, or a user's patched
+            // `ffmpeg =` override) is preferred automatically and takes the
+            // ordinary path below without ever paying the whole-file sniff —
+            // and only then the full structure sniff that reads the file.
+            if !cancel.load(Ordering::Relaxed)
+                && let Some(item) = item
+                && super::webp_bridge::has_webp_magic(path)
+                && !super::hw::animated_webp_decodable()
+                && let Some(bytes) = super::webp_bridge::sniff_animated_webp(path)
+            {
+                match super::webp_bridge::extract(&bytes, item.time, cancel) {
+                    Ok(bridge) => {
+                        // `probe_source` is skipped outright: the synthesized
+                        // StreamInfo is strictly more reliable than ffprobe
+                        // on a concat script of images.
+                        let source = ComposeSource {
+                            path: bridge.script.clone(),
+                            probe: Some(bridge.info),
+                            bridged: true,
+                        };
+                        bridges.push(bridge);
+                        return source;
+                    }
+                    // Warn-and-fall-through, never a silent drop: the item
+                    // keeps its place in the graph with the ORIGINAL file
+                    // behind it, and ffmpeg fails fast on what it cannot
+                    // decode — the pre-bridge behavior, an error rather than
+                    // an invented success.
+                    Err(error) => {
+                        if !cancel.load(Ordering::Relaxed) {
+                            tracing::warn!(
+                                file = %path.display(),
+                                sha = item.sha256.as_str(),
+                                error,
+                                "failed to bridge an animated WebP; passing the file through undecoded"
+                            );
+                        }
+                    }
+                }
+            }
             // A cancellation mid-probe skips the rest: the run below refuses
             // to start anyway, and each probe is its own child process.
             let probe = if cancel.load(Ordering::Relaxed) {
@@ -743,13 +797,7 @@ pub(crate) fn run_compose(
                     Err(error) => {
                         tracing::warn!(
                             file = %path.display(),
-                            sha = spec
-                                .params
-                                .doc
-                                .items
-                                .get(index)
-                                .map(|item| item.sha256.as_str())
-                                .unwrap_or_default(),
+                            sha = item.map(|item| item.sha256.as_str()).unwrap_or_default(),
                             error,
                             "failed to probe a composition source"
                         );
@@ -760,17 +808,22 @@ pub(crate) fn run_compose(
             ComposeSource {
                 path: path.clone(),
                 probe,
+                bridged: false,
             }
         })
         .collect();
     let plan = super::compose::build_filtergraph(&spec.params, &sources);
-    run_ffmpeg(
+    let outcome = run_ffmpeg(
         &build_compose_args(spec, &plan),
         &progress_path(&spec.output),
         Some(spec.params.target_seconds()),
         cancel,
         on_progress,
-    )
+    );
+    // Only now are the bridged frames done with — the retry inside
+    // `run_ffmpeg` reads them too.
+    drop(bridges);
+    outcome
 }
 
 /// The pool's entry point: whichever kind of job was dispatched.

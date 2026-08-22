@@ -772,6 +772,15 @@ pub(crate) struct ComposeSource {
     /// the stream, and drops audio that does not exist — ffmpeg's own verdict
     /// is the backstop for everything else.
     pub(crate) probe: Option<StreamInfo>,
+    /// Whether `path` names a bridged animated WebP's ffconcat script rather
+    /// than the item's own file ([`super::webp_bridge`]). The input then
+    /// needs `-f concat` ahead of its `-i` — extensionless scripts probe as
+    /// nothing — and carries NO time options: the extraction already
+    /// windowed the frames to the item's own timestamps, because a seek on
+    /// a concat script of image entries lands on entry boundaries rather
+    /// than inside them. `probe` carries the StreamInfo the extraction
+    /// synthesized.
+    pub(crate) bridged: bool,
 }
 
 /// ffprobe, for the three things a composition cannot ask the index database
@@ -908,8 +917,22 @@ pub(crate) fn build_filtergraph(params: &ComposeParams, sources: &[ComposeSource
     for (index, item) in doc.items.iter().enumerate() {
         let source = sources.get(index);
         let probe = source.and_then(|source| source.probe);
+        let bridged = source.is_some_and(|source| source.bridged);
+        // A bridged input is an ffconcat script: the demuxer must be forced
+        // (there is no extension for ffmpeg to guess it from), and it takes
+        // NO time options at all. `-ss`/`-to` on a concat script of image
+        // entries land on entry boundaries — the seek snaps to the *next*
+        // entry, or to nothing at all past the last one, which fails the
+        // whole graph (empirical, 7.1 and 8.0.1 both) — so the extraction
+        // already windowed the frames to the item's own timestamps and the
+        // script *is* the seeked content.
+        let args = if bridged {
+            vec!["-f".to_string(), "concat".to_string()]
+        } else {
+            input_args(item, doc.fps, probe)
+        };
         inputs.push(InputSpec {
-            args: input_args(item, doc.fps, probe),
+            args,
             path: source
                 .map(|source| source.path.clone())
                 .unwrap_or_default(),
@@ -1016,7 +1039,8 @@ pub(crate) fn build_filtergraph(params: &ComposeParams, sources: &[ComposeSource
     }
 }
 
-/// The input options an item needs before its `-i`.
+/// The input options an item needs before its `-i` (bridged inputs never
+/// reach here — their script already holds the item's own window).
 fn input_args(item: &ComposeItem, fps: u32, probe: Option<StreamInfo>) -> Vec<String> {
     match item.time {
         // Input seeking, and `-to` in the input's own timeline: the decoder
@@ -1241,6 +1265,7 @@ mod tests {
             .map(|index| ComposeSource {
                 path: PathBuf::from(format!("item{index}.mp4")),
                 probe: None,
+                bridged: false,
             })
             .collect()
     }
@@ -1872,6 +1897,7 @@ mod tests {
             &[ComposeSource {
                 path: PathBuf::from("a.mp4"),
                 probe: probe(Some(12.0)),
+                bridged: false,
             }],
         );
         assert_eq!(plan.inputs[0].args, ["-ss", "11.96"]);
@@ -2089,6 +2115,7 @@ mod tests {
                     has_audio: true,
                     duration_s: Some(30.0),
                 }),
+                bridged: false,
             },
             ComposeSource {
                 path: PathBuf::from("b.mp4"),
@@ -2099,6 +2126,7 @@ mod tests {
                     has_audio: false,
                     duration_s: Some(30.0),
                 }),
+                bridged: false,
             },
         ];
         let plan = build_filtergraph(&params, &probed);
@@ -2699,6 +2727,602 @@ mod tests {
             Some('g'),
             "and the background shows outside its rectangle"
         );
+    }
+
+    /// Whether this toolchain's `scale` preserves the trailing frame's
+    /// duration. ffmpeg 7.1's scale drops it, so the `fps` resample places
+    /// its EOF at the last frame's *start* and the animation's final frame
+    /// never renders — for a two-frame GIF, half the picture (fixed by 8.0,
+    /// which static_ffmpeg ships; ordinary video sources never notice,
+    /// because one frame at source rate is invisible). The two span tests
+    /// below gate their frame-accurate colour assertions on this probe, the
+    /// same way the avif round gates on an AV1 encoder: what a buggy scale
+    /// degrades to is still asserted (full-length output, first frame held),
+    /// what it cannot render is skipped rather than failed.
+    ///
+    /// Probed by running the fixture GIF through `scale,fps=25` and counting
+    /// the raw frames out: 25 when the trailing half second survives, 13
+    /// when it is dropped.
+    fn scale_preserves_trailing_frame_duration(gif: &Path, dir: &Path) -> bool {
+        let raw = dir.join("duration-probe.raw");
+        let status = Command::new(crate::media_tools::ffmpeg())
+            .args(["-y", "-v", "error", "-i"])
+            .arg(gif)
+            .args(["-vf", "scale=8:8,fps=25", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+            .arg(&raw)
+            .stdin(Stdio::null())
+            .status();
+        if !matches!(status, Ok(status) if status.success()) {
+            return false;
+        }
+        std::fs::metadata(&raw)
+            .map(|meta| meta.len() >= 20 * 8 * 8 * 3)
+            .unwrap_or(false)
+    }
+
+    /// The same two-frame GIF as a SPAN
+    /// (docs/animated-image-spans-design.md §5): the index measured its
+    /// length, the client classified it as playing, and the ordinary span
+    /// chain — `-ss`/`-to`, the fps resample, `span_loop` — plays it. Both
+    /// frames must appear at their own timestamps (red for the first half
+    /// second, blue for the second), and a span shorter than the cap must
+    /// loop to fill it, exactly like a video span. Skips (never fails) where
+    /// there is no ffmpeg.
+    #[test]
+    fn an_animated_image_span_plays_both_frames_and_loops_to_fill() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let gif = dir.path().join("two-frame.gif");
+        if !write_two_frame_gif(&gif, 64, 64) {
+            return;
+        }
+
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-mp4".to_string(),
+                length: ComposeLength::Cap { seconds: 3.0 },
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                src: rect(0, 0, 64, 64),
+                transform: Transform::default(),
+                dest: rect(20, 20, 80, 80),
+                // What the client builds for an animated image: the full
+                // measured length, from zero.
+                time: ItemTime::Span {
+                    start_cs: 0,
+                    end_cs: 100,
+                },
+                audio: false,
+            }],
+        };
+        let output = compose_fixture(dir.path(), &document, vec![gif.clone()], "gif-span");
+
+        let (width, height, duration, _frames) =
+            probe_artifact(&output).expect("the artifact is probeable");
+        assert_eq!((width, height), (160, 120));
+        assert!(
+            (duration - 3.0).abs() <= 2.0 / 25.0,
+            "a one-second GIF span loops to the three-second cap: {duration}"
+        );
+        // What a duration-dropping scale degrades to — the first frame held
+        // full length, today's frozen behavior — is still covered by the red
+        // assertion below; the blue and loop rows need the real timing.
+        let accurate = scale_preserves_trailing_frame_duration(&gif, dir.path());
+        for (at, expected, what) in [
+            ("0.2", 'r', "the first frame at its own timestamp"),
+            ("0.7", 'b', "the second frame at its own timestamp"),
+            ("1.2", 'r', "and the loop starts the animation over"),
+        ] {
+            if !accurate && expected != 'r' {
+                continue;
+            }
+            let png = dir.path().join(format!("gif-span-{at}.png"));
+            let frame = frame_of(&output, at, &png)
+                .unwrap_or_else(|| panic!("the artifact decodes at {at}"));
+            assert_eq!(primary(&frame, 60, 60), Some(expected), "{what} ({at}s)");
+            assert_eq!(
+                primary(&frame, 10, 110),
+                Some('g'),
+                "the background shows outside the rectangle ({at}s)"
+            );
+        }
+    }
+
+    /// The under-run tolerance (design §5): a measured duration that
+    /// OVERSHOOTS what actually decodes — the exactness the structure walk
+    /// deliberately does not promise. The span chain produces fewer frames
+    /// than it claimed; `overlay`'s default `eof_action=repeat` freezes that
+    /// item's last frame while the base carries the output to the full
+    /// resolved target. Degraded, never hung, never short. Skips (never
+    /// fails) where there is no ffmpeg.
+    #[test]
+    fn a_span_overshooting_its_animated_image_still_fills_the_target() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let gif = dir.path().join("two-frame.gif");
+        if !write_two_frame_gif(&gif, 64, 64) {
+            return;
+        }
+
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-mp4".to_string(),
+                // The longest span defines the target, so the overshoot is
+                // also the promised output length — the case where a short
+                // output would be a broken cache-key promise.
+                length: ComposeLength::LongestLoopOnce,
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                src: rect(0, 0, 64, 64),
+                transform: Transform::default(),
+                dest: rect(20, 20, 80, 80),
+                // Twice the GIF's real length: a measurement that disagrees
+                // with ffmpeg's decode timing, exaggerated.
+                time: ItemTime::Span {
+                    start_cs: 0,
+                    end_cs: 200,
+                },
+                audio: false,
+            }],
+        };
+        let output = compose_fixture(dir.path(), &document, vec![gif.clone()], "gif-overshoot");
+
+        let (_, _, duration, _) = probe_artifact(&output).expect("the artifact is probeable");
+        assert!(
+            (duration - 2.0).abs() <= 2.0 / 25.0,
+            "the output runs to the full claimed target: {duration}"
+        );
+        let png = dir.path().join("gif-overshoot.png");
+        let frame = frame_of(&output, "1.5", &png).expect("the artifact decodes past the GIF");
+        // Never black and never short on any toolchain; WHICH frame is held
+        // past the animation depends on the trailing frame surviving `scale`
+        // (see `scale_preserves_trailing_frame_duration`).
+        let held = if scale_preserves_trailing_frame_duration(&gif, dir.path()) {
+            'b'
+        } else {
+            'r'
+        };
+        assert_eq!(
+            primary(&frame, 60, 60),
+            Some(held),
+            "past the real animation the last decoded frame is held, not black"
+        );
+    }
+
+    /// A bridged source in the graph builder: the concat demuxer is forced
+    /// ahead of its `-i`, the synthesized [`StreamInfo`] does everything a
+    /// probe's would (here, clamping the crop to the decoded canvas), and
+    /// NO time options ride on any bridged input — `-ss`/`-to` on a concat
+    /// script of images land on entry boundaries or nothing at all, so the
+    /// extraction windows the frames instead and the script IS the seeked
+    /// content.
+    #[test]
+    fn a_bridged_source_forces_the_concat_demuxer_and_reads_its_synthesized_probe() {
+        let bridged_source = || ComposeSource {
+            path: PathBuf::from("frames.ffconcat"),
+            probe: Some(StreamInfo {
+                width: 16,
+                height: 16,
+                video_index: 0,
+                has_audio: false,
+                duration_s: Some(1.0),
+            }),
+            bridged: true,
+        };
+        let with_time = |time: ItemTime| {
+            let mut spanning = item(time);
+            // Deliberately larger than the decoded canvas: the synthesized
+            // probe must clamp it exactly as an ffprobe'd one would.
+            spanning.src = rect(0, 0, 640, 480);
+            params_for(
+                &request(vec![spanning], ComposeLength::Cap { seconds: 3.0 }),
+                "mosaic-mp4",
+            )
+        };
+
+        let plan = build_filtergraph(
+            &with_time(ItemTime::Span {
+                start_cs: 25,
+                end_cs: 100,
+            }),
+            &[bridged_source()],
+        );
+        assert_eq!(
+            plan.inputs[0].args,
+            ["-f", "concat"],
+            "a bridged span must not seek; extraction already windowed its frames"
+        );
+        assert_eq!(plan.inputs[0].path, PathBuf::from("frames.ffconcat"));
+        assert!(
+            plan.filter_complex.contains("crop=16:16:0:0"),
+            "the synthesized probe clamps the crop: {}",
+            plan.filter_complex
+        );
+
+        let plan = build_filtergraph(&with_time(ItemTime::Still { at_cs: 75 }), &[bridged_source()]);
+        assert_eq!(
+            plan.inputs[0].args,
+            ["-f", "concat"],
+            "a bridged still must not seek; extraction already selected its frame"
+        );
+
+        let plan = build_filtergraph(&with_time(ItemTime::Image), &[bridged_source()]);
+        assert_eq!(plan.inputs[0].args, ["-f", "concat"]);
+
+        // And an unbridged source of the same shape carries no `-f` at all.
+        let unbridged = ComposeSource {
+            bridged: false,
+            ..bridged_source()
+        };
+        let plan = build_filtergraph(&with_time(ItemTime::Image), &[unbridged]);
+        assert_eq!(plan.inputs[0].args, Vec::<String>::new());
+    }
+
+    /// The committed two-frame fixture (16x16, red then blue, 500 ms each) as
+    /// a real file — the bridge tests' source. Committed rather than written
+    /// by ffmpeg like the GIF, because writing one here would need the very
+    /// animated-WebP support whose absence the bridge exists for.
+    fn write_two_frame_webp(path: &Path) -> bool {
+        std::fs::write(path, include_bytes!("fixtures/two-frame.webp")).is_ok()
+    }
+
+    /// An `Image`-time item over an ANIMATED WebP, end to end — the case the
+    /// bridge design's §0 suspected was broken outright, and empirically was:
+    /// pre-bridge, ffmpeg's still-only webp decoder produced zero frames from
+    /// this fixture ("image data not found") and failed the WHOLE board, on
+    /// 7.1 and 8.0.1 alike (pinned 2026-08-22). Bridged, the item is a
+    /// one-frame concat script and composes exactly like any image: first
+    /// frame frozen, background intact, stills-only target length. Skips
+    /// (never fails) where there is no ffmpeg.
+    #[test]
+    fn an_animated_webp_image_item_composes_its_first_frame() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let webp = dir.path().join("two-frame.webp");
+        if !write_two_frame_webp(&webp) {
+            return;
+        }
+
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-mp4".to_string(),
+                length: ComposeLength::LongestLoopOnce,
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                src: rect(0, 0, 16, 16),
+                transform: Transform::default(),
+                dest: rect(20, 20, 80, 80),
+                time: ItemTime::Image,
+                audio: false,
+            }],
+        };
+        let output = compose_fixture(dir.path(), &document, vec![webp], "webp-image");
+
+        let (width, height, duration, frames) =
+            probe_artifact(&output).expect("the artifact is probeable");
+        assert_eq!((width, height), (160, 120));
+        assert!(frames > 1, "a frozen image still runs as a clip: {frames}");
+        let expected = STILLS_ONLY_TARGET_CS as f64 / 100.0;
+        assert!(
+            (duration - expected).abs() <= 2.0 / 25.0,
+            "the frozen image runs for the resolved target: {duration} vs {expected}"
+        );
+
+        let png = dir.path().join("webp-image.png");
+        let frame = frame_of(&output, "0.5", &png).expect("the artifact decodes back to a frame");
+        assert_eq!(
+            primary(&frame, 60, 60),
+            Some('r'),
+            "the *first* WebP frame is what is held, not the blue one after it"
+        );
+        assert_eq!(
+            primary(&frame, 10, 110),
+            Some('g'),
+            "and the background shows outside its rectangle"
+        );
+    }
+
+    /// The two-frame WebP as a SPAN, bridged: both frames at their own
+    /// timestamps, looping to the cap, exactly like the GIF span it mirrors.
+    ///
+    /// This test is also the trailing-`duration` pin the bridge design asked
+    /// for (§1): the concat demuxer on BOTH toolchains counts the last image
+    /// entry's `duration` into the stream (pinned empirically 2026-08-22 —
+    /// no repeat-the-last-file workaround is needed), so the blue frame
+    /// holds its full half second wherever `scale` preserves trailing frame
+    /// durations. ffmpeg 7.1's scale drops them — the same gated GIF
+    /// degradation — so the blue and loop rows are skipped there and the
+    /// span degrades to the first frame held full length. Skips (never
+    /// fails) where there is no ffmpeg.
+    #[test]
+    fn an_animated_webp_span_plays_both_frames_and_loops_to_fill() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let webp = dir.path().join("two-frame.webp");
+        let gif = dir.path().join("gate-probe.gif");
+        if !write_two_frame_webp(&webp) || !write_two_frame_gif(&gif, 64, 64) {
+            return;
+        }
+
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-mp4".to_string(),
+                length: ComposeLength::Cap { seconds: 3.0 },
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                src: rect(0, 0, 16, 16),
+                transform: Transform::default(),
+                dest: rect(20, 20, 80, 80),
+                // What the client builds for an animated image: the full
+                // measured length, from zero.
+                time: ItemTime::Span {
+                    start_cs: 0,
+                    end_cs: 100,
+                },
+                audio: false,
+            }],
+        };
+        let output = compose_fixture(dir.path(), &document, vec![webp], "webp-span");
+
+        let (width, height, duration, _frames) =
+            probe_artifact(&output).expect("the artifact is probeable");
+        assert_eq!((width, height), (160, 120));
+        assert!(
+            (duration - 3.0).abs() <= 2.0 / 25.0,
+            "a one-second WebP span loops to the three-second cap: {duration}"
+        );
+        let accurate = scale_preserves_trailing_frame_duration(&gif, dir.path());
+        for (at, expected, what) in [
+            ("0.2", 'r', "the first frame at its own timestamp"),
+            ("0.7", 'b', "the second frame at its own timestamp"),
+            ("1.2", 'r', "and the loop starts the animation over"),
+        ] {
+            if !accurate && expected != 'r' {
+                continue;
+            }
+            let png = dir.path().join(format!("webp-span-{at}.png"));
+            let frame = frame_of(&output, at, &png)
+                .unwrap_or_else(|| panic!("the artifact decodes at {at}"));
+            assert_eq!(primary(&frame, 60, 60), Some(expected), "{what} ({at}s)");
+            assert_eq!(
+                primary(&frame, 10, 110),
+                Some('g'),
+                "the background shows outside the rectangle ({at}s)"
+            );
+        }
+    }
+
+    /// A NONZERO-START span over a bridged WebP, end to end: the window is
+    /// honoured by extraction (the script holds only the second frame),
+    /// never by a seek — `-ss` on a concat script of images starts at the
+    /// wrong entry or produces an empty stream, so the red first frame must
+    /// not appear anywhere in the output and the half-second window must
+    /// loop to fill the cap like any span. Unreachable from the current UI
+    /// (it always sends `0..duration`), which is exactly why it needs a
+    /// pin: an API client that sends it must get the right frames or an
+    /// error, never silently-shifted ones. Skips (never fails) where there
+    /// is no ffmpeg.
+    #[test]
+    fn a_nonzero_start_span_over_an_animated_webp_plays_the_windowed_frames() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let webp = dir.path().join("two-frame.webp");
+        let gif = dir.path().join("gate-probe.gif");
+        if !write_two_frame_webp(&webp) || !write_two_frame_gif(&gif, 64, 64) {
+            return;
+        }
+
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-mp4".to_string(),
+                length: ComposeLength::Cap { seconds: 3.0 },
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                src: rect(0, 0, 16, 16),
+                transform: Transform::default(),
+                dest: rect(20, 20, 80, 80),
+                // The second half of the animation only: the blue frame.
+                time: ItemTime::Span {
+                    start_cs: 50,
+                    end_cs: 100,
+                },
+                audio: false,
+            }],
+        };
+        let output = compose_fixture(dir.path(), &document, vec![webp], "webp-window");
+
+        let (width, height, duration, _frames) =
+            probe_artifact(&output).expect("the artifact is probeable");
+        assert_eq!((width, height), (160, 120));
+        assert!(
+            (duration - 3.0).abs() <= 2.0 / 25.0,
+            "the windowed half-second loops to the three-second cap: {duration}"
+        );
+        // The colour rows need frame-accurate timing (`scale` on 7.x drops
+        // trailing frame durations — the same gated GIF degradation); the
+        // duration row above holds on every toolchain.
+        if scale_preserves_trailing_frame_duration(&gif, dir.path()) {
+            for at in ["0.2", "1.7"] {
+                let png = dir.path().join(format!("webp-window-{at}.png"));
+                let frame = frame_of(&output, at, &png)
+                    .unwrap_or_else(|| panic!("the artifact decodes at {at}"));
+                assert_eq!(
+                    primary(&frame, 60, 60),
+                    Some('b'),
+                    "only the windowed second frame plays; red would mean the \
+                     window was ignored ({at}s)"
+                );
+                assert_eq!(primary(&frame, 10, 110), Some('g'), "background intact ({at}s)");
+            }
+        }
+    }
+
+    /// The under-run tolerance over a bridged input: a span whose claimed
+    /// length OVERSHOOTS the animation extracts everything there is, the
+    /// stream ends early, and `overlay eof_action=repeat` holds the last
+    /// extracted frame while the base carries the output to the full target.
+    /// Degraded, never hung, never short — the same contract the GIF version
+    /// pins. Skips (never fails) where there is no ffmpeg.
+    #[test]
+    fn a_span_overshooting_its_animated_webp_still_fills_the_target() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let webp = dir.path().join("two-frame.webp");
+        let gif = dir.path().join("gate-probe.gif");
+        if !write_two_frame_webp(&webp) || !write_two_frame_gif(&gif, 64, 64) {
+            return;
+        }
+
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-mp4".to_string(),
+                // The longest span defines the target, so the overshoot is
+                // also the promised output length.
+                length: ComposeLength::LongestLoopOnce,
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                src: rect(0, 0, 16, 16),
+                transform: Transform::default(),
+                dest: rect(20, 20, 80, 80),
+                // Twice the WebP's real length.
+                time: ItemTime::Span {
+                    start_cs: 0,
+                    end_cs: 200,
+                },
+                audio: false,
+            }],
+        };
+        let output = compose_fixture(dir.path(), &document, vec![webp], "webp-overshoot");
+
+        let (_, _, duration, _) = probe_artifact(&output).expect("the artifact is probeable");
+        assert!(
+            (duration - 2.0).abs() <= 2.0 / 25.0,
+            "the output runs to the full claimed target: {duration}"
+        );
+        let png = dir.path().join("webp-overshoot.png");
+        let frame = frame_of(&output, "1.5", &png).expect("the artifact decodes past the WebP");
+        let held = if scale_preserves_trailing_frame_duration(&gif, dir.path()) {
+            'b'
+        } else {
+            'r'
+        };
+        assert_eq!(
+            primary(&frame, 60, 60),
+            Some(held),
+            "past the real animation the last decoded frame is held, not black"
+        );
+    }
+
+    /// A STILL over a bridged WebP, end to end: the covering frame — and only
+    /// it — is what the extraction wrote, with no `-ss` anywhere near the
+    /// concat script (the seek that cannot work; see the unit test above), so
+    /// the composed rectangle holds the frame the timestamp names. Both
+    /// toolchains: a single frozen frame never meets the 7.x trailing-
+    /// duration bug. Skips (never fails) where there is no ffmpeg.
+    #[test]
+    fn an_animated_webp_still_composes_its_covering_frame() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let webp = dir.path().join("two-frame.webp");
+        if !write_two_frame_webp(&webp) {
+            return;
+        }
+
+        let document = ComposeRequest {
+            canvas: Canvas {
+                w: 160,
+                h: 120,
+                background: "#00a000".to_string(),
+            },
+            fps: 25,
+            output: ComposeOutput {
+                preset: "mosaic-mp4".to_string(),
+                length: ComposeLength::Cap { seconds: 2.0 },
+            },
+            items: vec![ComposeItem {
+                sha256: "a".repeat(64),
+                src: rect(0, 0, 16, 16),
+                transform: Transform::default(),
+                dest: rect(20, 20, 80, 80),
+                // 0.75 s: inside the SECOND frame, so a bridge that froze
+                // the first frame — or a seek that found nothing — fails
+                // this by colour.
+                time: ItemTime::Still { at_cs: 75 },
+                audio: false,
+            }],
+        };
+        let output = compose_fixture(dir.path(), &document, vec![webp], "webp-still");
+
+        let (_, _, duration, frames) = probe_artifact(&output).expect("the artifact is probeable");
+        assert!(frames > 1, "a frozen frame still runs as a clip: {frames}");
+        assert!(
+            (duration - 2.0).abs() <= 2.0 / 25.0,
+            "the still holds for the whole cap: {duration}"
+        );
+        let png = dir.path().join("webp-still.png");
+        let frame = frame_of(&output, "1.0", &png).expect("the artifact decodes back to a frame");
+        assert_eq!(
+            primary(&frame, 60, 60),
+            Some('b'),
+            "the frame covering 0.75 s is the blue one"
+        );
+        assert_eq!(primary(&frame, 10, 110), Some('g'));
     }
 
     /// The longest span looping to fill a `cap{}` target, end to end.

@@ -127,6 +127,114 @@ pub(crate) fn av1_software_encoder() -> Option<&'static str> {
     })
 }
 
+/// The two-frame fixtures the animated-image decode probes run on
+/// (docs/animated-image-spans-design.md §5). Committed binaries, tiny on
+/// purpose: encoding one at probe time would need the very encoders whose
+/// absence is being probed for, and the *decode* side is the question.
+const ANIMATED_WEBP_FIXTURE: &[u8] = include_bytes!("fixtures/two-frame.webp");
+const ANIMATED_AVIF_FIXTURE: &[u8] = include_bytes!("fixtures/two-frame.avif");
+
+/// Whether this toolchain decodes *animated* WebP natively. No mainline
+/// build through 8.0.1 does — the webp decoder is still-image-only and
+/// answers an animated file with "image data not found" — which is why the
+/// probe decodes a real two-frame fixture rather than grepping a listing.
+///
+/// The answer no longer gates the capability list: the compose path bridges
+/// animated WebP through the Rust decoder either way
+/// (docs/animated-webp-bridge-design.md). What it decides now is the
+/// bridge's *bypass* — a toolchain that decodes the file itself (a future
+/// ffmpeg, or a user's patched `ffmpeg =` override) is preferred
+/// automatically and composes it unbridged. Probed once per process, like
+/// [`fast_h264_encoder`]: the answer cannot change while the process runs.
+pub(crate) fn animated_webp_decodable() -> bool {
+    static DECODABLE: OnceLock<bool> = OnceLock::new();
+    *DECODABLE.get_or_init(|| {
+        let capable = decodes_animated_fixture(ANIMATED_WEBP_FIXTURE, "webp");
+        tracing::info!(capable, "animated WebP decode probe");
+        capable
+    })
+}
+
+/// Whether this toolchain decodes animated AVIF: an AV1 *decoder* (present
+/// in the essentials builds, unlike the encoders) plus `avis` demux support.
+pub(crate) fn animated_avif_decodable() -> bool {
+    static DECODABLE: OnceLock<bool> = OnceLock::new();
+    *DECODABLE.get_or_init(|| {
+        let capable = decodes_animated_fixture(ANIMATED_AVIF_FIXTURE, "avif");
+        tracing::info!(capable, "animated AVIF decode probe");
+        capable
+    })
+}
+
+/// The image mimes the compose span path can play, as the limits payload
+/// publishes them (docs/animated-image-spans-design.md §5): GIF
+/// unconditionally — every build the project has ever bundled decodes it —
+/// WebP unconditionally too, because the compose path bridges what ffmpeg
+/// cannot decode through the Rust decoder and needs only PNG decode plus the
+/// concat demuxer, which every ffmpeg has
+/// (docs/animated-webp-bridge-design.md §3) — and AVIF as its probe passes.
+/// The order is stable so the serialized envelope is too.
+pub(crate) fn span_capable_image_mimes() -> Vec<String> {
+    let mut mimes = vec!["image/gif".to_string(), "image/webp".to_string()];
+    if animated_avif_decodable() {
+        mimes.push("image/avif".to_string());
+    }
+    mimes
+}
+
+/// Decodes one embedded fixture and requires more than one frame out.
+///
+/// ffprobe with `-count_frames`, which decodes every packet through the same
+/// resolved toolchain the transcoder spawns — rather than `ffmpeg … -f null
+/// -`, whose end-of-run `frame=` counter reports only the first output
+/// stream. That distinction is exactly the animated-AVIF trap: the fixture
+/// demuxes as a one-frame cover still *and* the animation track, and a probe
+/// that read the still's count would call a capable build incapable. Taking
+/// the maximum over every video stream asks the real question: can this
+/// build produce more than one frame from this container?
+///
+/// Every failure — a toolchain that will not run, a demuxer that rejects the
+/// container ("image data not found"), a decode that yields one frame — is
+/// the same `false`: for AVIF that leaves the mime off the capability list
+/// and the client composes the file frozen; for WebP it routes the compose
+/// through the Rust bridge instead (docs/animated-webp-bridge-design.md).
+fn decodes_animated_fixture(bytes: &[u8], ext: &str) -> bool {
+    let Ok(dir) = tempfile::tempdir() else {
+        return false;
+    };
+    let path = dir.path().join(format!("probe.{ext}"));
+    if std::fs::write(&path, bytes).is_err() {
+        return false;
+    }
+    let output = Command::new(crate::media_tools::ffprobe())
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    // One line per video stream; an undecodable stream prints "N/A" (with
+    // exit code 0, so the numbers are the answer, not the status).
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<i64>().ok())
+        .any(|frames| frames > 1)
+}
+
 /// The selection policy, separated from the two ffmpeg spawns so it can be
 /// tested without a toolchain.
 fn select_encoder(
@@ -399,5 +507,39 @@ Encoders:
             assert!(CANDIDATES.contains(&encoder), "unexpected encoder {encoder}");
         }
         assert_eq!(chosen, fast_h264_encoder());
+    }
+
+    /// The capability list's unconditional entries: GIF because ffmpeg
+    /// decode has been in every bundle the project ships, WebP because the
+    /// compose path bridges it in Rust when ffmpeg cannot. Both are asserted
+    /// with no toolchain at all — which also pins that a host with *no*
+    /// ffmpeg still answers, with the conservative list rather than a panic.
+    #[test]
+    fn gif_and_webp_are_always_span_capable() {
+        let mimes = span_capable_image_mimes();
+        assert_eq!(mimes.first().map(String::as_str), Some("image/gif"));
+        assert!(mimes.iter().any(|mime| mime == "image/webp"));
+    }
+
+    /// The decode probes against the real toolchain: whatever this host's
+    /// ffmpeg can do, the answer is stable across calls (the OnceLock) and
+    /// the published list mirrors the one probe that still gates an entry
+    /// (AVIF; WebP is unconditional now that the bridge exists, and its
+    /// probe survives only as the bridge's native-decode bypass). Skips
+    /// (never fails) where there is no ffmpeg, per the media-test
+    /// convention.
+    #[test]
+    fn animated_decode_probes_answer_stably_and_feed_the_capability_list() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        assert_eq!(animated_webp_decodable(), animated_webp_decodable());
+        assert_eq!(animated_avif_decodable(), animated_avif_decodable());
+        let mimes = span_capable_image_mimes();
+        assert!(mimes.iter().any(|mime| mime == "image/webp"));
+        assert_eq!(
+            mimes.iter().any(|mime| mime == "image/avif"),
+            animated_avif_decodable()
+        );
     }
 }
