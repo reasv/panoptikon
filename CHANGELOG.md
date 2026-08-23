@@ -52,10 +52,11 @@ Desktop release notes.
   selection's own bounding box. The cell shape is chosen automatically to
   crop the set as little as possible, and Reroll cycles through the
   alternative shapes. Auto-layout can now keep a board uniform as pins come
-  and go: a new "Uniform Auto-Layout" board setting switches the automatic
-  packing from the mosaic to identical cells, and can be saved as a
-  new-board default. Locked and anchored items stay exactly where they are -
-  the cells flow around them.
+  and go: a new "Uniform Auto-Layout" board setting - also in the maximized
+  board's toolbar, next to Gravity - switches the automatic packing from the
+  mosaic to identical cells, and can be saved as a new-board default.
+  Locked and anchored items stay exactly where they are - the cells flow
+  around them.
 
 - **Pinboard selections can now be moved and scaled as one group.** The new
   Scale & Move verb (selection toolbar and context menu) draws a bounding box
@@ -139,9 +140,11 @@ Desktop release notes.
 - **Pinboard mosaics can now be animated.** Exporting a board or selection
   that contains videos can produce an animated WebP, MP4, or WebM instead of
   a still: video pins play their trimmed segments in place (a playing pin
-  starts from its trim start; a stopped pin stays a freeze-frame), shorter
-  videos loop to fill the mosaic's duration, and MP4/WebM exports carry the
-  videos' audio mixed together.
+  starts from its trim start), shorter videos loop to fill the mosaic's
+  duration, and MP4/WebM exports carry the videos' audio mixed together.
+  Videos that are not playing contribute exactly the picture the board
+  shows: a paused pin is frozen on the frame it is parked on, and a closed
+  pin composites the very thumbnail it displays.
 - **Pinboard image export now works on selections and single pins.**
   Selecting pins and exporting produces a mosaic of exactly those pins, with
   their arrangement preserved and the size presets meaning the output file's
@@ -237,6 +240,9 @@ Desktop release notes.
   background.** Its Dock and application-switcher entry appears while a native
   setup, settings, Relay, or update window is visible, then disappears when the
   last such window closes. The menu-bar icon remains available throughout.
+  Clicking a pinned Dock icon while the app runs in the background now
+  performs the same Open action as the menu-bar icon - previously it did
+  nothing.
 - The first launch after upgrading migrates each database's schema (codec
   columns, outro metadata, database identity) and refreshes query-planner
   statistics; expect it to take somewhat longer than usual on large
