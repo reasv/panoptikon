@@ -9,12 +9,15 @@ Desktop release notes.
 ### Added
 
 - **Search from inside a maximized pinboard.** A maximized board no longer
-  has to be restored to run a search: the fullscreen toolbar's new Search
-  button (or Ctrl+Shift+F) opens a search bar overlaying the bottom edge,
-  with the live result count beside it. While the bar is open, searching
+  has to be restored to run a search: moving the mouse to the bottom edge
+  reveals a search bar - the same gesture that reveals the toolbar at the
+  top - with the live result count beside it. It slides away when the
+  pointer leaves, unless pinned open: click the bottom edge, use the bar's
+  pin button (or Ctrl+Shift+F), and it stays up while you work the board;
+  interacting with the bar also pins it. While the bar is up, searching
   works exactly as on the normal page - the same query, filters and
-  position, carried over in both directions - and closing it pauses
-  searching again, as maximizing always has. This is the first stage of a
+  position, carried over in both directions - and once it hides, searching
+  pauses again, as maximizing always has. This is the first stage of a
   self-contained maximized search view; browsing the results as a thumbnail
   strip in the same overlay arrives next.
 

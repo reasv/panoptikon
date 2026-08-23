@@ -63,17 +63,26 @@ Non-goals:
 
 ## 2. State model
 
-- `gso` — `parseAsBoolean.withDefault(false)`, `history: "push"`,
-  `clearOnDefault: true`, in `lib/state/gallery.ts` next to `gf`. Push so
-  Back closes the overlay; absent from clean links so "open maximized in new
-  tab" stays clean. Deep links with `gf…&gso=true` load straight into a
+- `gso` — the overlay's PINNED flag: `parseAsBoolean.withDefault(false)`,
+  `history: "push"`, `clearOnDefault: true`, in `lib/state/gallery.ts` next
+  to `gf`. Pinned means the panel stays up without the pointer holding it
+  there. Push so Back unpins; absent from clean links so "open maximized in
+  new tab" stays clean. Deep links with `gf…&gso=true` load straight into a
   searchable maximized board.
+- The ephemeral reveal state (pointer over the bottom hot band or panel,
+  focus inside the panel) is deliberately NOT in the URL: it lives in a
+  small zustand store (`lib/state/searchOverlayReveal.ts`) written only by
+  the overlay dock, so a transient peek never rewrites history. The server
+  twin consults `gso` alone — a cold load is either pinned-open or closed.
 - `isSearchSuppressed(state)` in `lib/state/pinboardView.ts`:
   `isPinboardMaximized(state) && !state.searchOverlay`, plus the
   `…FromParams` server twin (the parser mirror in `pinboardView.ts` must gain
   `gso`; parsers there are declared wire format and must match
   `state/gallery.ts` defaults). Client hook `useSearchSuppressed()` in
-  `lib/state/gallery.ts` composed like `usePinboardMaximized` (:239).
+  `lib/state/gallery.ts` composed like `usePinboardMaximized` (:239), with
+  one client-only addition: it also reads the ephemeral reveal store, so
+  suppressed = maximized && !pinned && !revealed — a hover-revealed overlay
+  is a consumer on screen and enables the query exactly like a pinned one.
 - Sidebar hiding and everything else about maximize keeps using
   `isPinboardMaximized` unchanged. `sb` remains untouched by maximize, as
   today.
@@ -168,32 +177,60 @@ there because it is board chrome; this is search chrome, and every input it
 needs is already in `MultiSearchView` scope):
 
 ```tsx
-{pinboardMaximized && overlayOpen && <SearchOverlay …/>}
+{pinboardMaximized && <SearchOverlay …/>}
 ```
+
+The dock mounts whenever the board is maximized; visibility (hidden,
+hover-revealed, pinned) is the dock's own affair, mirroring how
+`PinboardFullscreenBar` owns its hover state.
 
 - `fixed inset-x-0 bottom-0 z-50`, `data-search-overlay`,
   `bg-background/95 border-t shadow-md`. Full width. Three rows top to
   bottom: search-bar row, thumbnail strip, pagination.
-- Not hover-revealed. Unlike the toolbar it is a workspace with drags
-  originating inside it; it toggles and stays. Toggles: a `ToolbarButton`
-  (Search icon) in `PinboardFullscreenBar` (`PinboardMenu.tsx:486`) writing
-  `gso`, and a `Ctrl+Shift+F` chord registered by `MultiSearchView` while
-  `pinboardMaximized`.
+- **Reveal mirrors the toolbar, from the bottom edge — plus pinning.** The
+  dock renders a bottom hot band (the toolbar's `h-4` edge zone, upside
+  down) and a grab-handle hint visible while the panel is hidden. Hovering
+  the band slides the panel up; leaving hides it — unless it is held. The
+  panel is held open while any of: pointer over it, focus inside it
+  (typing), or PINNED (`gso`). Pin gestures: clicking the hot band / handle
+  toggles the pin (a click, not a hover, is the deliberate gesture); a pin
+  toggle button at the panel's right edge shows and flips the pinned state;
+  `Ctrl+Shift+F` (registered by `MultiSearchView` while `pinboardMaximized`)
+  toggles it from the keyboard; and any `pointerdown` inside the panel
+  auto-pins — interacting with the search UI IS the intent to keep it
+  around, and it is also what keeps the panel alive when a dropdown portals
+  focus out of it (the problem the toolbar solves with its exclusive-slot
+  machinery). Unpinning never snaps the panel away while pointer or focus
+  is still inside; it hides on the next leave. There is NO search button in
+  the top toolbar — a top control toggling a bottom panel is a pointer
+  round trip for nothing.
   Esc does not close it (Esc belongs to board selection/mode handlers).
-- No `pointer-events` forcing in either direction. The toolbar's
-  `pointer-events-auto` + exclusive-menu-slot machinery exists because it is
-  hover-revealed over a modal-locked body; the overlay is a plain fixed
-  panel, and Radix modal layers may disable it along with the rest of the
-  body while a menu is open, which is correct dismiss behavior. Menus inside
-  the overlay (search-type selector, tag autocomplete, similarity selects)
-  work exactly as they do on the normal page.
+- **Drags are not held.** A drag that starts inside an unpinned panel and
+  leaves it hides the panel like any other pointer exit — deliberately: a
+  drag toward the board is exactly when the panel should get out of the way
+  of the drop. What makes this safe is that hiding is CSS-only
+  (translate/opacity + `pointer-events-none`): the panel and its contents
+  stay MOUNTED for the whole maximized session, so a P2 strip card serving
+  as the HTML5 drag source survives its own panel hiding mid-drag. Never
+  convert the hide to a conditional unmount.
+- Pointer-events follow the toolbar's SHOW pattern only: the hidden panel
+  is `pointer-events-none` (an invisible fixed panel must not eat board
+  clicks near the bottom edge) and becomes interactive when shown. What is
+  NOT replicated is the toolbar's always-auto piercing of modal-locked
+  bodies and the exclusive-menu-slot machinery it necessitates: auto-pin on
+  interaction makes a panel with an open menu pinned by construction, so
+  Radix modal layers may disable it along with the rest of the body while a
+  menu is open — correct dismiss behavior. Menus inside the overlay
+  (search-type selector, tag autocomplete, similarity selects) work exactly
+  as they do on the normal page.
 - Approximate height: ~40px bar + 352px strip (`h-88` track, fixed 240×320
   cards) + ~40px pagination ≈ 430px. Accepted for v1; a compact strip
   variant is a possible follow-up, not in scope.
 - The overlay publishes its height as a CSS variable for the bottom-band
-  occupants (§7): set `--pinboard-bottom-inset` on the document root while
-  mounted (a `useLayoutEffect` writing/removing the property; the value is a
-  constant expression, no measurement loop needed).
+  occupants (§7): `--pinboard-bottom-inset` on the document root, measured
+  from the panel (ResizeObserver, so later phases' taller panel is tracked
+  automatically) and set only while the panel is SHOWN — hidden or merely
+  mounted, the property is removed and consumers fall back to 0px.
 
 ### 5.2 Search-bar row
 
@@ -366,8 +403,10 @@ primitives in `PinboardPreviewPopover.tsx`:
 
 ## 9. Sidebar overlay (phase 4)
 
-- `gsb` flag (§2), toggled by the `SearchBarRow` settings toggle in overlay
-  mounts and a `PinboardFullscreenBar` button if wanted.
+- Same dock model as §5.1, rotated: a left-edge hot band + handle,
+  hover-reveal sliding in from the left, `gsb` as the PINNED flag, pinned
+  by clicking the edge control, by a pin button in the panel, or by
+  pointerdown inside. No toolbar button.
 - Extract `SideBarContent` (the `DirectionAwareTabs` block) from
   `components/sidebar/SideBar.tsx` so the page keeps its in-flow/drawer
   container and the overlay gets a new one: `fixed left-0 top-0
@@ -387,11 +426,12 @@ primitives in `PinboardPreviewPopover.tsx`:
 - **P0 — host freeze.** The latch in `MultiSearchView` (§3), plus a
   dev-mode assertion that the `PinBoard` instance survives a maximize toggle
   unmoved. Independently shippable; no visible feature change.
-- **P1 — overlay shell + gates.** `gso`, `isSearchSuppressed` (+ server
-  mirror + prefetch), `SearchBarRow` extraction, overlay with row only,
-  toolbar toggle + `Ctrl+Shift+F`, exemption-list entries, bottom inset var
-  + history/toast yields. Search works from the overlay; results visible
-  only as the count.
+- **P1 — overlay shell + gates.** `gso` (pinned) plus the reveal dock (hot
+  band + handle, hover/focus/pin show-state, auto-pin, ephemeral reveal
+  store), `isSearchSuppressed` (+ server mirror + prefetch),
+  `SearchBarRow` extraction, panel with row + pin button, `Ctrl+Shift+F`,
+  exemption-list entries, bottom inset var + history/toast yields. Search
+  works from the overlay; results visible only as the count.
 - **P2 — strip + pagination.** Strip mount with `fallbackAnchor`, shared
   `useGalleryNavigate`, `PageSelect` wiring, live scrubber tracking (§6) in
   both strip mounts. Drag/pin-to-board works at this point with no
