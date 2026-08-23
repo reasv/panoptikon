@@ -340,8 +340,17 @@ overlay identically.
   owners for one coordinate, the exact bug class scroll mode is defined to
   avoid. A pan is therefore visual-only and a refresh re-centers on the
   selection — consistent with selection being the durable coordinate.
-- The keep-in-view programmatic `scrollToIndex` fires the same listener and
-  converges the highlight on the selected item's page; harmless.
+- The keep-in-view programmatic `scrollToIndex` must NOT feed the listener
+  (implemented: a consume-once flag set before the programmatic scroll,
+  cleared by rAF for the no-scroll case): `scrollToIndex`'s default `auto`
+  alignment resolves to `end` on forward jumps, putting a previous-page
+  card in the lead, so deriving from it reports N−1. For anchor/selection-
+  driven moves the anchor itself is the authoritative highlight —
+  `useDerivedVirtualPage`'s anchor branch fires for them, its `galleryOpen`
+  input widened to `gi !== null || pinboardMaximized` (the param's real
+  meaning: no grid is mounted to report scrolls and the anchor IS the
+  position, which the maximized board satisfies by construction). The
+  leading-card derivation serves user pans only.
 - If a helper is worth extracting (leading-item + end-clamp), it goes in
   `lib/scrollMode.ts` with a case in `scripts/scrollmode.test.mjs`.
 - Note `ResultGrid` and `ImageGallery` both carry `"use no memo"` for
@@ -403,10 +412,29 @@ primitives in `PinboardPreviewPopover.tsx`:
 
 ## 9. Sidebar overlay (phase 4)
 
-- Same dock model as §5.1, rotated: a left-edge hot band + handle,
+- Same dock model as §5.1, rotated: a left-edge hot band + handle
+  (vertically inset so the horizontal bands keep their corners),
   hover-reveal sliding in from the left, `gsb` as the PINNED flag, pinned
-  by clicking the edge control, by a pin button in the panel, or by
-  pointerdown inside. No toolbar button.
+  by clicking the edge control, by an in-flow pin button in a slim header
+  row at the panel's top (NOT absolutely positioned — it would overlap the
+  centered tab bar), by the overlay search-bar-row's settings toggle, or by
+  pointerdown inside. No toolbar button, and no hotkey (Ctrl+Shift+S is
+  browser save-page-as; future work if a safe chord is found).
+- The panel spans `top-0` to `bottom: var(--pinboard-bottom-inset, 0px)`
+  (the bottom dock owns that band while shown) and publishes its own
+  `--pinboard-left-inset` while shown, consumed by the history panel's
+  left-docked corners.
+- **Content mounts only while shown** — a deliberate deviation from §5.1's
+  CSS-only-hide rule, which exists for the strip's drag sources; the
+  sidebar has none, and a hidden-but-mounted Similar Items tab would
+  re-query CLIP similarity on every selection change, the exact behavior
+  the user has previously rejected. Costs accepted: per-reveal remount of
+  the cheap stats queries (react-query cache softens), transient scroll
+  reset; accordion state persists via localStorage, the tab via `sbt`.
+- The sidebar overlay does NOT participate in the search-suppression gate
+  (`gso`/reveal only): with the bottom overlay hidden, a filter edit from
+  the sidebar updates the URL but queries stay paused until the bottom
+  overlay shows.
 - Extract `SideBarContent` (the `DirectionAwareTabs` block) from
   `components/sidebar/SideBar.tsx` so the page keeps its in-flow/drawer
   container and the overlay gets a new one: `fixed left-0 top-0

@@ -8,18 +8,31 @@ Desktop release notes.
 
 ### Added
 
-- **Search from inside a maximized pinboard.** A maximized board no longer
-  has to be restored to run a search: moving the mouse to the bottom edge
-  reveals a search bar - the same gesture that reveals the toolbar at the
-  top - with the live result count beside it. It slides away when the
-  pointer leaves, unless pinned open: click the bottom edge, use the bar's
-  pin button (or Ctrl+Shift+F), and it stays up while you work the board;
-  interacting with the bar also pins it. While the bar is up, searching
-  works exactly as on the normal page - the same query, filters and
-  position, carried over in both directions - and once it hides, searching
-  pauses again, as maximizing always has. This is the first stage of a
-  self-contained maximized search view; browsing the results as a thumbnail
-  strip in the same overlay arrives next.
+- **The maximized pinboard is now a self-contained workspace: search,
+  browse and pin without leaving it.** Moving the mouse to the bottom edge
+  reveals a full compact search panel - the same gesture that reveals the
+  toolbar at the top: the search bar with live result count, the
+  side-scrolling thumbnail strip from the gallery, and the page bar
+  beneath it. Results can be dragged straight onto the board, pinned with
+  their pin button, or shift-click carried - no more restoring the board
+  to add items. Hovering a thumbnail shows a large centered preview over
+  the board in place of the gallery's big image. The left edge works the
+  same way for the search sidebar (filters, file details, similar items).
+  Both panels slide away when the pointer leaves - including while
+  dragging an item onto the board, where the panel gets out of the way of
+  the drop - unless pinned open: click the edge, use the panel's pin
+  button (Ctrl+Shift+F for the search panel), or simply interact with the
+  panel, and it stays while you work the board. Selection and position are
+  the same as the normal page in both directions: browse to an item while
+  maximized and the gallery is on it after restoring, and vice versa.
+  While both panels are hidden, searching stays paused exactly as
+  maximizing has always guaranteed.
+
+- **Scroll browsing: the page bar now tracks the thumbnail strip live.**
+  With the gallery open in scroll browsing (and in the new maximized
+  search panel), panning the thumbnail strip moves the page-bar highlight
+  as pages scroll past, the way grid scrolling always has - previously it
+  only updated when an item was selected.
 
 - **Animated images play in animated exports.** GIFs, animated WebPs and
   animated AVIFs on a pinboard now render as looping clips in the animated
