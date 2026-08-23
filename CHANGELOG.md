@@ -228,6 +228,17 @@ Desktop release notes.
 
 ### Fixed
 
+- **Opening the sidebar no longer stutters.** The Advanced Search Options
+  panel used to animate its way in by tweening the results column's width,
+  which re-laid-out and re-painted every visible result (and, with a
+  pinboard shown, re-ran the whole board layout) on every frame of the
+  animation — visible stutter in every view. The panel now slides in over
+  the page as a pure transform animation that cannot stutter, and the
+  results reflow exactly once, at the moment it lands; its content fills in
+  as it settles. Closing snaps in a single reflow. Pinboard items also no
+  longer ease their width and height (position still animates), so any
+  layout change on a large board — sidebar, maximize, layout verbs — costs
+  one reflow instead of one per animation frame.
 - **The search page no longer stutters on every action while a pinboard is
   shown.** With a many-pin board on screen, every URL-backed action on the
   search page — toggling the sidebar, switching grid tabs, changing pages,
