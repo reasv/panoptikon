@@ -315,6 +315,27 @@ In pages mode the strip shows the current page's rows
 (`arrayResultsSource`) and the bar flips pages — the same behavior the
 gallery strip has in pages mode today.
 
+### 5.5 View-mode toggle
+
+The paged/scroll switch (`ViewModeToggle`) lives in the results header's
+right-hand cell — a surface the maximized board does not render, so the
+maximized workspace had no way to change modes. That placement is right
+for the page (§ its own docstring: the header renders whenever the grid
+does), and wrong here for the same reason the search bar's page placement
+was: the control has to live where the workspace is.
+
+It mounts in the overlay's bottom row beside the pagination control — the
+control whose meaning it changes. Nothing about the component moves: the
+mode switch carries the user's position between the two coordinate
+systems and prefetches the landing page inside `useCommitViewMode`, not
+at the mount point, so a second mount is a second seat for the same
+machinery. Its save/clear-defaults menu comes along, and its `modal={false}`
+dropdown behaves inside the overlay like every other menu there (§5.1).
+
+Verify: the commit path runs while the panel is REVEALED but unpinned,
+where the SSR suppression twin is pinned-only — confirm the prefetch it
+issues is not fighting a suppressed query gate.
+
 ## 6. Strip scroll-tracking (shared fix)
 
 Finding, verified in code: the live "scrubber follows scrolling" behavior
@@ -387,28 +408,129 @@ and the two mounts.
   scrolling the board area; the board is never resized (overlay ≠ inset for
   the board itself — that is the stated UX).
 
-## 8. Hover preview
+## 8. Item preview: hover peek and pinned viewer
 
-New `ResultHoverPreview`, rendered by the overlay, built on the existing
-primitives in `PinboardPreviewPopover.tsx`:
+The maximized workspace has no large-image surface, and the board is
+currently the ONLY way to play a video in this UI. The first cut made the
+whole card body a hover trigger for a fixed-size centered image; the user
+rejected that on two grounds — a fixed box letterboxes most content (60%
+empty width on a portrait item) and, more importantly, an unconditional
+full-screen takeover on every pointer sweep covers the board precisely
+when the user is reaching across it to drop something. The trigger moves
+onto a dedicated control, and the surface gains a pinned mode with full
+display parity.
 
-- `useDelayedHover(200)` (debounced open, instant close) keyed by strip
-  index. The strip gains an optional `onItemHover?: (item, index) | null`
-  callback invoked from card `onMouseEnter`/`onMouseLeave`.
-- Rendering: `PreviewPopover`-style `createPortal` to `document.body`,
-  `pointer-events-none fixed z-70`, `object-contain` — but with a centered
-  box over the board area instead of the near-card box math: e.g.
-  `{ top: 4vh, left: 12vw, width: 76vw, height: calc(92vh -
-  var(--pinboard-bottom-inset)) }`. `object-contain` makes exact aspect math
-  unnecessary.
-- Source: `getFileURL(dbs, "thumbnail", "sha256", …)` immediately; for
-  `image/*` mime types, upgrade to `getFileURL(dbs, "file", …)` by loading
-  the full file behind the thumbnail and swapping on `onLoad` (the pattern
-  keeps hover cheap for sweeps — the 200ms debounce already suppresses most
-  loads — while giving real resolution on dwell). Videos and animations show
-  their stored thumbnail; no playback in the preview.
-- Cleared on `dragstart` from any card (a drag under a `z-70` preview would
-  be visually occluded) and on overlay close/unmount.
+**Identity rule.** "Selected" (blue ring, `gi`) and "the item in the
+viewer" are the SAME thing. There is no second selection concept:
+
+- Clicking a card (body) selects it as it always did; if the viewer is
+  open, the viewer follows.
+- Hovering a card's preview button shows that item EPHEMERALLY —
+  it never writes `gi` and never survives the pointer leaving.
+- Clicking a card's preview button opens the viewer AND selects that item
+  (the `useGalleryNavigate` write, exactly like a card click).
+
+### 8.1 The preview button
+
+A hover-visible button on the strip card, **top-center** — the four
+corners are taken (`BookmarkBtn`, `PinButton`, `FindButton`, and
+`FileActionCluster` at bottom-right). It renders only in the overlay's
+strip, gated on the new preview props being passed; the page gallery's
+strip is untouched (it has a large image already).
+
+- **Hover** drives the existing `onItemHover` contract (200ms delayed
+  open, instant close) — the card BODY no longer does. A sweep across
+  cards to reach a drag source is now silent.
+- **Click** toggles: with the viewer closed, open it on this item; with
+  the viewer already open **on this item**, close it. Clicking the button
+  of a DIFFERENT item while open just swaps the viewer to it (selection
+  moves; the viewer stays open).
+- The icon reflects which of those a click will do — a distinct
+  "close/collapse" glyph while this item is the pinned one.
+
+### 8.2 Adaptive sizing (both surfaces)
+
+The box is computed from the item's own aspect rather than fixed:
+
+- Bounds: the same region the fixed box used — horizontally centered over
+  the board with a clear margin, height `calc(<vh> -
+  var(--pinboard-bottom-inset, 0px))` so it never covers the open dock.
+- Fit the item's aspect (`item.width / item.height`) inside those bounds,
+  then **cap at natural size** — a 400px-wide image must not be blown up
+  to 76vw on a surface whose whole promise is "see it properly" — with a
+  floor (~320px on the fitted dimension) so a tiny item still yields a
+  usable box.
+- **Fallback**: when `width`/`height` are null (rows from older scans),
+  keep today's full-bounds box and let `object-contain` letterbox. No
+  aspect probe from the loaded image: a box that resizes after the picture
+  paints is worse than one that was always the right size.
+- **Accepted wart**: `item.width/height` are the CODED dimensions, so a
+  phone video with a 90° display matrix yields a wrong-orientation box and
+  the content letterboxes inside it. Only our guess is wrong — the viewer
+  component's own overlays anchor to element-confirmed, rotation-corrected
+  aspect (`mediaAspect` in `GalleryImageLarge`).
+
+### 8.3 The pinned viewer
+
+Pinned state is a URL flag (refresh-safe, `history: "push"` so Back
+closes), and the surface **reuses `GalleryImageLarge`** rather than
+reimplementing it. This is what buys display parity — the playability
+ladder, transcode rendition, trim/outro handling, end-action loop/stop,
+fullscreen host, click-half navigation and drag-out all come along.
+
+- **Extraction needed**: exactly one thing couples that component to the
+  gallery shell — `galleryPanelHeight(showPagination, thumbnailsOpen)`,
+  the viewport-calc height class at its panel root. Add an optional height
+  override prop; the page path passes nothing and stays byte-identical.
+- **No double mount.** `PinBoard` and `GalleryImageLarge` are the two arms
+  of the same ternary in `ImageGallery`, so while the board is showing,
+  `GalleryImageLarge` is mounted nowhere else. The viewer's instance is the
+  only one — no duplicate `window` keydown registrations, no second video
+  ref slot competing for the element.
+- **Header**: recomposed, NOT extracted from the gallery header (whose
+  prev/next arrows, thumbnails toggle and close-gallery semantics are
+  gallery-specific). It is the same atoms: `FilePathComponent` + the
+  `getLocale(last_modified)` line, the file verbs (`BookmarkBtn`,
+  `OpenFile`, `OpenFolder`, `ShareButton`, `OpenDetailsButton`), and an X
+  that closes the viewer.
+- **Navigation props**: `prevImage`/`nextImage` wire to the shared
+  `useGalleryNavigate`, which also gives the viewer arrow-key navigation
+  and the click-through halves; `advanceToNextVideo` wires to the same,
+  so video auto-advance works as it does in the gallery.
+- **Item resolution** mirrors the gallery's: the live row from
+  `source.get(gi)` preferred, `useItemSelection`'s held item as the
+  fallback (a cold chunk in scroll mode), a loading frame when neither.
+- **Out of scope inside the viewer**: no thumbnail strip (the overlay's
+  strip IS it), no pagination row, no prev/next chrome in the header. The
+  viewer is the gallery's picture, not the gallery's frame.
+
+### 8.4 Layering, and the hazards that come with a pinned surface
+
+The ephemeral peek and the pinned viewer are two different surfaces, and
+the peek stays LIGHT: thumbnail-only, `pointer-events-none`, portal at
+z-70 as today. Mounting a video slot per hover-sweep would churn decoders
+for nothing.
+
+- **Peek over viewer**: hovering another card's button while the viewer is
+  open renders the peek OVER it without unmounting it — a playing video
+  keeps playing underneath and is revealed again when the hover ends.
+  Never swap the viewer's item on hover.
+- **Drags must duck the viewer.** It is `pointer-events-auto` and sits
+  over the board's CENTER — exactly where drops land — so it must go
+  transparent and non-interactive for the duration of a drag and restore
+  on `dragend`. This is the same ruling as "an unpinned panel gets out of
+  the way during a drag", strengthened: here even the PINNED surface must
+  duck, because it covers the target rather than an edge. (Playback
+  continues while ducked; sub-second, accepted.)
+- **Both exemption lists** (`GalleryPinBoard`'s fullscreen-viewport
+  marquee starter and its click-outside deselect) must exempt the viewer,
+  or pressing its header rubber-bands the board underneath / clears the
+  pin selection. Reuse `data-search-overlay`.
+- **Esc priority**: with the viewer open, Esc closes the viewer and must
+  not also reach the board's clear-selection handler.
+- **Hotkey audit** (the P1 audit, redone): with the viewer open, the
+  gallery's own `window` keys (arrows, space, player chords) are live over
+  a maximized board that has Delete / Ctrl+A / Esc of its own. Walk them.
 
 ## 9. Sidebar overlay (phase 4)
 
@@ -466,6 +588,15 @@ primitives in `PinboardPreviewPopover.tsx`:
   dedicated code.
 - **P3 — hover preview.**
 - **P4 — sidebar overlay.**
+- **P5 — preview trigger + adaptive sizing** (§8.1, §8.2). The peek moves
+  off the card body onto a top-center button and the box fits the item.
+  No viewer yet: the peek is still thumbnail-only and ephemeral.
+- **P6 — the pinned viewer** (§8.3, §8.4). Pin flag, the
+  `GalleryImageLarge` height-override extraction, the recomposed header,
+  peek-over-viewer layering, drag ducking, Esc priority, exemption-list
+  entries. This is where video playback arrives in the maximized
+  workspace.
+- **P7 — view-mode toggle in the overlay** (§5.5).
 
 ## 11. Risks and verification
 
@@ -490,6 +621,13 @@ primitives in `PinboardPreviewPopover.tsx`:
 - **SSR parity**: `gso` parser added to the `pinboardView.ts` mirror with
   the same default; a maximized+overlay deep link must prefetch and paint
   rows on first load.
+- **Viewer parity** (P6): a video opened in the viewer must play,
+  seek, honour trim/outro and end-action, and go fullscreen — the whole
+  point of reusing `GalleryImageLarge` is that none of this is
+  reimplemented, so a divergence means the extraction leaked. Verify the
+  page gallery's DOM is byte-identical after the height-override prop.
+- **Viewer never eats a drop** (P6): drag a strip card over the open
+  viewer and confirm the drop lands on the board beneath it.
 - Manual QA (user-performed, per project convention): the full loop —
   maximize from grid and from gallery, open overlay, search, browse, drag
   and pin, hover preview, restore, confirm position/selection inheritance
