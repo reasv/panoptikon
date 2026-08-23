@@ -8,6 +8,16 @@ Desktop release notes.
 
 ### Added
 
+- **Search from inside a maximized pinboard.** A maximized board no longer
+  has to be restored to run a search: the fullscreen toolbar's new Search
+  button (or Ctrl+Shift+F) opens a search bar overlaying the bottom edge,
+  with the live result count beside it. While the bar is open, searching
+  works exactly as on the normal page - the same query, filters and
+  position, carried over in both directions - and closing it pauses
+  searching again, as maximizing always has. This is the first stage of a
+  self-contained maximized search view; browsing the results as a thumbnail
+  strip in the same overlay arrives next.
+
 - **Animated images play in animated exports.** GIFs, animated WebPs and
   animated AVIFs on a pinboard now render as looping clips in the animated
   mosaic export and the single-item clip save, exactly like videos: the
