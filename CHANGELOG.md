@@ -218,6 +218,18 @@ Desktop release notes.
 
 ### Fixed
 
+- **The search page no longer stutters on every action while a pinboard is
+  shown.** With a many-pin board on screen, every URL-backed action on the
+  search page — toggling the sidebar, switching grid tabs, changing pages,
+  opening the gallery — froze the page for up to a second. The cause was the
+  find-in-folder button mounted (invisibly, until hover) on every result
+  cell, pin and filmstrip frame: each copy subscribed to the entire search
+  query state, so any URL change re-rendered hundreds of hidden buttons.
+  The machinery is now shared by one page-level owner and the buttons
+  subscribe to nothing; with a 63-pin board, the main-thread cost of a
+  sidebar toggle drops from ~0.7-1.0s to ~0.1-0.3s, and other actions
+  improve by the same factor. Find-in-folder itself behaves exactly as
+  before, hover-to-prefetch link included.
 - **Continuous scanning now starts on databases without a same-named
   user-data database.** The background scanner assumed every index database
   had a user-data database of the same name and failed to start where none
