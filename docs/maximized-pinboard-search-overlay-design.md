@@ -326,6 +326,17 @@ click-revealed, pinned) is the dock's own affair, mirroring how
   dock (yielded) — i.e. nothing at all, leaving the panel's X as the only
   way out. Only `MultiSearchView` can compute the effective value, so it is
   passed to BOTH docks rather than read from the URL by either.
+- **Find-in-folder opens the dock.** `FindButton`'s navigate path
+  (`components/gallery/FindButton.tsx`) sets the dock's ephemeral open flag
+  when the board is maximized, after its awaited URL writes and before
+  `commit()`. Two independent reasons, either sufficient: the dock is the
+  only results surface on a maximized board, and with it closed
+  `useSearchSuppressed` means the rewritten query never RAN — the press
+  produced a toast and nothing else; and the button sits on a PIN, i.e. on
+  the board, so its own press is an outside click that dismissed an
+  already-open dock and re-suppressed the search. The ephemeral flag, not
+  `gso`: navigating to a folder is one look, and it should dismiss like any
+  other opened dock rather than stranding a URL flag.
 - **Pinning: toggle, chord, double-click on background.** Gestures: the
   pin toggle button, `Ctrl+Shift+F` (registered by `MultiSearchView` while
   `pinboardMaximized`; from hidden it opens-and-pins), and DOUBLE-clicking
