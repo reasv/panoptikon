@@ -566,10 +566,16 @@ fullscreen host, click-half navigation and drag-out all come along.
   only one — no duplicate `window` keydown registrations, no second video
   ref slot competing for the element.
 - **Header is CHROME ON the picture, not a row above it.** It is absolutely
-  positioned over the frame's top edge and appears only while the viewer is
-  showing its FIXED item — never during a peek, where its controls would
-  act on an item the user is not looking at, and where its absence is the
-  honest signal that this is a glance rather than a selection. Overlaying
+  positioned over the frame's top edge. The LABEL (path + timestamp)
+  follows whatever is DISPLAYED, peek included — the two subjects are meant
+  to look alike (§8), and a peek that told you nothing about the file you
+  are looking at would be a worse peek. Only the CONTROLS are fixed-only:
+  during a peek they would act on an item the user is not looking at, and
+  their arrival on click is the signal that the glance became a selection,
+  plus the nudge toward the way out. Nothing on the surface may take
+  pointer events while a peek is displayed, the label included — a
+  descendant re-enabling events under a `pointer-events-none` ancestor is
+  how a live control ends up floating over the board. Overlaying
   rather than stacking is what makes fixing a peek a no-op for the picture:
   a header in flow takes its height out of the fit budget, so the picture
   re-fits smaller the instant you click — the shrink the user rejected.
@@ -619,8 +625,17 @@ with a second framed surface the user can see.
   video keeps playing underneath and is revealed still playing when the
   hover ends. Never swap the viewer's own item on hover — `gi` is
   untouched by a peek, always.
+- **Peeks are STICKY across the strip.** Leaving a card does not clear the
+  subject while the viewer is open; only leaving the STRIP does. Per-card
+  clearing put the fixed item back in the ~200ms gap between one card's
+  instant close and the next card's dwell, so sweeping the strip strobed
+  the picture. The corollary is that peek→peek is the ordinary case, which
+  anything reasoning about "the previous shape" must account for.
 - **The box re-fits to the peeked item**, so the frame changes shape around
-  the (covered) player during a peek and returns on leave. That is a
+  the (covered) player during a peek and returns on leave. The size
+  transition is PEEK-ONLY and runs only between two fitted shapes: animating
+  peek→fixed or fixed→fixed would re-lay-out a frame around a playing
+  `<video>` for 150ms, which is what §8.2's stable bounds exist to prevent. That is a
   deliberate exception to §8.2's no-resize rule, which exists to stop
   panels revealing or hiding from moving a frame the user is watching:
   here the resize IS the user's own gesture and the picture it fits is the
