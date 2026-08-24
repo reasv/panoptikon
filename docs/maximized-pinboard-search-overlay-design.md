@@ -65,15 +65,21 @@ Non-goals:
 
 - `gso` — the overlay's PINNED flag: `parseAsBoolean.withDefault(false)`,
   `history: "push"`, `clearOnDefault: true`, in `lib/state/gallery.ts` next
-  to `gf`. Pinned means the panel stays up without the pointer holding it
-  there. Push so Back unpins; absent from clean links so "open maximized in
-  new tab" stays clean. Deep links with `gf…&gso=true` load straight into a
-  searchable maximized board.
-- The ephemeral reveal state (pointer over the bottom hot band or panel,
-  focus inside the panel) is deliberately NOT in the URL: it lives in a
-  small zustand store (`lib/state/searchOverlayReveal.ts`) written only by
-  the overlay dock, so a transient peek never rewrites history. The server
-  twin consults `gso` alone — a cold load is either pinned-open or closed.
+  to `gf`. Pinned means exactly one thing: the open panel SURVIVES outside
+  clicks (an unpinned open panel dismisses on them) — plus reload/Back,
+  since pin is URL state while open is ephemeral. Push so Back unpins;
+  absent from clean links so "open maximized in new tab" stays clean. Deep
+  links with `gf…&gso=true` load straight into a searchable maximized
+  board.
+- The ephemeral OPEN state (revealed by clicking one of the dock's edge
+  handles, dismissed by Esc / an outside click / the panel's close button)
+  is deliberately NOT in the URL: it lives in a small zustand store
+  (`lib/state/searchOverlayReveal.ts`) written only by the overlay dock,
+  and resets when the dock unmounts (restore), so opening the dock for one
+  search never rewrites history. `shown = revealed || pinned` — pinning
+  from the open state leaves `revealed` true underneath, so unpinning does
+  not snap the panel away. The server twin consults `gso` alone — a cold
+  load is either pinned-open or closed.
 - `isSearchSuppressed(state)` in `lib/state/pinboardView.ts`:
   `isPinboardMaximized(state) && !state.searchOverlay`, plus the
   `…FromParams` server twin (the parser mirror in `pinboardView.ts` must gain
@@ -81,7 +87,7 @@ Non-goals:
   `state/gallery.ts` defaults). Client hook `useSearchSuppressed()` in
   `lib/state/gallery.ts` composed like `usePinboardMaximized` (:239), with
   one client-only addition: it also reads the ephemeral reveal store, so
-  suppressed = maximized && !pinned && !revealed — a hover-revealed overlay
+  suppressed = maximized && !pinned && !revealed — a click-revealed overlay
   is a consumer on screen and enables the query exactly like a pinned one.
 - Sidebar hiding and everything else about maximize keeps using
   `isPinboardMaximized` unchanged. `sb` remains untouched by maximize, as
@@ -181,56 +187,90 @@ needs is already in `MultiSearchView` scope):
 ```
 
 The dock mounts whenever the board is maximized; visibility (hidden,
-hover-revealed, pinned) is the dock's own affair, mirroring how
+click-revealed, pinned) is the dock's own affair, mirroring how
 `PinboardFullscreenBar` owns its hover state.
 
 - `fixed inset-x-0 bottom-0 z-50`, `data-search-overlay`,
   `bg-background/95 border-t shadow-md`. Full width. Three rows top to
   bottom: search-bar row, thumbnail strip, pagination.
-- **Reveal mirrors the toolbar, from the bottom edge — plus pinning.** The
-  dock renders a bottom hot band (the toolbar's `h-4` edge zone, upside
-  down) and a grab-handle hint visible while the panel is hidden. Hovering
-  the band slides the panel up; leaving hides it — unless it is held. The
-  panel is held open while any of: pointer over it, focus inside it
-  (typing), or PINNED (`gso`). Pin gestures: clicking the hot band / handle
-  toggles the pin (a click, not a hover, is the deliberate gesture); a pin
-  toggle button at the panel's right edge shows and flips the pinned state;
-  `Ctrl+Shift+F` (registered by `MultiSearchView` while `pinboardMaximized`)
-  toggles it from the keyboard; and any `pointerdown` inside the panel
-  auto-pins — interacting with the search UI IS the intent to keep it
-  around, and it is also what keeps the panel alive when a dropdown portals
-  focus out of it (the problem the toolbar solves with its exclusive-slot
-  machinery). Unpinning never snaps the panel away while pointer or focus
-  is still inside; it hides on the next leave. There is NO search button in
-  the top toolbar — a top control toggling a bottom panel is a pointer
-  round trip for nothing.
-  Esc does not close it (Esc belongs to board selection/mode handlers).
-- **Drags are not held.** A drag that starts inside an unpinned panel and
-  leaves it hides the panel like any other pointer exit — deliberately: a
-  drag toward the board is exactly when the panel should get out of the way
-  of the drop. What makes this safe is that hiding is CSS-only
-  (translate/opacity + `pointer-events-none`): the panel and its contents
-  stay MOUNTED for the whole maximized session, so a P2 strip card serving
-  as the HTML5 drag source survives its own panel hiding mid-drag. Never
+- **Click-to-open on visible handles — NO hot bands.** (Revised from the
+  original hover-band model, which failed twice over: the full-length 1rem
+  edge strips sat at z-50 OVER the board and ate every click in the
+  outermost 16px — a crop handle touching the bottom edge was flatly
+  unclickable, and clicking it PINNED the dock instead — and any
+  bottom-edge hover fought auto-hide taskbars, which pop over the browser
+  and steal the gesture.) The only hot surfaces are the always-visible
+  grab handles; every other edge pixel is plain board. Hovering a handle
+  HIGHLIGHTS it (accent background + slight growth) rather than opening
+  anything — the visual cue that these docks are click-revealed, unlike
+  the hover-revealed top toolbar, which stays as-is (small, low-collision,
+  and its top drag handles are rarely reached thanks to compaction).
+  Clicking a handle opens the dock. The bottom dock gets THREE handles —
+  the existing bottom-center one, plus one low on each side edge — so an
+  auto-hide taskbar can never gate the feature: side edges don't summon
+  it. All three sit adjacent to where the panel appears; the side handles
+  carry a search glyph (they are not adjacent to a chevron's implied
+  direction), the center one keeps its chevron. There is still NO search
+  button in the top toolbar — a top control toggling a bottom panel is a
+  pointer round trip for nothing.
+- **Open is a stable state, not a hover.** The open panel stays up
+  regardless of pointer and focus — the hoverBand/hoverPanel/focusWithin
+  show-state machinery and the keyboard auto-pin are deleted wholesale,
+  and the portaled-menu blur problem they existed to patch disappears with
+  them (visibility no longer depends on focus at all). Dismissal of an
+  unpinned open panel: Esc, the panel's own close button (beside the pin
+  toggle — the edge handles are covered by the open panel, so the panel
+  must carry its own close affordance), or a click outside the panel. The
+  outside click is NOT swallowed: it performs its normal board action
+  (select a pin, start a marquee) and the chrome retreats with it. Two
+  exemptions the dismiss listener must honor: clicks inside portaled Radix
+  layers (`[data-radix-popper-content-wrapper]`, `[role="dialog"]`) are
+  not outside — choosing an item from the dock's own body-portaled menus
+  must not dismiss the dock — and clicks on ANY `[data-search-overlay]`
+  element are not outside, so using one dock never dismisses the other
+  (dismissal means returning to the BOARD, and the docks are one
+  workspace's chrome). Esc yields to everything above it in the Esc chain
+  (crop mode / `data-esc-owner` surfaces / the `gsv` viewer / open Radix
+  layers — honor `e.defaultPrevented`).
+- **Pinning: toggle, chord, double-click on background.** Gestures: the
+  pin toggle button, `Ctrl+Shift+F` (registered by `MultiSearchView` while
+  `pinboardMaximized`; from hidden it opens-and-pins), and DOUBLE-clicking
+  genuine panel background — one-way, pin only; the feedback is the pin
+  toggle flipping to pressed, and users who see the panel dismiss on
+  outside clicks will plausibly try a double-click to "activate" it.
+  Single background clicks are INERT: they neither pin (the old
+  pointerdown auto-pin upgraded the panel to a state that looked identical
+  and only behaved differently clicks later) nor dismiss. Interacting with
+  a control just has the control's effect — no auto-pin from pointer or
+  keyboard. "Background" is an interactive-ancestor test (`closest('button,
+  a, input, textarea, select, label, [role], [contenteditable="true"]')`
+  finds nothing), so rapid clicks on a control never pin. Unpinning stays
+  on the toggle / chord; it never snaps the panel away — `revealed` holds
+  it until a dismissal.
+- **Drags need no special case anymore.** Nothing hides on pointer exit,
+  so a drag out of the open panel leaves it up and multi-item drag
+  sessions work unpinned: drag out, drop, come back, drag the next. The
+  CSS-only-hide rule still stands — hiding is translate/opacity +
+  `pointer-events-none`, the panel and its contents stay MOUNTED for the
+  whole maximized session (a strip card serving as the HTML5 drag source
+  must survive the panel hiding by whatever path remains, e.g. Esc). Never
   convert the hide to a conditional unmount.
 - Pointer-events follow the toolbar's SHOW pattern only: the hidden panel
   is `pointer-events-none` (an invisible fixed panel must not eat board
-  clicks near the bottom edge) and becomes interactive when shown. What is
-  NOT replicated is the toolbar's always-auto piercing of modal-locked
-  bodies and the exclusive-menu-slot machinery it necessitates: auto-pin on
-  interaction makes a panel with an open menu pinned by construction, so
-  Radix modal layers may disable it along with the rest of the body while a
-  menu is open — correct dismiss behavior. Menus inside the overlay
-  (search-type selector, tag autocomplete, similarity selects) work exactly
-  as they do on the normal page.
+  clicks near the bottom edge) and becomes interactive when shown. Menus
+  inside the overlay (search-type selector, tag autocomplete, similarity
+  selects) work exactly as they do on the normal page.
 - Approximate height: ~40px bar + 352px strip (`h-88` track, fixed 240×320
   cards) + ~40px pagination ≈ 430px. Accepted for v1; a compact strip
   variant is a possible follow-up, not in scope.
 - The overlay publishes its height as a CSS variable for the bottom-band
   occupants (§7): `--pinboard-bottom-inset` on the document root, measured
-  from the panel (ResizeObserver, so later phases' taller panel is tracked
-  automatically) and set only while the panel is SHOWN — hidden or merely
-  mounted, the property is removed and consumers fall back to 0px.
+  from the panel (ResizeObserver, so a rewrapping bar or an appearing
+  pagination row is tracked live) and set only while the panel is SHOWN —
+  hidden or merely mounted, the property is removed and consumers fall
+  back to 0px. Under the click-to-open model "shown" is stable (it cannot
+  blink on a stray hover), which is what makes the var safe to consume for
+  real layout: §7 adds the board's scroll reservation as a consumer.
 
 ### 5.2 Search-bar row
 
@@ -394,19 +434,30 @@ and the two mounts.
   acceptable while focused in the overlay. The board's Delete ignores
   presses while a `[role="dialog"]` is open; the overlay is not a dialog and
   must not pretend to be one.
-- **Bottom band**: the overlay owns the bottom edge; existing occupants
-  yield via `--pinboard-bottom-inset` (§5.1):
+- **Bottom band**: the overlay owns the bottom edge while shown; existing
+  occupants yield via `--pinboard-bottom-inset` (§5.1):
   - `PinboardHistory` bottom docking (`PinboardHistory.tsx:49-89`): add the
     inset to the `bl`/`br` rect math.
   - Hole-mode hint toast (`HoleTargetOverlay.tsx:284`): `bottom-4` →
     `bottom-[calc(1rem+var(--pinboard-bottom-inset,0px))]`.
+  - **Scroll reservation**: the maximized board's scroll container
+    consumes the inset as extra bottom scroll range, so the board's last
+    rows can always be scrolled ABOVE the open dock — matching the normal
+    gallery, where the thumbnail strip takes real layout space and the
+    board scrolls clear of it. Applies whenever the dock is shown, pinned
+    or not (open is a stable, deliberately-entered state now, so the
+    relayout cannot flicker), and tracks the live dock height. The board
+    GRID is never resized: width, columns and item rects are untouched —
+    only the scrollable range grows. The sidebar deliberately does NOT get
+    the analogous width reservation: shrinking the board's width rescales
+    the entire grid.
 - **Z-order**: overlay at `z-50` alongside the toolbar; carry drag ghost
   (`z-60`) and preview popovers (`z-70`) stay above it, Radix portals
   (`z-50`, body-portaled later in DOM order) stack above it as they do the
   toolbar.
-- Board pins hidden behind the overlay while it is open are reachable by
-  scrolling the board area; the board is never resized (overlay ≠ inset for
-  the board itself — that is the stated UX).
+- Board pins behind the shown overlay are reachable by scrolling: the
+  scroll reservation above guarantees the clearance exactly, rather than
+  only when the board happened to have spare scroll range.
 
 ## 8. Item preview: one viewer, peeked or fixed
 
@@ -659,14 +710,20 @@ with a second framed surface the user can see.
 
 ## 9. Sidebar overlay (phase 4)
 
-- Same dock model as §5.1, rotated: a left-edge hot band + handle
-  (vertically inset so the horizontal bands keep their corners),
-  hover-reveal sliding in from the left, `gsb` as the PINNED flag, pinned
-  by clicking the edge control, by an in-flow pin button in a slim header
-  row at the panel's top (NOT absolutely positioned — it would overlap the
-  centered tab bar), by the overlay search-bar-row's settings toggle, or by
-  pointerdown inside. No toolbar button, and no hotkey (Ctrl+Shift+S is
-  browser save-page-as; future work if a safe chord is found).
+- Same dock model as §5.1, rotated: ONE always-visible handle on the left
+  edge, in the UPPER-middle region — clearly partitioned from the bottom
+  dock's low-left handle, which owns the lower region — that highlights on
+  hover and opens on click. No hot band. `gsb` is the PINNED flag with
+  §5.1's exact semantics: open is ephemeral and dismisses on Esc / outside
+  click / the panel's close button (beside the pin toggle in the slim
+  header row — NOT absolutely positioned, it would overlap the centered
+  tab bar); pinned survives outside clicks, reached via the pin toggle or
+  a double-click on panel background, one-way. The overlay
+  search-bar-row's settings toggle now toggles the sidebar's OPEN state
+  (not the pin — it is the "show me the filters" gesture, not a
+  persistence request). Single background clicks and control interactions
+  never pin. No toolbar button, and no hotkey (Ctrl+Shift+S is browser
+  save-page-as; future work if a safe chord is found).
 - The panel spans `top-0` to `bottom: var(--pinboard-bottom-inset, 0px)`
   (the bottom dock owns that band while shown) and publishes its width
   twice: `--pinboard-left-inset` while shown, consumed by the history
@@ -703,8 +760,9 @@ with a second framed surface the user can see.
 - **P0 — host freeze.** The latch in `MultiSearchView` (§3), plus a
   dev-mode assertion that the `PinBoard` instance survives a maximize toggle
   unmoved. Independently shippable; no visible feature change.
-- **P1 — overlay shell + gates.** `gso` (pinned) plus the reveal dock (hot
-  band + handle, hover/focus/pin show-state, auto-pin, ephemeral reveal
+- **P1 — overlay shell + gates.** `gso` (pinned) plus the reveal dock (as
+  first shipped: hot band + handle, hover/focus/pin show-state, auto-pin —
+  since replaced by §5.1's click-to-open model — plus the ephemeral reveal
   store), `isSearchSuppressed` (+ server mirror + prefetch),
   `SearchBarRow` extraction, panel with row + pin button, `Ctrl+Shift+F`,
   exemption-list entries, bottom inset var + history/toast yields. Search
