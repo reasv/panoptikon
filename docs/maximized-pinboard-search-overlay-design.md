@@ -206,13 +206,21 @@ click-revealed, pinned) is the dock's own affair, mirroring how
   the hover-revealed top toolbar, which stays as-is (small, low-collision,
   and its top drag handles are rarely reached thanks to compaction).
   Clicking a handle opens the dock. The bottom dock gets THREE handles —
-  the existing bottom-center one, plus one low on each side edge — so an
-  auto-hide taskbar can never gate the feature: side edges don't summon
-  it. All three sit adjacent to where the panel appears; the side handles
-  carry a search glyph (they are not adjacent to a chevron's implied
-  direction), the center one keeps its chevron. There is still NO search
-  button in the top toolbar — a top control toggling a bottom panel is a
-  pointer round trip for nothing.
+  bottom-center, left-center, right-center, each centred on its own side —
+  so an auto-hide taskbar can never gate the feature: side edges don't
+  summon it. The side handles carry a search glyph (they are not adjacent
+  to a chevron's implied direction), the center one keeps its chevron.
+  There is still NO search button in the top toolbar — a top control
+  toggling a bottom panel is a pointer round trip for nothing.
+- **A closed board shows exactly THREE edge controls, and all three open
+  the SEARCH dock.** The sidebar has no edge handle of its own until the
+  search panel is shown (§9): reaching for the screen edge to open filters
+  on a cold board is a gesture with no destination — the sidebar edits the
+  query the bottom dock runs, so it only makes sense beside it, and the
+  other thing it is good for (inspecting one item's data) is reached from
+  the item, not from the edge (§9.1). Positions were revised with this:
+  the two side handles moved from `bottom-24` to vertically centred, since
+  they no longer share the left edge with anything.
 - **Open is a stable state, not a hover.** The open panel stays up
   regardless of pointer and focus — the hoverBand/hoverPanel/focusWithin
   show-state machinery and the keyboard auto-pin are deleted wholesale,
@@ -222,16 +230,102 @@ click-revealed, pinned) is the dock's own affair, mirroring how
   toggle — the edge handles are covered by the open panel, so the panel
   must carry its own close affordance), or a click outside the panel. The
   outside click is NOT swallowed: it performs its normal board action
-  (select a pin, start a marquee) and the chrome retreats with it. Two
-  exemptions the dismiss listener must honor: clicks inside portaled Radix
-  layers (`[data-radix-popper-content-wrapper]`, `[role="dialog"]`) are
-  not outside — choosing an item from the dock's own body-portaled menus
-  must not dismiss the dock — and clicks on ANY `[data-search-overlay]`
+  (select a pin, start a marquee) and the chrome retreats with it.
+
+  **The outside dismissal listens for `click`, never `pointerdown`.** The
+  board's scroll reservation is shown-scoped (§7), so dismissing on
+  pointerdown collapsed the scroll range MID-GESTURE: the board lurched
+  under a pointer already down on a pin, and since `click` only fires on the
+  common ancestor of the pointerdown and pointerup targets it frequently
+  never fired at all — the pin was not selected and every board action
+  inside an open dock cost two presses.
+
+  What the `click` model costs, stated correctly (an earlier revision of
+  this section got it wrong): a marquee drag on the board DOES dismiss.
+  Both marquee starters `preventDefault()` on `pointerdown`, and per the
+  pointer-events compatibility mapping that suppresses the compatibility
+  MOUSE events only — never `click`, which is dispatched from the pointerup
+  regardless. The behavior is right (a marquee is a board gesture and "the
+  chrome retreats with it" is the contract); only the old reasoning — "a
+  marquee produces no click" — was false. What genuinely produces no click
+  is an HTML5 pin DRAG, which cancels it, so dragging a pin out leaves an
+  open dock up.
+
+  **ORIGIN GUARD — a capture-phase `pointerdown` companion.** Because the
+  click is dispatched at the nearest common inclusive ANCESTOR of the
+  mousedown and mouseup targets, a gesture STARTING inside a panel and
+  ending outside it lands on a target that is neither: here the docks are
+  fixed children of the search page's content column and the board sits in a
+  `[data-pinboard-frame]` panel inside that same column, so the ancestor is
+  the column `div` — matching no exemption and neither `<html>` nor
+  `<body>`. Drag-selecting text in the dock's search input and releasing a
+  few pixels above the panel edge therefore closed the dock, collapsing the
+  board's scroll range in the same commit. The dismiss listener must record,
+  on a capture-phase `pointerdown`, whether the gesture ORIGINATED in an
+  exempt subtree, and bail when it did. Still no `preventDefault` and no
+  `stopPropagation` anywhere. A click with no pointerdown of its own
+  (`detail === 0`, i.e. Enter/Space on a focused control) skips the guard
+  rather than inheriting the previous gesture's answer — and DOES dismiss,
+  deliberately: activating a board control is a genuine "back to the board"
+  gesture and there is no half-finished drag to protect.
+
+  **A RIGHT-CLICK on the board dismisses like a left click.** `click` fires
+  for the primary button only, so the switch off `pointerdown` silently
+  stopped a right-press — opening a pin's context menu — from retreating the
+  chrome, while every other way of reaching the board still did. A
+  `contextmenu` companion listener with the same exemptions and the same
+  origin guard restores it. `contextmenu` rather than `auxclick`: it is the
+  event the gesture means, it fires whether or not a menu appears, and it
+  leaves middle-click (not a board verb) alone. The Radix menu it opens
+  portals to `<body>` and is exempt, so the menu survives the dismissal that
+  revealed it.
+
+  Two exemptions BOTH docks honor: clicks inside portaled Radix layers
+  (`[data-radix-popper-content-wrapper]`, `[role="dialog"]`, `[role="menu"]`)
+  are not outside — choosing an item from the dock's own body-portaled menus
+  must not dismiss the dock; and clicks on ANY `[data-search-overlay]`
   element are not outside, so using one dock never dismisses the other
-  (dismissal means returning to the BOARD, and the docks are one
-  workspace's chrome). Esc yields to everything above it in the Esc chain
-  (crop mode / `data-esc-owner` surfaces / the `gsv` viewer / open Radix
-  layers — honor `e.defaultPrevented`).
+  (dismissal means returning to the BOARD, and the docks are one workspace's
+  chrome).
+
+  **Board-side exemptions are PER DOCK, never shared.** The only one is
+  `[data-opens-data-view]` — the pin's corner checkbox, which opens the
+  SIDEBAR dock on a re-click (§9.1) and lives on the BOARD. Without it the
+  checkbox press dismissed the sidebar and its own handler re-opened it in
+  the same commit, flashing the panel out and back. It is passed as the
+  sidebar's own extra exemption, NOT added to the shared list: shared, an
+  unpinned SEARCH dock survived a click on a pin's checkbox while dismissing
+  on a click anywhere else on the same pin — an inconsistency with no
+  explanation available from the UI. A pin button is board, not chrome, for
+  every dock but the one it opens. It is also deliberately its own attribute
+  rather than `data-search-overlay`, which gates the board's marquee starter
+  and deselect too.
+
+  **Esc peels ONE layer at a time.** With both docks up, one Esc closes the
+  sidebar and leaves the search dock; a second closes the search dock.
+  Neither dock consumes the key (claiming it would need
+  `stopImmediatePropagation` plus a registration-order guarantee, and the
+  board's own Esc must keep working), so the layering is done by standing
+  down: the bottom dock's Esc handler yields while the sidebar is shown AND
+  unpinned — precisely when the sidebar will act. A PINNED sidebar ignores
+  Esc, so it is not yielded to. Outside-click deliberately does NOT layer:
+  it dismisses BOTH. The asymmetry is intended — an outside click means
+  "back to the board", Esc means "back out one step". Esc still yields to
+  everything above it in the Esc chain (crop mode / `data-esc-owner`
+  surfaces / the `gsv` viewer / open Radix layers — honor
+  `e.defaultPrevented`).
+
+  **The viewer term in that chain is the EFFECTIVE flag, never raw `gsv`.**
+  A dock yields Esc to the viewer because the viewer's own window-capture
+  handler will consume the press — but that handler exists only while a
+  `PreviewSurface` is MOUNTED, and the surface stands down whenever the
+  gallery host is painting its large image under a stale `gpb`
+  (`largeImageHosted`, §8.3). `gsv` is deliberately not cleared on that
+  stand-down, so a dock reading the raw flag yielded to nothing: one Esc
+  press closed the viewer (absent), the sidebar (yielded) and the search
+  dock (yielded) — i.e. nothing at all, leaving the panel's X as the only
+  way out. Only `MultiSearchView` can compute the effective value, so it is
+  passed to BOTH docks rather than read from the URL by either.
 - **Pinning: toggle, chord, double-click on background.** Gestures: the
   pin toggle button, `Ctrl+Shift+F` (registered by `MultiSearchView` while
   `pinboardMaximized`; from hidden it opens-and-pins), and DOUBLE-clicking
@@ -251,10 +345,19 @@ click-revealed, pinned) is the dock's own affair, mirroring how
   so a drag out of the open panel leaves it up and multi-item drag
   sessions work unpinned: drag out, drop, come back, drag the next. The
   CSS-only-hide rule still stands — hiding is translate/opacity +
-  `pointer-events-none`, the panel and its contents stay MOUNTED for the
-  whole maximized session (a strip card serving as the HTML5 drag source
-  must survive the panel hiding by whatever path remains, e.g. Esc). Never
-  convert the hide to a conditional unmount.
+  `pointer-events-none` + `inert`, the panel and its contents stay MOUNTED
+  for the whole maximized session (a strip card serving as the HTML5 drag
+  source must survive the panel hiding by whatever path remains, e.g. Esc).
+  Never convert the hide to a conditional unmount. `inert` is required
+  ALONGSIDE that rule, not against it: the three CSS properties hide the
+  panel from the eye and the pointer but not from the TAB ORDER, so without
+  it Tab on a cold maximized board walked into the invisible search input,
+  tag combobox, pagination links and view-mode toggle with no focus ring and
+  typing silently rewrote query params — and hidden edge handles and the
+  hidden sidebar's pin toggle were focusable, with Enter popping a dock open
+  from nowhere. `inert` governs focus and hit-testing only; verified that it
+  does not unmount, does not change layout, and does not stop `drag` /
+  `dragend` reaching a source that becomes inert mid-drag.
 - Pointer-events follow the toolbar's SHOW pattern only: the hidden panel
   is `pointer-events-none` (an invisible fixed panel must not eat board
   clicks near the bottom edge) and becomes interactive when shown. Menus
@@ -450,7 +553,39 @@ and the two mounts.
     GRID is never resized: width, columns and item rects are untouched —
     only the scrollable range grows. The sidebar deliberately does NOT get
     the analogous width reservation: shrinking the board's width rescales
-    the entire grid.
+    the entire grid. The ONE surface that yields to the sidebar at all is
+    the preview box, and even there it is a minimum clearance that engages
+    only when the two would overlap, never a reservation (§8.2).
+
+    **The reservation is TWO in-flow spacers plus a DEFINITE HEIGHT on the
+    ScrollArea Root, and all three are one mechanism.** Two spacers because
+    the board has two possible bottoms: one after the grid (a board taller
+    than its wrapper ends at the GRID's bottom) and one after the wrapper (a
+    board that fits ends at the WRAPPER's box, which clamps the first spacer
+    away). The Root's `h-[97vh]` under `gf` is the non-obvious part and must
+    not be removed as redundant with the wrapper's own height: Radix's
+    Viewport is `h-full`, so against the Root's natural auto height (it is a
+    flex item in an auto-height `[data-pinboard-frame]`) the Viewport is auto
+    too and simply GROWS by the spacer — the reservation nets to exactly
+    zero, and the Root's own `clientHeight` inflates by a dock height. That
+    clientHeight is not decorative: it is the fill/mosaic FOLD (persisted
+    into the saved layout), the export height for PNG / mosaic / animated
+    output, and `PinboardHistory`'s corner docking; the Viewport's rect is
+    the drag-autoscroll edge and the selection toolbar's viewport cap.
+    Measured at 1920x1080 with a 400px dock: auto Root gives Root
+    clientHeight 1448 (baseline 1048) and range 600 tall / 0 fits — i.e. no
+    gain at all; definite Root gives clientHeight 1048 and range 1000 tall /
+    400 fits. Note also that `h-full` on the grid wrapper does NOT work as
+    the equivalent, because Radix wraps the Viewport's children in a
+    `display:table` box and a percentage height there collapses the wrapper
+    to its content.
+
+    **The reservation stays SHOWN-scoped**, and that is what forces the
+    outside-click dismissal onto `click` rather than `pointerdown` (§5.1). A
+    mount-scoped reservation would leave a permanent dock-height dead band
+    below a closed board, which is worse and always visible. Accepted, and
+    inherent to reclaiming the band: closing the dock while scrolled to the
+    very bottom shifts the board up by the dock's height.
 - **Z-order**: overlay at `z-50` alongside the toolbar; carry drag ghost
   (`z-60`) and preview popovers (`z-70`) stay above it, Radix portals
   (`z-50`, body-portaled later in DOM order) stack above it as they do the
@@ -555,13 +690,91 @@ The box is computed from the item's own aspect rather than fixed:
   because the dock is in play *while* the viewer is up (hovering strip
   buttons peeks over it) and because the viewer can hold a playing
   `<video>` whose frame must not be re-laid-out when a panel reveals or
-  hides. The sidebar is NOT reserved: it is an overlay by design, which the
-  board and the peek both simply let cover them.
+  hides. The sidebar is NOT reserved by the bounds: it is an overlay by
+  design, and the bounds stay the two symmetric `12vw` edges they always
+  were, so nothing about the box moves when a sidebar opens beside content
+  that already clears it.
   Never reserve a left edge here. A mount-scoped reservation never goes away
   — that shipped, and it parked the viewer a full sidebar-width right of the
   peek at all times — and a shown-scoped one resizes the box, because the
   fitted box is `min(100%, …)`, `100%` is the bounds' width, and the aspect
   turns a width change into a height change.
+- **Minimum clearance from the sidebar, instead of a reservation.** What
+  the sidebar does get is a floor on separation that engages ONLY in the
+  overlap case, which is what threads between the two failures above:
+  nothing moves for content that already clears the panel, and content
+  that would be covered is narrowed and pushed just enough to clear it by
+  `GAP` (16px). Both halves ride the SHOWN-scoped `--pinboard-left-inset`
+  (call it `S`), so both go inert on their own when no sidebar is up:
+  - the painted width takes a fourth `min()` operand,
+    `max(320px, 100vw - S - GAP - 12vw)` — the region between the sidebar
+    and the bounds' right edge, FLOORED at the same minimum the natural cap
+    uses. With `S` absent the unfloored term is `88vw - 16px`, far wider
+    than the `76vw` the bounds already impose, so it can only ever bind
+    while a sidebar is on screen. **The floor is not defensive tidiness:
+    without it this operand erases the picture.** `S` has a floor of its own
+    (`min(26rem, 90vw)` below `lg`), so on a narrow window the term goes to
+    zero and then negative — measured at an inner width of 980 with a 950px
+    sidebar, the box resolved to 0 (2px rendered, the frame's own borders),
+    and at the `90vw` rung it is negative at EVERY width. Overlapping on a
+    window too narrow to hold a sidebar and a legible picture side by side
+    is the better trade;
+  - the frame takes
+    `translateX(max(0px, min(S + GAP - 50vw + W/2, 38vw - W/2)))`, where
+    `W` is that same width expression restated (`100%` of the bounds is
+    exactly `76vw`, which is what makes it nameable outside the width
+    property; the app's body is `overflow-hidden`, so there is no
+    scrollbar to make the two differ). The content's natural left edge is
+    `50vw - W/2`, the shift is the deficit against `S + GAP`, and the
+    clamp at zero is what leaves non-overlapping content exactly where it
+    was. The `min()` CAP pairs with the width floor above and is inert
+    without it: whenever the clearance operand is unfloored,
+    `W <= 100vw - S - GAP - 12vw` rearranges to exactly
+    `S + GAP - 50vw + W/2 <= 38vw - W/2`. Where the floor DOES bind, the
+    uncapped shift met a demand the viewport cannot meet and pushed the
+    floored box clean off screen (measured: a 320px box translated 636px to
+    a right edge of 1286 in a 980px window). Capped, it lands hard against
+    the bounds' right edge and overlaps the sidebar, which is the accepted
+    trade.
+  So the box is never pushed past the bounds' right edge: by the cap when
+  the shift is positive, and by the `76vw` width cap (`50vw + W/2 <= 88vw`)
+  when it is zero. Measured in Chromium at 1920×1080: sidebar hidden →
+  `translateX(0px)` and a 76vw box; `S = 480px` → left edge exactly 496px,
+  right edge ≤ 1689.6px (`88vw`); a 400px-wide item with the same sidebar →
+  zero translate, unmoved; `S = 960px` (50vw) → unchanged from the unfloored
+  version, i.e. the floor and the cap are both inert at ordinary sizes. At
+  980×800 with `S = 882px` (90vw) the floored box is 320px wide with its
+  right edge exactly on the bound, where the unfloored one was a 2px sliver
+  past it. The shift is a TRANSFORM so the peek layer and the
+  overlaid header (both positioned inside the frame) travel with it for
+  free; the cost is that the frame becomes a containing block for any
+  `position: fixed` descendant — it has none today, Radix layers portal to
+  `<body>`, and the video's native fullscreen element is promoted to the
+  top layer — and `position: relative` + `left` is the escape hatch if one
+  ever appears.
+
+  **The width clamp is KEPT even though `--pinboard-left-inset` is
+  shown-scoped, and the reasoning must not be lost.** The clearance is an
+  operand of the WIDTH, not only of the transform, so opening the sidebar
+  from the viewer's own Data View button really does re-lay-out a playing
+  `<video>` — the same class of event the bottom-edge TRAP above forbids
+  (which is why `--pinboard-dock-height`, mount-scoped, is what the bounds
+  reserve). The distinction that decides it is DELIBERATE versus
+  INCIDENTAL. The bottom-edge failure was a HOVER: the band revealed itself
+  under a resting pointer and resized the picture with no user intent
+  behind it, repeatedly, and the user could not name what they had done.
+  Every path that changes `--pinboard-left-inset` is an act — pressing Data
+  View, the dock's settings toggle, Esc, an outside click — and a
+  deliberate act that moves the picture to make room for the thing just
+  asked for is a layout change the user authored. Transform-only was
+  considered and rejected: it cannot keep the stated requirement ("there
+  must be a clearance between them at all times") for items wide enough
+  that no shift alone clears the panel, which is exactly the case the
+  narrowing exists for. **Escape hatch** if the snap proves objectionable
+  in QA: drop the clearance operand from the width's `min()` and keep only
+  the transform, accepting partial overlap on wide items. Two lines
+  (`previewBox.ts`), and it trades a guarantee for a smoother frame — not
+  to be done silently.
 - Fit the item's aspect (`item.width / item.height`) inside those bounds,
   then **cap at natural size** — a 400px-wide image must not be blown up
   to 76vw on a surface whose whole promise is "see it properly" — with a
@@ -569,7 +782,10 @@ The box is computed from the item's own aspect rather than fixed:
   usable box.
 - **Fallback**: when `width`/`height` are null (rows from older scans),
   keep today's full-bounds box and let `object-contain` letterbox — no
-  probe there, since there is nothing to correct against.
+  probe there, since there is nothing to correct against. It still takes
+  the sidebar clearance above, and needs an explicit width to do it: a
+  bounds-spanning box is the widest case there is, so it is the one most
+  certain to overlap an open sidebar.
 - **Correction, not a wart**: `item.width/height` are the CODED dimensions
   (the scanner never reads EXIF orientation) while the browser DOES rotate
   when it paints, so a snug frame on the coded numbers is a landscape box
@@ -710,10 +926,33 @@ with a second framed surface the user can see.
 
 ## 9. Sidebar overlay (phase 4)
 
-- Same dock model as §5.1, rotated: ONE always-visible handle on the left
-  edge, in the UPPER-middle region — clearly partitioned from the bottom
-  dock's low-left handle, which owns the lower region — that highlights on
-  hover and opens on click. No hot band. `gsb` is the PINNED flag with
+- Same dock model as §5.1, rotated, with ONE difference that is this
+  section's central rule: **the sidebar's edge handle exists only while the
+  bottom search dock is SHOWN.** It is never an entry point from a cold
+  board (§5.1) — the sidebar edits the query the bottom dock runs, and the
+  per-item data view it also hosts is reached from the item (§9.1). When it
+  does appear it sits on the left edge, vertically centred in the space
+  ABOVE the dock — `calc((100vh - var(--pinboard-bottom-inset, 0px)) / 2)`,
+  not the viewport's middle — and tracks that space live, since the dock
+  republishes the inset when its bar rewraps or a pagination row appears.
+  There is no collision to arrange: the bottom dock's left and right
+  handles hide while its panel is shown, which is exactly when this one
+  exists. (The bottom dock's left AND bottom-centre handles also stand down
+  whenever the sidebar is SHOWN, which covers the other order — the sidebar
+  can be up over a hidden dock via §9.1. The centre handle needs it too: it
+  spans `50vw ± 56px` while the sidebar is `min(26rem, 90vw)` rising to
+  `50vw` at `lg`, and the sidebar renders after the bottom dock at the same
+  `z-50`, so between 1024px and 1280px it covers the handle's left half and
+  at or under ~920px it covers the handle entirely — an invisible click
+  target under a panel. The RIGHT handle deliberately does NOT stand down:
+  the sidebar is a left-edge panel whose widest rung is `90vw` — `50vw` is
+  the `lg` rung and everything above it is narrower, but below `lg` the
+  width is `min(26rem, 90vw)` and the 90vw floor binds under ~462px — which
+  still leaves 10vw of the right edge clear, wider than the 16px handle at
+  any usable viewport. So the right handle is uncovered at every width and
+  is the guaranteed way back to the search dock in that state. That is what licenses the other two to stand
+  down rather than being offset by `--pinboard-left-inset`.) The handle
+  highlights on hover and opens on click; no hot band. `gsb` is the PINNED flag with
   §5.1's exact semantics: open is ephemeral and dismisses on Esc / outside
   click / the panel's close button (beside the pin toggle in the slim
   header row — NOT absolutely positioned, it would overlap the centered
@@ -725,11 +964,12 @@ with a second framed surface the user can see.
   never pin. No toolbar button, and no hotkey (Ctrl+Shift+S is browser
   save-page-as; future work if a safe chord is found).
 - The panel spans `top-0` to `bottom: var(--pinboard-bottom-inset, 0px)`
-  (the bottom dock owns that band while shown) and publishes its width
-  twice: `--pinboard-left-inset` while shown, consumed by the history
-  panel's left-docked corners and the hover peek, and
-  `--pinboard-sidebar-width` for as long as it is mounted, consumed by the
-  pinned viewer's bounds (§8.2).
+  (the bottom dock owns that band while shown) and publishes its
+  `offsetWidth` as `--pinboard-left-inset` while SHOWN — consumed by the
+  history panel's left-docked corners and by the preview surface's minimum
+  clearance (§8.2). Shown-scoped only: the mount-scoped
+  `--pinboard-sidebar-width` an earlier draft called for was the
+  permanent-reservation failure recorded in §8.2 and does not exist.
 - **Content mounts only while shown** — a deliberate deviation from §5.1's
   CSS-only-hide rule, which exists for the strip's drag sources; the
   sidebar has none, and a hidden-but-mounted Similar Items tab would
@@ -744,16 +984,137 @@ with a second framed surface the user can see.
 - Extract `SideBarContent` (the `DirectionAwareTabs` block) from
   `components/sidebar/SideBar.tsx` so the page keeps its in-flow/drawer
   container and the overlay gets a new one: `fixed left-0 top-0
-  bottom-[var(--pinboard-bottom-inset,0px)] z-50 w-[26rem] border-r
-  bg-background/95` with its own ScrollArea, `data-search-overlay` (reusing
-  the same exemption attribute keeps the lists short).
+  bottom-[var(--pinboard-bottom-inset,0px)] z-50 border-r bg-background/95`
+  with its own ScrollArea, `data-search-overlay` (reusing the same
+  exemption attribute keeps the lists short).
+- **Width matches the page sidebar's, rung for rung.** The flat `26rem`
+  the overlay shipped with was 416px where the page sidebar renders 480px
+  at 1920, and the item data view inside it was visibly narrower than the
+  same tab on the normal page. The page ladder is
+  `lg:w-1/2 xl:w-1/3 2xl:w-1/4 4xl:w-[20%] 5xl:w-[18%]` of a parent that
+  spans the viewport, so the overlay uses the same numbers as VIEWPORT
+  units — `lg:50vw xl:calc(100vw/3) 2xl:25vw 4xl:20vw 5xl:18vw` — because
+  its own parent is the width-less `fixed` wrapper and percentages there
+  would resolve against a containing block defined by the child. Below
+  `lg` the page sidebar is a Drawer, so there is no rung to copy and the
+  old flat width stands, floored at `min(26rem, 90vw)` so a narrow window
+  is never covered edge to edge. `--pinboard-left-inset` is measured from
+  `offsetWidth`, so it tracks the ladder with no extra wiring.
 - The Details tab works off `useItemSelection`, which overlay strip clicks
   already populate. All filter edits flow into the same URL params the
   (enabled) query reads.
-- `sb` and the fixed width ladder of the page sidebar are untouched; the
-  overlay container is genuinely separate, per the layout-invariant note
-  that all page surfaces hard-code matching height constants — the overlay
-  deliberately opts out of that system by being viewport-fixed.
+- `sb` and the page sidebar's own ladder are untouched; the overlay
+  container is genuinely separate (it only copies the ladder's NUMBERS,
+  above), per the layout-invariant note that all page surfaces hard-code
+  matching height constants — the overlay deliberately opts out of that
+  system by being viewport-fixed.
+
+### 9.1 Item-centric entry points (Data View)
+
+The two ways into the sidebar that do NOT go through the bottom dock, both
+landing on the per-item data view (`sbt = 1`):
+
+- **The viewer header's Data View button** (`OpenDetailsButton` in the
+  maximized viewer's header, §8.3).
+- **A press on an ALREADY-SELECTED item's corner checkbox**
+  (`SelectButton` on a pinboard pin). The first press selects, as it
+  always did; the second used to be a no-op and now opens the data view.
+  Implemented as the RE-CLICK rule and deliberately NOT as an
+  `onDoubleClick` handler: a double-click on an unselected pin already
+  delivers both clicks, so "double-click a pin to inspect it" falls out
+  for free, while an `onDoubleClick` would fire on top of the two clicks
+  that produced it.
+
+  The second verb TOGGLES: a further press while the data view is already
+  open on that item CLOSES the pane. `reClick && dataViewOpen` is exactly
+  "the data view is showing THIS item" — the re-click test already means
+  this pin's file is the selection, and the pane always paints the current
+  selection — so this is the viewer header's own Data View toggle reached
+  from the board. Without it the control was a one-way door that did
+  nothing when repeated, sitting on the very item being inspected. The
+  cost is that the button takes the pane's shown state as a render input,
+  so every pin re-renders when the pane opens or closes; that is bounded
+  by the key budget below (the routing hook already subscribed to
+  `sb`/`gsb`/`sbt`, so only the ephemeral open flag is new, and `pinboard`
+  is still never read per row).
+
+  **The re-click test is FILE identity, not content identity.** The
+  checkbox's GLYPH has always been a `sha256` prefix test, and stays one —
+  it describes the picture on screen. The BRANCH may not be: selection
+  identity is `file_id` (`itemEquals`), and Panoptikon indexes per file, so
+  a copy or a hardlink is an ordinary second row with the same `sha256`.
+  With the content test driving the branch, selecting item A and then
+  pressing its duplicate B's checkbox took the re-click path and opened the
+  pane on **A**, and B could never be selected from its own checkbox at all.
+  Harmless while the second press was a no-op; actively wrong once it opened
+  a record.
+
+  The checkbox also carries `data-opens-data-view`, which the SIDEBAR's
+  outside-click dismissal exempts and the search dock's does not (§5.1) —
+  without it the press dismissed the sidebar it was about to open, and the
+  panel flashed out and back on every inspect. Per dock, not shared: for the
+  bottom dock a pin's checkbox is board like the rest of the pin.
+
+  **The file-identity test must distinguish "no files" from "files not
+  loaded yet".** The content-test fallback covers call sites that render
+  from a `sha256` alone and can never select anything; it must NOT cover the
+  loading window of a call site that does have files, which is where the
+  duplicate bug stayed live — pressing a pin's checkbox before its metadata
+  landed took the re-click path on the CONTENT test and opened the pane on
+  the other row, with a toast announcing it. The pinboard passes
+  `files={data?.files ?? null}`; `null` means pending and is neither a
+  re-click nor a select — the press is a no-op until the rows arrive.
+
+Both drive the dock's SHOWN state, not its pin: opening sets the ephemeral
+open flag (a look at the data dismisses like any other open dock, instead
+of writing a URL flag that outlives the glance) and closing clears the
+ephemeral flag AND unpins — otherwise "Close Data View" over a pinned
+sidebar is a dead button, since `pinned` alone still satisfies
+`shown = open || pinned`. The button's own open/close labelling reads that
+same shown state, so it is truthful in both directions.
+
+**One hook owns the routing, in ONE URL subscription.** `useDataViewPane`
+(`components/OpenFileDetails.tsx`) is the single place that decides which
+details pane exists — the page's own `<SideBar/>` via `sb` when not
+maximized, this overlay when maximized — and both controls above call it
+rather than branching for themselves. It replaced a `target` prop that only
+the viewer header could pass, which is why the corner checkbox could not
+have been wired without duplicating the branch. Non-maximized call sites
+(grid cards, the page gallery) keep writing exactly the `sb` + `sbt` pair
+they always wrote; the override exists because the page sidebar is not
+mounted in a maximized workspace, so an `sb` write there opens nothing and
+strands `sb=true` for the restore.
+
+Because both controls render PER RESULT ROW — `OpenDetailsButton` on every
+grid card, `SelectButton` on every pin — the hook's cost is multiplied by
+the grid or the board, and there is a hard budget on what it may read.
+
+It reads THREE SHORT KEYS (`gsb`, `sb`, `sbt`) through a single
+`useQueryStates` over the shared parser objects rather than three
+`useQueryState` calls: each nuqs instance keeps its own `useId`, `useState`,
+refs, effects and emitter subscription. The keys' LENGTH matters as much as
+their number — nuqs rebuilds a sync key by string-joining
+`searchParams.getAll(urlKey)` for every key in the map, in the hook body, on
+EVERY render of EVERY instance. A consolidated map that also carried the
+five board-maximize keys therefore had ~60 cards or ~100 pins each copy and
+compare `pinboard`, the app's longest parameter, per render pass:
+consolidation had removed the per-hook overhead and left the expensive read
+in place. **`pinboard` is never read per row.** The maximize decision is
+computed once by `MultiSearchView`, which already has it, and published
+through a React context that wraps its subtree. Context, not a store: a
+store written from an effect is a commit behind the URL, and a briefly wrong
+answer here routes a press to the pane that is not on screen (`sb=true`
+written into a maximized workspace opens nothing and strands the page
+sidebar for the restore), whereas context carries the value in the same
+render pass that computed it and propagates through memo boundaries. For the same
+reason the "Opening File Details" toast uses the standalone `toast()` export
+rather than `useToast()`, whose hook form registered a store listener per
+mount. The hook is also SPLIT: `useOpenDataView` exposes the open verb alone
+for `SelectButton`, which has no open/close labelling and must not re-render
+every pin when the pane's state changes; `useDataViewPane` adds
+`dataViewOpen` for `OpenDetailsButton`, which does. Per card / per pin the
+result is ONE nuqs subscription over three short keys, one context read, and
+zero toast listeners.
 
 ## 10. Phasing
 
