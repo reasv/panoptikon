@@ -453,22 +453,44 @@ strip is untouched (it has a large image already).
 The box is computed from the item's own aspect rather than fixed:
 
 - Bounds: the same region the fixed box used — horizontally centered over
-  the board with a clear margin, height `calc(<vh> -
-  var(--pinboard-bottom-inset, 0px))` so it never covers the open dock.
+  the board with a clear margin, a height that gives back the bottom dock's
+  band and a left edge that gives back the sidebar's width (§9 — the peek
+  portals above it), so a preview covers neither. Each of those two bands is
+  published in **two** custom properties with different lifetimes, and the
+  two surfaces read different ones (`app/search/previewBox.ts`): the
+  ephemeral peek takes the SHOWN-scoped pair (`--pinboard-bottom-inset`,
+  `--pinboard-left-inset`) and reclaims the space a hidden panel is not
+  using; the pinned viewer takes the MOUNT-scoped pair
+  (`--pinboard-dock-height`, `--pinboard-sidebar-width`), constant for the
+  whole maximized session, because it can hold a playing `<video>` and a
+  moving bound would re-lay-out its frame mid-playback. That applies to BOTH
+  edges: the fitted box is `min(100%, …)` and `100%` is the bounds' width, so
+  a moving left edge changes the box's width and, through the aspect, its
+  height.
 - Fit the item's aspect (`item.width / item.height`) inside those bounds,
   then **cap at natural size** — a 400px-wide image must not be blown up
   to 76vw on a surface whose whole promise is "see it properly" — with a
   floor (~320px on the fitted dimension) so a tiny item still yields a
   usable box.
 - **Fallback**: when `width`/`height` are null (rows from older scans),
-  keep today's full-bounds box and let `object-contain` letterbox. No
-  aspect probe from the loaded image: a box that resizes after the picture
-  paints is worse than one that was always the right size.
-- **Accepted wart**: `item.width/height` are the CODED dimensions, so a
-  phone video with a 90° display matrix yields a wrong-orientation box and
-  the content letterboxes inside it. Only our guess is wrong — the viewer
-  component's own overlays anchor to element-confirmed, rotation-corrected
-  aspect (`mediaAspect` in `GalleryImageLarge`).
+  keep today's full-bounds box and let `object-contain` letterbox — no
+  probe there, since there is nothing to correct against.
+- **Correction, not a wart**: `item.width/height` are the CODED dimensions
+  (the scanner never reads EXIF orientation) while the browser DOES rotate
+  when it paints, so a snug frame on the coded numbers is a landscape box
+  around a portrait photo. The full-bounds box hid this; this one cannot,
+  so the box follows the same ladder the viewer's overlays do
+  (`mediaAspect` in `GalleryImageLarge`): **element-confirmed,
+  rotation-corrected aspect beats item dimensions**, which stay as the
+  pre-load approximation. The natural cap is taken on the LONGER side,
+  which is rotation-invariant, so a corrected aspect re-projects it without
+  knowing which way the picture turned. Precedence between the peek's two
+  layers is not the gallery's plain "first writer wins": the stored
+  thumbnail is un-rotated too (`image` crate), so the dwell-upgrade FULL
+  file — the original as the browser paints it — outranks it and may
+  overwrite it. The resulting late resize is accepted: it beats a
+  permanently wrong frame, and it lands on the same frame as the picture
+  appearing or sharpening.
 
 ### 8.3 The pinned viewer
 
@@ -543,9 +565,11 @@ for nothing.
   pointerdown inside. No toolbar button, and no hotkey (Ctrl+Shift+S is
   browser save-page-as; future work if a safe chord is found).
 - The panel spans `top-0` to `bottom: var(--pinboard-bottom-inset, 0px)`
-  (the bottom dock owns that band while shown) and publishes its own
-  `--pinboard-left-inset` while shown, consumed by the history panel's
-  left-docked corners.
+  (the bottom dock owns that band while shown) and publishes its width
+  twice: `--pinboard-left-inset` while shown, consumed by the history
+  panel's left-docked corners and the hover peek, and
+  `--pinboard-sidebar-width` for as long as it is mounted, consumed by the
+  pinned viewer's bounds (§8.2).
 - **Content mounts only while shown** — a deliberate deviation from §5.1's
   CSS-only-hide rule, which exists for the strip's drag sources; the
   sidebar has none, and a hidden-but-mounted Similar Items tab would

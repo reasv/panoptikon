@@ -15,9 +15,19 @@ Desktop release notes.
   side-scrolling thumbnail strip from the gallery, and the page bar
   beneath it. Results can be dragged straight onto the board, pinned with
   their pin button, or shift-click carried - no more restoring the board
-  to add items. Hovering a thumbnail shows a large centered preview over
-  the board in place of the gallery's big image. The left edge works the
-  same way for the search sidebar (filters, file details, similar items).
+  to add items. Each thumbnail has a preview button on its top edge:
+  hovering it shows that item large over the board, and clicking it opens
+  the full viewer - the gallery's picture with everything it can do,
+  including video playback, which until now needed an item to be pinned
+  first. The viewer stays on the item you have selected and follows every
+  card click, arrow key and page jump; hovering another thumbnail's
+  preview button peeks at that item over the top without disturbing what
+  is playing underneath. Previews and the viewer are sized to the picture
+  rather than to a fixed rectangle, so nothing is framed in empty space,
+  and both get out of the way while an item is dragged onto the board.
+  The paged/scroll browsing switch is in the panel too, next to the page
+  bar. The left edge works the same way for the search sidebar (filters,
+  file details, similar items).
   Both panels slide away when the pointer leaves - including while
   dragging an item onto the board, where the panel gets out of the way of
   the drop - unless pinned open: click the edge, use the panel's pin
@@ -249,6 +259,17 @@ Desktop release notes.
   databases, once.
 
 ### Fixed
+
+- **Gallery keyboard shortcuts work again on tag-indexed databases.** The
+  arrow keys, the player shortcuts (play/pause, mute, fullscreen, frame
+  and speed steps, trim marks) and Ctrl+C in the gallery were silently
+  dead whenever the database had tags - which is to say, almost always.
+  The check that stands the shortcuts down while a menu or dialog is open
+  was matching the tag autocomplete list, which is always present in the
+  page even when closed, so every keypress was discarded. Arrow keys and
+  the player shortcuts now also stay out of the way of controls that use
+  them for their own purpose, such as the tab strips and the sliders in
+  the sidebar.
 
 - **Opening and closing the sidebar no longer stutters.** The Advanced
   Search Options panel used to animate its way in by tweening the results
