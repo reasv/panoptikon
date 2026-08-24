@@ -521,11 +521,14 @@ fullscreen host, click-half navigation and drag-out all come along.
   first cut shipped four of them and read lopsided against the two on the
   right). Accepted cost: with the dock unpinned and hidden the card is
   off-screen, so acting on the item means revealing the dock first.
-  The path sits in the middle track of a symmetric `1fr` grid, so it is
-  centered on the FRAME rather than on the space the buttons leave over —
-  the gallery header's flex arrangement only looks centered because its
-  two sides carry the same number of controls, which this one's never
-  will.
+  Layout: one control per side — `OpenDetailsButton` left, close right —
+  in a symmetric `1fr` grid whose middle track holds the label. Both
+  halves of that matter: the grid centers the path on the FRAME rather
+  than on the space the buttons leave over (the gallery header's flex
+  arrangement only looks centered because its two sides carry equal
+  control counts), and splitting the two controls is what makes the sides
+  weigh the same. Stacking both on one side is the same asymmetry the
+  four-verb version had, merely smaller — do not put them back together.
 - **Navigation props**: `prevImage`/`nextImage` wire to the shared
   `useGalleryNavigate`, which also gives the viewer arrow-key navigation
   and the click-through halves; `advanceToNextVideo` wires to the same,
