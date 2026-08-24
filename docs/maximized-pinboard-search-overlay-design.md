@@ -528,13 +528,25 @@ The box is computed from the item's own aspect rather than fixed:
   rotation-corrected aspect beats item dimensions**, which stay as the
   pre-load approximation. The natural cap is taken on the LONGER side,
   which is rotation-invariant, so a corrected aspect re-projects it without
-  knowing which way the picture turned. Precedence between the peek's two
-  layers is not the gallery's plain "first writer wins": the stored
-  thumbnail is un-rotated too (`image` crate), so the dwell-upgrade FULL
-  file — the original as the browser paints it — outranks it and may
-  overwrite it. The resulting late resize is accepted: it beats a
-  permanently wrong frame, and it lands on the same frame as the picture
-  appearing or sharpening.
+  knowing which way the picture turned. **Only the layer BOTH subjects
+  paint may report**, which is the `thumbnail` URL — the peek's base layer
+  and `GalleryImageLarge`'s still image build it from the same expression.
+  Restricting the store to those makes the box agree with what is painted
+  by construction in either subject, so fixing a peek stays a no-op for the
+  picture. The peek's dwell upgrade (the ORIGINAL file, which the browser
+  rotates per EXIF) reports NOTHING, and the reason is the trap the store's
+  per-file key hides: above the scanner's size thresholds `thumbnail`
+  serves a STORED thumbnail re-encoded without EXIF, so "same file" is not
+  "same painted image". Letting the upgrade outrank the thumbnail — which
+  shipped, briefly — fixed the box portrait around the landscape thumbnail
+  the viewer then painted inside it at ~44%, permanently, on exactly the
+  click this section exists to make invisible. Accepted in exchange: for a
+  large rotated still, the box matches the un-rotated thumbnail both
+  surfaces paint and only the dwell upgrade letterboxes inside it (the
+  pre-P5 behaviour for that one case); small files are served directly, so
+  their report is already the rotated one. The whole class of problem is
+  the scanner storing coded dimensions and un-rotated thumbnails, fixed
+  separately — once thumbnails carry orientation the two agree everywhere.
 
 ### 8.3 The pinned viewer
 
