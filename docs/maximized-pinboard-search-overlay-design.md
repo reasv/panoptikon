@@ -453,20 +453,24 @@ strip is untouched (it has a large image already).
 The box is computed from the item's own aspect rather than fixed:
 
 - Bounds: the same region the fixed box used — horizontally centered over
-  the board with a clear margin, a height that gives back the bottom dock's
-  band and a left edge that gives back the sidebar's width (§9 — the peek
-  portals above it), so a preview covers neither. Each of those two bands is
-  published in **two** custom properties with different lifetimes, and the
-  two surfaces read different ones (`app/search/previewBox.ts`): the
-  ephemeral peek takes the SHOWN-scoped pair (`--pinboard-bottom-inset`,
-  `--pinboard-left-inset`) and reclaims the space a hidden panel is not
-  using; the pinned viewer takes the MOUNT-scoped pair
-  (`--pinboard-dock-height`, `--pinboard-sidebar-width`), constant for the
-  whole maximized session, because it can hold a playing `<video>` and a
-  moving bound would re-lay-out its frame mid-playback. That applies to BOTH
-  edges: the fitted box is `min(100%, …)` and `100%` is the bounds' width, so
-  a moving left edge changes the box's width and, through the aspect, its
-  height.
+  the board with a clear margin, less the bottom dock's band. **ONE set of
+  bounds serves both surfaces** (`app/search/previewBox.ts`): they are
+  layered (§8.4), so bounds that differ land the peek beside the viewer's
+  frame instead of on it, and a viewer centered differently from the peek
+  reads as simply broken.
+  The two moving edges get deliberately different treatment. The dock is
+  reserved, via `--pinboard-dock-height` — the MOUNT-scoped twin of
+  `--pinboard-bottom-inset`, constant for the whole maximized session —
+  because the dock is in play *while* the viewer is up (hovering strip
+  buttons peeks over it) and because the viewer can hold a playing
+  `<video>` whose frame must not be re-laid-out when a panel reveals or
+  hides. The sidebar is NOT reserved: it is an overlay by design, which the
+  board and the peek both simply let cover them.
+  Never reserve a left edge here. A mount-scoped reservation never goes away
+  — that shipped, and it parked the viewer a full sidebar-width right of the
+  peek at all times — and a shown-scoped one resizes the box, because the
+  fitted box is `min(100%, …)`, `100%` is the bounds' width, and the aspect
+  turns a width change into a height change.
 - Fit the item's aspect (`item.width / item.height`) inside those bounds,
   then **cap at natural size** — a 400px-wide image must not be blown up
   to 76vw on a surface whose whole promise is "see it properly" — with a
