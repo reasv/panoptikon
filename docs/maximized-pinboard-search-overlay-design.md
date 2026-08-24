@@ -408,45 +408,85 @@ and the two mounts.
   scrolling the board area; the board is never resized (overlay ≠ inset for
   the board itself — that is the stated UX).
 
-## 8. Item preview: hover peek and pinned viewer
+## 8. Item preview: one viewer, peeked or fixed
 
-The maximized workspace has no large-image surface, and the board is
-currently the ONLY way to play a video in this UI. The first cut made the
-whole card body a hover trigger for a fixed-size centered image; the user
-rejected that on two grounds — a fixed box letterboxes most content (60%
-empty width on a portrait item) and, more importantly, an unconditional
-full-screen takeover on every pointer sweep covers the board precisely
-when the user is reaching across it to drop something. The trigger moves
-onto a dedicated control, and the surface gains a pinned mode with full
-display parity.
+The maximized workspace has no large-image surface, and the board was the
+ONLY way to play a video in this UI. The first cut made the whole card body
+a hover trigger for a fixed-size centered image; the user rejected that on
+two grounds — a fixed box letterboxes most content (60% empty width on a
+portrait item) and an unconditional full-screen takeover on every pointer
+sweep covers the board precisely when the user is reaching across it to
+drop something.
 
-**Identity rule.** "Selected" (blue ring, `gi`) and "the item in the
-viewer" are the SAME thing. There is no second selection concept:
+The second cut split the surface in two — a cheap `<img>` peek and a
+pinned viewer that layered over it — and the user rejected THAT for
+exposing an implementation detail as UI: clicking a peek visibly shrank
+the picture (the viewer's header row ate 3rem of the height budget, so the
+box re-fitted smaller) and stacked a second framed surface over the first.
+The split existed because mounting a real player per hover-sweep would
+churn video decoders, which is a reason the user should never have to
+perceive.
+
+**One surface, two subjects.** There is a single box. What it shows is:
+
+    displayed = peeked ?? fixed
+
+where `fixed` is the viewer's item (`gi`, present only while the viewer is
+open) and `peeked` is the ephemeral hover subject. Consequences that are
+now requirements, not niceties:
+
+- **Nothing resizes when you fix a peek.** Same box, same position, same
+  fit; the chrome that appears is OVERLAID on the picture (§8.3), never a
+  layout row.
+- **The box fits whatever is displayed**, so peeking a portrait item while
+  a landscape one is fixed re-fits to the portrait — content-fitted is the
+  whole point (§8.2), and letterboxing a peek inside the fixed item's
+  frame would reintroduce the complaint that started this.
+- **The fixed item's player stays MOUNTED under a peek.** The peek is a
+  layer inside the box, not a replacement for its content: a playing video
+  must survive a glance at a neighbour and be revealed still playing when
+  the pointer leaves. This is what the two-surface split bought, and it is
+  the one part of it that has to survive the merge.
+
+**Identity rule.** "Selected" (blue ring, `gi`) and "the fixed item" are
+the SAME thing. There is no second selection concept:
 
 - Clicking a card (body) selects it as it always did; if the viewer is
   open, the viewer follows.
-- Hovering a card's preview button shows that item EPHEMERALLY —
-  it never writes `gi` and never survives the pointer leaving.
+- Peeking shows an item EPHEMERALLY — it never writes `gi` and never
+  survives the pointer leaving.
 - Clicking a card's preview button opens the viewer AND selects that item
   (the `useGalleryNavigate` write, exactly like a card click).
 
-### 8.1 The preview button
+### 8.1 What peeks, and when
 
-A hover-visible button on the strip card, **top-center** — the four
-corners are taken (`BookmarkBtn`, `PinButton`, `FindButton`, and
-`FileActionCluster` at bottom-right). It renders only in the overlay's
-strip, gated on the new preview props being passed; the page gallery's
-strip is untouched (it has a large image already).
+The trigger is deliberately asymmetric between the two states, because the
+risk it guards against only exists in one of them:
 
-- **Hover** drives the existing `onItemHover` contract (200ms delayed
-  open, instant close) — the card BODY no longer does. A sweep across
-  cards to reach a drag source is now silent.
-- **Click** toggles: with the viewer closed, open it on this item; with
-  the viewer already open **on this item**, close it. Clicking the button
-  of a DIFFERENT item while open just swaps the viewer to it (selection
-  moves; the viewer stays open).
-- The icon reflects which of those a click will do — a distinct
-  "close/collapse" glyph while this item is the pinned one.
+- **Viewer closed** — only the card's preview button peeks. The card body
+  does nothing. This is the original guard: an unconditional body-hover
+  takeover covers the board exactly when the user is reaching across it,
+  and it is the reason the button exists at all.
+- **Viewer open** — any card body peeks, as well as its button. The
+  takeover already happened; the surface is up and the user is browsing
+  it, so making them find a small target per item is friction for no
+  protection. It also matches the click semantics they already have:
+  clicking a card body puts it in the viewer permanently, so hovering one
+  putting it there temporarily is the same gesture, weaker.
+
+The 200ms delayed open (instant close) is what makes the second bullet
+safe, and it is load-bearing: sweeping the pointer across the strip to
+reach a scrollbar, a pin button or a drag source passes over many cards
+and must swap nothing. Only a deliberate pause does.
+
+The button itself: hover-visible, **top-center** — the four corners are
+taken (`BookmarkBtn`, `PinButton`, `FindButton`, and `FileActionCluster`
+at bottom-right). It renders only in the overlay's strip; the page
+gallery's strip is untouched (it has a large image already). Clicking it
+opens the viewer on that item, or closes the viewer when that item is
+already the fixed one; its glyph says which. While the viewer is open the
+button is largely redundant with body hover, and that is fine — it stays
+as the close affordance and as the one control whose meaning is explicit.
 
 ### 8.2 Adaptive sizing (both surfaces)
 
@@ -513,6 +553,16 @@ fullscreen host, click-half navigation and drag-out all come along.
   `GalleryImageLarge` is mounted nowhere else. The viewer's instance is the
   only one — no duplicate `window` keydown registrations, no second video
   ref slot competing for the element.
+- **Header is CHROME ON the picture, not a row above it.** It is absolutely
+  positioned over the frame's top edge and appears only while the viewer is
+  showing its FIXED item — never during a peek, where its controls would
+  act on an item the user is not looking at, and where its absence is the
+  honest signal that this is a glance rather than a selection. Overlaying
+  rather than stacking is what makes fixing a peek a no-op for the picture:
+  a header in flow takes its height out of the fit budget, so the picture
+  re-fits smaller the instant you click — the shrink the user rejected.
+  Appearing on fix is also the affordance that teaches the mode: it is how
+  you learn the click did something and how you find the way out.
 - **Header**: recomposed, NOT extracted from the gallery header (whose
   prev/next arrows, thumbnails toggle and close-gallery semantics are
   gallery-specific). Label and viewer chrome only: `FilePathComponent` +
@@ -546,15 +596,23 @@ fullscreen host, click-half navigation and drag-out all come along.
 
 ### 8.4 Layering, and the hazards that come with a pinned surface
 
-The ephemeral peek and the pinned viewer are two different surfaces, and
-the peek stays LIGHT: thumbnail-only, `pointer-events-none`, portal at
-z-70 as today. Mounting a video slot per hover-sweep would churn decoders
-for nothing.
+The peek is a LAYER INSIDE the viewer's box, not a surface beside it:
+thumbnail-only, `pointer-events-none`, filling the frame. It stays light
+for the reason the old split existed — mounting a video slot per
+hover-sweep would churn decoders for nothing — but it no longer buys that
+with a second framed surface the user can see.
 
-- **Peek over viewer**: hovering another card's button while the viewer is
-  open renders the peek OVER it without unmounting it — a playing video
-  keeps playing underneath and is revealed again when the hover ends.
-  Never swap the viewer's item on hover.
+- **Peek over fixed item**: while the viewer is open, peeking another item
+  paints the layer over the fixed content WITHOUT unmounting it. A playing
+  video keeps playing underneath and is revealed still playing when the
+  hover ends. Never swap the viewer's own item on hover — `gi` is
+  untouched by a peek, always.
+- **The box re-fits to the peeked item**, so the frame changes shape around
+  the (covered) player during a peek and returns on leave. That is a
+  deliberate exception to §8.2's no-resize rule, which exists to stop
+  panels revealing or hiding from moving a frame the user is watching:
+  here the resize IS the user's own gesture and the picture it fits is the
+  one they asked to see.
 - **Drags must duck the viewer.** It is `pointer-events-auto` and sits
   over the board's CENTER — exactly where drops land — so it must go
   transparent and non-interactive for the duration of a drag and restore
