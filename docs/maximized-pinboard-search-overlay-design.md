@@ -511,10 +511,21 @@ fullscreen host, click-half navigation and drag-out all come along.
   ref slot competing for the element.
 - **Header**: recomposed, NOT extracted from the gallery header (whose
   prev/next arrows, thumbnails toggle and close-gallery semantics are
-  gallery-specific). It is the same atoms: `FilePathComponent` + the
-  `getLocale(last_modified)` line, the file verbs (`BookmarkBtn`,
-  `OpenFile`, `OpenFolder`, `ShareButton`, `OpenDetailsButton`), and an X
-  that closes the viewer.
+  gallery-specific). Label and viewer chrome only: `FilePathComponent` +
+  the `getLocale(last_modified)` line, `OpenDetailsButton`, and an X that
+  closes the viewer. The file verbs (`BookmarkBtn`, `OpenFile`,
+  `OpenFolder`, `ShareButton`) are deliberately NOT carried here — they
+  live on the strip card's hover overlay, which acts on this very item by
+  the identity rule, and duplicating them into a surface whose job is
+  showing the picture buys nothing (user ruling, 2026-08-24, after the
+  first cut shipped four of them and read lopsided against the two on the
+  right). Accepted cost: with the dock unpinned and hidden the card is
+  off-screen, so acting on the item means revealing the dock first.
+  The path sits in the middle track of a symmetric `1fr` grid, so it is
+  centered on the FRAME rather than on the space the buttons leave over —
+  the gallery header's flex arrangement only looks centered because its
+  two sides carry the same number of controls, which this one's never
+  will.
 - **Navigation props**: `prevImage`/`nextImage` wire to the shared
   `useGalleryNavigate`, which also gives the viewer arrow-key navigation
   and the click-through halves; `advanceToNextVideo` wires to the same,
