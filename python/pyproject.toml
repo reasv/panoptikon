@@ -15,7 +15,7 @@ dependencies = [
     "msgpack>=1.0",
     # Not imported by the worker: the Rust server resolves the UI's Node.js
     # runtime from this venv (see docs/architecture.md, tech debt register).
-    "nodejs-wheel>=20.17.0,<21",
+    "nodejs-wheel>=24.0.0,<25",
     # Also not imported by the worker: ships the ffmpeg/ffprobe binaries the
     # Rust server uses for video/audio processing (the package downloads them
     # on first use; `panoptikon setup` prefetches them after syncing).
