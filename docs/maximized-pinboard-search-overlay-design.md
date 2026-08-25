@@ -400,6 +400,13 @@ switch, `InstantSearchLock`, and the refresh toggle. Differences by mount:
 - Add a compact result count (the `AnimatedNumber` + metrics hover already
   used in the grid header band) at the row's right edge in the overlay,
   since the grid header is not on screen.
+- **Width**: the row takes the page header's own constraint —
+  `2xl:mx-auto` plus `2xl:w-1/2`, widening to `2xl:w-2/3` while the sidebar
+  is shown — rather than spanning the dock (user ruling, 2026-08-25: it
+  should read the same as the header it was taken from). In the dock the
+  wrapper is also a flex item, so the width classes come with
+  `2xl:flex-none`; without it the flex basis wins and the constraint does
+  nothing. The pin and close buttons stay at the row's right edge.
 
 All components in the row only read/write URL params and app-level providers
 (nuqs, react-query, toaster) — no page-layout assumptions. `useResetPage`
@@ -633,8 +640,10 @@ open) and `peeked` is the ephemeral hover subject. Consequences that are
 now requirements, not niceties:
 
 - **Nothing resizes when you fix a peek.** Same box, same position, same
-  fit; the chrome that appears is OVERLAID on the picture (§8.3), never a
-  layout row.
+  fit. This was first achieved by OVERLAYING the chrome on the picture; it
+  is now achieved by RESERVING the header's row unconditionally, whether or
+  not a header is painted (§8.3). The requirement is the invariance, not the
+  mechanism.
 - **The box fits whatever is displayed**, so peeking a portrait item while
   a landscape one is fixed re-fits to the portrait — content-fitted is the
   whole point (§8.2), and letterboxing a peek inside the fixed item's
@@ -757,7 +766,7 @@ The box is computed from the item's own aspect rather than fixed:
   980×800 with `S = 882px` (90vw) the floored box is 320px wide with its
   right edge exactly on the bound, where the unfloored one was a 2px sliver
   past it. The shift is a TRANSFORM so the peek layer and the
-  overlaid header (both positioned inside the frame) travel with it for
+  header row (both inside the frame) travel with it for
   free; the cost is that the frame becomes a containing block for any
   `position: fixed` descendant — it has none today, Radix layers portal to
   `<body>`, and the video's native fullscreen element is promoted to the
@@ -851,14 +860,13 @@ fullscreen host, click-half navigation and drag-out all come along.
   during a peek they would act on an item the user is not looking at, and
   their arrival on click is the signal that the glance became a selection,
   plus the nudge toward the way out. Nothing on the surface may take
-  pointer events while a peek is displayed, the label included — a
-  descendant re-enabling events under a `pointer-events-none` ancestor is
-  how a live control ends up floating over the board. Overlaying
-  rather than stacking is what makes fixing a peek a no-op for the picture:
-  a header in flow takes its height out of the fit budget, so the picture
-  re-fits smaller the instant you click — the shrink the user rejected.
-  Appearing on fix is also the affordance that teaches the mode: it is how
-  you learn the click did something and how you find the way out.
+  pointer events while a peek is displayed, the label included. Fixing a
+  peek is a no-op for the picture because the header's row is subtracted
+  from the height budget UNCONDITIONALLY (`VIEWER_HEADER_PX`,
+  `app/search/previewBox.ts`) — the budget is the same whether the header
+  paints or not, so nothing re-fits when the controls arrive. Appearing on
+  fix is also the affordance that teaches the mode: it is how you learn the
+  click did something and how you find the way out.
 - **Header**: recomposed, NOT extracted from the gallery header (whose
   prev/next arrows, thumbnails toggle and close-gallery semantics are
   gallery-specific). Label and viewer chrome only: `FilePathComponent` +
@@ -879,6 +887,22 @@ fullscreen host, click-half navigation and drag-out all come along.
   control counts), and splitting the two controls is what makes the sides
   weigh the same. Stacking both on one side is the same asymmetry the
   four-verb version had, merely smaller — do not put them back together.
+
+  **A SOLID ROW ABOVE THE PICTURE, not an overlay on it** (user ruling,
+  2026-08-25, reversing the first cut). It shipped overlaid — absolutely
+  positioned, a `from-black/60` scrim under white glyphs — to keep its
+  height out of the fit budget. That failed at both of a header's jobs: it
+  covered the video player's own copy and download controls, which anchor
+  to the same top corners, and over light picture content the white glyphs
+  were unreadable however heavy the scrim. Neither is fixable by tuning the
+  scrim. The row now owns its own height, that height is reserved
+  unconditionally (above), and three things went with the overlay: the
+  pointer-transparent band and its per-control `pointer-events-auto` (there
+  is no picture under the row to protect), the drop-shadowed white glyph
+  treatment (ordinary theme colours now), and `playerTopRightClass` — the
+  `GalleryImageLarge` prop that existed solely to push the player's
+  top-right controls out from under this header, deleted with its only
+  caller.
 - **Navigation props**: `prevImage`/`nextImage` wire to the shared
   `useGalleryNavigate`, which also gives the viewer arrow-key navigation
   and the click-through halves; `advanceToNextVideo` wires to the same,
