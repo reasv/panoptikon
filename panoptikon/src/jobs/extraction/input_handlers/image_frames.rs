@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use image::AnimationDecoder;
 use image::codecs::gif::GifDecoder;
-use image::{DynamicImage, GenericImageView};
+use image::metadata::Orientation;
+use image::{DynamicImage, GenericImageView, ImageDecoder};
 use serde_json::{Value, json};
 
 use crate::api_error::{ApiError, Blocker};
@@ -17,6 +18,11 @@ use crate::jobs::files::{FRAME_PROCESS_VERSION, stderr_tail};
 /// carry their own pixel dimensions (each page differs from the item's stored
 /// size); frames without dimensions are sliced using the item's stored
 /// width/height, mirroring the Python loader.
+///
+/// Dimensions are *display* dimensions throughout, because so are the pixels
+/// the models end up seeing (docs/display-dimensions-design.md §5): the
+/// slicer orients what it decodes before cutting, and a whole-file send keeps
+/// its EXIF for inferio's loader to apply.
 pub(super) struct BaseFrame {
     pub bytes: Vec<u8>,
     pub width: Option<i64>,
@@ -29,6 +35,14 @@ impl BaseFrame {
             bytes,
             width: None,
             height: None,
+        }
+    }
+
+    fn sized(bytes: Vec<u8>, (width, height): (u32, u32)) -> Self {
+        Self {
+            bytes,
+            width: Some(i64::from(width)),
+            height: Some(i64::from(height)),
         }
     }
 }
@@ -127,8 +141,15 @@ pub(super) async fn load_base_frames(
             tracing::error!(error = %err, path = %item.path, "failed to read image");
             ApiError::internal("Failed to read image")
         })?;
-        ensure_image_readable(&buffer, &item.path)?;
-        return Ok(vec![BaseFrame::sized_by_item(buffer)]);
+        // The header's own dimensions, not the item's — read from the same
+        // bytes the models will see, so a file that changed on disk after
+        // indexing can never be sliced against a stale shape. Display
+        // dimensions, like everything downstream: the slicer orients this
+        // buffer before cutting, and when no slicing happens the bytes go out
+        // whole with their EXIF intact, which inferio's loader applies
+        // (docs/display-dimensions-design.md §5).
+        let dimensions = ensure_image_readable(&buffer, &item.path)?;
+        return Ok(vec![BaseFrame::sized(buffer, dimensions)]);
     }
     if item.item_type.starts_with("video") {
         let mut conn = open_index_db_read_no_user_data(index_db).await?;
@@ -216,19 +237,28 @@ pub(super) async fn load_base_frames(
 /// attempt). Deliberately still *only* a header parse: fully decoding a still
 /// image would make the gateway stricter than the PIL consumer that actually
 /// arbitrates it (docs/failed-media-retry-design.md, arbiter principle).
-fn ensure_image_readable(buffer: &[u8], path: &str) -> ApiResult<()> {
-    image::ImageReader::new(std::io::Cursor::new(buffer))
+/// Returns the header's **display** dimensions — the coded numbers with the
+/// EXIF orientation applied — because that is the space every consumer of the
+/// returned frame works in: the slice grid is computed from them, and the
+/// pixels they describe are oriented wherever they are actually decoded (the
+/// slicer here, inferio's loader for a whole-file send).
+fn ensure_image_readable(buffer: &[u8], path: &str) -> ApiResult<(u32, u32)> {
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(buffer))
         .with_guessed_format()
         .map_err(|err| {
             tracing::error!(error = %err, path, "image format detection failed");
             ApiError::input(format!("Image {path} has an unrecognizable format: {err}"))
         })?
-        .into_dimensions()
+        .into_decoder()
         .map_err(|err| {
             tracing::error!(error = %err, path, "image is not readable");
             classify_image_error(err, format!("Image {path} has an unreadable header"))
         })?;
-    Ok(())
+    let coded = decoder.dimensions();
+    // An unreadable orientation is never a verdict on the pixels; the same
+    // degradation as the scan's `open_image_oriented`.
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    Ok(crate::jobs::files::oriented_dimensions(coded, orientation))
 }
 
 /// The scan-side rule ([`crate::jobs::files`]'s image classifier), applied to
@@ -455,11 +485,32 @@ fn slice_image_grid(image_bytes: &[u8], rows: usize, cols: usize) -> ApiResult<V
     Ok(output)
 }
 
+/// Decode for slicing: oriented, because the slice grid was computed from
+/// display dimensions and the cuts must land in the same space
+/// (docs/display-dimensions-design.md §5). Slices are re-encoded without
+/// EXIF, so orienting here is also what keeps them from reaching the models
+/// sideways — a whole-file send keeps its EXIF and inferio's loader applies
+/// it instead.
 fn load_dynamic_image(buffer: &[u8]) -> ApiResult<DynamicImage> {
-    crate::jobs::files::decode_image_bytes(buffer).map_err(|err| {
+    let mut image = crate::jobs::files::decode_image_bytes(buffer).map_err(|err| {
         tracing::error!(error = %err, "failed to decode image");
         ApiError::internal("Failed to decode image")
-    })
+    })?;
+    image.apply_orientation(buffer_orientation(buffer));
+    Ok(image)
+}
+
+/// The EXIF orientation of an in-memory image, header-only, degrading to
+/// `NoTransforms` on any failure: a missing or unreadable orientation is
+/// never a verdict on pixels that decoded fine (the scan's
+/// `open_image_oriented` rule).
+fn buffer_orientation(buffer: &[u8]) -> Orientation {
+    image::ImageReader::new(std::io::Cursor::new(buffer))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_decoder().ok())
+        .and_then(|mut decoder| decoder.orientation().ok())
+        .unwrap_or(Orientation::NoTransforms)
 }
 
 fn encode_jpeg(image: &DynamicImage) -> ApiResult<Vec<u8>> {
@@ -494,10 +545,15 @@ fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     // non-GIF (which PIL decoded regardless of extension) is handled as a
     // single still frame instead of failing the item.
     if !matches!(image::guess_format(&buffer), Ok(image::ImageFormat::Gif)) {
-        let image = crate::jobs::files::decode_image_bytes(&buffer).map_err(|err| {
+        let mut image = crate::jobs::files::decode_image_bytes(&buffer).map_err(|err| {
             tracing::error!(error = %err, path, "failed to decode mis-named gif");
             classify_image_error(err, format!("Failed to decode mis-named gif {path}"))
         })?;
+        // Oriented like every other decode headed for the models: the JPEG
+        // re-encode below drops the EXIF, and the item dims this frame falls
+        // back to are display dims (the scan content-sniffs, so a mis-named
+        // still was indexed with its orientation applied).
+        image.apply_orientation(buffer_orientation(&buffer));
         return Ok(vec![BaseFrame::sized_by_item(encode_jpeg(&image)?)]);
     }
     let decoder = GifDecoder::new(std::io::Cursor::new(&buffer)).map_err(|err| {
@@ -721,7 +777,7 @@ async fn render_html_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::files::{corner_is_card, write_clip};
+    use crate::jobs::files::{corner_is_card, jpeg_with_exif_orientation, write_clip};
 
     /// The extraction side has its own ffmpeg invocation, so the scan side's
     /// clamp test proves nothing about it. Both values of the gate are here:
@@ -759,6 +815,49 @@ mod tests {
         assert!(
             unclamped.iter().any(corner_is_card),
             "unclamped sampling lands in the card — that is what the gate turns back on"
+        );
+    }
+
+    // What the models see is the picture, in the same space the slice grid is
+    // computed in (docs/display-dimensions-design.md §5). The gate reports
+    // display dimensions and the slicer's decode orients — one disagreeing
+    // with the other would tile an EXIF-rotated photo with its rows and
+    // columns swapped, which is exactly the coded/display split this closes.
+    #[test]
+    fn the_slicer_and_its_grid_agree_on_the_picture() {
+        // Orientation 6: coded 64x32, painted 32x64.
+        let rotated = jpeg_with_exif_orientation(64, 32, 6);
+
+        assert_eq!(
+            ensure_image_readable(&rotated, "portrait.jpg").expect("the fixture parses"),
+            (32, 64),
+            "the gate reports what a browser paints, not the header's numbers"
+        );
+        assert_eq!(
+            load_dynamic_image(&rotated)
+                .expect("the fixture decodes")
+                .dimensions(),
+            (32, 64),
+            "the slicer cuts the oriented pixels those dimensions describe"
+        );
+
+        // And a missing orientation stays a no-op, coded == display.
+        let plain = {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(9, 4))
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .expect("the fixture encodes");
+            bytes
+        };
+        assert_eq!(
+            ensure_image_readable(&plain, "plain.png").expect("the fixture parses"),
+            (9, 4)
+        );
+        assert_eq!(
+            load_dynamic_image(&plain)
+                .expect("the fixture decodes")
+                .dimensions(),
+            (9, 4)
         );
     }
 }

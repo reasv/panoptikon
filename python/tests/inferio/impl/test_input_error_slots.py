@@ -59,6 +59,21 @@ def test_a_healthy_payload_decodes_without_a_slot():
     assert image is not None and image.size == (8, 8)
 
 
+def test_an_exif_orientation_is_applied_like_a_browser_would():
+    """The models must see the picture, not the pixels as stored: browsers,
+    ffmpeg's video decoder and the indexed dimensions all apply the EXIF
+    orientation (docs/display-dimensions-design.md §5), and this loader is
+    the one decode every whole-image payload passes through — indexed files
+    and search-by-image query uploads alike."""
+    exif = Image.Exif()
+    exif[0x0112] = 6  # rotate 90 clockwise: coded 8x4 is painted 4x8
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 4), (10, 20, 30)).save(buf, format="JPEG", exif=exif)
+
+    image = load_image_from_buffer(buf.getvalue())
+    assert image.size == (4, 8), "the loader returns what a browser paints"
+
+
 def test_an_undecodable_payload_becomes_an_input_slot():
     image, slot = load_image_or_slot(b"this is definitely not an image")
     assert image is None

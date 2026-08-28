@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::AnimationDecoder;
 
-use super::compose::{ItemTime, StreamInfo};
+use super::compose::{ItemTime, StreamInfo, orientation_transform};
 
 /// Hard ceiling on decoded frames (≈ 60 s × 60 fps), whatever the item's
 /// bounds claim: the bounds are client-supplied and the decode cost is paid
@@ -141,6 +141,24 @@ fn extract_with_budget(
     image::ImageDecoder::set_limits(&mut decoder, decode_limits())
         .map_err(|err| format!("the decode limits refused this file: {err}"))?;
     let (width, height) = image::ImageDecoder::dimensions(&decoder);
+    // ffmpeg does not apply a WebP's EXIF orientation and the frames written
+    // below are canvas-space PNGs, so the graph has to close the gap — the
+    // same `normalize` an unbridged EXIF-oriented WebP gets
+    // (docs/display-dimensions-design.md §1.3).
+    //
+    // Read on a decoder of its own: `orientation()` seeks to the EXIF chunk,
+    // and nothing about this extraction's frame-by-frame position may depend
+    // on a metadata seek having left the reader where it found it.
+    let normalize = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
+        .ok()
+        .and_then(|mut probe| image::ImageDecoder::orientation(&mut probe).ok())
+        .map(orientation_transform)
+        .unwrap_or_default();
+    let (display_width, display_height) = if normalize.quarter_turns % 2 == 1 {
+        (height, width)
+    } else {
+        (width, height)
+    };
 
     let hold_covering_frame_only = matches!(time, ItemTime::Still { .. });
     let mut script = String::from("ffconcat version 1.0\n");
@@ -237,8 +255,9 @@ fn extract_with_budget(
         _dir: dir,
         script: script_path,
         info: StreamInfo {
-            width: i64::from(width),
-            height: i64::from(height),
+            width: i64::from(display_width),
+            height: i64::from(display_height),
+            normalize,
             video_index: 0,
             has_audio: false,
             duration_s: Some(written_ms as f64 / 1000.0),
@@ -326,6 +345,7 @@ fn ms_seconds(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::compose::Transform;
 
     /// The committed two-frame fixture: 16x16, red then blue, 500 ms each.
     const FIXTURE: &[u8] = include_bytes!("fixtures/two-frame.webp");
@@ -377,6 +397,7 @@ mod tests {
             StreamInfo {
                 width: 16,
                 height: 16,
+                normalize: Transform::default(),
                 video_index: 0,
                 has_audio: false,
                 duration_s: Some(1.0),

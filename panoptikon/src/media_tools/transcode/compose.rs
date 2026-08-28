@@ -4,8 +4,9 @@
 //!
 //! A composition is described entirely by the client: a canvas, a frame rate,
 //! an output length policy, and a list of items each carrying a source
-//! rectangle (in the source's own pixels, *before* its display orientation is
-//! applied), a display transform, a destination rectangle on the canvas, and
+//! rectangle (in the source's own pixels as the *browser* paints them — its
+//! file orientation applied, the board's `Transform` not yet), a display
+//! transform, a destination rectangle on the canvas, and
 //! what the item is showing — a playing span, a frozen frame, or a still
 //! image. The server never re-derives any of that geometry: the pinboard's own
 //! layout solve is the authority, and reproducing it here would guarantee a
@@ -28,6 +29,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use image::ImageDecoder;
+use image::metadata::Orientation;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
@@ -778,11 +781,23 @@ fn normalize_color(value: &str) -> Option<String> {
 /// What one input's streams look like, as the graph builder needs them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StreamInfo {
-    /// Display dimensions: the rotation metadata is applied, because ffmpeg
-    /// auto-rotates on decode and the client's source rectangle is measured
-    /// against the browser's (equally auto-rotated) natural size.
+    /// Display dimensions: the orientation metadata is applied, because the
+    /// client's source rectangle is measured against the browser's (equally
+    /// oriented) natural size, and so is `items.width`/`items.height`
+    /// (docs/display-dimensions-design.md).
     pub(crate) width: i64,
     pub(crate) height: i64,
+    /// What the graph must apply *before the crop* to make the decoded frame
+    /// match those dimensions.
+    ///
+    /// Identity for almost everything, because ffmpeg normalizes almost
+    /// everything itself: it auto-rotates video from the display matrix, and
+    /// its mjpeg decoder honours EXIF. It does **not** do so for an
+    /// EXIF-oriented PNG, WebP or TIFF — browsers do — so for those this
+    /// carries the transform that closes the gap. Without it the client's
+    /// crop and the decoded frame are in different spaces, and the clamp
+    /// below silently shrinks the crop instead of failing.
+    pub(crate) normalize: Transform,
     /// Index *among video streams* of the one that carries pictures. A file
     /// whose first video stream is cover art would otherwise compose its album
     /// art (the Phase 2 `content_video_stream` rule, one layer down).
@@ -838,7 +853,88 @@ pub(crate) fn probe_source(path: &Path) -> Result<StreamInfo, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    parse_probe(&output.stdout).ok_or_else(|| "ffprobe found no usable video stream".to_string())
+    let probe =
+        parse_probe(&output.stdout).ok_or_else(|| "ffprobe found no usable video stream")?;
+    Ok(apply_still_orientation(probe, path))
+}
+
+/// Folds a still image's EXIF orientation into a probe ffprobe cannot report
+/// it in (docs/display-dimensions-design.md §1.3).
+///
+/// ffprobe exposes nothing about it — not `side_data_list`, not `stream_tags`
+/// — so the header is read directly. Measured against the bundled toolchain:
+/// an EXIF-rotated JPEG probes as its coded size but *decodes* transposed,
+/// while the same orientation on a PNG, WebP or TIFF probes and decodes coded.
+/// So both need their reported dimensions corrected, and only the latter need
+/// a filter.
+///
+/// A file the image crate will not open is a video (or something else ffmpeg
+/// handles and this does not), and is returned untouched — `parse_probe` has
+/// already applied its display matrix.
+fn apply_still_orientation(probe: StreamInfo, path: &Path) -> StreamInfo {
+    let Some(still) = still_source_orientation(path) else {
+        return probe;
+    };
+    let transform = orientation_transform(still.orientation);
+    let (width, height) = if transform.quarter_turns % 2 == 1 {
+        (probe.height, probe.width)
+    } else {
+        (probe.width, probe.height)
+    };
+    StreamInfo {
+        width,
+        height,
+        normalize: if still.decoder_applies {
+            Transform::default()
+        } else {
+            transform
+        },
+        ..probe
+    }
+}
+
+/// One still's orientation, and whether ffmpeg's own decoder will apply it.
+struct StillOrientation {
+    orientation: Orientation,
+    decoder_applies: bool,
+}
+
+fn still_source_orientation(path: &Path) -> Option<StillOrientation> {
+    let reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    // Content-sniffed, so a video never reaches the decoder below however it
+    // is named.
+    let format = reader.format()?;
+    let orientation = reader.into_decoder().ok()?.orientation().ok()?;
+    Some(StillOrientation {
+        orientation,
+        // The one format ffmpeg normalizes on its own. Kept as an explicit
+        // allowlist rather than a "these do not" denylist: a format this build
+        // has not been measured against is assumed *not* to be normalized,
+        // which produces a visible rotation rather than a silent double one.
+        decoder_applies: format == image::ImageFormat::Jpeg,
+    })
+}
+
+/// The image crate's orientation as this module's D4 transform. Both are
+/// "rotate clockwise, then flip horizontally", so the mapping is a rename.
+pub(super) fn orientation_transform(orientation: Orientation) -> Transform {
+    let (quarter_turns, flip_h) = match orientation {
+        Orientation::NoTransforms => (0, false),
+        Orientation::Rotate90 => (1, false),
+        Orientation::Rotate180 => (2, false),
+        Orientation::Rotate270 => (3, false),
+        Orientation::FlipHorizontal => (0, true),
+        Orientation::FlipVertical => (2, true),
+        Orientation::Rotate90FlipH => (1, true),
+        Orientation::Rotate270FlipH => (3, true),
+    };
+    Transform {
+        quarter_turns,
+        flip_h,
+    }
 }
 
 /// Pure half of [`probe_source`], so the stream selection has tests that need
@@ -894,6 +990,10 @@ fn parse_probe(stdout: &[u8]) -> Option<StreamInfo> {
     Some(StreamInfo {
         width,
         height,
+        // ffmpeg auto-rotates video from the display matrix, so what it hands
+        // the graph already matches the dimensions above. A still's gap is
+        // closed by `apply_still_orientation`, which needs the file.
+        normalize: Transform::default(),
         video_index,
         has_audio,
         duration_s,
@@ -1124,7 +1224,19 @@ fn video_chain(
     let video_index = probe.map(|probe| probe.video_index).unwrap_or(0);
     let src = clamped_src(item.src, probe);
     let geometry = {
-        let mut filters = vec![format!("crop={}:{}:{}:{}", src.w, src.h, src.x, src.y)];
+        // Ahead of the crop, and that order is the whole point: the crop
+        // arrives in display space (the client measured it against the
+        // browser's natural size), so the frame has to be in display space
+        // before it is cut. `item.transform` is the *board's* rotation and
+        // belongs after, on a frame already cropped in source space.
+        let mut filters: Vec<String> = probe
+            .map(|probe| probe.normalize)
+            .map(orientation_filters)
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        filters.push(format!("crop={}:{}:{}:{}", src.w, src.h, src.x, src.y));
         filters.extend(orientation_filters(item.transform).into_iter().map(str::to_string));
         filters.push(format!(
             "scale={}:{}:flags=lanczos",
@@ -1187,9 +1299,9 @@ fn audio_chain(
 }
 
 /// The crop, held inside the stream it crops. The client computes this against
-/// the natural size the browser reported, so a mismatch means the file behind
-/// the hash was replaced or the browser and ffmpeg disagree about rotation —
-/// either way a crop past the edge fails the encode, and a clamp does not.
+/// the natural size the browser reported, which `StreamInfo` is now also
+/// measured in — so a mismatch means the file behind the hash was replaced,
+/// and a crop past the edge fails the encode where a clamp does not.
 fn clamped_src(src: Rect, probe: Option<StreamInfo>) -> Rect {
     let Some(probe) = probe else {
         return src;
@@ -1927,6 +2039,7 @@ mod tests {
             Some(StreamInfo {
                 width: 640,
                 height: 480,
+                normalize: Transform::default(),
                 video_index: 0,
                 has_audio: false,
                 duration_s,
@@ -2176,6 +2289,7 @@ mod tests {
                     // rectangle is clamped into it.
                     width: 540,
                     height: 960,
+                    normalize: Transform::default(),
                     video_index: 0,
                     has_audio: true,
                     duration_s: Some(30.0),
@@ -2187,6 +2301,7 @@ mod tests {
                 probe: Some(StreamInfo {
                     width: 1920,
                     height: 1080,
+                    normalize: Transform::default(),
                     video_index: 1,
                     has_audio: false,
                     duration_s: Some(30.0),
@@ -2216,6 +2331,7 @@ mod tests {
         let info = StreamInfo {
             width: 100,
             height: 80,
+            normalize: Transform::default(),
             video_index: 0,
             has_audio: false,
             duration_s: Some(4.0),
@@ -2235,6 +2351,153 @@ mod tests {
         );
     }
 
+    /// A little-endian TIFF block declaring one Orientation tag — the payload
+    /// both a JPEG `APP1` segment and a PNG `eXIf` chunk carry.
+    fn exif_orientation_block(exif_orientation: u16) -> Vec<u8> {
+        let mut tiff = b"II\x2a\x00".to_vec();
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&exif_orientation.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0]);
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff
+    }
+
+    fn jpeg_with_orientation(path: &Path, exif_orientation: u16) {
+        let mut base = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 32))
+            .write_to(&mut std::io::Cursor::new(&mut base), image::ImageFormat::Jpeg)
+            .expect("the fixture encodes");
+        let mut payload = b"Exif\x00\x00".to_vec();
+        payload.extend_from_slice(&exif_orientation_block(exif_orientation));
+        let mut out = base[..2].to_vec();
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&base[2..]);
+        std::fs::write(path, out).expect("the fixture writes");
+    }
+
+    /// The same orientation as a PNG `eXIf` chunk, spliced in ahead of the
+    /// first `IDAT` (chunk layout: length, type, data, CRC-32 of type+data).
+    fn png_with_orientation(path: &Path, exif_orientation: u16) {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        let mut base = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 32))
+            .write_to(&mut std::io::Cursor::new(&mut base), image::ImageFormat::Png)
+            .expect("the fixture encodes");
+
+        let mut chunk_body = b"eXIf".to_vec();
+        chunk_body.extend_from_slice(&exif_orientation_block(exif_orientation));
+        let mut chunk = ((chunk_body.len() - 4) as u32).to_be_bytes().to_vec();
+        chunk.extend_from_slice(&chunk_body);
+        chunk.extend_from_slice(&crc32(&chunk_body).to_be_bytes());
+
+        // The eight-byte signature, then IHDR (13 bytes of data), then this.
+        let split = 8 + 4 + 4 + 13 + 4;
+        let mut out = base[..split].to_vec();
+        out.extend_from_slice(&chunk);
+        out.extend_from_slice(&base[split..]);
+        std::fs::write(path, out).expect("the fixture writes");
+    }
+
+    /// The measured asymmetry §1.3 exists for: ffmpeg's mjpeg decoder honours
+    /// EXIF and nothing else does, while ffprobe reports the coded size for
+    /// both. So both need their *dimensions* corrected and only the PNG needs
+    /// a *filter* — and getting that backwards is a silently double-rotated
+    /// export, which is exactly why the allowlist is by format.
+    #[test]
+    fn a_stills_orientation_is_folded_into_its_probe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let coded = StreamInfo {
+            width: 64,
+            height: 32,
+            normalize: Transform::default(),
+            video_index: 0,
+            has_audio: false,
+            duration_s: None,
+        };
+
+        let jpeg = dir.path().join("rotated.jpg");
+        jpeg_with_orientation(&jpeg, 6);
+        let probed = apply_still_orientation(coded, &jpeg);
+        assert_eq!((probed.width, probed.height), (32, 64));
+        assert_eq!(
+            probed.normalize,
+            Transform::default(),
+            "ffmpeg's own decoder already turned this one; a filter would turn it twice"
+        );
+
+        let png = dir.path().join("rotated.png");
+        png_with_orientation(&png, 6);
+        let probed = apply_still_orientation(coded, &png);
+        assert_eq!((probed.width, probed.height), (32, 64));
+        assert_eq!(
+            probed.normalize,
+            Transform {
+                quarter_turns: 1,
+                flip_h: false
+            },
+            "ffmpeg does not turn a PNG, so the graph has to"
+        );
+
+        // Not a still at all: `parse_probe` has already applied the display
+        // matrix, and nothing here may touch it.
+        let video = dir.path().join("clip.mp4");
+        std::fs::write(&video, b"not an image this crate can open").unwrap();
+        assert_eq!(apply_still_orientation(coded, &video), coded);
+    }
+
+    /// Where the normalization sits in the chain, which is the whole of its
+    /// correctness: the client's crop is in display space, so the frame has to
+    /// be in display space *before* it is cut. The board's own transform stays
+    /// after the crop, where it has always been.
+    #[test]
+    fn source_normalization_runs_ahead_of_the_crop() {
+        let doc = resolved(
+            &request(vec![item(ItemTime::Image)], ComposeLength::LongestLoopOnce),
+            "mosaic-mp4",
+        );
+        let mut turned = doc.items[0].clone();
+        turned.transform = Transform {
+            quarter_turns: 2,
+            flip_h: false,
+        };
+        let probe = StreamInfo {
+            width: 480,
+            height: 640,
+            normalize: Transform {
+                quarter_turns: 1,
+                flip_h: false,
+            },
+            video_index: 0,
+            has_audio: false,
+            duration_s: None,
+        };
+        let chain = video_chain(0, &turned, &doc, Some(probe), "2.000");
+        let normalize = chain.find("transpose=1").expect("the source is normalized");
+        let crop = chain.find("crop=").expect("the crop is applied");
+        let board = chain.find("hflip,vflip").expect("the board transform is applied");
+        assert!(
+            normalize < crop && crop < board,
+            "normalize, then crop, then the board's own turn: {chain}"
+        );
+    }
+
     /// The probe parser: the stream that carries pictures, and the rotation
     /// ffmpeg will have applied by the time the crop runs.
     #[test]
@@ -2248,6 +2511,7 @@ mod tests {
             Some(StreamInfo {
                 width: 640,
                 height: 480,
+                normalize: Transform::default(),
                 video_index: 0,
                 has_audio: true,
                 duration_s: Some(12.5),
@@ -2280,6 +2544,7 @@ mod tests {
             Some(StreamInfo {
                 width: 1920,
                 height: 1080,
+                normalize: Transform::default(),
                 video_index: 1,
                 has_audio: false,
                 duration_s: None,
@@ -2874,6 +3139,7 @@ mod tests {
                 info: Some(StreamInfo {
                     width: 64,
                     height: 64,
+                    normalize: Transform::default(),
                     video_index: 0,
                     has_audio: false,
                     duration_s: None,
@@ -3106,6 +3372,7 @@ mod tests {
             probe: Some(StreamInfo {
                 width: 16,
                 height: 16,
+                normalize: Transform::default(),
                 video_index: 0,
                 has_audio: false,
                 duration_s: Some(1.0),

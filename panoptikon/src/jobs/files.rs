@@ -19,7 +19,8 @@ use base64::Engine;
 use blurhash::encode as blurhash_encode;
 use image::ColorType;
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
+use image::metadata::Orientation;
+use image::{DynamicImage, GenericImageView, ImageDecoder, Rgb, RgbImage};
 use imageproc::drawing::{draw_text_mut, text_size};
 use lofty::prelude::{Accessor, TaggedFileExt};
 use md5::{Digest, Md5};
@@ -38,9 +39,9 @@ use crate::{
         file_scans::{FileScanUpdate, get_completed_scan_paths, get_open_file_scan_id},
         files::{
             FileScanData, FileUpsertResult, ItemScanMeta, PendingOutroItem, get_file_by_path,
-            get_item_content_end_ms, get_item_dimensions, get_item_id,
-            get_item_visual_meta, get_pending_outro_item, has_blurhash, item_animation_pending,
-            item_codec_pending,
+            get_item_content_end_ms, get_item_dimensions, get_item_id, get_item_visual_meta,
+            get_pending_outro_item, has_blurhash, item_animation_pending, item_codec_pending,
+            item_rotation_pending,
         },
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
@@ -934,6 +935,14 @@ struct BackfillResult {
     /// or unparseable"). Like the codecs there is no new-item twin: the
     /// measurement rides the `items` INSERT itself.
     animation: Option<f64>,
+    /// This file's measured orientation in clockwise quarter turns
+    /// (docs/display-dimensions-design.md §4), when the backfill examined one.
+    /// `None` whenever the stage did not run or the probe failed — the column
+    /// holds answers only, and the write it drives is the one non-idempotent
+    /// write in the whole backfill, so a guess here would transpose an item's
+    /// dimensions for good. Like the codecs there is no new-item twin: the
+    /// measurement rides the `items` INSERT itself.
+    rotation: Option<i64>,
     /// Design §7.1: this item newly turned positive *and* already had visuals,
     /// so the ones this pass produced replace them rather than filling a gap.
     /// The store guards are bypassed for exactly this case and no other.
@@ -2019,6 +2028,37 @@ impl ScanContext {
         }
     }
 
+    /// Stamps one item's measured orientation, which also transposes its
+    /// dimensions when the turn is an odd one
+    /// (docs/display-dimensions-design.md §4).
+    ///
+    /// `Ok(0)` is the ordinary race, not an error: another pass over identical
+    /// content stamped the column first, and because the swap and the stamp
+    /// are the same guarded statement, that pass transposed the dimensions
+    /// exactly once too.
+    async fn record_item_rotation(&mut self, sha256: &str, quarter_turns: Option<i64>) {
+        let Some(quarter_turns) = quarter_turns else {
+            return;
+        };
+        match call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::SetItemRotation {
+                sha256: sha256.to_string(),
+                quarter_turns,
+                reply,
+            }
+        })
+        .await
+        {
+            Ok(0) => tracing::debug!(sha256, "no unexamined item to store a rotation on"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                error = ?err,
+                sha256,
+                "failed to store a rotation; it will be re-measured next scan"
+            ),
+        }
+    }
+
     async fn handle_backfill(&mut self, backfill: BackfillResult) {
         self.in_flight_visuals.remove(&backfill.sha256);
 
@@ -2115,6 +2155,8 @@ impl ScanContext {
         self.record_item_codecs(&backfill.sha256, backfill.codecs.as_ref())
             .await;
         self.record_item_animation(&backfill.sha256, backfill.animation)
+            .await;
+        self.record_item_rotation(&backfill.sha256, backfill.rotation)
             .await;
 
         if wrote_visuals {
@@ -2222,6 +2264,25 @@ impl ScanContext {
         let animation_work = self
             .pending_animation_work(&sha256, &mime_type, &path)
             .await;
+        // The dispatcher's sixth question (docs/display-dimensions-design.md
+        // §4): "is this an image or a video whose orientation nothing has
+        // examined?" Cut from the same cloth as the codec and animation
+        // questions — not a missing visual, so an item with every visual it
+        // needs is still work, which is what backfills an existing library
+        // with no separate job.
+        //
+        // It carries what the *worker* will need and cannot ask for itself:
+        // whether this item has visuals that a transformed picture would make
+        // stale (§4.1). `thumbnail_stored` is the positive cache's answer from
+        // before the image and marker branches above repurposed `needs_thumb`,
+        // for exactly the reason the outro's replacement rule reads it.
+        let rotation_work = self
+            .pending_rotation_work(&sha256, &mime_type, &path)
+            .await
+            .then_some(RotationBackfill {
+                thumbnail_stored,
+                blurhash_stored: !needs_blurhash,
+            });
         if !needs_thumb && !needs_blurhash {
             // Counted before the outro, codec and animation questions are
             // consulted: the marker did remove a whole visuals dispatch,
@@ -2229,7 +2290,7 @@ impl ScanContext {
             if thumb_suppressed {
                 self.note_suppressed_visuals(&path);
             }
-            if outro_work.is_none() && !codec_work && !animation_work {
+            if outro_work.is_none() && !codec_work && !animation_work && rotation_work.is_none() {
                 return Ok(());
             }
         }
@@ -2282,7 +2343,11 @@ impl ScanContext {
                             &mime_type,
                         )
                         .await;
-                        if outro_work.is_none() && !codec_work && !animation_work {
+                        if outro_work.is_none()
+                            && !codec_work
+                            && !animation_work
+                            && rotation_work.is_none()
+                        {
                             return Ok(());
                         }
                         // A probe is still owed and needs neither frames nor a
@@ -2432,6 +2497,7 @@ impl ScanContext {
                     outro_work,
                     codec_work,
                     animation_work,
+                    rotation_work,
                     stored_content_end_ms,
                     &timers,
                 )
@@ -2466,6 +2532,11 @@ impl ScanContext {
                         outro: None,
                         codecs: None,
                         animation: None,
+                        // Nothing was examined, so the column stays NULL and
+                        // the next scan asks again — which for this one is the
+                        // only safe failure mode, its write being the single
+                        // non-idempotent one in the backfill.
+                        rotation: None,
                         replace_visuals: false,
                     })
                 }
@@ -2589,6 +2660,32 @@ impl ScanContext {
                     error = ?err,
                     path = %path.display(),
                     "failed to read the animation state; skipping the measurement"
+                );
+                false
+            }
+        }
+    }
+
+    /// The rotation dispatch question (docs/display-dimensions-design.md §4),
+    /// answered against the index alone.
+    ///
+    /// `false` means the item has been examined already, has no picture to
+    /// orient, or is not indexed.
+    async fn pending_rotation_work(&mut self, sha256: &str, mime_type: &str, path: &Path) -> bool {
+        // The mime gate first, so an audio file — the one media type with no
+        // picture — costs no query at all.
+        if !mime_type.starts_with("image") && !mime_type.starts_with("video") {
+            return false;
+        }
+        match item_rotation_pending(&mut self.conn, sha256).await {
+            Ok(pending) => pending,
+            // Advisory, like every other read on this path: without the answer
+            // the file is simply left alone this run.
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to read the rotation state; skipping the measurement"
                 );
                 false
             }
@@ -3719,8 +3816,15 @@ pub(crate) enum ImageStage {
     Decode,
 }
 
-/// The metadata phase's whole contact with an image: the dimensions, straight
-/// out of the header.
+/// The metadata phase's whole contact with an image: the *display*
+/// dimensions and the orientation that produced them, straight out of the
+/// header (docs/display-dimensions-design.md §3).
+///
+/// The dimensions the header states are the *coded* ones — the pixels as
+/// stored, before the EXIF orientation a browser applies before painting. The
+/// index records what the picture looks like, so a transposing orientation
+/// swaps them here, and the turn itself is kept so `items.rotation` can record
+/// what was applied.
 ///
 /// Deliberately *not* a decode (docs/failed-media-retry-design.md, "Scan policy
 /// for undecodable images"): the metadata phase decides whether a file is
@@ -3739,15 +3843,57 @@ pub(crate) enum ImageStage {
 /// as no limits at all — the image crate applies its own defaults, including a
 /// 512 MiB allocation cap that a header declaring an absurd width exceeds, and
 /// [`FileProcessError::from_image_error`] classifies that as `resource`.
-fn image_header_dimensions(
+fn image_header_geometry(
     path: impl AsRef<Path>,
-) -> Result<(u32, u32), (ImageStage, image::ImageError)> {
+) -> Result<((u32, u32), Orientation), (ImageStage, image::ImageError)> {
     let reader = image::ImageReader::open(path).map_err(|err| (ImageStage::Open, err.into()))?;
-    reader
+    // `into_dimensions()` is `into_decoder().map(|d| d.dimensions())`, so this
+    // is the same read with the same failure stages — it just keeps the
+    // decoder long enough to ask it one more question.
+    let mut decoder = reader
         .with_guessed_format()
         .map_err(|err| (ImageStage::Open, err.into()))?
-        .into_dimensions()
-        .map_err(|err| (ImageStage::Header, err))
+        .into_decoder()
+        .map_err(|err| (ImageStage::Header, err))?;
+    let coded = decoder.dimensions();
+    // An orientation this build cannot read is never a reason to reject a file
+    // whose header parsed. `NoTransforms` is the answer every *consumer* of
+    // this file reaches for the same reason, so recording it keeps the index
+    // and the picture agreeing; failing here would move the indexing gate,
+    // which docs/failed-media-retry-design.md deliberately puts at the header
+    // read and nowhere further.
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    Ok((oriented_dimensions(coded, orientation), orientation))
+}
+
+/// The clockwise quarter turns an orientation applies, which is all
+/// `items.rotation` records: mirroring never changes a dimension, and the one
+/// consumer that needs the full transform reads it from the file.
+fn orientation_quarter_turns(orientation: Orientation) -> i64 {
+    match orientation {
+        Orientation::NoTransforms | Orientation::FlipHorizontal => 0,
+        Orientation::Rotate90 | Orientation::Rotate90FlipH => 90,
+        Orientation::Rotate180 | Orientation::FlipVertical => 180,
+        Orientation::Rotate270 | Orientation::Rotate270FlipH => 270,
+    }
+}
+
+/// Whether a quarter turn swaps width and height. The single rule both the
+/// image and the video half of the scan apply, so they cannot drift apart.
+fn quarter_turns_transpose(quarter_turns: i64) -> bool {
+    quarter_turns == 90 || quarter_turns == 270
+}
+
+/// Coded dimensions as they are painted.
+pub(crate) fn oriented_dimensions(
+    (width, height): (u32, u32),
+    orientation: Orientation,
+) -> (u32, u32) {
+    if quarter_turns_transpose(orientation_quarter_turns(orientation)) {
+        (height, width)
+    } else {
+        (width, height)
+    }
 }
 
 /// [`open_image`] with the failing stage attached, for the scan's classifier.
@@ -3760,6 +3906,42 @@ fn open_image_staged(
         .map_err(|err| (ImageStage::Open, err.into()))?;
     reader.limits(decode_limits());
     reader.decode().map_err(|err| (ImageStage::Decode, err))
+}
+
+/// [`open_image_staged`] plus the orientation its header asks for — the
+/// picture, rather than the pixels as stored
+/// (docs/display-dimensions-design.md §1.1).
+///
+/// Every visuals decode goes through this, because everything downstream of it
+/// destroys the evidence: `encode_image` re-encodes through `to_rgb8()` + JPEG
+/// and drops the EXIF, so a stored thumbnail that skipped this step is
+/// sideways forever, against an original the browser paints upright and
+/// against its own item's dimensions.
+///
+/// The orientation comes from a second, header-only pass rather than from the
+/// decode itself: [`image::ImageReader::decode`] performs the allocation-cap
+/// reservation this codebase classifies `resource` failures by, and there is
+/// no way to keep that while holding the decoder. A header read next to a full
+/// decode costs nothing.
+///
+/// A failed orientation read never fails the decode. The pixels are good; the
+/// worst case is the picture this build already produced before orientation
+/// was read at all.
+fn open_image_oriented(
+    path: impl AsRef<Path>,
+) -> Result<DynamicImage, (ImageStage, image::ImageError)> {
+    let path = path.as_ref();
+    let mut image = open_image_staged(path)?;
+    match image_header_geometry(path) {
+        Ok((_, orientation)) => image.apply_orientation(orientation),
+        Err((stage, err)) => tracing::debug!(
+            error = %err,
+            stage = ?stage,
+            path = %path.display(),
+            "decoded an image but could not read its orientation"
+        ),
+    }
+    Ok(image)
 }
 
 /// In-memory counterpart of [`open_image`]: content-sniffed, same ceiling.
@@ -3791,6 +3973,7 @@ fn extract_item_metadata(
         mime_type: mime_type.to_string(),
         width: None,
         height: None,
+        rotation: None,
         duration: None,
         audio_tracks: None,
         video_tracks: None,
@@ -3804,10 +3987,14 @@ fn extract_item_metadata(
         // contributes, and they sit in the header of every format the crate
         // reads — so an image indexed through this path always has them, and a
         // file whose pixels are damaged is still indexed with its real size.
-        let (width, height) = image_header_dimensions(path)
+        // They are the *display* dimensions: the header's numbers with the
+        // EXIF orientation already applied, because that is the picture
+        // (docs/display-dimensions-design.md).
+        let ((width, height), orientation) = image_header_geometry(path)
             .map_err(|(stage, err)| FileProcessError::from_image_error(stage, err))?;
         metadata.width = Some(width as i64);
         metadata.height = Some(height as i64);
+        metadata.rotation = Some(orientation_quarter_turns(orientation));
         // The three animated-image containers also record their animation
         // length (docs/animated-image-spans-design.md §3): a positive value is
         // what lets the compose builder classify the item as a span, 0.0 is
@@ -3828,11 +4015,28 @@ fn extract_item_metadata(
         (metadata.video_codec, metadata.audio_codec) = media_codecs(&info, mime_type);
         if mime_type.starts_with("video") {
             if let Some(video) = info.video_track {
-                metadata.width = video.width.map(|width| width as i64);
-                metadata.height = video.height.map(|height| height as i64);
+                // Display dimensions, like the image branch above: ffprobe
+                // reports the coded size of a stream carrying a rotating
+                // display matrix, while every decoder — ffmpeg's included,
+                // which is what extracts this file's frames — autorotates it
+                // (docs/display-dimensions-design.md §3).
+                let transposed = quarter_turns_transpose(video.rotation);
+                let (width, height) = if transposed {
+                    (video.height, video.width)
+                } else {
+                    (video.width, video.height)
+                };
+                metadata.width = width.map(|width| width as i64);
+                metadata.height = height.map(|height| height as i64);
+                metadata.rotation = Some(video.rotation);
                 metadata.duration = Some(video.duration);
                 metadata.video_tracks = Some(1);
             }
+            // A video container with no video stream still records an
+            // *examined* orientation: leaving it NULL would put the item back
+            // in the backfill population on every scan for a picture it does
+            // not have.
+            metadata.rotation = metadata.rotation.or(Some(0));
             metadata.audio_tracks = Some(info.audio_tracks.len() as i64);
             metadata.subtitle_tracks = Some(info.subtitle_tracks.len() as i64);
         } else {
@@ -4110,7 +4314,7 @@ fn build_new_item_thumbnails(
         // with no visuals, exactly like a PDF pdfium cannot parse.
         // Only this `?` is the decode: the encode below it runs on pixels that
         // came out fine, so it owes a marker and no audit row.
-        let image = open_image_staged(path).map_err(|(stage, err)| {
+        let image = open_image_oriented(path).map_err(|(stage, err)| {
             VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
         })?;
         if let Some(thumb) = generate_thumbnail(path, &image).map_err(VisualsError::thumbnail)? {
@@ -4171,6 +4375,117 @@ fn html_visuals_failure(err: HtmlRenderError) -> FileProcessError {
     }
 }
 
+/// The orientation half of one backfill dispatch: what the dispatcher knows
+/// before the file is opened.
+///
+/// The stored-visual flags travel here because the dispatcher cannot ask the
+/// question itself (docs/display-dimensions-design.md §4.1) — the orientation
+/// is only known once the worker has read the header, and by then the
+/// dispatcher's decisions have already been made.
+struct RotationBackfill {
+    thumbnail_stored: bool,
+    blurhash_stored: bool,
+}
+
+/// What the orientation stage of one pass concluded.
+struct RotationPass {
+    /// Clockwise quarter turns from coded pixels to picture, 0 included — a
+    /// measured 0 is an answer and stamps the column.
+    quarter_turns: i64,
+    /// The stored thumbnail is of the *unrotated* pixels and must be replaced,
+    /// not merely left in place next to corrected dimensions.
+    stale_thumbnail: bool,
+    /// Likewise the blurhash, which is computed from the same decode.
+    stale_blurhash: bool,
+}
+
+/// Whether this pass invalidated a stored thumbnail. Free functions rather
+/// than methods so the `Option` handling reads the same at both call sites.
+fn stale_thumbnail(rotation: Option<&RotationPass>) -> bool {
+    rotation.is_some_and(|pass| pass.stale_thumbnail)
+}
+
+/// Whether this pass invalidated a stored blurhash.
+fn stale_blurhash(rotation: Option<&RotationPass>) -> bool {
+    rotation.is_some_and(|pass| pass.stale_blurhash)
+}
+
+/// Reads one item's orientation, and decides what that invalidates.
+///
+/// Deliberately cheap in the common case: an image costs a header read and
+/// stops there unless the header says the picture is transformed, which is a
+/// small minority of any library. Only then does anything decode.
+///
+/// A failed probe returns `None` and records nothing, exactly like
+/// [`codec_pass_for`]: the column stays NULL and the next scan asks again,
+/// which matters more for this column than for any other — its write is not
+/// idempotent, so a wrong answer would not be self-correcting.
+fn rotation_pass_for(
+    path: &Path,
+    mime_type: &str,
+    work: &RotationBackfill,
+) -> Option<RotationPass> {
+    if mime_type.starts_with("image") {
+        let (_, orientation) = match image_header_geometry(path) {
+            Ok(geometry) => geometry,
+            Err((stage, err)) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    ?stage,
+                    error = %err,
+                    "orientation probe failed"
+                );
+                // A header this build deterministically cannot parse — a
+                // format with no decoder (a legacy-indexed AVIF), a header
+                // PIL tolerated and the image crate rejects — is a verdict,
+                // not a transient: retrying it would re-dispatch the item on
+                // every scan forever, the one non-termination the backfill
+                // design forbids. `0` is exactly the column's "examined:
+                // none this build can read". An `Open` failure is I/O and a
+                // `Limits` failure is this machine's ceiling — both can
+                // change, so both stay retries.
+                let deterministic = stage == ImageStage::Header
+                    && !matches!(err, image::ImageError::Limits(_));
+                return deterministic.then_some(RotationPass {
+                    quarter_turns: 0,
+                    stale_thumbnail: false,
+                    stale_blurhash: false,
+                });
+            }
+        };
+        // `NoTransforms`, not a zero quarter turn: a mirrored image keeps its
+        // dimensions but not its pixels, so its stored visuals are just as
+        // stale as a rotated one's even though the columns need no correction.
+        let untransformed = orientation == Orientation::NoTransforms;
+        return Some(RotationPass {
+            quarter_turns: orientation_quarter_turns(orientation),
+            stale_thumbnail: !untransformed && work.thumbnail_stored,
+            stale_blurhash: !untransformed && work.blurhash_stored,
+        });
+    }
+    if mime_type.starts_with("video") {
+        let info = extract_media_info(path)
+            .map_err(|err| {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = ?err,
+                    "orientation probe failed"
+                );
+            })
+            .ok()?;
+        // Nothing to replace: `extract_video_frames_into` decodes with a plain
+        // `-i` and ffmpeg autorotates video, so this item's frames and the
+        // thumbnail grid built from them have always been the picture. Only
+        // the columns were ever wrong (docs/display-dimensions-design.md §1.2).
+        return Some(RotationPass {
+            quarter_turns: info.video_track.map(|video| video.rotation).unwrap_or(0),
+            stale_thumbnail: false,
+            stale_blurhash: false,
+        });
+    }
+    None
+}
+
 /// The outro half of one backfill dispatch.
 struct OutroBackfill {
     item: PendingOutroItem,
@@ -4196,6 +4511,7 @@ fn generate_backfill_visuals(
     outro: Option<OutroBackfill>,
     needs_codecs: bool,
     needs_animation: bool,
+    rotation_work: Option<RotationBackfill>,
     stored_content_end_ms: Option<i64>,
     timers: &ScanTimers,
 ) -> BackfillResult {
@@ -4221,6 +4537,19 @@ fn generate_backfill_visuals(
             crate::media_tools::animation::animation_duration_seconds(path, mime_type);
         drop(metadata_span);
         animation
+    } else {
+        None
+    };
+    // The orientation measurement, under the same reasoning and the same
+    // timer: scan metadata, not a visual, and — a header read for an image,
+    // the same ffprobe run for a video — exactly what the new-item path
+    // charges the metadata phase. It runs before the thumbnail span because
+    // what it finds can *turn the thumbnail half on* (§4.1).
+    let rotation = if let Some(work) = rotation_work {
+        let metadata_span = timers.metadata.start();
+        let rotation = rotation_pass_for(path, mime_type, &work);
+        drop(metadata_span);
+        rotation
     } else {
         None
     };
@@ -4261,12 +4590,20 @@ fn generate_backfill_visuals(
         None => existing_frames,
     };
     // Negatives change nothing, and an item that has no visuals yet only needs
-    // the clamp — the replacement is for the item that already had them.
-    let replace_visuals = pass_content_end_ms.is_some() && replaces_visuals;
+    // the clamp — the replacement is for the item that already had them. The
+    // orientation stage joins on the same terms: it only ever reports stale
+    // visuals for an item that *has* them, so an image with none is left to
+    // the ordinary generation path — a served-directly image, in particular,
+    // still gets no stored thumbnail out of this.
+    let replace_visuals =
+        (pass_content_end_ms.is_some() && replaces_visuals) || stale_thumbnail(rotation.as_ref());
     let needs_thumb = needs_thumb || replace_visuals;
     // A replaced thumbnail leaves the blurhash describing the old one, which
-    // is the same class of visual and the only one derived from it.
-    let needs_blurhash = needs_blurhash || replace_visuals;
+    // is the same class of visual and the only one derived from it. The
+    // orientation stage can also invalidate the blurhash *alone*: an image
+    // served from its original file has no stored thumbnail to replace, but
+    // its blurhash came from the same unrotated decode.
+    let needs_blurhash = needs_blurhash || replace_visuals || stale_blurhash(rotation.as_ref());
     // The clamp, and only the clamp, also honours the boundary a *previous*
     // scan stored: any regeneration of an already-examined item must sample
     // the same content range the first one did, or the card comes back.
@@ -4335,7 +4672,7 @@ fn generate_backfill_visuals(
             // an unrecorded failure here would re-decode it on every scan
             // forever.
             None if mime_type.starts_with("image") && !decode_failed => {
-                match open_image_staged(path) {
+                match open_image_oriented(path) {
                     Ok(image) => Some(image),
                     Err((stage, err)) => {
                         let err = VisualsError::image_decode(
@@ -4375,6 +4712,7 @@ fn generate_backfill_visuals(
         visual_verdicts: verdicts,
         visuals_scan_error: audit.and_then(|failure| backfill_scan_error(path, mime_type, failure)),
         outro: outro_record,
+        rotation: rotation.map(|pass| pass.quarter_turns),
         codecs,
         animation,
         replace_visuals,
@@ -4511,7 +4849,7 @@ fn build_backfill_thumbnails(
         if file_size > SMALL_IMAGE_FILE_SIZE {
             // As in the new-item pass: the decode owes the audit row, the
             // encode below it does not.
-            let image = open_image_staged(path).map_err(|(stage, err)| {
+            let image = open_image_oriented(path).map_err(|(stage, err)| {
                 VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
             })?;
             if let Some(thumb) = generate_thumbnail(path, &image).map_err(VisualsError::thumbnail)? {
@@ -4576,6 +4914,10 @@ fn image_is_served_directly(file_size: u64, width: i64, height: i64) -> bool {
             && file_size <= MAX_SERVED_IMAGE_FILE_SIZE)
 }
 
+/// `image` is an oriented decode ([`open_image_oriented`]), so the dimensions
+/// this measures are the same ones the item is indexed with — which is what
+/// lets the dispatcher answer the served-directly question from the index
+/// instead of decoding the file again.
 fn generate_thumbnail(
     path: &Path,
     image: &DynamicImage,
@@ -5717,6 +6059,16 @@ struct FfprobeStream {
     disposition: Option<FfprobeDisposition>,
     #[allow(dead_code)]
     tags: Option<FfprobeTags>,
+    /// ffprobe's `side_data_list`, requested only for the display matrix it
+    /// carries on a rotated capture (docs/display-dimensions-design.md §3).
+    side_data_list: Option<Vec<FfprobeSideData>>,
+}
+
+/// One entry of a stream's `side_data_list`. Only the rotation is read; every
+/// other kind of side data deserializes to a `None` here and is dropped.
+#[derive(Debug, Deserialize)]
+struct FfprobeSideData {
+    rotation: Option<f64>,
 }
 
 /// The one disposition flag any of this cares about: `attached_pic` marks a
@@ -5728,6 +6080,41 @@ struct FfprobeDisposition {
 }
 
 impl FfprobeStream {
+    /// The **clockwise** quarter turns from this stream's coded pixels to its
+    /// picture, normalized to 0/90/180/270, so a video's `items.rotation`
+    /// means the same thing an image's does (where it comes from EXIF, whose
+    /// turns are clockwise by definition).
+    ///
+    /// Negated, because ffprobe's `rotation` is counter-clockwise. Measured
+    /// rather than assumed: a frame with a marker in its top-left corner,
+    /// muxed with `-display_rotation 90`, probes as `rotation: 90` and decodes
+    /// with the marker in the **bottom** left — which is a 90 degree
+    /// counter-clockwise turn, i.e. 270 clockwise. `-display_rotation -90`
+    /// probes as `-90` and decodes with the marker top-**right**, 90
+    /// clockwise, which is the common portrait phone capture.
+    ///
+    /// Only the transposition is consumed (`quarter_turns_transpose`), and on
+    /// that both conventions agree — which is why
+    /// `media_tools::transcode::compose::parse_probe` gets away with an
+    /// `abs()` here. This column is read by people too, so it is signed
+    /// correctly.
+    ///
+    /// A matrix that is not a quarter turn (a shear, or one ffprobe reports a
+    /// fractional angle for) is dropped rather than rounded: no transposition
+    /// it implies is one this column can express, and 0 is what every decoder
+    /// in this codebase does with such a frame anyway.
+    fn quarter_turns(&self) -> i64 {
+        self.side_data_list
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find_map(|entry| entry.rotation)
+            .filter(|rotation| rotation.is_finite())
+            .map(|rotation| (-rotation.round() as i64).rem_euclid(360))
+            .filter(|turns| turns % 90 == 0)
+            .unwrap_or(0)
+    }
+
     /// Whether this stream is cover art rather than content.
     fn is_attached_pic(&self) -> bool {
         self.disposition
@@ -5763,10 +6150,16 @@ struct AudioTrack {
 
 struct VideoTrack {
     duration: f64,
+    /// ffprobe's `width`, which is the *coded* width — see
+    /// [`FfprobeStream::quarter_turns`].
     width: Option<u64>,
+    /// ffprobe's `height`, coded. See [`VideoTrack::width`].
     height: Option<u64>,
     /// See [`AudioTrack::codec_name`].
     codec_name: Option<String>,
+    /// Clockwise quarter turns from the coded pixels to the picture, read from
+    /// the stream's display matrix (0 when it carries none).
+    rotation: i64,
 }
 
 struct SubtitleTrack;
@@ -5845,6 +6238,7 @@ fn extract_media_info(path: &Path) -> Result<MediaInfo, FileProcessError> {
         // field; it lands nested under `disposition` in the JSON all the same.
         .arg(
             "stream=index,codec_type,codec_name,duration,width,height,tags\
+             :stream_side_data=rotation\
              :stream_disposition=attached_pic:format=duration",
         )
         .arg("-of")
@@ -5916,6 +6310,7 @@ fn extract_media_info(path: &Path) -> Result<MediaInfo, FileProcessError> {
                     duration: stream_duration(&stream),
                     width: stream.width,
                     height: stream.height,
+                    rotation: stream.quarter_turns(),
                     codec_name: stream.codec_name,
                 });
             }
@@ -6333,6 +6728,55 @@ pub(crate) fn corner_is_card(image: &DynamicImage) -> bool {
     let pixel = pixel.get_pixel(4, 4);
     (0..3)
         .all(|channel| (i32::from(pixel[channel]) - i32::from([12u8, 13, 25][channel])).abs() <= 10)
+}
+
+/// A JPEG carrying an EXIF orientation, built rather than committed: the
+/// image crate can encode a JPEG but not its EXIF, and a binary fixture
+/// would hide the one thing these tests are about.
+///
+/// The segment is the minimum a decoder needs: an APP1 marker, the `Exif`
+/// signature, a little-endian TIFF header, and an IFD of exactly one entry
+/// — tag 0x0112 (Orientation), type SHORT, count 1.
+#[cfg(test)]
+pub(crate) fn jpeg_with_exif_orientation(
+    width: u32,
+    height: u32,
+    exif_orientation: u16,
+) -> Vec<u8> {
+    let mut base = Vec::new();
+    // Noise rather than a flat colour, so a transposed decode is visible
+    // in the pixels and not only in the dimensions.
+    let mut pixels = image::RgbImage::new(width, height);
+    for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+        *pixel = image::Rgb([(x * 7 % 251) as u8, (y * 13 % 241) as u8, 32]);
+    }
+    image::DynamicImage::ImageRgb8(pixels)
+        .write_to(&mut std::io::Cursor::new(&mut base), image::ImageFormat::Jpeg)
+        .expect("the fixture encodes");
+
+    let mut tiff = Vec::new();
+    tiff.extend_from_slice(b"II\x2a\x00"); // little-endian, magic 42
+    tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at offset 8
+    tiff.extend_from_slice(&1u16.to_le_bytes()); // one entry
+    tiff.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+    tiff.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+    tiff.extend_from_slice(&1u32.to_le_bytes()); // count
+    tiff.extend_from_slice(&exif_orientation.to_le_bytes());
+    tiff.extend_from_slice(&[0, 0]); // the value field is four bytes wide
+    tiff.extend_from_slice(&0u32.to_le_bytes()); // no IFD1
+
+    let mut payload = b"Exif\x00\x00".to_vec();
+    payload.extend_from_slice(&tiff);
+    let mut app1 = vec![0xFF, 0xE1];
+    // The length counts itself but not the marker.
+    app1.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    app1.extend_from_slice(&payload);
+
+    // Straight after SOI, which is where a segment may always go.
+    let mut out = base[..2].to_vec();
+    out.extend_from_slice(&app1);
+    out.extend_from_slice(&base[2..]);
+    out
 }
 
 #[cfg(test)]
@@ -8826,6 +9270,7 @@ LIMIT 1
             mime_type: mime.to_string(),
             width: Some(576),
             height: Some(1024),
+            rotation: None,
             duration: Some(7.0),
             audio_tracks: Some(1),
             video_tracks: Some(1),
@@ -8881,6 +9326,7 @@ LIMIT 1
                     mime_type: "video/mp4".to_string(),
                     width: Some(8),
                     height: Some(8),
+                    rotation: None,
                     duration: Some(10.0),
                     audio_tracks: Some(1),
                     video_tracks: Some(video_tracks),
@@ -9085,6 +9531,215 @@ LIMIT 1
         );
     }
 
+    /// The state a pre-upgrade item is in: coded dimensions and a NULL
+    /// `rotation`. Applied on top of one of the `seed_*` helpers, which write
+    /// placeholder dimensions of their own.
+    async fn set_coded_dimensions(env: &VisualsEnv, sha256: &str, width: i64, height: i64) {
+        let mut conn = crate::db::open_index_db_write_no_user_data(&env.index_db)
+            .await
+            .expect("the index opens for writing");
+        sqlx::query("UPDATE items SET width = ?1, height = ?2, rotation = NULL WHERE sha256 = ?3")
+            .bind(width)
+            .bind(height)
+            .bind(sha256)
+            .execute(&mut conn)
+            .await
+            .expect("the seed updates");
+    }
+
+    async fn geometry_columns(
+        env: &VisualsEnv,
+        sha256: &str,
+    ) -> (Option<i64>, Option<i64>, Option<i64>) {
+        let mut conn = env.read().await;
+        sqlx::query_as("SELECT width, height, rotation FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    async fn stored_blurhash(env: &VisualsEnv, sha256: &str) -> Option<String> {
+        let mut conn = env.read().await;
+        sqlx::query_scalar("SELECT blurhash FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// A clip whose stream carries a rotating display matrix — the shape of
+    /// every portrait phone capture. `false` where this machine's ffmpeg
+    /// cannot produce one, checked with an ffprobe invocation of its own so a
+    /// toolchain gap skips the test instead of failing it.
+    fn write_rotated_clip(path: &Path, seed: &Path) -> bool {
+        if !crate::media_tools::ffmpeg_available() {
+            return false;
+        }
+        let status = Command::new(crate::media_tools::ffmpeg())
+            .args(["-y", "-v", "error", "-display_rotation", "-90", "-i"])
+            .arg(seed)
+            .args(["-c", "copy"])
+            .arg(path)
+            .status();
+        if !matches!(status, Ok(status) if status.success()) {
+            return false;
+        }
+        let probed = Command::new(crate::media_tools::ffprobe())
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream_side_data=rotation",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output();
+        matches!(probed, Ok(output) if String::from_utf8_lossy(&output.stdout).contains("-90"))
+    }
+
+    // The backfill's whole point (docs/display-dimensions-design.md §4): an
+    // item indexed before orientation was read is an image with every visual
+    // it needs, so the rotation question is the only thing that can dispatch
+    // it — and one scan later the columns describe the picture.
+    //
+    // The blurhash comes with it. This image is served from its original file,
+    // so there is no stored thumbnail to replace, but its blurhash was
+    // computed from the same unrotated decode and is just as stale (§4.1).
+    #[tokio::test]
+    async fn a_rotated_image_already_in_the_index_is_corrected_by_the_backfill() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-rotation-backfill"]).await;
+        let photo = env.media_dirs[0].join("portrait.jpg");
+        fs::write(&photo, jpeg_with_exif_orientation(64, 32, 6)).unwrap();
+        let sha256 = "sha_rotation_pending";
+        seed_image_item(&env, &photo, sha256, "image/jpeg", None).await;
+        set_coded_dimensions(&env, sha256, 64, 32).await;
+        let seeded_blurhash = stored_blurhash(&env, sha256).await;
+
+        env.scan().await;
+
+        assert_eq!(
+            geometry_columns(&env, sha256).await,
+            (Some(32), Some(64), Some(90)),
+            "the coded 64x32 is the picture's 32x64, and the turn is stamped"
+        );
+        assert_ne!(
+            stored_blurhash(&env, sha256).await,
+            seeded_blurhash,
+            "the blurhash described the unrotated decode and had to be replaced"
+        );
+    }
+
+    // The other termination story: an image this build cannot parse at all.
+    // The legacy scanner's PIL was more tolerant than the image crate (and
+    // indexed formats this build has no decoder for, had it ever had the
+    // plugins), so a legacy item can sit behind a header that deterministically
+    // fails here. That is a verdict — "examined: none this build can read",
+    // the column's own 0 — not a retry: leaving the column NULL would
+    // re-dispatch the item on every scan forever. An I/O failure, by contrast,
+    // says nothing about the bytes and must stay a retry.
+    #[test]
+    fn an_unparseable_header_is_a_zero_verdict_not_a_retry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let work = RotationBackfill {
+            thumbnail_stored: true,
+            blurhash_stored: true,
+        };
+
+        let garbage = dir.path().join("legacy.avif");
+        fs::write(&garbage, b"definitely not a parseable image").unwrap();
+        let pass = rotation_pass_for(&garbage, "image/avif", &work)
+            .expect("a deterministic parse failure is an answer");
+        assert_eq!(pass.quarter_turns, 0);
+        assert!(
+            !pass.stale_thumbnail && !pass.stale_blurhash,
+            "nothing can be regenerated from a file nothing can decode"
+        );
+
+        let missing = dir.path().join("vanished.jpg");
+        assert!(
+            rotation_pass_for(&missing, "image/jpeg", &work).is_none(),
+            "an I/O failure stays a retry — it says nothing about the bytes"
+        );
+    }
+
+    // The termination half, and the only place in the scan where getting it
+    // wrong is destructive: the write is not idempotent, so a second pass over
+    // a stamped item would transpose its dimensions straight back. The file on
+    // disk is genuinely rotated on purpose — if any scan re-measured it, 90
+    // would appear in the column and the dimensions would flip.
+    #[tokio::test]
+    async fn a_stamped_rotation_is_never_measured_again() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-rotation-stamped"]).await;
+        let photo = env.media_dirs[0].join("portrait.jpg");
+        fs::write(&photo, jpeg_with_exif_orientation(64, 32, 6)).unwrap();
+        let sha256 = "sha_rotation_stamped";
+        seed_image_item(&env, &photo, sha256, "image/jpeg", None).await;
+        set_coded_dimensions(&env, sha256, 32, 64).await;
+        {
+            let mut conn = crate::db::open_index_db_write_no_user_data(&env.index_db).await.unwrap();
+            sqlx::query("UPDATE items SET rotation = 90 WHERE sha256 = ?1")
+                .bind(sha256)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        env.scan().await;
+        env.scan().await;
+
+        assert_eq!(
+            geometry_columns(&env, sha256).await,
+            (Some(32), Some(64), Some(90)),
+            "two more scans must leave an already-answered item exactly as it was"
+        );
+    }
+
+    // The video half (§1.2): the columns are corrected and nothing is
+    // regenerated, because ffmpeg autorotates on decode and this item's
+    // frames have always been the picture.
+    #[tokio::test]
+    async fn a_rotated_video_already_in_the_index_is_corrected_by_the_backfill() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-rotation-video"]).await;
+        let seed = env.media_dirs[0].join("seed.mp4");
+        if !write_clip(&seed, None, None) {
+            return;
+        }
+        let clip = env.media_dirs[0].join("clip.mp4");
+        if !write_rotated_clip(&clip, &seed) {
+            return;
+        }
+        // The seed itself would be scanned as a second item; it has served its
+        // purpose and must not linger in the media directory.
+        fs::remove_file(&seed).unwrap();
+        let sha256 = "sha_rotation_video";
+        seed_video_item(
+            &env,
+            &clip,
+            sha256,
+            1,
+            Some("LEHV6nWB2yk8pyo0adR*".to_string()),
+        )
+        .await;
+        set_outro_kind(&env, sha256, Some("none/1")).await;
+        // `write_clip`'s own geometry, which `seed_video_item` does not record:
+        // what a pre-upgrade item holds is the *coded* size, and a square one
+        // would make the assertion below vacuous.
+        set_coded_dimensions(&env, sha256, 576, 1024).await;
+
+        env.scan().await;
+
+        assert_eq!(
+            geometry_columns(&env, sha256).await,
+            (Some(1024), Some(576), Some(90)),
+            "a -90 display matrix is 90 clockwise, and transposes the columns"
+        );
+    }
+
     /// Indexes a file as an image with the given mime and duration, without
     /// running a scan: these items stand in for a library indexed before
     /// animation lengths were measured, which is what the fifth dispatcher
@@ -9124,6 +9779,7 @@ LIMIT 1
                     mime_type: mime_type.to_string(),
                     width: Some(1),
                     height: Some(1),
+                    rotation: None,
                     duration,
                     audio_tracks: None,
                     video_tracks: None,
@@ -9371,6 +10027,7 @@ LIMIT 1
             duration: None,
             width: None,
             height: None,
+            side_data_list: None,
             disposition: attached_pic.map(|attached_pic| FfprobeDisposition {
                 attached_pic: Some(attached_pic),
             }),
@@ -9449,6 +10106,7 @@ LIMIT 1
             duration: 7.0,
             width: Some(8),
             height: Some(8),
+            rotation: 0,
             codec_name: codec_name.map(str::to_string),
         };
         let audio = |codec_name: Option<&str>| AudioTrack {
@@ -9517,6 +10175,7 @@ LIMIT 1
             mime_type: "video/mp4".to_string(),
             width: None,
             height: None,
+            rotation: None,
             duration: Some(duration),
             audio_tracks: Some(1),
             video_tracks: Some(video_tracks),
@@ -9768,7 +10427,7 @@ LIMIT 1
         // one-shot verdict could suppress the finished file forever.
         let garbage = dir.path().join("garbage.png");
         fs::write(&garbage, b"definitely not an image").unwrap();
-        let (stage, err) = image_header_dimensions(&garbage)
+        let (stage, err) = image_header_geometry(&garbage)
             .err()
             .expect("garbage has no parseable header");
         assert_eq!(stage, ImageStage::Header);
@@ -9891,7 +10550,7 @@ LIMIT 1
         let huge = dir.path().join("huge.png");
         fs::write(&huge, absurdly_wide_png(200_000_000)).unwrap();
 
-        let (stage, err) = image_header_dimensions(&huge)
+        let (stage, err) = image_header_geometry(&huge)
             .err()
             .expect("a 200-million-pixel row must not fit the default cap");
         assert_eq!(stage, ImageStage::Header, "no pixel data was read: {err:?}");
@@ -9911,13 +10570,144 @@ LIMIT 1
         // practice (a file that fails the header is never indexed, so no
         // visuals pass runs on it), but the two classifiers are read as a pair
         // and a silent divergence here is how the next stage split goes wrong.
-        let (stage, err) = image_header_dimensions(&huge).err().unwrap();
+        let (stage, err) = image_header_geometry(&huge).err().unwrap();
         let visuals = FileProcessError::visuals_from_image_error(stage, err);
         let failure = visuals
             .visual_failure()
             .expect("a limit failure is a verdict to mark");
         assert_eq!(failure.kind, ApiErrorKind::Resource);
         assert_eq!(failure.skip_after, SKIP_AFTER_CONFIRMED);
+    }
+
+    // The metadata phase records the *picture*, not the pixels as stored
+    // (docs/display-dimensions-design.md §3). Everything downstream — the
+    // pinboard's cell shapes, the crop the client sends back — is measured
+    // against what a browser paints, and a browser paints this transposed.
+    #[test]
+    fn an_exif_rotated_image_is_indexed_with_its_display_dimensions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rotated = dir.path().join("portrait.jpg");
+        // Orientation 6: rotate 90 degrees clockwise to display.
+        fs::write(&rotated, jpeg_with_exif_orientation(64, 32, 6)).unwrap();
+
+        let (dimensions, orientation) = image_header_geometry(&rotated).expect("the header parses");
+        assert_eq!(orientation, Orientation::Rotate90);
+        assert_eq!(
+            dimensions,
+            (32, 64),
+            "the header codes 64x32; the picture is 32x64"
+        );
+
+        let metadata = extract_item_metadata(&rotated, "image/jpeg", "md5".to_string())
+            .expect("a rotated photo is indexed");
+        assert_eq!((metadata.width, metadata.height), (Some(32), Some(64)));
+        assert_eq!(
+            metadata.rotation,
+            Some(90),
+            "the turn is stamped, so the backfill never asks about this item again"
+        );
+    }
+
+    // An image with no orientation at all still records an *answer*. A NULL
+    // there means "never examined", and leaving one behind would put every
+    // ordinary image in the library back in the backfill population on every
+    // scan, forever.
+    #[test]
+    fn an_unrotated_image_still_stamps_a_zero_turn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plain = dir.path().join("plain.png");
+        image::RgbImage::new(9, 4).save(&plain).unwrap();
+
+        let metadata = extract_item_metadata(&plain, "image/png", "md5".to_string())
+            .expect("an ordinary image is indexed");
+        assert_eq!((metadata.width, metadata.height), (Some(9), Some(4)));
+        assert_eq!(metadata.rotation, Some(0));
+    }
+
+    // The second half of §1.1: the dimensions and the stored pixels have to
+    // move together. `encode_image` re-encodes through `to_rgb8()` + JPEG and
+    // drops the EXIF, so a thumbnail generated from an unoriented decode is
+    // sideways forever — against the original file, which the browser paints
+    // upright, and against its own item's dimensions.
+    #[test]
+    fn a_visuals_decode_is_the_picture_not_the_stored_pixels() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rotated = dir.path().join("portrait.jpg");
+        fs::write(&rotated, jpeg_with_exif_orientation(64, 32, 6)).unwrap();
+
+        let raw = open_image_staged(&rotated).expect("the fixture decodes");
+        assert_eq!(
+            raw.dimensions(),
+            (64, 32),
+            "the raw decode is the coded pixels — this is the trap"
+        );
+
+        let oriented = open_image_oriented(&rotated).expect("the fixture decodes");
+        assert_eq!(
+            oriented.dimensions(),
+            (32, 64),
+            "every visuals decode must agree with the indexed dimensions"
+        );
+    }
+
+    // The eight EXIF cases collapsed onto the four turns `items.rotation`
+    // records. Mirroring never moves a dimension, so it never reaches the
+    // column — but it is still a transform, which is why the backfill keys its
+    // stale-visuals decision on the orientation and not on this.
+    #[test]
+    fn quarter_turns_drop_the_mirror_and_keep_the_turn() {
+        for (orientation, turns) in [
+            (Orientation::NoTransforms, 0),
+            (Orientation::FlipHorizontal, 0),
+            (Orientation::Rotate90, 90),
+            (Orientation::Rotate90FlipH, 90),
+            (Orientation::Rotate180, 180),
+            (Orientation::FlipVertical, 180),
+            (Orientation::Rotate270, 270),
+            (Orientation::Rotate270FlipH, 270),
+        ] {
+            assert_eq!(
+                orientation_quarter_turns(orientation),
+                turns,
+                "{orientation:?}"
+            );
+            assert_eq!(
+                oriented_dimensions((64, 32), orientation),
+                if turns % 180 == 90 { (32, 64) } else { (64, 32) },
+                "{orientation:?}"
+            );
+        }
+    }
+
+    // ffprobe reports the display matrix counter-clockwise; `items.rotation`
+    // is clockwise, so the two disagree by a sign. Measured against the
+    // bundled toolchain: `-display_rotation 90` probes as `rotation: 90` and
+    // decodes with a top-left marker in the *bottom* left, which is 270
+    // clockwise. Only the transposition is consumed, so a sign error would
+    // never show up in a dimension — it would just make the column lie.
+    #[test]
+    fn a_display_matrix_is_read_clockwise() {
+        let stream = |json: &str| {
+            serde_json::from_str::<FfprobeStream>(json).expect("the fixture parses")
+        };
+        let with_rotation =
+            |rotation: &str| format!(r#"{{"side_data_list":[{{"rotation":{rotation}}}]}}"#);
+
+        assert_eq!(stream(&with_rotation("-90")).quarter_turns(), 90);
+        assert_eq!(stream(&with_rotation("90")).quarter_turns(), 270);
+        assert_eq!(stream(&with_rotation("180")).quarter_turns(), 180);
+        assert_eq!(stream(&with_rotation("0")).quarter_turns(), 0);
+        assert_eq!(
+            stream(&with_rotation("-33.5")).quarter_turns(),
+            0,
+            "a matrix that is not a quarter turn is dropped, never rounded into one"
+        );
+        assert_eq!(
+            stream(r#"{"side_data_list":[{"displaymatrix":"..."}]}"#).quarter_turns(),
+            0,
+            "side data of another kind is not a rotation"
+        );
+        assert_eq!(stream("{}").quarter_turns(), 0, "no side data is no turn");
     }
 
     // The premise the whole un-fusing rests on: a truncated image's *header*
@@ -9955,7 +10745,9 @@ LIMIT 1
         fs::write(&truncated, &bytes[..bytes.len() * 6 / 10]).unwrap();
 
         assert_eq!(
-            image_header_dimensions(&truncated).ok(),
+            image_header_geometry(&truncated)
+                .ok()
+                .map(|(dimensions, _)| dimensions),
             Some((64, 64)),
             "the header of a truncated file is intact, so the metadata phase \
              indexes it with its real dimensions"

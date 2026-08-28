@@ -38,7 +38,7 @@ use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::media_tools::transcode::cache::{CacheStats, ResizeError};
 use crate::media_tools::transcode::compose::{
     self, ComposeLimits, ComposeParams, ComposeRejection, ComposeRequest, ItemSource,
-    ResolvedCompose, StreamInfo,
+    ResolvedCompose, StreamInfo, Transform,
 };
 use crate::media_tools::transcode::run::ComposeInput;
 use crate::media_tools::transcode::pool::{
@@ -1167,6 +1167,11 @@ async fn materialize_thumbnail(
         info: Some(StreamInfo {
             width: thumb.width,
             height: thumb.height,
+            // A stored thumbnail is generated from an already-oriented decode
+            // and re-encoded as JPEG with no EXIF of its own
+            // (docs/display-dimensions-design.md §1.1), so its pixels and the
+            // dimensions stored beside them are both the picture already.
+            normalize: Transform::default(),
             video_index: 0,
             has_audio: false,
             duration_s: None,
