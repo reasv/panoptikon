@@ -1537,6 +1537,7 @@ mod tests {
         let info = StreamInfo {
             width: 640,
             height: 360,
+            normalize: Transform::default(),
             video_index: 0,
             has_audio: false,
             duration_s: None,

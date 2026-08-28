@@ -32,8 +32,8 @@ use crate::db::{
     files::{
         FileScanData, FileUpsertResult, delete_file_by_path, delete_files_not_allowed,
         delete_item_if_orphan, delete_items_without_files, rename_file_path,
-        set_animation_duration, set_blurhash, set_item_codecs, set_outro_verdict,
-        update_file_data,
+        set_animation_duration, set_blurhash, set_item_codecs, set_item_rotation,
+        set_outro_verdict, update_file_data,
     },
     folders::{
         add_folder_to_database, delete_files_not_under_included_folders,
@@ -170,6 +170,20 @@ pub(crate) enum IndexDbWriterMessage {
     SetAnimationDuration {
         sha256: String,
         seconds: f64,
+        reply: Reply<u64>,
+    },
+    /// One item's measured orientation, which also transposes its stored
+    /// dimensions on an odd quarter turn
+    /// (docs/display-dimensions-design.md §4).
+    ///
+    /// Guarded on `rotation IS NULL` like the two above, but the guard is
+    /// load-bearing in a way theirs are not: this is the only write in the
+    /// scan that is **not idempotent**, since re-applying a 90 degree answer
+    /// would transpose the dimensions back. The swap and the stamp are one
+    /// statement so they cannot come apart.
+    SetItemRotation {
+        sha256: String,
+        quarter_turns: i64,
         reply: Reply<u64>,
     },
     RenameFilePath {
@@ -740,6 +754,20 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move { set_animation_duration(conn, &sha256, seconds).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::SetItemRotation {
+                sha256,
+                quarter_turns,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(
+                            async move { set_item_rotation(conn, &sha256, quarter_turns).await },
+                        )
                     })
                     .await;
                 let _ = reply.send(result);

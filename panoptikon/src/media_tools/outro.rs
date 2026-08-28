@@ -216,13 +216,16 @@ pub(crate) fn scaled_height(width: u32, height: u32) -> Option<u32> {
 /// The scaled height implied by the item's stored dimensions — but only when
 /// the byte count the decode actually produced confirms it.
 ///
-/// The stored dims are the *coded* ones while the filter graph sees the
-/// auto-rotated ones, and the two differ on every rotated phone capture, so
-/// both orientations are candidates. A candidate is taken only when it is the
-/// sole one whose frame length divides the stream cleanly: if both divide, if
-/// neither does, or if nothing was received, the honest answer is `None` and
-/// the caller turns that into a probe error. Guessing here reshapes the tail
-/// into a confidently wrong verdict, which is far worse than a retry.
+/// Both orientations are candidates, and stay so even now that the stored
+/// dimensions are the *display* ones and should therefore agree with what the
+/// filter graph sees (docs/display-dimensions-design.md): an item indexed
+/// before that landed still holds coded dimensions until the backfill reaches
+/// it, and this is not the place to depend on which. A candidate is taken only
+/// when it is the sole one whose frame length divides the stream cleanly: if
+/// both divide, if neither does, or if nothing was received, the honest answer
+/// is `None` and the caller turns that into a probe error. Guessing here
+/// reshapes the tail into a confidently wrong verdict, which is far worse than
+/// a retry.
 fn corroborated_height(source_dims: Option<(u32, u32)>, received: usize) -> Option<u32> {
     let (width, height) = source_dims?;
     if received == 0 {
@@ -245,7 +248,7 @@ fn corroborated_height(source_dims: Option<(u32, u32)>, received: usize) -> Opti
     accepted
 }
 
-/// Runs both stages. `source_dims` are the item's stored (coded) dimensions,
+/// Runs both stages. `source_dims` are the item's stored dimensions,
 /// consulted only if ffmpeg does not report its output geometry — and even
 /// then they are not trusted on sight: they are checked against the byte count
 /// the decode produced (`corroborated_height`), and a probe error is returned

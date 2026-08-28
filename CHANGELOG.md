@@ -260,6 +260,30 @@ Desktop release notes.
 
 ### Fixed
 
+- **Rotated photos and rotated phone videos are no longer indexed
+  sideways.** Their width and height were recorded exactly the wrong way
+  round: the scanner read the numbers stored in the file and ignored the
+  rotation the file also carries, which every browser applies before
+  painting. A portrait photo was filed as a landscape one. The visible
+  cost was on pinboards, where mosaic and uniform layouts lay out cells
+  from the indexed shape and so gave every rotated capture a cell of the
+  wrong proportions, cropped to fit. Their stored thumbnails were sideways
+  too - the original file was shown upright, its thumbnail on its side -
+  and a composed export of a rotated PNG or WebP could fail outright.
+  Newly scanned files are correct immediately. Existing libraries are
+  corrected automatically over the next scans, as part of the same pass
+  that already fills in other missing details, with no re-index and
+  nothing to click; a rotated image's thumbnail is regenerated when its
+  turn comes. Rotated videos need no new thumbnails - those were always
+  upright, and it was only the recorded numbers that disagreed with them.
+  Tagging, OCR and semantic search also see rotated photos upright now -
+  previously the models were shown the un-rotated pixels (rotated videos
+  were already shown upright), so tags and embeddings produced from now on
+  describe the picture; results computed earlier are not recomputed, and
+  simply improve whenever their models next run. An image used as a
+  search-by-image query is oriented the same way, so a rotated photo finds
+  its upright look-alikes.
+
 - **Gallery keyboard shortcuts work again on tag-indexed databases.** The
   arrow keys, the player shortcuts (play/pause, mute, fullscreen, frame
   and speed steps, trim marks) and Ctrl+C in the gallery were silently

@@ -13,8 +13,18 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 pub(crate) struct ItemScanMeta {
     pub md5: String,
     pub mime_type: String,
+    /// The *display* width — what a browser paints, not what the header codes
+    /// (docs/display-dimensions-design.md).
     pub width: Option<i64>,
+    /// The *display* height. See [`ItemScanMeta::width`].
     pub height: Option<i64>,
+    /// `items.rotation`: the clockwise quarter turns between this item's coded
+    /// pixels and the picture, 0/90/180/270 — see the migration
+    /// `20260824120000_item_rotation.sql`. `None` for anything with no picture
+    /// to orient (audio), which leaves the column NULL exactly as a
+    /// pre-upgrade item does; the backfill's `type` key means it never walks
+    /// them.
+    pub rotation: Option<i64>,
     pub duration: Option<f64>,
     pub audio_tracks: Option<i64>,
     pub video_tracks: Option<i64>,
@@ -546,6 +556,81 @@ pub(crate) async fn set_animation_duration(
     Ok(result.rows_affected())
 }
 
+/// The scan dispatcher's rotation question
+/// (docs/display-dimensions-design.md §4): "is this an image or a video whose
+/// orientation nothing has examined?" `false` means the item has been
+/// examined, has no picture to orient, or is not indexed.
+///
+/// Scoped to the picture mimes in SQL rather than trusting the dispatcher's
+/// extension guess, for the same reason as
+/// [`item_animation_pending`]: the index's own `type` is what the column's
+/// semantics are documented against, so a mislabeled file can never widen the
+/// population. The half-open ranges are what
+/// `idx_items_rotation_pending` can serve; `LIKE 'image/%'` is the
+/// anti-pattern this codebase has already paid for elsewhere.
+pub(crate) async fn item_rotation_pending(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+SELECT 1
+FROM items
+WHERE sha256 = ?1
+  AND rotation IS NULL
+  AND ((type >= 'image/' AND type < 'image0') OR (type >= 'video/' AND type < 'video0'))
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read an item's rotation state");
+        ApiError::internal("Failed to query item")
+    })?;
+    Ok(row.is_some())
+}
+
+/// Stores one item's measured orientation, transposing its dimensions when the
+/// turn is an odd one.
+///
+/// Guarded on `rotation IS NULL`, and that guard carries more weight here than
+/// anywhere else in the backfill (docs/display-dimensions-design.md §4): every
+/// other backfill write is idempotent, and **this one is not** — a second
+/// application of the same 90 degree answer would transpose the dimensions
+/// back to the coded ones it just corrected. The swap and the stamp are one
+/// statement so there is no window in which they can disagree.
+///
+/// `width`/`height` are swapped in SQL rather than recomputed from a value the
+/// worker carries, so an item whose dimensions were never recorded (NULL) is
+/// left NULL rather than being invented.
+pub(crate) async fn set_item_rotation(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    quarter_turns: i64,
+) -> ApiResult<u64> {
+    let transposes = quarter_turns == 90 || quarter_turns == 270;
+    let result = sqlx::query(
+        r#"
+UPDATE items
+SET rotation = ?1,
+    width = CASE WHEN ?2 THEN height ELSE width END,
+    height = CASE WHEN ?2 THEN width ELSE height END
+WHERE sha256 = ?3 AND rotation IS NULL
+        "#,
+    )
+    .bind(quarter_turns)
+    .bind(transposes)
+    .bind(sha256)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, sha256, "failed to store an item rotation");
+        ApiError::internal("Failed to store an item rotation")
+    })?;
+    Ok(result.rows_affected())
+}
+
 /// Returns the item's stored pixel dimensions, used to decide whether an
 /// image would produce a thumbnail at all without decoding it again.
 pub(crate) async fn get_item_dimensions(
@@ -619,6 +704,7 @@ INSERT INTO items (
     time_added,
     width,
     height,
+    rotation,
     duration,
     audio_tracks,
     video_tracks,
@@ -626,7 +712,7 @@ INSERT INTO items (
     blurhash,
     video_codec,
     audio_codec
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                 "#,
             )
             .bind(&data.sha256)
@@ -636,6 +722,7 @@ INSERT INTO items (
             .bind(time_added)
             .bind(meta.width)
             .bind(meta.height)
+            .bind(meta.rotation)
             .bind(meta.duration)
             .bind(meta.audio_tracks)
             .bind(meta.video_tracks)
@@ -967,6 +1054,7 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1
                     mime_type: "image/png".to_string(),
                     width: Some(10),
                     height: Some(20),
+                    rotation: None,
                     duration: None,
                     audio_tracks: None,
                     video_tracks: None,
@@ -996,6 +1084,125 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1
                 .await
                 .unwrap();
         assert_eq!(file_row.0, 1);
+    }
+
+    // The rotation backfill's population and — far more important — the one
+    // write in the scan that is not idempotent
+    // (docs/display-dimensions-design.md §4).
+    #[tokio::test]
+    async fn the_rotation_question_covers_pictures_and_stamps_exactly_once() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, width, height, time_added)
+VALUES
+    (1, 'sha_photo', 'md5_1', 'image/jpeg', 4032, 3024, '2024-01-01T00:00:00'),
+    (2, 'sha_clip', 'md5_2', 'video/mp4', 1920, 1080, '2024-01-01T00:00:00'),
+    (3, 'sha_song', 'md5_3', 'audio/mpeg', NULL, NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        for sha in ["sha_photo", "sha_clip"] {
+            assert!(
+                item_rotation_pending(&mut dbs.index_conn, sha)
+                    .await
+                    .unwrap(),
+                "{sha} has a picture nothing has oriented"
+            );
+        }
+        for sha in ["sha_song", "sha_missing"] {
+            assert!(
+                !item_rotation_pending(&mut dbs.index_conn, sha)
+                    .await
+                    .unwrap(),
+                "{sha} must never be dispatched for an orientation probe"
+            );
+        }
+
+        // An odd turn transposes, and the stamp terminates the question.
+        assert_eq!(
+            set_item_rotation(&mut dbs.index_conn, "sha_photo", 90)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !item_rotation_pending(&mut dbs.index_conn, "sha_photo")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            dimensions(&mut dbs.index_conn, "sha_photo").await,
+            (Some(3024), Some(4032), Some(90))
+        );
+
+        // The point of the guard: this write is the only one in the backfill
+        // that would *undo itself* if it ran twice.
+        assert_eq!(
+            set_item_rotation(&mut dbs.index_conn, "sha_photo", 90)
+                .await
+                .unwrap(),
+            0,
+            "a second pass must not transpose the dimensions back"
+        );
+        assert_eq!(
+            dimensions(&mut dbs.index_conn, "sha_photo").await,
+            (Some(3024), Some(4032), Some(90))
+        );
+
+        // An even turn is just as much an answer, and leaves the dimensions
+        // alone.
+        assert_eq!(
+            set_item_rotation(&mut dbs.index_conn, "sha_clip", 180)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            dimensions(&mut dbs.index_conn, "sha_clip").await,
+            (Some(1920), Some(1080), Some(180))
+        );
+    }
+
+    // A picture whose dimensions were never recorded must not have any
+    // invented for it by the transposition.
+    #[tokio::test]
+    async fn a_transposing_stamp_leaves_absent_dimensions_absent() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, time_added)
+VALUES (1, 'sha_photo', 'md5_1', 'image/jpeg', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            set_item_rotation(&mut dbs.index_conn, "sha_photo", 270)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            dimensions(&mut dbs.index_conn, "sha_photo").await,
+            (None, None, Some(270))
+        );
+    }
+
+    async fn dimensions(
+        conn: &mut sqlx::SqliteConnection,
+        sha256: &str,
+    ) -> (Option<i64>, Option<i64>, Option<i64>) {
+        sqlx::query_as("SELECT width, height, rotation FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
     }
 
     // The codec backfill's population, which no scan test can reach: the

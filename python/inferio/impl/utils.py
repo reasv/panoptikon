@@ -596,7 +596,8 @@ def load_image_from_buffer(
     fallback_opencv: bool = True,
 ) -> "PIL.Image.Image":
     """
-    Load an image from a raw byte buffer and return a Pillow Image in RGB mode.
+    Load an image from a raw byte buffer and return a Pillow Image in RGB
+    mode, display-oriented (the EXIF orientation applied, as a browser would).
 
     Parameters
     ----------
@@ -640,7 +641,7 @@ def load_image_from_buffer(
     # ––––– 1.  Pillow first –––––
     try:
         from PIL import Image as PILImage
-        from PIL import ImageFile
+        from PIL import ImageFile, ImageOps
 
         if accept_truncated:
             ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -651,6 +652,26 @@ def load_image_from_buffer(
 
         with PILImage.open(BytesIO(raw)) as im:
             im.load()                   # force decoding now
+            # The picture, not the pixels as stored: browsers, ffmpeg's
+            # video decoder and the indexed dimensions all apply the file's
+            # EXIF orientation (docs/display-dimensions-design.md §5), so
+            # the models must see the same frame. This is the one decode
+            # every image payload passes through — indexed files sent whole,
+            # and query uploads for search-by-image, which keeps a query
+            # embedding comparable with the index it searches. Re-encoded
+            # payloads (video frames, slices, PDF pages) carry no EXIF, so
+            # this is a no-op for them.
+            #
+            # A broken EXIF chunk is never a verdict on pixels that decoded
+            # fine: a decoder-shaped failure here degrades to the
+            # un-oriented image (what every consumer saw before orientation
+            # was read at all) instead of falling through to the ledger as
+            # "undecodable". Anything else propagates, per this function's
+            # taxonomy.
+            try:
+                im = ImageOps.exif_transpose(im)
+            except decode_errors:
+                pass
             return im.convert("RGB")
 
     except (ModuleNotFoundError, ImportError):
@@ -687,6 +708,10 @@ def load_image_from_buffer(
 
     if cv2 is not None:
         try:
+            # `imdecode` ignores EXIF orientation (only `imread` applies it),
+            # so this fallback yields the un-oriented pixels. Deliberately
+            # left that way: it only runs for a file Pillow could not decode
+            # at all, where sideways pixels beat none.
             arr = np.frombuffer(buf, dtype=np.uint8)
             img_cv = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
             if img_cv is None:

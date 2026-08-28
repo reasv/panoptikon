@@ -1,0 +1,48 @@
+-- The orientation transform between an item's coded pixels and the picture
+-- every consumer paints (docs/display-dimensions-design.md).
+--
+-- `width`/`height` used to hold *coded* dimensions: the header numbers, before
+-- an image's EXIF orientation or a video stream's display matrix. Browsers,
+-- ffmpeg's video decoder and ffmpeg's JPEG decoder all paint the *display*
+-- dimensions, so the two were transposed on every rotated phone capture. They
+-- now hold display dimensions, and this column records the transform that got
+-- them there.
+--
+-- Clockwise quarter turns from coded to display:
+--   NULL   never examined (pre-upgrade item) — the dims may still be coded
+--   0      examined: no transform, or none this build can read
+--   90     examined
+--   180    examined
+--   270    examined
+--
+-- Quarter turns, not the eight EXIF orientation codes: mirroring does not
+-- change dimensions, and the one consumer that needs the full transform
+-- (compose, which normalizes the still formats ffmpeg does not autorotate)
+-- reads it from the file rather than from here.
+--
+-- Deliberately **unversioned**, like the codec columns and unlike
+-- `outro_kind`: an orientation is a fact the header states, not a detector
+-- verdict a later threshold could overturn, so there is nothing for a version
+-- suffix to recover.
+--
+-- Immutable per item, like duration/width/height: any content change yields a
+-- new sha256 and therefore a new item.
+ALTER TABLE items ADD COLUMN rotation INTEGER;
+
+-- Serves the backfill dispatch question "is there an image or video whose
+-- orientation nothing has examined". Partial on the NULL state so the
+-- population drains away as the backfill runs, instead of carrying every row
+-- in the database forever.
+--
+-- `type` leads because items.type holds the whole mime string ('image/jpeg'),
+-- so each population is a half-open range scan (`type >= 'image/' AND type <
+-- 'image0'`, '0' being the byte after '/'). Not `LIKE 'image/%'`: SQLite
+-- cannot serve a LIKE prefix from an index under the default case-insensitive
+-- LIKE, which is the anti-pattern this codebase has already paid for on
+-- sha256, tag namespaces and file_scans.
+--
+-- Audio items keep a NULL `rotation` forever and are deliberately not
+-- backfilled: they have no picture to orient, and widening the pass would put
+-- every audio item in an existing library through a probe for a column
+-- nothing would read. The `type` key means the dispatch seek never walks them.
+CREATE INDEX idx_items_rotation_pending ON items(type) WHERE rotation IS NULL;
