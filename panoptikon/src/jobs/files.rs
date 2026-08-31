@@ -38,10 +38,10 @@ use crate::{
     db::{
         file_scans::{FileScanUpdate, get_completed_scan_paths, get_open_file_scan_id},
         files::{
-            FileScanData, FileUpsertResult, ItemScanMeta, PendingOutroItem, get_file_by_path,
-            get_item_content_end_ms, get_item_dimensions, get_item_id, get_item_visual_meta,
-            get_pending_outro_item, has_blurhash, item_animation_pending, item_codec_pending,
-            item_rotation_pending,
+            FileScanData, FileUpsertResult, ItemScanMeta, PendingOutroItem,
+            get_file_by_path, get_item_content_end_ms, get_item_id, get_item_visual_facts,
+            get_item_visual_meta, get_pending_outro_item, has_blurhash, item_animation_pending,
+            item_codec_pending, item_rotation_pending,
         },
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
@@ -54,7 +54,7 @@ use crate::{
         storage::{
             StoredImage, StoredTier, TierGeometry, get_frames_bytes, get_thumbnail_bytes,
             get_thumbnail_geometry, get_thumbnail_tier_geometry, has_any_frame, has_frame,
-            has_thumbnail,
+            has_thumbnail, has_thumbnail_tiers,
         },
         system_config::{SystemConfig, SystemConfigStore},
         visual_attempts::{
@@ -808,6 +808,21 @@ async fn sweep_orphaned_visual_attempts(index_db: &str) {
 
 pub(crate) const THUMBNAIL_PROCESS_VERSION: i64 = 1;
 pub(crate) const FRAME_PROCESS_VERSION: i64 = 1;
+/// The grid tier generator's version, stamped on every
+/// `storage.thumbnail_tiers` row.
+///
+/// Its own constant, independent of [`THUMBNAIL_PROCESS_VERSION`], because
+/// the two regenerate completely different work: bumping the tier version
+/// must not re-extract every video's frames to rebuild a display rendition
+/// that has not changed, and bumping the thumbnail version must not be the
+/// only way to retire a tier.
+///
+/// Bump it for a generator change the *stored geometry cannot see* — a
+/// different crop anchor, a different resampling filter, a different JPEG
+/// quality. A change that moves the dimensions needs no bump: the
+/// dispatcher's geometry comparison already catches it
+/// ([`tier_geometry_matches`]).
+pub(crate) const TIER_PROCESS_VERSION: i64 = 1;
 /// Minimum interval between mid-scan writes of the running counters to the
 /// file_scans row (progress display only; the final update is unconditional).
 pub(crate) const SCAN_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
@@ -1775,10 +1790,21 @@ impl ScanContext {
 
         // No positive-cache guard, unlike the two stores around it: the tier
         // write replaces the item's whole set, so identical content racing
-        // this rewrites the same bytes rather than colliding. An empty set
-        // needs no write at all here — a new item has nothing stored for it
-        // to contradict.
-        if !item.tiers.is_empty() {
+        // this rewrites the same bytes rather than colliding.
+        //
+        // An empty set is skipped only when there is also nothing stored to
+        // contradict. "A new item has nothing stored" is *nearly* always
+        // true and not quite: `storage.thumbnail_tiers` is keyed by content
+        // hash and outlives the `items` row until the orphan sweep runs, so
+        // content that was deindexed and reappears can meet a set from an
+        // older rule here. One EXISTS read per new item, and only when the
+        // pass produced no tier at all, buys the guarantee that this path
+        // never leaves one behind.
+        if !item.tiers.is_empty()
+            || has_thumbnail_tiers(&mut self.conn, &item.sha256)
+                .await
+                .unwrap_or(false)
+        {
             self.store_tiers(&item.sha256, &item.mime_type, item.tiers.clone())
                 .await;
         }
@@ -2083,7 +2109,7 @@ impl ScanContext {
             IndexDbWriterMessage::StoreThumbnailTiers {
                 sha256: sha256.to_string(),
                 mime_type: mime_type.to_string(),
-                process_version: THUMBNAIL_PROCESS_VERSION,
+                process_version: TIER_PROCESS_VERSION,
                 tiers: tiers.clone(),
                 reply,
             }
@@ -2254,37 +2280,75 @@ impl ScanContext {
         // nothing about the blurhash, while a marker-suppressed one is a
         // verdict on decoding this content at all.
         let mut thumb_suppressed = false;
+        // One stat and one index read for the whole image half of this
+        // dispatch. The served-directly predicate below and the ladder
+        // question after it are both pure functions of `(bytes, width,
+        // height)` about the same file, and this scans a library over SMB: a
+        // second stat per image per scan is a network round trip for an
+        // answer already in hand.
+        let image_facts = if mime_type.starts_with("image") {
+            self.image_facts(&sha256, &path).await
+        } else {
+            None
+        };
         if needs_thumb && mime_type.starts_with("image") {
             // Images served from the original file never get a stored
             // thumbnail, so `has_thumbnail` stays false for them forever.
             // Decide from the indexed dimensions instead of decoding, or every
             // rescan re-decodes every such image to produce nothing.
-            needs_thumb = match fs::metadata(&path) {
+            needs_thumb = match &image_facts {
                 // Unreadable now: leave the visuals to a later scan.
-                Err(_) => false,
-                Ok(metadata) => {
-                    let file_size = metadata.len();
-                    match get_item_dimensions(&mut self.conn, &sha256).await? {
-                        Some((Some(width), Some(height))) => {
-                            !image_is_served_directly(file_size, width, height)
-                        }
-                        // Dimensions were never recorded; fall back to the
-                        // size-only check and let the worker decode. The
-                        // byte bound is the only clause of the display rule
-                        // that needs no dimensions, so it is the only one
-                        // that can be asked here.
-                        _ => file_size > DISPLAY_MAX_FILE_SIZE,
-                    }
-                }
+                None => false,
+                Some(facts) => match facts.dimensions {
+                    Some((width, height)) => !image_is_served_directly(
+                        facts.file_size,
+                        width,
+                        height,
+                    ),
+                    // Dimensions were never recorded; fall back to the
+                    // size-only check and let the worker decode. The
+                    // byte bound is the only clause of the display rule
+                    // that needs no dimensions, so it is the only one
+                    // that can be asked here.
+                    //
+                    // It is *stricter* than the old ≤5 MB escape, so an
+                    // image between 5 and 24 MiB whose dimensions were
+                    // never indexed no longer gets a display thumb out of
+                    // this pass. That is a convergence, not a hole: the
+                    // sixth dispatch question (the display-dimensions
+                    // backfill, docs/display-dimensions-design.md §4)
+                    // fills `width`/`height` for any image whose header
+                    // reads at all, and on the next pass this branch is
+                    // no longer reachable for it — the measured branch
+                    // above answers instead, and the ladder question can
+                    // finally see it too. An image whose header does not
+                    // read has no dimensions for anyone to decide with,
+                    // and its decode failure is already a marker.
+                    None => facts.file_size > DISPLAY_MAX_FILE_SIZE,
+                },
             };
         }
+        // Whether this item's *still* rendition ladder applies to it at all.
+        // Answered here rather than inside the ladder question because the
+        // generator needs it even when the ladder question found no work: an
+        // animated image missing its display rendition still runs the image
+        // pass, and that pass must not write static tiers either.
+        let still_ladder = still_ladder_applies(
+            &mime_type,
+            image_facts.as_ref().and_then(|facts| facts.duration),
+        );
         // The dispatcher's seventh question
         // (docs/grid-scroll-performance-implementation.md §3, B1): "does this
         // item carry the renditions the current ladder would produce?" Asked
         // before the negative cache, because for an image the answer *is* a
         // decode of the original — the same decode a marker settles — and
         // suppression has to cover it.
-        let mut tier_work = self.pending_tier_work(&sha256, &mime_type, &path).await;
+        let mut tier_work = if still_ladder {
+            self.pending_tier_work(&sha256, &mime_type, &path, image_facts.as_ref())
+                .await
+        } else {
+            None
+        };
         if matches!(tier_work, Some(TierWork::Image { .. })) {
             needs_thumb = true;
         }
@@ -2592,6 +2656,7 @@ impl ScanContext {
                     animation_work,
                     rotation_work,
                     tier_work,
+                    still_ladder,
                     stored_content_end_ms,
                     &timers,
                 )
@@ -2811,16 +2876,29 @@ impl ScanContext {
     /// `None` means nothing to do — including for every item whose dimensions
     /// were never indexed, which cannot be decided without a decode and so is
     /// deliberately left alone rather than re-examined forever.
+    ///
+    /// The comparison is geometry *and* [`TIER_PROCESS_VERSION`]: a generator
+    /// change that keeps the dimensions is invisible to the geometry alone,
+    /// and without the version stamp nothing could ever trigger its
+    /// regeneration.
+    ///
+    /// `image_facts` is what the caller already stat'd and read for this file;
+    /// nothing here re-fetches it. Callers must have established
+    /// [`still_ladder_applies`] first — animated items are B2's.
     async fn pending_tier_work(
         &mut self,
         sha256: &str,
         mime_type: &str,
         path: &Path,
+        image_facts: Option<&ImageFacts>,
     ) -> Option<TierWork> {
-        // Animated items are step B2's: their grid renditions are video
-        // loops, and until that lands `item_thumbnail` still short-circuits
-        // them to the original file at every tier.
-        if mime_type.starts_with("image/gif") || mime_type.is_empty() {
+        // Before any storage read at all. This question is asked once per
+        // file per scan, forever, and most of the files in a general-purpose
+        // library are types no generator has ever produced a picture for — a
+        // .txt, a .zip, a .docx. Their answer is structurally `None` (a tier
+        // is derived from a rendition, and they have none), so paying two
+        // geometry queries each to rediscover that, over SMB, is pure loss.
+        if !mime_can_have_renditions(mime_type) {
             return None;
         }
         let stored_thumbnails = self.stored_geometry(sha256, path).await?;
@@ -2839,13 +2917,13 @@ impl ScanContext {
         };
 
         if mime_type.starts_with("image") {
-            let file_size = fs::metadata(path).ok()?.len();
-            let (width, height) = match get_item_dimensions(&mut self.conn, sha256).await {
-                Ok(Some((Some(width), Some(height)))) => (width, height),
-                // Never measured, or unreadable: undecidable without a decode,
-                // which is exactly what this question must never do.
-                _ => return None,
-            };
+            // Whatever the caller already stat'd and read; nothing is fetched
+            // a second time here.
+            let facts = image_facts?;
+            let file_size = facts.file_size;
+            // Never measured, or unreadable: undecidable without a decode,
+            // which is exactly what this question must never do.
+            let (width, height) = facts.dimensions?;
             let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
                 return None;
             };
@@ -2867,7 +2945,14 @@ impl ScanContext {
                 return None;
             }
             return Some(TierWork::Image {
-                replace_display: !stored_thumbnails.is_empty(),
+                // The *stored display rendition disagrees with the current
+                // display plan* — not merely "something is stored". An item
+                // that owes only grid tiers must not drag the display
+                // rendition and the blurhash into a rewrite: in a
+                // library-wide ladder backfill that is a re-encode and a
+                // re-store of an identical picture for every already-correct
+                // item in the library, which is most of them.
+                replace_display: !display_matches,
             });
         }
 
@@ -2907,6 +2992,37 @@ impl ScanContext {
             }
         }
         Some(TierWork::Derived(sources))
+    }
+
+    /// Everything the dimension-first questions need about one image, from a
+    /// single stat and a single index read.
+    ///
+    /// `None` means the file could not be stat'd now — the same "leave the
+    /// visuals to a later scan" answer the served-directly branch has always
+    /// given for an unreadable file.
+    async fn image_facts(&mut self, sha256: &str, path: &Path) -> Option<ImageFacts> {
+        let file_size = fs::metadata(path).ok()?.len();
+        let facts = match get_item_visual_facts(&mut self.conn, sha256).await {
+            Ok(facts) => facts,
+            // Advisory, like every other read on this path: without the answer
+            // the questions below fall back to what they do for an item whose
+            // dimensions were never measured.
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to read an item's visual facts"
+                );
+                None
+            }
+        };
+        Some(ImageFacts {
+            file_size,
+            dimensions: facts
+                .as_ref()
+                .and_then(|facts| facts.width.zip(facts.height)),
+            duration: facts.and_then(|facts| facts.duration),
+        })
     }
 
     /// The stored display renditions of an item as `(idx, width, height)`.
@@ -3836,9 +3952,11 @@ pub(crate) struct GeneratedVisuals {
     pub(crate) thumbnails: Vec<StoredImage>,
     pub(crate) frames: Vec<StoredImage>,
     /// The grid tiers of the renditions above. Flat rather than
-    /// `Option<Vec<_>>` like [`ProducedVisuals::tiers`]: a new item has
-    /// nothing stored, so "produced none" and "did not consider tiers" write
-    /// the same nothing.
+    /// `Option<Vec<_>>` like [`ProducedVisuals::tiers`]: on the new-item path
+    /// "produced none" and "did not consider tiers" reach the same guard,
+    /// which writes the (empty) set only when there is something stored to
+    /// retire — `storage.thumbnail_tiers` is keyed by content hash and can
+    /// outlive a deindexed item.
     pub(crate) tiers: Vec<StoredTier>,
     pub(crate) blurhash: Option<String>,
     /// Empty on the healthy path, which is what keeps this free: a pass that
@@ -4586,7 +4704,13 @@ fn build_new_item_thumbnails(
         let image = open_image_oriented(path).map_err(|(stage, err)| {
             VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
         })?;
-        build_image_renditions(&mut out, file_size, image).map_err(VisualsError::thumbnail)?;
+        build_image_renditions(
+            &mut out,
+            file_size,
+            image,
+            ImageLadderWork::first_pass(mime_type, metadata.duration),
+        )
+        .map_err(VisualsError::thumbnail)?;
     } else if mime_type.starts_with("application/pdf") {
         // Still renders nothing when pdfium is unavailable or the PDF is
         // broken — the item is indexed without visuals — but the two are no
@@ -4625,6 +4749,7 @@ fn wanted_tier_geometry(idx: i64, plans: &[(ThumbnailTier, TierRender)]) -> Vec<
             tier: tier.as_str().to_string(),
             width: i64::from(plan.width),
             height: i64::from(plan.height),
+            version: TIER_PROCESS_VERSION,
         })
         .collect();
     wanted.sort_by(|left, right| (left.idx, &left.tier).cmp(&(right.idx, &right.tier)));
@@ -4632,13 +4757,23 @@ fn wanted_tier_geometry(idx: i64, plans: &[(ThumbnailTier, TierRender)]) -> Vec<
 }
 
 /// Whether an item's stored tier set is exactly the one the current ladder
-/// would produce — same tiers, same indices, same pixel dimensions.
+/// would produce — same tiers, same indices, same pixel dimensions, and
+/// generated by at least the current [`TIER_PROCESS_VERSION`].
 ///
-/// Exact, not "at least": a rendition from a superseded rule is as much a
-/// mismatch as a missing one, and leaving it would keep serving the geometry
-/// the rule change was meant to retire.
+/// Exact on the geometry, not "at least": a rendition from a superseded rule
+/// is as much a mismatch as a missing one, and leaving it would keep serving
+/// the geometry the rule change was meant to retire.
+///
+/// `>=` on the version, matching `has_thumbnail`/`has_frame`: a row a *newer*
+/// generator wrote is not stale, so a downgrade does not thrash the whole
+/// library back to the older renditions.
 fn tier_geometry_matches(stored: &[TierGeometry], wanted: &[TierGeometry]) -> bool {
-    stored == wanted
+    stored.len() == wanted.len()
+        && stored.iter().zip(wanted).all(|(stored, wanted)| {
+            (stored.idx, &stored.tier, stored.width, stored.height)
+                == (wanted.idx, &wanted.tier, wanted.width, wanted.height)
+                && stored.version >= wanted.version
+        })
 }
 
 /// The size of the file a display rendition is decided against. Its own
@@ -4648,6 +4783,35 @@ fn image_file_size(path: &Path) -> Result<u64, VisualsError> {
     fs::metadata(path)
         .map(|metadata| metadata.len())
         .map_err(|err| VisualsError::thumbnail(FileProcessError::Io(err.to_string())))
+}
+
+/// Which halves of an image's rendition ladder a pass is for.
+///
+/// Both are decided by the dispatcher from indexed metadata; the generator
+/// only obeys. A pass with `display: false` still runs the full decode — the
+/// grid tiers come from the original pixels — it simply does not re-derive a
+/// picture that is already stored and already correct.
+#[derive(Clone, Copy)]
+struct ImageLadderWork {
+    /// Produce the display rendition, or the verdict that retires a stale
+    /// one. False exactly when the stored rendition already *is* what
+    /// [`display_plan`] wants: in a library-wide tier backfill, re-encoding
+    /// and re-storing an identical picture (and its blurhash) for every
+    /// already-correct item is the bulk of the work and buys nothing.
+    display: bool,
+    /// Produce the grid tiers. False for animated items — see
+    /// [`still_ladder_applies`].
+    tiers: bool,
+}
+
+impl ImageLadderWork {
+    /// A first generation: nothing is stored, so both halves are owed.
+    fn first_pass(mime_type: &str, duration: Option<f64>) -> Self {
+        Self {
+            display: true,
+            tiers: still_ladder_applies(mime_type, duration),
+        }
+    }
 }
 
 /// The display rendition and the grid tiers of one already-decoded image, in
@@ -4661,9 +4825,20 @@ fn build_image_renditions(
     out: &mut ProducedVisuals,
     file_size: u64,
     image: DynamicImage,
+    work: ImageLadderWork,
 ) -> Result<(), FileProcessError> {
     let (width, height) = image.dimensions();
-    out.tiers = Some(encode_tiers(0, &image, &grid_plans(file_size, width, height))?);
+    if work.tiers {
+        out.tiers = Some(encode_tiers(0, &image, &grid_plans(file_size, width, height))?);
+    }
+    if !work.display {
+        // The stored display rendition is already the one the rule wants, so
+        // nothing about it is produced, written or dropped. The original
+        // decode is the blurhash source if one is even owed — which is what
+        // the served-directly path uses anyway.
+        out.blurhash_source = Some(image);
+        return Ok(());
+    }
     match generate_display_thumbnail(file_size, &image) {
         Some(thumb) => {
             out.thumbnails.push(encode_image(0, &thumb)?);
@@ -4850,6 +5025,51 @@ enum TierWork {
     Derived(Vec<(i64, Vec<u8>)>),
 }
 
+/// One image's measurements, gathered once per dispatch and shared by every
+/// question that needs them (see `FileScanService::image_facts`).
+struct ImageFacts {
+    /// The byte count on disk *now*, which is what both rules are decided
+    /// against.
+    file_size: u64,
+    /// The indexed display dimensions, or `None` when either was never
+    /// measured.
+    dimensions: Option<(i64, i64)>,
+    /// `items.duration` — for an image, the animated-spans measurement.
+    duration: Option<f64>,
+}
+
+/// The mime families a stored rendition — and therefore a grid tier — can
+/// ever exist for. Exactly the branches `build_new_item_thumbnails` and
+/// `build_backfill_thumbnails` have generators for; everything else records a
+/// permanent "nothing".
+fn mime_can_have_renditions(mime_type: &str) -> bool {
+    mime_type.starts_with("image")
+        || mime_type.starts_with("video")
+        || mime_type.starts_with("audio")
+        || mime_type.starts_with("application/pdf")
+        || mime_type.starts_with("text/html")
+}
+
+/// Whether the **still** tier ladder applies to an item at all.
+///
+/// Animated items are step B2's (docs/grid-scroll-performance-implementation.md
+/// §3, B2): their grid renditions are H.264 loops with the static tiers as
+/// posters, so any still tier written for one now is superseded the moment
+/// that lands. Worse in the meantime, the default path can flip an animated
+/// original to a static JPEG for a large animated WebP, and a static tier
+/// derived from that same decode would silently make the grid the only
+/// surface that never animates. Excluded until B2 owns them.
+///
+/// `duration` is `items.duration`, and only an **image** is disqualified by
+/// it: a video's tiers are derived from its stored frame grid, which is a
+/// still by construction.
+fn still_ladder_applies(mime_type: &str, duration: Option<f64>) -> bool {
+    if mime_type.is_empty() || mime_type.starts_with("image/gif") {
+        return false;
+    }
+    !(mime_type.starts_with("image") && duration.is_some_and(|seconds| seconds > 0.0))
+}
+
 struct OutroBackfill {
     item: PendingOutroItem,
     /// Whether a positive verdict *replaces* visuals rather than informing
@@ -4876,6 +5096,12 @@ fn generate_backfill_visuals(
     needs_animation: bool,
     rotation_work: Option<RotationBackfill>,
     tier_work: Option<TierWork>,
+    // Whether the still ladder applies to this item at all
+    // (`still_ladder_applies`). Threaded separately from `tier_work` because
+    // it governs a pass the ladder question found *no* work for: an animated
+    // image missing its display rendition runs the image pass, and that pass
+    // must not write static tiers either.
+    still_ladder: bool,
     stored_content_end_ms: Option<i64>,
     timers: &ScanTimers,
 ) -> BackfillResult {
@@ -4969,6 +5195,26 @@ fn generate_backfill_visuals(
     let replace_visuals = (pass_content_end_ms.is_some() && replaces_visuals)
         || stale_thumbnail(rotation.as_ref())
         || ladder_replaces_display;
+    // Which halves of the image ladder this pass is for.
+    let image_work = ImageLadderWork {
+        display: match &tier_work {
+            // The ladder question examined this image, so it is the
+            // authority: `replace_display` says the stored display rendition
+            // is not the one the current plan wants, and that is the same
+            // fact as "a display rendition is owed" — a *missing* one does
+            // not match the plan either. An image dispatched purely for its
+            // grid tiers therefore gets `false`, and its already-correct
+            // display rendition and blurhash are left exactly as they are.
+            // Across a library-wide ladder backfill that is the difference
+            // between re-encoding and re-storing every stored rendition in
+            // the library and touching none of them.
+            Some(TierWork::Image { replace_display }) => *replace_display || replace_visuals,
+            // No ladder verdict for this file — an ordinary display-side
+            // backfill, which is exactly what the pass is for.
+            _ => true,
+        },
+        tiers: still_ladder,
+    };
     // An image owing renditions runs the ordinary image pass: display tier
     // and grid tiers come out of the one decode together, so there is no
     // separate stage for them and no second decode.
@@ -5006,6 +5252,7 @@ fn generate_backfill_visuals(
             frames_stored,
             video_duration,
             content_end_ms,
+            image_work,
         ) {
             Ok(produced) => {
                 thumbnails = produced.thumbnails;
@@ -5165,6 +5412,7 @@ fn build_backfill_thumbnails(
     frames_stored: bool,
     video_duration: f64,
     content_end_ms: Option<i64>,
+    image_work: ImageLadderWork,
 ) -> Result<ProducedVisuals, VisualsError> {
     let mut out = ProducedVisuals::default();
 
@@ -5244,7 +5492,8 @@ fn build_backfill_thumbnails(
         let image = open_image_oriented(path).map_err(|(stage, err)| {
             VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
         })?;
-        build_image_renditions(&mut out, file_size, image).map_err(VisualsError::thumbnail)?;
+        build_image_renditions(&mut out, file_size, image, image_work)
+            .map_err(VisualsError::thumbnail)?;
     } else if mime_type.starts_with("application/pdf") {
         let page = render_pdf_first_page(path)
             .map_err(|err| VisualsError::thumbnail(pdf_visuals_failure(err)))?;
@@ -8088,6 +8337,149 @@ LIMIT 1
         assert_eq!(tier_ids(&mut conn).await, ids);
     }
 
+    /// The `version` stamp on every tier row, in rowid order.
+    async fn tier_versions(conn: &mut sqlx::SqliteConnection) -> Vec<i64> {
+        sqlx::query_scalar("SELECT version FROM storage.thumbnail_tiers ORDER BY id")
+            .fetch_all(conn)
+            .await
+            .unwrap()
+    }
+
+    // A generator change the stored geometry cannot see — a different crop
+    // anchor, filter or quality — is what `TIER_PROCESS_VERSION` exists for.
+    // Without the version in the comparison the column would be written and
+    // never read, and nothing could ever trigger such a regeneration.
+    #[tokio::test]
+    async fn a_stale_tier_version_is_regenerated() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-tier-version"]).await;
+        image::RgbImage::new(1400, 1400)
+            .save(env.media_dirs[0].join("photo.bmp"))
+            .unwrap();
+        env.scan().await;
+
+        let wanted = vec![tier("grid-m", 1024, 1024), tier("grid-s", 512, 512)];
+        {
+            let mut conn = env.read().await;
+            assert_eq!(tier_rows(&mut conn).await, wanted);
+            assert_eq!(
+                tier_versions(&mut conn).await,
+                vec![TIER_PROCESS_VERSION; 2]
+            );
+        }
+
+        // The state a version bump leaves behind: identical geometry, an
+        // older stamp.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE storage.thumbnail_tiers SET version = ?1")
+                .bind(TIER_PROCESS_VERSION - 1)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 1,
+            "an out-of-date stamp is work even when the geometry matches"
+        );
+        let fresh_ids = {
+            let mut conn = env.read().await;
+            assert_eq!(tier_rows(&mut conn).await, wanted, "same geometry");
+            // The restamp is the proof the set was rewritten. Not the rowids:
+            // SQLite hands back the same `INTEGER PRIMARY KEY` values after a
+            // delete that empties the table, so they are only evidence in the
+            // *negative* direction (an unchanged list next to a zero write
+            // count).
+            assert_eq!(
+                tier_versions(&mut conn).await,
+                vec![TIER_PROCESS_VERSION; 2],
+                "restamped at the current version"
+            );
+            assert_eq!(
+                thumbnail_count(&mut conn).await,
+                0,
+                "a tier regeneration does not invent a display rendition"
+            );
+            tier_ids(&mut conn).await
+        };
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "and it settles: a matching stamp is not work"
+        );
+        let mut conn = env.read().await;
+        assert_eq!(tier_ids(&mut conn).await, fresh_ids);
+    }
+
+    // An item whose display rendition is already the one the current rule
+    // wants, missing only its grid tiers. The tier backfill must not escalate
+    // to a full visuals replacement: re-encoding and re-storing an identical
+    // display rendition (and its blurhash) for every already-correct item is
+    // the bulk of a library-wide upgrade, and it buys nothing.
+    //
+    // 9000x1000 uncompressed is 27 MB: past the 24 MB byte bound while every
+    // pixel bound is clear, so the display rendition is a plain re-encode at
+    // the original dimensions — stored, and stable across rescans.
+    #[tokio::test]
+    async fn a_tier_only_backfill_leaves_the_display_rendition_alone() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-tier-display-intact"]).await;
+        image::RgbImage::new(9000, 1000)
+            .save(env.media_dirs[0].join("wide.bmp"))
+            .unwrap();
+        env.scan().await;
+
+        let wanted = vec![tier("grid-m", 2048, 1000), tier("grid-s", 1024, 512)];
+        let (display_before, blurhash_before) = {
+            let mut conn = env.read().await;
+            assert_eq!(thumbnail_count(&mut conn).await, 1);
+            assert_eq!(tier_rows(&mut conn).await, wanted);
+            (display_rows(&mut conn).await, blurhash_of(&mut conn).await)
+        };
+        assert!(blurhash_before.is_some());
+
+        // The state an existing library is in: display renditions from before
+        // the ladder, no tiers.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("DELETE FROM storage.thumbnail_tiers")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1, "the tiers were dispatched");
+        let mut conn = env.read().await;
+        assert_eq!(tier_rows(&mut conn).await, wanted, "and written");
+        assert_eq!(
+            display_rows(&mut conn).await,
+            display_before,
+            "the display rendition was neither re-encoded nor re-stored \
+             (same rowid, same bytes)"
+        );
+        assert_eq!(blurhash_of(&mut conn).await, blurhash_before);
+    }
+
+    /// The stored display renditions as `(rowid, bytes)`. The store is a
+    /// delete-then-insert, so an unchanged rowid is proof nothing rewrote it.
+    async fn display_rows(conn: &mut sqlx::SqliteConnection) -> Vec<(i64, Vec<u8>)> {
+        sqlx::query_as("SELECT id, thumbnail FROM storage.thumbnails ORDER BY id")
+            .fetch_all(conn)
+            .await
+            .unwrap()
+    }
+
+    async fn blurhash_of(conn: &mut sqlx::SqliteConnection) -> Option<String> {
+        sqlx::query_scalar("SELECT blurhash FROM items")
+            .fetch_one(conn)
+            .await
+            .unwrap()
+    }
+
     // A video's grid tiers come from the pictures already in the database —
     // its 2x2 frame grid and its first frame — not from a fresh ffmpeg run
     // over the source. The clip's frames are 576x1024, so the grid is
@@ -9688,7 +10080,15 @@ LIMIT 1
 
         // The replace path's shape: no frames in hand, but four in the
         // database. The thumbnail is gone and nothing else is.
-        let Err(err) = build_backfill_thumbnails(&clip, "video/mp4", &[], true, 10.0, Some(5000))
+        let Err(err) = build_backfill_thumbnails(
+            &clip,
+            "video/mp4",
+            &[],
+            true,
+            10.0,
+            Some(5000),
+            ImageLadderWork::first_pass("video/mp4", Some(10.0)),
+        )
         else {
             panic!("unreadable bytes cannot yield frames");
         };
@@ -9703,7 +10103,15 @@ LIMIT 1
 
         // Nothing stored anywhere: the same failure really is both kinds'
         // only chance, and that has not changed.
-        let Err(err) = build_backfill_thumbnails(&clip, "video/mp4", &[], false, 10.0, None) else {
+        let Err(err) = build_backfill_thumbnails(
+            &clip,
+            "video/mp4",
+            &[],
+            false,
+            10.0,
+            None,
+            ImageLadderWork::first_pass("video/mp4", Some(10.0)),
+        ) else {
             panic!("unreadable bytes cannot yield frames");
         };
         assert_eq!(
@@ -12324,12 +12732,58 @@ LIMIT 1
                     tier: tier.tier.to_string(),
                     width: tier.width,
                     height: tier.height,
+                    version: TIER_PROCESS_VERSION,
                 })
                 .collect();
             assert!(
                 tier_geometry_matches(&stored, &wanted_tier_geometry(0, &plans)),
                 "{width}x{height}: stored {stored:?}"
             );
+        }
+    }
+
+    // Animated items are step B2's, and both the dispatch question and the
+    // generator have to agree on which those are — or the scan writes a still
+    // tier the dispatcher will never reconcile.
+    #[test]
+    fn the_still_ladder_skips_animated_images_only() {
+        // The pre-existing exclusions.
+        assert!(!still_ladder_applies("image/gif", None));
+        assert!(!still_ladder_applies("", None));
+        // A measured animation length disqualifies an image...
+        assert!(!still_ladder_applies("image/webp", Some(3.5)));
+        // ... and a measured *still* verdict, or no measurement at all, does
+        // not.
+        assert!(still_ladder_applies("image/webp", Some(0.0)));
+        assert!(still_ladder_applies("image/webp", None));
+        assert!(still_ladder_applies("image/jpeg", None));
+        // A video's duration says nothing about its tiers: they come from its
+        // stored frame grid, which is a still by construction.
+        assert!(still_ladder_applies("video/mp4", Some(120.0)));
+        assert!(still_ladder_applies("audio/mpeg", Some(200.0)));
+    }
+
+    // The ladder question's mime early-out must cover exactly the types a
+    // generator produces a picture for; anything wider costs two storage
+    // queries per file per scan, forever, for a structural `None`.
+    #[test]
+    fn only_types_with_a_generator_reach_the_ladder_question() {
+        for mime in [
+            "image/png",
+            "video/mp4",
+            "audio/mpeg",
+            "application/pdf",
+            "text/html",
+        ] {
+            assert!(mime_can_have_renditions(mime), "{mime}");
+        }
+        for mime in [
+            "text/plain",
+            "application/zip",
+            "application/epub+zip",
+            "",
+        ] {
+            assert!(!mime_can_have_renditions(mime), "{mime}");
         }
     }
 

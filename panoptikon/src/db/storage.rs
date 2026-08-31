@@ -35,6 +35,11 @@ pub(crate) struct TierGeometry {
     pub tier: String,
     pub width: i64,
     pub height: i64,
+    /// The `TIER_PROCESS_VERSION` this rendition was generated at. Geometry
+    /// alone cannot see a generator change that keeps the dimensions — a
+    /// different crop anchor, a different filter, a different quality — so
+    /// the dispatcher compares this too and treats an older stamp as work.
+    pub version: i64,
 }
 
 pub(crate) async fn has_thumbnail(
@@ -432,9 +437,9 @@ pub(crate) async fn get_thumbnail_tier_geometry(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
 ) -> ApiResult<Vec<TierGeometry>> {
-    let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(i64, String, i64, i64, i64)> = sqlx::query_as(
         r#"
-SELECT idx, tier, width, height
+SELECT idx, tier, width, height, version
 FROM storage.thumbnail_tiers
 WHERE item_sha256 = ?1
 ORDER BY idx, tier
@@ -449,13 +454,41 @@ ORDER BY idx, tier
     })?;
     Ok(rows
         .into_iter()
-        .map(|(idx, tier, width, height)| TierGeometry {
+        .map(|(idx, tier, width, height, version)| TierGeometry {
             idx,
             tier,
             width,
             height,
+            version,
         })
         .collect())
+}
+
+/// Whether this item carries *any* stored grid tier, at any version.
+///
+/// Deliberately version-agnostic, and deliberately not the geometry read: the
+/// only caller is the new-item path's "is an empty set still worth writing?"
+/// guard, and there the question is simply whether a delete would remove
+/// anything.
+pub(crate) async fn has_thumbnail_tiers(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+SELECT EXISTS(
+    SELECT 1 FROM storage.thumbnail_tiers WHERE item_sha256 = ?1 LIMIT 1
+) AS exists_flag
+        "#,
+    )
+    .bind(sha256)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to check thumbnail tier existence");
+        ApiError::internal("Failed to read thumbnail tiers")
+    })?;
+    Ok(row.0 != 0)
 }
 
 /// The bytes of one stored grid tier, or `None` when this item has no
@@ -728,6 +761,7 @@ VALUES
                 tier: "grid-m".to_string(),
                 width: 900,
                 height: 900,
+                version: 1,
             }]
         );
         assert_eq!(

@@ -38,7 +38,9 @@ pub(crate) const DISPLAY_MAX_FILE_SIZE: u64 = 24 * 1024 * 1024;
 /// Grid tiers: the largest original served directly, as a multiple of the
 /// tier's short side. 1.25x — a quarter over budget decodes cheaply enough
 /// that storing a near-identical rendition would cost more than it saves.
-/// Expressed as a ratio so the comparison stays integral.
+/// Expressed as a ratio so the comparison stays integral. The same slack
+/// applies to the **long** side against `2 * tier`, which is the longest a
+/// stored tier is ever allowed to be.
 const GRID_DIRECT_NUMERATOR: u64 = 5;
 const GRID_DIRECT_DENOMINATOR: u64 = 4;
 /// Grid tiers: the largest original served directly by byte count.
@@ -46,7 +48,9 @@ pub(crate) const GRID_DIRECT_MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
 
 /// The aspect above which a grid tier becomes a *crop* rather than a
 /// whole-image resize. At or below it, `long <= 2 * short`, and the tier is
-/// the plain short-side resize of the whole picture.
+/// the plain short-side resize of the whole picture. Equivalently: a stored
+/// tier's long side never exceeds `2 * tier`, which is what the serve rule's
+/// long-side bound is measured against.
 const GRID_MAX_WHOLE_ASPECT: u32 = 2;
 
 /// One rendition of an item's picture.
@@ -227,9 +231,19 @@ fn round_div(numerator: u64, denominator: u64) -> u32 {
 }
 
 /// Whether a grid tier serves an item's **original file** rather than a
-/// stored rendition (§2): short side within 1.25x the tier, aspect within 2
-/// (a strip always has a stored crop), and bytes within
+/// stored rendition (§2, as refined in adjudication): short side within 1.25x
+/// the tier, **long side within 1.25x `2 * tier`**, and bytes within
 /// [`GRID_DIRECT_MAX_FILE_SIZE`].
+///
+/// The long-side bound replaces an `aspect <= 2` clause that refused *every*
+/// strip however small. That clause was a proxy for the wrong thing: a
+/// 1000x2100 image (aspect 2.1) stored a grid-m "crop" of 1000x2048 — the
+/// whole picture, 2% smaller — which is pure waste, while what actually
+/// matters is the same thing the short-side clause measures, the decoded
+/// pixel count of what the cell paints. `2 * tier` is the longest a stored
+/// tier is ever allowed to be ([`tier_render`]), so an original already
+/// within a quarter of that is exactly as cheap to decode as the rendition
+/// would have been.
 pub(crate) fn grid_serves_original(file_size: u64, width: u32, height: u32, tier: u32) -> bool {
     within_grid_dimensions(width, height, tier) && file_size <= GRID_DIRECT_MAX_FILE_SIZE
 }
@@ -242,14 +256,19 @@ pub(crate) fn grid_serves_stored_thumbnail(width: u32, height: u32, tier: u32) -
     within_grid_dimensions(width, height, tier)
 }
 
+/// Both sides against the largest a stored tier could be: the short side
+/// against `tier`, the long side against `2 * tier`, each with the same 1.25x
+/// slack.
 fn within_grid_dimensions(width: u32, height: u32, tier: u32) -> bool {
     if width == 0 || height == 0 {
         return true;
     }
     let short = u64::from(width.min(height));
     let long = u64::from(width.max(height));
-    short * GRID_DIRECT_DENOMINATOR <= u64::from(tier) * GRID_DIRECT_NUMERATOR
-        && long <= u64::from(GRID_MAX_WHOLE_ASPECT) * short
+    let tier = u64::from(tier);
+    short * GRID_DIRECT_DENOMINATOR <= tier * GRID_DIRECT_NUMERATOR
+        && long * GRID_DIRECT_DENOMINATOR
+            <= u64::from(GRID_MAX_WHOLE_ASPECT) * tier * GRID_DIRECT_NUMERATOR
 }
 
 /// One tier's plan for a source of `width` x `height`: `None` when the source
@@ -566,17 +585,32 @@ mod tests {
     }
 
     #[test]
-    fn the_grid_serve_rule_is_dimensions_then_aspect_then_bytes() {
+    fn the_grid_serve_rule_is_short_side_then_long_side_then_bytes() {
         // Inside all three: served directly.
         assert!(grid_serves_original(2 * MB, 1200, 1200, 1024));
-        // Exactly 1.25x the tier is still direct.
+        // Exactly 1.25x the tier on the short side is still direct.
         assert!(grid_serves_original(2 * MB, 1280, 1280, 1024));
         // One pixel over is not.
         assert!(!grid_serves_original(2 * MB, 1281, 1281, 1024));
-        // Aspect over 2 never serves directly, however small.
-        assert!(!grid_serves_original(MB, 300, 900, 1024));
-        // Exactly 2 does.
+        // The long side has its own bound: 1.25 * (2 * tier) = 2560 at tier
+        // 1024. Exactly on it is direct, one pixel over is not.
+        assert!(grid_serves_original(MB, 300, 2560, 1024));
+        assert!(!grid_serves_original(MB, 300, 2561, 1024));
+        // Aspect alone decides nothing any more: a 1:3 image well inside both
+        // bounds is served directly, because the tier a crop would store is
+        // the whole picture at 2% off (the adjudicated refinement).
+        assert!(grid_serves_original(MB, 300, 900, 1024));
+        // A real strip still has a stored crop: its long side is far past the
+        // bound however narrow it is.
+        assert!(!grid_serves_original(MB, 800, 20000, 1024));
+        // Exactly 2:1 stays direct, as it always was.
         assert!(grid_serves_original(MB, 300, 600, 1024));
+        // The waste case the refinement exists for: 1000x2100 at tier 1024
+        // used to store a 1000x2048 "crop" of a 1000x2100 original.
+        assert!(grid_serves_original(2 * MB, 1000, 2100, 1024));
+        // ... and the same picture is far outside the *smaller* tier, which
+        // still stores a crop for it.
+        assert!(!grid_serves_original(2 * MB, 1000, 2100, 512));
         // Bytes over the bound do not.
         assert!(!grid_serves_original(
             GRID_DIRECT_MAX_FILE_SIZE + 1,
@@ -587,7 +621,33 @@ mod tests {
         assert!(grid_serves_original(GRID_DIRECT_MAX_FILE_SIZE, 600, 600, 1024));
         // The derived-thumbnail form drops only the byte clause.
         assert!(grid_serves_stored_thumbnail(600, 600, 1024));
-        assert!(!grid_serves_stored_thumbnail(300, 900, 1024));
+        assert!(!grid_serves_stored_thumbnail(800, 20000, 1024));
+    }
+
+    // The point of the refinement, stated as the plan does: a 1000x2100 image
+    // stores no grid-m at all (the original serves it), while an 800x20000
+    // webtoon still stores its top-strip crops at both tiers.
+    #[test]
+    fn the_long_side_bound_skips_near_identical_tiers_but_keeps_strip_crops() {
+        let plans = grid_plans(2 * MB, 1000, 2100);
+        assert_eq!(
+            plans.iter().map(|(tier, _)| *tier).collect::<Vec<_>>(),
+            vec![ThumbnailTier::GridS],
+            "grid-m must not store a 2%-smaller copy of the whole picture"
+        );
+
+        let plans = grid_plans(6 * MB, 800, 20000);
+        assert_eq!(
+            plans.iter().map(|(tier, _)| *tier).collect::<Vec<_>>(),
+            vec![ThumbnailTier::GridM, ThumbnailTier::GridS]
+        );
+        // Both are top-strip crops, exactly as before the refinement.
+        assert_eq!((plans[0].1.crop_y, plans[0].1.crop_height), (0, 2048));
+        assert_eq!((plans[0].1.width, plans[0].1.height), (800, 2048));
+        // grid-s cascades off the 800x2048 grid-m: 1600 of its rows scale to
+        // the 1024 the tier allows.
+        assert_eq!((plans[1].1.crop_y, plans[1].1.crop_height), (0, 1600));
+        assert_eq!((plans[1].1.width, plans[1].1.height), (512, 1024));
     }
 
     // The cascade selects the same source region as a direct plan would, and
@@ -667,9 +727,12 @@ mod tests {
 
         // Small enough for both: nothing is stored at all.
         assert!(grid_plans(MB, 600, 600).is_empty());
-        // ... and a strip of the same size still stores both, because a
-        // strip always has a stored crop.
-        let plans = grid_plans(MB, 200, 600);
+        // A narrow picture that is small on *both* axes is equally free —
+        // aspect on its own no longer forces a stored crop.
+        assert!(grid_plans(MB, 200, 600).is_empty());
+        // ... but a genuine strip stores both, because its long side is far
+        // past what either tier would ever hold.
+        let plans = grid_plans(MB, 200, 6000);
         assert_eq!(plans.len(), 2);
     }
 

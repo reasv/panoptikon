@@ -25,7 +25,7 @@ use crate::db::{
     index_writer::{IndexDbWriterMessage, call_index_db_writer},
     open_index_db_read,
     scan_errors::{ScanErrorRecord, get_scan_error},
-    storage::{has_frame, has_thumbnail},
+    storage::{has_frame, has_thumbnail, has_thumbnail_tiers},
     system_config::{SystemConfig, SystemConfigStore},
 };
 use crate::jobs::dir_poller::{
@@ -33,7 +33,8 @@ use crate::jobs::dir_poller::{
 };
 use crate::jobs::files::{
     FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, SCAN_PROGRESS_INTERVAL, ScanOptions,
-    ScanTimers, THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data,
+    ScanTimers, THUMBNAIL_PROCESS_VERSION, TIER_PROCESS_VERSION, build_extension_set,
+    build_file_scan_data,
     check_folder_validity, current_iso_timestamp, deduplicate_paths, folder_is_empty,
     format_system_time, get_last_modified_time_and_size, has_allowed_extension, infer_mime_type,
     is_excluded, is_hidden_or_temp, is_under_junk_dir, normalize_path, override_mime_from_content,
@@ -1518,12 +1519,21 @@ impl Actor for ContinuousScanActor {
                 // positive-cache guard: the write replaces the item's whole
                 // set, so identical content racing it rewrites the same bytes
                 // rather than colliding.
-                if !file_data.tiers.is_empty() {
+                //
+                // An empty set is skipped only when there is also nothing
+                // stored to contradict: `storage.thumbnail_tiers` is keyed by
+                // content hash and outlives a deindexed item until the orphan
+                // sweep, so content that reappears can meet a set from an
+                // older rule here. Mirrors `handle_new_item`.
+                let tiers_stored = has_thumbnail_tiers(&mut conn, &file_data.sha256)
+                    .await
+                    .unwrap_or(false);
+                if !file_data.tiers.is_empty() || tiers_stored {
                     let _ = call_index_db_writer(&state.index_db, |reply| {
                         IndexDbWriterMessage::StoreThumbnailTiers {
                             sha256: file_data.sha256.clone(),
                             mime_type: file_data.mime_type.clone(),
-                            process_version: THUMBNAIL_PROCESS_VERSION,
+                            process_version: TIER_PROCESS_VERSION,
                             tiers: file_data.tiers.clone(),
                             reply,
                         }
