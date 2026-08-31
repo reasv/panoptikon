@@ -530,8 +530,13 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
     }
     // Animated images are step B2's, which will store *loops* where nothing
     // is stored today. Treating today's absence as final would pin the
-    // static fall-up straight through that upgrade.
-    if item.duration.is_some_and(|seconds| seconds > 0.0) {
+    // static fall-up straight through that upgrade. GRID tiers only: the
+    // display path keeps serving what it serves today (same reasoning as the
+    // GIF line above — the one real display transition, `display_plan`
+    // flipping to Thumbnail for a huge animated file, is caught below), so
+    // guarding Display here would only cost a revalidation per animated
+    // image per gallery load, forever, protecting nothing.
+    if size != ThumbnailTier::Display && item.duration.is_some_and(|seconds| seconds > 0.0) {
         return false;
     }
     let (Some(width), Some(height), Some(file_size)) = (item.width, item.height, item.size) else {
@@ -1683,6 +1688,23 @@ VALUES (?1, 0, 'image/jpeg', 9000, 1000, 1, ?2)
             display_cache_control(&mut index_conn, &item, &file).await,
             CACHE_REVALIDATE
         );
+
+        // An animated non-GIF (WebP/AVIF) whose display rule serves the
+        // original: B2 changes its GRID answers (loops), never its display
+        // answer, so the default path keeps its immutability — the animated
+        // guard applies to grid tiers only. Its grid tier, by contrast,
+        // revalidates until B2 stores the loop.
+        item.mime_type = "image/webp".to_string();
+        item.duration = Some(2.0);
+        item.width = Some(1400);
+        item.height = Some(1400);
+        item.size = Some(500 * 1024);
+        assert_eq!(
+            display_cache_control(&mut index_conn, &item, &file).await,
+            CACHE_IMMUTABLE,
+            "animated display path keeps pre-ladder immutability"
+        );
+        assert!(!tier_fall_up_is_final(&item, ThumbnailTier::GridM));
 
         // A GIF's display answer is the original file and always will be —
         // B2 retires the short-circuit for tier requests only — so it keeps
