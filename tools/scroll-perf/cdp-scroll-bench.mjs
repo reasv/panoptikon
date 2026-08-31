@@ -1,0 +1,325 @@
+#!/usr/bin/env node
+// CDP scroll benchmark driver (grid scroll performance harness).
+//
+// Drives a constant-velocity rAF scroll inside a page's scroll viewport over a
+// Chrome DevTools Protocol connection and reports frame-time statistics, long
+// tasks, DOM churn, network volume and JS heap delta. Optionally records a
+// DevTools trace and attributes self-time per event name.
+//
+// Requires nothing but Node >= 20 built-ins (global fetch + WebSocket).
+//
+// Usage:
+//   node cdp-scroll-bench.mjs --port 9231 --url http://127.0.0.1:8777/?mode=t1024
+//        [--velocity 4000] [--ms 8000] [--dir down|up] [--settle 3000]
+//        [--reset] [--warm] [--pulse] [--blockImages] [--blockPattern <glob>]
+//        [--selector '#scroller'] [--target <url-substring>] [--trace out.json]
+//
+// Prints one JSON object to stdout. See README.md for how to read it.
+//
+// TRAP: requestAnimationFrame is throttled to a standstill when the browser
+// window is occluded, minimized or in a hidden tab. The measured window must be
+// visible on screen and the browser launched with background throttling off --
+// see README.md "Launching the instrumented browser".
+
+const args = {};
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a.startsWith('--')) {
+    const k = a.slice(2);
+    const next = process.argv[i + 1];
+    if (next && !next.startsWith('--')) { args[k] = next; i++; } else args[k] = true;
+  }
+}
+
+if (args.help || args.h) {
+  console.log(`cdp-scroll-bench.mjs -- constant-velocity scroll benchmark over CDP
+
+  --port <n>           CDP port of the instrumented browser (default 9223)
+  --url <url>          navigate before measuring (otherwise measures the open page)
+  --target <substr>    pick the page target whose URL contains this substring
+  --selector <css>     scroll viewport element (default: auto-detect)
+  --velocity <px/s>    scroll speed (default 4000)
+  --ms <ms>            measurement duration (default 8000)
+  --dir down|up        scroll direction (default down; 'up' pre-seeks to the end)
+  --settle <ms>        wait after navigation / pre-seek (default 3000)
+  --reset              scrollTop = 0 before measuring
+  --warm               slow pre-scroll over the range first (warm caches), then measure
+  --pulse              scroll 600ms of every 1100ms instead of continuously
+  --blockImages        block image requests via CDP (isolates JS cost)
+  --blockPattern <g>   override the blocked URL patterns (comma-separated globs)
+  --allowHidden        measure even if the window is hidden (results are junk)
+  --trace [file]       record a DevTools trace; with a filename, also save it`);
+  process.exit(0);
+}
+
+const port = args.port || '9223';
+const velocity = Number(args.velocity || 4000);
+const ms = Number(args.ms || 8000);
+const dir = args.dir === 'up' ? 'up' : 'down';
+const settle = Number(args.settle || 3000);
+const selector = typeof args.selector === 'string' ? args.selector : null;
+
+const DEFAULT_BLOCK = ['*/api/items/item/thumbnail*', '*/img/*'];
+const blockPatterns = typeof args.blockPattern === 'string'
+  ? args.blockPattern.split(',').map(s => s.trim()).filter(Boolean)
+  : DEFAULT_BLOCK;
+
+function fail(msg) { console.error(msg); process.exit(1); }
+
+let targets;
+try {
+  targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+} catch (e) {
+  fail(`cannot reach CDP on 127.0.0.1:${port} (${e.message}). Is the instrumented browser running?`);
+}
+
+const pages = targets.filter(t => t.type === 'page' && !t.url.startsWith('devtools://'));
+if (!pages.length) fail('no page target on this CDP endpoint');
+
+// Prefer an explicit --target substring, then a page already on --url's origin,
+// then the first page target (typically the about:blank we will navigate).
+let originHint = null;
+if (typeof args.url === 'string') { try { originHint = new URL(args.url).host; } catch { /* ignore */ } }
+const page =
+  (typeof args.target === 'string' && pages.find(t => t.url.includes(args.target))) ||
+  (originHint && pages.find(t => t.url.includes(originHint))) ||
+  pages[0];
+
+const ws = new WebSocket(page.webSocketDebuggerUrl);
+await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+
+let msgId = 0;
+const pending = new Map();
+const eventHandlers = new Map();
+ws.onmessage = (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.id && pending.has(m.id)) {
+    const { res, rej } = pending.get(m.id);
+    pending.delete(m.id);
+    if (m.error) rej(new Error(m.error.message)); else res(m.result);
+  } else if (m.method && eventHandlers.has(m.method)) {
+    eventHandlers.get(m.method)(m.params);
+  }
+};
+function send(method, params = {}) {
+  return new Promise((res, rej) => {
+    const id = ++msgId;
+    pending.set(id, { res, rej });
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+}
+async function evalJs(expr, timeoutMs = 120000) {
+  const r = await Promise.race([
+    send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('eval timeout')), timeoutMs)),
+  ]);
+  if (r.exceptionDetails) throw new Error('page exception: ' + JSON.stringify(r.exceptionDetails).slice(0, 800));
+  return r.result.value;
+}
+const sleep = (t) => new Promise(r => setTimeout(r, t));
+
+await send('Page.enable');
+await send('Network.enable');
+// Un-minimize and raise the window/tab: rAF is throttled to a standstill (and
+// layout is suspended) while the window is minimized or occluded.
+async function raiseWindow() {
+  try {
+    const { windowId, bounds } = await send('Browser.getWindowForTarget', { targetId: page.id });
+    if (bounds.windowState === 'minimized') {
+      await send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+    }
+  } catch { /* not a browser exposing Browser.* -- the visibility check still guards */ }
+  await send('Page.bringToFront').catch(() => {});
+}
+await raiseWindow();
+if (args.blockImages) {
+  await send('Network.setBlockedURLs', { urls: blockPatterns });
+}
+
+if (typeof args.url === 'string') {
+  const loaded = new Promise(res => { eventHandlers.set('Page.loadEventFired', res); });
+  await send('Page.navigate', { url: args.url });
+  await Promise.race([loaded, sleep(15000)]);
+  await sleep(settle);
+}
+
+// Fail fast rather than hang in a throttled rAF loop for a minute. On a shared
+// desktop the window can be minimized between runs, so retry the raise a few
+// times before giving up. Do this BEFORE any layout-forcing eval: a minimized
+// window suspends layout and Runtime.evaluate can block indefinitely.
+let visibility = await evalJs(`document.visibilityState`, 15000);
+for (let i = 0; i < 5 && visibility !== 'visible'; i++) {
+  await raiseWindow();
+  await sleep(600);
+  visibility = await evalJs(`document.visibilityState`, 15000);
+}
+if (visibility !== 'visible' && !args.allowHidden) {
+  fail(`document.visibilityState is "${visibility}": the measured window is hidden, minimized or occluded.\n` +
+    'requestAnimationFrame is throttled to a standstill in that state, so frame times would be meaningless.\n' +
+    'Raise the browser window on screen and re-run (see README.md), or pass --allowHidden to measure anyway.');
+}
+
+// Install the in-page harness. The viewport is either the --selector element or
+// auto-detected: the first tall (>1e5px) scrollable div, falling back to the
+// largest scrollable div, falling back to the document scroller.
+await evalJs(`
+window.__viewport = (() => {
+  const explicit = ${JSON.stringify(selector)};
+  if (explicit) {
+    const el = document.querySelector(explicit);
+    if (!el) throw new Error('no element matches selector ' + explicit);
+    return el;
+  }
+  const scrollables = [...document.querySelectorAll('div')].filter(
+    el => ['auto','scroll'].includes(getComputedStyle(el).overflowY) && el.scrollHeight > el.clientHeight + 1);
+  return scrollables.find(el => el.scrollHeight > 1e5)
+      || scrollables.sort((a,b) => b.scrollHeight - a.scrollHeight)[0]
+      || document.scrollingElement;
+})();
+window.__measure = async function(velocity, ms){
+  const el = window.__viewport;
+  const frames=[]; const longtasks=[]; let added=0, removed=0;
+  const po = new PerformanceObserver(l=>{ for(const e of l.getEntries()) longtasks.push(Math.round(e.duration)); });
+  po.observe({type:'longtask'});
+  const mo = new MutationObserver(muts=>{ for(const m of muts){ added+=m.addedNodes.length; removed+=m.removedNodes.length; } });
+  mo.observe(document.body,{childList:true,subtree:true});
+  const res0 = performance.getEntriesByType('resource').length;
+  const heap0 = performance.memory ? performance.memory.usedJSHeapSize : 0;
+  const scrollTop0 = Math.round(el.scrollTop);
+  const t0 = performance.now(); let lastT = t0; let lastFrame = t0;
+  const pulse = ${args.pulse ? 'true' : 'false'};
+  await new Promise(resolve=>{
+    function step(t){
+      frames.push(t-lastFrame); lastFrame=t;
+      const dt=Math.min(t-lastT, 100); lastT=t;
+      const phase = (t-t0) % 1100;
+      const active = !pulse || phase < 600;
+      if(active) el.scrollTop += velocity*dt/1000;
+      if(t-t0<ms) requestAnimationFrame(step); else resolve();
+    }
+    requestAnimationFrame(step);
+  });
+  await new Promise(r=>setTimeout(r,300));
+  po.disconnect(); mo.disconnect();
+  const resEntries = performance.getEntriesByType('resource').slice(res0);
+  const kb = Math.round(resEntries.reduce((a,r)=>a+r.transferSize,0)/1024);
+  frames.shift();
+  const sorted=[...frames].sort((a,b)=>a-b);
+  const q=p=>Math.round((sorted[Math.floor(p*sorted.length)]||0)*10)/10;
+  return {
+    scrollTopStart: scrollTop0,
+    scrollTopEnd: Math.round(el.scrollTop),
+    frames: frames.length, meanMs: Math.round(frames.reduce((a,b)=>a+b,0)/Math.max(1,frames.length)*10)/10,
+    p50:q(.5), p90:q(.9), p99:q(.99), maxMs: Math.round(sorted[sorted.length-1]||0),
+    framesOver32: frames.filter(f=>f>32).length, framesOver100: frames.filter(f=>f>100).length,
+    longtaskCount: longtasks.length, longtaskTotalMs: longtasks.reduce((a,b)=>a+b,0), longtaskTop: [...longtasks].sort((a,b)=>b-a).slice(0,8),
+    buckets: (()=>{ const B=[]; const per=Math.ceil(frames.length/Math.max(1,Math.round(ms/5000))); for(let i=0;i<frames.length;i+=per){ const s=[...frames.slice(i,i+per)].sort((a,b)=>a-b); B.push({p90:Math.round((s[Math.floor(.9*s.length)]||0)*10)/10, max:Math.round(s[s.length-1]||0), over32:s.filter(f=>f>32).length}); } return B; })(),
+    domAdded: added, domRemoved: removed,
+    netReqs: resEntries.length, netKB: kb,
+    heapMB: performance.memory ? Math.round(performance.memory.usedJSHeapSize/1048576) : null,
+    heapDeltaMB: performance.memory ? Math.round((performance.memory.usedJSHeapSize-heap0)/1048576) : null
+  };
+};
+'ok'`);
+
+if (args.reset) { await evalJs(`window.__viewport.scrollTop = 0; 'ok'`); await sleep(1500); }
+
+if (args.warm) {
+  // Slow pre-scroll over the measurement range to warm caches/chunks, then
+  // return to the start. Makes the "warm re-scroll" scenario reproducible.
+  await evalJs(`(async () => {
+    const el = window.__viewport; el.scrollTop = 0;
+    const target = ${velocity} * ${ms} / 1000;
+    for (let y = 0; y <= target; y += 600) { el.scrollTop = y; await new Promise(r=>setTimeout(r,120)); }
+    await new Promise(r=>setTimeout(r,3000));
+    return 'warmed to ' + el.scrollTop;
+  })()`, 300000);
+}
+
+if (dir === 'up') {
+  const dist = velocity * ms / 1000;
+  await evalJs(`window.__viewport.scrollTop = ${dist}; 'ok'`);
+  await sleep(settle);
+}
+
+const info = await evalJs(`({vp: innerWidth+'x'+innerHeight, dpr: devicePixelRatio, sh: window.__viewport.scrollHeight, imgs: document.querySelectorAll('img').length, visibility: document.visibilityState,
+  imgSample: [...document.querySelectorAll('img')].slice(0,6).map(i=>i.naturalWidth+'x'+i.naturalHeight),
+  megapixelsMounted: Math.round([...document.querySelectorAll('img')].reduce((a,i)=>a+i.naturalWidth*i.naturalHeight,0)/1e6)})`);
+
+let traceP = null;
+if (args.trace) {
+  const cats = ['devtools.timeline', 'disabled-by-default-devtools.timeline', 'disabled-by-default-devtools.timeline.frame', 'v8.execute', 'blink.user_timing'].join(',');
+  traceP = new Promise(res => { eventHandlers.set('Tracing.tracingComplete', p => res(p)); });
+  await send('Tracing.start', { categories: cats, transferMode: 'ReturnAsStream' });
+}
+
+const vel = dir === 'up' ? -velocity : velocity;
+await raiseWindow();
+const result = await evalJs(`window.__measure(${vel}, ${ms})`, ms + 60000);
+
+// An occluded (as opposed to minimized) window keeps visibilityState 'visible'
+// while Chromium stops servicing rAF entirely, so the only tell is the frame
+// count. Anything under ~10 fps average is not a measurement.
+if (result.frames < ms / 100) {
+  console.error(`WARNING: only ${result.frames} frames in ${ms}ms -- requestAnimationFrame was throttled.\n` +
+    'The measured window was almost certainly covered by another window. Bring it fully to the front\n' +
+    '(and launch with --disable-features=CalculateNativeWinOcclusion) before trusting any of this.');
+}
+
+let traceSummary = null;
+if (args.trace) {
+  await send('Tracing.end');
+  const complete = await traceP;
+  const streamHandle = complete.stream;
+  let data = '';
+  while (true) {
+    const chunk = await send('IO.read', { handle: streamHandle, size: 5_000_000 });
+    data += chunk.base64Encoded ? Buffer.from(chunk.data, 'base64').toString('utf8') : chunk.data;
+    if (chunk.eof) break;
+  }
+  await send('IO.close', { handle: streamHandle });
+  const trace = JSON.parse(data);
+  const events = trace.traceEvents || trace;
+  // Self-time attribution per event name: subtract nested children's duration
+  // from each complete ('X') event, summed per name across all threads.
+  const byThread = new Map();
+  for (const e of events) {
+    if (e.ph !== 'X' || !e.dur) continue;
+    const key = e.pid + ':' + e.tid;
+    if (!byThread.has(key)) byThread.set(key, []);
+    byThread.get(key).push(e);
+  }
+  const selfByName = new Map();
+  for (const evs of byThread.values()) {
+    evs.sort((a, b) => a.ts - b.ts || b.dur - a.dur);
+    const stack = [];
+    for (const e of evs) {
+      while (stack.length && stack[stack.length - 1].ts + stack[stack.length - 1].dur <= e.ts) stack.pop();
+      if (stack.length) {
+        const parent = stack[stack.length - 1];
+        parent.childDur = (parent.childDur || 0) + Math.min(e.dur, parent.ts + parent.dur - e.ts);
+      }
+      stack.push(e);
+    }
+    for (const e of evs) {
+      const self = Math.max(0, e.dur - (e.childDur || 0));
+      selfByName.set(e.name, (selfByName.get(e.name) || 0) + self);
+    }
+  }
+  traceSummary = [...selfByName.entries()]
+    .map(([name, us]) => [name, Math.round(us / 1000)])
+    .filter(([, ms2]) => ms2 >= 5)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 30);
+  if (typeof args.trace === 'string') {
+    const fs = await import('fs');
+    fs.writeFileSync(args.trace, data);
+  }
+}
+
+console.log(JSON.stringify({
+  scenario: { url: typeof args.url === 'string' ? args.url : page.url, dir, velocity, ms, blockImages: !!args.blockImages, warm: !!args.warm, pulse: !!args.pulse },
+  info, result, traceSummaryMs: traceSummary,
+}, null, 1));
+ws.close();
+process.exit(0);
