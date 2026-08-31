@@ -36,7 +36,13 @@ const ROW_H = CELL_H + 16;
 const ROWS = Number(Q.get('rows') || Math.max(400, Math.ceil(120000 / ROW_H)));
 const NOCACHE = Q.get('nocache') ? '&n=' + Math.random().toString(36).slice(2) : '';
 
-// full   = originals, the worst case today's serve-directly policy allows
+// full   = the four originals. The three JPEGs are the worst case today's
+//          serve-directly policy allows through (<= 5 MB at any dimensions);
+//          png-16mp.png (7.6 MB, 4600x3500) is NOT -- it is over the byte cap
+//          and over 4096 wide, so today it would be thumbnailed. It is kept as
+//          an upper bound on decode cost (and for comparability with the
+//          recorded baselines), so read this mode as "originals + one
+//          over-the-rule upper bound", not as four of today's served files.
 // t4096  = today's stored thumbs (LONG side capped at 4096)
 // t1024  = proposed grid-m tier (SHORT side 1024)
 // t512   = proposed grid-s tier (SHORT side 512)

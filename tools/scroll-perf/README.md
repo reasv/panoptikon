@@ -21,7 +21,7 @@ no dependencies. `ffmpeg`/`ffprobe` on PATH are needed only by `gen-images.mjs`.
 | file | what it is |
 |---|---|
 | `cdp-scroll-bench.mjs` | the driver: one scenario, one JSON object on stdout |
-| `run-matrix.mjs` | runs a whole scenario matrix, prints a markdown table |
+| `run-matrix.mjs` | runs a whole scenario matrix, prints a markdown table (`mean p50 p90 p99 max frames …`, plus a warning when rows' p50s disagree) |
 | `server.mjs` | static server for the synthetic page (default port 8777) |
 | `grid.html` | the synthetic virtualized grid |
 | `gen-images.mjs` | generates the synthetic image set into `imgtest/` |
@@ -82,8 +82,18 @@ node server.mjs --port 8777 &             # leave running
 node run-matrix.mjs synthetic --port 9231
 ```
 
+The matrix name is positional in any position (`run-matrix.mjs --port 9231
+synthetic` works too), can be given as `--matrix synthetic`, and defaults to
+`synthetic`. Any other flag is forwarded to every run.
+
 That is the whole baseline table of the plan's §1: originals / today's 4096px
 thumbs / grid-m 1024 / grid-s 512, each cold-down and warm-up.
+
+Every cold row passes `--reset`, and `--reset` issues CDP
+`Network.clearBrowserCache` before navigating. That is what keeps cold rows cold
+in a **reused** browser: without it the second and later runs would be served
+from the disk cache (`netKB` collapsing to ~0) and would quietly be warm runs
+wearing a cold label. Cookies are untouched.
 
 Single scenarios, for iterating:
 
@@ -103,13 +113,27 @@ cold-transfer runs).
 
 | file | dims | bytes | what it stands for |
 |---|---|---|---|
-| `jpeg-12mp.jpg` | 4000×3000 | ~1.1 MB | ordinary large photo |
-| `jpeg-33mp.jpg` | 7000×4700 | ~1.9 MB | high-res scan |
+| `jpeg-12mp.jpg` | 4000×3000 | ~1.1 MB | ordinary large photo — served directly today |
+| `jpeg-33mp.jpg` | 7000×4700 | ~1.9 MB | high-res scan — served directly today |
 | `jpeg-100mp.jpg` | 12000×8300 | ~3.0 MB | the ≤5 MB-any-dimensions serve-directly hole |
-| `png-16mp.png` | 4600×3500 | ~7.6 MB | PNG decode cost |
+| `png-16mp.png` | 4600×3500 | ~7.6 MB | **over** today's rule — decode-cost upper bound |
 | `t4096-*.jpg` | long side ≤ 4096 | ~1.1–1.2 MB | what panoptikon stores **today** |
 | `t1024-*.jpg` | short side 1024 | ~0.2 MB | proposed `grid-m` |
 | `t512-*.jpg` | short side 512 | ~0.06 MB | proposed `grid-s` |
+
+Read `mode=full` honestly: the three JPEGs are all within today's
+serve-directly rule, but `png-16mp.png` is not — at 7.6 MB and 4600 px wide it
+is over both the ≤5 MB byte cap and the 4096 px dimension bound, so today it
+would be thumbnailed rather than served. It stays in the set as an **upper
+bound on decode cost** (and because the recorded baselines were measured with
+it); the image set is deliberately never regenerated or resized, so those
+baselines stay comparable.
+
+The PNG is also low-entropy — ~0.47 B/px, against 25–45 MB for a real
+photographic 16 MP PNG — so its zlib-inflate cost is under-represented by
+roughly 4–6×. The dimension-driven costs (unfilter, the 64 MB RGBA surface, GPU
+upload, resample) are fully represented. Do not read the PNG row as a
+byte-cost datapoint.
 
 Verify a regeneration with `ffprobe -v error -select_streams v:0 -show_entries
 stream=width,height -of csv=p=0 imgtest/<file>`.
@@ -146,7 +170,7 @@ node cdp-scroll-bench.mjs --port 9231 \
 ## Driver flags
 
 ```
---port <n>         CDP port of the instrumented browser (default 9223)
+--port <n>         CDP port of the instrumented browser (default 9231)
 --url <url>        navigate before measuring (otherwise measures the open page)
 --target <substr>  pick the page target whose URL contains this substring
 --selector <css>   scroll viewport element (default: auto-detect)
@@ -154,14 +178,20 @@ node cdp-scroll-bench.mjs --port 9231 \
 --ms <ms>          measurement duration (default 8000)
 --dir down|up      direction; 'up' pre-seeks to the end first
 --settle <ms>      wait after navigation / pre-seek (default 3000)
---reset            scrollTop = 0 before measuring (cold run)
---warm             slow pre-scroll over the range, then measure (warm run)
+--reset            clear the HTTP cache and scrollTop = 0 before measuring (cold run)
+--warm             slow pre-scroll over the range, then measure (warm run; --dir up only)
 --pulse            scroll 600ms of every 1100ms (start/stop, not continuous)
 --blockImages      block image requests via CDP -- isolates JS cost
 --blockPattern <g> override the blocked globs (default: gateway thumbnails + /img/)
 --allowHidden      measure even if the window is hidden (results are junk)
 --trace [file]     record a DevTools trace; with a filename, also save it
+                   (e.g. --trace trace-out.json -- gitignored)
 ```
+
+`--warm` pairs only with `--dir up`: the warming pre-scroll ends at the **end**
+of the range, which is where an up-run starts. `--warm --dir down` is an error
+rather than a silently mismatched run; for a warm down-run, run the same down
+scenario twice without `--reset`.
 
 The viewport auto-detector picks the first scrollable `div` taller than 100 000
 px, falling back to the tallest scrollable `div`, falling back to the document
@@ -180,9 +210,17 @@ scroller. That finds panoptikon's results pane and the synthetic page's
   "megapixelsMounted": 976,   // sum of naturalWidth*naturalHeight -- THE cost driver
   "imgSample": ["12000x8300", ...]  // what the cells actually loaded
  },
- "result": { ... }
+ "result": { "megapixelsMountedMid": 1240, ... }  // same sum, sampled mid-run
 }
 ```
+
+> **`megapixelsMounted` is a start-of-run snapshot; don't compare it across
+> directions.** A `--reset` down-run starts at `scrollTop = 0`, where the row
+> window is clamped at the top of the document and therefore mounts roughly half
+> the rows a mid-document run does. An up-run starts pre-seeked into the middle
+> of the document with a full window. `result.megapixelsMountedMid`, sampled at
+> the measurement midpoint, is the fair cross-direction number; the start
+> snapshot is kept unchanged for continuity with earlier runs.
 
 **`meanMs` / `p50` / `p90` / `p99` / `maxMs`** — interval between consecutive
 rAF callbacks. The first frame is dropped (it carries navigation cost).
@@ -214,9 +252,16 @@ GC landed inside the window.
 
 **`domAdded` / `domRemoved`** — mutation counts, i.e. remount churn.
 
-**`netReqs` / `netKB`** — resource-timing entries created during the run and
-their transfer size. Zero KB with unchanged frame times is the crucial fact
-about warm scrolling: the cache kills the transfer, not the decode.
+**`netReqs` / `netKB`** — *all* resource-timing entries created during the run
+and their transfer size (images included). Zero KB with unchanged frame times is
+the crucial fact about warm scrolling: the cache kills the transfer, not the
+decode.
+
+**`apiReqs` / `apiKB`** — the same two numbers filtered to URLs containing
+`/api/`, i.e. the gateway's search/metadata traffic with the image bytes
+excluded. The request/KB figures quoted in the earlier investigation session
+were this `/api/`-filtered pair, not the unfiltered one — compare like with
+like.
 
 **`traceSummaryMs`** (with `--trace`) — top 30 trace event names by *self* time
 in ms, nesting subtracted. `ImageDecodeTask` / `Decode Image` dominating means

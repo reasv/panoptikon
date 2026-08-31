@@ -12,7 +12,8 @@
 //   node cdp-scroll-bench.mjs --port 9231 --url http://127.0.0.1:8777/?mode=t1024
 //        [--velocity 4000] [--ms 8000] [--dir down|up] [--settle 3000]
 //        [--reset] [--warm] [--pulse] [--blockImages] [--blockPattern <glob>]
-//        [--selector '#scroller'] [--target <url-substring>] [--trace out.json]
+//        [--selector '#scroller'] [--target <url-substring>]
+//        [--trace trace-out.json]
 //
 // Prints one JSON object to stdout. See README.md for how to read it.
 //
@@ -24,6 +25,7 @@
 const args = {};
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
+  if (a === '-h') { args.help = true; continue; }
   if (a.startsWith('--')) {
     const k = a.slice(2);
     const next = process.argv[i + 1];
@@ -34,7 +36,7 @@ for (let i = 2; i < process.argv.length; i++) {
 if (args.help || args.h) {
   console.log(`cdp-scroll-bench.mjs -- constant-velocity scroll benchmark over CDP
 
-  --port <n>           CDP port of the instrumented browser (default 9223)
+  --port <n>           CDP port of the instrumented browser (default 9231)
   --url <url>          navigate before measuring (otherwise measures the open page)
   --target <substr>    pick the page target whose URL contains this substring
   --selector <css>     scroll viewport element (default: auto-detect)
@@ -42,17 +44,18 @@ if (args.help || args.h) {
   --ms <ms>            measurement duration (default 8000)
   --dir down|up        scroll direction (default down; 'up' pre-seeks to the end)
   --settle <ms>        wait after navigation / pre-seek (default 3000)
-  --reset              scrollTop = 0 before measuring
-  --warm               slow pre-scroll over the range first (warm caches), then measure
+  --reset              clear the HTTP cache and scrollTop = 0 before measuring
+  --warm               slow pre-scroll over the range first (warm caches), then measure (--dir up only)
   --pulse              scroll 600ms of every 1100ms instead of continuously
   --blockImages        block image requests via CDP (isolates JS cost)
   --blockPattern <g>   override the blocked URL patterns (comma-separated globs)
   --allowHidden        measure even if the window is hidden (results are junk)
-  --trace [file]       record a DevTools trace; with a filename, also save it`);
+  --trace [file]       record a DevTools trace; with a filename, also save it
+                       (e.g. --trace trace-out.json -- gitignored)`);
   process.exit(0);
 }
 
-const port = args.port || '9223';
+const port = args.port || '9231';
 const velocity = Number(args.velocity || 4000);
 const ms = Number(args.ms || 8000);
 const dir = args.dir === 'up' ? 'up' : 'down';
@@ -65,6 +68,14 @@ const blockPatterns = typeof args.blockPattern === 'string'
   : DEFAULT_BLOCK;
 
 function fail(msg) { console.error(msg); process.exit(1); }
+
+// The pre-scroll leaves the viewport at the END of the range, which is the
+// start of an up-scroll -- there is no warm variant of a down-scroll.
+if (args.warm && args.dir !== 'up') {
+  fail('--warm only pairs with --dir up: the warming pre-scroll ends at the END of the range,\n' +
+    'which is exactly where an up-run starts.\n' +
+    'For a warm down-run, run the same down scenario twice without --reset.');
+}
 
 let targets;
 try {
@@ -136,6 +147,17 @@ if (args.blockImages) {
   await send('Network.setBlockedURLs', { urls: blockPatterns });
 }
 
+// A "cold" run is only cold if the HTTP cache is empty. In a reused browser the
+// second run onwards would otherwise serve every image from the disk cache,
+// silently turning cold rows warm (netKB collapses to ~0). Done before the
+// navigation so the first screenful is cold too. Cookies are irrelevant to this
+// harness, so Network.clearBrowserCookies is deliberately not issued.
+if (args.reset) {
+  await send('Network.clearBrowserCache').catch(e => {
+    console.error(`WARNING: Network.clearBrowserCache failed (${e.message}) -- "cold" rows may be cache-warm.`);
+  });
+}
+
 if (typeof args.url === 'string') {
   const loaded = new Promise(res => { eventHandlers.set('Page.loadEventFired', res); });
   await send('Page.navigate', { url: args.url });
@@ -147,11 +169,23 @@ if (typeof args.url === 'string') {
 // desktop the window can be minimized between runs, so retry the raise a few
 // times before giving up. Do this BEFORE any layout-forcing eval: a minimized
 // window suspends layout and Runtime.evaluate can block indefinitely.
-let visibility = await evalJs(`document.visibilityState`, 15000);
-for (let i = 0; i < 5 && visibility !== 'visible'; i++) {
-  await raiseWindow();
-  await sleep(600);
-  visibility = await evalJs(`document.visibilityState`, 15000);
+// A minimized window can make even this probe hang, so a timeout or a failed
+// eval is itself evidence of a bad state: report it as visibility "unknown" and
+// route through the same friendly failure instead of an unhandled rejection.
+async function probeVisibility() {
+  try {
+    return await evalJs(`document.visibilityState`, 15000);
+  } catch {
+    return 'unknown';
+  }
+}
+let visibility = await probeVisibility();
+if (!args.allowHidden) {
+  for (let i = 0; i < 5 && visibility !== 'visible'; i++) {
+    await raiseWindow();
+    await sleep(600);
+    visibility = await probeVisibility();
+  }
 }
 if (visibility !== 'visible' && !args.allowHidden) {
   fail(`document.visibilityState is "${visibility}": the measured window is hidden, minimized or occluded.\n` +
@@ -186,6 +220,12 @@ window.__measure = async function(velocity, ms){
   const res0 = performance.getEntriesByType('resource').length;
   const heap0 = performance.memory ? performance.memory.usedJSHeapSize : 0;
   const scrollTop0 = Math.round(el.scrollTop);
+  // Mid-run mounted-megapixels sample. At scrollTop=0 the row window is clamped
+  // at the top, so the start-of-run snapshot in info.megapixelsMounted under-
+  // counts a cold down-run relative to a mid-document up-run.
+  const mp = () => Math.round([...document.querySelectorAll('img')].reduce((a,i)=>a+i.naturalWidth*i.naturalHeight,0)/1e6);
+  let megapixelsMountedMid = null;
+  const midTimer = setTimeout(()=>{ megapixelsMountedMid = mp(); }, Math.round(ms/2));
   const t0 = performance.now(); let lastT = t0; let lastFrame = t0;
   const pulse = ${args.pulse ? 'true' : 'false'};
   await new Promise(resolve=>{
@@ -200,9 +240,14 @@ window.__measure = async function(velocity, ms){
     requestAnimationFrame(step);
   });
   await new Promise(r=>setTimeout(r,300));
+  clearTimeout(midTimer);
   po.disconnect(); mo.disconnect();
   const resEntries = performance.getEntriesByType('resource').slice(res0);
   const kb = Math.round(resEntries.reduce((a,r)=>a+r.transferSize,0)/1024);
+  // netReqs/netKB are ALL resources; apiReqs/apiKB are the /api/ subset (what
+  // the session-era numbers reported).
+  const apiEntries = resEntries.filter(r=>r.name.includes('/api/'));
+  const apiKb = Math.round(apiEntries.reduce((a,r)=>a+r.transferSize,0)/1024);
   frames.shift();
   const sorted=[...frames].sort((a,b)=>a-b);
   const q=p=>Math.round((sorted[Math.floor(p*sorted.length)]||0)*10)/10;
@@ -215,7 +260,9 @@ window.__measure = async function(velocity, ms){
     longtaskCount: longtasks.length, longtaskTotalMs: longtasks.reduce((a,b)=>a+b,0), longtaskTop: [...longtasks].sort((a,b)=>b-a).slice(0,8),
     buckets: (()=>{ const B=[]; const per=Math.ceil(frames.length/Math.max(1,Math.round(ms/5000))); for(let i=0;i<frames.length;i+=per){ const s=[...frames.slice(i,i+per)].sort((a,b)=>a-b); B.push({p90:Math.round((s[Math.floor(.9*s.length)]||0)*10)/10, max:Math.round(s[s.length-1]||0), over32:s.filter(f=>f>32).length}); } return B; })(),
     domAdded: added, domRemoved: removed,
+    megapixelsMountedMid,
     netReqs: resEntries.length, netKB: kb,
+    apiReqs: apiEntries.length, apiKB: apiKb,
     heapMB: performance.memory ? Math.round(performance.memory.usedJSHeapSize/1048576) : null,
     heapDeltaMB: performance.memory ? Math.round((performance.memory.usedJSHeapSize-heap0)/1048576) : null
   };
@@ -225,8 +272,9 @@ window.__measure = async function(velocity, ms){
 if (args.reset) { await evalJs(`window.__viewport.scrollTop = 0; 'ok'`); await sleep(1500); }
 
 if (args.warm) {
-  // Slow pre-scroll over the measurement range to warm caches/chunks, then
-  // return to the start. Makes the "warm re-scroll" scenario reproducible.
+  // Slow pre-scroll over the measurement range to warm caches/chunks. It ENDS
+  // at the end of the range, which is exactly where the up-run starts -- hence
+  // --warm requires --dir up. Makes the "warm re-scroll" scenario reproducible.
   await evalJs(`(async () => {
     const el = window.__viewport; el.scrollTop = 0;
     const target = ${velocity} * ${ms} / 1000;

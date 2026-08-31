@@ -7,11 +7,15 @@
 // (imgtest/ is gitignored) -- never commit the binaries.
 //
 // What it produces
-//   Originals -- the worst case today's serve-directly policy allows through:
-//     jpeg-12mp.jpg   4000x3000    ~1 MB
-//     jpeg-33mp.jpg   7000x4700    <3 MB
-//     jpeg-100mp.jpg  12000x8300   <3 MB   (the "2.9 MB 100 MP" hole)
-//     png-16mp.png    4600x3500    ~7 MB
+//   Originals -- three of them are the worst case today's serve-directly policy
+//   allows through (<= 5 MB at any dimensions); the PNG is NOT:
+//     jpeg-12mp.jpg   4000x3000    ~1 MB   served directly today
+//     jpeg-33mp.jpg   7000x4700    <3 MB   served directly today
+//     jpeg-100mp.jpg  12000x8300   <3 MB   served directly today (the "2.9 MB 100 MP" hole)
+//     png-16mp.png    4600x3500    ~7.6 MB OVER the rule (>5 MB and >4096 wide):
+//                                          it would be thumbnailed today. Kept as an
+//                                          upper bound on decode cost, and because the
+//                                          recorded baselines were measured with it.
 //   Tiers derived from them:
 //     t4096-*  LONG side <= 4096   -- what panoptikon stores today
 //     t1024-*  SHORT side 1024     -- proposed grid-m
@@ -88,7 +92,11 @@ const ORIGINALS = [
   { name: 'jpeg-100mp.jpg', w: 12000, h: 8300, noise: 14, budget: 3.0 * MB },
   // PNG is lossless: any added noise makes it incompressible (a noised 16 MP
   // PNG lands near 40 MB, outside every realistic serving rule). The plain
-  // upscale lands near the ~7 MB the real-world sample had.
+  // upscale lands near the ~7.6 MB the real-world sample had -- which is ALSO
+  // over today's serve-directly rule, so this row is an upper bound, not a
+  // "today" case. Its low entropy (~0.47 B/px) under-represents inflate cost;
+  // the dimension-driven costs are fully represented. Do NOT resize it: the
+  // recorded baselines were measured against these exact bytes.
   { name: 'png-16mp.png', w: 4600, h: 3500, noise: 0, png: true },
 ];
 const TIERS = [
@@ -146,6 +154,14 @@ for (const t of TIERS) {
     const d = probe(out);
     console.log(`write ${outName.padEnd(24)} ${d.w}x${d.h}  ${mb(size(out))}`);
   }
+}
+
+// The entropy source is an intermediate, not part of the image set: drop it so
+// imgtest/ contains only files the grid actually serves. (A re-run regenerates
+// it in a couple of seconds.)
+if (fs.existsSync(BASE)) {
+  fs.rmSync(BASE, { force: true });
+  console.log(`clean ${path.basename(BASE)} (intermediate)`);
 }
 
 console.log(`\ndone -> ${outDir}`);
