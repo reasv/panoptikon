@@ -100,7 +100,17 @@ Converged with the user 2026-08-31:
     rounds treat this as an invariant.
 - **Serve-directly becomes dimension-first**, per requested tier: for grid
   tiers, serve the original iff its short side ≤ 1.25× the tier AND its
-  aspect ≤ 2 (a strip always has a stored crop) AND bytes ≤ 8 MB.
+  long side ≤ 1.25× (2 × tier) AND bytes ≤ 8 MB. *(Adjudicated refinement,
+  B1 verify round 1: the original clause was `aspect ≤ 2`, which refused
+  every strip however small — a 1000×2100 image stored a grid-m "crop" of
+  1000×2048, the whole picture 2% smaller, pure waste. `2 × tier` is the
+  longest a stored tier is ever allowed to be, so bounding the long side
+  against it with the same 1.25× slack measures the thing that actually
+  costs — decoded pixels — instead of using aspect as a proxy for it.
+  Genuine strips are unaffected: an 800×20000 webtoon is far past the
+  bound at both tiers and still stores its top-strip crops. `grid_plans`
+  skips exactly what this rule would serve directly, so the dispatcher,
+  the generator and the endpoint stay one function.)*
 - **Display tier rule is re-based on the short side**: serve the original
   iff short side ≤ 4096 AND total ≤ 32 MP AND bytes ≤ 24 MB; otherwise
   store a display thumb scaled by `min(4096/short_side, sqrt(32MP/(w*h)),
@@ -114,7 +124,12 @@ Converged with the user 2026-08-31:
   indexed images lack the tiers the current code would produce"), following
   the established pattern (animated-spans / display-dims questions). Do NOT
   bump `THUMBNAIL_PROCESS_VERSION` (that would regenerate video thumbs
-  needlessly). Recovery remains generic erase+rerun; no one-off actions.
+  needlessly). Tier rows carry their own `TIER_PROCESS_VERSION`, independent
+  of it in both directions: bump that — and only that — for a tier generator
+  change the stored *geometry* cannot see (crop anchor, resampling filter,
+  JPEG quality). A change that moves the dimensions needs no bump; the
+  dispatcher's geometry comparison already catches it. Recovery remains
+  generic erase+rerun; no one-off actions.
 - **Animated thumbnails are video loops**: H.264 yuv420p, CRF ~18,
   `+faststart`, fps and duration preserved, ONE animated rendition per item
   (short side ≤ min(1024, source short side)) reused by both grid tiers.
@@ -152,7 +167,26 @@ GET /api/items/item/thumbnail?id=…&id_type=sha256[&index_db=…]
   `still=true` returns the static tier JPEG. Static items always return an
   image. Existing no-param behavior is unchanged (gallery untouched).
 - Caching: URLs stay content-addressed; the same immutable/ETag rules apply
-  per (id, size, still) variant.
+  per (id, size, still) variant, with one split settled in adjudication: a
+  requested tier that has **no stored rendition** answers with a fall-up (the
+  next larger tier, the display rendition, or the original file), and that
+  response is immutable only when the serve rules say the tier will *never*
+  exist. When the ladder says a tier should exist and the backfill has not
+  written it yet, the fall-up is `public, no-cache` — otherwise a client that
+  asked for `grid-m` during a library-wide upgrade pins the heavyweight bytes
+  for a year and never sees the tier land. The ETag already changes when the
+  tier arrives, so revalidation costs one 304.
+- **Transition semantics** (URL versioning considered and REJECTED — the
+  `size=` contract is frozen): B1 changes what the *default* path serves for
+  two classes of item — the webtoon fix (an 800×20000 strip is no longer
+  crushed to 163×4096) and items whose superseded stored rendition is
+  dropped. Clients holding a year-long immutable entry for those default-path
+  URLs keep serving the old bytes until natural eviction or a hard refresh.
+  Accepted as a one-release transition: nothing is broken, only stale, and
+  the new grid-tier URLs are unaffected because no cache has ever held them.
+  **Release-notes reminder**: the release that ships B1 must say that
+  previously-viewed extreme-aspect images may keep showing the old,
+  long-side-crushed thumbnail in a warm browser cache until it is refreshed.
 - Client decides `<img>` vs `<video>` from the result's `type` + `size`
   fields against the same floor constants; the floors are surfaced through
   `/api/client-config` so the two sides cannot drift.
@@ -197,7 +231,15 @@ and one runs the stdtest matrix against a gateway on 6343.
   survive.
 - Backfill: new scan question for missing tiers, wired like the existing
   backfill questions; must also catch previously direct-served >4096px
-  images that now need a display thumb.
+  images that now need a display thumb. It must early-out by mime family
+  before touching storage (most files in a general-purpose library have no
+  generator at all, and this runs per file per scan over SMB) and reuse the
+  stat/dimensions the served-directly question already fetched.
+- Animated items (GIF, and any image with a measured `items.duration > 0`)
+  are excluded from the **still** ladder in both the dispatch question and
+  the generator — B2 owns them. A static tier written for one now would be
+  superseded the moment the loop pipeline lands, and in the window before
+  it does the default path can flip an animated original to a static JPEG.
 - Video items: their existing thumbs (frame grid + first frame) also get
   tier variants — they're the 3840×2160 stills the grid loads today.
 
@@ -219,6 +261,13 @@ already-scanned fixture DB generates tiers exactly once.
 - Serving: the `size=grid-*` → video/mp4, `still=true` → poster contract.
   The `image/gif` short-circuit in `item_thumbnail` (api/items.rs:457) is
   retired for tier requests; kept for the default/display path.
+- **B2 MUST fold `still` into the ETag of the two file-serving branches**
+  (the GIF short-circuit and the image fall-through) *before* `still`
+  selects different bytes there. Those branches answer with
+  `file_response`, whose validator is `sha256-size-mtime` — identical for
+  the loop and the poster — so shipping the selection first hands a cached
+  poster back for a loop request and vice versa. The stored-rendition
+  branches already carry a `-still` suffix. TODO comments mark both sites.
 - Floors into `/api/client-config`.
 - Fixes the silent animation loss for >5 MB animated WebP as a side effect
   (loop exists; default path can keep serving what it serves today).
@@ -313,6 +362,14 @@ live on a fixture gateway)
   src to the display tier while hovered (cover→contain), with a
   no-flash transition (keep the crop painted until the contain rendition
   is ready).
+- **Contain surfaces and the hover swap request `?size=display`
+  explicitly** for aspect > 2 items — the parameter spelled out, never the
+  bare no-parameter URL that means the same thing. Two reasons, and the
+  second is why it is stated here rather than left to taste: it keeps the
+  aspect rule visible at every call site, and `?size=display` is a **new
+  URL**, so it cannot be answered from a cache entry stamped before B1
+  shipped. That is what busts the stale-webtoon class (see the
+  release-notes reminder below) for exactly the items the bug was about.
 - Size slider per design §9 (settled decisions there); scroll mode's fixed
   row height recomputed from explicit cell width; tier switch falls out of
   the URL builder. Breakpoint-auto remains the default.

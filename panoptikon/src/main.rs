@@ -30,6 +30,10 @@ mod shutdown;
 mod test_utils;
 mod ui;
 mod update;
+/// The stored-rendition ladder (`display`/`grid-m`/`grid-s`) shared by the
+/// scan's generator, its backfill dispatcher and the thumbnail endpoint —
+/// one place, because the three must agree exactly.
+mod visual_tiers;
 
 use crate::jobs::inference_pool::{InferencePool, JobInferenceContext, set_job_inference_context};
 use anyhow::Context as _;

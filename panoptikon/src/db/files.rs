@@ -631,22 +631,44 @@ WHERE sha256 = ?3 AND rotation IS NULL
     Ok(result.rows_affected())
 }
 
-/// Returns the item's stored pixel dimensions, used to decide whether an
-/// image would produce a thumbnail at all without decoding it again.
-pub(crate) async fn get_item_dimensions(
+/// What the scan's dimension-first questions are answered from, for one item.
+///
+/// Every field is indexed metadata, deliberately: the served-directly
+/// predicate and the rendition-ladder question both have to decide "does this
+/// item already carry what the current generator would produce?" *without*
+/// decoding the file (`jobs::files::maybe_dispatch_backfill`).
+pub(crate) struct ItemVisualFacts {
+    /// Display dimensions — the header's numbers with the EXIF orientation
+    /// applied (docs/display-dimensions-design.md).
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    /// `items.duration`. For an image this is the animated-spans measurement
+    /// (docs/animated-image-spans-design.md §3): `> 0` animated, `0` measured
+    /// still, `NULL` never measured.
+    pub duration: Option<f64>,
+}
+
+/// One read for all three, because the two questions above are asked about
+/// the same file in the same dispatch and the deployment this runs on scans
+/// a library over SMB.
+pub(crate) async fn get_item_visual_facts(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
-) -> ApiResult<Option<(Option<i64>, Option<i64>)>> {
-    let row: Option<(Option<i64>, Option<i64>)> =
-        sqlx::query_as("SELECT width, height FROM items WHERE sha256 = ?1")
+) -> ApiResult<Option<ItemVisualFacts>> {
+    let row: Option<(Option<i64>, Option<i64>, Option<f64>)> =
+        sqlx::query_as("SELECT width, height, duration FROM items WHERE sha256 = ?1")
             .bind(sha256)
             .fetch_optional(&mut *conn)
             .await
             .map_err(|err| {
-                tracing::error!(error = %err, "failed to read item dimensions");
+                tracing::error!(error = %err, "failed to read item visual facts");
                 ApiError::internal("Failed to query item")
             })?;
-    Ok(row)
+    Ok(row.map(|(width, height, duration)| ItemVisualFacts {
+        width,
+        height,
+        duration,
+    }))
 }
 
 pub(crate) async fn has_blurhash(
