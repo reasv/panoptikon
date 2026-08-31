@@ -2343,12 +2343,19 @@ impl ScanContext {
         // before the negative cache, because for an image the answer *is* a
         // decode of the original — the same decode a marker settles — and
         // suppression has to cover it.
-        let mut tier_work = if still_ladder {
-            self.pending_tier_work(&sha256, &mime_type, &path, image_facts.as_ref())
-                .await
-        } else {
-            None
-        };
+        // Asked for *every* item, animated ones included. `still_ladder ==
+        // false` is not "no question": it is the answer "the set this item
+        // wants is empty", and an item carrying a stale set has to be told so
+        // (see [`TierWork::Retire`]).
+        let mut tier_work = self
+            .pending_tier_work(
+                &sha256,
+                &mime_type,
+                &path,
+                image_facts.as_ref(),
+                still_ladder,
+            )
+            .await;
         if matches!(tier_work, Some(TierWork::Image { .. })) {
             needs_thumb = true;
         }
@@ -2883,14 +2890,17 @@ impl ScanContext {
     /// regeneration.
     ///
     /// `image_facts` is what the caller already stat'd and read for this file;
-    /// nothing here re-fetches it. Callers must have established
-    /// [`still_ladder_applies`] first — animated items are B2's.
+    /// nothing here re-fetches it. `still_ladder` is
+    /// [`still_ladder_applies`]'s answer, and `false` does **not** mean "skip
+    /// the question": it means the wanted set is *empty*, which is a verdict
+    /// like any other and the only thing that can retire a stale set.
     async fn pending_tier_work(
         &mut self,
         sha256: &str,
         mime_type: &str,
         path: &Path,
         image_facts: Option<&ImageFacts>,
+        still_ladder: bool,
     ) -> Option<TierWork> {
         // Before any storage read at all. This question is asked once per
         // file per scan, forever, and most of the files in a general-purpose
@@ -2898,10 +2908,18 @@ impl ScanContext {
         // .txt, a .zip, a .docx. Their answer is structurally `None` (a tier
         // is derived from a rendition, and they have none), so paying two
         // geometry queries each to rediscover that, over SMB, is pure loss.
+        //
+        // Accepted trade, and the same shape `thumbnails` has always had: an
+        // item whose mime type is re-classified *out* of the rendition
+        // families (a content sniff correcting an extension, a mime override)
+        // keeps its stored tier rows until the item itself is deleted and the
+        // orphan sweep takes them. Noticing would cost a storage query for
+        // every non-visual file in the library on every scan, to catch a
+        // reclassification that also has to survive re-hashing to reach this
+        // point at all.
         if !mime_can_have_renditions(mime_type) {
             return None;
         }
-        let stored_thumbnails = self.stored_geometry(sha256, path).await?;
         let stored_tiers = match get_thumbnail_tier_geometry(&mut self.conn, sha256).await {
             Ok(tiers) => tiers,
             // Advisory, like every other read on this path: without the answer
@@ -2915,6 +2933,25 @@ impl ScanContext {
                 return None;
             }
         };
+        if !still_ladder {
+            // The wanted set is empty. A stale one really can be stored: the
+            // ladder question runs *before* the animation question that
+            // stamps `items.duration`, so a scan that met an item indexed
+            // without that measurement sees `duration IS NULL`, concludes
+            // "still", and writes static tiers for what the very same scan
+            // then records as animated. Retiring them here is what closes
+            // that window — otherwise they are frozen for good and, being
+            // stored renditions, served immutably.
+            //
+            // Answered before the display geometry is read: this branch has
+            // no use for it, and animated items should not pay a second query
+            // to be told nothing.
+            if stored_tiers.is_empty() {
+                return None;
+            }
+            return Some(TierWork::Retire);
+        }
+        let stored_thumbnails = self.stored_geometry(sha256, path).await?;
 
         if mime_type.starts_with("image") {
             // Whatever the caller already stat'd and read; nothing is fetched
@@ -5023,6 +5060,13 @@ enum TierWork {
     /// reproduce pictures that are already stored would be the most expensive
     /// possible way to get them.
     Derived(Vec<(i64, Vec<u8>)>),
+    /// This item wants **no** stored tier at all and carries some: delete the
+    /// set. Produced only by the animated exclusion
+    /// ([`still_ladder_applies`]), which is the one verdict that can turn an
+    /// item's wanted set from non-empty to empty after a scan already wrote
+    /// one. Needs no decode and no source — the write is the whole work — so
+    /// it deliberately survives the negative cache's suppression.
+    Retire,
 }
 
 /// One image's measurements, gathered once per dispatch and shared by every
@@ -5283,6 +5327,17 @@ fn generate_backfill_visuals(
         // Inside the thumbgen span because that is the phase the work belongs
         // to, even though no source file is opened.
         tiers = build_stored_thumbnail_tiers(sources);
+    }
+    // The retirement verdict, outside the chain above rather than another arm
+    // of it: it is a *delete*, and the pass that produced no set is exactly
+    // the pass it has to survive. An animated image missing its display
+    // rendition runs the ordinary image pass, which — correctly — writes no
+    // tiers at all (`ImageLadderWork::tiers` is false for it), so an `else
+    // if` here would swallow the retirement and freeze the stale set for
+    // another scan. Only ever fills a `None`: a pass that did produce a set
+    // is the authority on what this item wants.
+    if matches!(tier_work, Some(TierWork::Retire)) && tiers.is_none() {
+        tiers = Some(Vec::new());
     }
     drop(thumb_span);
 
@@ -8412,6 +8467,74 @@ LIMIT 1
         );
         let mut conn = env.read().await;
         assert_eq!(tier_ids(&mut conn).await, fresh_ids);
+    }
+
+    // The ordering window, and what closes it. The ladder question runs
+    // before the animation question that stamps `items.duration`, so a scan
+    // meeting an item indexed without that measurement sees `duration IS
+    // NULL`, concludes "still", and writes static tiers for content the very
+    // same scan then records as animated. B2 owns animated renditions, so
+    // those stills are wrong — and being stored renditions they are served
+    // immutably, which makes "frozen forever" a real outcome rather than a
+    // cosmetic one.
+    //
+    // The post-window state is reproduced exactly: tiers written by a scan
+    // that believed the item still, and a positive `duration` recorded after
+    // them. A `duration` is a `duration` — the still ladder's exclusion is a
+    // predicate on the column, not on the container — so a BMP carrying one
+    // exercises the identical path an animated WebP does, deterministically
+    // and without an encoder.
+    #[tokio::test]
+    async fn a_stale_static_tier_set_is_retired_once_the_item_is_known_animated() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-tier-animated"]).await;
+        image::RgbImage::new(1400, 1400)
+            .save(env.media_dirs[0].join("loop.bmp"))
+            .unwrap();
+        env.scan().await;
+
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                tier_rows(&mut conn).await,
+                vec![tier("grid-m", 1024, 1024), tier("grid-s", 512, 512)],
+                "the premise: a scan that believed this item still wrote stills"
+            );
+        }
+
+        // What the animation question records once it runs.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE items SET duration = 3.5")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 1,
+            "the ladder question is still asked for an animated item"
+        );
+        let mut conn = env.read().await;
+        assert!(
+            tier_rows(&mut conn).await.is_empty(),
+            "an animated item wants no still tier, so the stale set is retired"
+        );
+        assert_eq!(
+            thumbnail_count(&mut conn).await,
+            0,
+            "and nothing else about the item is touched"
+        );
+        drop(conn);
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "and it settles: with nothing stored there is nothing to retire"
+        );
+        let mut conn = env.read().await;
+        assert!(tier_rows(&mut conn).await.is_empty());
     }
 
     // An item whose display rendition is already the one the current rule

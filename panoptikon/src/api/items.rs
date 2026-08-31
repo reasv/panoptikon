@@ -25,7 +25,7 @@ use crate::db::items::{
 use crate::db::storage::get_thumbnail_tier_bytes;
 use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::jobs::files::format_system_time;
-use crate::visual_tiers::{ThumbnailTier, grid_serves_original};
+use crate::visual_tiers::{DisplayPlan, ThumbnailTier, display_plan, grid_serves_original};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -492,30 +492,39 @@ fn tier_ladder(requested: ThumbnailTier) -> &'static [ThumbnailTier] {
 ///   must not claim immutability) and gets the same answer: revalidate. The
 ///   ETag already changes when the tier arrives, so it costs one 304.
 ///
+/// The **display** tier has exactly the same two cases, and it is not
+/// exempt: its rule changed too. An item the new short-side rule gives a
+/// rendition to — the 100 MP class, anything past the byte bound — is served
+/// from its original file until the backfill writes one, and calling *that*
+/// immutable pins the heavyweight original for a year on precisely the items
+/// the rule exists to shrink. So `display` is final iff [`display_plan`] says
+/// the original is what serves; for everything else it revalidates until the
+/// rendition lands, at which point the response is a stored-rendition hit and
+/// immutable again.
+///
 /// Answered from the indexed dimensions alone, and by the *same* pure
-/// function the scan's dispatcher and generator use
-/// ([`grid_serves_original`]), so the endpoint can never disagree with what
+/// functions the scan's dispatcher and generator use ([`display_plan`] and
+/// [`grid_serves_original`]), so the endpoint can never disagree with what
 /// was stored. Anything it cannot decide takes the revalidating branch.
 fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
-    let Some(short_side) = size.short_side() else {
-        // The display tier: nothing above it to fall up to, and what this
-        // path serves for it is what it has served since before the ladder
-        // existed. Unchanged.
-        return true;
-    };
     // GIFs — and items with no mime type at all — short-circuit to the
-    // original file at every tier, and that whole branch is B2's to rewrite.
-    // Nothing it answers today is final.
+    // original file at every tier. For the **display** path that is what they
+    // have always served and what B2 keeps serving (the short-circuit is
+    // retired for tier requests only), so the answer is final. A *grid*
+    // request for one is B2's to replace with a loop, so it is not.
     if item.mime_type.is_empty() || item.mime_type.starts_with("image/gif") {
-        return false;
+        return size == ThumbnailTier::Display;
     }
-    // Only an *image's* tiers are a function of the file this URL names.
+    // Only an *image's* renditions are a function of the file this URL names.
     // Every other kind derives them from a stored rendition — a video's
     // frame grid, an audio cover, a rendered page — whose geometry is not in
-    // the item metadata, so the question is unanswerable here. Costs a
-    // revalidation for the minority of such items whose rendition is small
-    // enough that no tier is ever stored; never pins a 3840x2160 frame grid
-    // for a year while the backfill is still running.
+    // the item metadata, so the question is unanswerable here. (Reachable
+    // only for a grid tier: a non-image's display answer is either its stored
+    // rendition, which is an exact hit, or the placeholder, which never
+    // claims immutability.) Costs a revalidation for the minority of such
+    // items whose rendition is small enough that no tier is ever stored;
+    // never pins a 3840x2160 frame grid for a year while the backfill is
+    // still running.
     if !item.mime_type.starts_with("image") {
         return false;
     }
@@ -538,7 +547,17 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
     if width == 0 || height == 0 {
         return false;
     }
-    grid_serves_original(file_size, width, height, short_side)
+    match size.short_side() {
+        // A grid tier: final iff the original is already inside the tier's
+        // budget, so nothing will ever be stored for it.
+        Some(short_side) => grid_serves_original(file_size, width, height, short_side),
+        // The display tier: final iff the display rule genuinely serves the
+        // original.
+        None => matches!(
+            display_plan(file_size, width, height),
+            DisplayPlan::Original
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1530,6 +1549,149 @@ VALUES (?1, 0, 'grid-m', 'image/jpeg', 1024, 768, 1, ?2)
         assert_eq!(
             cache_control_for(&mut index_conn, &item, &file, ThumbnailTier::GridS).await,
             CACHE_REVALIDATE
+        );
+    }
+
+    /// The **display** path is not exempt from the same split, because its
+    /// rule changed too. An item the short-side rule gives a rendition to is
+    /// served from its original until the backfill writes one, and calling
+    /// that immutable pins the heavyweight original for a year on exactly the
+    /// items the rule exists to shrink — the 100 MP class and anything past
+    /// the byte bound. Items the rule genuinely serves from the original keep
+    /// the pre-ladder immutability, bit for bit.
+    #[tokio::test]
+    async fn default_path_cache_control_follows_the_display_rule() {
+        const MIB: i64 = 1024 * 1024;
+
+        let file_path = temp_path("display_pending");
+        std::fs::write(&file_path, b"pretend this is a jpeg").unwrap();
+        let (mut item, mut file) = test_records(&file_path);
+        item.mime_type = "image/jpeg".to_string();
+        file.last_modified =
+            format_system_time(std::fs::metadata(&file_path).unwrap().modified().unwrap()).unwrap();
+
+        let crate::db::migrations::InMemoryDatabases {
+            mut index_conn,
+            storage_conn,
+            user_data_conn,
+        } = crate::db::migrations::setup_test_databases().await;
+        let _attached = (storage_conn, user_data_conn);
+
+        async fn display_cache_control(
+            conn: &mut sqlx::SqliteConnection,
+            item: &ItemRecord,
+            file: &FileRecord,
+        ) -> String {
+            let response = thumbnail_response(
+                conn,
+                item,
+                std::slice::from_ref(file),
+                true,
+                ThumbnailTier::Display,
+                false,
+                &HeaderMap::new(),
+                true,
+            )
+            .await
+            .expect("thumbnail response");
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .expect("cache-control")
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+
+        // Unchanged, and the point of the guard: shapes the display rule
+        // really does serve from the original stay immutable.
+        for (width, height, size) in [(400_i64, 400_i64, 480_000_i64), (4000, 3000, 4 * MIB)] {
+            item.width = Some(width);
+            item.height = Some(height);
+            item.size = Some(size);
+            assert_eq!(
+                display_cache_control(&mut index_conn, &item, &file).await,
+                CACHE_IMMUTABLE,
+                "{width}x{height} at {size} bytes is served from its original, forever"
+            );
+        }
+
+        // 12000x8333 at 3 MiB: the 100 MP hole. The new rule wants a
+        // rendition, the backfill has not written it, and the original is
+        // what serves in the meantime — provisionally.
+        item.width = Some(12000);
+        item.height = Some(8333);
+        item.size = Some(3 * MIB);
+        assert_eq!(
+            display_cache_control(&mut index_conn, &item, &file).await,
+            CACHE_REVALIDATE,
+            "a pending display rendition must not pin the 100 MP original"
+        );
+
+        // Past the byte bound with modest dimensions: the same verdict.
+        item.width = Some(9000);
+        item.height = Some(1000);
+        item.size = Some(27 * MIB);
+        assert_eq!(
+            display_cache_control(&mut index_conn, &item, &file).await,
+            CACHE_REVALIDATE
+        );
+
+        // The rendition lands. Now the response is the requested rendition
+        // itself — exact, and immutable again.
+        sqlx::query(
+            r#"
+INSERT INTO storage.thumbnails (
+    item_sha256, idx, item_mime_type, width, height, version, thumbnail
+)
+VALUES (?1, 0, 'image/jpeg', 9000, 1000, 1, ?2)
+            "#,
+        )
+        .bind(&item.sha256)
+        .bind(b"display-bytes".to_vec())
+        .execute(&mut index_conn)
+        .await
+        .unwrap();
+        let response = thumbnail_response(
+            &mut index_conn,
+            &item,
+            std::slice::from_ref(&file),
+            true,
+            ThumbnailTier::Display,
+            false,
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            CACHE_IMMUTABLE
+        );
+        assert_eq!(
+            response.headers().get(header::ETAG).unwrap(),
+            format!("\"{}-thumb0\"", item.sha256).as_str()
+        );
+
+        // Dimensions the index never measured are undecidable here too.
+        sqlx::query("DELETE FROM storage.thumbnails")
+            .execute(&mut index_conn)
+            .await
+            .unwrap();
+        item.height = None;
+        assert_eq!(
+            display_cache_control(&mut index_conn, &item, &file).await,
+            CACHE_REVALIDATE
+        );
+
+        // A GIF's display answer is the original file and always will be —
+        // B2 retires the short-circuit for tier requests only — so it keeps
+        // the pre-ladder immutability whatever its dimensions say.
+        item.mime_type = "image/gif".to_string();
+        item.duration = Some(4.0);
+        assert_eq!(
+            display_cache_control(&mut index_conn, &item, &file).await,
+            CACHE_IMMUTABLE
         );
     }
 }

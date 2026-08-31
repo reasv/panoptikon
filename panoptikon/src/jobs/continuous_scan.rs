@@ -1521,14 +1521,21 @@ impl Actor for ContinuousScanActor {
                 // rather than colliding.
                 //
                 // An empty set is skipped only when there is also nothing
-                // stored to contradict: `storage.thumbnail_tiers` is keyed by
-                // content hash and outlives a deindexed item until the orphan
-                // sweep, so content that reappears can meet a set from an
-                // older rule here. Mirrors `handle_new_item`.
-                let tiers_stored = has_thumbnail_tiers(&mut conn, &file_data.sha256)
-                    .await
-                    .unwrap_or(false);
-                if !file_data.tiers.is_empty() || tiers_stored {
+                // stored to contradict, and the EXISTS is paid only in that
+                // case — `||` short-circuits over the await, so the common
+                // path (a set to write) costs no extra query. Two things
+                // reach it: `storage.thumbnail_tiers` is keyed by content
+                // hash and outlives a deindexed item until the orphan sweep,
+                // so content that reappears can meet a set from an older
+                // rule; and an animated item's wanted set is empty by rule,
+                // which makes this the latency path's retirement of a stale
+                // static set — the job `TierWork::Retire` does for the folder
+                // scan. Mirrors `handle_new_item`.
+                if !file_data.tiers.is_empty()
+                    || has_thumbnail_tiers(&mut conn, &file_data.sha256)
+                        .await
+                        .unwrap_or(false)
+                {
                     let _ = call_index_db_writer(&state.index_db, |reply| {
                         IndexDbWriterMessage::StoreThumbnailTiers {
                             sha256: file_data.sha256.clone(),
