@@ -250,6 +250,15 @@ F5 exit criterion is expressed against these (last bucket p90 ≤ 1.25× first).
 on an images-blocked long run is the accumulation signal; negative just means a
 GC landed inside the window.
 
+**`renderer.documentsDelta`** (with `jsEventListenersDelta` / `nodesDelta`) —
+renderer-process counters from CDP `Performance.getMetrics`, sampled before and
+after the run; the matrix prints `documentsDelta` as `docs Δ`. This is the
+permanent regression sentinel for the F3 accumulation bug: per-cell
+`data:image/svg+xml` blur placeholders each cost an isolated Blink `Document`,
+and a Documents count that grows during scroll is that bug's signature. Expect
+single digits on a healthy build; the bench warns above +50. Null when the
+browser doesn't expose the Performance domain.
+
 **`domAdded` / `domRemoved`** — mutation counts, i.e. remount churn.
 
 **`netReqs` / `netKB`** — *all* resource-timing entries created during the run

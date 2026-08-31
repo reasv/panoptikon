@@ -131,6 +131,18 @@ const sleep = (t) => new Promise(r => setTimeout(r, t));
 
 await send('Page.enable');
 await send('Network.enable');
+await send('Performance.enable').catch(() => {});
+// Renderer-level accumulation sentinel. The F3 investigation attributed the
+// sustained-scroll degradation to isolated Blink Documents leaking (one per
+// unique SVG blur placeholder); Documents is the cheap regression tell, and
+// JSEventListeners/Nodes classify other leak shapes.
+async function rendererMetrics() {
+  try {
+    const { metrics } = await send('Performance.getMetrics');
+    const get = (n) => metrics.find(m => m.name === n)?.value;
+    return { documents: get('Documents'), jsEventListeners: get('JSEventListeners'), nodes: get('Nodes') };
+  } catch { return null; }
+}
 // Un-minimize and raise the window/tab: rAF is throttled to a standstill (and
 // layout is suspended) while the window is minimized or occluded.
 async function raiseWindow() {
@@ -303,7 +315,22 @@ if (args.trace) {
 
 const vel = dir === 'up' ? -velocity : velocity;
 await raiseWindow();
+const rmStart = await rendererMetrics();
 const result = await evalJs(`window.__measure(${vel}, ${ms})`, ms + 60000);
+const rmEnd = await rendererMetrics();
+let renderer = null;
+if (rmStart && rmEnd) {
+  renderer = {
+    documentsStart: rmStart.documents, documentsEnd: rmEnd.documents,
+    documentsDelta: rmEnd.documents - rmStart.documents,
+    jsEventListenersDelta: rmEnd.jsEventListeners - rmStart.jsEventListeners,
+    nodesDelta: rmEnd.nodes - rmStart.nodes,
+  };
+  if (renderer.documentsDelta > 50) {
+    console.error(`WARNING: renderer Documents grew ${rmStart.documents} -> ${rmEnd.documents} during the run -- ` +
+      'isolated-Document churn (e.g. per-cell SVG placeholders). This is the F3 accumulation signature.');
+  }
+}
 
 // An occluded (as opposed to minimized) window keeps visibilityState 'visible'
 // while Chromium stops servicing rAF entirely, so the only tell is the frame
@@ -375,7 +402,7 @@ if (args.trace) {
 
 console.log(JSON.stringify({
   scenario: { url: typeof args.url === 'string' ? args.url : page.url, dir, velocity, ms, blockImages: !!args.blockImages, warm: !!args.warm, pulse: !!args.pulse },
-  info, result, traceSummaryMs: traceSummary,
+  info, result, renderer, traceSummaryMs: traceSummary,
 }, null, 1));
 ws.close();
 process.exit(0);

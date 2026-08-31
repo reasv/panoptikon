@@ -99,7 +99,7 @@ for (const [label, qs, extra] of matrix.rows) {
     continue;
   }
   const j = JSON.parse(r.stdout);
-  out.push({ label, info: j.info, result: j.result });
+  out.push({ label, info: j.info, result: j.result, renderer: j.renderer });
 }
 
 // p50 and the frame count are printed because the frame-time FLOOR is the
@@ -108,16 +108,18 @@ for (const [label, qs, extra] of matrix.rows) {
 // Windows dynamic refresh rate can move the panel between runs, and rows whose
 // p50 differs were measured against different floors -- not comparable.
 const n = (v) => (v === null || v === undefined ? '-' : String(v));
-console.log(`\n| scenario | mean | p50 | p90 | p99 | max | frames | >32ms | longtasks | mounted MP (mid) | heap Δ |`);
-console.log(`|---|---|---|---|---|---|---|---|---|---|---|`);
+console.log(`\n| scenario | mean | p50 | p90 | p99 | max | frames | >32ms | longtasks | mounted MP (mid) | heap Δ | docs Δ |`);
+console.log(`|---|---|---|---|---|---|---|---|---|---|---|---|`);
 for (const row of out) {
-  if (row.error) { console.log(`| ${row.label} | ERROR: ${row.error} | | | | | | | | | |`); continue; }
+  if (row.error) { console.log(`| ${row.label} | ERROR: ${row.error} | | | | | | | | | | |`); continue; }
   const r = row.result;
   console.log(`| ${row.label} | ${n(r.meanMs)}ms | ${n(r.p50)}ms | ${n(r.p90)}ms | ${n(r.p99)}ms | ${n(r.maxMs)}ms | ` +
     `${n(r.frames)} | ${n(r.framesOver32)} | ${n(r.longtaskCount)} / ${n(r.longtaskTotalMs)}ms | ` +
     // Mid-run sample: the start-of-run snapshot is top-clamped for cold down
     // runs and not comparable across directions (see README).
-    `${n(r.megapixelsMountedMid ?? row.info.megapixelsMounted)} | ${n(r.heapDeltaMB)}MB |`);
+    // docs Δ: renderer Documents growth over the run -- the F3 accumulation
+    // sentinel (isolated-Document churn from per-cell SVG placeholders).
+    `${n(r.megapixelsMountedMid ?? row.info.megapixelsMounted)} | ${n(r.heapDeltaMB)}MB | ${n(row.renderer?.documentsDelta)} |`);
 }
 
 // Different p50s across rows = a different refresh floor, so absolute p90/p99
