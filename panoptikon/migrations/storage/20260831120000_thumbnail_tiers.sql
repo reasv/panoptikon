@@ -39,7 +39,7 @@ CREATE TABLE thumbnail_tiers (
     -- tiers *without decoding anything*.
     width INTEGER NOT NULL,
     height INTEGER NOT NULL,
-    version INTEGER NOT NULL,            -- THUMBNAIL_PROCESS_VERSION at generation
+    version INTEGER NOT NULL,            -- TIER_PROCESS_VERSION at generation
     thumbnail BLOB NOT NULL,
     UNIQUE(item_sha256, idx, tier)
 );
