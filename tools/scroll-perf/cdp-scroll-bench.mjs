@@ -308,10 +308,18 @@ const result = await evalJs(`window.__measure(${vel}, ${ms})`, ms + 60000);
 // An occluded (as opposed to minimized) window keeps visibilityState 'visible'
 // while Chromium stops servicing rAF entirely, so the only tell is the frame
 // count. Anything under ~10 fps average is not a measurement.
+// Discriminate from a genuinely catastrophic run: throttled rAF yields few
+// frames with ZERO long-task time, catastrophic decode yields few frames with
+// seconds of it (the plan's originals rows are real ~6-frame measurements).
 if (result.frames < ms / 100) {
-  console.error(`WARNING: only ${result.frames} frames in ${ms}ms -- requestAnimationFrame was throttled.\n` +
-    'The measured window was almost certainly covered by another window. Bring it fully to the front\n' +
-    '(and launch with --disable-features=CalculateNativeWinOcclusion) before trusting any of this.');
+  if (result.longtaskTotalMs < ms / 4) {
+    console.error(`WARNING: only ${result.frames} frames in ${ms}ms with ${result.longtaskTotalMs}ms of long tasks -- requestAnimationFrame was throttled.\n` +
+      'The measured window was almost certainly covered by another window. Bring it fully to the front\n' +
+      '(and launch with --disable-features=CalculateNativeWinOcclusion) before trusting any of this.');
+  } else {
+    console.error(`note: only ${result.frames} frames in ${ms}ms, but ${result.longtaskTotalMs}ms of long tasks -- ` +
+      'catastrophic frame times on a live window, not rAF throttling.');
+  }
 }
 
 let traceSummary = null;

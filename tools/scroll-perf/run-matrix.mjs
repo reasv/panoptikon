@@ -89,10 +89,13 @@ for (const [label, qs, extra] of matrix.rows) {
   const r = spawnSync(process.execPath, args, { encoding: 'utf8', maxBuffer: 1 << 28 });
   if (r.status !== 0 || !r.stdout.trim()) {
     process.stderr.write((r.stderr || '').trim() + '\n');
-    // The LAST non-empty stderr line: the driver's failures print a multi-line
-    // explanation whose first line is the least specific part of it.
+    // The driver's fail() messages put the diagnosis on the FIRST line and the
+    // remedy after it; a Node crash instead leads with a file:// banner. Take
+    // the first line that isn't stack noise.
     const lines = (r.stderr || '').split('\n').map(s => s.trim()).filter(Boolean);
-    out.push({ label, error: lines.length ? lines[lines.length - 1] : 'no output' });
+    const noise = /^(file:\/\/|at |\^|Node\.js v|node:)/;
+    const cell = lines.find(l => /^Error:/.test(l)) || lines.find(l => !noise.test(l)) || lines[0];
+    out.push({ label, error: cell || 'no output' });
     continue;
   }
   const j = JSON.parse(r.stdout);
@@ -105,14 +108,16 @@ for (const [label, qs, extra] of matrix.rows) {
 // Windows dynamic refresh rate can move the panel between runs, and rows whose
 // p50 differs were measured against different floors -- not comparable.
 const n = (v) => (v === null || v === undefined ? '-' : String(v));
-console.log(`\n| scenario | mean | p50 | p90 | p99 | max | frames | >32ms | longtasks | mounted MP | heap Δ |`);
+console.log(`\n| scenario | mean | p50 | p90 | p99 | max | frames | >32ms | longtasks | mounted MP (mid) | heap Δ |`);
 console.log(`|---|---|---|---|---|---|---|---|---|---|---|`);
 for (const row of out) {
   if (row.error) { console.log(`| ${row.label} | ERROR: ${row.error} | | | | | | | | | |`); continue; }
   const r = row.result;
   console.log(`| ${row.label} | ${n(r.meanMs)}ms | ${n(r.p50)}ms | ${n(r.p90)}ms | ${n(r.p99)}ms | ${n(r.maxMs)}ms | ` +
     `${n(r.frames)} | ${n(r.framesOver32)} | ${n(r.longtaskCount)} / ${n(r.longtaskTotalMs)}ms | ` +
-    `${n(row.info.megapixelsMounted)} | ${n(r.heapDeltaMB)}MB |`);
+    // Mid-run sample: the start-of-run snapshot is top-clamped for cold down
+    // runs and not comparable across directions (see README).
+    `${n(r.megapixelsMountedMid ?? row.info.megapixelsMounted)} | ${n(r.heapDeltaMB)}MB |`);
 }
 
 // Different p50s across rows = a different refresh floor, so absolute p90/p99
