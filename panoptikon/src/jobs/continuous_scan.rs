@@ -1513,6 +1513,24 @@ impl Actor for ContinuousScanActor {
                     }
                 }
 
+                // The grid tier ladder, alongside the display renditions above
+                // (docs/grid-scroll-performance-implementation.md §2). No
+                // positive-cache guard: the write replaces the item's whole
+                // set, so identical content racing it rewrites the same bytes
+                // rather than colliding.
+                if !file_data.tiers.is_empty() {
+                    let _ = call_index_db_writer(&state.index_db, |reply| {
+                        IndexDbWriterMessage::StoreThumbnailTiers {
+                            sha256: file_data.sha256.clone(),
+                            mime_type: file_data.mime_type.clone(),
+                            process_version: THUMBNAIL_PROCESS_VERSION,
+                            tiers: file_data.tiers.clone(),
+                            reply,
+                        }
+                    })
+                    .await;
+                }
+
                 if !file_data.frames.is_empty() {
                     if let Ok(mut frame_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await

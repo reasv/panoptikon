@@ -52,7 +52,8 @@ use crate::{
             stage_blocks_indexing,
         },
         storage::{
-            StoredImage, get_frames_bytes, get_thumbnail_bytes, has_any_frame, has_frame,
+            StoredImage, StoredTier, TierGeometry, get_frames_bytes, get_thumbnail_bytes,
+            get_thumbnail_geometry, get_thumbnail_tier_geometry, has_any_frame, has_frame,
             has_thumbnail,
         },
         system_config::{SystemConfig, SystemConfigStore},
@@ -68,6 +69,10 @@ use crate::{
     },
     pql::builder::filters::evaluate_match,
     pql::model::{Match, MatchValue},
+    visual_tiers::{
+        DISPLAY_MAX_FILE_SIZE, DisplayPlan, ThumbnailTier, TierRender, display_plan, grid_plans,
+        grid_plans_for_stored_thumbnail, grid_renditions,
+    },
 };
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -806,13 +811,6 @@ pub(crate) const FRAME_PROCESS_VERSION: i64 = 1;
 /// Minimum interval between mid-scan writes of the running counters to the
 /// file_scans row (progress display only; the final update is unconditional).
 pub(crate) const SCAN_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
-/// Images at or below this size never get a stored thumbnail.
-const SMALL_IMAGE_FILE_SIZE: u64 = 5 * 1024 * 1024;
-/// Images within this pixel size are served from the original file.
-const MAX_SERVED_IMAGE_DIMENSION: i64 = 4096;
-/// Images above this file size get a thumbnail even when their pixel
-/// dimensions are modest.
-const MAX_SERVED_IMAGE_FILE_SIZE: u64 = 24 * 1024 * 1024;
 
 struct FolderStats {
     new_items: i64,
@@ -894,6 +892,8 @@ struct NewItemData {
     mime_type: String,
     metadata: ItemScanMeta,
     thumbnails: Vec<StoredImage>,
+    /// See [`GeneratedVisuals::tiers`].
+    tiers: Vec<StoredTier>,
     frames: Vec<StoredImage>,
     blurhash: Option<String>,
     /// What the visuals pass concluded about the kinds it produced nothing
@@ -913,6 +913,11 @@ struct BackfillResult {
     sha256: String,
     mime_type: String,
     thumbnails: Vec<StoredImage>,
+    /// See [`ProducedVisuals::tiers`] — `None` means this pass never
+    /// considered tiers, `Some` (empty included) replaces the stored set.
+    tiers: Option<Vec<StoredTier>>,
+    /// See [`ProducedVisuals::drop_thumbnails`].
+    drop_thumbnails: bool,
     extracted_frames: Vec<StoredImage>,
     blurhash: Option<String>,
     /// See [`NewItemData::visual_verdicts`].
@@ -1768,6 +1773,16 @@ impl ScanContext {
             }
         }
 
+        // No positive-cache guard, unlike the two stores around it: the tier
+        // write replaces the item's whole set, so identical content racing
+        // this rewrites the same bytes rather than colliding. An empty set
+        // needs no write at all here — a new item has nothing stored for it
+        // to contradict.
+        if !item.tiers.is_empty() {
+            self.store_tiers(&item.sha256, &item.mime_type, item.tiers.clone())
+                .await;
+        }
+
         if !item.frames.is_empty()
             && !has_frame(&mut self.conn, &item.sha256, FRAME_PROCESS_VERSION).await?
         {
@@ -2059,6 +2074,26 @@ impl ScanContext {
         }
     }
 
+    /// Writes one item's whole grid tier set. Failures are logged and skipped,
+    /// like every other visuals store: the next scan re-derives them, and a
+    /// missing tier degrades to the next larger rendition on the serving
+    /// ladder rather than to a broken image.
+    async fn store_tiers(&mut self, sha256: &str, mime_type: &str, tiers: Vec<StoredTier>) {
+        if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::StoreThumbnailTiers {
+                sha256: sha256.to_string(),
+                mime_type: mime_type.to_string(),
+                process_version: THUMBNAIL_PROCESS_VERSION,
+                tiers: tiers.clone(),
+                reply,
+            }
+        })
+        .await
+        {
+            tracing::error!(error = ?err, "failed to store thumbnail tiers");
+        }
+    }
+
     async fn handle_backfill(&mut self, backfill: BackfillResult) {
         self.in_flight_visuals.remove(&backfill.sha256);
 
@@ -2099,6 +2134,39 @@ impl ScanContext {
             {
                 tracing::error!(error = ?err, "failed to store thumbnails");
             }
+        }
+
+        // The one write that *removes* a stored visual without replacing it:
+        // the display rule is short-side based now, so an item it serves from
+        // its original can still be carrying the rendition the old long-side
+        // rule stored — an 800x20000 webtoon crushed to 163x4096, which the
+        // serving path would go on preferring to the original forever. Guarded
+        // on something actually being stored, so the overwhelmingly common
+        // case (a directly-served image that never had a rendition) issues no
+        // write at all.
+        if backfill.drop_thumbnails && already_stored {
+            wrote_visuals = true;
+            if let Err(err) =
+                call_index_db_writer(&self.index_db, |reply| {
+                    IndexDbWriterMessage::DeleteThumbnails {
+                        sha256: backfill.sha256.clone(),
+                        reply,
+                    }
+                })
+                .await
+            {
+                tracing::error!(error = ?err, "failed to drop stale thumbnails");
+            }
+        }
+
+        // Unlike the two stores around it, an *empty* set is a real
+        // instruction here — "this item wants no stored tier" — and the
+        // delete it carries is how a set from an older rule is retired. Only
+        // `None` means the pass never considered tiers.
+        if let Some(tiers) = &backfill.tiers {
+            wrote_visuals = true;
+            self.store_tiers(&backfill.sha256, &backfill.mime_type, tiers.clone())
+                .await;
         }
 
         let frames_stored = has_frame(&mut self.conn, &backfill.sha256, FRAME_PROCESS_VERSION)
@@ -2201,11 +2269,24 @@ impl ScanContext {
                             !image_is_served_directly(file_size, width, height)
                         }
                         // Dimensions were never recorded; fall back to the
-                        // size-only check and let the worker decode.
-                        _ => file_size > SMALL_IMAGE_FILE_SIZE,
+                        // size-only check and let the worker decode. The
+                        // byte bound is the only clause of the display rule
+                        // that needs no dimensions, so it is the only one
+                        // that can be asked here.
+                        _ => file_size > DISPLAY_MAX_FILE_SIZE,
                     }
                 }
             };
+        }
+        // The dispatcher's seventh question
+        // (docs/grid-scroll-performance-implementation.md §3, B1): "does this
+        // item carry the renditions the current ladder would produce?" Asked
+        // before the negative cache, because for an image the answer *is* a
+        // decode of the original — the same decode a marker settles — and
+        // suppression has to cover it.
+        let mut tier_work = self.pending_tier_work(&sha256, &mime_type, &path).await;
+        if matches!(tier_work, Some(TierWork::Image { .. })) {
+            needs_thumb = true;
         }
         // Last, after the positive cache missed *and* the served-directly
         // predicate said a thumbnail would be stored: the negative cache. This
@@ -2219,6 +2300,12 @@ impl ScanContext {
         if needs_thumb && self.thumbnail_marker_suppresses(&sha256, &path).await {
             needs_thumb = false;
             thumb_suppressed = true;
+            // The image ladder is that same decode, so the marker settles it
+            // too. A `Derived` set is untouched: it decodes stored q85 JPEGs,
+            // not the file the marker has a verdict about.
+            if matches!(tier_work, Some(TierWork::Image { .. })) {
+                tier_work = None;
+            }
         }
         // The dispatcher's third question (docs/video-outro-detection-design.md
         // §7): "is this a video nothing has examined for an appended outro?"
@@ -2290,7 +2377,12 @@ impl ScanContext {
             if thumb_suppressed {
                 self.note_suppressed_visuals(&path);
             }
-            if outro_work.is_none() && !codec_work && !animation_work && rotation_work.is_none() {
+            if outro_work.is_none()
+                && !codec_work
+                && !animation_work
+                && rotation_work.is_none()
+                && tier_work.is_none()
+            {
                 return Ok(());
             }
         }
@@ -2347,6 +2439,7 @@ impl ScanContext {
                             && !codec_work
                             && !animation_work
                             && rotation_work.is_none()
+                            && tier_work.is_none()
                         {
                             return Ok(());
                         }
@@ -2392,7 +2485,7 @@ impl ScanContext {
                 if thumb_suppressed {
                     self.note_suppressed_visuals(&path);
                 }
-                if outro_work.is_none() && !codec_work && !animation_work {
+                if outro_work.is_none() && !codec_work && !animation_work && tier_work.is_none() {
                     return Ok(());
                 }
             }
@@ -2498,6 +2591,7 @@ impl ScanContext {
                     codec_work,
                     animation_work,
                     rotation_work,
+                    tier_work,
                     stored_content_end_ms,
                     &timers,
                 )
@@ -2520,6 +2614,11 @@ impl ScanContext {
                         sha256: outer_sha256,
                         mime_type: outer_mime,
                         thumbnails: Vec::new(),
+                        // A dead worker concluded nothing about the ladder
+                        // either: `None` writes no set, so the stored one
+                        // stays and the next scan asks again.
+                        tiers: None,
+                        drop_thumbnails: false,
                         extracted_frames: Vec::new(),
                         blurhash: None,
                         // A dead worker is no verdict on the content: the
@@ -2688,6 +2787,140 @@ impl ScanContext {
                     "failed to read the rotation state; skipping the measurement"
                 );
                 false
+            }
+        }
+    }
+
+    /// The rendition-ladder dispatch question
+    /// (docs/grid-scroll-performance-implementation.md §3, B1), and the
+    /// seventh the dispatcher asks: "does this item carry exactly the
+    /// renditions the current ladder would produce?"
+    ///
+    /// Answered against indexed metadata and *stored geometry* — the width
+    /// and height columns of `thumbnails`/`thumbnail_tiers` — never by
+    /// decoding anything. That is the same invariant the served-directly
+    /// predicate has always carried, and it is load-bearing twice over here:
+    /// grid tiers are legitimately absent for small originals, so "no row"
+    /// can never mean "work to do" on its own, and the answer has to be
+    /// *exact* or an item is re-dispatched on every scan forever. Which is
+    /// why every dimension the generator writes is one this function can
+    /// predict: [`display_plan`] and [`grid_plans`] are pure functions of
+    /// `(bytes, width, height)`, and the generator resizes to exactly what
+    /// they name.
+    ///
+    /// `None` means nothing to do — including for every item whose dimensions
+    /// were never indexed, which cannot be decided without a decode and so is
+    /// deliberately left alone rather than re-examined forever.
+    async fn pending_tier_work(
+        &mut self,
+        sha256: &str,
+        mime_type: &str,
+        path: &Path,
+    ) -> Option<TierWork> {
+        // Animated items are step B2's: their grid renditions are video
+        // loops, and until that lands `item_thumbnail` still short-circuits
+        // them to the original file at every tier.
+        if mime_type.starts_with("image/gif") || mime_type.is_empty() {
+            return None;
+        }
+        let stored_thumbnails = self.stored_geometry(sha256, path).await?;
+        let stored_tiers = match get_thumbnail_tier_geometry(&mut self.conn, sha256).await {
+            Ok(tiers) => tiers,
+            // Advisory, like every other read on this path: without the answer
+            // the file is simply left alone this run.
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to read the stored tiers; skipping the ladder question"
+                );
+                return None;
+            }
+        };
+
+        if mime_type.starts_with("image") {
+            let file_size = fs::metadata(path).ok()?.len();
+            let (width, height) = match get_item_dimensions(&mut self.conn, sha256).await {
+                Ok(Some((Some(width), Some(height)))) => (width, height),
+                // Never measured, or unreadable: undecidable without a decode,
+                // which is exactly what this question must never do.
+                _ => return None,
+            };
+            let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+                return None;
+            };
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let display_matches = match display_plan(file_size, width, height) {
+                DisplayPlan::Original => stored_thumbnails.is_empty(),
+                DisplayPlan::Thumbnail {
+                    width: expected_width,
+                    height: expected_height,
+                } => {
+                    stored_thumbnails.as_slice()
+                        == [(0, i64::from(expected_width), i64::from(expected_height))]
+                }
+            };
+            let wanted = wanted_tier_geometry(0, &grid_plans(file_size, width, height));
+            if display_matches && tier_geometry_matches(&stored_tiers, &wanted) {
+                return None;
+            }
+            return Some(TierWork::Image {
+                replace_display: !stored_thumbnails.is_empty(),
+            });
+        }
+
+        // A non-image with no stored rendition has no source for a tier and
+        // no question to answer: the *thumbnail* question owns that gap, and
+        // the pass that fills it produces the tiers in the same breath.
+        if stored_thumbnails.is_empty() {
+            return None;
+        }
+        let mut wanted = Vec::new();
+        for (idx, width, height) in &stored_thumbnails {
+            let (Ok(width), Ok(height)) = (u32::try_from(*width), u32::try_from(*height)) else {
+                return None;
+            };
+            wanted.extend(wanted_tier_geometry(
+                *idx,
+                &grid_plans_for_stored_thumbnail(width, height),
+            ));
+        }
+        if tier_geometry_matches(&stored_tiers, &wanted) {
+            return None;
+        }
+        // Only now, with work established, are the blobs worth reading.
+        let mut sources = Vec::with_capacity(stored_thumbnails.len());
+        for (idx, _, _) in &stored_thumbnails {
+            match get_thumbnail_bytes(&mut self.conn, sha256, *idx).await {
+                Ok(Some(bytes)) => sources.push((*idx, bytes)),
+                Ok(None) => return None,
+                Err(err) => {
+                    tracing::warn!(
+                        error = ?err,
+                        path = %path.display(),
+                        "failed to read a stored thumbnail; skipping its tiers"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(TierWork::Derived(sources))
+    }
+
+    /// The stored display renditions of an item as `(idx, width, height)`.
+    /// `None` on a read failure, which leaves the file alone this run.
+    async fn stored_geometry(&mut self, sha256: &str, path: &Path) -> Option<Vec<(i64, i64, i64)>> {
+        match get_thumbnail_geometry(&mut self.conn, sha256).await {
+            Ok(rows) => Some(rows),
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to read the stored thumbnail geometry"
+                );
+                None
             }
         }
     }
@@ -2933,6 +3166,7 @@ fn prepare_new_item(
         mime_type,
         metadata,
         thumbnails: visuals.thumbnails,
+        tiers: visuals.tiers,
         frames: visuals.frames,
         blurhash: visuals.blurhash,
         visual_verdicts: visuals.verdicts,
@@ -2968,6 +3202,8 @@ pub(crate) struct PreparedFile {
     pub(crate) mime_type: String,
     pub(crate) metadata: ItemScanMeta,
     pub(crate) thumbnails: Vec<StoredImage>,
+    /// See [`GeneratedVisuals::tiers`].
+    pub(crate) tiers: Vec<StoredTier>,
     pub(crate) frames: Vec<StoredImage>,
     pub(crate) blurhash: Option<String>,
     /// What the visuals pass concluded about the kinds it produced nothing
@@ -2986,6 +3222,8 @@ pub(crate) struct FileWriteData {
     pub(crate) new_file_timestamp: bool,
     pub(crate) new_file_hash: bool,
     pub(crate) thumbnails: Vec<StoredImage>,
+    /// See [`GeneratedVisuals::tiers`].
+    pub(crate) tiers: Vec<StoredTier>,
     pub(crate) frames: Vec<StoredImage>,
     pub(crate) blurhash: Option<String>,
     /// See [`PreparedFile::visual_verdicts`].
@@ -3015,6 +3253,7 @@ impl FileWriteData {
             new_file_timestamp,
             new_file_hash,
             thumbnails: prepared.thumbnails,
+            tiers: prepared.tiers,
             frames: prepared.frames,
             blurhash: prepared.blurhash,
             visual_verdicts: prepared.visual_verdicts,
@@ -3596,6 +3835,11 @@ fn run_outro_pass(
 pub(crate) struct GeneratedVisuals {
     pub(crate) thumbnails: Vec<StoredImage>,
     pub(crate) frames: Vec<StoredImage>,
+    /// The grid tiers of the renditions above. Flat rather than
+    /// `Option<Vec<_>>` like [`ProducedVisuals::tiers`]: a new item has
+    /// nothing stored, so "produced none" and "did not consider tiers" write
+    /// the same nothing.
+    pub(crate) tiers: Vec<StoredTier>,
     pub(crate) blurhash: Option<String>,
     /// Empty on the healthy path, which is what keeps this free: a pass that
     /// stored something owes no marker, and the store clears any stale one.
@@ -3702,6 +3946,7 @@ pub(crate) fn process_file(
         mime_type,
         metadata,
         thumbnails: visuals.thumbnails,
+        tiers: visuals.tiers,
         frames: visuals.frames,
         blurhash: visuals.blurhash,
         visual_verdicts: visuals.verdicts,
@@ -4055,6 +4300,19 @@ fn extract_item_metadata(
 struct ProducedVisuals {
     thumbnails: Vec<StoredImage>,
     frames: Vec<StoredImage>,
+    /// The grid tiers this pass produced
+    /// (docs/grid-scroll-performance-implementation.md §2).
+    ///
+    /// `None` means the pass never considered tiers, and nothing is written.
+    /// `Some` — the empty vector included — is the *authoritative* set for
+    /// this item and replaces whatever is stored: a partial write would leave
+    /// a rendition from an older rule behind, which the backfill's set
+    /// comparison would then re-dispatch on every scan forever.
+    tiers: Option<Vec<StoredTier>>,
+    /// This item's stored display renditions must go: the current rule serves
+    /// its original file. Only an image pass ever concludes this, and only in
+    /// a backfill — a new item has nothing stored to drop.
+    drop_thumbnails: bool,
     blurhash_source: Option<DynamicImage>,
     /// Kinds the pass concluded about with nothing to blame: the generator ran
     /// and this content genuinely has no such visual. Deliberately *not* set
@@ -4205,6 +4463,7 @@ fn generate_new_item_visuals(
         Ok(produced) => {
             visuals.thumbnails = produced.thumbnails;
             visuals.frames = produced.frames;
+            visuals.tiers = produced.tiers.unwrap_or_default();
             visuals.verdicts = produced
                 .nothing
                 .into_iter()
@@ -4283,6 +4542,12 @@ fn build_new_item_thumbnails(
                 let labeled_first = overlay_mime_label(extracted_frames[0].clone(), mime_type);
                 out.thumbnails
                     .push(encode_image(1, &labeled_first).map_err(VisualsError::thumbnail)?);
+                // A 2x2 grid of 1920x1080 frames is a 3840x2160 still, and it
+                // is what the grid loads for every video today.
+                out.tiers = Some(
+                    tiers_of_stored_thumbnails(&[(0, &grid), (1, &labeled_first)])
+                        .map_err(VisualsError::thumbnail)?,
+                );
                 // Past the thumbnail: the frames were extracted and the grid
                 // encoded, so an encode failure here is the frames' verdict
                 // alone.
@@ -4306,26 +4571,22 @@ fn build_new_item_thumbnails(
         let thumb = get_audio_thumbnail(path, mime_type);
         out.thumbnails
             .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
+        out.tiers =
+            Some(tiers_of_stored_thumbnails(&[(0, &thumb)]).map_err(VisualsError::thumbnail)?);
         out.blurhash_source = Some(thumb);
     } else if mime_type.starts_with("image") {
-        // The full decode lives here and only here: it is what the thumbnail
-        // and the blurhash are made of, and — since the un-fusing — nothing
-        // else depends on it. A file that fails it is indexed from its header
-        // with no visuals, exactly like a PDF pdfium cannot parse.
-        // Only this `?` is the decode: the encode below it runs on pixels that
-        // came out fine, so it owes a marker and no audit row.
+        // The full decode lives here and only here: it is what the thumbnail,
+        // the grid tiers and the blurhash are made of, and — since the
+        // un-fusing — nothing else depends on it. A file that fails it is
+        // indexed from its header with no visuals, exactly like a PDF pdfium
+        // cannot parse.
+        // Only this `?` is the decode: the encodes below it run on pixels that
+        // came out fine, so they owe a marker and no audit row.
+        let file_size = image_file_size(path)?;
         let image = open_image_oriented(path).map_err(|(stage, err)| {
             VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
         })?;
-        if let Some(thumb) = generate_thumbnail(path, &image).map_err(VisualsError::thumbnail)? {
-            out.thumbnails
-                .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
-            out.blurhash_source = Some(thumb);
-        } else {
-            // Served from the original file. No marker: the served-directly
-            // predicate already answers this without decoding anything.
-            out.blurhash_source = Some(image);
-        }
+        build_image_renditions(&mut out, file_size, image).map_err(VisualsError::thumbnail)?;
     } else if mime_type.starts_with("application/pdf") {
         // Still renders nothing when pdfium is unavailable or the PDF is
         // broken — the item is indexed without visuals — but the two are no
@@ -4335,18 +4596,100 @@ fn build_new_item_thumbnails(
             .map_err(|err| VisualsError::thumbnail(pdf_visuals_failure(err)))?;
         out.thumbnails
             .push(encode_image(0, &page).map_err(VisualsError::thumbnail)?);
+        out.tiers =
+            Some(tiers_of_stored_thumbnails(&[(0, &page)]).map_err(VisualsError::thumbnail)?);
         out.blurhash_source = Some(page);
     } else if mime_type.starts_with("text/html") {
         let shot = render_html_screenshot_classified(path)
             .map_err(|err| VisualsError::thumbnail(html_visuals_failure(err)))?;
         out.thumbnails
             .push(encode_image(0, &shot).map_err(VisualsError::thumbnail)?);
+        out.tiers =
+            Some(tiers_of_stored_thumbnails(&[(0, &shot)]).map_err(VisualsError::thumbnail)?);
         out.blurhash_source = Some(shot);
     } else {
         // No generator for this type at all: a correct, permanent nothing.
         out.nothing.push(VisualKind::Thumbnail);
     }
 
+    Ok(out)
+}
+
+/// The rows a planned tier set would store, in the order
+/// [`get_thumbnail_tier_geometry`] returns them (index, then tier name).
+fn wanted_tier_geometry(idx: i64, plans: &[(ThumbnailTier, TierRender)]) -> Vec<TierGeometry> {
+    let mut wanted: Vec<TierGeometry> = plans
+        .iter()
+        .map(|(tier, plan)| TierGeometry {
+            idx,
+            tier: tier.as_str().to_string(),
+            width: i64::from(plan.width),
+            height: i64::from(plan.height),
+        })
+        .collect();
+    wanted.sort_by(|left, right| (left.idx, &left.tier).cmp(&(right.idx, &right.tier)));
+    wanted
+}
+
+/// Whether an item's stored tier set is exactly the one the current ladder
+/// would produce — same tiers, same indices, same pixel dimensions.
+///
+/// Exact, not "at least": a rendition from a superseded rule is as much a
+/// mismatch as a missing one, and leaving it would keep serving the geometry
+/// the rule change was meant to retire.
+fn tier_geometry_matches(stored: &[TierGeometry], wanted: &[TierGeometry]) -> bool {
+    stored == wanted
+}
+
+/// The size of the file a display rendition is decided against. Its own
+/// helper so the two generation passes cannot drift on which error class a
+/// failed stat is (transient io, never a verdict on the content).
+fn image_file_size(path: &Path) -> Result<u64, VisualsError> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|err| VisualsError::thumbnail(FileProcessError::Io(err.to_string())))
+}
+
+/// The display rendition and the grid tiers of one already-decoded image, in
+/// one place so the new-item and backfill passes cannot produce different
+/// ladders for the same file.
+///
+/// Tiers come from the **original decode**, never from the display rendition:
+/// a megapixel-guarded display tier can be *smaller* than `grid-m` (an
+/// 800x60000 strip scales to 653 px wide), so cascading off it would upscale.
+fn build_image_renditions(
+    out: &mut ProducedVisuals,
+    file_size: u64,
+    image: DynamicImage,
+) -> Result<(), FileProcessError> {
+    let (width, height) = image.dimensions();
+    out.tiers = Some(encode_tiers(0, &image, &grid_plans(file_size, width, height))?);
+    match generate_display_thumbnail(file_size, &image) {
+        Some(thumb) => {
+            out.thumbnails.push(encode_image(0, &thumb)?);
+            out.blurhash_source = Some(thumb);
+        }
+        None => {
+            // Served from the original file. No marker: the served-directly
+            // predicate already answers this without decoding anything. The
+            // drop is what retires a rendition the *old*, long-side rule
+            // stored — an 800x20000 webtoon crushed to 163x4096.
+            out.drop_thumbnails = true;
+            out.blurhash_source = Some(image);
+        }
+    }
+    Ok(())
+}
+
+/// The grid tiers of pictures this generator produced, across every display
+/// index an item has.
+fn tiers_of_stored_thumbnails(
+    thumbnails: &[(i64, &DynamicImage)],
+) -> Result<Vec<StoredTier>, FileProcessError> {
+    let mut out = Vec::new();
+    for (idx, image) in thumbnails {
+        out.extend(encode_stored_thumbnail_tiers(*idx, image)?);
+    }
     Ok(out)
 }
 
@@ -4487,6 +4830,26 @@ fn rotation_pass_for(
 }
 
 /// The outro half of one backfill dispatch.
+/// What the tier question found an item missing
+/// (docs/grid-scroll-performance-implementation.md §3, B1).
+///
+/// Two shapes, because two kinds of item have two different sources for
+/// their renditions.
+enum TierWork {
+    /// An image: the whole ladder — display rendition and grid tiers alike —
+    /// is rebuilt from one decode of the original. `replace_display` says a
+    /// rendition is already stored and this one overwrites it, which is what
+    /// lifts the backfill's "never write over a stored visual" guard for
+    /// exactly this item.
+    Image { replace_display: bool },
+    /// Everything else: the grid tiers are derived from the display
+    /// renditions already in the database, keyed by their index. Never from
+    /// the source file — re-running ffmpeg over a library's videos to
+    /// reproduce pictures that are already stored would be the most expensive
+    /// possible way to get them.
+    Derived(Vec<(i64, Vec<u8>)>),
+}
+
 struct OutroBackfill {
     item: PendingOutroItem,
     /// Whether a positive verdict *replaces* visuals rather than informing
@@ -4512,6 +4875,7 @@ fn generate_backfill_visuals(
     needs_codecs: bool,
     needs_animation: bool,
     rotation_work: Option<RotationBackfill>,
+    tier_work: Option<TierWork>,
     stored_content_end_ms: Option<i64>,
     timers: &ScanTimers,
 ) -> BackfillResult {
@@ -4595,9 +4959,20 @@ fn generate_backfill_visuals(
     // visuals for an item that *has* them, so an image with none is left to
     // the ordinary generation path — a served-directly image, in particular,
     // still gets no stored thumbnail out of this.
-    let replace_visuals =
-        (pass_content_end_ms.is_some() && replaces_visuals) || stale_thumbnail(rotation.as_ref());
-    let needs_thumb = needs_thumb || replace_visuals;
+    // The ladder question joins on the same terms as the orientation stage:
+    // an image whose stored display rendition is not the one the current rule
+    // wants is a *replacement*, so it lifts the same store guard. An image
+    // with nothing stored is an ordinary first generation.
+    let image_ladder = matches!(&tier_work, Some(TierWork::Image { .. }));
+    let ladder_replaces_display =
+        matches!(&tier_work, Some(TierWork::Image { replace_display: true }));
+    let replace_visuals = (pass_content_end_ms.is_some() && replaces_visuals)
+        || stale_thumbnail(rotation.as_ref())
+        || ladder_replaces_display;
+    // An image owing renditions runs the ordinary image pass: display tier
+    // and grid tiers come out of the one decode together, so there is no
+    // separate stage for them and no second decode.
+    let needs_thumb = needs_thumb || replace_visuals || image_ladder;
     // A replaced thumbnail leaves the blurhash describing the old one, which
     // is the same class of visual and the only one derived from it. The
     // orientation stage can also invalidate the blurhash *alone*: an image
@@ -4610,6 +4985,8 @@ fn generate_backfill_visuals(
     let content_end_ms = pass_content_end_ms.or(stored_content_end_ms);
 
     let mut thumbnails = Vec::new();
+    let mut tiers: Option<Vec<StoredTier>> = None;
+    let mut drop_thumbnails = false;
     let mut extracted_frames = Vec::new();
     let mut blurhash_source: Option<DynamicImage> = None;
     let mut verdicts = Vec::new();
@@ -4632,6 +5009,8 @@ fn generate_backfill_visuals(
         ) {
             Ok(produced) => {
                 thumbnails = produced.thumbnails;
+                tiers = produced.tiers;
+                drop_thumbnails = produced.drop_thumbnails;
                 extracted_frames = produced.frames;
                 blurhash_source = produced.blurhash_source;
                 verdicts = produced
@@ -4651,6 +5030,12 @@ fn generate_backfill_visuals(
                 decode_failed = true;
             }
         }
+    } else if let Some(TierWork::Derived(sources)) = &tier_work {
+        // The tier-only half: this item's display renditions are already
+        // right, and its grid tiers are derived from those stored pictures.
+        // Inside the thumbgen span because that is the phase the work belongs
+        // to, even though no source file is opened.
+        tiers = build_stored_thumbnail_tiers(sources);
     }
     drop(thumb_span);
 
@@ -4707,6 +5092,8 @@ fn generate_backfill_visuals(
         sha256,
         mime_type: mime_type.to_string(),
         thumbnails,
+        tiers,
+        drop_thumbnails,
         extracted_frames,
         blurhash,
         visual_verdicts: verdicts,
@@ -4821,6 +5208,10 @@ fn build_backfill_thumbnails(
             let labeled_first = overlay_mime_label(frames[0].clone(), mime_type);
             out.thumbnails
                 .push(encode_image(1, &labeled_first).map_err(VisualsError::thumbnail)?);
+            out.tiers = Some(
+                tiers_of_stored_thumbnails(&[(0, &grid), (1, &labeled_first)])
+                    .map_err(VisualsError::thumbnail)?,
+            );
             if fresh {
                 // The thumbnail is already built; only the frames are at stake
                 // from here.
@@ -4837,46 +5228,75 @@ fn build_backfill_thumbnails(
         let thumb = get_audio_thumbnail(path, mime_type);
         out.thumbnails
             .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
+        out.tiers =
+            Some(tiers_of_stored_thumbnails(&[(0, &thumb)]).map_err(VisualsError::thumbnail)?);
         out.blurhash_source = Some(thumb);
     } else if mime_type.starts_with("image") {
-        let file_size = fs::metadata(path)
-            .map_err(|err| VisualsError::thumbnail(FileProcessError::Io(err.to_string())))?
-            .len();
-        // Only decode when the image is large enough to warrant a thumbnail;
-        // the blurhash fallback opens the image separately when needed. Both
-        // early exits here are the served-directly predicate, which needs no
-        // marker of its own.
-        if file_size > SMALL_IMAGE_FILE_SIZE {
-            // As in the new-item pass: the decode owes the audit row, the
-            // encode below it does not.
-            let image = open_image_oriented(path).map_err(|(stage, err)| {
-                VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
-            })?;
-            if let Some(thumb) = generate_thumbnail(path, &image).map_err(VisualsError::thumbnail)? {
-                out.thumbnails
-                    .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
-                out.blurhash_source = Some(thumb);
-            } else {
-                out.blurhash_source = Some(image);
-            }
-        }
+        // No pre-gate of its own any more: the dispatcher decided this image
+        // owes a rendition (a display one, a tier, or both) from the indexed
+        // dimensions, which is the whole point of keeping that predicate
+        // decode-free. Re-deriving it here from a byte count alone would
+        // disagree with it — the ladder is dimension-first now.
+        //
+        // As in the new-item pass: the decode owes the audit row, the encodes
+        // below it do not.
+        let file_size = image_file_size(path)?;
+        let image = open_image_oriented(path).map_err(|(stage, err)| {
+            VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
+        })?;
+        build_image_renditions(&mut out, file_size, image).map_err(VisualsError::thumbnail)?;
     } else if mime_type.starts_with("application/pdf") {
         let page = render_pdf_first_page(path)
             .map_err(|err| VisualsError::thumbnail(pdf_visuals_failure(err)))?;
         out.thumbnails
             .push(encode_image(0, &page).map_err(VisualsError::thumbnail)?);
+        out.tiers =
+            Some(tiers_of_stored_thumbnails(&[(0, &page)]).map_err(VisualsError::thumbnail)?);
         out.blurhash_source = Some(page);
     } else if mime_type.starts_with("text/html") {
         let shot = render_html_screenshot_classified(path)
             .map_err(|err| VisualsError::thumbnail(html_visuals_failure(err)))?;
         out.thumbnails
             .push(encode_image(0, &shot).map_err(VisualsError::thumbnail)?);
+        out.tiers =
+            Some(tiers_of_stored_thumbnails(&[(0, &shot)]).map_err(VisualsError::thumbnail)?);
         out.blurhash_source = Some(shot);
     } else {
         out.nothing.push(VisualKind::Thumbnail);
     }
 
     Ok(out)
+}
+
+/// The grid tiers of an item whose display renditions are already stored and
+/// correct — a video, an audio cover, a PDF page — decoded from those stored
+/// JPEGs rather than from the source file.
+///
+/// This is the tier-only half of the backfill, and it never touches the
+/// original: re-running ffmpeg over a library's videos to produce pictures
+/// that are already in the database would be the most expensive possible way
+/// to get them.
+/// `None` on any failure, and deliberately all-or-nothing: the stored set is
+/// replaced wholesale, so writing a partial one would leave a set that never
+/// matches what the dispatcher expects — re-dispatching the item on every
+/// scan forever. Writing nothing retries the same work next scan, which for a
+/// stored q85 JPEG is cheap, and never stores a wrong answer.
+fn build_stored_thumbnail_tiers(sources: &[(i64, Vec<u8>)]) -> Option<Vec<StoredTier>> {
+    let mut out = Vec::new();
+    for (idx, bytes) in sources {
+        let image = decode_image_bytes(bytes)
+            .inspect_err(|err| {
+                tracing::warn!(error = %err, idx, "a stored thumbnail did not decode");
+            })
+            .ok()?;
+        let tiers = encode_stored_thumbnail_tiers(*idx, &image)
+            .inspect_err(|err| {
+                tracing::warn!(error = ?err, idx, "failed to encode a thumbnail tier");
+            })
+            .ok()?;
+        out.extend(tiers);
+    }
+    Some(out)
 }
 
 /// The blurhash is computed from an image already in memory, so a failure is
@@ -4902,39 +5322,89 @@ fn resize_for_blurhash(image: &DynamicImage) -> DynamicImage {
     image.thumbnail(max_dim, max_dim)
 }
 
-/// Whether an image is served from its original file and therefore gets no
-/// stored thumbnail. Kept separate from [`generate_thumbnail`] so a rescan can
-/// answer the question from indexed metadata instead of decoding the file:
-/// nothing is stored for these images, so `has_thumbnail` stays false forever
-/// and an unguarded backfill would decode them on every single scan.
+/// Whether an image is served from its original file at the **display** tier
+/// and therefore gets no stored rendition
+/// (docs/grid-scroll-performance-implementation.md §2).
+///
+/// Kept separate from the generator so a rescan can answer the question from
+/// indexed metadata instead of decoding the file: nothing is stored for these
+/// images, so `has_thumbnail` stays false forever and an unguarded backfill
+/// would decode them on every single scan.
 fn image_is_served_directly(file_size: u64, width: i64, height: i64) -> bool {
-    file_size <= SMALL_IMAGE_FILE_SIZE
-        || (width <= MAX_SERVED_IMAGE_DIMENSION
-            && height <= MAX_SERVED_IMAGE_DIMENSION
-            && file_size <= MAX_SERVED_IMAGE_FILE_SIZE)
+    let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+        // Nonsensical indexed dimensions: let the worker decode and decide.
+        return false;
+    };
+    matches!(
+        display_plan(file_size, width, height),
+        DisplayPlan::Original
+    )
 }
 
+/// The display rendition for one already-decoded image, or `None` when the
+/// original is what gets served.
+///
 /// `image` is an oriented decode ([`open_image_oriented`]), so the dimensions
 /// this measures are the same ones the item is indexed with — which is what
 /// lets the dispatcher answer the served-directly question from the index
-/// instead of decoding the file again.
-fn generate_thumbnail(
-    path: &Path,
-    image: &DynamicImage,
-) -> Result<Option<DynamicImage>, FileProcessError> {
-    let metadata = fs::metadata(path).map_err(|err| FileProcessError::Io(err.to_string()))?;
-    let file_size = metadata.len();
+/// instead of decoding the file again. `resize_exact` rather than `resize`
+/// for the same reason: the stored dimensions have to be *exactly* the ones
+/// [`display_plan`] predicts, or the backfill's "is this the rendition the
+/// current rule wants?" comparison never settles.
+fn generate_display_thumbnail(file_size: u64, image: &DynamicImage) -> Option<DynamicImage> {
     let (width, height) = image.dimensions();
-    if image_is_served_directly(file_size, width as i64, height as i64) {
-        return Ok(None);
+    match display_plan(file_size, width, height) {
+        DisplayPlan::Original => None,
+        // Only the byte bound was broken, so every pixel is kept and the
+        // rendition is a re-encode. Resampling an image onto its own
+        // dimensions would cost a full Lanczos pass to produce the same
+        // picture, slightly blurrier.
+        DisplayPlan::Thumbnail {
+            width: target_width,
+            height: target_height,
+        } if (target_width, target_height) == (width, height) => Some(image.clone()),
+        DisplayPlan::Thumbnail { width, height } => Some(image.resize_exact(
+            width,
+            height,
+            image::imageops::FilterType::Lanczos3,
+        )),
     }
+}
 
-    let max_dimension = MAX_SERVED_IMAGE_DIMENSION as u32;
-    Ok(Some(image.resize(
-        max_dimension,
-        max_dimension,
-        image::imageops::FilterType::Lanczos3,
-    )))
+/// Encodes a planned set of grid renditions of one picture.
+///
+/// `idx` is the display rendition these are tiers *of*, so `big` selects the
+/// same picture at every tier of a video.
+fn encode_tiers(
+    idx: i64,
+    image: &DynamicImage,
+    plans: &[(ThumbnailTier, TierRender)],
+) -> Result<Vec<StoredTier>, FileProcessError> {
+    grid_renditions(image, plans)
+        .into_iter()
+        .map(|(tier, rendition)| {
+            let encoded = encode_image(idx, &rendition)?;
+            Ok(StoredTier {
+                idx,
+                tier: tier.as_str(),
+                width: encoded.width,
+                height: encoded.height,
+                bytes: encoded.bytes,
+            })
+        })
+        .collect()
+}
+
+/// The grid tiers of a picture the generator itself produced — a video's
+/// frame grid, an audio cover, a rendered PDF page, an HTML screenshot.
+/// Their source is a q85 JPEG, never a user file, so the byte half of the
+/// serve-directly rule does not apply.
+fn encode_stored_thumbnail_tiers(
+    idx: i64,
+    image: &DynamicImage,
+) -> Result<Vec<StoredTier>, FileProcessError> {
+    let (width, height) = image.dimensions();
+    encode_tiers(idx, image, &grid_plans_for_stored_thumbnail(width, height))
 }
 
 fn encode_image(idx: i64, image: &DynamicImage) -> Result<StoredImage, FileProcessError> {
@@ -7448,6 +7918,227 @@ LIMIT 1
             .unwrap()
     }
 
+    /// The rowids of the stored grid tiers. The tier write is a
+    /// delete-then-insert of the item's whole set, so an unchanged list is
+    /// proof no pass rewrote them — which is exactly what the ladder's
+    /// write-once discipline claims.
+    async fn tier_ids(conn: &mut sqlx::SqliteConnection) -> Vec<i64> {
+        sqlx::query_scalar("SELECT id FROM storage.thumbnail_tiers ORDER BY id")
+            .fetch_all(conn)
+            .await
+            .unwrap()
+    }
+
+    fn tier(name: &str, width: i64, height: i64) -> (String, i64, i64) {
+        (name.to_string(), width, height)
+    }
+
+    // The ladder on the new-item path, and its write-once discipline. 1400x1400
+    // uncompressed is 5.88 MB: inside every display bound, so the original
+    // serves and nothing is stored for it — and past 1.25x both grid tiers, so
+    // both are. That is the shape most of a photo library is in.
+    #[tokio::test]
+    async fn a_scanned_image_stores_its_grid_tiers_exactly_once() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-tier-new"]).await;
+        image::RgbImage::new(1400, 1400)
+            .save(env.media_dirs[0].join("photo.bmp"))
+            .unwrap();
+
+        env.scan().await;
+        let mut conn = env.read().await;
+        assert_eq!(
+            thumbnail_count(&mut conn).await,
+            0,
+            "the display tier serves this original"
+        );
+        assert_eq!(
+            tier_rows(&mut conn).await,
+            vec![tier("grid-m", 1024, 1024), tier("grid-s", 512, 512)]
+        );
+        let ids = tier_ids(&mut conn).await;
+        drop(conn);
+
+        // The rescan reaches the file and concludes there is nothing to do —
+        // from indexed dimensions and stored geometry, with no decode.
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.unchanged_files, 1, "the walk did reach the file");
+        assert_eq!(
+            (totals.backfilled_visuals, totals.visuals_suppressed),
+            (0, 0),
+            "an item with the renditions it wants is invisible to the dispatcher"
+        );
+        let mut conn = env.read().await;
+        assert_eq!(
+            tier_ids(&mut conn).await,
+            ids,
+            "the rescan rewrote tiers it already had"
+        );
+    }
+
+    // A library indexed before the ladder existed: display renditions decided
+    // by the old rule, no tiers at all. One scan brings it up to date, and the
+    // next does nothing — the same convergence the animation and rotation
+    // questions have.
+    #[tokio::test]
+    async fn an_existing_library_backfills_its_grid_tiers() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-tier-backfill"]).await;
+        image::RgbImage::new(1400, 1400)
+            .save(env.media_dirs[0].join("photo.bmp"))
+            .unwrap();
+        env.scan().await;
+
+        {
+            let mut conn = env.write().await;
+            sqlx::query("DELETE FROM storage.thumbnail_tiers")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.unchanged_files, 1);
+        assert_eq!(
+            totals.backfilled_visuals, 1,
+            "the ladder question dispatched the file"
+        );
+        let mut conn = env.read().await;
+        assert_eq!(
+            tier_rows(&mut conn).await,
+            vec![tier("grid-m", 1024, 1024), tier("grid-s", 512, 512)]
+        );
+        let ids = tier_ids(&mut conn).await;
+        drop(conn);
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "and settles: the second rescan writes nothing"
+        );
+        let mut conn = env.read().await;
+        assert_eq!(tier_ids(&mut conn).await, ids);
+    }
+
+    // The display rule is short-side based now, so an item it serves from its
+    // original can be carrying a rendition the old long-side rule stored — a
+    // webtoon crushed to 163x4096, which the serving path would go on
+    // preferring to the original forever. The ladder retires it.
+    #[tokio::test]
+    async fn a_superseded_display_rendition_is_dropped() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-tier-superseded"]).await;
+        // 900x3000 uncompressed = 8.1 MB: every display bound clear, so the
+        // original serves. A 10:3 strip, so both grid tiers are top crops.
+        image::RgbImage::new(900, 3000)
+            .save(env.media_dirs[0].join("strip.bmp"))
+            .unwrap();
+        env.scan().await;
+
+        let sha256: String = {
+            let mut conn = env.read().await;
+            assert_eq!(thumbnail_count(&mut conn).await, 0);
+            assert_eq!(
+                tier_rows(&mut conn).await,
+                vec![tier("grid-m", 900, 2048), tier("grid-s", 512, 1024)]
+            );
+            sqlx::query_scalar("SELECT sha256 FROM items")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap()
+        };
+
+        // What the old rule left behind, planted by hand: a long-side-fitted
+        // rendition of a strip.
+        let stale = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(163, 4096)))
+            .expect("a 163x4096 image encodes");
+        call_index_db_writer(&env.index_db, |reply| {
+            IndexDbWriterMessage::StoreThumbnails {
+                sha256: sha256.clone(),
+                mime_type: "image/bmp".to_string(),
+                process_version: THUMBNAIL_PROCESS_VERSION,
+                thumbnails: vec![stale.clone()],
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        let mut conn = env.read().await;
+        assert_eq!(
+            thumbnail_count(&mut conn).await,
+            0,
+            "the rendition the current rule does not want is gone"
+        );
+        assert_eq!(
+            tier_rows(&mut conn).await,
+            vec![tier("grid-m", 900, 2048), tier("grid-s", 512, 1024)]
+        );
+        let ids = tier_ids(&mut conn).await;
+        drop(conn);
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "and the drop settles rather than repeating every scan"
+        );
+        let mut conn = env.read().await;
+        assert_eq!(tier_ids(&mut conn).await, ids);
+    }
+
+    // A video's grid tiers come from the pictures already in the database —
+    // its 2x2 frame grid and its first frame — not from a fresh ffmpeg run
+    // over the source. The clip's frames are 576x1024, so the grid is
+    // 1152x2048: past 1.25x `grid-s` and inside 1.25x `grid-m`, while the
+    // first frame is inside both. One tier, and the dispatcher predicts
+    // exactly that.
+    #[tokio::test]
+    async fn a_video_backfills_tiers_from_its_stored_thumbnails() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-tier-video"]).await;
+        let clip = env.media_dirs[0].join("clip.mp4");
+        if !write_clip(&clip, None, None) {
+            return;
+        }
+        env.scan().await;
+        {
+            let mut conn = env.read().await;
+            assert_eq!(thumbnail_count(&mut conn).await, 2, "the grid and frame 0");
+            assert_eq!(tier_rows(&mut conn).await, vec![tier("grid-s", 512, 910)]);
+        }
+
+        // The state an existing library is in, and the one that proves the
+        // derivation: the tiers are gone, the source file is replaced by bytes
+        // no decoder will touch, and the stored pictures are all that is left.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("DELETE FROM storage.thumbnail_tiers")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        let mtime = fs::metadata(&clip).unwrap().modified().unwrap();
+        let length = fs::metadata(&clip).unwrap().len();
+        fs::write(&clip, vec![0_u8; length as usize]).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&clip)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.unchanged_files, 1);
+        let mut conn = env.read().await;
+        assert_eq!(
+            tier_rows(&mut conn).await,
+            vec![tier("grid-s", 512, 910)],
+            "the tiers came back from the stored pictures, not from the file"
+        );
+    }
+
     // The end-to-end contract of the visuals negative cache, at the level the
     // production symptom lives at: a scan that finds nothing new must not
     // regenerate visuals it already knows produce nothing.
@@ -7470,11 +8161,12 @@ LIMIT 1
         // Its own folder: the temp root is shared by every test in the process.
         let media_dir = root.join("media-visual-attempts");
         fs::create_dir_all(&media_dir).unwrap();
-        // 4900x400 uncompressed = 5.88 MB: over the small-file cutoff *and*
-        // wider than the served-directly dimension limit, so this image really
-        // does get a stored thumbnail — which is what makes a missing one
-        // meaningful rather than the normal state of most images.
-        image::RgbImage::new(4900, 400)
+        // An image the display rule really does store a rendition for, so a
+        // missing one is meaningful rather than the normal state of most
+        // images. Under the dimension-first rule that takes *bytes*: 9000x1000
+        // uncompressed is 27 MB, past the 24 MB bound while every pixel bound
+        // is clear, so the rendition is a plain re-encode.
+        image::RgbImage::new(9000, 1000)
             .save(media_dir.join("large.bmp"))
             .unwrap();
 
@@ -7679,11 +8371,11 @@ LIMIT 1
         let media_dir = root.join("media-undecodable");
         fs::create_dir_all(&media_dir).unwrap();
 
-        // 4900x400 uncompressed = 5.88 MB. Truncating 100 KB keeps it over the
-        // small-file cutoff and wider than the served-directly dimension
-        // limit, so this one really would get a stored thumbnail.
+        // 9000x1000 uncompressed = 27 MB. Truncating 100 KB leaves it well
+        // past the display rule's 24 MB byte bound, so this one really would
+        // get a stored rendition.
         let large = media_dir.join("large.bmp");
-        image::RgbImage::new(4900, 400).save(&large).unwrap();
+        image::RgbImage::new(9000, 1000).save(&large).unwrap();
         let full_len = fs::metadata(&large).unwrap().len();
         fs::OpenOptions::new()
             .write(true)
@@ -7739,7 +8431,7 @@ LIMIT 1
         let (large_sha, small_sha) = (indexed[0].1.clone(), indexed[1].1.clone());
         assert_eq!(
             (indexed[0].2, indexed[0].3, indexed[1].2, indexed[1].3),
-            (Some(4900), Some(400), Some(64), Some(64)),
+            (Some(9000), Some(1000), Some(64), Some(64)),
             "the dimensions come from the header, which truncation leaves intact"
         );
         assert!(
@@ -7848,7 +8540,7 @@ LIMIT 1
         // directly, by the moved bytes under the path that keys it. The mtime
         // is set by hand because the walker's shortcut compares it and a
         // rewrite inside the same clock tick would read as unchanged.
-        image::RgbImage::new(4900, 400).save(&large).unwrap();
+        image::RgbImage::new(9000, 1000).save(&large).unwrap();
         let mtime = fs::metadata(&large).unwrap().modified().unwrap();
         fs::File::options()
             .write(true)
@@ -8383,7 +9075,10 @@ LIMIT 1
 
         let test_env = test_data_dir();
         let env = visuals_env(test_env.path(), &["media-blurhash-suppressed"]).await;
-        image::RgbImage::new(4900, 400)
+        // 27 MB uncompressed: past the display rule's byte bound, so this
+        // image really does store a rendition. See
+        // `a_recorded_visuals_attempt_suppresses_the_next_generation`.
+        image::RgbImage::new(9000, 1000)
             .save(env.media_dirs[0].join("large.bmp"))
             .unwrap();
 
@@ -10216,10 +10911,21 @@ LIMIT 1
         );
 
         // And an image that does get a thumbnail concludes nothing at all.
+        // 27 MB uncompressed, past the display rule's byte bound.
         let large = dir.path().join("large.bmp");
-        image::RgbImage::new(4900, 400).save(&large).unwrap();
+        image::RgbImage::new(9000, 1000).save(&large).unwrap();
         let produced = build_new_item_thumbnails(&large, "image/bmp", &meta(0, 0.0), None).unwrap();
         assert!(produced.nothing.is_empty() && produced.thumbnails.len() == 1);
+        // ... and carries the grid tiers of the same decode. A 9:1 strip is
+        // cropped rather than resized whole, so both tiers exist.
+        let tiers = produced.tiers.expect("an image pass always plans tiers");
+        assert_eq!(
+            tiers
+                .iter()
+                .map(|tier| (tier.tier, tier.width, tier.height))
+                .collect::<Vec<_>>(),
+            vec![("grid-m", 2048, 1000), ("grid-s", 1024, 512)]
+        );
     }
 
     // The visuals half of the taxonomy, site by site: which failures are the
@@ -11553,29 +12259,78 @@ LIMIT 1
         );
     }
 
+    // The dispatcher's copy of the display rule must agree with the
+    // generator's, because the whole no-redecode invariant rests on the two
+    // being the same function of the same indexed numbers.
     #[test]
     fn served_directly_matches_the_thumbnail_decision() {
-        // Small file: never thumbnailed, whatever the dimensions.
-        assert!(image_is_served_directly(SMALL_IMAGE_FILE_SIZE, 9000, 9000));
-        // Large pixels or a large file force a thumbnail.
+        const MB: u64 = 1024 * 1024;
+        // The dead hole the old rule had: 2.9 MB, 100 MP, served raw to the
+        // grid. Under the dimension-first rule it gets a rendition.
+        assert!(!image_is_served_directly(3 * MB, 12000, 8333));
+        // Short side over the cap.
+        assert!(!image_is_served_directly(MB, 5000, 5000));
+        // Bytes over the cap, dimensions modest.
         assert!(!image_is_served_directly(
-            SMALL_IMAGE_FILE_SIZE + 1,
-            MAX_SERVED_IMAGE_DIMENSION + 1,
-            10
+            DISPLAY_MAX_FILE_SIZE + 1,
+            1000,
+            1000
         ));
-        assert!(!image_is_served_directly(
-            MAX_SERVED_IMAGE_FILE_SIZE + 1,
-            10,
-            10
-        ));
-        // The common case that used to be re-decoded on every scan: bigger
-        // than the small-file cutoff, but modest in both other dimensions.
-        assert!(image_is_served_directly(
-            SMALL_IMAGE_FILE_SIZE + 1,
-            MAX_SERVED_IMAGE_DIMENSION,
-            MAX_SERVED_IMAGE_DIMENSION
-        ));
-        assert!(image_is_served_directly(MAX_SERVED_IMAGE_FILE_SIZE, 10, 10));
+        assert!(image_is_served_directly(DISPLAY_MAX_FILE_SIZE, 1000, 1000));
+        // The common case that must never be re-decoded on every scan.
+        assert!(image_is_served_directly(6 * MB, 4096, 4096));
+        // A webtoon: 16 MP with an 800 px short side. The old long-side rule
+        // stored a 163x4096 rendition for this; now the original serves.
+        assert!(image_is_served_directly(6 * MB, 800, 20000));
+        // Whatever the generator decides, the two agree — including for the
+        // shapes above.
+        for (bytes, width, height) in [
+            (3 * MB, 12000_u32, 8333_u32),
+            (MB, 5000, 5000),
+            (6 * MB, 4096, 4096),
+            (6 * MB, 800, 20000),
+            (30 * MB, 4000, 3000),
+        ] {
+            let image = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+            let generator_stores_one = matches!(
+                display_plan(bytes, width, height),
+                DisplayPlan::Thumbnail { .. }
+            );
+            assert_eq!(
+                generator_stores_one,
+                !image_is_served_directly(bytes, i64::from(width), i64::from(height)),
+                "{width}x{height} at {bytes} bytes"
+            );
+            // And the generator honours its own plan for a real image.
+            let _ = generate_display_thumbnail(bytes, &image);
+        }
+    }
+
+    // The tier ladder is derived from the same indexed numbers, so what the
+    // dispatcher predicts and what the generator writes have to be the same
+    // pixel dimensions. A drift here does not corrupt anything — it makes
+    // the backfill re-dispatch the item on every scan, forever.
+    #[test]
+    fn planned_tier_geometry_matches_what_is_stored() {
+        const MB: u64 = 1024 * 1024;
+        for (width, height) in [(1500_u32, 2000_u32), (300, 2000), (2000, 300), (60, 60)] {
+            let image = DynamicImage::ImageRgb8(image::RgbImage::new(width, height));
+            let plans = grid_plans(50 * MB, width, height);
+            let stored = encode_tiers(0, &image, &plans).expect("tiers encode");
+            let stored: Vec<TierGeometry> = stored
+                .iter()
+                .map(|tier| TierGeometry {
+                    idx: tier.idx,
+                    tier: tier.tier.to_string(),
+                    width: tier.width,
+                    height: tier.height,
+                })
+                .collect();
+            assert!(
+                tier_geometry_matches(&stored, &wanted_tier_geometry(0, &plans)),
+                "{width}x{height}: stored {stored:?}"
+            );
+        }
     }
 
     // An image that is served from its original file stores no thumbnail, so
@@ -11621,6 +12376,12 @@ LIMIT 1
             .await
             .unwrap();
         assert_eq!(thumbnails.0, 0);
+        // The grid tiers of a 1400x1400 square: whole-image resizes, no crop.
+        let square_tiers = vec![
+            ("grid-m".to_string(), 1024_i64, 1024_i64),
+            ("grid-s".to_string(), 512, 512),
+        ];
+        assert_eq!(tier_rows(&mut conn).await, square_tiers);
         drop(conn);
 
         // Same mtime, same byte count, but 4900 pixels wide: a decode would
@@ -11646,6 +12407,25 @@ LIMIT 1
             .await
             .unwrap();
         assert_eq!(thumbnails.0, 0, "the backfill re-decoded the image");
+        // And the ladder question did not re-decode either: a 4900x400 strip
+        // would have produced 2048x400 / 1024x400 crops, so the square tiers
+        // still standing prove the answer came from the index.
+        assert_eq!(
+            tier_rows(&mut conn).await,
+            square_tiers,
+            "the ladder question re-decoded the image"
+        );
+    }
+
+    /// Every stored grid tier as `(tier, width, height)`, in the order the
+    /// dispatcher's own read returns them.
+    async fn tier_rows(conn: &mut sqlx::SqliteConnection) -> Vec<(String, i64, i64)> {
+        sqlx::query_as(
+            "SELECT tier, width, height FROM storage.thumbnail_tiers ORDER BY idx, tier",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
     }
 
     // VACUUM must run outside the writer's usual transaction wrapper; both

@@ -2003,7 +2003,7 @@
           "items"
         ],
         "summary": "Get thumbnail for an item",
-        "description": "Returns a thumbnail for a given item.\nThe thumbnail may be a thumbnail,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nGIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).",
+        "description": "Returns a thumbnail for a given item.\nThe thumbnail may be a stored rendition,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nGIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).\nThe `size` parameter selects a rendition tier: `display` (default, unchanged behaviour),\n`grid-m` (short side 1024) or `grid-s` (short side 512).\nA tier with no stored rendition falls through to the next larger one.",
         "operationId": "item_thumbnail",
         "parameters": [
           {
@@ -2055,6 +2055,30 @@
             "schema": {
               "type": "boolean",
               "default": true
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "description": "Which rendition to serve. `display` (the default, and what omitting\nthe parameter has always meant) is gallery quality; `grid-m` and\n`grid-s` cap the **short** side at 1024 and 512 for grid-sized boxes.\nA tier an item has no stored rendition for falls through to the next\nlarger one, so a request is always answerable.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ThumbnailTier"
+                }
+              ],
+              "default": "display"
+            }
+          },
+          {
+            "name": "still",
+            "in": "query",
+            "description": "Animated items: serve the static tier image (the loop's poster)\ninstead of the loop. Accepted now and a no-op for static items, whose\nrenditions are always images; the animated pipeline it selects\nbetween is step B2.",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
             }
           }
         ],
@@ -11519,6 +11543,15 @@
             }
           }
         }
+      },
+      "ThumbnailTier": {
+        "type": "string",
+        "description": "One rendition of an item's picture.\n\nThe wire values are the frozen `size=` parameter of\n`GET /api/items/item/thumbnail`; do not rename them.",
+        "enum": [
+          "display",
+          "grid-m",
+          "grid-s"
+        ]
       },
       "TranscodeCacheResize": {
         "type": "object",

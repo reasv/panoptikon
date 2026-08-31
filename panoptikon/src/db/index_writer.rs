@@ -45,8 +45,9 @@ use crate::db::{
         rekey_scan_error, upsert_scan_error,
     },
     storage::{
-        StoredImage, delete_orphaned_frames, delete_orphaned_thumbnails,
-        delete_orphaned_visual_attempts, store_frames, store_thumbnails,
+        StoredImage, StoredTier, delete_orphaned_frames, delete_orphaned_thumbnails,
+        delete_orphaned_visual_attempts, delete_thumbnails, store_frames, store_thumbnail_tiers,
+        store_thumbnails,
     },
     visual_attempts::{
         VisualAttemptRecord, delete_blocked_visual_attempts, upsert_visual_attempts,
@@ -139,6 +140,25 @@ pub(crate) enum IndexDbWriterMessage {
         process_version: i64,
         frames: Vec<StoredImage>,
         reply: Reply<()>,
+    },
+    /// One item's **whole** grid tier set
+    /// (docs/grid-scroll-performance-implementation.md §2). An empty `tiers`
+    /// is a legitimate instruction — "this item wants no stored tier" — so
+    /// the caller must not short-circuit on it the way the two above do.
+    StoreThumbnailTiers {
+        sha256: String,
+        mime_type: String,
+        process_version: i64,
+        tiers: Vec<StoredTier>,
+        reply: Reply<()>,
+    },
+    /// Drops an item's stored display renditions, for the one case that needs
+    /// it: the display rule is short-side based now, so an item the rule
+    /// serves from its original can still be carrying a rendition the old
+    /// long-side rule stored. See [`crate::db::storage::delete_thumbnails`].
+    DeleteThumbnails {
+        sha256: String,
+        reply: Reply<u64>,
     },
     /// One genuine outro verdict (docs/video-outro-detection-design.md §7.2).
     /// The `items` write and the probe marker's delete share this one
@@ -711,6 +731,37 @@ impl Actor for IndexDbWriter {
                         Box::pin(async move {
                             store_frames(conn, &sha256, &mime_type, process_version, &frames).await
                         })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::StoreThumbnailTiers {
+                sha256,
+                mime_type,
+                process_version,
+                tiers,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            store_thumbnail_tiers(
+                                conn,
+                                &sha256,
+                                &mime_type,
+                                process_version,
+                                &tiers,
+                            )
+                            .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteThumbnails { sha256, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_thumbnails(conn, &sha256).await })
                     })
                     .await;
                 let _ = reply.send(result);

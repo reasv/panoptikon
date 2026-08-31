@@ -192,6 +192,7 @@ impl Modify for JsonValueSchema {
             crate::api::jobs::VectorQuantRebuildRequest,
             crate::db::items::ExtractedTextRecord,
             crate::db::items::ItemIdentifierType,
+            crate::visual_tiers::ThumbnailTier,
             crate::api::bookmarks::BookmarkNamespaces,
             crate::api::bookmarks::BookmarkUsers,
             crate::api::bookmarks::Results,

@@ -12,6 +12,31 @@ pub(crate) struct StoredImage {
     pub bytes: Vec<u8>,
 }
 
+/// One grid tier rendition, bound for `storage.thumbnail_tiers`
+/// (docs/grid-scroll-performance-implementation.md §2).
+#[derive(Clone)]
+pub(crate) struct StoredTier {
+    /// Mirrors [`StoredImage::idx`]: which of the item's pictures this is a
+    /// tier of.
+    pub idx: i64,
+    /// `ThumbnailTier::as_str` — never a free-form string.
+    pub tier: &'static str,
+    pub width: i64,
+    pub height: i64,
+    pub bytes: Vec<u8>,
+}
+
+/// The stored geometry of one rendition, which is all the scan's backfill
+/// dispatcher needs to decide whether it is the one the current generator
+/// would produce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TierGeometry {
+    pub idx: i64,
+    pub tier: String,
+    pub width: i64,
+    pub height: i64,
+}
+
 pub(crate) async fn has_thumbnail(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
@@ -289,6 +314,187 @@ LIMIT 1
     }))
 }
 
+/// Replaces an item's **whole** grid tier set in one statement pair.
+///
+/// Whole-set, not per-row: the backfill's predicate is "the stored set is
+/// exactly the set the current generator would produce", and a partial write
+/// could leave a rendition from an older rule behind — which the predicate
+/// would then see forever as a set that does not match, re-dispatching the
+/// item on every scan. An empty `tiers` is a legitimate call: it says this
+/// item wants no stored tier at all, and the delete is the whole write.
+///
+/// No `visual_attempts` delete: the negative cache shadows `thumbnails` and
+/// `frames`, and a tier is neither — a tier is derived from a rendition the
+/// positive cache already holds, or from a decode that cache already settled.
+pub(crate) async fn store_thumbnail_tiers(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    mime_type: &str,
+    process_version: i64,
+    tiers: &[StoredTier],
+) -> ApiResult<()> {
+    sqlx::query(
+        r#"
+DELETE FROM storage.thumbnail_tiers
+WHERE item_sha256 = ?1
+        "#,
+    )
+    .bind(sha256)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to prune thumbnail tiers");
+        ApiError::internal("Failed to store thumbnail tiers")
+    })?;
+
+    for tier in tiers {
+        sqlx::query(
+            r#"
+INSERT INTO storage.thumbnail_tiers (
+    item_sha256, idx, tier, item_mime_type, width, height, version, thumbnail
+)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(sha256)
+        .bind(tier.idx)
+        .bind(tier.tier)
+        .bind(mime_type)
+        .bind(tier.width)
+        .bind(tier.height)
+        .bind(process_version)
+        .bind(&tier.bytes)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to store a thumbnail tier");
+            ApiError::internal("Failed to store thumbnail tiers")
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Drops an item's stored display renditions.
+///
+/// The one case that needs it: the display rule is now short-side based, so
+/// an item whose original is served directly under it can still be carrying a
+/// rendition the *long*-side rule stored — an 800x20000 webtoon crushed to
+/// 163x4096. Leaving that row would keep serving the bug forever, since the
+/// serving path prefers a stored rendition to the original.
+pub(crate) async fn delete_thumbnails(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<u64> {
+    let result = sqlx::query(
+        r#"
+DELETE FROM storage.thumbnails
+WHERE item_sha256 = ?1
+        "#,
+    )
+    .bind(sha256)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, sha256, "failed to delete thumbnails");
+        ApiError::internal("Failed to delete thumbnails")
+    })?;
+    Ok(result.rows_affected())
+}
+
+/// Every stored display rendition of an item as `(idx, width, height)`,
+/// ordered by index. Geometry only — the blobs stay on disk, because this
+/// answers a dispatcher question asked once per file per scan.
+pub(crate) async fn get_thumbnail_geometry(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<Vec<(i64, i64, i64)>> {
+    sqlx::query_as(
+        r#"
+SELECT idx, width, height
+FROM storage.thumbnails
+WHERE item_sha256 = ?1
+ORDER BY idx
+        "#,
+    )
+    .bind(sha256)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read thumbnail geometry");
+        ApiError::internal("Failed to read thumbnails")
+    })
+}
+
+/// Every stored grid tier of an item, geometry only. See
+/// [`get_thumbnail_geometry`].
+pub(crate) async fn get_thumbnail_tier_geometry(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<Vec<TierGeometry>> {
+    let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        r#"
+SELECT idx, tier, width, height
+FROM storage.thumbnail_tiers
+WHERE item_sha256 = ?1
+ORDER BY idx, tier
+        "#,
+    )
+    .bind(sha256)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read thumbnail tier geometry");
+        ApiError::internal("Failed to read thumbnail tiers")
+    })?;
+    Ok(rows
+        .into_iter()
+        .map(|(idx, tier, width, height)| TierGeometry {
+            idx,
+            tier,
+            width,
+            height,
+        })
+        .collect())
+}
+
+/// The bytes of one stored grid tier, or `None` when this item has no
+/// rendition at that (index, tier) — which is a normal, expected answer: an
+/// original small enough to serve as-is at a tier stores nothing for it.
+pub(crate) async fn get_thumbnail_tier_bytes(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    idx: i64,
+    tier: &str,
+) -> ApiResult<Option<Vec<u8>>> {
+    let row = sqlx::query(
+        r#"
+SELECT thumbnail
+FROM storage.thumbnail_tiers
+WHERE item_sha256 = ?1 AND idx = ?2 AND tier = ?3
+LIMIT 1
+        "#,
+    )
+    .bind(sha256)
+    .bind(idx)
+    .bind(tier)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read a thumbnail tier");
+        ApiError::internal("Failed to read thumbnail tier")
+    })?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let bytes: Vec<u8> = row.try_get("thumbnail").map_err(|err| {
+        tracing::error!(error = %err, "failed to parse a thumbnail tier");
+        ApiError::internal("Failed to read thumbnail tier")
+    })?;
+    Ok(Some(bytes))
+}
+
 pub(crate) async fn get_frames_bytes(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
@@ -320,6 +526,10 @@ ORDER BY idx
     Ok(frames)
 }
 
+/// Sweeps both display renditions and grid tiers for content that left the
+/// index. The two are counted together because the caller's only use for the
+/// number is the "blob pages were reclaimed" flag that gates the post-job
+/// VACUUM, and a tier blob is as much a blob page as a display one.
 pub(crate) async fn delete_orphaned_thumbnails(
     conn: &mut sqlx::SqliteConnection,
 ) -> ApiResult<u64> {
@@ -340,8 +550,28 @@ WHERE item_sha256 IN (
         tracing::error!(error = %err, "failed to delete orphaned thumbnails");
         ApiError::internal("Failed to delete orphaned thumbnails")
     })?;
+    let mut deleted = result.rows_affected();
 
-    Ok(result.rows_affected())
+    let tiers = sqlx::query(
+        r#"
+DELETE FROM storage.thumbnail_tiers
+WHERE item_sha256 IN (
+    SELECT storage.thumbnail_tiers.item_sha256
+    FROM storage.thumbnail_tiers
+    LEFT JOIN items ON storage.thumbnail_tiers.item_sha256 = items.sha256
+    WHERE items.sha256 IS NULL
+)
+        "#,
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to delete orphaned thumbnail tiers");
+        ApiError::internal("Failed to delete orphaned thumbnails")
+    })?;
+    deleted += tiers.rows_affected();
+
+    Ok(deleted)
 }
 
 pub(crate) async fn delete_orphaned_frames(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
@@ -429,10 +659,137 @@ VALUES
         .await
         .unwrap();
 
+        // Grid tiers go with the display renditions they were derived from:
+        // same sweep, same reason, and their blob pages are what makes the
+        // count worth reporting.
+        sqlx::query(
+            r#"
+INSERT INTO storage.thumbnail_tiers (item_sha256, idx, tier, item_mime_type, width, height, version, thumbnail)
+VALUES
+    ('sha_one', 0, 'grid-m', 'image/png', 10, 10, 1, x'00'),
+    ('sha_missing', 0, 'grid-m', 'image/png', 10, 10, 1, x'00'),
+    ('sha_missing', 0, 'grid-s', 'image/png', 5, 5, 1, x'00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
         let deleted = delete_orphaned_thumbnails(&mut dbs.index_conn)
             .await
             .unwrap();
-        assert_eq!(deleted, 1);
+        assert_eq!(deleted, 3, "one rendition and both of its tiers");
+        let left: Vec<(String, String)> =
+            sqlx::query_as("SELECT item_sha256, tier FROM storage.thumbnail_tiers")
+                .fetch_all(&mut dbs.index_conn)
+                .await
+                .unwrap();
+        assert_eq!(left, vec![("sha_one".to_string(), "grid-m".to_string())]);
+    }
+
+    // The tier write replaces an item's *whole* set. A partial write would
+    // leave a rendition from a superseded rule behind, and the scan's
+    // "is this the set the current ladder wants?" comparison would then
+    // re-dispatch the item on every scan forever.
+    #[tokio::test]
+    async fn storing_tiers_replaces_the_whole_set() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let tier = |name: &'static str, width: i64| StoredTier {
+            idx: 0,
+            tier: name,
+            width,
+            height: width,
+            bytes: vec![0_u8],
+        };
+
+        store_thumbnail_tiers(
+            conn,
+            "sha_one",
+            "image/png",
+            1,
+            &[tier("grid-m", 1024), tier("grid-s", 512)],
+        )
+        .await
+        .unwrap();
+        // A second item, so the replace has to discriminate.
+        store_thumbnail_tiers(conn, "sha_two", "image/png", 1, &[tier("grid-s", 512)])
+            .await
+            .unwrap();
+
+        // A rule change that wants only the larger tier: the smaller one goes.
+        store_thumbnail_tiers(conn, "sha_one", "image/png", 1, &[tier("grid-m", 900)])
+            .await
+            .unwrap();
+        assert_eq!(
+            get_thumbnail_tier_geometry(conn, "sha_one").await.unwrap(),
+            vec![TierGeometry {
+                idx: 0,
+                tier: "grid-m".to_string(),
+                width: 900,
+                height: 900,
+            }]
+        );
+        assert_eq!(
+            get_thumbnail_tier_geometry(conn, "sha_two")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the other item is untouched"
+        );
+
+        // And an empty set is a real instruction: this item wants no tier.
+        store_thumbnail_tiers(conn, "sha_one", "image/png", 1, &[])
+            .await
+            .unwrap();
+        assert!(
+            get_thumbnail_tier_geometry(conn, "sha_one")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            get_thumbnail_tier_bytes(conn, "sha_two", 0, "grid-s")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // The one write that removes a stored visual without replacing it: an
+    // item the short-side display rule serves from its original, still
+    // carrying what the old long-side rule stored.
+    #[tokio::test]
+    async fn deleting_thumbnails_takes_only_the_named_item() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        for sha in ["sha_one", "sha_two"] {
+            store_thumbnails(
+                conn,
+                sha,
+                "image/jpeg",
+                1,
+                &[StoredImage {
+                    idx: 0,
+                    width: 163,
+                    height: 4096,
+                    bytes: vec![0_u8],
+                }],
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(delete_thumbnails(conn, "sha_one").await.unwrap(), 1);
+        assert!(
+            get_thumbnail_bytes(conn, "sha_one", 0).await.unwrap().is_none()
+        );
+        assert!(
+            get_thumbnail_bytes(conn, "sha_two", 0).await.unwrap().is_some()
+        );
+        // Idempotent: a second pass has nothing left to take.
+        assert_eq!(delete_thumbnails(conn, "sha_one").await.unwrap(), 0);
     }
 
     // Ensures storage cleanup removes frames that no longer have corresponding items.

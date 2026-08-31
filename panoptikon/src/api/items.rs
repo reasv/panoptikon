@@ -22,8 +22,10 @@ use crate::db::items::{
     get_extracted_text_for_item, get_item_metadata, get_item_metadata_unchecked, get_text_by_ids,
     get_thumbnail_bytes,
 };
+use crate::db::storage::get_thumbnail_tier_bytes;
 use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::jobs::files::format_system_time;
+use crate::visual_tiers::ThumbnailTier;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -218,6 +220,21 @@ pub(crate) struct ThumbnailQuery {
     #[serde(default = "default_true")]
     #[param(default = true)]
     big: bool,
+    /// Which rendition to serve. `display` (the default, and what omitting
+    /// the parameter has always meant) is gallery quality; `grid-m` and
+    /// `grid-s` cap the **short** side at 1024 and 512 for grid-sized boxes.
+    /// A tier an item has no stored rendition for falls through to the next
+    /// larger one, so a request is always answerable.
+    #[serde(default)]
+    #[param(default = "display")]
+    size: ThumbnailTier,
+    /// Animated items: serve the static tier image (the loop's poster)
+    /// instead of the loop. Accepted now and a no-op for static items, whose
+    /// renditions are always images; the animated pipeline it selects
+    /// between is step B2.
+    #[serde(default)]
+    #[param(default = false)]
+    still: bool,
 }
 
 #[utoipa::path(
@@ -400,7 +417,7 @@ pub async fn texts_any(
     path = "/api/items/item/thumbnail",
     tag = "items",
     summary = "Get thumbnail for an item",
-    description = "Returns a thumbnail for a given item.\nThe thumbnail may be a thumbnail,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nGIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).",
+    description = "Returns a thumbnail for a given item.\nThe thumbnail may be a stored rendition,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nGIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).\nThe `size` parameter selects a rendition tier: `display` (default, unchanged behaviour),\n`grid-m` (short side 1024) or `grid-s` (short side 512).\nA tier with no stored rendition falls through to the next larger one.",
     params(DbQueryParams, ThumbnailQuery),
     responses(
         (status = 200, description = "Item thumbnail image")
@@ -426,6 +443,8 @@ pub async fn item_thumbnail(
         &item,
         &item_data.files,
         query.big,
+        query.size,
+        query.still,
         &request_headers,
         content_addressed,
     )
@@ -439,11 +458,29 @@ pub async fn item_thumbnail(
     }
 }
 
+/// The renditions a request for `requested` may be answered with, best first.
+///
+/// A grid tier is legitimately absent — an original small enough to serve
+/// as-is stores nothing for it, and a library scanned before the ladder
+/// existed stores nothing for any of them — so "no row" must never be a 404.
+/// Falling through to the next *larger* rendition always answers with the
+/// right picture, merely bigger than asked for.
+fn tier_ladder(requested: ThumbnailTier) -> &'static [ThumbnailTier] {
+    match requested {
+        ThumbnailTier::Display => &[],
+        ThumbnailTier::GridM => &[ThumbnailTier::GridM],
+        ThumbnailTier::GridS => &[ThumbnailTier::GridS, ThumbnailTier::GridM],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn thumbnail_response(
     conn: &mut sqlx::SqliteConnection,
     item: &ItemRecord,
     files: &[FileRecord],
     big: bool,
+    size: ThumbnailTier,
+    still: bool,
     request_headers: &HeaderMap,
     content_addressed: bool,
 ) -> ApiResult<Response<Body>> {
@@ -455,6 +492,8 @@ async fn thumbnail_response(
 
     let mime = item.mime_type.as_str();
     if mime.is_empty() || mime.starts_with("image/gif") {
+        // Animated items are step B2's: until their video loops exist, every
+        // tier of a GIF is the original file, exactly as before.
         return file_response(item, files, "inline", request_headers, content_addressed).await;
     }
 
@@ -464,21 +503,42 @@ async fn thumbnail_response(
         0
     };
 
-    // Stored thumbnails are keyed by content hash; the ETag mirrors that. If
-    // thumbnail generation ever changes quality/size for existing content,
-    // bust caches by versioning the URL, not by weakening this. Unlike raw
-    // file serving there is no drift caveat: the stored thumbnail is derived
-    // from exactly the content the URL names, however the disk file has
-    // changed since, so content-addressed requests stay fully immutable.
+    // Stored renditions are keyed by content hash; the ETag mirrors that,
+    // per (id, size, still) variant. If generation ever changes quality/size
+    // for existing content, bust caches by versioning the URL, not by
+    // weakening this. Unlike raw file serving there is no drift caveat: the
+    // stored rendition is derived from exactly the content the URL names,
+    // however the disk file has changed since, so content-addressed requests
+    // stay fully immutable.
+    //
+    // `still` is part of the variant even though it selects nothing yet: it
+    // will pick the poster over the loop for animated items (B2), and a
+    // cache entry stamped before that landed must not be reused for it.
     let sha256 = &item.sha256;
+    let still_suffix = if still { "-still" } else { "" };
+    let filename = format!("{original_filename_no_ext}.jpg");
+    let cache_control = if content_addressed {
+        CACHE_IMMUTABLE
+    } else {
+        CACHE_REVALIDATE
+    };
+    for tier in tier_ladder(size) {
+        if let Some(buffer) =
+            get_thumbnail_tier_bytes(conn, sha256, index, tier.as_str()).await?
+        {
+            let etag = format!("\"{sha256}-thumb{index}-{}{still_suffix}\"", tier.as_str());
+            return bytes_response(
+                buffer,
+                "image/jpeg",
+                &filename,
+                &etag,
+                cache_control,
+                request_headers,
+            );
+        }
+    }
     if let Some(buffer) = get_thumbnail_bytes(conn, sha256, index).await? {
-        let etag = format!("\"{sha256}-thumb{index}\"");
-        let filename = format!("{original_filename_no_ext}.jpg");
-        let cache_control = if content_addressed {
-            CACHE_IMMUTABLE
-        } else {
-            CACHE_REVALIDATE
-        };
+        let etag = format!("\"{sha256}-thumb{index}{still_suffix}\"");
         return bytes_response(
             buffer,
             "image/jpeg",
