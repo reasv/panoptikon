@@ -429,18 +429,30 @@ fn cascade(
 /// Whether an item's picture *moves* — the one fact that decides which of the
 /// two grid ladders it belongs to (§2, step B2).
 ///
-/// `image/gif` is animated by **mime**, not by measurement: the animation
-/// question that stamps `items.duration` runs after the ladder question in
-/// the same scan, so a GIF indexed before that feature existed reads
-/// `duration IS NULL` here, and treating it as a still would write static
-/// tiers for a picture that moves. The cost is a one-frame loop for the rare
-/// single-frame GIF, which is exactly what it should serve anyway. Every
-/// other animated container (WebP today, AVIF when importing lands) is
-/// decided by the measurement, because for those formats the still case is
-/// the common one.
+/// The two container families get opposite defaults, because their *unknown*
+/// cases are opposite:
+///
+/// * `image/gif` is animated **unless measured still**. The animation
+///   question that stamps `items.duration` runs after the ladder question in
+///   the same scan, and a GIF indexed before that feature existed reads
+///   `duration IS NULL` here — while the overwhelming majority of GIFs move,
+///   so an unmeasured one is treated as animated rather than given static
+///   tiers for a picture that moves. Only an explicit `Some(0.0)` — a
+///   well-formed file with fewer than two frames, or one whose structure did
+///   not parse — takes the still ladder, which is what keeps every
+///   single-frame GIF from carrying an eternal one-frame mp4.
+/// * Every other image container (WebP today, AVIF when importing lands) is
+///   animated only when the measurement says so, because for those formats
+///   the still case is the common one.
+///
+/// Shared by the scan and the serving endpoint, which is why the
+/// pre-measurement caution that belongs to the **scan alone** — not writing a
+/// WebP's tiers until its animation has been measured — lives in
+/// `jobs::files::grid_ladder` rather than here. The two sides must answer
+/// this question identically, or a stored rendition becomes unreachable.
 pub(crate) fn is_animated_image(mime_type: &str, duration: Option<f64>) -> bool {
     if mime_type.starts_with("image/gif") {
-        return true;
+        return !duration.is_some_and(|seconds| seconds <= 0.0);
     }
     mime_type.starts_with("image") && duration.is_some_and(|seconds| seconds > 0.0)
 }
@@ -955,13 +967,18 @@ mod tests {
         assert!(!animated_serves_original(1024, 512, 0));
     }
 
-    // GIF is animated by mime (the animation measurement runs after the
-    // ladder question, so `duration IS NULL` must not read as "still"), every
-    // other container by measurement.
+    // The two container families default opposite ways, because their
+    // *unknown* cases are opposite: a GIF is animated unless measured still
+    // (the measurement runs after the ladder question, so `duration IS NULL`
+    // must not read as "still"), every other container only when measured.
     #[test]
-    fn animation_is_decided_by_mime_for_gif_and_by_measurement_otherwise() {
+    fn a_gif_is_animated_unless_measured_still() {
         assert!(is_animated_image("image/gif", None));
-        assert!(is_animated_image("image/gif", Some(0.0)));
+        assert!(
+            !is_animated_image("image/gif", Some(0.0)),
+            "a single-frame GIF must not carry an eternal one-frame mp4"
+        );
+        assert!(is_animated_image("image/gif", Some(1.2)));
         assert!(is_animated_image("image/webp", Some(3.5)));
         assert!(!is_animated_image("image/webp", Some(0.0)));
         assert!(!is_animated_image("image/webp", None));

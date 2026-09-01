@@ -393,9 +393,29 @@ no heap growth trend with images blocked, and the fix is explainable (no
 **F6 — Animated cells** (after B2 + F1)
 
 - Cells render `<video muted autoplay loop playsinline disablepictureinpicture>`
-  for animated types above the floor (decided from `type`+`size` vs
-  client-config floors), poster = still tier; styled indistinguishably from
-  `<img>`.
+  for animated types above the floor — decided from `type`+`duration` ("does
+  it move") and `size`+`width`/`height` against the client-config floors ("is
+  it above them"); all five fields are in the search payload — poster = still
+  tier; styled indistinguishably from `<img>`.
+- **The `<video>` → poster fallback is REQUIRED, not defensive polish.** A
+  grid-tier request for an animated item above the floor answers with the
+  item's *own* format rather than `video/mp4` in two cases the client cannot
+  tell apart in advance, and a cell that only ever mounts `<video>` shows
+  nothing in both:
+  - **Backfill pending** — the loop has not been written yet. Transitional,
+    and it costs one wasted fetch per animated cell for the length of the
+    upgrade window; the response is `public, no-cache`, so it resolves as
+    soon as the scan lands.
+  - **Keep-the-original** — no H.264 encode of this source came out smaller
+    than the source, so the settled §2 edge stores the loop's geometry with
+    no bytes and the endpoint serves the file itself. **Permanent** for those
+    items, and served immutable, so the fallback is the only thing that ever
+    renders them.
+
+  Handle it on the element's `error` event: swap to the `still=true` poster
+  URL, which is a stored JPEG for every item above the floor. Do not gate on
+  a probe request — that would double the request count for the common case
+  to save one wasted fetch in the rare one.
 - Concurrent-playback cap: play only sufficiently-visible cells
   (IntersectionObserver), pause during fast scroll and off-screen. Respect
   the existing browser-media-hygiene rule in verification (muted is
@@ -405,7 +425,8 @@ no heap growth trend with images blocked, and the fix is explainable (no
 
 Exit: a seeded fixture page of 30 animated cells scrolls within the tier-M
 frame budget; play/pause cap observable; static fallback correct below the
-floor.
+floor; the poster fallback covered by a test that serves a non-video response
+at a grid tier.
 
 ### Final pass
 

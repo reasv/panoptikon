@@ -507,6 +507,16 @@ pub(crate) struct StoredRendition {
     /// The stored media type, never assumed from the table: an animated
     /// item's `loop` row is an mp4 sitting beside JPEG posters.
     pub media_type: String,
+    /// The `TIER_PROCESS_VERSION` these bytes were generated at.
+    ///
+    /// **Served, not merely stored**: it is part of the response's ETag. A
+    /// generator change the stored *geometry* cannot see — a different crop
+    /// anchor, resampling filter or JPEG quality, a different CRF — is
+    /// precisely what that version exists to force a regeneration for, and
+    /// the regenerated rendition lands at the same `(item, idx, tier)` with
+    /// different bytes. A validator that ignored it would let an immutable
+    /// response keep handing back the superseded bytes for a year.
+    pub version: i64,
     /// Empty for the one row that means "the original file is the rendition"
     /// (see [`StoredTier::bytes`]).
     pub bytes: Vec<u8>,
@@ -523,7 +533,7 @@ pub(crate) async fn get_thumbnail_tier_rendition(
 ) -> ApiResult<Option<StoredRendition>> {
     let row = sqlx::query(
         r#"
-SELECT thumbnail, media_type
+SELECT thumbnail, media_type, version
 FROM storage.thumbnail_tiers
 WHERE item_sha256 = ?1 AND idx = ?2 AND tier = ?3
 LIMIT 1
@@ -550,6 +560,9 @@ LIMIT 1
         media_type: row
             .try_get("media_type")
             .map_err(|err| field("media_type", err))?,
+        version: row
+            .try_get("version")
+            .map_err(|err| field("version", err))?,
         bytes: row
             .try_get("thumbnail")
             .map_err(|err| field("thumbnail", err))?,

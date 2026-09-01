@@ -691,7 +691,7 @@ async fn thumbnail_response(
         if let Some(rendition) =
             get_thumbnail_tier_rendition(conn, sha256, index, tier.as_str()).await?
         {
-            let etag = format!("\"{sha256}-thumb{index}-{}{still_suffix}\"", tier.as_str());
+            let etag = tier_etag(sha256, index, tier.as_str(), rendition.version, still_suffix);
             return bytes_response(
                 rendition.bytes,
                 &rendition.media_type,
@@ -741,6 +741,26 @@ async fn thumbnail_response(
     )
 }
 
+/// The validator for one stored grid rendition, and the only place its shape
+/// is written.
+///
+/// `(content hash, picture index, tier, generator version, still variant)` —
+/// every input that can change the bytes this URL answers with. The
+/// **version** is the one that is not obvious and the one that matters: a
+/// rendition's identity is not fully captured by its geometry, because
+/// `TIER_PROCESS_VERSION` exists exactly for the generator changes geometry
+/// cannot see (crop anchor, resampling filter, JPEG quality, the loop's CRF).
+/// Those regenerate in place, at the same `(item, idx, tier)`, and a hit is
+/// served `immutable` — so without the version a bumped generator would leave
+/// every warm client on the superseded bytes for a year.
+///
+/// The `still` variant rides here too, for the same reason it rides on the
+/// file branches: for an animated item it selects a different picture
+/// entirely.
+fn tier_etag(sha256: &str, index: i64, tier: &str, version: i64, still_suffix: &str) -> String {
+    format!("\"{sha256}-thumb{index}-{tier}-v{version}{still_suffix}\"")
+}
+
 /// A grid-tier request for an animated item (§2, step B2).
 ///
 /// Three answers, and which one is right is decided entirely by what the scan
@@ -784,14 +804,17 @@ async fn animated_tier_response(
             get_thumbnail_tier_rendition(conn, sha256, index, LOOP_TIER).await?
             && !rendition.bytes.is_empty()
         {
-            let etag = format!("\"{sha256}-thumb{index}-{LOOP_TIER}\"");
+            let etag = tier_etag(sha256, index, LOOP_TIER, rendition.version, "");
             return bytes_response(
                 rendition.bytes,
                 &rendition.media_type,
                 &format!("{original_filename_no_ext}.mp4"),
                 &etag,
-                // The loop is the whole animated ladder: a hit is exact at
-                // every grid tier, so it is immutable like any other.
+                // The loop is the whole animated ladder: it is the exact
+                // answer at every grid tier, never a fall-up, so a hit is
+                // immutable like any other. Safe across a generator change
+                // because its ETag carries the version the bytes were made
+                // at ([`tier_etag`]).
                 if content_addressed {
                     CACHE_IMMUTABLE
                 } else {
@@ -818,16 +841,20 @@ async fn animated_tier_response(
         if let Some(rendition) =
             get_thumbnail_tier_rendition(conn, sha256, index, tier.as_str()).await?
         {
-            let etag = format!("\"{sha256}-thumb{index}-{}{still_suffix}\"", tier.as_str());
+            let etag = tier_etag(sha256, index, tier.as_str(), rendition.version, still_suffix);
             return bytes_response(
                 rendition.bytes,
                 &rendition.media_type,
                 &format!("{original_filename_no_ext}.jpg"),
                 &etag,
-                // A poster answers *every* grid tier: an item that stores
-                // only `grid-m` stores it because `grid-s` would have been
-                // the identical picture, so the fall-up is the rendition.
-                if content_addressed {
+                // Exact hits only. A `grid-s` request answered from `grid-m`
+                // is a fall-up like any other: today it is stored that way
+                // because the two renditions would be the identical picture,
+                // but a generator change can make `grid-s` a real, smaller
+                // rendition — and an immutable fall-up would pin the larger
+                // poster past it. The version-aware ETag makes the
+                // revalidation one 304.
+                if content_addressed && *tier == size {
                     CACHE_IMMUTABLE
                 } else {
                     CACHE_REVALIDATE
@@ -1023,6 +1050,21 @@ async fn try_file_response(
     .await
 }
 
+/// A whole stored rendition, in one response.
+///
+/// **No `Range` support**, which is worth stating because one of the things
+/// this now serves is an mp4: the animated loop is written with
+/// `+faststart`, and a `<video>` element that cannot ask for a byte range
+/// simply downloads the whole thing before playing. For a grid loop — a few
+/// hundred KB, and the cell wants every frame anyway — that is the right
+/// trade, and it is why the loop endpoint is this function rather than
+/// [`serve_file`]'s range machinery (which needs a file handle; these bytes
+/// live in the database).
+///
+/// The consequence is that the encoder's `+faststart` is *aspirational*
+/// today: it buys nothing until Range lands here, and it is kept because it
+/// costs one output-side rewrite at generation time and is exactly what a
+/// future ranged path would need to already be true of every stored loop.
 fn bytes_response(
     bytes: Vec<u8>,
     media_type: &str,
@@ -2032,7 +2074,7 @@ VALUES (?1, 0, ?2, 'image/gif', ?3, ?4, ?5, 1, ?6)
         for size in [ThumbnailTier::GridM, ThumbnailTier::GridS] {
             let (kind, etag, cache) = serve(&mut index_conn, &item, &file, size, false).await;
             assert_eq!(kind, "video/mp4", "{size:?} must answer with the loop");
-            assert_eq!(etag, format!("\"{}-thumb0-loop\"", item.sha256));
+            assert_eq!(etag, format!("\"{}-thumb0-loop-v1\"", item.sha256));
             assert_eq!(cache, CACHE_IMMUTABLE);
         }
 
@@ -2040,21 +2082,53 @@ VALUES (?1, 0, ?2, 'image/gif', ?3, ?4, ?5, 1, ?6)
         let (kind, etag, cache) =
             serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, true).await;
         assert_eq!(kind, "image/jpeg");
-        assert_eq!(etag, format!("\"{}-thumb0-grid-m-still\"", item.sha256));
+        assert_eq!(etag, format!("\"{}-thumb0-grid-m-v1-still\"", item.sha256));
         assert_eq!(cache, CACHE_IMMUTABLE);
         let (_, etag, _) = serve(&mut index_conn, &item, &file, ThumbnailTier::GridS, true).await;
-        assert_eq!(etag, format!("\"{}-thumb0-grid-s-still\"", item.sha256));
+        assert_eq!(etag, format!("\"{}-thumb0-grid-s-v1-still\"", item.sha256));
+
+        // The generator version rides in the validator. `TIER_PROCESS_VERSION`
+        // exists for the changes stored *geometry* cannot see — a crop anchor,
+        // a filter, a JPEG quality, the loop's CRF — which regenerate in place
+        // at the same (item, idx, tier). An ETag blind to it would keep every
+        // warm client on the superseded bytes of an immutable response.
+        sqlx::query("UPDATE storage.thumbnail_tiers SET version = 2")
+            .execute(&mut index_conn)
+            .await
+            .unwrap();
+        let (_, restamped_loop, _) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, false).await;
+        assert_eq!(restamped_loop, format!("\"{}-thumb0-loop-v2\"", item.sha256));
+        let (_, restamped_poster, _) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, true).await;
+        assert_eq!(
+            restamped_poster,
+            format!("\"{}-thumb0-grid-m-v2-still\"", item.sha256)
+        );
+        sqlx::query("UPDATE storage.thumbnail_tiers SET version = 1")
+            .execute(&mut index_conn)
+            .await
+            .unwrap();
 
         // A poster is never substituted for a loop, and the smaller poster
         // falls up to `grid-m` when only that one is stored — the shape every
-        // animated item under 1.25x the tier is in.
+        // animated item under 1.25x the tier is in. A **fall-up** answer, so
+        // it revalidates: today `grid-s` is absent because it would have been
+        // the identical picture, but a generator change can make it a real
+        // rendition, and an immutable fall-up would pin the larger poster
+        // straight past it.
         sqlx::query("DELETE FROM storage.thumbnail_tiers WHERE tier = 'grid-s'")
             .execute(&mut index_conn)
             .await
             .unwrap();
-        let (kind, etag, _) = serve(&mut index_conn, &item, &file, ThumbnailTier::GridS, true).await;
+        let (kind, etag, cache) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::GridS, true).await;
         assert_eq!(kind, "image/jpeg");
-        assert_eq!(etag, format!("\"{}-thumb0-grid-m-still\"", item.sha256));
+        assert_eq!(etag, format!("\"{}-thumb0-grid-m-v1-still\"", item.sha256));
+        assert_eq!(
+            cache, CACHE_REVALIDATE,
+            "a poster fall-up is not this URL's final answer"
+        );
 
         // The display path is untouched: a GIF still short-circuits to its
         // own file, immutably, exactly as before this step.

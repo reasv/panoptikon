@@ -56,6 +56,37 @@ const WHOLE_ANIMATION: ItemTime = ItemTime::Span {
     end_cs: i64::MAX,
 };
 
+/// Why a loop could not be produced.
+///
+/// Three outcomes, because the ledger owes three different verdicts and only
+/// the caller can write them (`jobs::files::build_animated_tiers` maps each
+/// one onto the same negative-cache machinery the image pass uses).
+#[derive(Debug)]
+pub(crate) enum LoopError {
+    /// ffmpeg could not be *started*. Never a verdict on the media: a missing
+    /// toolchain is `blocked` and self-heals when it appears, and anything
+    /// else about this host stays transient.
+    Spawn(std::io::Error),
+    /// ffmpeg ran and did not produce a usable loop. It did its own file I/O,
+    /// so broken content and a mount hiccup are indistinguishable from here;
+    /// this needs a second failure before it settles anything.
+    Failed(String),
+    /// This toolchain has no decoder for the container at all, so there is no
+    /// loop to produce and will not be until the toolchain changes. A
+    /// permanent *nothing*, not a failure — retrying it costs a full decode
+    /// and a process spawn per animated item, on every scan, forever.
+    Unsupported(String),
+}
+
+impl std::fmt::Display for LoopError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(err) => write!(formatter, "ffmpeg did not start: {err}"),
+            Self::Failed(detail) | Self::Unsupported(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
 /// Encodes one item's loop and returns the mp4 bytes.
 ///
 /// `plan` is [`crate::visual_tiers::loop_render`]'s geometry in **display**
@@ -64,24 +95,20 @@ const WHOLE_ANIMATION: ItemTime = ItemTime::Span {
 /// scale filter is unconditional and exact, so the encoded stream always has
 /// the dimensions the dispatcher predicted — an output that silently differed
 /// would re-dispatch the item on every scan forever.
-///
-/// `Err` is a string for the log and a retry next scan: a loop is not a
-/// thumbnail, so it has no negative-cache kind of its own, and a transient
-/// ffmpeg failure must never freeze into a stored verdict.
 pub(crate) fn encode_loop(
     path: &Path,
     mime_type: &str,
     plan: &TierRender,
     normalize: Transform,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, LoopError> {
     let dir = tempfile::tempdir()
-        .map_err(|err| format!("could not create a loop directory: {err}"))?;
+        .map_err(|err| LoopError::Failed(format!("could not create a loop directory: {err}")))?;
     let output = dir.path().join("loop.mp4");
 
     // Held across the ffmpeg run — including the `cache:` retry inside
     // `ffmpeg_output_with_input_retry` — because dropping it deletes the
     // frames the concat script names.
-    let bridge = bridge_input(path, mime_type);
+    let bridge = prepare_input(path, mime_type)?;
     let (input_args, input): (&[&str], &Path) = match &bridge {
         Some(bridge) => (&["-f", "concat"], bridge.script.as_path()),
         None => (&[], path),
@@ -90,6 +117,24 @@ pub(crate) fn encode_loop(
     let mut args: Vec<OsString> = Vec::new();
     for arg in ["-nostdin", "-hide_banner", "-nostats", "-v", "error"] {
         args.push(arg.into());
+    }
+    // The pathological-GIF-delay floor (§2, B2 round 2). Measured, not
+    // assumed: ffmpeg's gif demuxer substitutes its `default_delay` for a
+    // 0 cs frame but leaves **1 cs** exactly as written, and its documented
+    // `-min_delay` / `-default_delay` demuxer options have no effect on that
+    // case at all (verified on 7.1 against a real 1 cs file). Browsers and
+    // `media_tools::animation::gif_animation_seconds` both floor 0 and 1 cs
+    // to 10 cs, so without this the stored loop plays ~10x too fast and its
+    // duration disagrees with `items.duration` and with the display path.
+    //
+    // Applied as an input frame rate — which restamps every frame onto a
+    // uniform grid while keeping all of them — and *only* when every delay in
+    // the file is pathological, which is how the tools that write them write
+    // them. A file with any real delay keeps its exact source timing (see
+    // `gif_uniform_pathological_rate`).
+    if let Some(rate) = gif_forced_input_rate(path, mime_type) {
+        args.push("-r".into());
+        args.push(rate.to_string().into());
     }
     for arg in input_args {
         args.push((*arg).into());
@@ -138,21 +183,37 @@ pub(crate) fn encode_loop(
     // reads them a second time.
     let outcome = match result {
         Ok(outcome) => outcome,
-        Err(err) => return Err(format!("ffmpeg did not start: {err}")),
+        Err(err) => return Err(LoopError::Spawn(err)),
     };
     drop(bridge);
     if !outcome.status.success() {
-        return Err(format!(
+        return Err(LoopError::Failed(format!(
             "ffmpeg failed: {}",
             crate::jobs::files::stderr_tail(&outcome.stderr)
+        )));
+    }
+    let bytes = std::fs::read(&output).map_err(|err| {
+        LoopError::Failed(format!("the encoded loop did not read back: {err}"))
+    })?;
+    if bytes.is_empty() {
+        return Err(LoopError::Failed(
+            "ffmpeg produced an empty loop".to_string(),
         ));
     }
-    let bytes =
-        std::fs::read(&output).map_err(|err| format!("the encoded loop did not read back: {err}"))?;
-    if bytes.is_empty() {
-        return Err("ffmpeg produced an empty loop".to_string());
-    }
     Ok(bytes)
+}
+
+/// The input frame rate that floors a GIF's pathological frame delays, or
+/// `None` for every file whose timing must be left exactly as written.
+///
+/// Reads the file — the same whole-file read the scan's animation question
+/// already performs for this mime — and answers only for `image/gif`.
+fn gif_forced_input_rate(path: &Path, mime_type: &str) -> Option<u32> {
+    if mime_type != "image/gif" {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    crate::media_tools::animation::gif_uniform_pathological_rate(&bytes)
 }
 
 /// The filter chain, as a pure function so the geometry has a test that
@@ -192,36 +253,78 @@ fn loop_filters(plan: &TierRender, normalize: Transform) -> String {
     filters.join(",")
 }
 
-/// The bridged input for an animated WebP, or `None` for everything that goes
-/// straight to ffmpeg.
+/// Aggregate byte ceiling on the bridge's decoded frames, on top of its frame
+/// count budget.
+///
+/// The frame budget alone bounds the wrong axis. 3600 canvas-sized lossless
+/// PNGs of a 1920x1080 animation is 3.6-7 GB of temp files for one item —
+/// enough to fill a scratch volume mid-scan on a library with a handful of
+/// long animated WebPs. This bounds what actually lands on disk, and it
+/// degrades through the bridge's existing truncation semantics: a shorter
+/// loop, with the stored geometry still exactly what the dispatcher
+/// predicted, rather than a failure.
+const BRIDGE_BYTE_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The bridged input for an animated WebP, `Ok(None)` for everything that
+/// goes straight to ffmpeg, and `Err` for a container this toolchain has no
+/// decoder for at all.
 ///
 /// Cheapest check first, exactly as the compose path orders them: the mime
 /// gate, then a 12-byte magic read, then the native-decode bypass, then the
-/// whole-file structure sniff. An extraction failure is *not* fatal — the
+/// whole-file structure sniff. A WebP *extraction* failure is not fatal — the
 /// original file is passed through and ffmpeg fails fast on it, which is the
 /// pre-bridge behaviour and an error rather than an invented success.
-fn bridge_input(
+///
+/// AVIF is the one container with no fallback of either kind: the bridge
+/// decodes WebP only, so when this toolchain cannot demux animated AVIF
+/// either (`hw::animated_avif_decodable`, the same probe the compose path's
+/// capability list is built from) there is nothing left to try. That is a
+/// permanent nothing on this host, not a failure to retry — the caller turns
+/// it into a ledger verdict so the next scan does not repeat a decode and a
+/// process spawn to reach the same conclusion.
+fn prepare_input(
     path: &Path,
     mime_type: &str,
-) -> Option<super::transcode::webp_bridge::BridgedInput> {
+) -> Result<Option<super::transcode::webp_bridge::BridgedInput>, LoopError> {
+    if mime_type.starts_with("image/avif") && !super::transcode::hw::animated_avif_decodable() {
+        return Err(LoopError::Unsupported(
+            "this ffmpeg cannot decode animated AVIF, and the frame bridge covers WebP only"
+                .to_string(),
+        ));
+    }
     if !mime_type.starts_with("image/webp") {
-        return None;
+        return Ok(None);
     }
     if !super::transcode::webp_bridge::has_webp_magic(path)
         || super::transcode::hw::animated_webp_decodable()
     {
-        return None;
+        return Ok(None);
     }
-    let bytes = super::transcode::webp_bridge::sniff_animated_webp(path)?;
-    match super::transcode::webp_bridge::extract(&bytes, WHOLE_ANIMATION, &AtomicBool::new(false)) {
-        Ok(bridge) => Some(bridge),
+    let Some(bytes) = super::transcode::webp_bridge::sniff_animated_webp(path) else {
+        return Ok(None);
+    };
+    // No cancellation flag, and deliberately not a pretend one: the scan
+    // cancels by aborting the *async* job task (`JobRunnerMessage::
+    // CancelRunning` calls `JoinHandle::abort`), and this whole visuals pass
+    // runs inside a `spawn_blocking` closure, which tokio cannot abort and
+    // which is therefore always run to completion. Nothing to thread until
+    // the scan grows a real cooperative cancellation token; the budgets below
+    // are what bound a hostile file's cost in the meantime.
+    let cancel = AtomicBool::new(false);
+    match super::transcode::webp_bridge::extract_within(
+        &bytes,
+        WHOLE_ANIMATION,
+        &cancel,
+        BRIDGE_BYTE_BUDGET,
+    ) {
+        Ok(bridge) => Ok(Some(bridge)),
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
                 error,
                 "could not bridge an animated WebP for its loop; letting ffmpeg try the file"
             );
-            None
+            Ok(None)
         }
     }
 }
@@ -308,5 +411,243 @@ mod tests {
                 end_cs: i64::MAX
             }
         );
+    }
+
+    /// The two-frame animated WebP the compose bridge is pinned against,
+    /// reused here so the loop's bridge path has a real file to walk.
+    const WEBP_FIXTURE: &[u8] = include_bytes!("transcode/fixtures/two-frame.webp");
+
+    /// A real animated GIF with the delays this test wants, written by the
+    /// `image` crate's encoder so the LZW data is valid and ffmpeg will
+    /// actually decode it. Frames differ from one another, so nothing about
+    /// the timing can be an artefact of a degenerate encode.
+    fn write_gif(path: &Path, side: u32, delays_ms: &[u32]) {
+        let file = std::fs::File::create(path).expect("the fixture is writable");
+        let mut encoder = image::codecs::gif::GifEncoder::new(file);
+        encoder
+            .set_repeat(image::codecs::gif::Repeat::Infinite)
+            .expect("the repeat header is written");
+        let frames: Vec<image::Frame> = delays_ms
+            .iter()
+            .enumerate()
+            .map(|(index, ms)| {
+                let shade = (index as u8).wrapping_mul(31);
+                let buffer = image::RgbaImage::from_fn(side, side, |x, _| {
+                    if (x / 32) % 2 == 0 {
+                        image::Rgba([shade, 40, 200, 255])
+                    } else {
+                        image::Rgba([200, shade, 40, 255])
+                    }
+                });
+                image::Frame::from_parts(
+                    buffer,
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(*ms, 1),
+                )
+            })
+            .collect();
+        encoder.encode_frames(frames).expect("the fixture encodes");
+    }
+
+    /// `(frame count, container duration, every frame's presentation time)`
+    /// of an encoded loop, straight from ffprobe.
+    fn probe_loop(bytes: &[u8]) -> (usize, f64, Vec<f64>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loop.mp4");
+        std::fs::write(&path, bytes).unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new(crate::media_tools::ffprobe())
+                .args(args)
+                .arg(&path)
+                .output()
+                .expect("ffprobe runs");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let duration: f64 = run(&[
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+        ])
+        .parse()
+        .expect("a duration");
+        let pts: Vec<f64> = run(&[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=pts_time",
+            "-of",
+            "csv=p=0",
+        ])
+        .lines()
+        .filter_map(|line| line.trim().trim_end_matches(',').parse().ok())
+        .collect();
+        (pts.len(), duration, pts)
+    }
+
+    fn encoded(path: &Path, mime: &str, side: u32) -> Vec<u8> {
+        encode_loop(
+            path,
+            mime,
+            &loop_render(side, side),
+            Transform::default(),
+        )
+        .expect("the fixture encodes")
+    }
+
+    /// The pathological-delay floor, end to end on a real GIF.
+    ///
+    /// A file whose every frame claims 1 cs is written by ad tools meaning
+    /// "as fast as possible", and everything that shows it to a human — the
+    /// browsers, and `gif_animation_seconds`, hence `items.duration` and the
+    /// display path — plays it at 10 cs a frame. ffmpeg does not: it
+    /// substitutes for 0 cs and leaves 1 cs alone, and its `-min_delay` /
+    /// `-default_delay` demuxer options do not change that. Without the
+    /// floor the stored loop runs 10x fast and a tenth as long as the item it
+    /// belongs to.
+    #[test]
+    fn a_uniformly_pathological_gif_loops_at_the_length_it_plays_at() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onecs.gif");
+        write_gif(&path, 640, &[10; 8]);
+
+        // The premise, from the same parser `items.duration` comes from.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            crate::media_tools::animation::gif_animation_seconds(&bytes),
+            0.8,
+            "eight frames floored to 10 cs each"
+        );
+        assert_eq!(
+            crate::media_tools::animation::gif_uniform_pathological_rate(&bytes),
+            Some(10)
+        );
+
+        let (frames, duration, pts) = probe_loop(&encoded(&path, "image/gif", 640));
+        assert_eq!(frames, 8, "every frame survives the retiming");
+        assert!(
+            (duration - 0.8).abs() < 0.001,
+            "the loop must run as long as the item says it does: {duration}"
+        );
+        for (index, time) in pts.iter().enumerate() {
+            assert!(
+                (time - index as f64 * 0.1).abs() < 0.001,
+                "frame {index} at {time}"
+            );
+        }
+    }
+
+    /// The other half of the same rule: a file with real delays keeps its
+    /// exact source timing, variable frame durations and all. This is what
+    /// the floor must not touch, and why it engages only when *every* delay
+    /// is pathological.
+    #[test]
+    fn a_mixed_delay_gif_keeps_its_exact_source_timing() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.gif");
+        write_gif(&path, 320, &[100, 500, 100, 900]);
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            crate::media_tools::animation::gif_animation_seconds(&bytes),
+            1.6
+        );
+        assert_eq!(
+            crate::media_tools::animation::gif_uniform_pathological_rate(&bytes),
+            None,
+            "a real delay anywhere means the source timing is authoritative"
+        );
+
+        let (frames, duration, pts) = probe_loop(&encoded(&path, "image/gif", 320));
+        assert_eq!(frames, 4);
+        assert!((duration - 1.6).abs() < 0.001, "{duration}");
+        for (index, expected) in [0.0, 0.1, 0.6, 0.7].iter().enumerate() {
+            assert!(
+                (pts[index] - expected).abs() < 0.001,
+                "frame {index} at {} wanted {expected}",
+                pts[index]
+            );
+        }
+    }
+
+    /// The animated-WebP path, which no mainline ffmpeg can demux: the file
+    /// is decoded in Rust and substituted as an ffconcat script of PNG
+    /// frames. Walked from the magic read through the sniff to a real
+    /// encode, against the same committed fixture the compose bridge is
+    /// pinned to.
+    #[test]
+    fn an_animated_webp_loops_through_the_frame_bridge() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two-frame.webp");
+        std::fs::write(&path, WEBP_FIXTURE).unwrap();
+
+        assert!(super::super::transcode::webp_bridge::has_webp_magic(&path));
+        assert!(super::super::transcode::webp_bridge::sniff_animated_webp(&path).is_some());
+        let bridged = prepare_input(&path, "image/webp").expect("no unsupported container");
+        assert_eq!(
+            bridged.is_some(),
+            !super::super::transcode::hw::animated_webp_decodable(),
+            "the bridge engages exactly when this toolchain cannot demux the file"
+        );
+        if let Some(bridge) = &bridged {
+            let script = std::fs::read_to_string(&bridge.script).unwrap();
+            assert_eq!(script.matches("file frame-").count(), 2);
+        }
+        drop(bridged);
+
+        // 16x16, so the loop is the source size rounded to even: unchanged.
+        let plan = loop_render(16, 16);
+        assert_eq!((plan.width, plan.height), (16, 16));
+        let (frames, duration, _) = probe_loop(
+            &encode_loop(&path, "image/webp", &plan, Transform::default())
+                .expect("the bridged fixture encodes"),
+        );
+        assert_eq!(frames, 2, "both frames of the fixture");
+        assert!(
+            duration > 0.5,
+            "the two 500 ms frames must not collapse: {duration}"
+        );
+    }
+
+    /// AVIF has no fallback of either kind — the frame bridge decodes WebP
+    /// only — so a toolchain that cannot demux animated AVIF has nothing left
+    /// to try. That is a permanent nothing on this host, reported as such so
+    /// the caller can record it instead of paying a decode and a process
+    /// spawn to rediscover it on every scan.
+    #[test]
+    fn an_undecodable_animated_avif_reports_unsupported() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.avif");
+        std::fs::write(&path, b"not really an avif").unwrap();
+
+        let outcome = prepare_input(&path, "image/avif");
+        if super::super::transcode::hw::animated_avif_decodable() {
+            assert!(
+                matches!(outcome, Ok(None)),
+                "a capable toolchain takes the ordinary path"
+            );
+        } else {
+            assert!(
+                matches!(outcome, Err(LoopError::Unsupported(_))),
+                "an incapable one says so rather than failing per scan"
+            );
+        }
     }
 }

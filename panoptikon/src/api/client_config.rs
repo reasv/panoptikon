@@ -64,12 +64,22 @@ pub(crate) struct ClientCapabilities {
 /// [`crate::visual_tiers`] (docs/grid-scroll-performance-implementation.md
 /// §2, step B2).
 ///
-/// The client decides `<img>` vs `<video>` for a grid cell from the search
-/// result's `type` and `size` fields against these two numbers, and the
-/// server decides what to store from the same two — so they are surfaced
-/// rather than duplicated in the UI. Server-derived constants, not
-/// policy-scoped configuration: every policy sees the same floor, because it
-/// is a property of what the scan wrote.
+/// A grid cell decides `<img>` vs `<video>` from four fields of its search
+/// result — `type` and `duration` say whether the picture moves, `size` and
+/// `width`/`height` say whether it clears the floor — against these two
+/// numbers, which is the same rule and the same arithmetic the scan used to
+/// decide what to store. Surfaced rather than duplicated in the UI so the two
+/// sides cannot drift.
+///
+/// Clearing the floor is necessary but not sufficient: an item above it is
+/// served a loop *once the backfill has written one*, and an item whose H.264
+/// encode came out no smaller than its source keeps serving the source
+/// permanently (the settled keep-the-original edge). A cell that mounts a
+/// `<video>` must therefore fall back to its poster when playback errors —
+/// the F6 contract in the plan document.
+///
+/// Server-derived constants, not policy-scoped configuration: every policy
+/// sees the same floor, because it is a property of what the scan wrote.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct AnimatedThumbnailFloor {
     /// An animated item at or below **both** of these is served as its
