@@ -23,8 +23,12 @@ use std::path::Path;
 /// Whether [`animation_duration_seconds`] has anything to say about this
 /// mime: the gate both the metadata phase and the backfill dispatcher check
 /// before spending anything. Every other image mime stays NULL forever.
+///
+/// One table with the loop encoder's two capability gates
+/// ([`crate::media_tools::animated_container_support`]), which is also where
+/// the matching discipline is written down.
 pub(crate) fn measures_animation(mime_type: &str) -> bool {
-    matches!(mime_type, "image/gif" | "image/webp" | "image/avif")
+    super::animated_container_support(mime_type).is_container()
 }
 
 /// The measured animation length of one file, in seconds.

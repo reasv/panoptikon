@@ -70,7 +70,7 @@ use crate::{
     pql::builder::filters::evaluate_match,
     pql::model::{Match, MatchValue},
     media_tools::animated_loop::LoopError,
-    media_tools::transcode::compose::{Transform, orientation_transform},
+    media_tools::transcode::compose::Transform,
     visual_tiers::{
         DISPLAY_MAX_FILE_SIZE, DisplayPlan, LOOP_MEDIA_TYPE, LOOP_TIER, TIER_MEDIA_TYPE,
         ThumbnailTier, TierRender, animated_plans, animated_serves_original, display_plan,
@@ -2543,6 +2543,7 @@ impl ScanContext {
             codec: codec_work,
             animation: animation_work,
             rotation: rotation_work,
+            indexed_rotation: image_facts.as_ref().and_then(|facts| facts.rotation),
             tier: tier_work,
             ladder,
             existing_frames: Vec::new(),
@@ -3141,7 +3142,8 @@ impl ScanContext {
             dimensions: facts
                 .as_ref()
                 .and_then(|facts| facts.width.zip(facts.height)),
-            duration: facts.and_then(|facts| facts.duration),
+            duration: facts.as_ref().and_then(|facts| facts.duration),
+            rotation: facts.and_then(|facts| facts.rotation),
         })
     }
 
@@ -4358,8 +4360,11 @@ fn image_header_geometry(
 }
 
 /// The clockwise quarter turns an orientation applies, which is all
-/// `items.rotation` records: mirroring never changes a dimension, and the one
-/// consumer that needs the full transform reads it from the file.
+/// `items.rotation` records: mirroring never changes a dimension, and the
+/// column exists to explain the dimensions. The one consumer that would like
+/// the full transform — the animated ladder's crop
+/// ([`indexed_display_transform`]) — accepts the turn without the flip rather
+/// than re-read the file for it.
 fn orientation_quarter_turns(orientation: Orientation) -> i64 {
     match orientation {
         Orientation::NoTransforms | Orientation::FlipHorizontal => 0,
@@ -4868,6 +4873,10 @@ fn build_new_item_thumbnails(
         let work = ImageLadderWork {
             display: true,
             tiers: first_pass_ladder(mime_type, metadata.duration, file_size, width, height),
+            // Measured by this very pass's metadata phase, so the loop is
+            // oriented by exactly the turn the item is about to be indexed
+            // with.
+            rotation: metadata.rotation,
         };
         build_image_renditions(&mut out, path, mime_type, file_size, image, work)
             .map_err(VisualsError::thumbnail)?;
@@ -4964,6 +4973,10 @@ struct ImageLadderWork {
     display: bool,
     /// Which grid renditions this pass owes — see [`grid_ladder`].
     tiers: GridLadder,
+    /// The item's orientation in clockwise quarter turns, as the scan measured
+    /// and stored it (`items.rotation`); `None` where nothing has examined it.
+    /// Only the animated ladder reads it — see [`indexed_display_transform`].
+    rotation: Option<i64>,
 }
 
 /// The display rendition and the grid tiers of one already-decoded image, in
@@ -4990,7 +5003,8 @@ fn build_image_renditions(
             out.tiers = Some(encode_tiers(0, &image, &grid_plans(file_size, width, height))?);
         }
         GridLadder::Animated => {
-            let (tiers, verdicts) = build_animated_tiers(path, mime_type, file_size, &image);
+            let (tiers, verdicts) =
+                build_animated_tiers(path, mime_type, file_size, &image, work.rotation);
             out.tiers = tiers;
             out.tier_verdicts = verdicts;
         }
@@ -5066,6 +5080,7 @@ fn build_animated_tiers(
     mime_type: &str,
     file_size: u64,
     first_frame: &DynamicImage,
+    rotation: Option<i64>,
 ) -> (Option<Vec<StoredTier>>, Vec<VisualVerdict>) {
     let (width, height) = first_frame.dimensions();
     let mut tiers = match encode_tiers(0, first_frame, &poster_plans(width, height)) {
@@ -5081,7 +5096,7 @@ fn build_animated_tiers(
         path,
         mime_type,
         &plan,
-        image_display_transform(path),
+        indexed_display_transform(rotation),
     ) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -5158,7 +5173,8 @@ fn loop_failure(error: LoopError) -> VisualsError {
 }
 
 /// The transform that takes a file's stored pixels into the display space the
-/// index records its dimensions in.
+/// index records its dimensions in, from the orientation the scan measured
+/// (`items.rotation`) rather than from a second read of the file's header.
 ///
 /// Identity for everything without an EXIF orientation, which is every GIF and
 /// nearly every animated WebP — but the loop's crop rectangle is expressed in
@@ -5166,29 +5182,27 @@ fn loop_failure(error: LoopError) -> VisualsError {
 /// itself (ffmpeg does not apply a WebP's EXIF orientation, and the bridge
 /// writes canvas-space frames).
 ///
-/// **Speculative, and knowingly so.** The orientation is read from the file's
-/// header here rather than taken from `items.rotation`, which the scan
-/// measures and stores — so a file whose header this build cannot read, or
-/// whose stored rotation the display-dimensions backfill later corrects,
-/// gets the identity transform and a loop that disagrees with its own
-/// poster. Harmless today because no animated container in the wild carries
-/// an EXIF orientation (GIF has no EXIF at all, and animated WebP with one is
-/// vanishingly rare), and cheap to make authoritative later: thread the
-/// indexed `rotation` into the ladder the way the dimensions already are.
-/// Until then the stored *geometry* is still exactly what the dispatcher
-/// predicted — the scale filter is unconditional — so a wrong transform can
-/// only ever produce a wrong-looking loop, never a non-terminating backfill.
-fn image_display_transform(path: &Path) -> Transform {
-    match image_header_geometry(path) {
-        Ok((_, orientation)) => orientation_transform(orientation),
-        Err(err) => {
-            tracing::debug!(
-                error = ?err,
-                path = %path.display(),
-                "could not read an orientation for a loop; assuming none"
-            );
-            Transform::default()
-        }
+/// The indexed value is the authoritative one, and it is threaded in the way
+/// the dimensions already are: it is the same measurement the item's `width`
+/// and `height` were oriented by, so a loop can no longer disagree with the
+/// geometry the dispatcher predicted for it or with its own poster. `None` —
+/// an item nothing has examined yet — is the identity, which is what an
+/// unreadable header used to produce.
+///
+/// One thing the column cannot carry: `items.rotation` records the turn only,
+/// mirroring dropped ([`orientation_quarter_turns`]), so a *mirrored* animated
+/// container gets its turn and not its flip. That is the same class of
+/// cosmetic gap the header read had (it could be a stale answer instead of a
+/// missing one), on a population no smaller: an EXIF orientation on an
+/// animated container is vanishingly rare to begin with, and a mirroring one
+/// rarer still.
+fn indexed_display_transform(rotation: Option<i64>) -> Transform {
+    Transform {
+        // Euclidean on both, so a column outside 0/90/180/270 — which no
+        // writer produces — still lands inside the group instead of wrapping
+        // past it.
+        quarter_turns: rotation.unwrap_or(0).div_euclid(90).rem_euclid(4) as u8,
+        flip_h: false,
     }
 }
 
@@ -5412,6 +5426,10 @@ struct ImageFacts {
     dimensions: Option<(i64, i64)>,
     /// `items.duration` — for an image, the animated-spans measurement.
     duration: Option<f64>,
+    /// `items.rotation` — the turn the indexed dimensions were oriented by,
+    /// which is the one the animated ladder's loop is cropped against
+    /// ([`indexed_display_transform`]). `None` where nothing has examined it.
+    rotation: Option<i64>,
 }
 
 /// The mime families a stored rendition — and therefore a grid tier — can
@@ -5474,6 +5492,9 @@ fn first_pass_ladder(
             file_size,
             dimensions: Some((i64::from(width), i64::from(height))),
             duration,
+            // The ladder classifier has no use for it; the pass carries its own
+            // freshly measured turn to the loop encoder instead.
+            rotation: None,
         }),
     )
 }
@@ -5533,12 +5554,10 @@ fn grid_ladder(mime_type: &str, facts: Option<&ImageFacts>) -> GridLadder {
     // a cached `OnceLock`, so this is one boolean read per file after the
     // first, and a restart with a better toolchain picks every item up.
     //
-    // Cost of the probe itself is bounded by the mime test in front of it: it
-    // spawns ffmpeg at most once per process, and only if the library
-    // actually contains an animated AVIF.
-    if mime_type.starts_with("image/avif")
-        && !crate::media_tools::transcode::hw::animated_avif_decodable()
-    {
+    // Which containers need the probe, and the cost of asking, are
+    // [`crate::media_tools::AnimatedContainer`]'s to say — the same table the
+    // loop encoder's own input gate consults.
+    if crate::media_tools::animated_container_support(mime_type).loop_is_undecodable() {
         return GridLadder::Unknown;
     }
     let Some(facts) = facts else {
@@ -5594,6 +5613,11 @@ struct PendingBackfillWork {
     animation: bool,
     /// The orientation question (docs/display-dimensions-design.md §4).
     rotation: Option<RotationBackfill>,
+    /// `items.rotation` as it stands *now*, which is what orients an animated
+    /// item's loop when this pass measures no orientation of its own
+    /// ([`indexed_display_transform`]). `None` for a non-image, which has no
+    /// animated ladder to orient.
+    indexed_rotation: Option<i64>,
     /// The rendition-ladder question
     /// (docs/grid-scroll-performance-implementation.md §3, B1).
     tier: Option<TierWork>,
@@ -5655,6 +5679,7 @@ fn generate_backfill_visuals(
         codec: needs_codecs,
         animation: needs_animation,
         rotation: rotation_work,
+        indexed_rotation,
         tier: tier_work,
         ladder,
         existing_frames,
@@ -5701,6 +5726,13 @@ fn generate_backfill_visuals(
     } else {
         None
     };
+    // The orientation the animated ladder crops against: this pass's own
+    // measurement where it made one — strictly newer than the index, which for
+    // a pending item holds nothing at all — and the stored answer otherwise.
+    let display_rotation = rotation
+        .as_ref()
+        .map(|pass| pass.quarter_turns)
+        .or(indexed_rotation);
     // Inside the thumbgen span, and first within it: everything below samples
     // frames, and design §7 requires detection to have happened by then. The
     // ~85ms of process spawn belongs to the visuals phase it clamps rather
@@ -5772,6 +5804,7 @@ fn generate_backfill_visuals(
             _ => true,
         },
         tiers: ladder,
+        rotation: display_rotation,
     };
     // An image owing renditions runs the ordinary image pass: display tier
     // and grid tiers come out of the one decode together, so there is no
@@ -5872,7 +5905,7 @@ fn generate_backfill_visuals(
         }) {
             Ok((file_size, image)) => {
                 let (produced, tier_verdicts) =
-                    build_animated_tiers(path, mime_type, file_size, &image);
+                    build_animated_tiers(path, mime_type, file_size, &image, display_rotation);
                 tiers = produced;
                 verdicts.extend(tier_verdicts);
             }
@@ -9227,7 +9260,7 @@ VALUES (?1, 0, 'grid-m', 'image/gif', 'image/jpeg', 200, 200, ?2, X'00')
         let file_size = fs::metadata(&path).unwrap().len();
         let image = open_image_oriented(&path).expect("the fixture decodes");
 
-        let (tiers, verdicts) = build_animated_tiers(&path, "image/gif", file_size, &image);
+        let (tiers, verdicts) = build_animated_tiers(&path, "image/gif", file_size, &image, None);
         let tiers = tiers.expect("the ladder is produced");
         assert!(
             verdicts.is_empty(),
@@ -9277,7 +9310,8 @@ VALUES (?1, 0, 'grid-m', 'image/gif', 'image/jpeg', 200, 200, ?2, X'00')
         fs::write(&path, b"GIF89a and then nothing ffmpeg can use").unwrap();
         let image = DynamicImage::ImageRgb8(image::RgbImage::new(1400, 1400));
 
-        let (tiers, verdicts) = build_animated_tiers(&path, "image/gif", 4_000_000, &image);
+        let (tiers, verdicts) =
+            build_animated_tiers(&path, "image/gif", 4_000_000, &image, None);
         assert!(
             tiers.is_none(),
             "a set without its loop must never be stored: it would never \
@@ -11354,6 +11388,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             ImageLadderWork {
                 display: true,
                 tiers: GridLadder::Still,
+                rotation: None,
             },
         )
         else {
@@ -11380,6 +11415,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             ImageLadderWork {
                 display: true,
                 tiers: GridLadder::Still,
+                rotation: None,
             },
         ) else {
             panic!("unreadable bytes cannot yield frames");
@@ -13063,6 +13099,33 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         }
     }
 
+    // The animated ladder's crop rectangle is expressed in display space, so
+    // the loop encoder has to be handed the same turn the item's indexed
+    // dimensions were oriented by. It comes from `items.rotation` now rather
+    // than from a second read of the file's header, so this is the whole
+    // mapping — and the flip the column cannot carry is deliberately absent.
+    #[test]
+    fn a_loop_is_oriented_by_the_indexed_turn() {
+        let turns = |transform: Transform| {
+            assert!(!transform.flip_h, "the column records no mirroring");
+            transform.quarter_turns
+        };
+        // Never examined: the identity, which is what every GIF and nearly
+        // every animated WebP wants anyway.
+        assert_eq!(indexed_display_transform(None), Transform::default());
+        for (rotation, quarter_turns) in [(0, 0), (90, 1), (180, 2), (270, 3)] {
+            assert_eq!(
+                turns(indexed_display_transform(Some(rotation))),
+                quarter_turns,
+                "{rotation}"
+            );
+        }
+        // Values no writer produces, kept inside the group rather than
+        // panicking or wrapping past it.
+        assert_eq!(turns(indexed_display_transform(Some(360))), 0);
+        assert_eq!(turns(indexed_display_transform(Some(-90))), 3);
+    }
+
     // ffprobe reports the display matrix counter-clockwise; `items.rotation`
     // is clockwise, so the two disagree by a sign. Measured against the
     // bundled toolchain: `-display_rotation 90` probes as `rotation: 90` and
@@ -14019,6 +14082,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             file_size,
             dimensions: Some((width, height)),
             duration,
+            rotation: None,
         }
     }
 
@@ -14087,6 +14151,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
                     file_size: 4 * MB,
                     dimensions: None,
                     duration: Some(2.0),
+                    rotation: None,
                 })
             ),
             GridLadder::Unknown

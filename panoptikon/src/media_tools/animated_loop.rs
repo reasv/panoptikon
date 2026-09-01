@@ -308,13 +308,14 @@ fn prepare_input(
     path: &Path,
     mime_type: &str,
 ) -> Result<Option<super::transcode::webp_bridge::BridgedInput>, LoopError> {
-    if mime_type.starts_with("image/avif") && !super::transcode::hw::animated_avif_decodable() {
+    let support = super::animated_container_support(mime_type);
+    if support.loop_is_undecodable() {
         return Err(LoopError::Unsupported(
             "this ffmpeg cannot decode animated AVIF, and the frame bridge covers WebP only"
                 .to_string(),
         ));
     }
-    if !mime_type.starts_with("image/webp") {
+    if support != super::AnimatedContainer::Bridge {
         return Ok(None);
     }
     if !super::transcode::webp_bridge::has_webp_magic(path)

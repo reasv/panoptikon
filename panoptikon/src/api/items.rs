@@ -800,26 +800,14 @@ fn rendition_cache_control(
     }
 }
 
-/// A grid-tier request for an animated item (§2, step B2).
+/// A grid-tier request for an animated item (§2, step B2) — the serving half
+/// of the fallback ladder written out in [`crate::visual_tiers`]'s module
+/// docs, which is where the whole rule lives and where the client's half of it
+/// is described too.
 ///
-/// Three answers, and which one is right is decided entirely by what the scan
-/// stored:
-///
-/// * **The loop** — one H.264 rendition per item, answering *both* grid
-///   tiers, served as its stored media type. An exact hit by construction:
-///   there is nothing larger to fall up to, because the loop is not a ladder.
-/// * **The poster** (`still=true`) — the static tiers, walked with the same
-///   fall-up ladder every still request uses (`grid-s` falls up to `grid-m`,
-///   which every animated item above the floor stores).
-/// * **The original file** — for an item at or below the raw floor, where
-///   nothing is stored and nothing ever will be (final, immutable); for one
-///   whose loop the backfill has not written yet (pending, revalidates); and
-///   for the settled encoded-larger-than-the-source edge, where the stored
-///   loop row deliberately carries no bytes.
-///
-/// A poster is never substituted for a missing loop. The grid would then be
-/// the one surface where an animated item does not move, silently and
-/// permanently, which is precisely the bug this step exists to fix.
+/// Which answer is right is decided entirely by what the scan stored: the
+/// loop, its poster (`still=true`), or the item's own file — the last with a
+/// cache lifetime that depends on *why* there is no loop.
 #[allow(clippy::too_many_arguments)]
 async fn animated_tier_response(
     conn: &mut sqlx::SqliteConnection,

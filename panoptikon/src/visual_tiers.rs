@@ -20,6 +20,40 @@
 //! file again (`jobs::files::maybe_dispatch_backfill`). Anything that made a
 //! rendition's geometry depend on the pixels would re-decode every image in
 //! the library on every scan, forever.
+//!
+//! # The animated fallback ladder
+//!
+//! Written out once, here, because it spans three files that each see one end
+//! of it: `api::items::animated_tier_response` serves it, the scan's backfill
+//! decides what there is to serve, and `ui/lib/thumbnailTier.ts` decides which
+//! element asks. Their own docs point here rather than restating it.
+//!
+//! A grid request for an animated item, `still` unset, is answered:
+//!
+//! * **the stored loop** where one exists — `video/mp4`, the exact answer at
+//!   both grid tiers, immutable;
+//! * **the original file, revalidating**, where no loop row exists yet: the
+//!   backfill has not reached this item, so the answer must not be pinned;
+//! * **the original file, immutable**, where the loop row exists and carries
+//!   no bytes — the settled keep-the-original verdict (no encode came out
+//!   smaller than the source), which is as final as a hit.
+//!
+//! `still=true` asks for the poster instead, and is deliberately a **no-op at
+//! or below the raw floor**: nothing is stored for those items, so both values
+//! answer with the original — which animates natively in an `<img>`. That is
+//! what lets a client with an incomplete row ask for `still=true` and never
+//! put `video/mp4` into an `<img>`. Above the floor it answers the static
+//! posters through the ordinary fall-up ladder, never immutably on a fall-up.
+//!
+//! A poster is never substituted for a missing loop server-side: the grid
+//! would then be the one surface where an animated item silently stops moving.
+//! The client closes that gap from its own end — a `<video>` that errors
+//! latches to the poster permanently — which is what makes the two
+//! original-file answers above safe rather than broken.
+//!
+//! `animated_floor: null` from `/api/client-config` means **no loops at all**:
+//! with no floor to evaluate every animated cell asks `still=true`, and
+//! nothing mounts a `<video>`.
 
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
 use serde::Deserialize;
