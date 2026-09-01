@@ -4846,12 +4846,7 @@ fn build_new_item_thumbnails(
                 .extend_from_slice(&[VisualKind::Thumbnail, VisualKind::Frame]);
         }
     } else if mime_type.starts_with("audio") {
-        let thumb = get_audio_thumbnail(path, mime_type);
-        out.thumbnails
-            .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
-        out.tiers =
-            Some(tiers_of_stored_thumbnails(&[(0, &thumb)]).map_err(VisualsError::thumbnail)?);
-        out.blurhash_source = Some(thumb);
+        store_rendered_still(&mut out, get_audio_thumbnail(path, mime_type))?;
     } else if mime_type.starts_with("image") {
         // The full decode lives here and only here: it is what the thumbnail,
         // the grid tiers and the blurhash are made of, and — since the
@@ -4883,19 +4878,11 @@ fn build_new_item_thumbnails(
         // pdfium refuses to parse does not.
         let page = render_pdf_first_page(path)
             .map_err(|err| VisualsError::thumbnail(pdf_visuals_failure(err)))?;
-        out.thumbnails
-            .push(encode_image(0, &page).map_err(VisualsError::thumbnail)?);
-        out.tiers =
-            Some(tiers_of_stored_thumbnails(&[(0, &page)]).map_err(VisualsError::thumbnail)?);
-        out.blurhash_source = Some(page);
+        store_rendered_still(&mut out, page)?;
     } else if mime_type.starts_with("text/html") {
         let shot = render_html_screenshot_classified(path)
             .map_err(|err| VisualsError::thumbnail(html_visuals_failure(err)))?;
-        out.thumbnails
-            .push(encode_image(0, &shot).map_err(VisualsError::thumbnail)?);
-        out.tiers =
-            Some(tiers_of_stored_thumbnails(&[(0, &shot)]).map_err(VisualsError::thumbnail)?);
-        out.blurhash_source = Some(shot);
+        store_rendered_still(&mut out, shot)?;
     } else {
         // No generator for this type at all: a correct, permanent nothing.
         out.nothing.push(VisualKind::Thumbnail);
@@ -5215,6 +5202,27 @@ fn tiers_of_stored_thumbnails(
         out.extend(encode_stored_thumbnail_tiers(*idx, image)?);
     }
     Ok(out)
+}
+
+/// The whole visuals ladder of a type whose generator renders exactly one
+/// still: audio (cover art or placeholder), a PDF's first page, an HTML
+/// screenshot. Their branches in the two passes were six verbatim copies of
+/// these three lines.
+///
+/// Deliberately does *not* cover the image and video branches, which look
+/// similar and are not: an image's ladder is dimension-first and can be
+/// animated or absent entirely, and a video's is built from two pictures with
+/// its frames' own verdicts attached.
+fn store_rendered_still(
+    out: &mut ProducedVisuals,
+    image: DynamicImage,
+) -> Result<(), VisualsError> {
+    out.thumbnails
+        .push(encode_image(0, &image).map_err(VisualsError::thumbnail)?);
+    out.tiers =
+        Some(tiers_of_stored_thumbnails(&[(0, &image)]).map_err(VisualsError::thumbnail)?);
+    out.blurhash_source = Some(image);
+    Ok(())
 }
 
 /// A missing pdfium is `blocked` and self-heals once the library appears; a
@@ -6084,12 +6092,7 @@ fn build_backfill_thumbnails(
             out.blurhash_source = Some(grid);
         }
     } else if mime_type.starts_with("audio") {
-        let thumb = get_audio_thumbnail(path, mime_type);
-        out.thumbnails
-            .push(encode_image(0, &thumb).map_err(VisualsError::thumbnail)?);
-        out.tiers =
-            Some(tiers_of_stored_thumbnails(&[(0, &thumb)]).map_err(VisualsError::thumbnail)?);
-        out.blurhash_source = Some(thumb);
+        store_rendered_still(&mut out, get_audio_thumbnail(path, mime_type))?;
     } else if mime_type.starts_with("image") {
         // No pre-gate of its own any more: the dispatcher decided this image
         // owes a rendition (a display one, a tier, or both) from the indexed
@@ -6108,19 +6111,11 @@ fn build_backfill_thumbnails(
     } else if mime_type.starts_with("application/pdf") {
         let page = render_pdf_first_page(path)
             .map_err(|err| VisualsError::thumbnail(pdf_visuals_failure(err)))?;
-        out.thumbnails
-            .push(encode_image(0, &page).map_err(VisualsError::thumbnail)?);
-        out.tiers =
-            Some(tiers_of_stored_thumbnails(&[(0, &page)]).map_err(VisualsError::thumbnail)?);
-        out.blurhash_source = Some(page);
+        store_rendered_still(&mut out, page)?;
     } else if mime_type.starts_with("text/html") {
         let shot = render_html_screenshot_classified(path)
             .map_err(|err| VisualsError::thumbnail(html_visuals_failure(err)))?;
-        out.thumbnails
-            .push(encode_image(0, &shot).map_err(VisualsError::thumbnail)?);
-        out.tiers =
-            Some(tiers_of_stored_thumbnails(&[(0, &shot)]).map_err(VisualsError::thumbnail)?);
-        out.blurhash_source = Some(shot);
+        store_rendered_still(&mut out, shot)?;
     } else {
         out.nothing.push(VisualKind::Thumbnail);
     }
@@ -7283,18 +7278,6 @@ fn extract_video_frames(
     result
 }
 
-/// Renders the last portion of a captured stderr for error messages, keeping
-/// diagnostics without dumping pages of encoder output into the log.
-pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
-    const MAX_LEN: usize = 500;
-    let text = String::from_utf8_lossy(stderr);
-    let trimmed = text.trim();
-    match trimmed.char_indices().nth_back(MAX_LEN - 1) {
-        Some((idx, _)) => format!("...{}", &trimmed[idx..]),
-        None => trimmed.to_string(),
-    }
-}
-
 /// `decode_limit` is the outro clamp, in seconds. Passed as an *input* option
 /// (`-t` before `-i`) so it bounds the decode itself rather than only what the
 /// image muxer writes; the filter graph then never sees a frame past the
@@ -7337,7 +7320,7 @@ fn extract_video_frames_into(
     })?;
 
     if !output.status.success() {
-        let detail = stderr_tail(&output.stderr);
+        let detail = crate::media_tools::stderr_tail(&output.stderr);
         // The generator's own classified line, the twin of pdfium's and the
         // browser's: the callers log this at debug (one verdict, one log), so
         // this is where a video that will not yield frames becomes visible.
@@ -7592,7 +7575,10 @@ fn extract_media_info(path: &Path) -> Result<MediaInfo, FileProcessError> {
         // later scan before it suppresses anything.
         return Err(ScanFailure::input_unconfirmed(
             STAGE_METADATA,
-            format!("ffprobe failed: {}", stderr_tail(&output.stderr)),
+            format!(
+                "ffprobe failed: {}",
+                crate::media_tools::stderr_tail(&output.stderr)
+            ),
         ));
     }
 

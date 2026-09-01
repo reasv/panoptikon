@@ -209,7 +209,7 @@ pub(crate) fn encode_loop(
     if !outcome.status.success() {
         return Err(LoopError::Failed(format!(
             "ffmpeg failed: {}",
-            crate::jobs::files::stderr_tail(&outcome.stderr)
+            crate::media_tools::stderr_tail(&outcome.stderr)
         )));
     }
     // ffmpeg reported success, so the bytes not coming back is this machine's

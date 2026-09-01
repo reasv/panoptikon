@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use crate::api_error::ApiError;
 use crate::inferio_client::{InferenceFile, InferenceInput};
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
-use crate::jobs::files::stderr_tail;
+use crate::media_tools::stderr_tail;
 
 pub(super) async fn build_audio_tracks_inputs(
     item: &JobInputData,

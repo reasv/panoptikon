@@ -12,7 +12,8 @@ use crate::db::open_index_db_read_no_user_data;
 use crate::db::storage::{StoredImage, get_frames_bytes};
 use crate::inferio_client::{InferenceFile, InferenceInput};
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
-use crate::jobs::files::{FRAME_PROCESS_VERSION, stderr_tail};
+use crate::jobs::files::FRAME_PROCESS_VERSION;
+use crate::media_tools::stderr_tail;
 
 /// A frame ready to be sent to inference. PDF pages and HTML screenshots
 /// carry their own pixel dimensions (each page differs from the item's stored

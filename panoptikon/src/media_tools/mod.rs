@@ -39,6 +39,22 @@ use std::sync::OnceLock;
 /// and a different io path cannot change the verdict.
 pub(crate) const FFMPEG_INPUT_OPEN_FAILURE: &str = "Error opening input";
 
+/// Renders the last portion of a captured stderr for error messages, keeping
+/// diagnostics without dumping pages of encoder output into the log.
+///
+/// Lives here rather than with the scan job that first needed it: every caller
+/// is reading the stderr of a tool this module resolves and spawns, and two of
+/// them are inside `media_tools` itself.
+pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
+    const MAX_LEN: usize = 500;
+    let text = String::from_utf8_lossy(stderr);
+    let trimmed = text.trim();
+    match trimmed.char_indices().nth_back(MAX_LEN - 1) {
+        Some((idx, _)) => format!("...{}", &trimmed[idx..]),
+        None => trimmed.to_string(),
+    }
+}
+
 /// The argument vector with every `-i` operand rewritten through ffmpeg's
 /// `cache:` protocol, which interposes a lazily-populated temp-file cache
 /// between the demuxer and the real file — rebuilding the whole io stack
@@ -297,7 +313,7 @@ fn venv_static_ffmpeg(python: &Path) -> Option<(PathBuf, PathBuf)> {
     };
     if !output.status.success() {
         tracing::debug!(
-            stderr = %crate::jobs::files::stderr_tail(&output.stderr),
+            stderr = %stderr_tail(&output.stderr),
             "static-ffmpeg probe failed (package missing from the venv?); \
              using ffmpeg/ffprobe from PATH"
         );
