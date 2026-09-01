@@ -973,6 +973,37 @@ struct BackfillResult {
     replace_visuals: bool,
 }
 
+impl BackfillResult {
+    /// A pass that concluded *nothing at all*, for the one caller that has no
+    /// pass to report: the visuals worker died.
+    ///
+    /// Every field is the "nothing was learned" value, and each is load-bearing
+    /// rather than merely empty. No visual verdict, so the generation is
+    /// retried next scan unmarked and unrecorded. `tiers: None` writes no set,
+    /// so the stored one stays and the ladder question asks again. The
+    /// animation length and the orientation stay `None` for the same reason —
+    /// and for the orientation that is the only safe failure mode at all, its
+    /// write being the single non-idempotent one in the backfill.
+    fn inconclusive(sha256: String, mime_type: String) -> Self {
+        Self {
+            sha256,
+            mime_type,
+            thumbnails: Vec::new(),
+            tiers: None,
+            drop_thumbnails: false,
+            extracted_frames: Vec::new(),
+            blurhash: None,
+            visual_verdicts: Vec::new(),
+            visuals_scan_error: None,
+            outro: None,
+            codecs: None,
+            animation: None,
+            rotation: None,
+            replace_visuals: false,
+        }
+    }
+}
+
 struct FailedFile {
     path: PathBuf,
     error: FileProcessError,
@@ -2294,13 +2325,18 @@ impl ScanContext {
         mime_type: String,
         path: PathBuf,
     ) -> ApiResult<()> {
-        let mut needs_thumb =
-            !has_thumbnail(&mut self.conn, &sha256, THUMBNAIL_PROCESS_VERSION).await?;
-        // The positive cache's answer, before the image and marker branches
-        // below repurpose `needs_thumb`. Only the outro's replacement rule
-        // reads it, and only §7.1's question: is there anything stored here to
-        // replace?
-        let thumbnail_stored = !needs_thumb;
+        // The positive cache's answer, and only that: is there a stored
+        // rendition of this content? Two rules read it as such — §7.1's "is
+        // there anything here to replace" and the orientation question's "does
+        // this item have visuals a transformed picture would make stale" — and
+        // both are asked long after the branches below have moved
+        // `generate_thumbnail` on to a different question.
+        let thumbnail_stored =
+            has_thumbnail(&mut self.conn, &sha256, THUMBNAIL_PROCESS_VERSION).await?;
+        // "Run the thumbnail half of a pass", which starts out as the positive
+        // cache's answer inverted and is then decided by the image rule, the
+        // negative cache and the ladder question in turn.
+        let mut generate_thumbnail = !thumbnail_stored;
         let needs_blurhash = !has_blurhash(&mut self.conn, &sha256).await?;
         // *Why* a thumbnail is not needed decides what the rest of this
         // function may still do: a stored or served-directly thumbnail says
@@ -2318,12 +2354,12 @@ impl ScanContext {
         } else {
             None
         };
-        if needs_thumb && mime_type.starts_with("image") {
+        if generate_thumbnail && mime_type.starts_with("image") {
             // Images served from the original file never get a stored
             // thumbnail, so `has_thumbnail` stays false for them forever.
             // Decide from the indexed dimensions instead of decoding, or every
             // rescan re-decodes every such image to produce nothing.
-            needs_thumb = match &image_facts {
+            generate_thumbnail = match &image_facts {
                 // Unreadable now: leave the visuals to a later scan.
                 None => false,
                 Some(facts) => match facts.dimensions {
@@ -2375,7 +2411,7 @@ impl ScanContext {
             .pending_tier_work(&sha256, &mime_type, &path, image_facts.as_ref(), ladder)
             .await;
         if matches!(tier_work, Some(TierWork::Image { .. })) {
-            needs_thumb = true;
+            generate_thumbnail = true;
         }
         // Last, after the positive cache missed *and* the served-directly
         // predicate said a thumbnail would be stored: the negative cache. This
@@ -2393,11 +2429,11 @@ impl ScanContext {
         // item is usually served directly at the display tier (so
         // `needs_thumb` is false for it and the gate would never be reached).
         let animated_ladder = matches!(tier_work, Some(TierWork::Animated));
-        if (needs_thumb || animated_ladder)
+        if (generate_thumbnail || animated_ladder)
             && self.thumbnail_marker_suppresses(&sha256, &path).await
         {
-            if needs_thumb {
-                needs_thumb = false;
+            if generate_thumbnail {
+                generate_thumbnail = false;
                 thumb_suppressed = true;
             }
             // The image and animated ladders both *start* with that decode,
@@ -2482,9 +2518,8 @@ impl ScanContext {
         //
         // It carries what the *worker* will need and cannot ask for itself:
         // whether this item has visuals that a transformed picture would make
-        // stale (§4.1). `thumbnail_stored` is the positive cache's answer from
-        // before the image and marker branches above repurposed `needs_thumb`,
-        // for exactly the reason the outro's replacement rule reads it.
+        // stale (§4.1) — the positive cache's own answer, for exactly the
+        // reason the outro's replacement rule reads it.
         let rotation_work = self
             .pending_rotation_work(&sha256, &mime_type, &path)
             .await
@@ -2492,19 +2527,38 @@ impl ScanContext {
                 thumbnail_stored,
                 blurhash_stored: !needs_blurhash,
             });
-        if !needs_thumb && !needs_blurhash {
-            // Counted before the outro, codec and animation questions are
-            // consulted: the marker did remove a whole visuals dispatch,
-            // whether or not a probe still owes this file a run of its own.
+        // Every question is answered now, so the rest of the dispatch works
+        // from one value. The three early returns below share [`
+        // PendingBackfillWork::any`] rather than each spelling the same chain
+        // of questions out, which is how one of them came to omit one.
+        let mut work = PendingBackfillWork {
+            thumbnail: generate_thumbnail,
+            blurhash: needs_blurhash,
+            outro: outro_work.map(|item| OutroBackfill {
+                // §7.1 needs facts this dispatch has not gathered yet; filled
+                // in below, once they are.
+                replaces_visuals: false,
+                item,
+            }),
+            codec: codec_work,
+            animation: animation_work,
+            rotation: rotation_work,
+            tier: tier_work,
+            ladder,
+            existing_frames: Vec::new(),
+            existing_thumb: None,
+            frames_stored: false,
+            video_duration: 0.0,
+            stored_content_end_ms: None,
+        };
+        if !work.thumbnail && !work.blurhash {
+            // Counted before the remaining questions are consulted: the marker
+            // did remove a whole visuals dispatch, whether or not a probe still
+            // owes this file a run of its own.
             if thumb_suppressed {
                 self.note_suppressed_visuals(&path);
             }
-            if outro_work.is_none()
-                && !codec_work
-                && !animation_work
-                && rotation_work.is_none()
-                && tier_work.is_none()
-            {
+            if !work.any() {
                 return Ok(());
             }
         }
@@ -2514,20 +2568,18 @@ impl ScanContext {
             return Ok(());
         }
 
-        let mut existing_frames = Vec::new();
         // Whether the fetch below actually ran, which decides whether
-        // `existing_frames` is evidence about `storage.frames` or merely the
-        // default. See `frames_stored`.
+        // `work.existing_frames` is evidence about `storage.frames` or merely
+        // the default. See `frames_stored`.
         let mut frames_fetched = false;
-        let mut video_duration = 0.0_f64;
-        if needs_thumb && mime_type.starts_with("video") {
+        if work.thumbnail && mime_type.starts_with("video") {
             // Frames already stored in the database can rebuild the thumbnail
             // even when the item's duration metadata is missing; only a fresh
             // ffmpeg extraction needs a usable duration (matching Python,
             // which consults metadata only when no frames exist).
-            existing_frames = get_frames_bytes(&mut self.conn, &sha256).await?;
+            work.existing_frames = get_frames_bytes(&mut self.conn, &sha256).await?;
             frames_fetched = true;
-            if existing_frames.is_empty() {
+            if work.existing_frames.is_empty() {
                 if let Some((duration, video_tracks)) =
                     get_item_visual_meta(&mut self.conn, &sha256).await?
                 {
@@ -2557,29 +2609,22 @@ impl ScanContext {
                             &mime_type,
                         )
                         .await;
-                        if outro_work.is_none()
-                            && !codec_work
-                            && !animation_work
-                            && rotation_work.is_none()
-                            && tier_work.is_none()
-                        {
+                        if !work.any() {
                             return Ok(());
                         }
                         // A probe is still owed and needs neither frames nor a
                         // duration to reach a verdict, so the dispatch goes
                         // ahead with the thumbnail half switched off.
-                        needs_thumb = false;
+                        work.thumbnail = false;
                     } else {
-                        video_duration = duration;
+                        work.video_duration = duration;
                     }
                 }
             }
         }
-        let existing_thumb = if !needs_thumb && needs_blurhash {
-            get_thumbnail_bytes(&mut self.conn, &sha256, 0).await?
-        } else {
-            None
-        };
+        if !work.thumbnail && work.blurhash {
+            work.existing_thumb = get_thumbnail_bytes(&mut self.conn, &sha256, 0).await?;
+        }
         // A blurhash can only come from a stored thumbnail or the image itself.
         // With no stored thumbnail, a non-image has no second source at all —
         // and neither, in practice, does a *suppressed* image: its only
@@ -2587,7 +2632,7 @@ impl ScanContext {
         // precisely the decode the thumbnail marker's verdict already settled.
         // Falling through here would re-open and re-decode the file on every
         // single scan, the exact waste this table exists to kill.
-        if !needs_thumb && needs_blurhash && existing_thumb.is_none() {
+        if !work.thumbnail && work.blurhash && work.existing_thumb.is_none() {
             let mut no_source = !mime_type.starts_with("image");
             // Reaching here with an unsuppressed image means the marker was
             // never consulted above, because the image would never store a
@@ -2602,14 +2647,22 @@ impl ScanContext {
             }
             no_source = no_source || thumb_suppressed;
             if no_source {
-                // As above: the suppression is counted even when the outro,
-                // codec or animation question keeps the dispatch alive.
+                // As above: the suppression is counted even when one of the
+                // remaining questions keeps the dispatch alive.
                 if thumb_suppressed {
                     self.note_suppressed_visuals(&path);
                 }
-                if outro_work.is_none() && !codec_work && !animation_work && tier_work.is_none() {
+                if !work.any() {
                     return Ok(());
                 }
+                // A question is still owed and none of them needs a picture, so
+                // the dispatch goes ahead with the blurhash half switched off —
+                // the same move the track-less video above makes with the
+                // thumbnail half, and for the same reason. There is no source
+                // here but a full decode of the original, which for a
+                // suppressed image is precisely the decode its marker settled
+                // and for everything else produces nothing at all.
+                work.blurhash = false;
             }
         }
 
@@ -2618,19 +2671,19 @@ impl ScanContext {
         // anything here to replace", and — threaded into the worker — the fact
         // `build_backfill_thumbnails` classifies a failed extraction by.
         //
-        // `existing_frames` answers it for free wherever the thumbnail half
-        // fetched it (`get_frames_bytes` is unversioned, so empty means no
+        // `work.existing_frames` answers it for free wherever the thumbnail
+        // half fetched it (`get_frames_bytes` is unversioned, so empty means no
         // rows). The query is only needed where it did not, which is exactly
-        // the replace path: a stored thumbnail makes `needs_thumb` false at
-        // dispatch, so nothing fetches the frames, yet a positive verdict may
-        // be about to re-extract them. Deriving the fact from the unfetched
+        // the replace path: a stored thumbnail switches the thumbnail half off
+        // at dispatch, so nothing fetches the frames, yet a positive verdict
+        // may be about to re-extract them. Deriving the fact from the unfetched
         // default there would call an item with frames frameless — and then a
         // failed re-extraction writes a `Frame` failure marker, or a
         // zero-frame one writes a `nothing(Frame)` verdict, for a video that
         // has frames.
-        let frames_stored = if frames_fetched {
-            !existing_frames.is_empty()
-        } else if outro_work.is_some() && mime_type.starts_with("video") {
+        work.frames_stored = if frames_fetched {
+            !work.existing_frames.is_empty()
+        } else if work.outro.is_some() && mime_type.starts_with("video") {
             has_any_frame(&mut self.conn, &sha256).await?
         } else {
             false
@@ -2640,12 +2693,11 @@ impl ScanContext {
         // extraction stores frames of its own, so an item can have those and
         // no thumbnail. A marker-suppressed item is left alone whatever the
         // probe finds; the verdict that settled its decode still stands.
-        let outro_replaces_visuals = matches!(&outro_work, Some(_) if !thumb_suppressed)
-            && (thumbnail_stored || frames_stored);
-        let outro_work = outro_work.map(|item| OutroBackfill {
-            replaces_visuals: outro_replaces_visuals,
-            item,
-        });
+        let outro_replaces_visuals =
+            !thumb_suppressed && (thumbnail_stored || work.frames_stored);
+        if let Some(outro) = &mut work.outro {
+            outro.replaces_visuals = outro_replaces_visuals;
+        }
         // The boundary this item was *already* examined for. Without it, every
         // regeneration after the verdict was stored — a storage.db rebuild, a
         // `THUMBNAIL_PROCESS_VERSION`/`FRAME_PROCESS_VERSION` bump, a store
@@ -2662,22 +2714,21 @@ impl ScanContext {
         // (design §8: "consumers ignore the metadata"), which is also what
         // makes turning detection off the escape hatch for a false positive:
         // off, then regenerate, and the visuals come back untrimmed.
-        let stored_content_end_ms = if self.detect_outros
-            && outro_work.is_none()
-            && needs_thumb
+        if self.detect_outros
+            && work.outro.is_none()
+            && work.thumbnail
             && mime_type.starts_with("video")
         {
-            get_item_content_end_ms(&mut self.conn, &sha256).await?
-        } else {
-            None
-        };
-        if video_duration <= 0.0 {
+            work.stored_content_end_ms = get_item_content_end_ms(&mut self.conn, &sha256).await?;
+        }
+        if work.video_duration <= 0.0 {
             // The probe carries the duration for the case the thumbnail half
             // never asked for one: an item whose visuals are complete and
             // whose outro turns out positive still has to re-extract.
-            video_duration = outro_work
+            work.video_duration = work
+                .outro
                 .as_ref()
-                .and_then(|work| work.item.duration)
+                .and_then(|outro| outro.item.duration)
                 .unwrap_or(0.0);
         }
 
@@ -2699,25 +2750,7 @@ impl ScanContext {
             let outer_sha256 = sha256.clone();
             let outer_mime = mime_type.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                generate_backfill_visuals(
-                    &path,
-                    &mime_type,
-                    sha256,
-                    needs_thumb,
-                    needs_blurhash,
-                    existing_frames,
-                    existing_thumb,
-                    frames_stored,
-                    video_duration,
-                    outro_work,
-                    codec_work,
-                    animation_work,
-                    rotation_work,
-                    tier_work,
-                    ladder,
-                    stored_content_end_ms,
-                    &timers,
-                )
+                generate_backfill_visuals(&path, &mime_type, sha256, work, &timers)
             })
             .await;
             match joined {
@@ -2733,34 +2766,10 @@ impl ScanContext {
                         path = %outer_path.display(),
                         "visuals backfill worker failed"
                     );
-                    TaskOutcome::Backfill(BackfillResult {
-                        sha256: outer_sha256,
-                        mime_type: outer_mime,
-                        thumbnails: Vec::new(),
-                        // A dead worker concluded nothing about the ladder
-                        // either: `None` writes no set, so the stored one
-                        // stays and the next scan asks again.
-                        tiers: None,
-                        drop_thumbnails: false,
-                        extracted_frames: Vec::new(),
-                        blurhash: None,
-                        // A dead worker is no verdict on the content: the
-                        // generation is retried next scan, unmarked and
-                        // unrecorded. The animation length stays `None` for
-                        // the same reason — nothing was measured, so the
-                        // column stays NULL and the next scan asks again.
-                        visual_verdicts: Vec::new(),
-                        visuals_scan_error: None,
-                        outro: None,
-                        codecs: None,
-                        animation: None,
-                        // Nothing was examined, so the column stays NULL and
-                        // the next scan asks again — which for this one is the
-                        // only safe failure mode, its write being the single
-                        // non-idempotent one in the backfill.
-                        rotation: None,
-                        replace_visuals: false,
-                    })
+                    // A dead worker is no verdict on anything: every column it
+                    // would have written stays as it was and the next scan asks
+                    // the same questions again.
+                    TaskOutcome::Backfill(BackfillResult::inconclusive(outer_sha256, outer_mime))
                 }
             }
         });
@@ -5550,34 +5559,102 @@ struct OutroBackfill {
     replaces_visuals: bool,
 }
 
+/// One dispatch's answers: what every question the dispatcher asks about an
+/// item found owing, plus the material it already fetched for the worker.
+///
+/// It exists because both halves used to be loose parameters. The questions
+/// were re-asked as a copied `is_none() && !… && is_none()` chain at each of
+/// the three early returns — which is exactly where a copy went stale and the
+/// orientation question fell out of one of them, leaving `items.rotation` NULL
+/// forever for any item that owed nothing else (see
+/// [`PendingBackfillWork::any`]). The material was 13 more positional
+/// arguments into a worker that already needed
+/// `#[allow(clippy::too_many_arguments)]`.
+struct PendingBackfillWork {
+    /// Run the thumbnail half of the pass. Note that this is *not* "no
+    /// thumbnail is stored": the image rule, the negative cache and the ladder
+    /// question all move it, and the dispatcher keeps the positive cache's own
+    /// answer separately (`thumbnail_stored`) for the two rules that need it.
+    thumbnail: bool,
+    /// Run the blurhash half of the pass.
+    blurhash: bool,
+    /// The outro question (docs/video-outro-detection-design.md §7).
+    outro: Option<OutroBackfill>,
+    /// The codec question (docs/video-transcoding-design.md §6).
+    codec: bool,
+    /// The animation-length question (docs/animated-image-spans-design.md §4).
+    animation: bool,
+    /// The orientation question (docs/display-dimensions-design.md §4).
+    rotation: Option<RotationBackfill>,
+    /// The rendition-ladder question
+    /// (docs/grid-scroll-performance-implementation.md §3, B1).
+    tier: Option<TierWork>,
+    /// Which grid ladder this item's renditions come from ([`grid_ladder`]).
+    /// Carried separately from `tier` because it governs a pass the ladder
+    /// question found *no* work for: an animated image missing its display
+    /// rendition runs the image pass, and that pass must produce the animated
+    /// set rather than static tiers.
+    ladder: GridLadder,
+    /// Frames already in `storage.frames`, where the thumbnail half fetched
+    /// them: a video's thumbnail can be rebuilt from these without ffmpeg.
+    existing_frames: Vec<Vec<u8>>,
+    /// The stored display rendition, where the blurhash half needs one and the
+    /// thumbnail half is not about to produce it.
+    existing_thumb: Option<Vec<u8>>,
+    /// Whether `storage.frames` holds anything for this content — the
+    /// dispatcher's answer, never derived from `existing_frames`, which the
+    /// replace path never fetches.
+    frames_stored: bool,
+    /// The duration frame sampling places its points inside.
+    video_duration: f64,
+    /// The content boundary a *previous* scan stored, which every
+    /// regeneration of an already-examined item must sample within.
+    stored_content_end_ms: Option<i64>,
+}
+
+impl PendingBackfillWork {
+    /// Whether any of the dispatcher's five *non-visual* questions found work
+    /// — the shared guard of every early return, and the reason they cannot
+    /// drift apart again.
+    ///
+    /// The two visual halves are deliberately not part of it: each early
+    /// return sits inside the branch that already established them, and one of
+    /// them (the track-less video) returns while the blurhash half is still
+    /// nominally on.
+    fn any(&self) -> bool {
+        self.outro.is_some()
+            || self.codec
+            || self.animation
+            || self.rotation.is_some()
+            || self.tier.is_some()
+    }
+}
+
 /// Regenerates only the visuals a file is missing. Never fails hard: partial
 /// or failed generation degrades to empty results, matching the Python
 /// behavior of catching thumbnail/blurhash errors per file.
-#[allow(clippy::too_many_arguments)]
 fn generate_backfill_visuals(
     path: &Path,
     mime_type: &str,
     sha256: String,
-    needs_thumb: bool,
-    needs_blurhash: bool,
-    existing_frames: Vec<Vec<u8>>,
-    existing_thumb: Option<Vec<u8>>,
-    frames_stored: bool,
-    video_duration: f64,
-    outro: Option<OutroBackfill>,
-    needs_codecs: bool,
-    needs_animation: bool,
-    rotation_work: Option<RotationBackfill>,
-    tier_work: Option<TierWork>,
-    // Which grid ladder this item's renditions come from ([`grid_ladder`]).
-    // Threaded separately from `tier_work` because it governs a pass the
-    // ladder question found *no* work for: an animated image missing its
-    // display rendition runs the image pass, and that pass must produce the
-    // animated set rather than static tiers.
-    ladder: GridLadder,
-    stored_content_end_ms: Option<i64>,
+    work: PendingBackfillWork,
     timers: &ScanTimers,
 ) -> BackfillResult {
+    let PendingBackfillWork {
+        thumbnail: needs_thumb,
+        blurhash: needs_blurhash,
+        outro,
+        codec: needs_codecs,
+        animation: needs_animation,
+        rotation: rotation_work,
+        tier: tier_work,
+        ladder,
+        existing_frames,
+        existing_thumb,
+        frames_stored,
+        video_duration,
+        stored_content_end_ms,
+    } = work;
     // Independent of everything below — it reads stream headers and produces
     // no visual — so it runs first and under the metadata timer, which is the
     // phase it belongs to and the one the new-item path charges the identical
@@ -10659,6 +10736,77 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             (rows.len(), rows[0].2),
             (1, 1),
             "no pass ran, so the marker learned nothing: {rows:?}"
+        );
+    }
+
+    // The dispatch's early returns all ask the same question — "is any of the
+    // non-visual backfill questions still owed?" — and the copy guarding the
+    // no-blurhash-source branch used to leave the orientation question out of
+    // it. A marker-suppressed image whose *only* remaining work is its
+    // orientation therefore returned early on every scan and `items.rotation`
+    // stayed NULL forever, which is the one thing a backfill question must
+    // never do: not terminate.
+    //
+    // The other half of the same branch is what it must *not* wake up. The
+    // dispatch it keeps alive is a header read; the blurhash half has no source
+    // but a full decode of the original, which is exactly the decode this
+    // file's marker already settled (see the test above).
+    #[tokio::test]
+    async fn rotation_alone_keeps_a_suppressed_dispatch_alive() {
+        use crate::db::visual_attempts::upsert_visual_attempts;
+
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-rotation-suppressed"]).await;
+        // 27 MB uncompressed: past the display rule's byte bound, so this image
+        // really does store a rendition and the positive cache is what the
+        // marker has to beat.
+        image::RgbImage::new(9000, 1000)
+            .save(env.media_dirs[0].join("large.bmp"))
+            .unwrap();
+
+        env.scan().await;
+        let mut conn = env.read().await;
+        let sha256: String = sqlx::query_scalar("SELECT sha256 FROM items")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        // No stored thumbnail (the positive cache misses), no blurhash and no
+        // orientation (both still owed), and a marker that settles the decode.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("DELETE FROM storage.thumbnails")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE items SET blurhash = NULL, rotation = NULL")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            upsert_visual_attempts(
+                &mut conn,
+                &[VisualVerdict::nothing(VisualKind::Thumbnail).into_record(
+                    &sha256,
+                    "image/bmp",
+                    THUMBNAIL_PROCESS_VERSION,
+                )],
+                Some(1),
+            )
+            .await
+            .unwrap();
+        }
+
+        env.scan().await;
+
+        assert_eq!(
+            geometry_columns(&env, &sha256).await.2,
+            Some(0),
+            "the orientation question was the only work left, and it still has to run"
+        );
+        assert!(
+            stored_blurhash(&env, &sha256).await.is_none(),
+            "a blurhash here could only have come from re-decoding the settled original"
         );
     }
 
