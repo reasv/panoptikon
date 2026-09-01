@@ -12,6 +12,10 @@
 //! callers are blocking job helpers, so the python probe (and a possible
 //! first-use download) never blocks the async runtime.
 
+/// The animated grid rendition
+/// (docs/grid-scroll-performance-implementation.md §2, step B2): one H.264
+/// loop per animated item, encoded during the visuals pass.
+pub(crate) mod animated_loop;
 /// Animation-length measurement for GIF/WebP/AVIF
 /// (docs/animated-image-spans-design.md §3): pure structure parsing, no
 /// ffmpeg, because it feeds the index rather than a rendition.

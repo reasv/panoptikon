@@ -60,6 +60,35 @@ pub(crate) struct ClientCapabilities {
     pub video_compose: bool,
 }
 
+/// The animated raw floor, verbatim from
+/// [`crate::visual_tiers`] (docs/grid-scroll-performance-implementation.md
+/// §2, step B2).
+///
+/// The client decides `<img>` vs `<video>` for a grid cell from the search
+/// result's `type` and `size` fields against these two numbers, and the
+/// server decides what to store from the same two — so they are surfaced
+/// rather than duplicated in the UI. Server-derived constants, not
+/// policy-scoped configuration: every policy sees the same floor, because it
+/// is a property of what the scan wrote.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct AnimatedThumbnailFloor {
+    /// An animated item at or below **both** of these is served as its
+    /// original file at every grid tier: no loop is stored for it, so a cell
+    /// renders it as an image.
+    pub max_file_size: u64,
+    /// The longer side, in pixels. Both sides must be within it.
+    pub max_side: u32,
+}
+
+impl AnimatedThumbnailFloor {
+    fn current() -> Self {
+        Self {
+            max_file_size: crate::visual_tiers::ANIMATED_RAW_MAX_FILE_SIZE,
+            max_side: crate::visual_tiers::ANIMATED_RAW_MAX_SIDE,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ClientConfigResponse {
     /// Name of the policy that matched this request.
@@ -77,6 +106,9 @@ pub(crate) struct ClientConfigResponse {
     /// True only for a policy explicitly marked as the local Desktop client
     /// while the private parent-shell bridge is configured.
     pub desktop_shell_available: bool,
+    /// The animated raw floor the thumbnail endpoint serves by (see
+    /// [`AnimatedThumbnailFloor`]).
+    pub animated_floor: AnimatedThumbnailFloor,
 }
 
 /// The probe table: (capability, method, representative real route). Paths
@@ -127,6 +159,7 @@ pub(crate) fn build_client_config(
             crate::desktop::is_managed(),
             crate::api::desktop::desktop_bridge_is_configured(),
         ),
+        animated_floor: AnimatedThumbnailFloor::current(),
     }
 }
 
@@ -274,6 +307,17 @@ disable_backend_open = true
         assert_eq!(
             response.client,
             serde_json::json!({ "search_throttle_ms": 1500, "disable_backend_open": true })
+        );
+        // Server-derived, not policy-scoped: a restricted policy sees the
+        // same floor the desktop one does, because it is a property of what
+        // the scan wrote rather than of what this client may do.
+        assert_eq!(
+            response.animated_floor.max_file_size,
+            crate::visual_tiers::ANIMATED_RAW_MAX_FILE_SIZE
+        );
+        assert_eq!(
+            response.animated_floor.max_side,
+            crate::visual_tiers::ANIMATED_RAW_MAX_SIDE
         );
     }
 

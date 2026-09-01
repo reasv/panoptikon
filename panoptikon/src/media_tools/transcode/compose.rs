@@ -920,7 +920,7 @@ fn still_source_orientation(path: &Path) -> Option<StillOrientation> {
 
 /// The image crate's orientation as this module's D4 transform. Both are
 /// "rotate clockwise, then flip horizontally", so the mapping is a rename.
-pub(super) fn orientation_transform(orientation: Orientation) -> Transform {
+pub(crate) fn orientation_transform(orientation: Orientation) -> Transform {
     let (quarter_turns, flip_h) = match orientation {
         Orientation::NoTransforms => (0, false),
         Orientation::Rotate90 => (1, false),
@@ -1323,7 +1323,7 @@ fn clamped_src(src: Rect, probe: Option<StreamInfo>) -> Rect {
 /// already cropped in source space. Deliberately not collapsed into fewer
 /// filters: `transpose` plus an explicit `hflip` is what each of the eight
 /// cases means, and a clever identity here is a bug nobody can read.
-fn orientation_filters(transform: Transform) -> Vec<&'static str> {
+pub(crate) fn orientation_filters(transform: Transform) -> Vec<&'static str> {
     let mut filters = Vec::new();
     match transform.quarter_turns {
         1 => filters.push("transpose=1"),

@@ -2003,7 +2003,7 @@
           "items"
         ],
         "summary": "Get thumbnail for an item",
-        "description": "Returns a thumbnail for a given item.\nThe thumbnail may be a stored rendition,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nGIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).\nThe `size` parameter selects a rendition tier: `display` (default, unchanged behaviour),\n`grid-m` (short side 1024) or `grid-s` (short side 512).\nA tier with no stored rendition falls through to the next larger one.",
+        "description": "Returns a thumbnail for a given item.\nThe thumbnail may be a stored rendition,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nOn the default (`display`) path GIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).\nThe `size` parameter selects a rendition tier: `display` (default, unchanged behaviour),\n`grid-m` (short side 1024) or `grid-s` (short side 512).\nA tier with no stored rendition falls through to the next larger one.\nAt a grid tier an **animated** item above the raw floor answers with its H.264 loop as\n`video/mp4` (one rendition serves both grid tiers), and `still=true` answers with the\nstatic poster for that tier instead. Animated items at or below the floor - at most\n1 MiB with both sides at most 512 px, reported by `/api/client-config` - are answered\nwith their original file at every tier.",
         "operationId": "item_thumbnail",
         "parameters": [
           {
@@ -2074,7 +2074,7 @@
           {
             "name": "still",
             "in": "query",
-            "description": "Animated items: serve the static tier image (the loop's poster)\ninstead of the loop. Accepted now and a no-op for static items, whose\nrenditions are always images; the animated pipeline it selects\nbetween is step B2.",
+            "description": "Animated items: serve the static tier image (the loop's poster)\ninstead of the loop. A no-op for static items, whose renditions are\nalways images, and for animated items at or below the raw floor,\nwhich are served as their original file either way.",
             "required": false,
             "schema": {
               "type": "boolean",
@@ -5859,6 +5859,28 @@
           }
         }
       },
+      "AnimatedThumbnailFloor": {
+        "type": "object",
+        "description": "The animated raw floor, verbatim from\n[`crate::visual_tiers`] (docs/grid-scroll-performance-implementation.md\n§2, step B2).\n\nThe client decides `<img>` vs `<video>` for a grid cell from the search\nresult's `type` and `size` fields against these two numbers, and the\nserver decides what to store from the same two — so they are surfaced\nrather than duplicated in the UI. Server-derived constants, not\npolicy-scoped configuration: every policy sees the same floor, because it\nis a property of what the scan wrote.",
+        "required": [
+          "max_file_size",
+          "max_side"
+        ],
+        "properties": {
+          "max_file_size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "An animated item at or below **both** of these is served as its\noriginal file at every grid tier: no loop is stored for it, so a cell\nrenders it as an image.",
+            "minimum": 0
+          },
+          "max_side": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The longer side, in pixels. Both sides must be within it.",
+            "minimum": 0
+          }
+        }
+      },
       "ArtifactMissResponse": {
         "type": "object",
         "required": [
@@ -6146,9 +6168,14 @@
           "capabilities",
           "client",
           "desktop_managed",
-          "desktop_shell_available"
+          "desktop_shell_available",
+          "animated_floor"
         ],
         "properties": {
+          "animated_floor": {
+            "$ref": "#/components/schemas/AnimatedThumbnailFloor",
+            "description": "The animated raw floor the thumbnail endpoint serves by (see\n[`AnimatedThumbnailFloor`])."
+          },
           "capabilities": {
             "$ref": "#/components/schemas/ClientCapabilities",
             "description": "Ruleset-derived feature switches (see ClientCapabilities)."

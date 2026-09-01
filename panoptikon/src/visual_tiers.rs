@@ -53,6 +53,32 @@ pub(crate) const GRID_DIRECT_MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
 /// long-side bound is measured against.
 const GRID_MAX_WHOLE_ASPECT: u32 = 2;
 
+/// Animated raw floor (§2, step B2): an animated original this small is
+/// served as-is at every grid tier, and nothing is stored for it — no loop,
+/// no poster. **Both** clauses have to hold; a 900 KB 600x600 GIF is over the
+/// floor on dimensions alone.
+pub(crate) const ANIMATED_RAW_MAX_FILE_SIZE: u64 = 1024 * 1024;
+/// The other half of the animated raw floor: neither side may exceed this.
+pub(crate) const ANIMATED_RAW_MAX_SIDE: u32 = 512;
+
+/// The animated loop's short-side cap. ONE loop per item, reused by both grid
+/// tiers — an H.264 stream is not a ladder: `grid-s` cells paint the same
+/// decode scaled down, and a second encode would double the scan's most
+/// expensive visual for no measurable decode saving.
+pub(crate) const LOOP_MAX_SHORT_SIDE: u32 = 1024;
+
+/// The stored discriminator of the animated loop, in the same column as
+/// `grid-m`/`grid-s` and deliberately not a [`ThumbnailTier`]: the loop is a
+/// rendition *kind*, not a `size=` value. It answers **both** grid tiers.
+pub(crate) const LOOP_TIER: &str = "loop";
+
+/// The loop's stored media type, and what the endpoint serves it as.
+pub(crate) const LOOP_MEDIA_TYPE: &str = "video/mp4";
+
+/// Every still rendition's media type — the display renditions and both grid
+/// tiers are q85 JPEGs.
+pub(crate) const TIER_MEDIA_TYPE: &str = "image/jpeg";
+
 /// One rendition of an item's picture.
 ///
 /// The wire values are the frozen `size=` parameter of
@@ -397,6 +423,131 @@ fn cascade(
         bytes = None;
         out.push((tier, rendition));
     }
+    out
+}
+
+/// Whether an item's picture *moves* — the one fact that decides which of the
+/// two grid ladders it belongs to (§2, step B2).
+///
+/// `image/gif` is animated by **mime**, not by measurement: the animation
+/// question that stamps `items.duration` runs after the ladder question in
+/// the same scan, so a GIF indexed before that feature existed reads
+/// `duration IS NULL` here, and treating it as a still would write static
+/// tiers for a picture that moves. The cost is a one-frame loop for the rare
+/// single-frame GIF, which is exactly what it should serve anyway. Every
+/// other animated container (WebP today, AVIF when importing lands) is
+/// decided by the measurement, because for those formats the still case is
+/// the common one.
+pub(crate) fn is_animated_image(mime_type: &str, duration: Option<f64>) -> bool {
+    if mime_type.starts_with("image/gif") {
+        return true;
+    }
+    mime_type.starts_with("image") && duration.is_some_and(|seconds| seconds > 0.0)
+}
+
+/// The animated raw floor: whether an animated original is served as-is at
+/// the grid tiers, with nothing stored for it at all.
+///
+/// Deliberately *both* bounds and deliberately not the still rule's shape: a
+/// loop costs an ffmpeg encode per item and a stored mp4 per item, so the
+/// floor is where that stops paying for itself. A 512-or-smaller animation
+/// under a megabyte decodes cheaply enough in the cell that an H.264
+/// rendition of it would be pure overhead.
+///
+/// A picture with no measured dimensions is **not** under the floor: this is
+/// asked by the endpoint, where "unknown" must never become "immutable
+/// forever".
+pub(crate) fn animated_serves_original(file_size: u64, width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && file_size <= ANIMATED_RAW_MAX_FILE_SIZE
+        && width.max(height) <= ANIMATED_RAW_MAX_SIDE
+}
+
+/// The loop's geometry: the [`tier_render`] of the source at
+/// [`LOOP_MAX_SHORT_SIDE`], with both output sides rounded **down** to even.
+///
+/// Same crop rule as every other grid rendition, so a webtoon's loop is the
+/// same top strip its poster is (§2: `object-position: 50% 0%`), and one
+/// function keeps the dispatcher, the generator and the endpoint from
+/// drifting apart.
+///
+/// The evenness is yuv420p's: chroma is subsampled 2x2, so an odd side has no
+/// legal encoding. Down rather than up because upscaling to satisfy a codec
+/// constraint invents pixels; the one exception is a side that would round to
+/// zero, which is clamped to 2 (a 1-pixel side can only exist on a degenerate
+/// source, and a zero-height video is not a rendition).
+pub(crate) fn loop_render(width: u32, height: u32) -> TierRender {
+    let mut plan = tier_render(width, height, LOOP_MAX_SHORT_SIDE);
+    plan.width = even_side(plan.width);
+    plan.height = even_side(plan.height);
+    plan
+}
+
+fn even_side(side: u32) -> u32 {
+    if side < 2 { 2 } else { side & !1 }
+}
+
+/// The poster plans for an animated item: the static renditions `still=true`
+/// answers with, rendered from the item's first frame.
+///
+/// Unlike [`grid_plans`] there is no "serve the original" escape, and that is
+/// the whole difference: the original *moves*, so it is never an acceptable
+/// still, however small it is. `grid-m` is therefore unconditional — every
+/// animated item above the raw floor has exactly one poster to fall up to —
+/// while `grid-s` is stored only when it is genuinely smaller, and is
+/// answered by the fall-up ladder (`grid-s` -> `grid-m`) when it is not.
+/// Nothing is ever stored twice.
+pub(crate) fn poster_plans(width: u32, height: u32) -> Vec<(ThumbnailTier, TierRender)> {
+    let mut out = Vec::with_capacity(ThumbnailTier::GRID.len());
+    let mut source = (width, height);
+    for (index, tier) in ThumbnailTier::GRID.into_iter().enumerate() {
+        let Some(short_side) = tier.short_side() else {
+            continue;
+        };
+        let plan = tier_render(source.0, source.1, short_side);
+        // The cascade renders each tier from the one before it, exactly as
+        // [`grid_renditions`] does, so a skipped identity render leaves the
+        // source where it was.
+        if index > 0 && (plan.width, plan.height) == source {
+            continue;
+        }
+        source = (plan.width, plan.height);
+        out.push((tier, plan));
+    }
+    out
+}
+
+/// The settled encoded-larger-than-the-source edge (§2): whether an item
+/// keeps serving its **original** at the grid tiers because no H.264 encode
+/// of it came out smaller.
+///
+/// Real for the shape the loop pipeline meets most often at the small end —
+/// a few flat-colour frames at large dimensions, where GIF's palette coding
+/// beats a codec that has to carry an intra frame. Serving a *larger*
+/// rendition than the file it replaces would invert the entire point of the
+/// ladder.
+///
+/// `>=` rather than `>`: a tie is not worth a second decoder in the cell.
+pub(crate) fn loop_keeps_original(encoded_len: u64, source_len: u64) -> bool {
+    encoded_len >= source_len
+}
+
+/// The **whole** stored set of an animated item above the raw floor: its
+/// posters, then its loop, named by the strings the `tier` column holds.
+///
+/// One function for the dispatcher's prediction and the generator's output,
+/// for the same reason [`grid_plans`] is one function: the backfill compares
+/// the stored geometry against this and never terminates if the two can
+/// disagree. Ordered the way `get_thumbnail_tier_geometry` returns rows —
+/// `grid-m`, `grid-s`, `loop` is already lexicographic — but the comparison
+/// sorts anyway.
+pub(crate) fn animated_plans(width: u32, height: u32) -> Vec<(&'static str, TierRender)> {
+    let mut out: Vec<(&'static str, TierRender)> = poster_plans(width, height)
+        .into_iter()
+        .map(|(tier, plan)| (tier.as_str(), plan))
+        .collect();
+    out.push((LOOP_TIER, loop_render(width, height)));
     out
 }
 
@@ -777,6 +928,167 @@ mod tests {
             rendered.pixels().all(|pixel| *pixel == MARK),
             "a wide crop must be the horizontally CENTERED band"
         );
+    }
+
+    // The raw floor's truth table (§2, B2): BOTH clauses, and a picture with
+    // no measured dimensions is never under it.
+    #[test]
+    fn the_animated_raw_floor_needs_both_bytes_and_dimensions() {
+        // Under both: served raw.
+        assert!(animated_serves_original(400 * 1024, 480, 320));
+        // Exactly on both bounds is still under the floor.
+        assert!(animated_serves_original(ANIMATED_RAW_MAX_FILE_SIZE, 512, 512));
+        // One byte over.
+        assert!(!animated_serves_original(
+            ANIMATED_RAW_MAX_FILE_SIZE + 1,
+            512,
+            512
+        ));
+        // One pixel over, on either axis — a 900 KB 600x600 GIF is over the
+        // floor on dimensions alone, which is the case the two-clause rule
+        // exists for.
+        assert!(!animated_serves_original(900 * 1024, 513, 512));
+        assert!(!animated_serves_original(900 * 1024, 512, 513));
+        assert!(!animated_serves_original(900 * 1024, 600, 600));
+        // Unmeasured dimensions are never "final by rule".
+        assert!(!animated_serves_original(1024, 0, 512));
+        assert!(!animated_serves_original(1024, 512, 0));
+    }
+
+    // GIF is animated by mime (the animation measurement runs after the
+    // ladder question, so `duration IS NULL` must not read as "still"), every
+    // other container by measurement.
+    #[test]
+    fn animation_is_decided_by_mime_for_gif_and_by_measurement_otherwise() {
+        assert!(is_animated_image("image/gif", None));
+        assert!(is_animated_image("image/gif", Some(0.0)));
+        assert!(is_animated_image("image/webp", Some(3.5)));
+        assert!(!is_animated_image("image/webp", Some(0.0)));
+        assert!(!is_animated_image("image/webp", None));
+        assert!(!is_animated_image("image/jpeg", None));
+        // Not an image at all: a video's grid tiers come from its stored
+        // frame grid, which is a still by construction.
+        assert!(!is_animated_image("video/mp4", Some(120.0)));
+        assert!(!is_animated_image("audio/mpeg", Some(200.0)));
+        assert!(!is_animated_image("", None));
+    }
+
+    // The loop is the same crop rule as every other grid rendition, with even
+    // sides because yuv420p subsamples chroma 2x2.
+    #[test]
+    fn loop_geometry_is_the_tier_crop_rounded_down_to_even() {
+        // A plain photo-shaped animation: short side to 1024, no crop.
+        let plan = loop_render(1500, 2000);
+        assert_eq!((plan.crop_width, plan.crop_height), (1500, 2000));
+        assert_eq!((plan.width, plan.height), (1024, 1364));
+        // The unrounded render would have been 1365 rows; evenness rounds
+        // DOWN, never up.
+        assert_eq!(tier_render(1500, 2000, 1024).height, 1365);
+
+        // Never upscaled: a source under the cap keeps its size (rounded).
+        let plan = loop_render(300, 401);
+        assert_eq!((plan.width, plan.height), (300, 400));
+
+        // A tall strip: top band, long side capped at 2 * 1024.
+        let plan = loop_render(800, 20000);
+        assert_eq!((plan.crop_x, plan.crop_y), (0, 0));
+        assert_eq!(plan.crop_height, 2048, "tall loops keep the TOP strip");
+        assert_eq!((plan.width, plan.height), (800, 2048));
+
+        // A wide strip: horizontally centered band.
+        let plan = loop_render(20000, 800);
+        assert_eq!(plan.crop_x, (20000 - 2048) / 2);
+        assert_eq!((plan.width, plan.height), (2048, 800));
+
+        // Every shape comes out even, and never zero.
+        for (width, height) in [
+            (1_u32, 1_u32),
+            (1, 40000),
+            (40000, 1),
+            (3, 7),
+            (1023, 1025),
+            (12000, 8333),
+        ] {
+            let plan = loop_render(width, height);
+            assert_eq!(plan.width % 2, 0, "{width}x{height} -> {plan:?}");
+            assert_eq!(plan.height % 2, 0, "{width}x{height} -> {plan:?}");
+            assert!(plan.width >= 2 && plan.height >= 2, "{plan:?}");
+        }
+    }
+
+    // A poster always exists, however small the animation is: the original
+    // moves, so it can never be the still.
+    #[test]
+    fn posters_always_store_a_grid_m_and_deduplicate_grid_s() {
+        // Small enough that both tiers would be the identity render: only
+        // `grid-m` is stored, and a `grid-s` request falls up to it.
+        let plans = poster_plans(300, 300);
+        assert_eq!(
+            plans.iter().map(|(tier, _)| *tier).collect::<Vec<_>>(),
+            vec![ThumbnailTier::GridM]
+        );
+        assert_eq!((plans[0].1.width, plans[0].1.height), (300, 300));
+
+        // Big enough for both, cascading exactly like the still ladder.
+        let plans = poster_plans(2000, 2000);
+        assert_eq!(
+            plans.iter().map(|(tier, _)| *tier).collect::<Vec<_>>(),
+            vec![ThumbnailTier::GridM, ThumbnailTier::GridS]
+        );
+        assert_eq!((plans[0].1.width, plans[0].1.height), (1024, 1024));
+        assert_eq!((plans[1].1.width, plans[1].1.height), (512, 512));
+
+        // A strip's poster is the same top crop the still ladder stores.
+        let plans = poster_plans(800, 20000);
+        assert_eq!((plans[0].1.crop_y, plans[0].1.crop_height), (0, 2048));
+        assert_eq!((plans[0].1.width, plans[0].1.height), (800, 2048));
+
+        // Unlike the still ladder, no byte or dimension escape can empty the
+        // set: `grid-m` is unconditional.
+        for (width, height) in [(1_u32, 1_u32), (64, 48), (300, 900), (5000, 5000)] {
+            let plans = poster_plans(width, height);
+            assert_eq!(plans[0].0, ThumbnailTier::GridM, "{width}x{height}");
+        }
+    }
+
+    // The whole stored set of an animated item, which is what the backfill
+    // dispatcher compares the stored rows against.
+    #[test]
+    fn the_animated_set_is_its_posters_plus_exactly_one_loop() {
+        let plans = animated_plans(2000, 2000);
+        assert_eq!(
+            plans.iter().map(|(tier, _)| *tier).collect::<Vec<_>>(),
+            vec!["grid-m", "grid-s", LOOP_TIER]
+        );
+        assert_eq!(
+            plans
+                .iter()
+                .filter(|(tier, _)| *tier == LOOP_TIER)
+                .count(),
+            1,
+            "one animated rendition per item, reused by both grid tiers"
+        );
+        let (_, loop_plan) = plans.last().unwrap();
+        assert_eq!((loop_plan.width, loop_plan.height), (1024, 1024));
+
+        // The smallest possible set: one poster and one loop.
+        let plans = animated_plans(300, 300);
+        assert_eq!(
+            plans.iter().map(|(tier, _)| *tier).collect::<Vec<_>>(),
+            vec!["grid-m", LOOP_TIER]
+        );
+    }
+
+    // Serving a rendition *larger* than the file it replaces would invert the
+    // whole point of the ladder, so the original wins ties and everything
+    // above them.
+    #[test]
+    fn an_encode_no_smaller_than_its_source_keeps_the_original() {
+        assert!(loop_keeps_original(40_000, 12_000));
+        assert!(loop_keeps_original(12_000, 12_000), "a tie keeps the source");
+        assert!(!loop_keeps_original(11_999, 12_000));
+        // The ordinary case by a wide margin: a GIF against its H.264.
+        assert!(!loop_keeps_original(120_000, 6 * MB));
     }
 
     #[test]
