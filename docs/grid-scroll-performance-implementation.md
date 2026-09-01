@@ -428,6 +428,13 @@ frame budget; play/pause cap observable; static fallback correct below the
 floor; the poster fallback covered by a test that serves a non-video response
 at a grid tier.
 
+Reading the result: an animated page's frame times sit at ~11 ms where the
+same page of stills sits at ~5.5 ms, and that gap is **not main-thread work**.
+Playing loops drop the page's compositor cadence from ~180 Hz to ~90 Hz, so
+~11 ms *is* the rAF interval — the frame is idle for most of it. Long tasks and
+frames over 32 ms are the numbers that would mean jank, and both are zero on
+both pages. Do not read the 11 ms as a regression.
+
 ### Final pass
 
 **R — Fable architectural review, per subsystem** (only after all issues
