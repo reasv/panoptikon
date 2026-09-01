@@ -1,3 +1,33 @@
+//! The folder scan: walk, hash, index, and generate every visual an item
+//! carries.
+//!
+//! A map of the file, in the order the code runs rather than the order it is
+//! written:
+//!
+//! * **The walk** — `execute_folder_scan` / `scan_single_folder` /
+//!   `ScanContext::scan_path`. One `ScanContext` per root owns the connection,
+//!   the worker `JoinSet`, the stats and the `scan_errors` ledger it preloaded.
+//! * **Per file** — `dispatch_hash` (the mtime shortcut, then hashing),
+//!   `dispatch_prepare` (metadata plus first-generation visuals for a *new*
+//!   item), and `maybe_dispatch_backfill` for content that is already indexed.
+//! * **The dispatcher's questions** — `maybe_dispatch_backfill` asks one
+//!   question per thing an item can owe: the thumbnail, the blurhash, and the
+//!   five `pending_*` questions (outro, codec, animation, orientation,
+//!   ladder) whose answers become one [`PendingBackfillWork`]. Every one is
+//!   answered from *indexed metadata*; nothing here may decode a file to
+//!   decide whether it needs decoding.
+//! * **The generators** — `generate_new_item_visuals` and
+//!   `generate_backfill_visuals`, both blocking and both entered through
+//!   `spawn_blocking`, with `build_*_renditions`/`build_*_thumbnails` and the
+//!   per-type renderers (video frames, audio cover art, pdfium, the headless
+//!   browser) under them.
+//! * **The verdict vocabulary** — `FileProcessError`/`ScanFailure`/
+//!   `VisualsError` and the `visual_attempts` markers they become, which is
+//!   what keeps a broken file from being retried on every scan forever
+//!   (docs/failed-media-retry-design.md).
+//! * **The writes** — `handle_new_item`/`handle_backfill`/`fail_file`, all
+//!   through the index-db writer task.
+
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -2378,7 +2408,7 @@ impl ScanContext {
                     // image between 5 and 24 MiB whose dimensions were
                     // never indexed no longer gets a display thumb out of
                     // this pass. That is a convergence, not a hole: the
-                    // sixth dispatch question (the display-dimensions
+                    // orientation question (the display-dimensions
                     // backfill, docs/display-dimensions-design.md §4)
                     // fills `width`/`height` for any image whose header
                     // reads at all, and on the next pass this branch is
@@ -2397,7 +2427,7 @@ impl ScanContext {
         // image missing its display rendition still runs the image pass, and
         // that pass must produce the animated set rather than static tiers.
         let ladder = grid_ladder(&mime_type, image_facts.as_ref());
-        // The dispatcher's seventh question
+        // The ladder question
         // (docs/grid-scroll-performance-implementation.md §3, B1): "does this
         // item carry the renditions the current ladder would produce?" Asked
         // before the negative cache, because for an image the answer *is* a
@@ -2465,9 +2495,10 @@ impl ScanContext {
             // ffmpeg on every scan that touches it for any other reason.
             ladder = GridLadder::Unknown;
         }
-        // The dispatcher's third question (docs/video-outro-detection-design.md
+        // The outro question (docs/video-outro-detection-design.md
         // §7): "is this a video nothing has examined for an appended outro?"
-        // Unlike the other two it is not about a missing visual, so a video
+        // Unlike the thumbnail and blurhash questions it is not about a
+        // missing visual, so a video
         // with both a thumbnail and a blurhash is still work — that is exactly
         // what backfills an existing library, with no migration and no
         // separate job.
@@ -2484,7 +2515,7 @@ impl ScanContext {
                 .await;
             outro_work = None;
         }
-        // The dispatcher's fourth question (docs/video-transcoding-design.md
+        // The codec question (docs/video-transcoding-design.md
         // §6): "is this a video whose stream codecs nothing has recorded?"
         // Like the outro question it is not about a missing visual, so a video
         // with every visual it needs is still work — that is what backfills an
@@ -2499,7 +2530,7 @@ impl ScanContext {
             .pending_codec_work(&sha256, &mime_type, &path)
             .await
             .is_some();
-        // The dispatcher's fifth question (docs/animated-image-spans-design.md
+        // The animation question (docs/animated-image-spans-design.md
         // §4): "is this a gif/webp/avif whose animation length nothing has
         // measured?" Cut from the same cloth as the codec question — not a
         // missing visual, so an image with every visual it needs is still
@@ -2509,7 +2540,7 @@ impl ScanContext {
         let animation_work = self
             .pending_animation_work(&sha256, &mime_type, &path)
             .await;
-        // The dispatcher's sixth question (docs/display-dimensions-design.md
+        // The orientation question (docs/display-dimensions-design.md
         // §4): "is this an image or a video whose orientation nothing has
         // examined?" Cut from the same cloth as the codec and animation
         // questions — not a missing visual, so an item with every visual it
@@ -3018,7 +3049,7 @@ impl ScanContext {
             // and guessing "animated" would need geometry nobody measured.
             GridLadder::Unknown => return None,
             GridLadder::Animated => {
-                // The animated ladder is a *replacement* for the still one,
+                // The animated ladder is a *replacement* for the static one,
                 // not an addition to it, and it touches no display rendition
                 // at all — so unlike the still branch below this reads no
                 // display geometry.
@@ -5416,7 +5447,7 @@ enum TierWork {
 }
 
 /// One image's measurements, gathered once per dispatch and shared by every
-/// question that needs them (see `FileScanService::image_facts`).
+/// question that needs them (see `ScanContext::image_facts`).
 struct ImageFacts {
     /// The byte count on disk *now*, which is what both rules are decided
     /// against.
@@ -5503,7 +5534,7 @@ fn first_pass_ladder(
 ///
 /// `facts` is `None` for everything that is not an image; an image's byte
 /// count and dimensions come from the single stat and index read the
-/// dispatch already paid for (`FileScanService::image_facts`).
+/// dispatch already paid for (`ScanContext::image_facts`).
 fn grid_ladder(mime_type: &str, facts: Option<&ImageFacts>) -> GridLadder {
     // No mime type at all: `mime_can_have_renditions` says no generator will
     // ever produce a picture for it, so its wanted set is empty by rule.
@@ -5512,7 +5543,7 @@ fn grid_ladder(mime_type: &str, facts: Option<&ImageFacts>) -> GridLadder {
     }
     let duration = facts.and_then(|facts| facts.duration);
     if !is_animated_image(mime_type, duration) {
-        // An animated *container* nothing has measured yet is not a still —
+        // An animated *container* nothing has measured yet is not static —
         // it is unknown, and the scan is the only side of the ladder that can
         // tell the difference. The animation question
         // (docs/animated-image-spans-design.md §4) runs after this one in the
@@ -11103,7 +11134,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     }
 
     /// Sets (or clears) an item's stored outro verdict, which is what the
-    /// dispatcher's third question reads.
+    /// dispatcher's outro question reads.
     async fn set_outro_kind(env: &VisualsEnv, sha256: &str, kind: Option<&str>) {
         let mut conn = env.write().await;
         sqlx::query("UPDATE items SET outro_kind = ?1, content_end_ms = NULL WHERE sha256 = ?2")
@@ -14177,7 +14208,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     }
 
     // The pre-spans window, walked as the transition it is. An animated
-    // *container* nothing has measured is not a still: classifying it `Still`
+    // *container* nothing has measured is not static: classifying it `Static`
     // writes static tiers for a picture that may well move, serves them
     // immutably in the window before the measurement lands, and leaves them
     // unreachable — on the next scan a genuinely still file answers

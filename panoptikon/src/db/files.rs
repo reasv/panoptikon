@@ -637,6 +637,11 @@ WHERE sha256 = ?3 AND rotation IS NULL
 /// predicate and the rendition-ladder question both have to decide "does this
 /// item already carry what the current generator would produce?" *without*
 /// decoding the file (`jobs::files::maybe_dispatch_backfill`).
+///
+/// Read straight out of the row rather than through a tuple: four nullable
+/// columns of three types is exactly the shape a positional decode gets
+/// silently wrong.
+#[derive(sqlx::FromRow)]
 pub(crate) struct ItemVisualFacts {
     /// Display dimensions — the header's numbers with the EXIF orientation
     /// applied (docs/display-dimensions-design.md).
@@ -659,7 +664,7 @@ pub(crate) async fn get_item_visual_facts(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
 ) -> ApiResult<Option<ItemVisualFacts>> {
-    let row: Option<(Option<i64>, Option<i64>, Option<f64>, Option<i64>)> =
+    let row: Option<ItemVisualFacts> =
         sqlx::query_as("SELECT width, height, duration, rotation FROM items WHERE sha256 = ?1")
             .bind(sha256)
             .fetch_optional(&mut *conn)
@@ -668,12 +673,7 @@ pub(crate) async fn get_item_visual_facts(
                 tracing::error!(error = %err, "failed to read item visual facts");
                 ApiError::internal("Failed to query item")
             })?;
-    Ok(row.map(|(width, height, duration, rotation)| ItemVisualFacts {
-        width,
-        height,
-        duration,
-        rotation,
-    }))
+    Ok(row)
 }
 
 pub(crate) async fn has_blurhash(

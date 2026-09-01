@@ -136,10 +136,14 @@ Converged with the user 2026-08-31:
   Applies to GIF and animated WebP (and AVIF when importing lands), except
   small-raw floor: original served raw iff ≤1 MB AND both dims ≤512.
   Static tier thumbs double as posters. Encoded-larger-than-original edge:
-  keep the original. Client renders `<video muted autoplay loop playsinline>`
-  styled identically to an image, with a cap on concurrently *playing*
-  animations (IntersectionObserver; pause off-screen and during fast
-  scroll). Codec choice is settled: NOT AV1 (hardware decode sessions are
+  keep the original. Client renders `<video muted loop playsinline
+  preload="none">` styled identically to an image — **no `autoplay`**: a
+  playback director plays only cells that are sufficiently visible and inside
+  the concurrency cap (IntersectionObserver; pause off-screen and during fast
+  scroll), and `preload="none"` is what makes that decision cover the network
+  and not just the decode. Measured while `autoplay` was still on: every
+  mounted loop fetched and fully buffered itself, 16 of 16 buffered with 14 of
+  them off screen, ~4 MB nobody saw. Codec choice is settled: NOT AV1 (hardware decode sessions are
   finite at 20–30 streams; software H.264 is cheap, software AV1 is not).
   Known risk to quality-pass: yuv420 chroma fringing on pixel-art GIFs.
 - **Tier selection is client-side by need**: request the smallest tier whose
@@ -408,8 +412,9 @@ no heap growth trend with images blocked, and the fix is explainable (no
 
 **F6 — Animated cells** (after B2 + F1)
 
-- Cells render `<video muted autoplay loop playsinline disablepictureinpicture>`
-  for animated types above the floor — decided from `type`+`duration` ("does
+- Cells render `<video muted loop playsinline disablepictureinpicture
+  preload="none">` — deliberately **not** `autoplay`; see §2 — for animated
+  types above the floor — decided from `type`+`duration` ("does
   it move") and `size`+`width`/`height` against the client-config floors ("is
   it above them"); all five fields are in the search payload — poster = still
   tier; styled indistinguishably from `<img>`.
@@ -536,3 +541,26 @@ Standing constraints for every agent:
   not named here (P4/P5/P6 stay tracked there).
 - Animate-on-hover-only as default (kept as a possible later policy toggle;
   always-animate remains the default UX).
+- **A per-item animated-rendition field in the search payload.** The client
+  currently transcribes `is_animated_image`, redoes the floor arithmetic from
+  `/api/client-config`, and still guesses about a loop the backfill may not
+  have written; one server-computed field per item ("static" / "still" /
+  "loop") would collapse all three. The `<video>` → poster error latch stays
+  regardless — it also covers the settled keep-the-original edge, which no
+  payload field makes go away. Deferred because the search payload's shape is
+  frozen for this release.
+- **AVIF importing readiness.** The seam is already clean: `grid_ladder`
+  answers `Unknown` (never a permanent verdict) for a container this build
+  cannot demux, the capability table
+  (`media_tools::animated_container_support`) has the AVIF row and the probe
+  behind it, `animation::avif_animation_seconds` measures the duration with no
+  ffmpeg at all, and the loop encoder's input preparation already refuses AVIF
+  explicitly rather than by omission. What is missing is only the import path
+  itself.
+- **Lazy-mount cell overlay chrome.** Every grid cell mounts its overlay
+  chrome — a `QueryObserver` plus Radix menus — invisibly, whether or not the
+  pointer ever reaches it. At the measured mount ceiling (280 mounts/s, i.e.
+  ~3.6 ms per mount on average) a mid-teens p90 at the smallest cell size is
+  the estimate, so gating the overlay behind `pointerenter`/`focusin` is worth
+  a look. Verify with the harness before building any of it: the estimate is
+  arithmetic on an average, not a measurement of this component.

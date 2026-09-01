@@ -1,7 +1,7 @@
 //! The stored-rendition ladder every visual surface serves from
 //! (`docs/grid-scroll-performance-implementation.md` §2).
 //!
-//! Three tiers, all derived from one decode:
+//! Three static tiers, all derived from one decode:
 //!
 //! * `display` — gallery quality and the browser-safety bound. Capped on the
 //!   **short** side (4096) and on total pixels (32 MP), because a cell that
@@ -13,8 +13,14 @@
 //!   side covers the cell box is what keeps decoded megapixels per screenful
 //!   constant as cells shrink.
 //!
-//! Two rules do all the work here, and both are pure functions of
-//! `(file_size, width, height)` — deliberately, because the scan's backfill
+//! …and, for an animated item above the raw floor, a fourth rendition that is
+//! not a tier at all: ONE H.264 `loop` answering both grid tiers, plus the
+//! static posters `still=true` selects. Its geometry rules live here beside
+//! the static ones, and what gets *served* when a loop is missing is the
+//! fallback ladder below.
+//!
+//! The rules here are pure functions of `(file_size, width, height)` —
+//! deliberately, because the scan's backfill
 //! dispatcher has to answer "does this item already have what the current
 //! generator would produce?" from *indexed metadata*, never by decoding the
 //! file again (`jobs::files::maybe_dispatch_backfill`). Anything that made a
@@ -109,7 +115,7 @@ pub(crate) const LOOP_TIER: &str = "loop";
 /// The loop's stored media type, and what the endpoint serves it as.
 pub(crate) const LOOP_MEDIA_TYPE: &str = "video/mp4";
 
-/// Every still rendition's media type — the display renditions and both grid
+/// Every static rendition's media type — the display renditions and both grid
 /// tiers are q85 JPEGs.
 pub(crate) const TIER_MEDIA_TYPE: &str = "image/jpeg";
 
@@ -473,11 +479,11 @@ fn cascade(
 ///   so an unmeasured one is treated as animated rather than given static
 ///   tiers for a picture that moves. Only an explicit `Some(0.0)` — a
 ///   well-formed file with fewer than two frames, or one whose structure did
-///   not parse — takes the still ladder, which is what keeps every
+///   not parse — takes the static ladder, which is what keeps every
 ///   single-frame GIF from carrying an eternal one-frame mp4.
 /// * Every other image container (WebP today, AVIF when importing lands) is
 ///   animated only when the measurement says so, because for those formats
-///   the still case is the common one.
+///   the static case is the common one.
 ///
 /// Shared by the scan and the serving endpoint, which is why the
 /// pre-measurement caution that belongs to the **scan alone** — not writing a
@@ -494,7 +500,7 @@ pub(crate) fn is_animated_image(mime_type: &str, duration: Option<f64>) -> bool 
 /// The animated raw floor: whether an animated original is served as-is at
 /// the grid tiers, with nothing stored for it at all.
 ///
-/// Deliberately *both* bounds and deliberately not the still rule's shape: a
+/// Deliberately *both* bounds and deliberately not the static rule's shape: a
 /// loop costs an ffmpeg encode per item and a stored mp4 per item, so the
 /// floor is where that stops paying for itself. A 512-or-smaller animation
 /// under a megabyte decodes cheaply enough in the cell that an H.264
@@ -539,7 +545,7 @@ fn even_side(side: u32) -> u32 {
 ///
 /// Unlike [`grid_plans`] there is no "serve the original" escape, and that is
 /// the whole difference: the original *moves*, so it is never an acceptable
-/// still, however small it is. `grid-m` is therefore unconditional — every
+/// poster, however small it is. `grid-m` is therefore unconditional — every
 /// animated item above the raw floor has exactly one poster to fall up to —
 /// while `grid-s` is stored only when it is genuinely smaller, and is
 /// answered by the fall-up ladder (`grid-s` -> `grid-m`) when it is not.
@@ -1068,7 +1074,7 @@ mod tests {
     }
 
     // A poster always exists, however small the animation is: the original
-    // moves, so it can never be the still.
+    // moves, so it can never be the poster.
     #[test]
     fn posters_always_store_a_grid_m_and_deduplicate_grid_s() {
         // Small enough that both tiers would be the identity render: only
@@ -1080,7 +1086,7 @@ mod tests {
         );
         assert_eq!((plans[0].1.width, plans[0].1.height), (300, 300));
 
-        // Big enough for both, cascading exactly like the still ladder.
+        // Big enough for both, cascading exactly like the static ladder.
         let plans = poster_plans(2000, 2000);
         assert_eq!(
             plans.iter().map(|(tier, _)| *tier).collect::<Vec<_>>(),
@@ -1089,12 +1095,12 @@ mod tests {
         assert_eq!((plans[0].1.width, plans[0].1.height), (1024, 1024));
         assert_eq!((plans[1].1.width, plans[1].1.height), (512, 512));
 
-        // A strip's poster is the same top crop the still ladder stores.
+        // A strip's poster is the same top crop the static ladder stores.
         let plans = poster_plans(800, 20000);
         assert_eq!((plans[0].1.crop_y, plans[0].1.crop_height), (0, 2048));
         assert_eq!((plans[0].1.width, plans[0].1.height), (800, 2048));
 
-        // Unlike the still ladder, no byte or dimension escape can empty the
+        // Unlike the static ladder, no byte or dimension escape can empty the
         // set: `grid-m` is unconditional.
         for (width, height) in [(1_u32, 1_u32), (64, 48), (300, 900), (5000, 5000)] {
             let plans = poster_plans(width, height);

@@ -568,7 +568,7 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
     }
     // The endpoint's half of the scan's pre-measurement caution
     // (`jobs::files::grid_ladder`). An animated *container* nothing has
-    // measured is not a still: `is_animated_image` above answers "not
+    // measured is not static: `is_animated_image` above answers "not
     // animated" for it, and without this the ordinary grid rule below would
     // call a 900x900 700 KB WebP final and pin its original for a year — on
     // exactly the items whose loop is still on its way, which would then
@@ -596,6 +596,40 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
     }
 }
 
+/// The thumbnail endpoint: one URL family whose answer is decided by
+/// `(size, still)` and by what the scan actually stored for this item.
+///
+/// Every state it can end in, and the headers that go with it. `CA` is
+/// `content_addressed` (an ETag-bearing, immutable-eligible URL); a
+/// non-`CA` request is `no-cache` in every row without exception.
+///
+/// | # | state | body | Content-Type | ETag | Cache-Control (CA) |
+/// |---|-------|------|--------------|------|--------------------|
+/// | 1 | empty mime, or a GIF at `display` | the file | the file's | `sha256-size-mtime` + variant | immutable / drifted |
+/// | 2 | animated grid, loop stored | `thumbnail_tiers.loop` | stored (`video/mp4`) | `sha-thumb0-loop-v{ver}` | immutable |
+/// | 3 | animated grid, loop row empty | the file | the file's | + variant | immutable / drifted |
+/// | 4 | animated grid, no loop row | the file | the file's | + variant | `fall_up_is_final` ? immutable/drifted : no-cache |
+/// | 5 | animated grid, `still=true`, poster stored | `thumbnail_tiers.grid-*` | stored (JPEG) | `…-{tier}-v{ver}-still` | exact hit ? immutable : no-cache |
+/// | 6 | animated grid, `still=true`, no poster | the file | the file's | + `-still` | as row 4 |
+/// | 7 | static ladder, tier rendition found | `thumbnail_tiers` row | stored (JPEG) | `…-{tier}-v{ver}` + variant | exact or `fall_up_is_final` ? immutable : no-cache |
+/// | 8 | static ladder, display rendition found | `thumbnails` row | `image/jpeg` (hardcoded) | `sha-thumb{idx}` + variant | `size == display` or `fall_up_is_final` ? immutable : no-cache |
+/// | 9 | image, nothing stored | the file | the file's | + variant | `fall_up_is_final` ? immutable/drifted : no-cache |
+/// | 10 | non-image, nothing stored | `PLACEHOLDER_PNG` | `image/png` | `sha-placeholder` | `max-age=300` |
+///
+/// Three things the table is easy to get wrong on:
+///
+/// * The **still variant** is part of the ETag on every row, file branches
+///   included — `file_response`'s own validator is `sha256-size-mtime` and
+///   identical for a loop and its poster. Row 2 is the exception that proves
+///   it: the loop's ETag hardcodes `""` for the suffix, because `still=true`
+///   is by definition not this branch.
+/// * The **file branches have a third cache state**, `CACHE_DRIFTED`: a
+///   content-addressed URL whose file's mtime no longer matches the indexed
+///   one gets a bounded lifetime rather than `immutable`
+///   ([`try_file_response`]). "immutable / drifted" above means that split.
+/// * **Rendition rows never drift** — they are derived from exactly the
+///   content the URL names — so their lifetime is [`rendition_cache_control`]
+///   alone.
 #[allow(clippy::too_many_arguments)]
 async fn thumbnail_response(
     conn: &mut sqlx::SqliteConnection,
@@ -644,7 +678,7 @@ async fn thumbnail_response(
 
     // The animated ladder (§2, step B2): a moving picture's grid rendition is
     // an H.264 loop, and `still=true` is how a caller asks for the poster
-    // instead. Answered before the still ladder below, because for these
+    // instead. Answered before the static ladder below, because for these
     // items the two are alternatives, not a fall-up chain — a *poster* is
     // never the answer to an animated grid request, or the grid would be the
     // one surface that never animates.
@@ -893,7 +927,7 @@ async fn animated_tier_response(
     }
     // No poster: a raw-floor item (nothing is ever stored, final) or one the
     // backfill has not reached (pending). Its own file is the closest thing
-    // to a still it has.
+    // to a poster it has.
     file_variant_response(
         item,
         files,
