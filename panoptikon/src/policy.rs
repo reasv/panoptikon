@@ -321,7 +321,16 @@ fn apply_policy(
     } else if is_api {
         needs_db_params(&path)
     } else {
-        true
+        // UI-bound requests (pages, assets, HMR) are forwarded with their
+        // query string untouched. Injecting the policy's DB defaults here
+        // makes the Next.js server SSR against a URL the browser never had:
+        // every nuqs-serialized link href then carries index_db/user_data_db
+        // that the client-side render omits, and React fails hydration
+        // (error #418) on every page load. DB scoping for SSR does not need
+        // the page URL — the UI's SSR API calls come back through the
+        // gateway with the echoed policy token, and this same enforcement
+        // resolves the DB params on that API hop.
+        false
     };
 
     if apply_db_params {

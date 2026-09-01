@@ -1070,8 +1070,8 @@ allow = "*"
 
     /// The OnUpgrade extension survives the tower PolicyLayer: an upgrade
     /// request through the real policy stack still bridges, with the
-    /// policy's work visible in the forwarded handshake (injected DB params
-    /// and a minted policy token).
+    /// policy's work visible in the forwarded handshake (a minted policy
+    /// token, and the UI-bound query string left untouched).
     #[tokio::test]
     async fn upgrade_bridges_through_the_policy_layer() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1119,11 +1119,13 @@ allow = "*"
             "expected 101 through the policy layer, got: {response_head}"
         );
 
-        // The policy layer ran on this request: DB defaults injected into
-        // the query and a policy token minted for the UI-bound handshake.
+        // The policy layer ran on this request: a policy token was minted
+        // for the UI-bound handshake, and the query string was left alone —
+        // UI-bound requests must reach the Next.js server with exactly the
+        // URL the browser sent, or SSR/hydration URL state diverges.
         let forwarded = head_rx.await.unwrap().to_ascii_lowercase();
-        assert!(forwarded.contains("get /hmr?"), "head: {forwarded}");
-        assert!(forwarded.contains("index_db=default"), "head: {forwarded}");
+        assert!(forwarded.contains("get /hmr "), "head: {forwarded}");
+        assert!(!forwarded.contains("index_db="), "head: {forwarded}");
         assert!(
             forwarded.contains("x-panoptikon-policy:"),
             "head: {forwarded}"
