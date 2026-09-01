@@ -33,7 +33,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use super::transcode::compose::{ItemTime, Transform, orientation_filters};
-use crate::visual_tiers::TierRender;
+use crate::visual_tiers::TierPlan;
 
 /// x264's rate factor for a loop. Visually transparent for the material —
 /// flat-colour animations and short clips — at a fraction of a GIF's bytes.
@@ -109,7 +109,7 @@ impl std::fmt::Display for LoopError {
 
 /// Encodes one item's loop and returns the mp4 bytes.
 ///
-/// `plan` is [`crate::visual_tiers::loop_render`]'s geometry in **display**
+/// `plan` is [`crate::visual_tiers::loop_plan`]'s geometry in **display**
 /// space, and `normalize` is the transform that takes the file's stored
 /// pixels there (an EXIF-oriented WebP; GIF carries no orientation). The
 /// scale filter is unconditional and exact, so the encoded stream always has
@@ -118,7 +118,7 @@ impl std::fmt::Display for LoopError {
 pub(crate) fn encode_loop(
     path: &Path,
     mime_type: &str,
-    plan: &TierRender,
+    plan: &TierPlan,
     normalize: Transform,
 ) -> Result<Vec<u8>, LoopError> {
     let dir = tempfile::tempdir()
@@ -255,7 +255,7 @@ fn gif_forced_input_rate(path: &Path, mime_type: &str) -> Option<u32> {
 /// omitting it conditionally would need the source dimensions here to know
 /// which case it is — a second source of truth for the one number that must
 /// not have one.
-fn loop_filters(plan: &TierRender, normalize: Transform) -> String {
+fn loop_filters(plan: &TierPlan, normalize: Transform) -> String {
     let mut filters: Vec<String> = orientation_filters(normalize)
         .into_iter()
         .map(str::to_string)
@@ -355,13 +355,13 @@ fn prepare_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::visual_tiers::loop_render;
+    use crate::visual_tiers::loop_plan;
 
     /// A normal-aspect source: the crop is the whole frame, and the scale
     /// lands on exactly the geometry the dispatcher predicted.
     #[test]
     fn an_ordinary_loop_keeps_the_whole_frame() {
-        let plan = loop_render(1500, 2000);
+        let plan = loop_plan(1500, 2000);
         assert_eq!(
             loop_filters(&plan, Transform::default()),
             "crop=1500:2000:0:0,scale=1024:1364:flags=lanczos+accurate_rnd+full_chroma_int"
@@ -372,14 +372,14 @@ mod tests {
     /// `object-position: 50% 0%` paints.
     #[test]
     fn a_strip_crops_before_it_scales() {
-        let plan = loop_render(800, 20000);
+        let plan = loop_plan(800, 20000);
         assert_eq!(
             loop_filters(&plan, Transform::default()),
             "crop=800:2048:0:0,scale=800:2048:flags=lanczos+accurate_rnd+full_chroma_int"
         );
 
         // A wide strip keeps the horizontally centered band.
-        let plan = loop_render(20000, 800);
+        let plan = loop_plan(20000, 800);
         assert!(
             loop_filters(&plan, Transform::default())
                 .starts_with(&format!("crop=2048:800:{}:0,", (20000 - 2048) / 2)),
@@ -392,7 +392,7 @@ mod tests {
     /// the crop rectangle is expressed in display space.
     #[test]
     fn orientation_is_applied_before_the_crop() {
-        let plan = loop_render(800, 20000);
+        let plan = loop_plan(800, 20000);
         let chain = loop_filters(
             &plan,
             Transform {
@@ -415,7 +415,7 @@ mod tests {
     /// even where the render is the identity in both.
     #[test]
     fn the_exact_geometry_is_never_omitted() {
-        let plan = loop_render(300, 300);
+        let plan = loop_plan(300, 300);
         assert_eq!((plan.width, plan.height), (300, 300));
         assert_eq!(
             loop_filters(&plan, Transform::default()),
@@ -517,7 +517,7 @@ mod tests {
         encode_loop(
             path,
             mime,
-            &loop_render(side, side),
+            &loop_plan(side, side),
             Transform::default(),
         )
         .expect("the fixture encodes")
@@ -633,7 +633,7 @@ mod tests {
         drop(bridged);
 
         // 16x16, so the loop is the source size rounded to even: unchanged.
-        let plan = loop_render(16, 16);
+        let plan = loop_plan(16, 16);
         assert_eq!((plan.width, plan.height), (16, 16));
         let (frames, duration, _) = probe_loop(
             &encode_loop(&path, "image/webp", &plan, Transform::default())

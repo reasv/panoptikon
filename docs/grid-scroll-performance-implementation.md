@@ -216,7 +216,7 @@ and one runs the stdtest matrix against a gateway on 6343.
 **B1 — Still-image tier ladder + dimension-first serving**
 
 - Scan/generation: extend the visuals pass (`jobs/files.rs`,
-  `build_new_item_thumbnails` / `generate_thumbnail` / `encode_image`) to
+  `build_new_item_renditions` / `generate_thumbnail` / `encode_image`) to
   produce `grid-m`/`grid-s` renditions by cascaded resize from the already
   decoded image (display → m → s). Short-side cap per §2; aspect > 2
   produces the presentation-matched crop (top strip / center band) instead

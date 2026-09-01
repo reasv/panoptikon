@@ -652,12 +652,7 @@ async fn thumbnail_response(
     // answer for this URL. Computed once, because several different responses
     // below can be a fall-up.
     let fall_up_is_final = tier_fall_up_is_final(item, size);
-    // The `still` variant is part of every ETag on this endpoint, including
-    // the file-serving branches. `file_response`'s own validator is
-    // `sha256-size-mtime`, identical for the loop and the poster, so without
-    // this a cached poster would be handed back for a loop request and vice
-    // versa (§3, B2's must).
-    let still_suffix = if still { "-still" } else { "" };
+    let still_suffix = still_suffix(still);
     // An item with no mime type has no generator and no rendition, at any
     // tier: its file is the answer, exactly as before.
     //
@@ -689,7 +684,6 @@ async fn thumbnail_response(
             files,
             size,
             still,
-            still_suffix,
             original_filename_no_ext,
             request_headers,
             content_addressed,
@@ -809,6 +803,15 @@ fn tier_etag(sha256: &str, index: i64, tier: &str, version: i64, still_suffix: &
     format!("\"{sha256}-thumb{index}-{tier}-v{version}{still_suffix}\"")
 }
 
+/// The `still` variant's ETag suffix, which is part of every ETag on this
+/// endpoint — the file-serving branches included. `file_response`'s own
+/// validator is `sha256-size-mtime`, identical for a loop and its poster, so
+/// without this a cached poster would be handed back for a loop request and
+/// vice versa (§3, B2's must).
+fn still_suffix(still: bool) -> &'static str {
+    if still { "-still" } else { "" }
+}
+
 /// The cache lifetime of a response served from a **stored rendition**, which
 /// is one rule across all four sites that serve one.
 ///
@@ -849,13 +852,15 @@ async fn animated_tier_response(
     files: &[FileRecord],
     size: ThumbnailTier,
     still: bool,
-    still_suffix: &str,
     original_filename_no_ext: &str,
     request_headers: &HeaderMap,
     content_addressed: bool,
     fall_up_is_final: bool,
 ) -> ApiResult<Response<Body>> {
     let sha256 = &item.sha256;
+    // The same suffix the caller derived; derived again rather than passed,
+    // so the flag and the string it implies cannot be handed in disagreeing.
+    let still_suffix = still_suffix(still);
     // Animated items are images, so there is only ever one picture: index 0.
     // (`big` selects between a video's two stored pictures and has no meaning
     // here.)

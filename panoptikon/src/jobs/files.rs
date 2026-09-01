@@ -103,9 +103,9 @@ use crate::{
     media_tools::transcode::compose::Transform,
     visual_tiers::{
         DISPLAY_MAX_FILE_SIZE, DisplayPlan, LOOP_MEDIA_TYPE, LOOP_TIER, TIER_MEDIA_TYPE,
-        ThumbnailTier, TierRender, animated_plans, animated_serves_original, display_plan,
+        ThumbnailTier, TierPlan, animated_plans, animated_serves_original, display_plan,
         grid_plans, grid_plans_for_stored_thumbnail, grid_renditions, is_animated_image,
-        loop_keeps_original, loop_render, poster_plans,
+        loop_keeps_original, loop_plan, poster_plans,
     },
 };
 
@@ -2621,7 +2621,7 @@ impl ScanContext {
                             path = %path.display(),
                             "skipping video thumbnail generation due to missing video track"
                         );
-                        // The same conclusion `build_new_item_thumbnails`
+                        // The same conclusion `build_new_item_renditions`
                         // records for this video, and the one that matters
                         // most: an item indexed before this cache existed has
                         // never been through the new-item path, so without
@@ -2701,7 +2701,7 @@ impl ScanContext {
         // Whether `storage.frames` holds anything for this content. Two
         // questions need it and they must not disagree: §7.1's "is there
         // anything here to replace", and — threaded into the worker — the fact
-        // `build_backfill_thumbnails` classifies a failed extraction by.
+        // `build_backfill_renditions` classifies a failed extraction by.
         //
         // `work.existing_frames` answers it for free wherever the thumbnail
         // half fetched it (`get_frames_bytes` is unversioned, so empty means no
@@ -3064,7 +3064,7 @@ impl ScanContext {
                 }
                 return Some(TierWork::Animated);
             }
-            GridLadder::Still => {}
+            GridLadder::Static => {}
         }
         let stored_thumbnails = self.stored_geometry(sha256, path).await?;
 
@@ -4000,7 +4000,7 @@ fn outro_source_dims(width: Option<i64>, height: Option<i64>) -> Option<(u32, u3
 /// indexer are outside that invariant; the backfill dispatcher already reads
 /// them the same way, concluding a permanent nothing for both visual kinds.)
 ///
-/// Not the same gate as [`build_new_item_thumbnails`], which needs
+/// Not the same gate as [`build_new_item_renditions`], which needs
 /// `video_tracks > 0 && duration > 0.0` because it has to place sample points
 /// inside a known length. The probe needs no duration at all: it works from
 /// the end of the stream backwards, and a missing duration only costs it a
@@ -4763,7 +4763,7 @@ fn generate_new_item_visuals(
     // in one function is what makes that structural rather than a convention.
     let thumb_span = timers.thumbgen.start();
     let outro = outro_pass_for(path, mime_type, metadata, detect_outros);
-    let attempt = build_new_item_thumbnails(path, mime_type, metadata, outro.content_end_ms());
+    let attempt = build_new_item_renditions(path, mime_type, metadata, outro.content_end_ms());
     drop(thumb_span);
 
     let mut visuals = GeneratedVisuals::default();
@@ -4829,7 +4829,7 @@ fn html_visuals_error_blocks_indexing(err: VisualsError) -> FileProcessError {
 
 /// `content_end_ms` is this pass's own outro verdict, which ran before it
 /// (design §7): frame sampling is clamped to `[0, content_end_ms)`.
-fn build_new_item_thumbnails(
+fn build_new_item_renditions(
     path: &Path,
     mime_type: &str,
     metadata: &ItemScanMeta,
@@ -4933,8 +4933,8 @@ fn build_new_item_thumbnails(
 
 /// The rows a planned tier set would store, in the order
 /// [`get_thumbnail_tier_geometry`] returns them (index, then tier name).
-fn wanted_tier_geometry(idx: i64, plans: &[(ThumbnailTier, TierRender)]) -> Vec<TierGeometry> {
-    let named: Vec<(&str, TierRender)> = plans
+fn wanted_tier_geometry(idx: i64, plans: &[(ThumbnailTier, TierPlan)]) -> Vec<TierGeometry> {
+    let named: Vec<(&str, TierPlan)> = plans
         .iter()
         .map(|(tier, plan)| (tier.as_str(), *plan))
         .collect();
@@ -4944,7 +4944,7 @@ fn wanted_tier_geometry(idx: i64, plans: &[(ThumbnailTier, TierRender)]) -> Vec<
 /// [`wanted_tier_geometry`] for a set whose discriminators are not all
 /// `size=` values — the animated ladder, whose `loop` row is a rendition kind
 /// rather than a tier.
-fn wanted_named_tier_geometry(idx: i64, plans: &[(&str, TierRender)]) -> Vec<TierGeometry> {
+fn wanted_named_tier_geometry(idx: i64, plans: &[(&str, TierPlan)]) -> Vec<TierGeometry> {
     let mut wanted: Vec<TierGeometry> = plans
         .iter()
         .map(|(tier, plan)| TierGeometry {
@@ -5030,7 +5030,7 @@ fn build_image_renditions(
 ) -> Result<(), FileProcessError> {
     let (width, height) = image.dimensions();
     match work.tiers {
-        GridLadder::Still => {
+        GridLadder::Static => {
             out.tiers = Some(encode_tiers(0, &image, &grid_plans(file_size, width, height))?);
         }
         GridLadder::Animated => {
@@ -5122,7 +5122,7 @@ fn build_animated_tiers(
         }
     };
 
-    let plan = loop_render(width, height);
+    let plan = loop_plan(width, height);
     let bytes = match crate::media_tools::animated_loop::encode_loop(
         path,
         mime_type,
@@ -5464,8 +5464,8 @@ struct ImageFacts {
 }
 
 /// The mime families a stored rendition — and therefore a grid tier — can
-/// ever exist for. Exactly the branches `build_new_item_thumbnails` and
-/// `build_backfill_thumbnails` have generators for; everything else records a
+/// ever exist for. Exactly the branches `build_new_item_renditions` and
+/// `build_backfill_renditions` have generators for; everything else records a
 /// permanent "nothing".
 fn mime_can_have_renditions(mime_type: &str) -> bool {
     mime_type.starts_with("image")
@@ -5488,7 +5488,11 @@ enum GridLadder {
     /// Static renditions: `grid-m`/`grid-s` JPEGs. Every item that does not
     /// move, and every non-image (a video's tiers come from its stored frame
     /// grid, which is a still by construction).
-    Still,
+    ///
+    /// Internal to the scan: nothing about this name reaches the wire, where
+    /// `still` means the `still=true` variant of a *request* and selects an
+    /// animated item's poster.
+    Static,
     /// An animated image above the raw floor: one H.264 loop, plus the static
     /// posters `still=true` answers with.
     Animated,
@@ -5567,7 +5571,7 @@ fn grid_ladder(mime_type: &str, facts: Option<&ImageFacts>) -> GridLadder {
         if duration.is_none() && crate::media_tools::animation::measures_animation(mime_type) {
             return GridLadder::Unknown;
         }
-        return GridLadder::Still;
+        return GridLadder::Static;
     }
     // A container this build has no decoder for is **undecidable**, not a
     // permanent nothing. The frame bridge decodes WebP only, so an animated
@@ -5788,7 +5792,7 @@ fn generate_backfill_visuals(
     // `frames_stored` is the dispatcher's answer about `storage.frames`, not
     // anything derived from `existing_frames` — which the discard below
     // empties, and which the replace path never fetched in the first place.
-    // `build_backfill_thumbnails` classifies a failed extraction by it: with
+    // `build_backfill_renditions` classifies a failed extraction by it: with
     // frames in the database an extraction failure is a thumbnail-only
     // verdict, and calling those frames permanently unobtainable would be a
     // lie.
@@ -5867,7 +5871,7 @@ fn generate_backfill_visuals(
     // blurhash fallback only runs when the thumbnail half did not fail.
     let mut audit: Option<ScanFailure> = None;
     if needs_thumb {
-        match build_backfill_thumbnails(
+        match build_backfill_renditions(
             path,
             mime_type,
             &existing_frames,
@@ -6081,14 +6085,14 @@ fn backfill_scan_error(
 
 /// `content_end_ms` is where the item's content ends — this pass's own outro
 /// verdict, or the one a previous scan stored. See
-/// [`build_new_item_thumbnails`].
+/// [`build_new_item_renditions`].
 ///
 /// `frames_stored` is whether `storage.frames` holds anything for this item.
 /// It is *not* `!existing_frames.is_empty()`: the caller empties that list
 /// when a newly-positive verdict makes the stored frames wrong to reuse, and
 /// classifying an extraction failure from the emptied list would call frames
 /// that exist permanently unobtainable.
-fn build_backfill_thumbnails(
+fn build_backfill_renditions(
     path: &Path,
     mime_type: &str,
     existing_frames: &[Vec<u8>],
@@ -6297,7 +6301,7 @@ fn generate_display_thumbnail(file_size: u64, image: &DynamicImage) -> Option<Dy
 fn encode_tiers(
     idx: i64,
     image: &DynamicImage,
-    plans: &[(ThumbnailTier, TierRender)],
+    plans: &[(ThumbnailTier, TierPlan)],
 ) -> Result<Vec<StoredTier>, FileProcessError> {
     grid_renditions(image, plans)
         .into_iter()
@@ -11409,7 +11413,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
 
         // The replace path's shape: no frames in hand, but four in the
         // database. The thumbnail is gone and nothing else is.
-        let Err(err) = build_backfill_thumbnails(
+        let Err(err) = build_backfill_renditions(
             &clip,
             "video/mp4",
             &[],
@@ -11418,7 +11422,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             Some(5000),
             ImageLadderWork {
                 display: true,
-                tiers: GridLadder::Still,
+                tiers: GridLadder::Static,
                 rotation: None,
             },
         )
@@ -11436,7 +11440,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
 
         // Nothing stored anywhere: the same failure really is both kinds'
         // only chance, and that has not changed.
-        let Err(err) = build_backfill_thumbnails(
+        let Err(err) = build_backfill_renditions(
             &clip,
             "video/mp4",
             &[],
@@ -11445,7 +11449,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             None,
             ImageLadderWork {
                 display: true,
-                tiers: GridLadder::Still,
+                tiers: GridLadder::Static,
                 rotation: None,
             },
         ) else {
@@ -12626,7 +12630,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
 
         // A video with no video track: both kinds conclude a permanent
         // nothing, without ffmpeg ever being started.
-        let produced = build_new_item_thumbnails(
+        let produced = build_new_item_renditions(
             &dir.path().join("audio-only.mp4"),
             "video/mp4",
             &meta(0, 10.0),
@@ -12640,7 +12644,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // for the kind that could have existed.
         let plain = dir.path().join("notes.txt");
         fs::write(&plain, b"hello").unwrap();
-        let produced = build_new_item_thumbnails(&plain, "text/plain", &meta(0, 0.0), None)
+        let produced = build_new_item_renditions(&plain, "text/plain", &meta(0, 0.0), None)
             .expect("an unsupported type is not a failure");
         assert_eq!(produced.nothing, vec![VisualKind::Thumbnail]);
 
@@ -12648,7 +12652,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // marker — the predicate already answers this without decoding.
         let small = dir.path().join("small.png");
         image::RgbImage::new(8, 8).save(&small).unwrap();
-        let produced = build_new_item_thumbnails(&small, "image/png", &meta(0, 0.0), None)
+        let produced = build_new_item_renditions(&small, "image/png", &meta(0, 0.0), None)
             .expect("a small image is not a failure");
         assert!(
             produced.nothing.is_empty() && produced.thumbnails.is_empty(),
@@ -12659,7 +12663,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // 27 MB uncompressed, past the display rule's byte bound.
         let large = dir.path().join("large.bmp");
         image::RgbImage::new(9000, 1000).save(&large).unwrap();
-        let produced = build_new_item_thumbnails(&large, "image/bmp", &meta(0, 0.0), None).unwrap();
+        let produced = build_new_item_renditions(&large, "image/bmp", &meta(0, 0.0), None).unwrap();
         assert!(produced.nothing.is_empty() && produced.thumbnails.len() == 1);
         // ... and carries the grid tiers of the same decode. A 9:1 strip is
         // cropped rather than resized whole, so both tiers exist.
@@ -14122,16 +14126,16 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     // the serving endpoint. All three have to agree on which items move, or
     // the scan writes a set the dispatcher will never reconcile.
     #[test]
-    fn the_ladder_splits_still_animated_and_raw_floor_items() {
+    fn the_ladder_splits_static_animated_and_raw_floor_items() {
         const MB: u64 = 1024 * 1024;
         // Stills, whatever their duration says: a video's tiers come from its
         // stored frame grid, which is a still by construction.
-        assert_eq!(grid_ladder("image/jpeg", None), GridLadder::Still);
-        assert_eq!(grid_ladder("video/mp4", None), GridLadder::Still);
-        assert_eq!(grid_ladder("audio/mpeg", None), GridLadder::Still);
+        assert_eq!(grid_ladder("image/jpeg", None), GridLadder::Static);
+        assert_eq!(grid_ladder("video/mp4", None), GridLadder::Static);
+        assert_eq!(grid_ladder("audio/mpeg", None), GridLadder::Static);
         assert_eq!(
             grid_ladder("image/webp", Some(&facts(9 * MB, 2000, 2000, Some(0.0)))),
-            GridLadder::Still,
+            GridLadder::Static,
             "a measured *still* WebP is an ordinary image"
         );
         // No mime type: no generator will ever produce a picture, so the
@@ -14168,7 +14172,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // rendition anyone wants.
         assert_eq!(
             grid_ladder("image/gif", Some(&facts(4 * MB, 1400, 1400, Some(0.0)))),
-            GridLadder::Still
+            GridLadder::Static
         );
 
         // Undecidable: an animated item whose dimensions were never measured.
@@ -14195,7 +14199,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         );
         assert_eq!(
             first_pass_ladder("image/gif", Some(0.0), 4 * MB, 1400, 1400),
-            GridLadder::Still
+            GridLadder::Static
         );
         assert_eq!(
             first_pass_ladder("image/gif", Some(2.0), 300 * 1024, 320, 240),
@@ -14203,7 +14207,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         );
         assert_eq!(
             first_pass_ladder("image/png", None, 30 * MB, 8000, 8000),
-            GridLadder::Still
+            GridLadder::Static
         );
     }
 
@@ -14227,7 +14231,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             // The measurement lands, and the item settles either way.
             assert_eq!(
                 grid_ladder(mime, Some(&facts(6 * MB, 2000, 2000, Some(0.0)))),
-                GridLadder::Still,
+                GridLadder::Static,
                 "{mime} measured still takes the static ladder"
             );
             assert_eq!(
@@ -14245,14 +14249,14 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // immediately, exactly as before: their `duration` is NULL forever.
         assert_eq!(
             grid_ladder("image/png", Some(&facts(6 * MB, 2000, 2000, None))),
-            GridLadder::Still
+            GridLadder::Static
         );
         assert_eq!(
             grid_ladder("image/jpeg", Some(&facts(6 * MB, 2000, 2000, None))),
-            GridLadder::Still
+            GridLadder::Static
         );
         // And a video is never in this family at all.
-        assert_eq!(grid_ladder("video/mp4", None), GridLadder::Still);
+        assert_eq!(grid_ladder("video/mp4", None), GridLadder::Static);
     }
 
     // The ladder question's mime early-out must cover exactly the types a

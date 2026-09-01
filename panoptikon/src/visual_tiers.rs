@@ -220,7 +220,7 @@ fn scale_side(side: u32, scale: f64) -> u32 {
 /// resize. Both halves are recorded so the dispatcher can predict the stored
 /// dimensions without touching a pixel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TierRender {
+pub(crate) struct TierPlan {
     pub crop_x: u32,
     pub crop_y: u32,
     pub crop_width: u32,
@@ -245,7 +245,7 @@ pub(crate) struct TierRender {
 /// Never upscales: the short side target is `min(tier, short)`. By
 /// construction the result is at most `2 * tier^2` pixels, so no separate
 /// megapixel guard exists or is needed.
-pub(crate) fn tier_render(width: u32, height: u32, tier: u32) -> TierRender {
+pub(crate) fn tier_plan(width: u32, height: u32, tier: u32) -> TierPlan {
     debug_assert!(width > 0 && height > 0 && tier > 0);
     let width = width.max(1);
     let height = height.max(1);
@@ -267,7 +267,7 @@ pub(crate) fn tier_render(width: u32, height: u32, tier: u32) -> TierRender {
     let out_long = out_long.max(1);
 
     if tall {
-        TierRender {
+        TierPlan {
             crop_x: 0,
             // Top strip. Shared by every cover-top consumer (grid cells,
             // gallery filmstrip, pinboard history previews), so the stored
@@ -279,7 +279,7 @@ pub(crate) fn tier_render(width: u32, height: u32, tier: u32) -> TierRender {
             height: out_long,
         }
     } else {
-        TierRender {
+        TierPlan {
             // Horizontally centered band.
             crop_x: (width - crop_long) / 2,
             crop_y: 0,
@@ -307,7 +307,7 @@ fn round_div(numerator: u64, denominator: u64) -> u32 {
 /// whole picture, 2% smaller — which is pure waste, while what actually
 /// matters is the same thing the short-side clause measures, the decoded
 /// pixel count of what the cell paints. `2 * tier` is the longest a stored
-/// tier is ever allowed to be ([`tier_render`]), so an original already
+/// tier is ever allowed to be ([`tier_plan`]), so an original already
 /// within a quarter of that is exactly as cheap to decode as the rendition
 /// would have been.
 pub(crate) fn grid_serves_original(file_size: u64, width: u32, height: u32, tier: u32) -> bool {
@@ -318,7 +318,7 @@ pub(crate) fn grid_serves_original(file_size: u64, width: u32, height: u32, tier
 /// video's frame grid, an audio cover, a rendered PDF page): the byte clause
 /// is dropped because the source is already a q85 JPEG the generator wrote,
 /// never a user file that could be arbitrarily large.
-pub(crate) fn grid_serves_stored_thumbnail(width: u32, height: u32, tier: u32) -> bool {
+fn grid_serves_stored_thumbnail(width: u32, height: u32, tier: u32) -> bool {
     within_grid_dimensions(width, height, tier)
 }
 
@@ -339,12 +339,12 @@ fn within_grid_dimensions(width: u32, height: u32, tier: u32) -> bool {
 
 /// One tier's plan for a source of `width` x `height`: `None` when the source
 /// itself is what gets served.
-pub(crate) fn grid_plan(
+fn grid_plan(
     file_size: u64,
     width: u32,
     height: u32,
     tier: ThumbnailTier,
-) -> Option<TierRender> {
+) -> Option<TierPlan> {
     let short_side = tier.short_side()?;
     if width == 0 || height == 0 {
         return None;
@@ -352,15 +352,15 @@ pub(crate) fn grid_plan(
     if grid_serves_original(file_size, width, height, short_side) {
         return None;
     }
-    Some(tier_render(width, height, short_side))
+    Some(tier_plan(width, height, short_side))
 }
 
 /// [`grid_plan`] for a rendition derived from a stored thumbnail.
-pub(crate) fn grid_plan_for_stored_thumbnail(
+fn grid_plan_for_stored_thumbnail(
     width: u32,
     height: u32,
     tier: ThumbnailTier,
-) -> Option<TierRender> {
+) -> Option<TierPlan> {
     let short_side = tier.short_side()?;
     if width == 0 || height == 0 {
         return None;
@@ -368,12 +368,12 @@ pub(crate) fn grid_plan_for_stored_thumbnail(
     if grid_serves_stored_thumbnail(width, height, short_side) {
         return None;
     }
-    Some(tier_render(width, height, short_side))
+    Some(tier_plan(width, height, short_side))
 }
 
-/// Applies a [`TierRender`]. `crop_imm` is a view copy, so the resize reads
+/// Applies a [`TierPlan`]. `crop_imm` is a view copy, so the resize reads
 /// only the pixels the crop kept.
-pub(crate) fn render(image: &DynamicImage, plan: &TierRender) -> DynamicImage {
+pub(crate) fn render(image: &DynamicImage, plan: &TierPlan) -> DynamicImage {
     let (width, height) = image.dimensions();
     let cropped = if plan.crop_x == 0
         && plan.crop_y == 0
@@ -401,7 +401,7 @@ pub(crate) fn render(image: &DynamicImage, plan: &TierRender) -> DynamicImage {
 /// intermediate would upscale.
 pub(crate) fn grid_renditions(
     image: &DynamicImage,
-    plans: &[(ThumbnailTier, TierRender)],
+    plans: &[(ThumbnailTier, TierPlan)],
 ) -> Vec<(ThumbnailTier, DynamicImage)> {
     let mut out: Vec<(ThumbnailTier, DynamicImage)> = Vec::with_capacity(plans.len());
     for (tier, plan) in plans {
@@ -420,7 +420,7 @@ pub(crate) fn grid_plans(
     file_size: u64,
     width: u32,
     height: u32,
-) -> Vec<(ThumbnailTier, TierRender)> {
+) -> Vec<(ThumbnailTier, TierPlan)> {
     cascade(Some(file_size), width, height)
 }
 
@@ -428,7 +428,7 @@ pub(crate) fn grid_plans(
 pub(crate) fn grid_plans_for_stored_thumbnail(
     width: u32,
     height: u32,
-) -> Vec<(ThumbnailTier, TierRender)> {
+) -> Vec<(ThumbnailTier, TierPlan)> {
     cascade(None, width, height)
 }
 
@@ -444,8 +444,8 @@ fn cascade(
     file_size: Option<u64>,
     width: u32,
     height: u32,
-) -> Vec<(ThumbnailTier, TierRender)> {
-    let mut out: Vec<(ThumbnailTier, TierRender)> = Vec::with_capacity(ThumbnailTier::GRID.len());
+) -> Vec<(ThumbnailTier, TierPlan)> {
+    let mut out: Vec<(ThumbnailTier, TierPlan)> = Vec::with_capacity(ThumbnailTier::GRID.len());
     let mut source = (width, height);
     let mut bytes = file_size;
     for tier in ThumbnailTier::GRID {
@@ -516,7 +516,7 @@ pub(crate) fn animated_serves_original(file_size: u64, width: u32, height: u32) 
         && width.max(height) <= ANIMATED_RAW_MAX_SIDE
 }
 
-/// The loop's geometry: the [`tier_render`] of the source at
+/// The loop's geometry: the [`tier_plan`] of the source at
 /// [`LOOP_MAX_SHORT_SIDE`], with both output sides rounded **down** to even.
 ///
 /// Same crop rule as every other grid rendition, so a webtoon's loop is the
@@ -529,8 +529,8 @@ pub(crate) fn animated_serves_original(file_size: u64, width: u32, height: u32) 
 /// constraint invents pixels; the one exception is a side that would round to
 /// zero, which is clamped to 2 (a 1-pixel side can only exist on a degenerate
 /// source, and a zero-height video is not a rendition).
-pub(crate) fn loop_render(width: u32, height: u32) -> TierRender {
-    let mut plan = tier_render(width, height, LOOP_MAX_SHORT_SIDE);
+pub(crate) fn loop_plan(width: u32, height: u32) -> TierPlan {
+    let mut plan = tier_plan(width, height, LOOP_MAX_SHORT_SIDE);
     plan.width = even_side(plan.width);
     plan.height = even_side(plan.height);
     plan
@@ -550,14 +550,14 @@ fn even_side(side: u32) -> u32 {
 /// while `grid-s` is stored only when it is genuinely smaller, and is
 /// answered by the fall-up ladder (`grid-s` -> `grid-m`) when it is not.
 /// Nothing is ever stored twice.
-pub(crate) fn poster_plans(width: u32, height: u32) -> Vec<(ThumbnailTier, TierRender)> {
+pub(crate) fn poster_plans(width: u32, height: u32) -> Vec<(ThumbnailTier, TierPlan)> {
     let mut out = Vec::with_capacity(ThumbnailTier::GRID.len());
     let mut source = (width, height);
     for (index, tier) in ThumbnailTier::GRID.into_iter().enumerate() {
         let Some(short_side) = tier.short_side() else {
             continue;
         };
-        let plan = tier_render(source.0, source.1, short_side);
+        let plan = tier_plan(source.0, source.1, short_side);
         // The cascade renders each tier from the one before it, exactly as
         // [`grid_renditions`] does, so a skipped identity render leaves the
         // source where it was.
@@ -594,12 +594,12 @@ pub(crate) fn loop_keeps_original(encoded_len: u64, source_len: u64) -> bool {
 /// disagree. Ordered the way `get_thumbnail_tier_geometry` returns rows —
 /// `grid-m`, `grid-s`, `loop` is already lexicographic — but the comparison
 /// sorts anyway.
-pub(crate) fn animated_plans(width: u32, height: u32) -> Vec<(&'static str, TierRender)> {
-    let mut out: Vec<(&'static str, TierRender)> = poster_plans(width, height)
+pub(crate) fn animated_plans(width: u32, height: u32) -> Vec<(&'static str, TierPlan)> {
+    let mut out: Vec<(&'static str, TierPlan)> = poster_plans(width, height)
         .into_iter()
         .map(|(tier, plan)| (tier.as_str(), plan))
         .collect();
-    out.push((LOOP_TIER, loop_render(width, height)));
+    out.push((LOOP_TIER, loop_plan(width, height)));
     out
 }
 
@@ -668,10 +668,10 @@ mod tests {
     #[test]
     fn a_normal_aspect_tier_is_a_plain_short_side_resize() {
         // 3000x4000, tier 1024: short side to 1024, no crop.
-        let plan = tier_render(3000, 4000, 1024);
+        let plan = tier_plan(3000, 4000, 1024);
         assert_eq!(
             plan,
-            TierRender {
+            TierPlan {
                 crop_x: 0,
                 crop_y: 0,
                 crop_width: 3000,
@@ -682,7 +682,7 @@ mod tests {
         );
 
         // Landscape is the same rule on the other axis.
-        let plan = tier_render(4000, 3000, 512);
+        let plan = tier_plan(4000, 3000, 512);
         assert_eq!((plan.width, plan.height), (683, 512));
         assert_eq!((plan.crop_width, plan.crop_height), (4000, 3000));
     }
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn aspect_exactly_two_is_not_cropped() {
         for (width, height) in [(1000_u32, 2000_u32), (2000, 1000)] {
-            let plan = tier_render(width, height, 512);
+            let plan = tier_plan(width, height, 512);
             assert_eq!(
                 (plan.crop_width, plan.crop_height),
                 (width, height),
@@ -702,7 +702,7 @@ mod tests {
             assert_eq!(plan.width.max(plan.height), 1024);
         }
         // Just past the boundary, the crop engages.
-        let plan = tier_render(1000, 2001, 512);
+        let plan = tier_plan(1000, 2001, 512);
         assert!(plan.crop_height < 2001, "{plan:?}");
     }
 
@@ -711,7 +711,7 @@ mod tests {
     fn extreme_aspect_crops_match_the_css_presentation() {
         // A webtoon: 800x20000. Tier 1024 -> short side stays 800 (no
         // upscale), long side capped at 2048.
-        let plan = tier_render(800, 20000, 1024);
+        let plan = tier_plan(800, 20000, 1024);
         assert_eq!(plan.crop_x, 0);
         assert_eq!(plan.crop_y, 0, "tall images keep the TOP strip");
         assert_eq!(plan.crop_width, 800);
@@ -719,14 +719,14 @@ mod tests {
         assert_eq!(plan.crop_height, 2048, "no upscale, so crop == output");
 
         // A tall strip wide enough to be scaled down as well.
-        let plan = tier_render(2000, 30000, 512);
+        let plan = tier_plan(2000, 30000, 512);
         assert_eq!(plan.crop_y, 0);
         assert_eq!((plan.width, plan.height), (512, 1024));
         // 1024 output rows at 512/2000 scale = 4000 source rows.
         assert_eq!(plan.crop_height, 4000);
 
         // A wide strip: 20000x800, tier 1024. The band is centered.
-        let plan = tier_render(20000, 800, 1024);
+        let plan = tier_plan(20000, 800, 1024);
         assert_eq!(plan.crop_y, 0);
         assert_eq!(plan.crop_height, 800);
         assert_eq!((plan.width, plan.height), (2048, 800));
@@ -743,7 +743,7 @@ mod tests {
     fn tiny_originals_are_never_upscaled() {
         for (width, height) in [(64_u32, 48_u32), (48, 64), (7, 7), (1, 1)] {
             for tier in [1024_u32, 512] {
-                let plan = tier_render(width, height, tier);
+                let plan = tier_plan(width, height, tier);
                 assert_eq!(
                     (plan.width, plan.height),
                     (width, height),
@@ -753,9 +753,9 @@ mod tests {
         }
         // A tiny *strip* still crops (its long side is over 2x the tier only
         // if it is over 2x the tier; below that it is left whole).
-        let plan = tier_render(100, 300, 512);
+        let plan = tier_plan(100, 300, 512);
         assert_eq!((plan.width, plan.height), (100, 300));
-        let plan = tier_render(100, 3000, 512);
+        let plan = tier_plan(100, 3000, 512);
         assert_eq!((plan.width, plan.height), (100, 1024));
     }
 
@@ -774,7 +774,7 @@ mod tests {
         ];
         for (width, height) in shapes {
             for tier in [1024_u32, 512] {
-                let plan = tier_render(width, height, tier);
+                let plan = tier_plan(width, height, tier);
                 let pixels = u64::from(plan.width) * u64::from(plan.height);
                 assert!(
                     pixels <= 2 * u64::from(tier) * u64::from(tier),
@@ -873,7 +873,7 @@ mod tests {
         ];
         for (width, height) in shapes {
             let cascaded = grid_plans(50 * MB, width, height);
-            let direct = tier_render(width, height, 512);
+            let direct = tier_plan(width, height, 512);
             let last = cascaded
                 .last()
                 .unwrap_or_else(|| panic!("{width}x{height} planned nothing"));
@@ -956,7 +956,7 @@ mod tests {
                 tall.put_pixel(x, y, MARK);
             }
         }
-        let plan = tier_render(100, 1000, 100);
+        let plan = tier_plan(100, 1000, 100);
         assert_eq!((plan.crop_y, plan.crop_height), (0, 200));
         let rendered = render(&DynamicImage::ImageRgb8(tall), &plan).to_rgb8();
         assert_eq!(rendered.dimensions(), (100, 200));
@@ -972,7 +972,7 @@ mod tests {
                 wide.put_pixel(x, y, MARK);
             }
         }
-        let plan = tier_render(1000, 100, 100);
+        let plan = tier_plan(1000, 100, 100);
         assert_eq!((plan.crop_x, plan.crop_width), (400, 200));
         let rendered = render(&DynamicImage::ImageRgb8(wide), &plan).to_rgb8();
         assert_eq!(rendered.dimensions(), (200, 100));
@@ -1035,25 +1035,25 @@ mod tests {
     #[test]
     fn loop_geometry_is_the_tier_crop_rounded_down_to_even() {
         // A plain photo-shaped animation: short side to 1024, no crop.
-        let plan = loop_render(1500, 2000);
+        let plan = loop_plan(1500, 2000);
         assert_eq!((plan.crop_width, plan.crop_height), (1500, 2000));
         assert_eq!((plan.width, plan.height), (1024, 1364));
         // The unrounded render would have been 1365 rows; evenness rounds
         // DOWN, never up.
-        assert_eq!(tier_render(1500, 2000, 1024).height, 1365);
+        assert_eq!(tier_plan(1500, 2000, 1024).height, 1365);
 
         // Never upscaled: a source under the cap keeps its size (rounded).
-        let plan = loop_render(300, 401);
+        let plan = loop_plan(300, 401);
         assert_eq!((plan.width, plan.height), (300, 400));
 
         // A tall strip: top band, long side capped at 2 * 1024.
-        let plan = loop_render(800, 20000);
+        let plan = loop_plan(800, 20000);
         assert_eq!((plan.crop_x, plan.crop_y), (0, 0));
         assert_eq!(plan.crop_height, 2048, "tall loops keep the TOP strip");
         assert_eq!((plan.width, plan.height), (800, 2048));
 
         // A wide strip: horizontally centered band.
-        let plan = loop_render(20000, 800);
+        let plan = loop_plan(20000, 800);
         assert_eq!(plan.crop_x, (20000 - 2048) / 2);
         assert_eq!((plan.width, plan.height), (2048, 800));
 
@@ -1066,7 +1066,7 @@ mod tests {
             (1023, 1025),
             (12000, 8333),
         ] {
-            let plan = loop_render(width, height);
+            let plan = loop_plan(width, height);
             assert_eq!(plan.width % 2, 0, "{width}x{height} -> {plan:?}");
             assert_eq!(plan.height % 2, 0, "{width}x{height} -> {plan:?}");
             assert!(plan.width >= 2 && plan.height >= 2, "{plan:?}");
