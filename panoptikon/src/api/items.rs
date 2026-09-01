@@ -25,6 +25,7 @@ use crate::db::items::{
 use crate::db::storage::get_thumbnail_tier_rendition;
 use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::jobs::files::format_system_time;
+use crate::media_tools::animation::measures_animation;
 use crate::visual_tiers::{
     DisplayPlan, LOOP_TIER, ThumbnailTier, animated_serves_original, display_plan,
     grid_serves_original, is_animated_image,
@@ -564,6 +565,23 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
     // load, forever, protecting nothing.
     if size != ThumbnailTier::Display && is_animated_image(&item.mime_type, item.duration) {
         return animated_serves_original(file_size, width, height);
+    }
+    // The endpoint's half of the scan's pre-measurement caution
+    // (`jobs::files::grid_ladder`). An animated *container* nothing has
+    // measured is not a still: `is_animated_image` above answers "not
+    // animated" for it, and without this the ordinary grid rule below would
+    // call a 900x900 700 KB WebP final and pin its original for a year — on
+    // exactly the items whose loop is still on its way, which would then
+    // never reach the client at all.
+    //
+    // Grid tiers only, and only until the measurement lands: an item with a
+    // real `duration` takes the animated branch above, and a measured-still
+    // one takes the ordinary rule with nothing left to wait for.
+    if size != ThumbnailTier::Display
+        && item.duration.is_none()
+        && measures_animation(&item.mime_type)
+    {
+        return false;
     }
     match size.short_side() {
         // A grid tier: final iff the original is already inside the tier's
@@ -2215,6 +2233,130 @@ VALUES (?1, 0, ?2, 'image/gif', ?3, ?4, ?5, 1, ?6)
         assert!(
             tier_fall_up_is_final(&item, ThumbnailTier::Display),
             "the display path is unchanged by the floor"
+        );
+    }
+
+    /// The endpoint's half of the scan's pre-measurement caution: an animated
+    /// *container* nothing has measured yet must not have its original pinned
+    /// at a grid tier. Without this, a 900x900 700 KB WebP indexed before the
+    /// animation question existed reads as a plain still — comfortably inside
+    /// the grid rule — and a client caches its heavyweight original for a
+    /// year, so the loop the very next scan writes never reaches it.
+    #[tokio::test]
+    async fn an_unmeasured_animated_container_never_pins_its_original() {
+        let file_path = temp_path("unmeasured.webp");
+        std::fs::write(&file_path, b"RIFF....WEBPpretend").unwrap();
+        let (mut item, mut file) = test_records(&file_path);
+        item.mime_type = "image/webp".to_string();
+        item.duration = None;
+        item.width = Some(900);
+        item.height = Some(900);
+        item.size = Some(700 * 1024);
+        file.last_modified =
+            format_system_time(std::fs::metadata(&file_path).unwrap().modified().unwrap()).unwrap();
+
+        let crate::db::migrations::InMemoryDatabases {
+            mut index_conn,
+            storage_conn,
+            user_data_conn,
+        } = crate::db::migrations::setup_test_databases().await;
+        let _attached = (storage_conn, user_data_conn);
+
+        async fn cache(
+            conn: &mut sqlx::SqliteConnection,
+            item: &ItemRecord,
+            file: &FileRecord,
+            size: ThumbnailTier,
+        ) -> String {
+            let response = thumbnail_response(
+                conn,
+                item,
+                std::slice::from_ref(file),
+                true,
+                size,
+                false,
+                &HeaderMap::new(),
+                true,
+            )
+            .await
+            .expect("thumbnail response");
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .expect("cache-control")
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+
+        for size in [ThumbnailTier::GridM, ThumbnailTier::GridS] {
+            assert!(!tier_fall_up_is_final(&item, size));
+            assert_eq!(
+                cache(&mut index_conn, &item, &file, size).await,
+                CACHE_REVALIDATE,
+                "{size:?} must revalidate until the animation question runs"
+            );
+        }
+        // The display path is untouched: its answer does not change when the
+        // measurement lands, so a revalidation there would protect nothing.
+        assert!(tier_fall_up_is_final(&item, ThumbnailTier::Display));
+        assert_eq!(
+            cache(&mut index_conn, &item, &file, ThumbnailTier::Display).await,
+            CACHE_IMMUTABLE
+        );
+
+        // Measured still: an ordinary image, and the ordinary grid rule
+        // decides — 900x900 is inside `grid-m`'s budget, so its original is
+        // that tier's answer forever.
+        item.duration = Some(0.0);
+        assert!(tier_fall_up_is_final(&item, ThumbnailTier::GridM));
+        assert_eq!(
+            cache(&mut index_conn, &item, &file, ThumbnailTier::GridM).await,
+            CACHE_IMMUTABLE
+        );
+
+        // Measured animated, above the raw floor: pending again until the
+        // loop lands...
+        item.duration = Some(2.0);
+        assert!(!tier_fall_up_is_final(&item, ThumbnailTier::GridM));
+        assert_eq!(
+            cache(&mut index_conn, &item, &file, ThumbnailTier::GridM).await,
+            CACHE_REVALIDATE
+        );
+
+        // ... and immutable the moment it does, as an exact hit.
+        sqlx::query(
+            r#"
+INSERT INTO storage.thumbnail_tiers (
+    item_sha256, idx, tier, item_mime_type, media_type, width, height, version, thumbnail
+)
+VALUES (?1, 0, 'loop', 'image/webp', 'video/mp4', 900, 900, 1, ?2)
+            "#,
+        )
+        .bind(&item.sha256)
+        .bind(b"mp4-bytes".to_vec())
+        .execute(&mut index_conn)
+        .await
+        .unwrap();
+        let response = thumbnail_response(
+            &mut index_conn,
+            &item,
+            std::slice::from_ref(&file),
+            true,
+            ThumbnailTier::GridM,
+            false,
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            CACHE_IMMUTABLE
         );
     }
 }

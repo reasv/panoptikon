@@ -1900,19 +1900,42 @@ impl ScanContext {
     /// and must never abort the folder scan over a cache whose whole purpose
     /// is saving work.
     async fn thumbnail_marker_suppresses(&mut self, sha256: &str, path: &Path) -> bool {
-        match visuals_suppressed(
-            &mut self.conn,
-            sha256,
-            VisualKind::Thumbnail,
-            THUMBNAIL_PROCESS_VERSION,
-        )
-        .await
-        {
+        self.marker_suppresses(sha256, path, VisualKind::Thumbnail)
+            .await
+    }
+
+    /// The same consult for the **animated loop**
+    /// (docs/grid-scroll-performance-implementation.md §2, step B2), which is
+    /// its own kind and its own version.
+    ///
+    /// Scoped as narrowly as it is written: a `loop` marker suppresses the
+    /// animated ladder and nothing else. It must never reach the display
+    /// rendition, because a loop fails on files whose pixels decoded
+    /// perfectly — the posters came out of that decode — and the display rule
+    /// can start wanting a still for such an item at any time.
+    ///
+    /// The converse coupling is real and deliberate: a *thumbnail* marker
+    /// does suppress the animated ladder, because the ladder starts with the
+    /// very decode that marker is a verdict about.
+    async fn loop_marker_suppresses(&mut self, sha256: &str, path: &Path) -> bool {
+        self.marker_suppresses(sha256, path, VisualKind::Loop).await
+    }
+
+    /// One kind's negative-cache consult, at that kind's own generator
+    /// version ([`visual_process_version`]) — never another's, or a marker
+    /// would expire on the wrong bump.
+    ///
+    /// Markers are advisory: a read that fails costs one regenerated nothing,
+    /// and must never abort the folder scan over a cache whose whole purpose
+    /// is saving work.
+    async fn marker_suppresses(&mut self, sha256: &str, path: &Path, kind: VisualKind) -> bool {
+        match visuals_suppressed(&mut self.conn, sha256, kind, visual_process_version(kind)).await {
             Ok(suppressed) => suppressed,
             Err(err) => {
                 tracing::warn!(
                     error = ?err,
                     path = %path.display(),
+                    kind = kind.as_str(),
                     "failed to read the visuals negative cache; regenerating"
                 );
                 false
@@ -2377,13 +2400,34 @@ impl ScanContext {
                 needs_thumb = false;
                 thumb_suppressed = true;
             }
-            // The image and animated ladders are that same decode, so the
-            // marker settles them too. A `Derived` set is untouched: it
-            // decodes stored q85 JPEGs, not the file the marker has a verdict
-            // about, and `Retire` is a delete that needs no source at all.
+            // The image and animated ladders both *start* with that decode,
+            // so a thumbnail marker settles them too. A `Derived` set is
+            // untouched: it decodes stored q85 JPEGs, not the file the marker
+            // has a verdict about, and `Retire` is a delete that needs no
+            // source at all.
             if matches!(tier_work, Some(TierWork::Image { .. } | TierWork::Animated)) {
                 tier_work = None;
             }
+        }
+        // The animated ladder's own marker, and deliberately a separate
+        // consult rather than another use of the one above. It runs *after*,
+        // on whatever survived: a `loop` marker means the decode was fine and
+        // the encode was not, so it may retire the ladder and nothing else —
+        // never `needs_thumb`, never the display rendition this file is
+        // perfectly capable of producing (and may start owing the moment the
+        // display rule flips for it).
+        let mut ladder = ladder;
+        if matches!(tier_work, Some(TierWork::Animated))
+            && self.loop_marker_suppresses(&sha256, &path).await
+        {
+            tier_work = None;
+            // The generator's obligation goes with it. `ladder` is threaded
+            // separately from `tier_work` so that an animated image running
+            // the image pass for its *display* half still produces the
+            // animated set out of that one decode — which is exactly the case
+            // this marker has to reach, or a suppressed item would re-run
+            // ffmpeg on every scan that touches it for any other reason.
+            ladder = GridLadder::Unknown;
         }
         // The dispatcher's third question (docs/video-outro-detection-design.md
         // §7): "is this a video nothing has examined for an appended outro?"
@@ -3792,6 +3836,14 @@ fn visual_process_version(kind: VisualKind) -> i64 {
         // `version >= ?` consult while the unrecognised suffix recovers the
         // negatives (docs/video-outro-detection-design.md §7.2).
         VisualKind::Outro => OUTRO_DETECTOR_VERSION,
+        // The *tier* generator's version, never the thumbnail's: a loop is a
+        // `thumbnail_tiers` rendition, and §2 forbids bumping
+        // `THUMBNAIL_PROCESS_VERSION` for tier work (that would regenerate
+        // every video thumbnail in the library to fix an encoder setting).
+        // This is also the only thing that gives a loop failure a heal path:
+        // bump the tier version and the ledger's `version >= ?` consult
+        // retires every one of these markers for free.
+        VisualKind::Loop => TIER_PROCESS_VERSION,
     }
 }
 
@@ -4586,6 +4638,22 @@ impl VisualsError {
             audit_stage: None,
         }
     }
+
+    /// The animated ladder failed on a file whose pixels are fine.
+    ///
+    /// Scoped to [`VisualKind::Loop`] and to nothing else, deliberately: both
+    /// sites that produce one — a poster encode and the ffmpeg run — are
+    /// *past* the decode, on an image the generator has already turned into a
+    /// first frame. Claiming the thumbnail kind here would assert the file
+    /// cannot be decoded, and would suppress a display rendition this file is
+    /// perfectly capable of producing.
+    fn animated_loop(error: FileProcessError) -> Self {
+        Self {
+            kinds: &[VisualKind::Loop],
+            error,
+            audit_stage: None,
+        }
+    }
 }
 
 /// One verdict per kind the failure actually invalidates. A transient failure
@@ -4976,12 +5044,17 @@ fn build_image_renditions(
 ///
 /// **Every failure owes the ledger a verdict**, which is the second half of
 /// the contract and the expensive one to get wrong. The animated ladder is a
-/// full decode of the original plus an ffmpeg run, and the dispatcher already
-/// consults the *thumbnail* marker before dispatching it
-/// (`thumbnail_marker_suppresses`) — so without a written verdict there is
-/// nothing for that consult to find, and an item ffmpeg cannot encode pays
-/// the whole cost again on every scan, forever. The kinds map onto the same
-/// three shapes the image pass uses:
+/// full decode of the original plus an ffmpeg run, and the dispatcher
+/// consults a marker before dispatching it — so without a written verdict
+/// there is nothing for that consult to find, and an item ffmpeg cannot
+/// encode pays the whole cost again on every scan, forever.
+///
+/// Every verdict written here is [`VisualKind::Loop`] and **never**
+/// [`VisualKind::Thumbnail`]. Both failing sites are *past* the decode: the
+/// posters were built from `first_frame` moments earlier, so the pixels are
+/// demonstrably fine. Marking the thumbnail kind would assert the opposite
+/// and, worse, suppress a display rendition this file can produce — including
+/// later, when the display rule flips and starts wanting one. The outcomes:
 ///
 /// * a poster encode failure is `input` — the generator decided it on pixels
 ///   it already held, so one attempt settles it;
@@ -4989,16 +5062,9 @@ fn build_image_renditions(
 ///   I/O, so a broken file and a mount hiccup are indistinguishable and it
 ///   takes two;
 /// * a failure to *start* ffmpeg is `blocked`, which self-heals the moment
-///   the toolchain appears and is never a verdict on the media;
-/// * a container this toolchain cannot decode at all is a **nothing** — the
-///   same verdict a mime with no generator gets, because that is exactly what
-///   it is.
-///
-/// Marking the *thumbnail* kind is deliberate and is the coupling the
-/// dispatcher already assumes: it also suppresses a display rendition for
-/// this item, which for an animated item is almost always served directly
-/// anyway, and which a file that cannot be decoded or encoded was never
-/// going to get.
+///   the toolchain appears, and host trouble (no scratch space, no read-back)
+///   is transient — neither is a verdict on the media, so neither settles
+///   anything.
 fn build_animated_tiers(
     path: &Path,
     mime_type: &str,
@@ -5010,7 +5076,7 @@ fn build_animated_tiers(
         Ok(tiers) => tiers,
         Err(err) => {
             tracing::debug!(error = ?err, path = %path.display(), "failed to encode a loop poster");
-            return (None, failure_verdicts(&VisualsError::thumbnail(err)));
+            return (None, failure_verdicts(&VisualsError::animated_loop(err)));
         }
     };
 
@@ -5022,19 +5088,6 @@ fn build_animated_tiers(
         image_display_transform(path),
     ) {
         Ok(bytes) => bytes,
-        Err(LoopError::Unsupported(detail)) => {
-            // Not a failure: this host has no decoder for the container, so
-            // there is genuinely nothing to produce. Recorded as the same
-            // permanent `nothing` a mime with no generator at all gets, which
-            // is what stops the next scan from spending a decode and a
-            // process spawn to reach the identical conclusion.
-            tracing::debug!(
-                path = %path.display(),
-                detail,
-                "no animated loop can be produced for this container on this toolchain"
-            );
-            return (None, vec![VisualVerdict::nothing(VisualKind::Thumbnail)]);
-        }
         Err(error) => {
             tracing::debug!(
                 path = %path.display(),
@@ -5076,25 +5129,34 @@ fn build_animated_tiers(
 }
 
 /// Classifies one [`LoopError`] into the failure vocabulary the ledger
-/// already speaks. `Unsupported` never reaches here — it is a `nothing`, not
-/// a failure, and its caller handles it directly.
+/// already speaks — always as [`VisualKind::Loop`], never as the thumbnail's
+/// (see [`build_animated_tiers`]).
+///
+/// Only one arm can ever suppress anything, and only after two strikes:
+/// exactly one of these outcomes is a statement about the *file*.
 fn loop_failure(error: LoopError) -> VisualsError {
     match error {
         // Failing to *start* ffmpeg is never a verdict on the media: a
         // missing toolchain is `blocked` and self-heals when it appears,
         // anything else about this machine stays transient and retries.
-        LoopError::Spawn(err) => VisualsError::thumbnail(
+        LoopError::Spawn(err) => VisualsError::animated_loop(
             FileProcessError::visuals_from_api_error(crate::media_tools::spawn_error("ffmpeg", &err)),
         ),
         // ffmpeg did its own file I/O, so a broken file and a transient mount
         // hiccup exit identically: this needs a second failure in a later
         // scan before it suppresses anything.
         LoopError::Failed(detail) => {
-            VisualsError::thumbnail(visuals_input_unconfirmed(format!("loop encode: {detail}")))
+            VisualsError::animated_loop(visuals_input_unconfirmed(format!("loop encode: {detail}")))
         }
-        LoopError::Unsupported(detail) => {
-            debug_assert!(false, "an unsupported container is a nothing, not a failure");
-            VisualsError::thumbnail(visuals_input(detail))
+        // Host trouble — no scratch space, an output that would not read
+        // back — and a container this build cannot decode. Neither says
+        // anything about the file, so neither may spend a strike: a disk that
+        // fills mid-backfill would otherwise retire the loop ladder for the
+        // whole library, and a permanent verdict for an undecodable container
+        // has no heal path at all (the dispatcher's own probe is what gates
+        // that case instead — see [`grid_ladder`]).
+        LoopError::Host(detail) | LoopError::Unsupported(detail) => {
+            VisualsError::animated_loop(FileProcessError::Io(detail))
         }
     }
 }
@@ -5437,6 +5499,30 @@ fn grid_ladder(mime_type: &str, facts: Option<&ImageFacts>) -> GridLadder {
             return GridLadder::Unknown;
         }
         return GridLadder::Still;
+    }
+    // A container this build has no decoder for is **undecidable**, not a
+    // permanent nothing. The frame bridge decodes WebP only, so an animated
+    // AVIF needs a toolchain that can demux it; when this one cannot, there
+    // is no loop to produce *today*.
+    //
+    // Answered here rather than by letting the encoder fail and recording it,
+    // which is the trap R2-A found: a ledger row would be the item's answer
+    // forever. `nothing` markers carry no blocker, so the auto-heal probe
+    // cannot clear them; the store that clears markers never runs for an item
+    // served directly at the display tier, which animated items usually are;
+    // and the only remaining escape is a `THUMBNAIL_PROCESS_VERSION` bump,
+    // which §2 forbids for tier work. Installing a capable ffmpeg would then
+    // never produce a single loop. A gate re-evaluates instead — the probe is
+    // a cached `OnceLock`, so this is one boolean read per file after the
+    // first, and a restart with a better toolchain picks every item up.
+    //
+    // Cost of the probe itself is bounded by the mime test in front of it: it
+    // spawns ffmpeg at most once per process, and only if the library
+    // actually contains an animated AVIF.
+    if mime_type.starts_with("image/avif")
+        && !crate::media_tools::transcode::hw::animated_avif_decodable()
+    {
+        return GridLadder::Unknown;
     }
     let Some(facts) = facts else {
         return GridLadder::Unknown;
@@ -9137,8 +9223,10 @@ VALUES (?1, 0, 'grid-m', 'image/gif', 'image/jpeg', 200, 200, ?2, X'00')
         let kinds: Vec<VisualKind> = verdicts.iter().map(|verdict| verdict.kind).collect();
         assert_eq!(
             kinds,
-            vec![VisualKind::Thumbnail],
-            "the kind the dispatcher already consults for this ladder"
+            vec![VisualKind::Loop],
+            "a loop failure is the loop's own verdict: the pixels decoded, and \
+             a thumbnail marker would suppress a display rendition this file \
+             can still produce"
         );
         let failure = verdicts[0]
             .failure
@@ -9181,6 +9269,7 @@ VALUES (?1, 0, 'grid-m', 'image/gif', 'image/jpeg', 200, 200, ?2, X'00')
         );
 
         // A run that failed needs two strikes: ffmpeg did its own file I/O.
+        // This is the ONLY outcome that can ever suppress anything.
         let ran = LoopError::Failed("moov atom not found".to_string());
         let failure = loop_failure(ran)
             .error
@@ -9189,6 +9278,189 @@ VALUES (?1, 0, 'grid-m', 'image/gif', 'image/jpeg', 200, 200, ?2, X'00')
             .clone();
         assert_eq!(failure.kind, ApiErrorKind::Input);
         assert_eq!(failure.skip_after, SKIP_AFTER_AMBIGUOUS);
+
+        // Host trouble is never the file's fault. A disk that fills during a
+        // library-wide backfill must not spend a strike against every
+        // animated item in the library and retire the ladder wholesale.
+        for host in [
+            LoopError::Host("could not create a loop directory: disk full".to_string()),
+            LoopError::Host("the encoded loop did not read back: disk full".to_string()),
+        ] {
+            assert!(
+                failure_verdicts(&loop_failure(host)).is_empty(),
+                "host trouble writes no marker and is simply retried"
+            );
+        }
+
+        // A container this build cannot decode is transient here too: the
+        // dispatcher's probe is what gates it, and a ledger row would be the
+        // item's answer forever with no path back (R2-A).
+        let unsupported = LoopError::Unsupported("no animated AVIF decoder".to_string());
+        assert!(failure_verdicts(&loop_failure(unsupported)).is_empty());
+
+        // Every arm scopes to the loop kind and only the loop kind.
+        for error in [
+            LoopError::Failed("x".to_string()),
+            LoopError::Host("y".to_string()),
+            LoopError::Spawn(std::io::Error::other("z")),
+            LoopError::Unsupported("w".to_string()),
+        ] {
+            assert_eq!(loop_failure(error).kinds, &[VisualKind::Loop]);
+        }
+    }
+
+    /// R2-C's bite case, and the reason the loop has a kind of its own: a
+    /// loop failure must not cost this item its **display** rendition. The
+    /// dispatcher consults the two markers separately, so a `loop` marker
+    /// retires the animated ladder while a display rendition the rule starts
+    /// wanting later is still generated.
+    #[tokio::test]
+    async fn a_loop_marker_retires_the_ladder_without_touching_the_display_half() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-loop-marker"]).await;
+        let path = env.media_dirs[0].join("clip.gif");
+        write_animated_gif(&path, 900, 2, 100, |x, y, index| {
+            let shade = (index as u8).wrapping_mul(90);
+            image::Rgba([shade, (x / 32) as u8, (y / 32) as u8, 255])
+        });
+        // Past the display rule's *byte* bound, so this item genuinely owes a
+        // display rendition — the half a loop marker must never touch. GIF
+        // decoders stop at the trailer, so padding changes the file's size
+        // and nothing else about it; both the dispatcher and the generator
+        // read the same `image_file_size`, so they agree.
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&vec![0_u8; (DISPLAY_MAX_FILE_SIZE + 1) as usize])
+                .unwrap();
+        }
+        env.scan().await;
+        let sha: String = {
+            let mut conn = env.read().await;
+            assert_eq!(
+                thumbnail_count(&mut conn).await,
+                1,
+                "the premise: past the byte bound, this item owes a display rendition"
+            );
+            assert!(
+                tier_rows(&mut conn)
+                    .await
+                    .iter()
+                    .any(|(tier, _, _)| tier == LOOP_TIER),
+                "the premise: and it is on the animated ladder"
+            );
+            sqlx::query_scalar("SELECT sha256 FROM items LIMIT 1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap()
+        };
+
+        // Two strikes of the one outcome that can settle anything, and both
+        // stored renditions cleared so the next scan owes each half again.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("DELETE FROM storage.thumbnail_tiers")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM storage.thumbnails")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                r#"
+INSERT INTO storage.visual_attempts (
+    item_sha256, kind, item_mime_type, version, outcome, skip_after, attempts,
+    first_seen, last_attempt
+)
+VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
+                "#,
+            )
+            .bind(&sha)
+            .bind(TIER_PROCESS_VERSION)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        env.scan().await;
+        let mut conn = env.read().await;
+        // The bite case. Had the loop failure marked `thumbnail` — the kind
+        // the ladder's decode shares — this would be 0, and a file ffmpeg
+        // cannot encode would have lost the still it is perfectly capable of
+        // producing.
+        assert_eq!(
+            thumbnail_count(&mut conn).await,
+            1,
+            "a loop marker must never suppress a display rendition"
+        );
+        assert!(
+            tier_rows(&mut conn).await.is_empty(),
+            "and it must retire the animated ladder, including the pass the \
+             display half is running anyway"
+        );
+
+        // The heal path the kind exists for: the tier version moves and the
+        // ledger's `version >= ?` consult stops finding the marker.
+        assert!(
+            visuals_suppressed(&mut conn, &sha, VisualKind::Loop, TIER_PROCESS_VERSION)
+                .await
+                .unwrap(),
+            "the marker suppresses at the version it was written for"
+        );
+        assert!(
+            !visuals_suppressed(&mut conn, &sha, VisualKind::Loop, TIER_PROCESS_VERSION + 1)
+                .await
+                .unwrap(),
+            "a TIER_PROCESS_VERSION bump retires it for free"
+        );
+        // And it is invisible to the thumbnail consult by construction: the
+        // ledger's key is (content, kind).
+        assert!(
+            !visuals_suppressed(
+                &mut conn,
+                &sha,
+                VisualKind::Thumbnail,
+                THUMBNAIL_PROCESS_VERSION
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    /// R2-A: a container this build cannot decode is **undecidable**, not a
+    /// permanent nothing — so the dispatcher answers `Unknown` and writes no
+    /// ledger row, and installing a capable ffmpeg later picks the item up on
+    /// the next process. A `nothing` marker could never be cleared: it
+    /// carries no blocker for the auto-heal to probe, the store that clears
+    /// markers never runs for a served-directly item, and the only remaining
+    /// escape is a `THUMBNAIL_PROCESS_VERSION` bump that §2 forbids.
+    #[test]
+    fn an_undecodable_animated_container_is_undecidable_not_a_permanent_nothing() {
+        const MB: u64 = 1024 * 1024;
+        let animated = facts(6 * MB, 2000, 2000, Some(2.0));
+        assert_eq!(
+            grid_ladder("image/avif", Some(&animated)),
+            if crate::media_tools::transcode::hw::animated_avif_decodable() {
+                GridLadder::Animated
+            } else {
+                GridLadder::Unknown
+            },
+            "an animated AVIF follows what this toolchain can actually demux"
+        );
+        // The gate is the container's, not the ladder's: WebP has the frame
+        // bridge, so it never depends on an ffmpeg demuxer.
+        assert_eq!(
+            grid_ladder("image/webp", Some(&animated)),
+            GridLadder::Animated
+        );
+        assert_eq!(
+            grid_ladder("image/gif", Some(&animated)),
+            GridLadder::Animated
+        );
     }
 
     /// The reclassification HG3 introduced, end to end: a GIF the animation

@@ -58,23 +58,41 @@ const WHOLE_ANIMATION: ItemTime = ItemTime::Span {
 
 /// Why a loop could not be produced.
 ///
-/// Three outcomes, because the ledger owes three different verdicts and only
-/// the caller can write them (`jobs::files::build_animated_tiers` maps each
-/// one onto the same negative-cache machinery the image pass uses).
+/// Four outcomes, because the ledger owes different verdicts for each and
+/// only the caller can write them (`jobs::files::build_animated_tiers` maps
+/// them onto the same negative-cache machinery the image pass uses). The
+/// distinction that matters most is **who failed**: exactly one of these is a
+/// statement about the file.
 #[derive(Debug)]
 pub(crate) enum LoopError {
     /// ffmpeg could not be *started*. Never a verdict on the media: a missing
     /// toolchain is `blocked` and self-heals when it appears, and anything
     /// else about this host stays transient.
     Spawn(std::io::Error),
-    /// ffmpeg ran and did not produce a usable loop. It did its own file I/O,
-    /// so broken content and a mount hiccup are indistinguishable from here;
+    /// This machine could not hold the encode — a scratch directory that
+    /// would not open, an output that would not read back.
+    ///
+    /// Kept apart from [`Self::Failed`] precisely because the two are
+    /// indistinguishable at the call site otherwise, and the consequences are
+    /// not: a disk that fills during a library-wide backfill would spend a
+    /// strike against every animated item in the library and retire the
+    /// feature wholesale. Host trouble is transient, always.
+    Host(String),
+    /// ffmpeg ran and did not produce a usable loop. **The one verdict about
+    /// the content** — and still only half of one, because ffmpeg did its own
+    /// file I/O, so a broken file and a mount hiccup exit identically and
     /// this needs a second failure before it settles anything.
     Failed(String),
-    /// This toolchain has no decoder for the container at all, so there is no
-    /// loop to produce and will not be until the toolchain changes. A
-    /// permanent *nothing*, not a failure — retrying it costs a full decode
-    /// and a process spawn per animated item, on every scan, forever.
+    /// This toolchain has no decoder for the container at all.
+    ///
+    /// **Defensive, and unreachable from a scan**: the dispatcher does not
+    /// classify an item as animated when its container needs a decoder this
+    /// build lacks — `jobs::files::grid_ladder` asks the same probe — so
+    /// nothing reaches the encoder to fail this way. Kept because the encoder
+    /// is callable outside that gate, and treated as **transient**: a
+    /// permanent verdict here is exactly the trap R2-A found, because no
+    /// ledger heal path could ever notice a capable ffmpeg being installed
+    /// later. The gate re-evaluates on process restart instead.
     Unsupported(String),
 }
 
@@ -82,7 +100,9 @@ impl std::fmt::Display for LoopError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(err) => write!(formatter, "ffmpeg did not start: {err}"),
-            Self::Failed(detail) | Self::Unsupported(detail) => formatter.write_str(detail),
+            Self::Host(detail) | Self::Failed(detail) | Self::Unsupported(detail) => {
+                formatter.write_str(detail)
+            }
         }
     }
 }
@@ -102,7 +122,7 @@ pub(crate) fn encode_loop(
     normalize: Transform,
 ) -> Result<Vec<u8>, LoopError> {
     let dir = tempfile::tempdir()
-        .map_err(|err| LoopError::Failed(format!("could not create a loop directory: {err}")))?;
+        .map_err(|err| LoopError::Host(format!("could not create a loop directory: {err}")))?;
     let output = dir.path().join("loop.mp4");
 
     // Held across the ffmpeg run — including the `cache:` retry inside
@@ -192,9 +212,11 @@ pub(crate) fn encode_loop(
             crate::jobs::files::stderr_tail(&outcome.stderr)
         )));
     }
-    let bytes = std::fs::read(&output).map_err(|err| {
-        LoopError::Failed(format!("the encoded loop did not read back: {err}"))
-    })?;
+    // ffmpeg reported success, so the bytes not coming back is this machine's
+    // problem and not the file's — a full disk, a scratch directory swept out
+    // from under the run.
+    let bytes = std::fs::read(&output)
+        .map_err(|err| LoopError::Host(format!("the encoded loop did not read back: {err}")))?;
     if bytes.is_empty() {
         return Err(LoopError::Failed(
             "ffmpeg produced an empty loop".to_string(),

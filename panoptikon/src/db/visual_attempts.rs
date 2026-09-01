@@ -52,6 +52,26 @@ pub(crate) enum VisualKind {
     /// `outro_kind` column itself: a row that already carries a verdict is
     /// never dispatched, so the marker is only ever read for a file with none.
     Outro,
+    /// Shadows the `loop` row of `storage.thumbnail_tiers` — an animated
+    /// item's H.264 rendition
+    /// (docs/grid-scroll-performance-implementation.md §2, step B2).
+    ///
+    /// Its own kind rather than a second use of [`VisualKind::Thumbnail`],
+    /// for two reasons that both bite:
+    ///
+    /// * **Truthfulness.** A loop encode fails on a file whose pixels decoded
+    ///   perfectly — its posters were built from that very decode moments
+    ///   earlier. A `thumbnail` marker would assert the opposite.
+    /// * **Blast radius.** A `thumbnail` marker also suppresses the *display*
+    ///   rendition, so a file ffmpeg cannot encode would lose the still it is
+    ///   perfectly capable of producing — including later, when the display
+    ///   rule flips and starts wanting one.
+    ///
+    /// Keyed to `TIER_PROCESS_VERSION`, which is what gives loop failures the
+    /// heal path the design asks for: bumping the tier generator retires them
+    /// through this table's existing `version >= ?` consult, without touching
+    /// `THUMBNAIL_PROCESS_VERSION` (which §2 forbids bumping for tier work).
+    Loop,
 }
 
 impl VisualKind {
@@ -60,6 +80,7 @@ impl VisualKind {
             VisualKind::Thumbnail => "thumbnail",
             VisualKind::Frame => "frame",
             VisualKind::Outro => "outro",
+            VisualKind::Loop => "loop",
         }
     }
 
@@ -73,6 +94,7 @@ impl VisualKind {
             "thumbnail" => Some(VisualKind::Thumbnail),
             "frame" => Some(VisualKind::Frame),
             "outro" => Some(VisualKind::Outro),
+            "loop" => Some(VisualKind::Loop),
             _ => None,
         }
     }
