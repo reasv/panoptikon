@@ -383,6 +383,22 @@ min) stays flat; grid on 6343 requests the expected tier per size
 (network-log assertion); slider round-trips through URL + defaults stamping
 consistent with the presentation-params doctrine.
 
+Measured outcome (Wave-4 integration, 2026-09-01): met at every size except
+the slider MINIMUM under the harness's 4000 px/s protocol, where 15 columns
+× max velocity ≈ 280 cell mounts/s hits a steady-state mount-throughput
+ceiling — p90 ~28 ms, zero long tasks, dead flat over 60 s (no
+accumulation), image-independent (identical with images blocked), and flat
+(p90 6.0) at a realistic 1500 px/s. Recorded as a known ceiling, not chased
+in this batch; cell MOUNT cost is the lever if it ever matters.
+
+Release-note item (alongside the stale-webtoon-cache note): on datasets
+whose images sit inside the grid-m dimension bound (e.g. ~768×1092 anime
+sets), `grid-m` serves the ORIGINAL directly — the ladder then optimizes
+decoded pixels (30 vs ~976 MP/screenful) but not bytes (~800 KB originals
+vs ~105 KB stored grid-s tiers). That is the settled §2 dimension-first
+tradeoff; remote/NAS users who want small bytes at mid sizes should use the
+smaller cell sizes, which request stored tiers.
+
 **F5 — Accumulation fixes** (from F3 findings; scope defined at
 adjudication)
 
