@@ -290,7 +290,7 @@ the same step:
   track-less video *already in an index* (which is every existing library:
   those items never went through the new-item recording path) was re-decided
   on every scan forever. It now writes the same `none` verdict for both kinds
-  that `build_new_item_thumbnails` writes, which is honest there because the
+  that `build_new_item_renditions` writes, which is honest there because the
   branch only runs when no frames are stored.
 - **One attempt token per run, not per root.** `attempts` counts runs that saw
   the same conclusion and dedups on `last_scan_id`, but a run opens one

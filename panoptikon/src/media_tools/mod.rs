@@ -39,6 +39,80 @@ use std::sync::OnceLock;
 /// and a different io path cannot change the verdict.
 pub(crate) const FFMPEG_INPUT_OPEN_FAILURE: &str = "Error opening input";
 
+/// What this build can do with one animated-image container — the single
+/// table behind three gates that used to each spell out their own mime list:
+/// the animation measurement ([`animation::measures_animation`]), the grid
+/// ladder's decodability question (`jobs::files::grid_ladder`) and the loop
+/// encoder's input preparation (`animated_loop::prepare_input`).
+///
+/// **Matched on the exact mime essence**, which is the stricter of the two
+/// disciplines the three gates had between them and the one that changes
+/// nothing: the scan derives every mime from `MimeGuess::essence_str`, so
+/// what the indexer can emit is always a bare `type/subtype` with no
+/// parameters, and prefix and exact agree on all of it. Where they could
+/// disagree — some future `image/webp; …` — exact is what the *column-writing*
+/// gate already did, and a container this table declines is declined
+/// consistently everywhere: nothing measures a duration for it, so nothing
+/// downstream ever calls it animated either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnimatedContainer {
+    /// Not one of the three animated-image containers.
+    No,
+    /// GIF: every ffmpeg build demuxes it, and no bridge is ever involved.
+    Direct,
+    /// WebP: ffmpeg may or may not have a native decoder for the animated
+    /// form, and where it does not the frame bridge covers it — so a loop is
+    /// always producible, and only the *route* varies.
+    Bridge,
+    /// AVIF: the bridge decodes WebP only, so whether a loop can be produced
+    /// at all is this ffmpeg's answer and has to be probed
+    /// ([`transcode::hw::animated_avif_decodable`]).
+    Probe,
+}
+
+impl AnimatedContainer {
+    /// Whether this is one of the three containers at all — the mime gate in
+    /// front of every animation measurement.
+    pub(crate) fn is_container(self) -> bool {
+        !matches!(self, Self::No)
+    }
+
+    /// Whether a loop is impossible on this build for want of a demuxer. The
+    /// one capability question with a runtime answer, and deliberately the
+    /// only place the probe is spent: it is a cached `OnceLock`, but the mime
+    /// test in front of it means a library with no animated AVIF in it never
+    /// spawns ffmpeg for this at all.
+    pub(crate) fn loop_is_undecodable(self) -> bool {
+        matches!(self, Self::Probe) && !transcode::hw::animated_avif_decodable()
+    }
+}
+
+/// [`AnimatedContainer`] for one mime type.
+pub(crate) fn animated_container_support(mime_type: &str) -> AnimatedContainer {
+    match mime_type {
+        "image/gif" => AnimatedContainer::Direct,
+        "image/webp" => AnimatedContainer::Bridge,
+        "image/avif" => AnimatedContainer::Probe,
+        _ => AnimatedContainer::No,
+    }
+}
+
+/// Renders the last portion of a captured stderr for error messages, keeping
+/// diagnostics without dumping pages of encoder output into the log.
+///
+/// Lives here rather than with the scan job that first needed it: every caller
+/// is reading the stderr of a tool this module resolves and spawns, and two of
+/// them are inside `media_tools` itself.
+pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
+    const MAX_LEN: usize = 500;
+    let text = String::from_utf8_lossy(stderr);
+    let trimmed = text.trim();
+    match trimmed.char_indices().nth_back(MAX_LEN - 1) {
+        Some((idx, _)) => format!("...{}", &trimmed[idx..]),
+        None => trimmed.to_string(),
+    }
+}
+
 /// The argument vector with every `-i` operand rewritten through ffmpeg's
 /// `cache:` protocol, which interposes a lazily-populated temp-file cache
 /// between the demuxer and the real file — rebuilding the whole io stack
@@ -297,7 +371,7 @@ fn venv_static_ffmpeg(python: &Path) -> Option<(PathBuf, PathBuf)> {
     };
     if !output.status.success() {
         tracing::debug!(
-            stderr = %crate::jobs::files::stderr_tail(&output.stderr),
+            stderr = %stderr_tail(&output.stderr),
             "static-ffmpeg probe failed (package missing from the venv?); \
              using ffmpeg/ffprobe from PATH"
         );

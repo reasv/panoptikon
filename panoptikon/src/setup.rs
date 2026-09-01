@@ -297,7 +297,7 @@ async fn prefetch_static_ffmpeg(interpreter: &Path) {
             tracing::info!("ffmpeg/ffprobe are ready");
         }
         Ok(output) => tracing::warn!(
-            stderr = %crate::jobs::files::stderr_tail(&output.stderr),
+            stderr = %crate::media_tools::stderr_tail(&output.stderr),
             "static-ffmpeg prefetch failed; video/audio jobs fall back to \
              ffmpeg from PATH"
         ),

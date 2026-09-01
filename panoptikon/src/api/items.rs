@@ -568,7 +568,7 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
     }
     // The endpoint's half of the scan's pre-measurement caution
     // (`jobs::files::grid_ladder`). An animated *container* nothing has
-    // measured is not a still: `is_animated_image` above answers "not
+    // measured is not static: `is_animated_image` above answers "not
     // animated" for it, and without this the ordinary grid rule below would
     // call a 900x900 700 KB WebP final and pin its original for a year — on
     // exactly the items whose loop is still on its way, which would then
@@ -596,6 +596,40 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
     }
 }
 
+/// The thumbnail endpoint: one URL family whose answer is decided by
+/// `(size, still)` and by what the scan actually stored for this item.
+///
+/// Every state it can end in, and the headers that go with it. `CA` is
+/// `content_addressed` (an ETag-bearing, immutable-eligible URL); a
+/// non-`CA` request is `no-cache` in every row without exception.
+///
+/// | # | state | body | Content-Type | ETag | Cache-Control (CA) |
+/// |---|-------|------|--------------|------|--------------------|
+/// | 1 | empty mime, or a GIF at `display` | the file | the file's | `sha256-size-mtime` + variant | immutable / drifted |
+/// | 2 | animated grid, loop stored | `thumbnail_tiers.loop` | stored (`video/mp4`) | `sha-thumb0-loop-v{ver}` | immutable |
+/// | 3 | animated grid, loop row empty | the file | the file's | + variant | immutable / drifted |
+/// | 4 | animated grid, no loop row | the file | the file's | + variant | `fall_up_is_final` ? immutable/drifted : no-cache |
+/// | 5 | animated grid, `still=true`, poster stored | `thumbnail_tiers.grid-*` | stored (JPEG) | `…-{tier}-v{ver}-still` | exact hit ? immutable : no-cache |
+/// | 6 | animated grid, `still=true`, no poster | the file | the file's | + `-still` | as row 4 |
+/// | 7 | static ladder, tier rendition found | `thumbnail_tiers` row | stored (JPEG) | `…-{tier}-v{ver}` + variant | exact or `fall_up_is_final` ? immutable : no-cache |
+/// | 8 | static ladder, display rendition found | `thumbnails` row | `image/jpeg` (hardcoded) | `sha-thumb{idx}` + variant | `size == display` or `fall_up_is_final` ? immutable : no-cache |
+/// | 9 | image, nothing stored | the file | the file's | + variant | `fall_up_is_final` ? immutable/drifted : no-cache |
+/// | 10 | non-image, nothing stored | `PLACEHOLDER_PNG` | `image/png` | `sha-placeholder` | `max-age=300` |
+///
+/// Three things the table is easy to get wrong on:
+///
+/// * The **still variant** is part of the ETag on every row, file branches
+///   included — `file_response`'s own validator is `sha256-size-mtime` and
+///   identical for a loop and its poster. Row 2 is the exception that proves
+///   it: the loop's ETag hardcodes `""` for the suffix, because `still=true`
+///   is by definition not this branch.
+/// * The **file branches have a third cache state**, `CACHE_DRIFTED`: a
+///   content-addressed URL whose file's mtime no longer matches the indexed
+///   one gets a bounded lifetime rather than `immutable`
+///   ([`try_file_response`]). "immutable / drifted" above means that split.
+/// * **Rendition rows never drift** — they are derived from exactly the
+///   content the URL names — so their lifetime is [`rendition_cache_control`]
+///   alone.
 #[allow(clippy::too_many_arguments)]
 async fn thumbnail_response(
     conn: &mut sqlx::SqliteConnection,
@@ -618,12 +652,7 @@ async fn thumbnail_response(
     // answer for this URL. Computed once, because several different responses
     // below can be a fall-up.
     let fall_up_is_final = tier_fall_up_is_final(item, size);
-    // The `still` variant is part of every ETag on this endpoint, including
-    // the file-serving branches. `file_response`'s own validator is
-    // `sha256-size-mtime`, identical for the loop and the poster, so without
-    // this a cached poster would be handed back for a loop request and vice
-    // versa (§3, B2's must).
-    let still_suffix = if still { "-still" } else { "" };
+    let still_suffix = still_suffix(still);
     // An item with no mime type has no generator and no rendition, at any
     // tier: its file is the answer, exactly as before.
     //
@@ -644,7 +673,7 @@ async fn thumbnail_response(
 
     // The animated ladder (§2, step B2): a moving picture's grid rendition is
     // an H.264 loop, and `still=true` is how a caller asks for the poster
-    // instead. Answered before the still ladder below, because for these
+    // instead. Answered before the static ladder below, because for these
     // items the two are alternatives, not a fall-up chain — a *poster* is
     // never the answer to an animated grid request, or the grid would be the
     // one surface that never animates.
@@ -655,7 +684,6 @@ async fn thumbnail_response(
             files,
             size,
             still,
-            still_suffix,
             original_filename_no_ext,
             request_headers,
             content_addressed,
@@ -695,16 +723,6 @@ async fn thumbnail_response(
     // items are which.
     let sha256 = &item.sha256;
     let filename = format!("{original_filename_no_ext}.jpg");
-    // A response that is the requested tier's own rendition is final by
-    // construction; anything else is a fall-up and answers to the split in
-    // [`tier_fall_up_is_final`].
-    let cache_control = |exact: bool| {
-        if content_addressed && (exact || fall_up_is_final) {
-            CACHE_IMMUTABLE
-        } else {
-            CACHE_REVALIDATE
-        }
-    };
     for tier in tier_ladder(size) {
         if let Some(rendition) =
             get_thumbnail_tier_rendition(conn, sha256, index, tier.as_str()).await?
@@ -715,7 +733,9 @@ async fn thumbnail_response(
                 &rendition.media_type,
                 &filename,
                 &etag,
-                cache_control(*tier == size),
+                // Exact when the ladder walk stopped on the tier that was
+                // asked for; every earlier stop is a fall-up.
+                rendition_cache_control(content_addressed, *tier == size, fall_up_is_final),
                 request_headers,
             );
         }
@@ -729,7 +749,11 @@ async fn thumbnail_response(
             &etag,
             // The display rendition answers a `display` request exactly and
             // every grid request as a fall-up.
-            cache_control(size == ThumbnailTier::Display),
+            rendition_cache_control(
+                content_addressed,
+                size == ThumbnailTier::Display,
+                fall_up_is_final,
+            ),
             request_headers,
         );
     }
@@ -779,26 +803,48 @@ fn tier_etag(sha256: &str, index: i64, tier: &str, version: i64, still_suffix: &
     format!("\"{sha256}-thumb{index}-{tier}-v{version}{still_suffix}\"")
 }
 
-/// A grid-tier request for an animated item (§2, step B2).
+/// The `still` variant's ETag suffix, which is part of every ETag on this
+/// endpoint — the file-serving branches included. `file_response`'s own
+/// validator is `sha256-size-mtime`, identical for a loop and its poster, so
+/// without this a cached poster would be handed back for a loop request and
+/// vice versa (§3, B2's must).
+fn still_suffix(still: bool) -> &'static str {
+    if still { "-still" } else { "" }
+}
+
+/// The cache lifetime of a response served from a **stored rendition**, which
+/// is one rule across all four sites that serve one.
 ///
-/// Three answers, and which one is right is decided entirely by what the scan
-/// stored:
+/// `content_addressed` is the request's own key discipline: nothing on a URL
+/// that is not addressed by content is ever immutable. `exact` says the
+/// rendition served is the tier that was asked for, which is final by
+/// construction. Anything else is a fall-up, and `fall_up_is_final` is
+/// [`tier_fall_up_is_final`]'s verdict on whether the rendition it stood in for
+/// can still appear.
 ///
-/// * **The loop** — one H.264 rendition per item, answering *both* grid
-///   tiers, served as its stored media type. An exact hit by construction:
-///   there is nothing larger to fall up to, because the loop is not a ladder.
-/// * **The poster** (`still=true`) — the static tiers, walked with the same
-///   fall-up ladder every still request uses (`grid-s` falls up to `grid-m`,
-///   which every animated item above the floor stores).
-/// * **The original file** — for an item at or below the raw floor, where
-///   nothing is stored and nothing ever will be (final, immutable); for one
-///   whose loop the backfill has not written yet (pending, revalidates); and
-///   for the settled encoded-larger-than-the-source edge, where the stored
-///   loop row deliberately carries no bytes.
+/// The file-serving branches do not go through this: they carry their own
+/// mtime-based validator and their own drift caveat (see
+/// [`file_variant_response`]).
+fn rendition_cache_control(
+    content_addressed: bool,
+    exact: bool,
+    fall_up_is_final: bool,
+) -> &'static str {
+    if content_addressed && (exact || fall_up_is_final) {
+        CACHE_IMMUTABLE
+    } else {
+        CACHE_REVALIDATE
+    }
+}
+
+/// A grid-tier request for an animated item (§2, step B2) — the serving half
+/// of the fallback ladder written out in [`crate::visual_tiers`]'s module
+/// docs, which is where the whole rule lives and where the client's half of it
+/// is described too.
 ///
-/// A poster is never substituted for a missing loop. The grid would then be
-/// the one surface where an animated item does not move, silently and
-/// permanently, which is precisely the bug this step exists to fix.
+/// Which answer is right is decided entirely by what the scan stored: the
+/// loop, its poster (`still=true`), or the item's own file — the last with a
+/// cache lifetime that depends on *why* there is no loop.
 #[allow(clippy::too_many_arguments)]
 async fn animated_tier_response(
     conn: &mut sqlx::SqliteConnection,
@@ -806,53 +852,60 @@ async fn animated_tier_response(
     files: &[FileRecord],
     size: ThumbnailTier,
     still: bool,
-    still_suffix: &str,
     original_filename_no_ext: &str,
     request_headers: &HeaderMap,
     content_addressed: bool,
     fall_up_is_final: bool,
 ) -> ApiResult<Response<Body>> {
     let sha256 = &item.sha256;
+    // The same suffix the caller derived; derived again rather than passed,
+    // so the flag and the string it implies cannot be handed in disagreeing.
+    let still_suffix = still_suffix(still);
     // Animated items are images, so there is only ever one picture: index 0.
     // (`big` selects between a video's two stored pictures and has no meaning
     // here.)
     let index = 0;
     if !still {
-        if let Some(rendition) =
-            get_thumbnail_tier_rendition(conn, sha256, index, LOOP_TIER).await?
-            && !rendition.bytes.is_empty()
-        {
-            let etag = tier_etag(sha256, index, LOOP_TIER, rendition.version, "");
-            return bytes_response(
-                rendition.bytes,
-                &rendition.media_type,
-                &format!("{original_filename_no_ext}.mp4"),
-                &etag,
-                // The loop is the whole animated ladder: it is the exact
-                // answer at every grid tier, never a fall-up, so a hit is
-                // immutable like any other. Safe across a generator change
-                // because its ETag carries the version the bytes were made
-                // at ([`tier_etag`]).
-                if content_addressed {
-                    CACHE_IMMUTABLE
-                } else {
-                    CACHE_REVALIDATE
-                },
-                request_headers,
-            );
-        }
-        // No loop bytes: either none stored yet (pending — `fall_up_is_final`
-        // is false and the response revalidates until it lands) or the row
-        // that says the source is smaller than any encode of it, which is as
-        // final as a hit. Both serve the item's own animated file.
-        return file_variant_response(
-            item,
-            files,
-            still_suffix,
-            request_headers,
-            content_addressed && (fall_up_is_final || stored_loop_keeps_original(conn, item).await),
-        )
-        .await;
+        // One read of the loop row, and all three of its answers. The row's
+        // three states are the three answers, so nothing here asks twice.
+        return match get_thumbnail_tier_rendition(conn, sha256, index, LOOP_TIER).await? {
+            Some(rendition) if !rendition.bytes.is_empty() => {
+                let etag = tier_etag(sha256, index, LOOP_TIER, rendition.version, "");
+                bytes_response(
+                    rendition.bytes,
+                    &rendition.media_type,
+                    &format!("{original_filename_no_ext}.mp4"),
+                    &etag,
+                    // Always exact: the loop is the whole animated ladder, so
+                    // it is the answer at every grid tier and never a fall-up.
+                    // Safe across a generator change because its ETag carries
+                    // the version the bytes were made at ([`tier_etag`]).
+                    rendition_cache_control(content_addressed, true, fall_up_is_final),
+                    request_headers,
+                )
+            }
+            // Geometry written, bytes deliberately not: the verdict that no
+            // encode of this source came out smaller than the source. Settled,
+            // so the item's own file is as final an answer as a hit.
+            Some(_) => {
+                file_variant_response(item, files, still_suffix, request_headers, content_addressed)
+                    .await
+            }
+            // No row at all: the backfill has not reached this item, so the
+            // file stands in until the loop lands and must revalidate —
+            // unless this item's ladder can never store one
+            // (`fall_up_is_final`).
+            None => {
+                file_variant_response(
+                    item,
+                    files,
+                    still_suffix,
+                    request_headers,
+                    content_addressed && fall_up_is_final,
+                )
+                .await
+            }
+        };
     }
 
     for tier in tier_ladder(size) {
@@ -865,25 +918,21 @@ async fn animated_tier_response(
                 &rendition.media_type,
                 &format!("{original_filename_no_ext}.jpg"),
                 &etag,
-                // Exact hits only. A `grid-s` request answered from `grid-m`
-                // is a fall-up like any other: today it is stored that way
-                // because the two renditions would be the identical picture,
-                // but a generator change can make `grid-s` a real, smaller
-                // rendition — and an immutable fall-up would pin the larger
-                // poster past it. The version-aware ETag makes the
-                // revalidation one 304.
-                if content_addressed && *tier == size {
-                    CACHE_IMMUTABLE
-                } else {
-                    CACHE_REVALIDATE
-                },
+                // Exact hits only, `fall_up_is_final` deliberately not
+                // consulted. A `grid-s` request answered from `grid-m` is a
+                // fall-up like any other: today it is stored that way because
+                // the two renditions would be the identical picture, but a
+                // generator change can make `grid-s` a real, smaller rendition
+                // — and an immutable fall-up would pin the larger poster past
+                // it. The version-aware ETag makes the revalidation one 304.
+                rendition_cache_control(content_addressed, *tier == size, false),
                 request_headers,
             );
         }
     }
     // No poster: a raw-floor item (nothing is ever stored, final) or one the
     // backfill has not reached (pending). Its own file is the closest thing
-    // to a still it has.
+    // to a poster it has.
     file_variant_response(
         item,
         files,
@@ -892,22 +941,6 @@ async fn animated_tier_response(
         content_addressed && fall_up_is_final,
     )
     .await
-}
-
-/// Whether this item's stored loop row is the "keep the original" verdict —
-/// geometry written, bytes deliberately not, because no encode of this source
-/// came out smaller than the source.
-///
-/// Only asked on the one branch that has already read the row and found it
-/// empty *or* absent, and only to decide a cache lifetime: an absent row is
-/// backfill-pending and must revalidate, while a settled verdict is as
-/// permanent as a hit.
-async fn stored_loop_keeps_original(conn: &mut sqlx::SqliteConnection, item: &ItemRecord) -> bool {
-    get_thumbnail_tier_rendition(conn, &item.sha256, 0, LOOP_TIER)
-        .await
-        .ok()
-        .flatten()
-        .is_some()
 }
 
 /// [`file_response`] with a variant suffix folded into its ETag.

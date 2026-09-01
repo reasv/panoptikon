@@ -477,10 +477,11 @@ ORDER BY idx, tier
 
 /// Whether this item carries *any* stored grid tier, at any version.
 ///
-/// Deliberately version-agnostic, and deliberately not the geometry read: the
-/// only caller is the new-item path's "is an empty set still worth writing?"
-/// guard, and there the question is simply whether a delete would remove
-/// anything.
+/// Deliberately version-agnostic, and deliberately not the geometry read.
+/// Both callers ask the same "is an empty set still worth writing?" guard —
+/// the folder scan's new-item path (`jobs::files::handle_new_item`) and the
+/// continuous scan's mirror of it — and there the question is simply whether
+/// a delete would remove anything.
 pub(crate) async fn has_thumbnail_tiers(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
