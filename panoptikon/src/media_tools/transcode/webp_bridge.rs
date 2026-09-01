@@ -118,10 +118,28 @@ pub(crate) fn extract(
     time: ItemTime,
     cancel: &AtomicBool,
 ) -> Result<BridgedInput, String> {
-    extract_with_budget(bytes, time, cancel, FRAME_BUDGET)
+    extract_with_budget(bytes, time, cancel, FRAME_BUDGET, u64::MAX)
 }
 
-/// [`extract`] with the decode budget as a parameter, so the budget rules
+/// [`extract`] with an aggregate ceiling on what the written frames occupy on
+/// disk, for callers that extract a *whole* animation rather than a
+/// composition's bounded window.
+///
+/// [`FRAME_BUDGET`] bounds the wrong axis on its own: 3600 canvas-sized
+/// lossless PNGs of a 1080p animation is several gigabytes of temp files for
+/// a single item. Exhausting this budget truncates exactly like exhausting
+/// the frame budget does — the documented under-run — so the caller gets a
+/// shorter animation rather than a failure.
+pub(crate) fn extract_within(
+    bytes: &[u8],
+    time: ItemTime,
+    cancel: &AtomicBool,
+    byte_budget: u64,
+) -> Result<BridgedInput, String> {
+    extract_with_budget(bytes, time, cancel, FRAME_BUDGET, byte_budget)
+}
+
+/// [`extract`] with the decode budgets as parameters, so the budget rules
 /// can be pinned against the two-frame fixture instead of a 3600-frame
 /// monster nobody wants committed.
 fn extract_with_budget(
@@ -129,6 +147,7 @@ fn extract_with_budget(
     time: ItemTime,
     cancel: &AtomicBool,
     budget: usize,
+    byte_budget: u64,
 ) -> Result<BridgedInput, String> {
     let dir = tempfile::tempdir()
         .map_err(|err| format!("could not create a frame directory: {err}"))?;
@@ -170,10 +189,26 @@ fn extract_with_budget(
     // The decoded timeline's position — where the *next* frame starts.
     let mut total_ms: u64 = 0;
     let mut covering: Option<(image::RgbaImage, u64)> = None;
+    // What the written PNGs occupy on disk so far, against `byte_budget`.
+    let mut written_bytes: u64 = 0;
     let mut frames = decoder.into_frames();
     loop {
         if !wants_more(time, decoded, total_ms) {
             break;
+        }
+        // The byte ceiling, checked before the next decode for the same
+        // reason the frame budget is, and with the same two outcomes: a span
+        // already inside its window truncates (the documented under-run),
+        // while a bound that was never reached is a refusal rather than a
+        // nearby-wrong frame.
+        if written_bytes >= byte_budget {
+            if matches!(time, ItemTime::Span { .. }) && written > 0 {
+                break;
+            }
+            return Err(format!(
+                "the {byte_budget}-byte frame budget ran out before the item's \
+                 timestamp was reached"
+            ));
         }
         if decoded >= budget {
             // The budget cut extraction short of the item's own bound. A
@@ -221,10 +256,16 @@ fn extract_with_budget(
         if let Some(slice) = slice {
             written += 1;
             let name = frame_name(written);
+            let frame_path = dir.path().join(&name);
             frame
                 .buffer()
-                .save(dir.path().join(&name))
+                .save(&frame_path)
                 .map_err(|err| format!("frame {written} did not write: {err}"))?;
+            written_bytes = written_bytes.saturating_add(
+                std::fs::metadata(&frame_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+            );
             script.push_str(&format!("file {name}\nduration {}\n", ms_seconds(slice)));
             written_ms += slice;
         }
@@ -570,7 +611,8 @@ mod tests {
     #[test]
     fn an_exhausted_budget_truncates_a_started_span_and_refuses_everything_else() {
         let cancel = AtomicBool::new(false);
-        let with_budget = |time, budget| extract_with_budget(FIXTURE, time, &cancel, budget);
+        let with_budget =
+            |time, budget| extract_with_budget(FIXTURE, time, &cancel, budget, u64::MAX);
 
         // A still whose covering frame lies past the budget: error.
         assert!(with_budget(ItemTime::Still { at_cs: 75 }, 1).is_err());
@@ -609,6 +651,49 @@ mod tests {
 
         // And the real ceiling is what `extract` passes down.
         assert_eq!(FRAME_BUDGET, 3600);
+    }
+
+    /// The aggregate byte ceiling, which bounds the axis the frame count
+    /// cannot: a span already inside its window truncates, and `extract`
+    /// itself is unbounded so the compose path is untouched.
+    #[test]
+    fn an_exhausted_byte_budget_truncates_a_started_span() {
+        let cancel = AtomicBool::new(false);
+        let span = ItemTime::Span {
+            start_cs: 0,
+            end_cs: 100,
+        };
+        // One byte of budget: the first frame is always written (the check
+        // runs before the *next* decode), then the span truncates.
+        let bridge = extract_within(FIXTURE, span, &cancel, 1)
+            .expect("a truncated tail is a degradation, not a failure");
+        assert_eq!(
+            script_of(&bridge),
+            "ffconcat version 1.0\nfile frame-00001.png\nduration 0.500\n"
+        );
+
+        // A budget exhausted before anything was written refuses rather than
+        // shipping a nearby frame, exactly as the frame budget does.
+        assert!(extract_within(FIXTURE, span, &cancel, 0).is_err());
+
+        // Frames the window excludes are decoded but never written, so they
+        // do not spend the budget: a span starting at the second frame still
+        // gets that frame under a one-byte ceiling.
+        let bridge = extract_within(
+            FIXTURE,
+            ItemTime::Span {
+                start_cs: 50,
+                end_cs: 100,
+            },
+            &cancel,
+            1,
+        )
+        .expect("only written frames are charged");
+        assert_eq!(frame_primary(&bridge, 1), 'b');
+
+        // A budget no real animation reaches changes nothing.
+        let bridge = extract_within(FIXTURE, span, &cancel, u64::MAX).expect("unbounded");
+        assert_eq!(bridge.info.duration_s, Some(1.0));
     }
 
     /// The decode ceiling: a structurally-valid animated WebP whose VP8X

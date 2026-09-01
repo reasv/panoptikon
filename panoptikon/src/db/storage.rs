@@ -19,10 +19,20 @@ pub(crate) struct StoredTier {
     /// Mirrors [`StoredImage::idx`]: which of the item's pictures this is a
     /// tier of.
     pub idx: i64,
-    /// `ThumbnailTier::as_str` — never a free-form string.
+    /// `ThumbnailTier::as_str`, or `visual_tiers::LOOP_TIER` for an animated
+    /// item's video loop — never a free-form string.
     pub tier: &'static str,
+    /// What the endpoint serves these bytes as: `image/jpeg` for every still
+    /// rendition, `video/mp4` for a loop, and the *item's own* mime type for
+    /// the one row that carries no bytes (see `bytes`).
+    pub media_type: String,
     pub width: i64,
     pub height: i64,
+    /// **Empty means the original file is the rendition.** Only the loop row
+    /// is ever written that way, and only for the settled
+    /// encoded-larger-than-the-source verdict: the geometry still has to be
+    /// stored, or the backfill dispatcher would ask for the loop again on
+    /// every scan forever, but the bytes would be a pessimization to serve.
     pub bytes: Vec<u8>,
 }
 
@@ -356,15 +366,16 @@ WHERE item_sha256 = ?1
         sqlx::query(
             r#"
 INSERT INTO storage.thumbnail_tiers (
-    item_sha256, idx, tier, item_mime_type, width, height, version, thumbnail
+    item_sha256, idx, tier, item_mime_type, media_type, width, height, version, thumbnail
 )
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
         )
         .bind(sha256)
         .bind(tier.idx)
         .bind(tier.tier)
         .bind(mime_type)
+        .bind(&tier.media_type)
         .bind(tier.width)
         .bind(tier.height)
         .bind(process_version)
@@ -491,18 +502,38 @@ SELECT EXISTS(
     Ok(row.0 != 0)
 }
 
-/// The bytes of one stored grid tier, or `None` when this item has no
-/// rendition at that (index, tier) — which is a normal, expected answer: an
-/// original small enough to serve as-is at a tier stores nothing for it.
-pub(crate) async fn get_thumbnail_tier_bytes(
+/// One stored grid rendition as the endpoint serves it.
+pub(crate) struct StoredRendition {
+    /// The stored media type, never assumed from the table: an animated
+    /// item's `loop` row is an mp4 sitting beside JPEG posters.
+    pub media_type: String,
+    /// The `TIER_PROCESS_VERSION` these bytes were generated at.
+    ///
+    /// **Served, not merely stored**: it is part of the response's ETag. A
+    /// generator change the stored *geometry* cannot see — a different crop
+    /// anchor, resampling filter or JPEG quality, a different CRF — is
+    /// precisely what that version exists to force a regeneration for, and
+    /// the regenerated rendition lands at the same `(item, idx, tier)` with
+    /// different bytes. A validator that ignored it would let an immutable
+    /// response keep handing back the superseded bytes for a year.
+    pub version: i64,
+    /// Empty for the one row that means "the original file is the rendition"
+    /// (see [`StoredTier::bytes`]).
+    pub bytes: Vec<u8>,
+}
+
+/// One stored grid rendition, or `None` when this item has nothing at that
+/// (index, tier) — which is a normal, expected answer: an original small
+/// enough to serve as-is at a tier stores nothing for it.
+pub(crate) async fn get_thumbnail_tier_rendition(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
     idx: i64,
     tier: &str,
-) -> ApiResult<Option<Vec<u8>>> {
+) -> ApiResult<Option<StoredRendition>> {
     let row = sqlx::query(
         r#"
-SELECT thumbnail
+SELECT thumbnail, media_type, version
 FROM storage.thumbnail_tiers
 WHERE item_sha256 = ?1 AND idx = ?2 AND tier = ?3
 LIMIT 1
@@ -521,11 +552,21 @@ LIMIT 1
     let Some(row) = row else {
         return Ok(None);
     };
-    let bytes: Vec<u8> = row.try_get("thumbnail").map_err(|err| {
-        tracing::error!(error = %err, "failed to parse a thumbnail tier");
+    let field = |name: &str, err: sqlx::Error| {
+        tracing::error!(error = %err, name, "failed to parse a thumbnail tier");
         ApiError::internal("Failed to read thumbnail tier")
-    })?;
-    Ok(Some(bytes))
+    };
+    Ok(Some(StoredRendition {
+        media_type: row
+            .try_get("media_type")
+            .map_err(|err| field("media_type", err))?,
+        version: row
+            .try_get("version")
+            .map_err(|err| field("version", err))?,
+        bytes: row
+            .try_get("thumbnail")
+            .map_err(|err| field("thumbnail", err))?,
+    }))
 }
 
 pub(crate) async fn get_frames_bytes(
@@ -731,6 +772,7 @@ VALUES
         let tier = |name: &'static str, width: i64| StoredTier {
             idx: 0,
             tier: name,
+            media_type: "image/jpeg".to_string(),
             width,
             height: width,
             bytes: vec![0_u8],
@@ -784,10 +826,93 @@ VALUES
                 .is_empty()
         );
         assert!(
-            get_thumbnail_tier_bytes(conn, "sha_two", 0, "grid-s")
+            get_thumbnail_tier_rendition(conn, "sha_two", 0, "grid-s")
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// The media type travels with the bytes: an animated item's `loop` row
+    /// is an mp4 sitting beside JPEG posters in the same table, and the one
+    /// that carries no bytes at all means "the original file is the
+    /// rendition" (the settled encoded-larger-than-the-source edge).
+    #[tokio::test]
+    async fn a_tier_row_carries_its_own_media_type() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        store_thumbnail_tiers(
+            conn,
+            "sha_loop",
+            "image/gif",
+            1,
+            &[
+                StoredTier {
+                    idx: 0,
+                    tier: "grid-m",
+                    media_type: "image/jpeg".to_string(),
+                    width: 1024,
+                    height: 1024,
+                    bytes: vec![1_u8],
+                },
+                StoredTier {
+                    idx: 0,
+                    tier: "loop",
+                    media_type: "video/mp4".to_string(),
+                    width: 1024,
+                    height: 1024,
+                    bytes: vec![2_u8],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let poster = get_thumbnail_tier_rendition(conn, "sha_loop", 0, "grid-m")
+            .await
+            .unwrap()
+            .expect("the poster is stored");
+        assert_eq!(poster.media_type, "image/jpeg");
+        let animated = get_thumbnail_tier_rendition(conn, "sha_loop", 0, "loop")
+            .await
+            .unwrap()
+            .expect("the loop is stored");
+        assert_eq!(animated.media_type, "video/mp4");
+        assert_eq!(animated.bytes, vec![2_u8]);
+
+        // The keep-the-original row: geometry, no bytes.
+        store_thumbnail_tiers(
+            conn,
+            "sha_loop",
+            "image/gif",
+            1,
+            &[StoredTier {
+                idx: 0,
+                tier: "loop",
+                media_type: "image/gif".to_string(),
+                width: 512,
+                height: 512,
+                bytes: Vec::new(),
+            }],
+        )
+        .await
+        .unwrap();
+        let kept = get_thumbnail_tier_rendition(conn, "sha_loop", 0, "loop")
+            .await
+            .unwrap()
+            .expect("the geometry is stored even when the bytes are not");
+        assert!(kept.bytes.is_empty());
+        assert_eq!(kept.media_type, "image/gif");
+        assert_eq!(
+            get_thumbnail_tier_geometry(conn, "sha_loop").await.unwrap(),
+            vec![TierGeometry {
+                idx: 0,
+                tier: "loop".to_string(),
+                width: 512,
+                height: 512,
+                version: 1,
+            }],
+            "the dispatcher still sees a loop it does not have to re-encode"
         );
     }
 

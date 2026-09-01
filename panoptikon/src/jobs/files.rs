@@ -69,9 +69,13 @@ use crate::{
     },
     pql::builder::filters::evaluate_match,
     pql::model::{Match, MatchValue},
+    media_tools::animated_loop::LoopError,
+    media_tools::transcode::compose::{Transform, orientation_transform},
     visual_tiers::{
-        DISPLAY_MAX_FILE_SIZE, DisplayPlan, ThumbnailTier, TierRender, display_plan, grid_plans,
-        grid_plans_for_stored_thumbnail, grid_renditions,
+        DISPLAY_MAX_FILE_SIZE, DisplayPlan, LOOP_MEDIA_TYPE, LOOP_TIER, TIER_MEDIA_TYPE,
+        ThumbnailTier, TierRender, animated_plans, animated_serves_original, display_plan,
+        grid_plans, grid_plans_for_stored_thumbnail, grid_renditions, is_animated_image,
+        loop_keeps_original, loop_render, poster_plans,
     },
 };
 
@@ -1896,19 +1900,42 @@ impl ScanContext {
     /// and must never abort the folder scan over a cache whose whole purpose
     /// is saving work.
     async fn thumbnail_marker_suppresses(&mut self, sha256: &str, path: &Path) -> bool {
-        match visuals_suppressed(
-            &mut self.conn,
-            sha256,
-            VisualKind::Thumbnail,
-            THUMBNAIL_PROCESS_VERSION,
-        )
-        .await
-        {
+        self.marker_suppresses(sha256, path, VisualKind::Thumbnail)
+            .await
+    }
+
+    /// The same consult for the **animated loop**
+    /// (docs/grid-scroll-performance-implementation.md §2, step B2), which is
+    /// its own kind and its own version.
+    ///
+    /// Scoped as narrowly as it is written: a `loop` marker suppresses the
+    /// animated ladder and nothing else. It must never reach the display
+    /// rendition, because a loop fails on files whose pixels decoded
+    /// perfectly — the posters came out of that decode — and the display rule
+    /// can start wanting a still for such an item at any time.
+    ///
+    /// The converse coupling is real and deliberate: a *thumbnail* marker
+    /// does suppress the animated ladder, because the ladder starts with the
+    /// very decode that marker is a verdict about.
+    async fn loop_marker_suppresses(&mut self, sha256: &str, path: &Path) -> bool {
+        self.marker_suppresses(sha256, path, VisualKind::Loop).await
+    }
+
+    /// One kind's negative-cache consult, at that kind's own generator
+    /// version ([`visual_process_version`]) — never another's, or a marker
+    /// would expire on the wrong bump.
+    ///
+    /// Markers are advisory: a read that fails costs one regenerated nothing,
+    /// and must never abort the folder scan over a cache whose whole purpose
+    /// is saving work.
+    async fn marker_suppresses(&mut self, sha256: &str, path: &Path, kind: VisualKind) -> bool {
+        match visuals_suppressed(&mut self.conn, sha256, kind, visual_process_version(kind)).await {
             Ok(suppressed) => suppressed,
             Err(err) => {
                 tracing::warn!(
                     error = ?err,
                     path = %path.display(),
+                    kind = kind.as_str(),
                     "failed to read the visuals negative cache; regenerating"
                 );
                 false
@@ -2328,33 +2355,24 @@ impl ScanContext {
                 },
             };
         }
-        // Whether this item's *still* rendition ladder applies to it at all.
-        // Answered here rather than inside the ladder question because the
-        // generator needs it even when the ladder question found no work: an
-        // animated image missing its display rendition still runs the image
-        // pass, and that pass must not write static tiers either.
-        let still_ladder = still_ladder_applies(
-            &mime_type,
-            image_facts.as_ref().and_then(|facts| facts.duration),
-        );
+        // Which rendition ladder this item's grid tiers come from. Answered
+        // here rather than inside the ladder question because the generator
+        // needs it even when the ladder question found no work: an animated
+        // image missing its display rendition still runs the image pass, and
+        // that pass must produce the animated set rather than static tiers.
+        let ladder = grid_ladder(&mime_type, image_facts.as_ref());
         // The dispatcher's seventh question
         // (docs/grid-scroll-performance-implementation.md §3, B1): "does this
         // item carry the renditions the current ladder would produce?" Asked
         // before the negative cache, because for an image the answer *is* a
         // decode of the original — the same decode a marker settles — and
         // suppression has to cover it.
-        // Asked for *every* item, animated ones included. `still_ladder ==
-        // false` is not "no question": it is the answer "the set this item
-        // wants is empty", and an item carrying a stale set has to be told so
-        // (see [`TierWork::Retire`]).
+        // Asked for *every* item, animated ones included.
+        // [`GridLadder::Nothing`] is not "no question": it is the answer "the
+        // set this item wants is empty", and an item carrying a stale set has
+        // to be told so (see [`TierWork::Retire`]).
         let mut tier_work = self
-            .pending_tier_work(
-                &sha256,
-                &mime_type,
-                &path,
-                image_facts.as_ref(),
-                still_ladder,
-            )
+            .pending_tier_work(&sha256, &mime_type, &path, image_facts.as_ref(), ladder)
             .await;
         if matches!(tier_work, Some(TierWork::Image { .. })) {
             needs_thumb = true;
@@ -2368,15 +2386,48 @@ impl ScanContext {
         // Only the thumbnail kind is consulted here because only the thumbnail
         // is dispatched: video frames come out of the same pass, so suppressing
         // the thumbnail suppresses their extraction too.
-        if needs_thumb && self.thumbnail_marker_suppresses(&sha256, &path).await {
-            needs_thumb = false;
-            thumb_suppressed = true;
-            // The image ladder is that same decode, so the marker settles it
-            // too. A `Derived` set is untouched: it decodes stored q85 JPEGs,
-            // not the file the marker has a verdict about.
-            if matches!(tier_work, Some(TierWork::Image { .. })) {
+        //
+        // The animated ladder is asked the same question even when no
+        // thumbnail is: its posters come from a decode of the *original*,
+        // which is exactly what a marker has a verdict about, and an animated
+        // item is usually served directly at the display tier (so
+        // `needs_thumb` is false for it and the gate would never be reached).
+        let animated_ladder = matches!(tier_work, Some(TierWork::Animated));
+        if (needs_thumb || animated_ladder)
+            && self.thumbnail_marker_suppresses(&sha256, &path).await
+        {
+            if needs_thumb {
+                needs_thumb = false;
+                thumb_suppressed = true;
+            }
+            // The image and animated ladders both *start* with that decode,
+            // so a thumbnail marker settles them too. A `Derived` set is
+            // untouched: it decodes stored q85 JPEGs, not the file the marker
+            // has a verdict about, and `Retire` is a delete that needs no
+            // source at all.
+            if matches!(tier_work, Some(TierWork::Image { .. } | TierWork::Animated)) {
                 tier_work = None;
             }
+        }
+        // The animated ladder's own marker, and deliberately a separate
+        // consult rather than another use of the one above. It runs *after*,
+        // on whatever survived: a `loop` marker means the decode was fine and
+        // the encode was not, so it may retire the ladder and nothing else —
+        // never `needs_thumb`, never the display rendition this file is
+        // perfectly capable of producing (and may start owing the moment the
+        // display rule flips for it).
+        let mut ladder = ladder;
+        if matches!(tier_work, Some(TierWork::Animated))
+            && self.loop_marker_suppresses(&sha256, &path).await
+        {
+            tier_work = None;
+            // The generator's obligation goes with it. `ladder` is threaded
+            // separately from `tier_work` so that an animated image running
+            // the image pass for its *display* half still produces the
+            // animated set out of that one decode — which is exactly the case
+            // this marker has to reach, or a suppressed item would re-run
+            // ffmpeg on every scan that touches it for any other reason.
+            ladder = GridLadder::Unknown;
         }
         // The dispatcher's third question (docs/video-outro-detection-design.md
         // §7): "is this a video nothing has examined for an appended outro?"
@@ -2663,7 +2714,7 @@ impl ScanContext {
                     animation_work,
                     rotation_work,
                     tier_work,
-                    still_ladder,
+                    ladder,
                     stored_content_end_ms,
                     &timers,
                 )
@@ -2890,17 +2941,17 @@ impl ScanContext {
     /// regeneration.
     ///
     /// `image_facts` is what the caller already stat'd and read for this file;
-    /// nothing here re-fetches it. `still_ladder` is
-    /// [`still_ladder_applies`]'s answer, and `false` does **not** mean "skip
-    /// the question": it means the wanted set is *empty*, which is a verdict
-    /// like any other and the only thing that can retire a stale set.
+    /// nothing here re-fetches it. `ladder` is [`grid_ladder`]'s answer, and
+    /// [`GridLadder::Nothing`] does **not** mean "skip the question": it means
+    /// the wanted set is *empty*, which is a verdict like any other and the
+    /// only thing that can retire a stale set.
     async fn pending_tier_work(
         &mut self,
         sha256: &str,
         mime_type: &str,
         path: &Path,
         image_facts: Option<&ImageFacts>,
-        still_ladder: bool,
+        ladder: GridLadder,
     ) -> Option<TierWork> {
         // Before any storage read at all. This question is asked once per
         // file per scan, forever, and most of the files in a general-purpose
@@ -2933,23 +2984,46 @@ impl ScanContext {
                 return None;
             }
         };
-        if !still_ladder {
-            // The wanted set is empty. A stale one really can be stored: the
-            // ladder question runs *before* the animation question that
-            // stamps `items.duration`, so a scan that met an item indexed
-            // without that measurement sees `duration IS NULL`, concludes
-            // "still", and writes static tiers for what the very same scan
-            // then records as animated. Retiring them here is what closes
-            // that window — otherwise they are frozen for good and, being
-            // stored renditions, served immutably.
-            //
-            // Answered before the display geometry is read: this branch has
-            // no use for it, and animated items should not pay a second query
-            // to be told nothing.
-            if stored_tiers.is_empty() {
-                return None;
+        match ladder {
+            GridLadder::Nothing => {
+                // The wanted set is empty. A stale one really can be stored:
+                // the ladder question runs *before* the animation question
+                // that stamps `items.duration`, so a scan that met an item
+                // indexed without that measurement sees `duration IS NULL`,
+                // concludes "still", and writes static tiers for what the
+                // very same scan then records as animated. Retiring them here
+                // is what closes that window — otherwise they are frozen for
+                // good and, being stored renditions, served immutably.
+                //
+                // Answered before the display geometry is read: this branch
+                // has no use for it, and raw-floor animated items should not
+                // pay a second query to be told nothing.
+                if stored_tiers.is_empty() {
+                    return None;
+                }
+                return Some(TierWork::Retire);
             }
-            return Some(TierWork::Retire);
+            // Not enough indexed metadata to say what this item wants. Left
+            // exactly as it is: guessing "empty" would retire a correct set,
+            // and guessing "animated" would need geometry nobody measured.
+            GridLadder::Unknown => return None,
+            GridLadder::Animated => {
+                // The animated ladder is a *replacement* for the still one,
+                // not an addition to it, and it touches no display rendition
+                // at all — so unlike the still branch below this reads no
+                // display geometry.
+                let facts = image_facts?;
+                let (width, height) = facts.dimensions?;
+                let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+                    return None;
+                };
+                let wanted = wanted_named_tier_geometry(0, &animated_plans(width, height));
+                if tier_geometry_matches(&stored_tiers, &wanted) {
+                    return None;
+                }
+                return Some(TierWork::Animated);
+            }
+            GridLadder::Still => {}
         }
         let stored_thumbnails = self.stored_geometry(sha256, path).await?;
 
@@ -3762,6 +3836,14 @@ fn visual_process_version(kind: VisualKind) -> i64 {
         // `version >= ?` consult while the unrecognised suffix recovers the
         // negatives (docs/video-outro-detection-design.md §7.2).
         VisualKind::Outro => OUTRO_DETECTOR_VERSION,
+        // The *tier* generator's version, never the thumbnail's: a loop is a
+        // `thumbnail_tiers` rendition, and §2 forbids bumping
+        // `THUMBNAIL_PROCESS_VERSION` for tier work (that would regenerate
+        // every video thumbnail in the library to fix an encoder setting).
+        // This is also the only thing that gives a loop failure a heal path:
+        // bump the tier version and the ledger's `version >= ?` consult
+        // retires every one of these markers for free.
+        VisualKind::Loop => TIER_PROCESS_VERSION,
     }
 }
 
@@ -4475,6 +4557,17 @@ struct ProducedVisuals {
     /// predicate is already the cache for those, and marking them would put a
     /// row in the table for the majority of every image library.
     nothing: Vec<VisualKind>,
+    /// Verdicts the **animated ladder** owes, which the pass carries rather
+    /// than returning as an error.
+    ///
+    /// Its own channel because an animated-ladder failure is not a failure of
+    /// the pass: the display rendition and the blurhash come out of the same
+    /// decode and are still perfectly good, so propagating a `VisualsError`
+    /// would throw away work that succeeded. The verdicts still have to reach
+    /// the ledger — a loop that cannot be encoded costs a decode plus an
+    /// ffmpeg run on every scan until something records that it cannot
+    /// (see [`build_animated_tiers`]).
+    tier_verdicts: Vec<VisualVerdict>,
 }
 
 /// A failure that ended a generation pass, carrying the kinds it actually
@@ -4541,6 +4634,22 @@ impl VisualsError {
     fn both(error: FileProcessError) -> Self {
         Self {
             kinds: &[VisualKind::Thumbnail, VisualKind::Frame],
+            error,
+            audit_stage: None,
+        }
+    }
+
+    /// The animated ladder failed on a file whose pixels are fine.
+    ///
+    /// Scoped to [`VisualKind::Loop`] and to nothing else, deliberately: both
+    /// sites that produce one — a poster encode and the ffmpeg run — are
+    /// *past* the decode, on an image the generator has already turned into a
+    /// first frame. Claiming the thumbnail kind here would assert the file
+    /// cannot be decoded, and would suppress a display rendition this file is
+    /// perfectly capable of producing.
+    fn animated_loop(error: FileProcessError) -> Self {
+        Self {
+            kinds: &[VisualKind::Loop],
             error,
             audit_stage: None,
         }
@@ -4624,6 +4733,11 @@ fn generate_new_item_visuals(
                 .into_iter()
                 .map(VisualVerdict::nothing)
                 .collect();
+            // The animated ladder's own verdicts, on the same terms as the
+            // backfill path: the pass succeeded and its loop still may not
+            // have, and an unrecorded loop failure is a decode plus an ffmpeg
+            // run repeated on every scan.
+            visuals.verdicts.extend(produced.tier_verdicts);
             produced.blurhash_source
         }
         Err(err) if mime_type.starts_with("text/html") => {
@@ -4741,13 +4855,18 @@ fn build_new_item_thumbnails(
         let image = open_image_oriented(path).map_err(|(stage, err)| {
             VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
         })?;
-        build_image_renditions(
-            &mut out,
-            file_size,
-            image,
-            ImageLadderWork::first_pass(mime_type, metadata.duration),
-        )
-        .map_err(VisualsError::thumbnail)?;
+        // A first generation, so the display half is always owed; the grid
+        // half is the same pure verdict the dispatcher reaches on a rescan,
+        // read here off the decode's own dimensions rather than the index's
+        // (they are the same numbers — the index records the *oriented*
+        // geometry this decode produces).
+        let (width, height) = image.dimensions();
+        let work = ImageLadderWork {
+            display: true,
+            tiers: first_pass_ladder(mime_type, metadata.duration, file_size, width, height),
+        };
+        build_image_renditions(&mut out, path, mime_type, file_size, image, work)
+            .map_err(VisualsError::thumbnail)?;
     } else if mime_type.starts_with("application/pdf") {
         // Still renders nothing when pdfium is unavailable or the PDF is
         // broken — the item is indexed without visuals — but the two are no
@@ -4779,11 +4898,22 @@ fn build_new_item_thumbnails(
 /// The rows a planned tier set would store, in the order
 /// [`get_thumbnail_tier_geometry`] returns them (index, then tier name).
 fn wanted_tier_geometry(idx: i64, plans: &[(ThumbnailTier, TierRender)]) -> Vec<TierGeometry> {
+    let named: Vec<(&str, TierRender)> = plans
+        .iter()
+        .map(|(tier, plan)| (tier.as_str(), *plan))
+        .collect();
+    wanted_named_tier_geometry(idx, &named)
+}
+
+/// [`wanted_tier_geometry`] for a set whose discriminators are not all
+/// `size=` values — the animated ladder, whose `loop` row is a rendition kind
+/// rather than a tier.
+fn wanted_named_tier_geometry(idx: i64, plans: &[(&str, TierRender)]) -> Vec<TierGeometry> {
     let mut wanted: Vec<TierGeometry> = plans
         .iter()
         .map(|(tier, plan)| TierGeometry {
             idx,
-            tier: tier.as_str().to_string(),
+            tier: (*tier).to_string(),
             width: i64::from(plan.width),
             height: i64::from(plan.height),
             version: TIER_PROCESS_VERSION,
@@ -4836,19 +4966,8 @@ struct ImageLadderWork {
     /// and re-storing an identical picture (and its blurhash) for every
     /// already-correct item is the bulk of the work and buys nothing.
     display: bool,
-    /// Produce the grid tiers. False for animated items — see
-    /// [`still_ladder_applies`].
-    tiers: bool,
-}
-
-impl ImageLadderWork {
-    /// A first generation: nothing is stored, so both halves are owed.
-    fn first_pass(mime_type: &str, duration: Option<f64>) -> Self {
-        Self {
-            display: true,
-            tiers: still_ladder_applies(mime_type, duration),
-        }
-    }
+    /// Which grid renditions this pass owes — see [`grid_ladder`].
+    tiers: GridLadder,
 }
 
 /// The display rendition and the grid tiers of one already-decoded image, in
@@ -4858,15 +4977,33 @@ impl ImageLadderWork {
 /// Tiers come from the **original decode**, never from the display rendition:
 /// a megapixel-guarded display tier can be *smaller* than `grid-m` (an
 /// 800x60000 strip scales to 653 px wide), so cascading off it would upscale.
+/// For an animated item the same decode is the first frame, which is exactly
+/// what its posters are made of — so the animated ladder costs one ffmpeg run
+/// and no second decode.
 fn build_image_renditions(
     out: &mut ProducedVisuals,
+    path: &Path,
+    mime_type: &str,
     file_size: u64,
     image: DynamicImage,
     work: ImageLadderWork,
 ) -> Result<(), FileProcessError> {
     let (width, height) = image.dimensions();
-    if work.tiers {
-        out.tiers = Some(encode_tiers(0, &image, &grid_plans(file_size, width, height))?);
+    match work.tiers {
+        GridLadder::Still => {
+            out.tiers = Some(encode_tiers(0, &image, &grid_plans(file_size, width, height))?);
+        }
+        GridLadder::Animated => {
+            let (tiers, verdicts) = build_animated_tiers(path, mime_type, file_size, &image);
+            out.tiers = tiers;
+            out.tier_verdicts = verdicts;
+        }
+        // Neither produces a set: an empty wanted set is a *delete*, and the
+        // pass that decides one is owed is the ladder question
+        // ([`TierWork::Retire`]), not this one. Leaving `out.tiers` at `None`
+        // is what keeps a display-only backfill of a raw-floor animated item
+        // from writing anything at all.
+        GridLadder::Nothing | GridLadder::Unknown => {}
     }
     if !work.display {
         // The stored display rendition is already the one the rule wants, so
@@ -4891,6 +5028,172 @@ fn build_image_renditions(
         }
     }
     Ok(())
+}
+
+/// The animated ladder of one item: its static posters and its H.264 loop
+/// (docs/grid-scroll-performance-implementation.md §2, step B2).
+///
+/// `first_frame` is the item's own decode — `image` hands back the first
+/// frame of an animated GIF/WebP — so the posters cost no decode of their
+/// own, and they are the *same* crop rule the loop uses.
+///
+/// The set is all-or-nothing for the same reason [`build_stored_thumbnail_tiers`]
+/// is: the stored set is replaced wholesale, so a set missing its loop would
+/// never match what the dispatcher predicts — re-dispatching the item on
+/// every scan forever.
+///
+/// **Every failure owes the ledger a verdict**, which is the second half of
+/// the contract and the expensive one to get wrong. The animated ladder is a
+/// full decode of the original plus an ffmpeg run, and the dispatcher
+/// consults a marker before dispatching it — so without a written verdict
+/// there is nothing for that consult to find, and an item ffmpeg cannot
+/// encode pays the whole cost again on every scan, forever.
+///
+/// Every verdict written here is [`VisualKind::Loop`] and **never**
+/// [`VisualKind::Thumbnail`]. Both failing sites are *past* the decode: the
+/// posters were built from `first_frame` moments earlier, so the pixels are
+/// demonstrably fine. Marking the thumbnail kind would assert the opposite
+/// and, worse, suppress a display rendition this file can produce — including
+/// later, when the display rule flips and starts wanting one. The outcomes:
+///
+/// * a poster encode failure is `input` — the generator decided it on pixels
+///   it already held, so one attempt settles it;
+/// * a failed ffmpeg run is `input`-unconfirmed — ffmpeg did its own file
+///   I/O, so a broken file and a mount hiccup are indistinguishable and it
+///   takes two;
+/// * a failure to *start* ffmpeg is `blocked`, which self-heals the moment
+///   the toolchain appears, and host trouble (no scratch space, no read-back)
+///   is transient — neither is a verdict on the media, so neither settles
+///   anything.
+fn build_animated_tiers(
+    path: &Path,
+    mime_type: &str,
+    file_size: u64,
+    first_frame: &DynamicImage,
+) -> (Option<Vec<StoredTier>>, Vec<VisualVerdict>) {
+    let (width, height) = first_frame.dimensions();
+    let mut tiers = match encode_tiers(0, first_frame, &poster_plans(width, height)) {
+        Ok(tiers) => tiers,
+        Err(err) => {
+            tracing::debug!(error = ?err, path = %path.display(), "failed to encode a loop poster");
+            return (None, failure_verdicts(&VisualsError::animated_loop(err)));
+        }
+    };
+
+    let plan = loop_render(width, height);
+    let bytes = match crate::media_tools::animated_loop::encode_loop(
+        path,
+        mime_type,
+        &plan,
+        image_display_transform(path),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %error,
+                "failed to encode an animated loop"
+            );
+            return (None, failure_verdicts(&loop_failure(error)));
+        }
+    };
+    // The settled encoded-larger-than-the-source edge (§2): keep the
+    // original. The row is still written — with the geometry the dispatcher
+    // predicted, or the backfill would ask for this loop again on every scan
+    // forever — but carries no bytes, which is how the endpoint learns to
+    // serve the file itself at the grid tiers. A verdict about the *content*,
+    // unlike the failure above, so freezing it is correct: the same file
+    // encodes the same way until `TIER_PROCESS_VERSION` says otherwise.
+    let keeps_original = loop_keeps_original(bytes.len() as u64, file_size);
+    if keeps_original {
+        tracing::debug!(
+            path = %path.display(),
+            encoded = bytes.len(),
+            source = file_size,
+            "the animated loop was not smaller than its source; keeping the original"
+        );
+    }
+    tiers.push(StoredTier {
+        idx: 0,
+        tier: LOOP_TIER,
+        media_type: if keeps_original {
+            mime_type.to_string()
+        } else {
+            LOOP_MEDIA_TYPE.to_string()
+        },
+        width: i64::from(plan.width),
+        height: i64::from(plan.height),
+        bytes: if keeps_original { Vec::new() } else { bytes },
+    });
+    (Some(tiers), Vec::new())
+}
+
+/// Classifies one [`LoopError`] into the failure vocabulary the ledger
+/// already speaks — always as [`VisualKind::Loop`], never as the thumbnail's
+/// (see [`build_animated_tiers`]).
+///
+/// Only one arm can ever suppress anything, and only after two strikes:
+/// exactly one of these outcomes is a statement about the *file*.
+fn loop_failure(error: LoopError) -> VisualsError {
+    match error {
+        // Failing to *start* ffmpeg is never a verdict on the media: a
+        // missing toolchain is `blocked` and self-heals when it appears,
+        // anything else about this machine stays transient and retries.
+        LoopError::Spawn(err) => VisualsError::animated_loop(
+            FileProcessError::visuals_from_api_error(crate::media_tools::spawn_error("ffmpeg", &err)),
+        ),
+        // ffmpeg did its own file I/O, so a broken file and a transient mount
+        // hiccup exit identically: this needs a second failure in a later
+        // scan before it suppresses anything.
+        LoopError::Failed(detail) => {
+            VisualsError::animated_loop(visuals_input_unconfirmed(format!("loop encode: {detail}")))
+        }
+        // Host trouble — no scratch space, an output that would not read
+        // back — and a container this build cannot decode. Neither says
+        // anything about the file, so neither may spend a strike: a disk that
+        // fills mid-backfill would otherwise retire the loop ladder for the
+        // whole library, and a permanent verdict for an undecodable container
+        // has no heal path at all (the dispatcher's own probe is what gates
+        // that case instead — see [`grid_ladder`]).
+        LoopError::Host(detail) | LoopError::Unsupported(detail) => {
+            VisualsError::animated_loop(FileProcessError::Io(detail))
+        }
+    }
+}
+
+/// The transform that takes a file's stored pixels into the display space the
+/// index records its dimensions in.
+///
+/// Identity for everything without an EXIF orientation, which is every GIF and
+/// nearly every animated WebP — but the loop's crop rectangle is expressed in
+/// display space, so where one *does* exist the encode has to close the gap
+/// itself (ffmpeg does not apply a WebP's EXIF orientation, and the bridge
+/// writes canvas-space frames).
+///
+/// **Speculative, and knowingly so.** The orientation is read from the file's
+/// header here rather than taken from `items.rotation`, which the scan
+/// measures and stores — so a file whose header this build cannot read, or
+/// whose stored rotation the display-dimensions backfill later corrects,
+/// gets the identity transform and a loop that disagrees with its own
+/// poster. Harmless today because no animated container in the wild carries
+/// an EXIF orientation (GIF has no EXIF at all, and animated WebP with one is
+/// vanishingly rare), and cheap to make authoritative later: thread the
+/// indexed `rotation` into the ladder the way the dimensions already are.
+/// Until then the stored *geometry* is still exactly what the dispatcher
+/// predicted — the scale filter is unconditional — so a wrong transform can
+/// only ever produce a wrong-looking loop, never a non-terminating backfill.
+fn image_display_transform(path: &Path) -> Transform {
+    match image_header_geometry(path) {
+        Ok((_, orientation)) => orientation_transform(orientation),
+        Err(err) => {
+            tracing::debug!(
+                error = ?err,
+                path = %path.display(),
+                "could not read an orientation for a loop; assuming none"
+            );
+            Transform::default()
+        }
+    }
 }
 
 /// The grid tiers of pictures this generator produced, across every display
@@ -5060,12 +5363,24 @@ enum TierWork {
     /// reproduce pictures that are already stored would be the most expensive
     /// possible way to get them.
     Derived(Vec<(i64, Vec<u8>)>),
+    /// An animated image above the raw floor: one H.264 loop plus its static
+    /// posters, both produced from the item's own file — the loop by ffmpeg,
+    /// the posters from the first frame the same decode yields. Carries no
+    /// payload because it needs none: the path and the mime type are the
+    /// whole input, and unlike [`TierWork::Image`] it never touches the
+    /// display rendition (§3, B2: the default path keeps serving what it
+    /// serves today).
+    Animated,
     /// This item wants **no** stored tier at all and carries some: delete the
-    /// set. Produced only by the animated exclusion
-    /// ([`still_ladder_applies`]), which is the one verdict that can turn an
-    /// item's wanted set from non-empty to empty after a scan already wrote
-    /// one. Needs no decode and no source — the write is the whole work — so
-    /// it deliberately survives the negative cache's suppression.
+    /// set. Produced by [`GridLadder::Nothing`], which in practice means one
+    /// thing: an animated item at or below the raw floor, served from its own
+    /// file at every tier. (`grid_ladder` also answers `Nothing` for an item
+    /// with no mime type at all, but that item never reaches the ladder
+    /// question — [`mime_can_have_renditions`] turns it away first, before a
+    /// single storage read.) It is the one verdict that can turn an item's
+    /// wanted set from non-empty to empty after a scan already wrote one.
+    /// Needs no decode and no source — the write is the whole work — so it
+    /// deliberately survives the negative cache's suppression.
     Retire,
 }
 
@@ -5094,24 +5409,138 @@ fn mime_can_have_renditions(mime_type: &str) -> bool {
         || mime_type.starts_with("text/html")
 }
 
-/// Whether the **still** tier ladder applies to an item at all.
+/// Which grid ladder an item's stored renditions come from
+/// (docs/grid-scroll-performance-implementation.md §3, B1 and B2).
 ///
-/// Animated items are step B2's (docs/grid-scroll-performance-implementation.md
-/// §3, B2): their grid renditions are H.264 loops with the static tiers as
-/// posters, so any still tier written for one now is superseded the moment
-/// that lands. Worse in the meantime, the default path can flip an animated
-/// original to a static JPEG for a large animated WebP, and a static tier
-/// derived from that same decode would silently make the grid the only
-/// surface that never animates. Excluded until B2 owns them.
+/// The whole verdict is a pure function of *indexed metadata* — mime type,
+/// `items.duration`, the file's byte count and its display dimensions — and
+/// nothing here ever decodes anything. That is the invariant the backfill
+/// dispatcher lives or dies by: the question is asked once per file per scan,
+/// forever, over SMB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GridLadder {
+    /// Static renditions: `grid-m`/`grid-s` JPEGs. Every item that does not
+    /// move, and every non-image (a video's tiers come from its stored frame
+    /// grid, which is a still by construction).
+    Still,
+    /// An animated image above the raw floor: one H.264 loop, plus the static
+    /// posters `still=true` answers with.
+    Animated,
+    /// Nothing at all. An animated image at or below the raw floor is served
+    /// from its original file at every tier, so its wanted set is *empty* —
+    /// which is a verdict, not an absence, and the only thing that can retire
+    /// a set an earlier rule wrote.
+    Nothing,
+    /// Undecidable from the index alone: an animated image whose dimensions
+    /// were never measured, so neither the floor nor the loop's geometry can
+    /// be evaluated. No work, and no retirement either — deciding either way
+    /// would churn the item every scan until the dimensions land.
+    Unknown,
+}
+
+/// [`grid_ladder`] for the new-item pass, whose measurements come from the
+/// decode it just performed rather than from the index.
 ///
-/// `duration` is `items.duration`, and only an **image** is disqualified by
-/// it: a video's tiers are derived from its stored frame grid, which is a
-/// still by construction.
-fn still_ladder_applies(mime_type: &str, duration: Option<f64>) -> bool {
-    if mime_type.is_empty() || mime_type.starts_with("image/gif") {
-        return false;
+/// The two must agree — the very next scan asks [`grid_ladder`] the same
+/// question off the indexed values — which is why this is a thin adapter and
+/// not a second rule.
+fn first_pass_ladder(
+    mime_type: &str,
+    duration: Option<f64>,
+    file_size: u64,
+    width: u32,
+    height: u32,
+) -> GridLadder {
+    grid_ladder(
+        mime_type,
+        Some(&ImageFacts {
+            file_size,
+            dimensions: Some((i64::from(width), i64::from(height))),
+            duration,
+        }),
+    )
+}
+
+/// [`GridLadder`] for one item, from what the dispatcher already gathered.
+///
+/// `facts` is `None` for everything that is not an image; an image's byte
+/// count and dimensions come from the single stat and index read the
+/// dispatch already paid for (`FileScanService::image_facts`).
+fn grid_ladder(mime_type: &str, facts: Option<&ImageFacts>) -> GridLadder {
+    // No mime type at all: `mime_can_have_renditions` says no generator will
+    // ever produce a picture for it, so its wanted set is empty by rule.
+    if mime_type.is_empty() {
+        return GridLadder::Nothing;
     }
-    !(mime_type.starts_with("image") && duration.is_some_and(|seconds| seconds > 0.0))
+    let duration = facts.and_then(|facts| facts.duration);
+    if !is_animated_image(mime_type, duration) {
+        // An animated *container* nothing has measured yet is not a still —
+        // it is unknown, and the scan is the only side of the ladder that can
+        // tell the difference. The animation question
+        // (docs/animated-image-spans-design.md §4) runs after this one in the
+        // same scan, so a WebP or AVIF indexed before that feature existed
+        // reads `duration IS NULL` here. Calling it `Still` would write
+        // static tiers for a picture that may well move, and serve them
+        // *immutably* to anything that asks in the window before the
+        // measurement lands — and the retirement machinery could never reach
+        // them, because on the next scan the genuinely still ones answer
+        // identically.
+        //
+        // GIF cannot reach this branch with an unmeasured duration at all —
+        // it already defaults the other way (animated unless measured still),
+        // so its unknown case is safe and `measures_animation` needs no
+        // exception for it.
+        //
+        // The accepted cost is small and one-sided: a genuinely still WebP
+        // from a pre-spans library gets its grid tiers one scan later.
+        // Nothing is pinned meanwhile — with no tiers stored the endpoint
+        // falls up and revalidates.
+        if duration.is_none() && crate::media_tools::animation::measures_animation(mime_type) {
+            return GridLadder::Unknown;
+        }
+        return GridLadder::Still;
+    }
+    // A container this build has no decoder for is **undecidable**, not a
+    // permanent nothing. The frame bridge decodes WebP only, so an animated
+    // AVIF needs a toolchain that can demux it; when this one cannot, there
+    // is no loop to produce *today*.
+    //
+    // Answered here rather than by letting the encoder fail and recording it,
+    // which is the trap R2-A found: a ledger row would be the item's answer
+    // forever. `nothing` markers carry no blocker, so the auto-heal probe
+    // cannot clear them; the store that clears markers never runs for an item
+    // served directly at the display tier, which animated items usually are;
+    // and the only remaining escape is a `THUMBNAIL_PROCESS_VERSION` bump,
+    // which §2 forbids for tier work. Installing a capable ffmpeg would then
+    // never produce a single loop. A gate re-evaluates instead — the probe is
+    // a cached `OnceLock`, so this is one boolean read per file after the
+    // first, and a restart with a better toolchain picks every item up.
+    //
+    // Cost of the probe itself is bounded by the mime test in front of it: it
+    // spawns ffmpeg at most once per process, and only if the library
+    // actually contains an animated AVIF.
+    if mime_type.starts_with("image/avif")
+        && !crate::media_tools::transcode::hw::animated_avif_decodable()
+    {
+        return GridLadder::Unknown;
+    }
+    let Some(facts) = facts else {
+        return GridLadder::Unknown;
+    };
+    let Some((width, height)) = facts.dimensions else {
+        return GridLadder::Unknown;
+    };
+    let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+        return GridLadder::Unknown;
+    };
+    if width == 0 || height == 0 {
+        return GridLadder::Unknown;
+    }
+    if animated_serves_original(facts.file_size, width, height) {
+        GridLadder::Nothing
+    } else {
+        GridLadder::Animated
+    }
 }
 
 struct OutroBackfill {
@@ -5140,12 +5569,12 @@ fn generate_backfill_visuals(
     needs_animation: bool,
     rotation_work: Option<RotationBackfill>,
     tier_work: Option<TierWork>,
-    // Whether the still ladder applies to this item at all
-    // (`still_ladder_applies`). Threaded separately from `tier_work` because
-    // it governs a pass the ladder question found *no* work for: an animated
-    // image missing its display rendition runs the image pass, and that pass
-    // must not write static tiers either.
-    still_ladder: bool,
+    // Which grid ladder this item's renditions come from ([`grid_ladder`]).
+    // Threaded separately from `tier_work` because it governs a pass the
+    // ladder question found *no* work for: an animated image missing its
+    // display rendition runs the image pass, and that pass must produce the
+    // animated set rather than static tiers.
+    ladder: GridLadder,
     stored_content_end_ms: Option<i64>,
     timers: &ScanTimers,
 ) -> BackfillResult {
@@ -5257,7 +5686,7 @@ fn generate_backfill_visuals(
             // backfill, which is exactly what the pass is for.
             _ => true,
         },
-        tiers: still_ladder,
+        tiers: ladder,
     };
     // An image owing renditions runs the ordinary image pass: display tier
     // and grid tiers come out of the one decode together, so there is no
@@ -5309,6 +5738,9 @@ fn generate_backfill_visuals(
                     .into_iter()
                     .map(VisualVerdict::nothing)
                     .collect();
+                // The animated ladder's own verdicts ride alongside: the pass
+                // succeeded, and its loop still may not have.
+                verdicts.extend(produced.tier_verdicts);
             }
             Err(err) => {
                 // The failing site named the kinds it invalidates — a pass
@@ -5328,11 +5760,58 @@ fn generate_backfill_visuals(
         // to, even though no source file is opened.
         tiers = build_stored_thumbnail_tiers(sources);
     }
+    // The animated ladder, outside the chain above for the same reason the
+    // retirement below it is: an animated image that *also* owes a display
+    // rendition runs the ordinary image pass, and that pass already produced
+    // this set out of the decode it performed (`ImageLadderWork::tiers`), so
+    // an `else if` would be dead exactly when it mattered.
+    //
+    // The exclusivity condition is the image pass having *been attempted*,
+    // never its having succeeded. A pass that ran and failed — the decode
+    // broke, or ffmpeg did — has already paid the full decode and process
+    // spawn and already written the verdicts they owe; re-running the
+    // identical work here would double both, in the same scan, for exactly
+    // the items least able to afford it.
+    //
+    // Its own decode of the original when it does run, because there is
+    // nothing else to make a poster from: an animated item is normally served
+    // directly at the display tier, so there is no stored picture of it
+    // anywhere. The negative cache was consulted for exactly this decode
+    // before the work was dispatched.
+    let image_pass_attempted = needs_thumb && mime_type.starts_with("image");
+    if matches!(tier_work, Some(TierWork::Animated)) && !image_pass_attempted {
+        match image_file_size(path).map_err(|err| err.error).and_then(|file_size| {
+            open_image_oriented(path)
+                .map(|image| (file_size, image))
+                .map_err(|(stage, err)| FileProcessError::visuals_from_image_error(stage, err))
+        }) {
+            Ok((file_size, image)) => {
+                let (produced, tier_verdicts) =
+                    build_animated_tiers(path, mime_type, file_size, &image);
+                tiers = produced;
+                verdicts.extend(tier_verdicts);
+            }
+            Err(err) => {
+                // The decode this ladder is made of, and the same verdict the
+                // image pass would have written for it: an image whose pixels
+                // do not decode is markered, or the next scan repeats the
+                // whole attempt.
+                let err = VisualsError::image_decode(err);
+                tracing::debug!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to decode an animated image for its loop poster"
+                );
+                verdicts.extend(failure_verdicts(&err));
+                audit = audit.or_else(|| visuals_audit_failure(mime_type, &err));
+            }
+        }
+    }
     // The retirement verdict, outside the chain above rather than another arm
     // of it: it is a *delete*, and the pass that produced no set is exactly
     // the pass it has to survive. An animated image missing its display
     // rendition runs the ordinary image pass, which — correctly — writes no
-    // tiers at all (`ImageLadderWork::tiers` is false for it), so an `else
+    // tiers at all when its ladder is [`GridLadder::Nothing`], so an `else
     // if` here would swallow the retirement and freeze the stale set for
     // another scan. Only ever fills a `None`: a pass that did produce a set
     // is the authority on what this item wants.
@@ -5547,7 +6026,7 @@ fn build_backfill_thumbnails(
         let image = open_image_oriented(path).map_err(|(stage, err)| {
             VisualsError::image_decode(FileProcessError::visuals_from_image_error(stage, err))
         })?;
-        build_image_renditions(&mut out, file_size, image, image_work)
+        build_image_renditions(&mut out, path, mime_type, file_size, image, image_work)
             .map_err(VisualsError::thumbnail)?;
     } else if mime_type.starts_with("application/pdf") {
         let page = render_pdf_first_page(path)
@@ -5691,6 +6170,7 @@ fn encode_tiers(
             Ok(StoredTier {
                 idx,
                 tier: tier.as_str(),
+                media_type: TIER_MEDIA_TYPE.to_string(),
                 width: encoded.width,
                 height: encoded.height,
                 bytes: encoded.bytes,
@@ -8473,19 +8953,22 @@ LIMIT 1
     // before the animation question that stamps `items.duration`, so a scan
     // meeting an item indexed without that measurement sees `duration IS
     // NULL`, concludes "still", and writes static tiers for content the very
-    // same scan then records as animated. B2 owns animated renditions, so
-    // those stills are wrong — and being stored renditions they are served
-    // immutably, which makes "frozen forever" a real outcome rather than a
-    // cosmetic one.
+    // same scan then records as animated. Those stills are wrong — an
+    // animated item's grid rendition is a loop — and being stored renditions
+    // they are served immutably, which makes "frozen forever" a real outcome
+    // rather than a cosmetic one.
     //
     // The post-window state is reproduced exactly: tiers written by a scan
     // that believed the item still, and a positive `duration` recorded after
-    // them. A `duration` is a `duration` — the still ladder's exclusion is a
+    // them. A `duration` is a `duration` — the animated verdict is a
     // predicate on the column, not on the container — so a BMP carrying one
     // exercises the identical path an animated WebP does, deterministically
     // and without an encoder.
     #[tokio::test]
-    async fn a_stale_static_tier_set_is_retired_once_the_item_is_known_animated() {
+    async fn a_stale_static_tier_set_is_rebuilt_once_the_item_is_known_animated() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
         let test_env = test_data_dir();
         let env = visuals_env(test_env.path(), &["media-tier-animated"]).await;
         image::RgbImage::new(1400, 1400)
@@ -8517,14 +9000,103 @@ LIMIT 1
             "the ladder question is still asked for an animated item"
         );
         let mut conn = env.read().await;
-        assert!(
-            tier_rows(&mut conn).await.is_empty(),
-            "an animated item wants no still tier, so the stale set is retired"
+        // 5.88 MB uncompressed at 1400x1400: past the raw floor on both
+        // clauses, so this item wants the animated ladder — posters at the
+        // same geometry the stills had, plus the one loop that answers both
+        // grid tiers.
+        assert_eq!(
+            tier_rows(&mut conn).await,
+            vec![
+                tier("grid-m", 1024, 1024),
+                tier("grid-s", 512, 512),
+                tier(LOOP_TIER, 1024, 1024),
+            ],
+            "the stale still set is replaced by the animated one"
+        );
+        assert_eq!(
+            tier_media_types(&mut conn).await,
+            vec![
+                ("grid-m".to_string(), TIER_MEDIA_TYPE.to_string()),
+                ("grid-s".to_string(), TIER_MEDIA_TYPE.to_string()),
+                (LOOP_TIER.to_string(), LOOP_MEDIA_TYPE.to_string()),
+            ],
+            "an uncompressed 5.88 MB source dwarfs its H.264 encode, so the \
+             loop is stored rather than the keep-the-original verdict"
         );
         assert_eq!(
             thumbnail_count(&mut conn).await,
             0,
-            "and nothing else about the item is touched"
+            "and the display half of the ladder is not touched"
+        );
+        drop(conn);
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "and it settles: the animated set is the one the ladder wants"
+        );
+        let mut conn = env.read().await;
+        assert_eq!(tier_rows(&mut conn).await.len(), 3);
+    }
+
+    // The raw floor's other side: an animated item small enough to serve as
+    // its own file wants *nothing* stored, and a set an older rule left
+    // behind is retired rather than frozen. A GIF is animated by mime, so
+    // this isolates the floor itself — no duration measurement, no encoder,
+    // and no still-ladder verdict that could reach the same answer by
+    // accident.
+    #[tokio::test]
+    async fn a_raw_floor_animated_item_retires_whatever_it_carries() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-tier-floor"]).await;
+        let gif = env.media_dirs[0].join("tiny.gif");
+        image::RgbImage::from_fn(200, 200, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 0])
+        })
+        .save(&gif)
+        .unwrap();
+        assert!(
+            fs::metadata(&gif).unwrap().len() <= 1024 * 1024,
+            "the fixture has to be under the floor's byte clause"
+        );
+        env.scan().await;
+
+        {
+            let mut conn = env.read().await;
+            assert!(
+                tier_rows(&mut conn).await.is_empty(),
+                "nothing is stored for an item under the raw floor"
+            );
+        }
+
+        // A set from an older rule, planted the way an upgrade leaves one.
+        {
+            let mut conn = env.write().await;
+            let sha: String = sqlx::query_scalar("SELECT sha256 FROM items LIMIT 1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                r#"
+INSERT INTO storage.thumbnail_tiers (
+    item_sha256, idx, tier, item_mime_type, media_type, width, height, version, thumbnail
+)
+VALUES (?1, 0, 'grid-m', 'image/gif', 'image/jpeg', 200, 200, ?2, X'00')
+                "#,
+            )
+            .bind(&sha)
+            .bind(TIER_PROCESS_VERSION)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        let mut conn = env.read().await;
+        assert!(
+            tier_rows(&mut conn).await.is_empty(),
+            "an item under the raw floor wants no rendition at all"
         );
         drop(conn);
 
@@ -8533,8 +9105,443 @@ LIMIT 1
             totals.backfilled_visuals, 0,
             "and it settles: with nothing stored there is nothing to retire"
         );
+    }
+
+    /// A real animated GIF of `frames` frames, written by the `image` crate's
+    /// encoder so the LZW data is valid and ffmpeg will decode it. `pattern`
+    /// picks the pixels; the caller uses it to choose content whose GIF and
+    /// H.264 sizes it cares about.
+    fn write_animated_gif(
+        path: &Path,
+        side: u32,
+        frames: usize,
+        delay_ms: u32,
+        pattern: impl Fn(u32, u32, usize) -> image::Rgba<u8>,
+    ) {
+        let file = fs::File::create(path).unwrap();
+        let mut encoder = image::codecs::gif::GifEncoder::new(file);
+        encoder
+            .set_repeat(image::codecs::gif::Repeat::Infinite)
+            .unwrap();
+        let built: Vec<image::Frame> = (0..frames)
+            .map(|index| {
+                let buffer = image::RgbaImage::from_fn(side, side, |x, y| pattern(x, y, index));
+                image::Frame::from_parts(
+                    buffer,
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(delay_ms, 1),
+                )
+            })
+            .collect();
+        encoder.encode_frames(built).unwrap();
+    }
+
+    /// The settled encoded-larger-than-the-source edge (§2), reached the way
+    /// a library reaches it rather than by planting a row: a dithered
+    /// two-colour pattern is what GIF's palette coding is best at and what
+    /// H.264's transform is worst at, so the encode really does come out
+    /// larger — by two orders of magnitude here.
+    ///
+    /// The row is still written, with the geometry the dispatcher predicted,
+    /// because the alternative is asking for this loop again on every scan
+    /// forever. It carries no bytes, which is how the endpoint learns to
+    /// serve the file itself.
+    #[test]
+    fn a_loop_no_smaller_than_its_source_keeps_the_original() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dither.gif");
+        write_animated_gif(&path, 600, 2, 100, |x, y, index| {
+            if (x + y + index as u32).is_multiple_of(3) {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            }
+        });
+        let file_size = fs::metadata(&path).unwrap().len();
+        let image = open_image_oriented(&path).expect("the fixture decodes");
+
+        let (tiers, verdicts) = build_animated_tiers(&path, "image/gif", file_size, &image);
+        let tiers = tiers.expect("the ladder is produced");
+        assert!(
+            verdicts.is_empty(),
+            "keeping the original is a verdict about the content, not a failure"
+        );
+
+        let animated = tiers
+            .iter()
+            .find(|tier| tier.tier == LOOP_TIER)
+            .expect("the loop row is written whatever the comparison says");
+        assert!(
+            animated.bytes.is_empty(),
+            "an encode no smaller than its source must not be stored"
+        );
+        assert_eq!(
+            animated.media_type, "image/gif",
+            "the row names what the endpoint will actually serve"
+        );
+        assert_eq!(
+            (animated.width, animated.height),
+            (600, 600),
+            "the geometry is still exactly what the dispatcher predicts"
+        );
+        // ... and the posters are real pictures either way: `still=true` has
+        // to answer with something.
+        let posters: Vec<&StoredTier> = tiers
+            .iter()
+            .filter(|tier| tier.tier != LOOP_TIER)
+            .collect();
+        assert!(!posters.is_empty());
+        assert!(posters.iter().all(|tier| !tier.bytes.is_empty()));
+    }
+
+    /// The animated ladder's failure ledger. Without it the dispatcher's
+    /// existing marker consult has nothing to find, and an item whose loop
+    /// cannot be encoded pays a full decode plus a process spawn on every
+    /// scan, forever.
+    #[test]
+    fn a_failed_loop_encode_owes_the_ledger_a_verdict() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        // Decodable pixels in hand (so the posters encode), behind a path
+        // ffmpeg cannot make anything of.
+        let path = dir.path().join("broken.gif");
+        fs::write(&path, b"GIF89a and then nothing ffmpeg can use").unwrap();
+        let image = DynamicImage::ImageRgb8(image::RgbImage::new(1400, 1400));
+
+        let (tiers, verdicts) = build_animated_tiers(&path, "image/gif", 4_000_000, &image);
+        assert!(
+            tiers.is_none(),
+            "a set without its loop must never be stored: it would never \
+             match what the dispatcher predicts"
+        );
+        let kinds: Vec<VisualKind> = verdicts.iter().map(|verdict| verdict.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![VisualKind::Loop],
+            "a loop failure is the loop's own verdict: the pixels decoded, and \
+             a thumbnail marker would suppress a display rendition this file \
+             can still produce"
+        );
+        let failure = verdicts[0]
+            .failure
+            .as_ref()
+            .expect("a failed run is a failure, not a permanent nothing");
+        assert_eq!(
+            failure.skip_after, SKIP_AFTER_AMBIGUOUS,
+            "ffmpeg did its own file I/O, so one failure does not settle it"
+        );
+    }
+
+    /// The classification, per outcome: only the caller can write these, and
+    /// the three shapes have very different lifetimes.
+    #[test]
+    fn loop_failures_classify_by_what_actually_went_wrong() {
+        // A missing toolchain is `blocked`: never a verdict on the media, and
+        // it self-heals the moment ffmpeg appears.
+        let missing = LoopError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no ffmpeg",
+        ));
+        let failure = loop_failure(missing)
+            .error
+            .visual_failure()
+            .expect("a classified failure")
+            .clone();
+        assert!(matches!(
+            failure.kind,
+            ApiErrorKind::Blocked {
+                blocker: Blocker::Ffmpeg
+            }
+        ));
+
+        // Any other spawn problem is this machine's, and stays transient —
+        // no verdict at all, so the work is simply retried.
+        let busy = LoopError::Spawn(std::io::Error::other("resource temporarily unavailable"));
+        assert!(
+            failure_verdicts(&loop_failure(busy)).is_empty(),
+            "a transient failure must not write a marker"
+        );
+
+        // A run that failed needs two strikes: ffmpeg did its own file I/O.
+        // This is the ONLY outcome that can ever suppress anything.
+        let ran = LoopError::Failed("moov atom not found".to_string());
+        let failure = loop_failure(ran)
+            .error
+            .visual_failure()
+            .expect("a classified failure")
+            .clone();
+        assert_eq!(failure.kind, ApiErrorKind::Input);
+        assert_eq!(failure.skip_after, SKIP_AFTER_AMBIGUOUS);
+
+        // Host trouble is never the file's fault. A disk that fills during a
+        // library-wide backfill must not spend a strike against every
+        // animated item in the library and retire the ladder wholesale.
+        for host in [
+            LoopError::Host("could not create a loop directory: disk full".to_string()),
+            LoopError::Host("the encoded loop did not read back: disk full".to_string()),
+        ] {
+            assert!(
+                failure_verdicts(&loop_failure(host)).is_empty(),
+                "host trouble writes no marker and is simply retried"
+            );
+        }
+
+        // A container this build cannot decode is transient here too: the
+        // dispatcher's probe is what gates it, and a ledger row would be the
+        // item's answer forever with no path back (R2-A).
+        let unsupported = LoopError::Unsupported("no animated AVIF decoder".to_string());
+        assert!(failure_verdicts(&loop_failure(unsupported)).is_empty());
+
+        // Every arm scopes to the loop kind and only the loop kind.
+        for error in [
+            LoopError::Failed("x".to_string()),
+            LoopError::Host("y".to_string()),
+            LoopError::Spawn(std::io::Error::other("z")),
+            LoopError::Unsupported("w".to_string()),
+        ] {
+            assert_eq!(loop_failure(error).kinds, &[VisualKind::Loop]);
+        }
+    }
+
+    /// R2-C's bite case, and the reason the loop has a kind of its own: a
+    /// loop failure must not cost this item its **display** rendition. The
+    /// dispatcher consults the two markers separately, so a `loop` marker
+    /// retires the animated ladder while a display rendition the rule starts
+    /// wanting later is still generated.
+    #[tokio::test]
+    async fn a_loop_marker_retires_the_ladder_without_touching_the_display_half() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-loop-marker"]).await;
+        let path = env.media_dirs[0].join("clip.gif");
+        write_animated_gif(&path, 900, 2, 100, |x, y, index| {
+            let shade = (index as u8).wrapping_mul(90);
+            image::Rgba([shade, (x / 32) as u8, (y / 32) as u8, 255])
+        });
+        // Past the display rule's *byte* bound, so this item genuinely owes a
+        // display rendition — the half a loop marker must never touch. GIF
+        // decoders stop at the trailer, so padding changes the file's size
+        // and nothing else about it; both the dispatcher and the generator
+        // read the same `image_file_size`, so they agree.
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&vec![0_u8; (DISPLAY_MAX_FILE_SIZE + 1) as usize])
+                .unwrap();
+        }
+        env.scan().await;
+        let sha: String = {
+            let mut conn = env.read().await;
+            assert_eq!(
+                thumbnail_count(&mut conn).await,
+                1,
+                "the premise: past the byte bound, this item owes a display rendition"
+            );
+            assert!(
+                tier_rows(&mut conn)
+                    .await
+                    .iter()
+                    .any(|(tier, _, _)| tier == LOOP_TIER),
+                "the premise: and it is on the animated ladder"
+            );
+            sqlx::query_scalar("SELECT sha256 FROM items LIMIT 1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap()
+        };
+
+        // Two strikes of the one outcome that can settle anything, and both
+        // stored renditions cleared so the next scan owes each half again.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("DELETE FROM storage.thumbnail_tiers")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM storage.thumbnails")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                r#"
+INSERT INTO storage.visual_attempts (
+    item_sha256, kind, item_mime_type, version, outcome, skip_after, attempts,
+    first_seen, last_attempt
+)
+VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
+                "#,
+            )
+            .bind(&sha)
+            .bind(TIER_PROCESS_VERSION)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        env.scan().await;
         let mut conn = env.read().await;
-        assert!(tier_rows(&mut conn).await.is_empty());
+        // The bite case. Had the loop failure marked `thumbnail` — the kind
+        // the ladder's decode shares — this would be 0, and a file ffmpeg
+        // cannot encode would have lost the still it is perfectly capable of
+        // producing.
+        assert_eq!(
+            thumbnail_count(&mut conn).await,
+            1,
+            "a loop marker must never suppress a display rendition"
+        );
+        assert!(
+            tier_rows(&mut conn).await.is_empty(),
+            "and it must retire the animated ladder, including the pass the \
+             display half is running anyway"
+        );
+
+        // The heal path the kind exists for: the tier version moves and the
+        // ledger's `version >= ?` consult stops finding the marker.
+        assert!(
+            visuals_suppressed(&mut conn, &sha, VisualKind::Loop, TIER_PROCESS_VERSION)
+                .await
+                .unwrap(),
+            "the marker suppresses at the version it was written for"
+        );
+        assert!(
+            !visuals_suppressed(&mut conn, &sha, VisualKind::Loop, TIER_PROCESS_VERSION + 1)
+                .await
+                .unwrap(),
+            "a TIER_PROCESS_VERSION bump retires it for free"
+        );
+        // And it is invisible to the thumbnail consult by construction: the
+        // ledger's key is (content, kind).
+        assert!(
+            !visuals_suppressed(
+                &mut conn,
+                &sha,
+                VisualKind::Thumbnail,
+                THUMBNAIL_PROCESS_VERSION
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    /// R2-A: a container this build cannot decode is **undecidable**, not a
+    /// permanent nothing — so the dispatcher answers `Unknown` and writes no
+    /// ledger row, and installing a capable ffmpeg later picks the item up on
+    /// the next process. A `nothing` marker could never be cleared: it
+    /// carries no blocker for the auto-heal to probe, the store that clears
+    /// markers never runs for a served-directly item, and the only remaining
+    /// escape is a `THUMBNAIL_PROCESS_VERSION` bump that §2 forbids.
+    #[test]
+    fn an_undecodable_animated_container_is_undecidable_not_a_permanent_nothing() {
+        const MB: u64 = 1024 * 1024;
+        let animated = facts(6 * MB, 2000, 2000, Some(2.0));
+        assert_eq!(
+            grid_ladder("image/avif", Some(&animated)),
+            if crate::media_tools::transcode::hw::animated_avif_decodable() {
+                GridLadder::Animated
+            } else {
+                GridLadder::Unknown
+            },
+            "an animated AVIF follows what this toolchain can actually demux"
+        );
+        // The gate is the container's, not the ladder's: WebP has the frame
+        // bridge, so it never depends on an ffmpeg demuxer.
+        assert_eq!(
+            grid_ladder("image/webp", Some(&animated)),
+            GridLadder::Animated
+        );
+        assert_eq!(
+            grid_ladder("image/gif", Some(&animated)),
+            GridLadder::Animated
+        );
+    }
+
+    /// The reclassification HG3 introduced, end to end: a GIF the animation
+    /// question later measures as **still** leaves the animated ladder, and
+    /// the retirement machinery is what moves it — the loop row goes and the
+    /// static tiers arrive, in one pass, and the next scan writes nothing.
+    #[tokio::test]
+    async fn a_gif_measured_still_swaps_its_loop_for_static_tiers() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-tier-restill"]).await;
+        write_animated_gif(
+            &env.media_dirs[0].join("clip.gif"),
+            1400,
+            2,
+            100,
+            |x, y, index| {
+                let shade = (index as u8).wrapping_mul(90);
+                image::Rgba([shade, (x / 64) as u8, (y / 64) as u8, 255])
+            },
+        );
+        env.scan().await;
+
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                tier_rows(&mut conn).await,
+                vec![
+                    tier("grid-m", 1024, 1024),
+                    tier("grid-s", 512, 512),
+                    tier(LOOP_TIER, 1024, 1024),
+                ],
+                "the premise: a measured animation takes the animated ladder"
+            );
+        }
+
+        // What the animation question records for a single-frame GIF, or for
+        // one whose structure does not parse: measured, and still.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE items SET duration = 0.0")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        let mut conn = env.read().await;
+        assert_eq!(
+            tier_rows(&mut conn).await,
+            vec![tier("grid-m", 1024, 1024), tier("grid-s", 512, 512)],
+            "a measured-still GIF wants static tiers and no loop"
+        );
+        assert!(
+            !tier_media_types(&mut conn)
+                .await
+                .iter()
+                .any(|(tier, _)| tier == LOOP_TIER),
+            "the loop row is retired, not left behind to be served immutably"
+        );
+        drop(conn);
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "and it settles: the still set is the one the ladder now wants"
+        );
+    }
+
+    /// Every stored grid rendition as `(tier, media_type)`, in the
+    /// dispatcher's own order.
+    async fn tier_media_types(conn: &mut sqlx::SqliteConnection) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT tier, media_type FROM storage.thumbnail_tiers ORDER BY idx, tier",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
     }
 
     // An item whose display rendition is already the one the current rule
@@ -10210,7 +11217,10 @@ LIMIT 1
             true,
             10.0,
             Some(5000),
-            ImageLadderWork::first_pass("video/mp4", Some(10.0)),
+            ImageLadderWork {
+                display: true,
+                tiers: GridLadder::Still,
+            },
         )
         else {
             panic!("unreadable bytes cannot yield frames");
@@ -10233,7 +11243,10 @@ LIMIT 1
             false,
             10.0,
             None,
-            ImageLadderWork::first_pass("video/mp4", Some(10.0)),
+            ImageLadderWork {
+                display: true,
+                tiers: GridLadder::Still,
+            },
         ) else {
             panic!("unreadable bytes cannot yield frames");
         };
@@ -12865,25 +13878,151 @@ LIMIT 1
         }
     }
 
-    // Animated items are step B2's, and both the dispatch question and the
-    // generator have to agree on which those are — or the scan writes a still
-    // tier the dispatcher will never reconcile.
+    /// Facts for the ladder classifier, in the shape the dispatcher gathers
+    /// them.
+    fn facts(file_size: u64, width: i64, height: i64, duration: Option<f64>) -> ImageFacts {
+        ImageFacts {
+            file_size,
+            dimensions: Some((width, height)),
+            duration,
+        }
+    }
+
+    // The classifier every part of the ladder obeys: the dispatch question,
+    // the generator, and — through `is_animated_image` and the raw floor —
+    // the serving endpoint. All three have to agree on which items move, or
+    // the scan writes a set the dispatcher will never reconcile.
     #[test]
-    fn the_still_ladder_skips_animated_images_only() {
-        // The pre-existing exclusions.
-        assert!(!still_ladder_applies("image/gif", None));
-        assert!(!still_ladder_applies("", None));
-        // A measured animation length disqualifies an image...
-        assert!(!still_ladder_applies("image/webp", Some(3.5)));
-        // ... and a measured *still* verdict, or no measurement at all, does
-        // not.
-        assert!(still_ladder_applies("image/webp", Some(0.0)));
-        assert!(still_ladder_applies("image/webp", None));
-        assert!(still_ladder_applies("image/jpeg", None));
-        // A video's duration says nothing about its tiers: they come from its
+    fn the_ladder_splits_still_animated_and_raw_floor_items() {
+        const MB: u64 = 1024 * 1024;
+        // Stills, whatever their duration says: a video's tiers come from its
         // stored frame grid, which is a still by construction.
-        assert!(still_ladder_applies("video/mp4", Some(120.0)));
-        assert!(still_ladder_applies("audio/mpeg", Some(200.0)));
+        assert_eq!(grid_ladder("image/jpeg", None), GridLadder::Still);
+        assert_eq!(grid_ladder("video/mp4", None), GridLadder::Still);
+        assert_eq!(grid_ladder("audio/mpeg", None), GridLadder::Still);
+        assert_eq!(
+            grid_ladder("image/webp", Some(&facts(9 * MB, 2000, 2000, Some(0.0)))),
+            GridLadder::Still,
+            "a measured *still* WebP is an ordinary image"
+        );
+        // No mime type: no generator will ever produce a picture, so the
+        // wanted set is empty by rule.
+        assert_eq!(grid_ladder("", None), GridLadder::Nothing);
+
+        // Animated, above the raw floor on bytes, on dimensions, or on both.
+        assert_eq!(
+            grid_ladder("image/gif", Some(&facts(4 * MB, 400, 400, None))),
+            GridLadder::Animated,
+            "a GIF is animated by mime — the duration measurement runs later"
+        );
+        assert_eq!(
+            grid_ladder("image/gif", Some(&facts(200 * 1024, 800, 600, Some(3.0)))),
+            GridLadder::Animated
+        );
+        assert_eq!(
+            grid_ladder("image/webp", Some(&facts(6 * MB, 1200, 1200, Some(2.0)))),
+            GridLadder::Animated
+        );
+
+        // Under the raw floor: served as-is, nothing stored at all.
+        assert_eq!(
+            grid_ladder("image/gif", Some(&facts(300 * 1024, 320, 240, Some(1.0)))),
+            GridLadder::Nothing
+        );
+        assert_eq!(
+            grid_ladder("image/webp", Some(&facts(MB, 512, 512, Some(1.0)))),
+            GridLadder::Nothing
+        );
+
+        // A measured-still GIF leaves the animated ladder entirely: a single
+        // frame is not an animation, and an eternal one-frame mp4 is not a
+        // rendition anyone wants.
+        assert_eq!(
+            grid_ladder("image/gif", Some(&facts(4 * MB, 1400, 1400, Some(0.0)))),
+            GridLadder::Still
+        );
+
+        // Undecidable: an animated item whose dimensions were never measured.
+        // Neither "empty" (which would retire a correct set) nor "animated"
+        // (which needs geometry nobody has) is a safe guess.
+        assert_eq!(grid_ladder("image/gif", None), GridLadder::Unknown);
+        assert_eq!(
+            grid_ladder(
+                "image/gif",
+                Some(&ImageFacts {
+                    file_size: 4 * MB,
+                    dimensions: None,
+                    duration: Some(2.0),
+                })
+            ),
+            GridLadder::Unknown
+        );
+
+        // The new-item pass asks the same question off its own decode.
+        assert_eq!(
+            first_pass_ladder("image/gif", Some(2.0), 4 * MB, 400, 400),
+            GridLadder::Animated
+        );
+        assert_eq!(
+            first_pass_ladder("image/gif", Some(0.0), 4 * MB, 1400, 1400),
+            GridLadder::Still
+        );
+        assert_eq!(
+            first_pass_ladder("image/gif", Some(2.0), 300 * 1024, 320, 240),
+            GridLadder::Nothing
+        );
+        assert_eq!(
+            first_pass_ladder("image/png", None, 30 * MB, 8000, 8000),
+            GridLadder::Still
+        );
+    }
+
+    // The pre-spans window, walked as the transition it is. An animated
+    // *container* nothing has measured is not a still: classifying it `Still`
+    // writes static tiers for a picture that may well move, serves them
+    // immutably in the window before the measurement lands, and leaves them
+    // unreachable — on the next scan a genuinely still file answers
+    // identically, so nothing distinguishes the two. Only the scan can see
+    // this; `is_animated_image` is shared with the endpoint and must not move.
+    #[test]
+    fn an_unmeasured_animated_container_is_undecidable_until_it_is_measured() {
+        const MB: u64 = 1024 * 1024;
+        for mime in ["image/webp", "image/avif"] {
+            // Indexed before the animation question existed.
+            assert_eq!(
+                grid_ladder(mime, Some(&facts(6 * MB, 2000, 2000, None))),
+                GridLadder::Unknown,
+                "{mime} with no measurement must not be called still"
+            );
+            // The measurement lands, and the item settles either way.
+            assert_eq!(
+                grid_ladder(mime, Some(&facts(6 * MB, 2000, 2000, Some(0.0)))),
+                GridLadder::Still,
+                "{mime} measured still takes the static ladder"
+            );
+            assert_eq!(
+                grid_ladder(mime, Some(&facts(6 * MB, 2000, 2000, Some(2.0)))),
+                GridLadder::Animated
+            );
+            // Below the raw floor it wants nothing at all, measured or not.
+            assert_eq!(
+                grid_ladder(mime, Some(&facts(300 * 1024, 400, 400, Some(2.0)))),
+                GridLadder::Nothing
+            );
+        }
+
+        // The containers the animation question never measures are decided
+        // immediately, exactly as before: their `duration` is NULL forever.
+        assert_eq!(
+            grid_ladder("image/png", Some(&facts(6 * MB, 2000, 2000, None))),
+            GridLadder::Still
+        );
+        assert_eq!(
+            grid_ladder("image/jpeg", Some(&facts(6 * MB, 2000, 2000, None))),
+            GridLadder::Still
+        );
+        // And a video is never in this family at all.
+        assert_eq!(grid_ladder("video/mp4", None), GridLadder::Still);
     }
 
     // The ladder question's mime early-out must cover exactly the types a

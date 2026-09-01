@@ -22,10 +22,14 @@ use crate::db::items::{
     get_extracted_text_for_item, get_item_metadata, get_item_metadata_unchecked, get_text_by_ids,
     get_thumbnail_bytes,
 };
-use crate::db::storage::get_thumbnail_tier_bytes;
+use crate::db::storage::get_thumbnail_tier_rendition;
 use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::jobs::files::format_system_time;
-use crate::visual_tiers::{DisplayPlan, ThumbnailTier, display_plan, grid_serves_original};
+use crate::media_tools::animation::measures_animation;
+use crate::visual_tiers::{
+    DisplayPlan, LOOP_TIER, ThumbnailTier, animated_serves_original, display_plan,
+    grid_serves_original, is_animated_image,
+};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -229,9 +233,9 @@ pub(crate) struct ThumbnailQuery {
     #[param(default = "display")]
     size: ThumbnailTier,
     /// Animated items: serve the static tier image (the loop's poster)
-    /// instead of the loop. Accepted now and a no-op for static items, whose
-    /// renditions are always images; the animated pipeline it selects
-    /// between is step B2.
+    /// instead of the loop. A no-op for static items, whose renditions are
+    /// always images, and for animated items at or below the raw floor,
+    /// which are served as their original file either way.
     #[serde(default)]
     #[param(default = false)]
     still: bool,
@@ -417,7 +421,7 @@ pub async fn texts_any(
     path = "/api/items/item/thumbnail",
     tag = "items",
     summary = "Get thumbnail for an item",
-    description = "Returns a thumbnail for a given item.\nThe thumbnail may be a stored rendition,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nGIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).\nThe `size` parameter selects a rendition tier: `display` (default, unchanged behaviour),\n`grid-m` (short side 1024) or `grid-s` (short side 512).\nA tier with no stored rendition falls through to the next larger one.",
+    description = "Returns a thumbnail for a given item.\nThe thumbnail may be a stored rendition,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nOn the default (`display`) path GIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).\nThe `size` parameter selects a rendition tier: `display` (default, unchanged behaviour),\n`grid-m` (short side 1024) or `grid-s` (short side 512).\nA tier with no stored rendition falls through to the next larger one.\nAt a grid tier an **animated** item above the raw floor answers with its H.264 loop as\n`video/mp4` (one rendition serves both grid tiers), and `still=true` answers with the\nstatic poster for that tier instead. Animated items at or below the floor - at most\n1 MiB with both sides at most 512 px, reported by `/api/client-config` - are answered\nwith their original file at every tier.",
     params(DbQueryParams, ThumbnailQuery),
     responses(
         (status = 200, description = "Item thumbnail image")
@@ -507,13 +511,19 @@ fn tier_ladder(requested: ThumbnailTier) -> &'static [ThumbnailTier] {
 /// [`grid_serves_original`]), so the endpoint can never disagree with what
 /// was stored. Anything it cannot decide takes the revalidating branch.
 fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
-    // GIFs — and items with no mime type at all — short-circuit to the
-    // original file at every tier. For the **display** path that is what they
-    // have always served and what B2 keeps serving (the short-circuit is
-    // retired for tier requests only), so the answer is final. A *grid*
-    // request for one is B2's to replace with a loop, so it is not.
-    if item.mime_type.is_empty() || item.mime_type.starts_with("image/gif") {
-        return size == ThumbnailTier::Display;
+    // An item with no mime type at all short-circuits to its original file at
+    // every tier, and always will: `mime_can_have_renditions` says no
+    // generator will ever produce a picture for it, so its wanted set is
+    // empty by rule and the file *is* the rendition.
+    if item.mime_type.is_empty() {
+        return true;
+    }
+    // A GIF's **display** answer is its original file and always will be —
+    // the short-circuit below is retired for tier requests only — so it is
+    // final whatever its dimensions say. Its *grid* answers go through the
+    // animated rule further down, like every other animated image.
+    if item.mime_type.starts_with("image/gif") && size == ThumbnailTier::Display {
+        return true;
     }
     // Only an *image's* renditions are a function of the file this URL names.
     // Every other kind derives them from a stored rendition — a video's
@@ -528,17 +538,6 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
     if !item.mime_type.starts_with("image") {
         return false;
     }
-    // Animated images are step B2's, which will store *loops* where nothing
-    // is stored today. Treating today's absence as final would pin the
-    // static fall-up straight through that upgrade. GRID tiers only: the
-    // display path keeps serving what it serves today (same reasoning as the
-    // GIF line above — the one real display transition, `display_plan`
-    // flipping to Thumbnail for a huge animated file, is caught below), so
-    // guarding Display here would only cost a revalidation per animated
-    // image per gallery load, forever, protecting nothing.
-    if size != ThumbnailTier::Display && item.duration.is_some_and(|seconds| seconds > 0.0) {
-        return false;
-    }
     let (Some(width), Some(height), Some(file_size)) = (item.width, item.height, item.size) else {
         return false;
     };
@@ -550,6 +549,38 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
         return false;
     };
     if width == 0 || height == 0 {
+        return false;
+    }
+    // An animated image's GRID answers come off the animated ladder: above
+    // the raw floor it stores a loop and posters, so the file it is served
+    // from today is a *pending* answer and must revalidate; at or below the
+    // floor nothing is ever stored for it, so the original is its rendition
+    // forever and is as final as a hit.
+    //
+    // Grid tiers only. The display path keeps serving what it serves today
+    // (same reasoning as the GIF line above), and the one real display
+    // transition — `display_plan` flipping to Thumbnail for a huge animated
+    // file — is caught by the ordinary display rule below, so guarding
+    // Display here would cost a revalidation per animated image per gallery
+    // load, forever, protecting nothing.
+    if size != ThumbnailTier::Display && is_animated_image(&item.mime_type, item.duration) {
+        return animated_serves_original(file_size, width, height);
+    }
+    // The endpoint's half of the scan's pre-measurement caution
+    // (`jobs::files::grid_ladder`). An animated *container* nothing has
+    // measured is not a still: `is_animated_image` above answers "not
+    // animated" for it, and without this the ordinary grid rule below would
+    // call a 900x900 700 KB WebP final and pin its original for a year — on
+    // exactly the items whose loop is still on its way, which would then
+    // never reach the client at all.
+    //
+    // Grid tiers only, and only until the measurement lands: an item with a
+    // real `duration` takes the animated branch above, and a measured-still
+    // one takes the ordinary rule with nothing left to wait for.
+    if size != ThumbnailTier::Display
+        && item.duration.is_none()
+        && measures_animation(&item.mime_type)
+    {
         return false;
     }
     match size.short_side() {
@@ -584,29 +615,51 @@ async fn thumbnail_response(
 
     let mime = item.mime_type.as_str();
     // Whether anything but the requested tier's own rendition is a final
-    // answer for this URL. Computed once, because three different responses
+    // answer for this URL. Computed once, because several different responses
     // below can be a fall-up.
     let fall_up_is_final = tier_fall_up_is_final(item, size);
-    if mime.is_empty() || mime.starts_with("image/gif") {
-        // Animated items are step B2's: until their video loops exist, every
-        // tier of a GIF is the original file, exactly as before.
-        //
-        // TODO(B2): this branch must fold `still` into its ETag before it can
-        // select different bytes. It rewrites to serve the loop at `size=grid-*`
-        // and the static poster at `still=true`, and `file_response`'s
-        // validator is `sha256-size-mtime` — identical for both variants — so
-        // shipping the selection without extending the ETag would hand a
-        // cached poster back for a loop request and vice versa.
-        //
-        // `fall_up_is_final` is false for every animated item precisely so
-        // that the bytes served here do not outlive that change in a client
-        // cache.
-        return file_response(
+    // The `still` variant is part of every ETag on this endpoint, including
+    // the file-serving branches. `file_response`'s own validator is
+    // `sha256-size-mtime`, identical for the loop and the poster, so without
+    // this a cached poster would be handed back for a loop request and vice
+    // versa (§3, B2's must).
+    let still_suffix = if still { "-still" } else { "" };
+    // An item with no mime type has no generator and no rendition, at any
+    // tier: its file is the answer, exactly as before.
+    //
+    // A GIF keeps the same short-circuit on the **display** path only — that
+    // is the default path the gallery uses and B2 does not touch it — while
+    // its grid tiers now go through the animated ladder below, which is what
+    // retires the short-circuit for tier requests.
+    if mime.is_empty() || (mime.starts_with("image/gif") && size == ThumbnailTier::Display) {
+        return file_variant_response(
             item,
             files,
-            "inline",
+            still_suffix,
             request_headers,
             content_addressed && fall_up_is_final,
+        )
+        .await;
+    }
+
+    // The animated ladder (§2, step B2): a moving picture's grid rendition is
+    // an H.264 loop, and `still=true` is how a caller asks for the poster
+    // instead. Answered before the still ladder below, because for these
+    // items the two are alternatives, not a fall-up chain — a *poster* is
+    // never the answer to an animated grid request, or the grid would be the
+    // one surface that never animates.
+    if size != ThumbnailTier::Display && is_animated_image(mime, item.duration) {
+        return animated_tier_response(
+            conn,
+            item,
+            files,
+            size,
+            still,
+            still_suffix,
+            original_filename_no_ext,
+            request_headers,
+            content_addressed,
+            fall_up_is_final,
         )
         .await;
     }
@@ -636,11 +689,11 @@ async fn thumbnail_response(
     // aspect > 2 items, which is a new URL and therefore busts the stale
     // webtoon class outright.
     //
-    // `still` is part of the variant even though it selects nothing yet: it
-    // will pick the poster over the loop for animated items (B2), and a
-    // cache entry stamped before that landed must not be reused for it.
+    // `still` is part of the variant even where it selects nothing: for a
+    // static item both values are the same picture, and paying one extra
+    // cache entry for that is far cheaper than a rule that has to know which
+    // items are which.
     let sha256 = &item.sha256;
-    let still_suffix = if still { "-still" } else { "" };
     let filename = format!("{original_filename_no_ext}.jpg");
     // A response that is the requested tier's own rendition is final by
     // construction; anything else is a fall-up and answers to the split in
@@ -653,13 +706,13 @@ async fn thumbnail_response(
         }
     };
     for tier in tier_ladder(size) {
-        if let Some(buffer) =
-            get_thumbnail_tier_bytes(conn, sha256, index, tier.as_str()).await?
+        if let Some(rendition) =
+            get_thumbnail_tier_rendition(conn, sha256, index, tier.as_str()).await?
         {
-            let etag = format!("\"{sha256}-thumb{index}-{}{still_suffix}\"", tier.as_str());
+            let etag = tier_etag(sha256, index, tier.as_str(), rendition.version, still_suffix);
             return bytes_response(
-                buffer,
-                "image/jpeg",
+                rendition.bytes,
+                &rendition.media_type,
                 &filename,
                 &etag,
                 cache_control(*tier == size),
@@ -682,15 +735,10 @@ async fn thumbnail_response(
     }
 
     if mime.starts_with("image") {
-        // TODO(B2): fold `still` into this branch's ETag before it selects
-        // different bytes. B2 rewrites this to choose between an animated
-        // loop and its static poster, and `file_response`'s validator
-        // (`sha256-size-mtime`) is identical for both — so a cached poster
-        // would be handed back for a loop request and vice versa.
-        return file_response(
+        return file_variant_response(
             item,
             files,
-            "inline",
+            still_suffix,
             request_headers,
             content_addressed && fall_up_is_final,
         )
@@ -711,6 +759,182 @@ async fn thumbnail_response(
     )
 }
 
+/// The validator for one stored grid rendition, and the only place its shape
+/// is written.
+///
+/// `(content hash, picture index, tier, generator version, still variant)` —
+/// every input that can change the bytes this URL answers with. The
+/// **version** is the one that is not obvious and the one that matters: a
+/// rendition's identity is not fully captured by its geometry, because
+/// `TIER_PROCESS_VERSION` exists exactly for the generator changes geometry
+/// cannot see (crop anchor, resampling filter, JPEG quality, the loop's CRF).
+/// Those regenerate in place, at the same `(item, idx, tier)`, and a hit is
+/// served `immutable` — so without the version a bumped generator would leave
+/// every warm client on the superseded bytes for a year.
+///
+/// The `still` variant rides here too, for the same reason it rides on the
+/// file branches: for an animated item it selects a different picture
+/// entirely.
+fn tier_etag(sha256: &str, index: i64, tier: &str, version: i64, still_suffix: &str) -> String {
+    format!("\"{sha256}-thumb{index}-{tier}-v{version}{still_suffix}\"")
+}
+
+/// A grid-tier request for an animated item (§2, step B2).
+///
+/// Three answers, and which one is right is decided entirely by what the scan
+/// stored:
+///
+/// * **The loop** — one H.264 rendition per item, answering *both* grid
+///   tiers, served as its stored media type. An exact hit by construction:
+///   there is nothing larger to fall up to, because the loop is not a ladder.
+/// * **The poster** (`still=true`) — the static tiers, walked with the same
+///   fall-up ladder every still request uses (`grid-s` falls up to `grid-m`,
+///   which every animated item above the floor stores).
+/// * **The original file** — for an item at or below the raw floor, where
+///   nothing is stored and nothing ever will be (final, immutable); for one
+///   whose loop the backfill has not written yet (pending, revalidates); and
+///   for the settled encoded-larger-than-the-source edge, where the stored
+///   loop row deliberately carries no bytes.
+///
+/// A poster is never substituted for a missing loop. The grid would then be
+/// the one surface where an animated item does not move, silently and
+/// permanently, which is precisely the bug this step exists to fix.
+#[allow(clippy::too_many_arguments)]
+async fn animated_tier_response(
+    conn: &mut sqlx::SqliteConnection,
+    item: &ItemRecord,
+    files: &[FileRecord],
+    size: ThumbnailTier,
+    still: bool,
+    still_suffix: &str,
+    original_filename_no_ext: &str,
+    request_headers: &HeaderMap,
+    content_addressed: bool,
+    fall_up_is_final: bool,
+) -> ApiResult<Response<Body>> {
+    let sha256 = &item.sha256;
+    // Animated items are images, so there is only ever one picture: index 0.
+    // (`big` selects between a video's two stored pictures and has no meaning
+    // here.)
+    let index = 0;
+    if !still {
+        if let Some(rendition) =
+            get_thumbnail_tier_rendition(conn, sha256, index, LOOP_TIER).await?
+            && !rendition.bytes.is_empty()
+        {
+            let etag = tier_etag(sha256, index, LOOP_TIER, rendition.version, "");
+            return bytes_response(
+                rendition.bytes,
+                &rendition.media_type,
+                &format!("{original_filename_no_ext}.mp4"),
+                &etag,
+                // The loop is the whole animated ladder: it is the exact
+                // answer at every grid tier, never a fall-up, so a hit is
+                // immutable like any other. Safe across a generator change
+                // because its ETag carries the version the bytes were made
+                // at ([`tier_etag`]).
+                if content_addressed {
+                    CACHE_IMMUTABLE
+                } else {
+                    CACHE_REVALIDATE
+                },
+                request_headers,
+            );
+        }
+        // No loop bytes: either none stored yet (pending — `fall_up_is_final`
+        // is false and the response revalidates until it lands) or the row
+        // that says the source is smaller than any encode of it, which is as
+        // final as a hit. Both serve the item's own animated file.
+        return file_variant_response(
+            item,
+            files,
+            still_suffix,
+            request_headers,
+            content_addressed && (fall_up_is_final || stored_loop_keeps_original(conn, item).await),
+        )
+        .await;
+    }
+
+    for tier in tier_ladder(size) {
+        if let Some(rendition) =
+            get_thumbnail_tier_rendition(conn, sha256, index, tier.as_str()).await?
+        {
+            let etag = tier_etag(sha256, index, tier.as_str(), rendition.version, still_suffix);
+            return bytes_response(
+                rendition.bytes,
+                &rendition.media_type,
+                &format!("{original_filename_no_ext}.jpg"),
+                &etag,
+                // Exact hits only. A `grid-s` request answered from `grid-m`
+                // is a fall-up like any other: today it is stored that way
+                // because the two renditions would be the identical picture,
+                // but a generator change can make `grid-s` a real, smaller
+                // rendition — and an immutable fall-up would pin the larger
+                // poster past it. The version-aware ETag makes the
+                // revalidation one 304.
+                if content_addressed && *tier == size {
+                    CACHE_IMMUTABLE
+                } else {
+                    CACHE_REVALIDATE
+                },
+                request_headers,
+            );
+        }
+    }
+    // No poster: a raw-floor item (nothing is ever stored, final) or one the
+    // backfill has not reached (pending). Its own file is the closest thing
+    // to a still it has.
+    file_variant_response(
+        item,
+        files,
+        still_suffix,
+        request_headers,
+        content_addressed && fall_up_is_final,
+    )
+    .await
+}
+
+/// Whether this item's stored loop row is the "keep the original" verdict —
+/// geometry written, bytes deliberately not, because no encode of this source
+/// came out smaller than the source.
+///
+/// Only asked on the one branch that has already read the row and found it
+/// empty *or* absent, and only to decide a cache lifetime: an absent row is
+/// backfill-pending and must revalidate, while a settled verdict is as
+/// permanent as a hit.
+async fn stored_loop_keeps_original(conn: &mut sqlx::SqliteConnection, item: &ItemRecord) -> bool {
+    get_thumbnail_tier_rendition(conn, &item.sha256, 0, LOOP_TIER)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// [`file_response`] with a variant suffix folded into its ETag.
+///
+/// The thumbnail endpoint's file-serving branches answer different bytes for
+/// different `(size, still)` combinations of the same URL family, while
+/// `file_response`'s own validator is `sha256-size-mtime` — identical for all
+/// of them. Without the suffix a cached poster would be handed back for a
+/// loop request and vice versa.
+async fn file_variant_response(
+    item: &ItemRecord,
+    files: &[FileRecord],
+    etag_suffix: &str,
+    request_headers: &HeaderMap,
+    content_addressed: bool,
+) -> ApiResult<Response<Body>> {
+    file_response_with_etag_suffix(
+        item,
+        files,
+        "inline",
+        etag_suffix,
+        request_headers,
+        content_addressed,
+    )
+    .await
+}
+
 /// Serves the first candidate file that can actually be opened. Candidates
 /// are ordered by `available` DESC in the DB; a missing or hung file falls
 /// through to the next instead of failing the request (previously every
@@ -722,12 +946,34 @@ async fn file_response(
     request_headers: &HeaderMap,
     content_addressed: bool,
 ) -> ApiResult<Response<Body>> {
+    file_response_with_etag_suffix(
+        item,
+        files,
+        content_disposition_type,
+        "",
+        request_headers,
+        content_addressed,
+    )
+    .await
+}
+
+/// [`file_response`], with the response-variant suffix its ETag needs when
+/// the same file answers more than one thing (see [`file_variant_response`]).
+async fn file_response_with_etag_suffix(
+    item: &ItemRecord,
+    files: &[FileRecord],
+    content_disposition_type: &'static str,
+    etag_suffix: &str,
+    request_headers: &HeaderMap,
+    content_addressed: bool,
+) -> ApiResult<Response<Body>> {
     let mut last_error = ApiError::not_found(NO_FILE_FOUND);
     for file in files {
         match try_file_response(
             item,
             file,
             content_disposition_type,
+            etag_suffix,
             request_headers,
             content_addressed,
         )
@@ -747,6 +993,7 @@ async fn try_file_response(
     item: &ItemRecord,
     file: &FileRecord,
     content_disposition_type: &'static str,
+    etag_suffix: &str,
     request_headers: &HeaderMap,
     content_addressed: bool,
 ) -> ApiResult<Response<Body>> {
@@ -778,7 +1025,10 @@ async fn try_file_response(
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    let etag = format!("\"{}-{:x}-{:x}\"", item.sha256, size, mtime_secs);
+    let etag = format!(
+        "\"{}-{:x}-{:x}{etag_suffix}\"",
+        item.sha256, size, mtime_secs
+    );
 
     // Immutability requires the served bytes to still be the content the URL
     // names. The on-disk mtime matching the one recorded at index time is
@@ -818,6 +1068,21 @@ async fn try_file_response(
     .await
 }
 
+/// A whole stored rendition, in one response.
+///
+/// **No `Range` support**, which is worth stating because one of the things
+/// this now serves is an mp4: the animated loop is written with
+/// `+faststart`, and a `<video>` element that cannot ask for a byte range
+/// simply downloads the whole thing before playing. For a grid loop — a few
+/// hundred KB, and the cell wants every frame anyway — that is the right
+/// trade, and it is why the loop endpoint is this function rather than
+/// [`serve_file`]'s range machinery (which needs a file handle; these bytes
+/// live in the database).
+///
+/// The consequence is that the encoder's `+faststart` is *aspirational*
+/// today: it buys nothing until Range lands here, and it is kept because it
+/// costs one output-side rewrite at generation time and is exactly what a
+/// future ranged path would need to already be true of every stored loop.
 fn bytes_response(
     bytes: Vec<u8>,
     media_type: &str,
@@ -1713,6 +1978,384 @@ VALUES (?1, 0, 'image/jpeg', 9000, 1000, 1, ?2)
         item.duration = Some(4.0);
         assert_eq!(
             display_cache_control(&mut index_conn, &item, &file).await,
+            CACHE_IMMUTABLE
+        );
+    }
+
+    /// The frozen animated contract (§2, step B2), end to end over the four
+    /// `(size, still)` combinations that matter: a grid tier answers with the
+    /// **loop**, `still=true` with the **poster**, the display path is
+    /// untouched, and every file-serving branch carries the `still` variant
+    /// in its ETag — the one thing that must land before `still` selects
+    /// different bytes, because `file_response`'s own validator is identical
+    /// for both.
+    #[tokio::test]
+    async fn the_animated_grid_contract_serves_loops_posters_and_files() {
+        let file_path = temp_path("animated_contract.gif");
+        std::fs::write(&file_path, b"GIF89a pretend this animates").unwrap();
+        let (mut item, mut file) = test_records(&file_path);
+        item.mime_type = "image/gif".to_string();
+        item.duration = Some(3.0);
+        item.width = Some(1400);
+        item.height = Some(1400);
+        item.size = Some(6 * 1024 * 1024);
+        // Recorded the way the scanner does, so the file branches are
+        // immutable-when-final rather than merely drift-bounded.
+        file.last_modified =
+            format_system_time(std::fs::metadata(&file_path).unwrap().modified().unwrap()).unwrap();
+
+        let crate::db::migrations::InMemoryDatabases {
+            mut index_conn,
+            storage_conn,
+            user_data_conn,
+        } = crate::db::migrations::setup_test_databases().await;
+        let _attached = (storage_conn, user_data_conn);
+
+        /// `(content-type, etag, cache-control)` for one request.
+        async fn serve(
+            conn: &mut sqlx::SqliteConnection,
+            item: &ItemRecord,
+            file: &FileRecord,
+            size: ThumbnailTier,
+            still: bool,
+        ) -> (String, String, String) {
+            let response = thumbnail_response(
+                conn,
+                item,
+                std::slice::from_ref(file),
+                true,
+                size,
+                still,
+                &HeaderMap::new(),
+                true,
+            )
+            .await
+            .expect("thumbnail response");
+            let header = |name: header::HeaderName| {
+                response
+                    .headers()
+                    .get(name)
+                    .map(|value| value.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            };
+            (
+                header(header::CONTENT_TYPE),
+                header(header::ETAG),
+                header(header::CACHE_CONTROL),
+            )
+        }
+
+        // Nothing stored yet: the grid answer is the animated original, and
+        // it must NOT be pinned — the loop is on its way.
+        let (kind, loop_etag, cache) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, false).await;
+        assert_eq!(kind, "image/gif");
+        assert_eq!(cache, CACHE_REVALIDATE, "the loop has not landed yet");
+        let (_, still_etag, _) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, true).await;
+        assert!(
+            still_etag.ends_with("-still\""),
+            "the still variant has to be in the file branch's ETag: {still_etag}"
+        );
+        assert_ne!(
+            loop_etag, still_etag,
+            "a cached poster must never be handed back for a loop request"
+        );
+
+        // The scan writes the animated set: two posters and one loop.
+        for (tier, media, width, height, bytes) in [
+            ("grid-m", "image/jpeg", 1024_i64, 1024_i64, b"poster-m".to_vec()),
+            ("grid-s", "image/jpeg", 512, 512, b"poster-s".to_vec()),
+            ("loop", "video/mp4", 1024, 1024, b"mp4-bytes".to_vec()),
+        ] {
+            sqlx::query(
+                r#"
+INSERT INTO storage.thumbnail_tiers (
+    item_sha256, idx, tier, item_mime_type, media_type, width, height, version, thumbnail
+)
+VALUES (?1, 0, ?2, 'image/gif', ?3, ?4, ?5, 1, ?6)
+                "#,
+            )
+            .bind(&item.sha256)
+            .bind(tier)
+            .bind(media)
+            .bind(width)
+            .bind(height)
+            .bind(bytes)
+            .execute(&mut index_conn)
+            .await
+            .unwrap();
+        }
+
+        // One loop answers BOTH grid tiers, as its stored media type, and a
+        // hit is immutable.
+        for size in [ThumbnailTier::GridM, ThumbnailTier::GridS] {
+            let (kind, etag, cache) = serve(&mut index_conn, &item, &file, size, false).await;
+            assert_eq!(kind, "video/mp4", "{size:?} must answer with the loop");
+            assert_eq!(etag, format!("\"{}-thumb0-loop-v1\"", item.sha256));
+            assert_eq!(cache, CACHE_IMMUTABLE);
+        }
+
+        // `still=true` takes the poster ladder instead, per tier.
+        let (kind, etag, cache) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, true).await;
+        assert_eq!(kind, "image/jpeg");
+        assert_eq!(etag, format!("\"{}-thumb0-grid-m-v1-still\"", item.sha256));
+        assert_eq!(cache, CACHE_IMMUTABLE);
+        let (_, etag, _) = serve(&mut index_conn, &item, &file, ThumbnailTier::GridS, true).await;
+        assert_eq!(etag, format!("\"{}-thumb0-grid-s-v1-still\"", item.sha256));
+
+        // The generator version rides in the validator. `TIER_PROCESS_VERSION`
+        // exists for the changes stored *geometry* cannot see — a crop anchor,
+        // a filter, a JPEG quality, the loop's CRF — which regenerate in place
+        // at the same (item, idx, tier). An ETag blind to it would keep every
+        // warm client on the superseded bytes of an immutable response.
+        sqlx::query("UPDATE storage.thumbnail_tiers SET version = 2")
+            .execute(&mut index_conn)
+            .await
+            .unwrap();
+        let (_, restamped_loop, _) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, false).await;
+        assert_eq!(restamped_loop, format!("\"{}-thumb0-loop-v2\"", item.sha256));
+        let (_, restamped_poster, _) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, true).await;
+        assert_eq!(
+            restamped_poster,
+            format!("\"{}-thumb0-grid-m-v2-still\"", item.sha256)
+        );
+        sqlx::query("UPDATE storage.thumbnail_tiers SET version = 1")
+            .execute(&mut index_conn)
+            .await
+            .unwrap();
+
+        // A poster is never substituted for a loop, and the smaller poster
+        // falls up to `grid-m` when only that one is stored — the shape every
+        // animated item under 1.25x the tier is in. A **fall-up** answer, so
+        // it revalidates: today `grid-s` is absent because it would have been
+        // the identical picture, but a generator change can make it a real
+        // rendition, and an immutable fall-up would pin the larger poster
+        // straight past it.
+        sqlx::query("DELETE FROM storage.thumbnail_tiers WHERE tier = 'grid-s'")
+            .execute(&mut index_conn)
+            .await
+            .unwrap();
+        let (kind, etag, cache) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::GridS, true).await;
+        assert_eq!(kind, "image/jpeg");
+        assert_eq!(etag, format!("\"{}-thumb0-grid-m-v1-still\"", item.sha256));
+        assert_eq!(
+            cache, CACHE_REVALIDATE,
+            "a poster fall-up is not this URL's final answer"
+        );
+
+        // The display path is untouched: a GIF still short-circuits to its
+        // own file, immutably, exactly as before this step.
+        let (kind, etag, cache) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::Display, false).await;
+        assert_eq!(kind, "image/gif");
+        assert_eq!(cache, CACHE_IMMUTABLE);
+        assert!(!etag.contains("-still"));
+
+        // The settled encoded-larger-than-the-source edge: the loop row is
+        // stored for its geometry but carries no bytes, and the endpoint
+        // reads that as "the original file is the rendition" — a verdict, so
+        // immutable, unlike the pending case at the top of this test.
+        sqlx::query("UPDATE storage.thumbnail_tiers SET thumbnail = X'', media_type = 'image/gif' WHERE tier = 'loop'")
+            .execute(&mut index_conn)
+            .await
+            .unwrap();
+        let (kind, _, cache) =
+            serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, false).await;
+        assert_eq!(kind, "image/gif");
+        assert_eq!(
+            cache, CACHE_IMMUTABLE,
+            "a settled keep-the-original verdict is as permanent as a hit"
+        );
+    }
+
+    /// The raw floor: an animated item small enough to serve as its own file
+    /// stores nothing, ever — so its grid answers are final by rule and may
+    /// be pinned, which is the whole difference between "nothing here" and
+    /// "nothing here *yet*".
+    #[tokio::test]
+    async fn raw_floor_animated_originals_are_final_at_every_tier() {
+        let file_path = temp_path("animated_floor.gif");
+        std::fs::write(&file_path, b"GIF89a tiny").unwrap();
+        let (mut item, mut file) = test_records(&file_path);
+        item.mime_type = "image/gif".to_string();
+        item.duration = Some(1.0);
+        item.width = Some(400);
+        item.height = Some(400);
+        item.size = Some(500 * 1024);
+        file.last_modified =
+            format_system_time(std::fs::metadata(&file_path).unwrap().modified().unwrap()).unwrap();
+
+        let crate::db::migrations::InMemoryDatabases {
+            mut index_conn,
+            storage_conn,
+            user_data_conn,
+        } = crate::db::migrations::setup_test_databases().await;
+        let _attached = (storage_conn, user_data_conn);
+
+        for (size, still) in [
+            (ThumbnailTier::GridM, false),
+            (ThumbnailTier::GridM, true),
+            (ThumbnailTier::GridS, false),
+            (ThumbnailTier::Display, false),
+        ] {
+            assert!(
+                tier_fall_up_is_final(&item, size),
+                "{size:?} is answered by the original for good"
+            );
+            let response = thumbnail_response(
+                &mut index_conn,
+                &item,
+                std::slice::from_ref(&file),
+                true,
+                size,
+                still,
+                &HeaderMap::new(),
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                CACHE_IMMUTABLE,
+                "{size:?} still={still}"
+            );
+            assert_eq!(response.headers().get(header::CONTENT_TYPE).unwrap(), "image/gif");
+        }
+
+        // One pixel over the floor and the same URL is pending, not final.
+        item.width = Some(513);
+        assert!(!tier_fall_up_is_final(&item, ThumbnailTier::GridM));
+        assert!(
+            tier_fall_up_is_final(&item, ThumbnailTier::Display),
+            "the display path is unchanged by the floor"
+        );
+    }
+
+    /// The endpoint's half of the scan's pre-measurement caution: an animated
+    /// *container* nothing has measured yet must not have its original pinned
+    /// at a grid tier. Without this, a 900x900 700 KB WebP indexed before the
+    /// animation question existed reads as a plain still — comfortably inside
+    /// the grid rule — and a client caches its heavyweight original for a
+    /// year, so the loop the very next scan writes never reaches it.
+    #[tokio::test]
+    async fn an_unmeasured_animated_container_never_pins_its_original() {
+        let file_path = temp_path("unmeasured.webp");
+        std::fs::write(&file_path, b"RIFF....WEBPpretend").unwrap();
+        let (mut item, mut file) = test_records(&file_path);
+        item.mime_type = "image/webp".to_string();
+        item.duration = None;
+        item.width = Some(900);
+        item.height = Some(900);
+        item.size = Some(700 * 1024);
+        file.last_modified =
+            format_system_time(std::fs::metadata(&file_path).unwrap().modified().unwrap()).unwrap();
+
+        let crate::db::migrations::InMemoryDatabases {
+            mut index_conn,
+            storage_conn,
+            user_data_conn,
+        } = crate::db::migrations::setup_test_databases().await;
+        let _attached = (storage_conn, user_data_conn);
+
+        async fn cache(
+            conn: &mut sqlx::SqliteConnection,
+            item: &ItemRecord,
+            file: &FileRecord,
+            size: ThumbnailTier,
+        ) -> String {
+            let response = thumbnail_response(
+                conn,
+                item,
+                std::slice::from_ref(file),
+                true,
+                size,
+                false,
+                &HeaderMap::new(),
+                true,
+            )
+            .await
+            .expect("thumbnail response");
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .expect("cache-control")
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+
+        for size in [ThumbnailTier::GridM, ThumbnailTier::GridS] {
+            assert!(!tier_fall_up_is_final(&item, size));
+            assert_eq!(
+                cache(&mut index_conn, &item, &file, size).await,
+                CACHE_REVALIDATE,
+                "{size:?} must revalidate until the animation question runs"
+            );
+        }
+        // The display path is untouched: its answer does not change when the
+        // measurement lands, so a revalidation there would protect nothing.
+        assert!(tier_fall_up_is_final(&item, ThumbnailTier::Display));
+        assert_eq!(
+            cache(&mut index_conn, &item, &file, ThumbnailTier::Display).await,
+            CACHE_IMMUTABLE
+        );
+
+        // Measured still: an ordinary image, and the ordinary grid rule
+        // decides — 900x900 is inside `grid-m`'s budget, so its original is
+        // that tier's answer forever.
+        item.duration = Some(0.0);
+        assert!(tier_fall_up_is_final(&item, ThumbnailTier::GridM));
+        assert_eq!(
+            cache(&mut index_conn, &item, &file, ThumbnailTier::GridM).await,
+            CACHE_IMMUTABLE
+        );
+
+        // Measured animated, above the raw floor: pending again until the
+        // loop lands...
+        item.duration = Some(2.0);
+        assert!(!tier_fall_up_is_final(&item, ThumbnailTier::GridM));
+        assert_eq!(
+            cache(&mut index_conn, &item, &file, ThumbnailTier::GridM).await,
+            CACHE_REVALIDATE
+        );
+
+        // ... and immutable the moment it does, as an exact hit.
+        sqlx::query(
+            r#"
+INSERT INTO storage.thumbnail_tiers (
+    item_sha256, idx, tier, item_mime_type, media_type, width, height, version, thumbnail
+)
+VALUES (?1, 0, 'loop', 'image/webp', 'video/mp4', 900, 900, 1, ?2)
+            "#,
+        )
+        .bind(&item.sha256)
+        .bind(b"mp4-bytes".to_vec())
+        .execute(&mut index_conn)
+        .await
+        .unwrap();
+        let response = thumbnail_response(
+            &mut index_conn,
+            &item,
+            std::slice::from_ref(&file),
+            true,
+            ThumbnailTier::GridM,
+            false,
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
             CACHE_IMMUTABLE
         );
     }

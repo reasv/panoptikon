@@ -57,22 +57,76 @@ pub(crate) fn animation_duration_seconds(path: &Path, mime_type: &str) -> Option
 
 // ---- GIF ------------------------------------------------------------------
 
+/// The delay at or below which a GIF frame is *pathological* — the values ad
+/// tools write meaning "as fast as possible" — and the length it is played
+/// as instead. Both in centiseconds, matching the GCE field's own unit.
+pub(crate) const GIF_MIN_DELAY_CS: u64 = 1;
+pub(crate) const GIF_DEFAULT_DELAY_CS: u64 = 10;
+
 /// GIF (89a §23-26): walk the block structure and sum one Graphic Control
 /// Extension delay per rendered frame.
 ///
-/// A delay of 0 or 1 cs is normalized to 10 cs, because that is what the
-/// file *plays* as everywhere it matters: both ffmpeg's gif demuxer and the
-/// browsers substitute ~100 ms for the pathological delays ad tools wrote,
-/// and the number recorded here has to be the length the compose span will
-/// actually run. A frame with no GCE at all has delay 0 and gets the same
-/// treatment.
+/// A delay of [`GIF_MIN_DELAY_CS`] or less is normalized to
+/// [`GIF_DEFAULT_DELAY_CS`], because that is what the file *plays* as where
+/// a human sees it: browsers substitute ~100 ms for the pathological delays
+/// ad tools wrote, and the number recorded here has to be the length the
+/// compose span will actually run. A frame with no GCE at all has delay 0 and
+/// gets the same treatment.
+///
+/// **ffmpeg does not agree, and measurably so** (7.1, verified against real
+/// files): its gif demuxer substitutes for a 0 cs frame but leaves 1 cs
+/// exactly as written, and its documented `-min_delay` / `-default_delay`
+/// demuxer options have no effect on that case at all. Anything that hands a
+/// GIF to ffmpeg and needs the *played* length therefore has to close the gap
+/// itself — see [`gif_uniform_pathological_rate`], which the animated loop
+/// encoder (`media_tools::animated_loop`) uses to do exactly that.
 pub(crate) fn gif_animation_seconds(bytes: &[u8]) -> f64 {
-    parse_gif(bytes).unwrap_or(0.0)
+    parse_gif(bytes).map(|timing| timing.seconds()).unwrap_or(0.0)
 }
 
-/// `None` is a structural error (the caller's 0.0 verdict); `Some(0.0)` is a
-/// well-formed file with fewer than two frames.
-fn parse_gif(bytes: &[u8]) -> Option<f64> {
+/// The input frame rate that makes ffmpeg play a **uniformly pathological**
+/// GIF at the length [`gif_animation_seconds`] measured, or `None` when the
+/// file's own timing must be left exactly as written.
+///
+/// `Some` only when every rendered frame's delay is pathological, which is
+/// how the tools that write them write them — all frames or none. That
+/// restriction is what keeps the fix from touching timing it has no business
+/// touching: a mixed file (say 100/500/100/900 ms) is already exact through
+/// ffmpeg, and re-stamping it onto a uniform grid would destroy that. A file
+/// that mixes pathological and real delays keeps ffmpeg's timing and is
+/// short by up to 90 ms per pathological frame; it is not a shape anything
+/// observed writes, and inventing per-frame surgery for it would cost the
+/// exactness of the common case (`setpts` retiming drops the final frame
+/// outright — measured).
+pub(crate) fn gif_uniform_pathological_rate(bytes: &[u8]) -> Option<u32> {
+    let timing = parse_gif(bytes)?;
+    (timing.frames >= 2 && timing.pathological_frames == timing.frames)
+        .then_some((100 / GIF_DEFAULT_DELAY_CS) as u32)
+}
+
+/// One GIF's frame timing, as the structure walk found it.
+struct GifTiming {
+    frames: u64,
+    /// How many of those frames carried a delay at or below
+    /// [`GIF_MIN_DELAY_CS`].
+    pathological_frames: u64,
+    /// The normalized total, in centiseconds.
+    total_cs: u64,
+}
+
+impl GifTiming {
+    /// `0.0` for a well-formed file with fewer than two frames: a single
+    /// picture is not an animation, whatever its GCE claims.
+    fn seconds(&self) -> f64 {
+        if self.frames < 2 {
+            return 0.0;
+        }
+        self.total_cs as f64 / 100.0
+    }
+}
+
+/// `None` is a structural error (the caller's 0.0 verdict).
+fn parse_gif(bytes: &[u8]) -> Option<GifTiming> {
     if bytes.len() < 13 || (&bytes[..6] != b"GIF87a" && &bytes[..6] != b"GIF89a") {
         return None;
     }
@@ -85,6 +139,7 @@ fn parse_gif(bytes: &[u8]) -> Option<f64> {
     }
 
     let mut frames = 0u64;
+    let mut pathological_frames = 0u64;
     let mut total_cs = 0u64;
     // The delay the *next* image descriptor renders with: a GCE applies to
     // the single rendering block that follows it (89a §23).
@@ -126,16 +181,22 @@ fn parse_gif(bytes: &[u8]) -> Option<f64> {
                 at += 1; // LZW minimum code size
                 at = skip_gif_sub_blocks(bytes, at)?;
                 frames += 1;
-                total_cs += if pending_cs <= 1 { 10 } else { pending_cs };
+                if pending_cs <= GIF_MIN_DELAY_CS {
+                    pathological_frames += 1;
+                    total_cs += GIF_DEFAULT_DELAY_CS;
+                } else {
+                    total_cs += pending_cs;
+                }
                 pending_cs = 0;
             }
             _ => return None,
         }
     }
-    if frames < 2 {
-        return Some(0.0);
-    }
-    Some(total_cs as f64 / 100.0)
+    Some(GifTiming {
+        frames,
+        pathological_frames,
+        total_cs,
+    })
 }
 
 /// Walks one chain of GIF data sub-blocks (a length byte, that many bytes,

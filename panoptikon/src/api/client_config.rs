@@ -60,6 +60,45 @@ pub(crate) struct ClientCapabilities {
     pub video_compose: bool,
 }
 
+/// The animated raw floor, verbatim from
+/// [`crate::visual_tiers`] (docs/grid-scroll-performance-implementation.md
+/// §2, step B2).
+///
+/// A grid cell decides `<img>` vs `<video>` from four fields of its search
+/// result — `type` and `duration` say whether the picture moves, `size` and
+/// `width`/`height` say whether it clears the floor — against these two
+/// numbers, which is the same rule and the same arithmetic the scan used to
+/// decide what to store. Surfaced rather than duplicated in the UI so the two
+/// sides cannot drift.
+///
+/// Clearing the floor is necessary but not sufficient: an item above it is
+/// served a loop *once the backfill has written one*, and an item whose H.264
+/// encode came out no smaller than its source keeps serving the source
+/// permanently (the settled keep-the-original edge). A cell that mounts a
+/// `<video>` must therefore fall back to its poster when playback errors —
+/// the F6 contract in the plan document.
+///
+/// Server-derived constants, not policy-scoped configuration: every policy
+/// sees the same floor, because it is a property of what the scan wrote.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct AnimatedThumbnailFloor {
+    /// An animated item at or below **both** of these is served as its
+    /// original file at every grid tier: no loop is stored for it, so a cell
+    /// renders it as an image.
+    pub max_file_size: u64,
+    /// The longer side, in pixels. Both sides must be within it.
+    pub max_side: u32,
+}
+
+impl AnimatedThumbnailFloor {
+    fn current() -> Self {
+        Self {
+            max_file_size: crate::visual_tiers::ANIMATED_RAW_MAX_FILE_SIZE,
+            max_side: crate::visual_tiers::ANIMATED_RAW_MAX_SIDE,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ClientConfigResponse {
     /// Name of the policy that matched this request.
@@ -77,6 +116,9 @@ pub(crate) struct ClientConfigResponse {
     /// True only for a policy explicitly marked as the local Desktop client
     /// while the private parent-shell bridge is configured.
     pub desktop_shell_available: bool,
+    /// The animated raw floor the thumbnail endpoint serves by (see
+    /// [`AnimatedThumbnailFloor`]).
+    pub animated_floor: AnimatedThumbnailFloor,
 }
 
 /// The probe table: (capability, method, representative real route). Paths
@@ -127,6 +169,7 @@ pub(crate) fn build_client_config(
             crate::desktop::is_managed(),
             crate::api::desktop::desktop_bridge_is_configured(),
         ),
+        animated_floor: AnimatedThumbnailFloor::current(),
     }
 }
 
@@ -274,6 +317,17 @@ disable_backend_open = true
         assert_eq!(
             response.client,
             serde_json::json!({ "search_throttle_ms": 1500, "disable_backend_open": true })
+        );
+        // Server-derived, not policy-scoped: a restricted policy sees the
+        // same floor the desktop one does, because it is a property of what
+        // the scan wrote rather than of what this client may do.
+        assert_eq!(
+            response.animated_floor.max_file_size,
+            crate::visual_tiers::ANIMATED_RAW_MAX_FILE_SIZE
+        );
+        assert_eq!(
+            response.animated_floor.max_side,
+            crate::visual_tiers::ANIMATED_RAW_MAX_SIDE
         );
     }
 
