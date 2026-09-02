@@ -26,8 +26,8 @@ use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::jobs::files::format_system_time;
 use crate::media_tools::animation::measures_animation;
 use crate::visual_tiers::{
-    DisplayPlan, FormatPolicy, LOOP_DISPLAY_TIER, LOOP_TIER, ThumbnailTier,
-    animated_serves_original, display_plan, grid_serves_original, is_animated_image,
+    DisplayShape, LOOP_TIER, ThumbnailTier, animated_serves_original, display_shape,
+    grid_serves_original, is_animated_image,
 };
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -559,19 +559,9 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
     if !item.mime_type.starts_with("image") {
         return false;
     }
-    let (Some(width), Some(height), Some(file_size)) = (item.width, item.height, item.size) else {
+    let Some((file_size, width, height)) = item_measurements(item) else {
         return false;
     };
-    let (Ok(width), Ok(height), Ok(file_size)) = (
-        u32::try_from(width),
-        u32::try_from(height),
-        u64::try_from(file_size),
-    ) else {
-        return false;
-    };
-    if width == 0 || height == 0 {
-        return false;
-    }
     // An animated image's GRID answers come off the animated ladder: above
     // the raw floor it stores a loop and posters, so the file it is served
     // from today is a *pending* answer and must revalidate; at or below the
@@ -594,16 +584,8 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
         // backfill writes it. Pinning the file for a year on exactly the items
         // the rule exists to shrink is what this guards against.
         return matches!(
-            display_plan(
-                &item.mime_type,
-                true,
-                None,
-                file_size,
-                width,
-                height,
-                FormatPolicy::default(),
-            ),
-            DisplayPlan::Original
+            display_shape(&item.mime_type, true, file_size, width, height),
+            DisplayShape::Original
         );
     }
     // The endpoint's half of the scan's pre-measurement caution
@@ -630,23 +612,50 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
         // The display tier: final iff the display rule genuinely serves the
         // original.
         //
-        // The policy and the transparency verdict are deliberately not
-        // consulted: both decide a rendition's *format*, and neither can turn
-        // a stored rendition into a served original or back. The serve side
-        // needs no policy at all — stored rows carry their own media type.
+        // The *shape* alone, which is the whole reason the rule is split in
+        // two: format decides a rendition's container and can never turn a
+        // stored rendition into a served original or back, so the serve side
+        // needs neither the policy nor the transparency verdict — a stored
+        // row carries its own media type.
         None => matches!(
-            display_plan(
-                &item.mime_type,
-                false,
-                None,
-                file_size,
-                width,
-                height,
-                FormatPolicy::default(),
-            ),
-            DisplayPlan::Original
+            display_shape(&item.mime_type, false, file_size, width, height),
+            DisplayShape::Original
         ),
     }
+}
+
+/// One item's `(file_size, width, height)` as `display_shape` and the grid
+/// rules want them, or `None` where a measurement is missing, nonsensical or
+/// zero.
+///
+/// One conversion for every serving-side rule that asks a `visual_tiers`
+/// question about an item, so the "not decidable here" answer — which every
+/// caller reads as *revalidate*, the safe direction — is reached the same way
+/// each time.
+fn item_measurements(item: &ItemRecord) -> Option<(u64, u32, u32)> {
+    let (Some(width), Some(height), Some(file_size)) = (item.width, item.height, item.size) else {
+        return None;
+    };
+    let (Ok(width), Ok(height), Ok(file_size)) = (
+        u32::try_from(width),
+        u32::try_from(height),
+        u64::try_from(file_size),
+    ) else {
+        return None;
+    };
+    (width > 0 && height > 0).then_some((file_size, width, height))
+}
+
+/// This item's display shape, from the indexed metadata alone.
+fn item_display_shape(item: &ItemRecord) -> Option<DisplayShape> {
+    let (file_size, width, height) = item_measurements(item)?;
+    Some(display_shape(
+        &item.mime_type,
+        is_animated_image(&item.mime_type, item.duration),
+        file_size,
+        width,
+        height,
+    ))
 }
 
 /// The thumbnail endpoint: one URL family whose answer is decided by
@@ -1130,7 +1139,12 @@ async fn animated_display_response(
     content_addressed: bool,
     fall_up_is_final: bool,
 ) -> ApiResult<Response<Body>> {
-    let Some(tier) = animated_display_loop_tier(item) else {
+    // The row the scan stored by, named by the same rule
+    // ([`crate::visual_tiers::display_shape`]), so the endpoint can never look
+    // for a row the generator did not write. Anything unmeasured answers with
+    // the file — the safe direction, since an unmeasured item is one the scan
+    // has not reached either.
+    let Some(DisplayShape::Loop { tier }) = item_display_shape(item) else {
         return file_variant_response(
             item,
             files,
@@ -1168,43 +1182,6 @@ async fn animated_display_response(
             )
             .await
         }
-    }
-}
-
-/// Which loop row answers this item's display request, or `None` where the
-/// answer is the original file.
-///
-/// Answered from the indexed metadata by the *same* pure function the scan
-/// stored by ([`display_plan`]), so the endpoint can never look for a row the
-/// generator did not write. Anything it cannot measure answers `None`, which
-/// is the file — the safe direction, since an unmeasured item is one the scan
-/// has not reached either.
-fn animated_display_loop_tier(item: &ItemRecord) -> Option<&'static str> {
-    let (Some(width), Some(height), Some(file_size)) = (item.width, item.height, item.size) else {
-        return None;
-    };
-    let (Ok(width), Ok(height), Ok(file_size)) = (
-        u32::try_from(width),
-        u32::try_from(height),
-        u64::try_from(file_size),
-    ) else {
-        return None;
-    };
-    match display_plan(
-        &item.mime_type,
-        true,
-        None,
-        file_size,
-        width,
-        height,
-        FormatPolicy::default(),
-    ) {
-        DisplayPlan::Loop {
-            reuse_grid_loop: true,
-            ..
-        } => Some(LOOP_TIER),
-        DisplayPlan::Loop { .. } => Some(LOOP_DISPLAY_TIER),
-        DisplayPlan::Original | DisplayPlan::Thumbnail { .. } => None,
     }
 }
 

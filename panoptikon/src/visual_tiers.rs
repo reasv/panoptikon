@@ -436,14 +436,30 @@ pub(crate) enum DisplayPlan {
         height: u32,
         format: RenditionFormat,
     },
-    /// Serve a stored H.264 loop (R3). `reuse_grid_loop` says the `loop` row
-    /// the grid tiers already have *is* the display loop; otherwise a second
-    /// [`LOOP_DISPLAY_TIER`] row of exactly these dimensions is stored.
-    Loop {
-        reuse_grid_loop: bool,
-        width: u32,
-        height: u32,
-    },
+    /// Serve a stored H.264 loop (R3), named by the row that holds it:
+    /// [`LOOP_TIER`] where the grid loop is already the whole picture at
+    /// native resolution, [`LOOP_DISPLAY_TIER`] where a second encode is
+    /// owed. The geometry lives with the plan that produces the row
+    /// ([`animated_plans`]) and never here — nothing that reads this needs
+    /// it, and two copies of one derivation is how they come to disagree.
+    Loop { tier: &'static str },
+}
+
+/// The display answer's *shape*, before any format has been decided.
+///
+/// The half of the rule that is pure geometry and triggers, so the half the
+/// **serving** side can ask: a stored row carries its own media type, so the
+/// endpoint needs no policy, no transparency verdict and no encoder to know
+/// whether a `display` request is answered from the item's own file, from a
+/// still rendition, or from a loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DisplayShape {
+    /// Serve the original file; store nothing.
+    Original,
+    /// Store a still rendition of exactly these dimensions.
+    Still { width: u32, height: u32 },
+    /// Serve the stored H.264 loop this row holds (R3).
+    Loop { tier: &'static str },
 }
 
 /// The display rule (R2 for stills, R3 for moving pictures) — the one
@@ -468,6 +484,47 @@ pub(crate) enum DisplayPlan {
 /// **A moving picture never gets a still.** Its display answer is its own
 /// file — which animates natively in an `<img>` — until the same trigger
 /// fires on the animated class's bound, and then it is an H.264 loop.
+pub(crate) fn display_shape(
+    mime_type: &str,
+    animated: bool,
+    file_size: u64,
+    width: u32,
+    height: u32,
+) -> DisplayShape {
+    if width == 0 || height == 0 {
+        return DisplayShape::Original;
+    }
+    let class = source_class(mime_type, animated);
+    if !display_trigger_fires(class, file_size, width, height) {
+        return DisplayShape::Original;
+    }
+    if class == SourceClass::Animated {
+        return match animated_display_loop(file_size, width, height) {
+            Some(tier) => DisplayShape::Loop { tier },
+            // Unreachable: the trigger that got us here is the one
+            // [`animated_display_loop`] asks. The arm exists so the two
+            // cannot be made to disagree silently.
+            None => DisplayShape::Original,
+        };
+    }
+    let (width, height) = display_dimensions(width, height);
+    // A shape no container can name. The 2560 cap is on the *short* side, so
+    // a 200x100000 strip keeps every one of its rows: too long for WebP,
+    // which sends it to JPEG, and too long for JPEG's 16-bit frame header
+    // too. [`JPEG_MAX_SIDE`] is the larger of the two limits and the one the
+    // WebP fallback lands on, so it bounds every format and belongs to the
+    // shape rather than to any of them. It has to be reached *here*, or the
+    // plan names a rendition the generator cannot produce and the item is
+    // dispatched, made to fail and dispatched again on every scan forever.
+    if !RenditionFormat::Jpeg.can_hold(width, height) {
+        return DisplayShape::Original;
+    }
+    DisplayShape::Still { width, height }
+}
+
+/// [`display_shape`] with the format decided: the whole display rule, and
+/// what the **scan** asks, because storing a rendition means choosing a
+/// container for it (R2's format half, R4 and R5).
 pub(crate) fn display_plan(
     mime_type: &str,
     animated: bool,
@@ -477,38 +534,36 @@ pub(crate) fn display_plan(
     height: u32,
     policy: FormatPolicy,
 ) -> DisplayPlan {
-    if width == 0 || height == 0 {
-        return DisplayPlan::Original;
+    match display_shape(mime_type, animated, file_size, width, height) {
+        DisplayShape::Original => DisplayPlan::Original,
+        DisplayShape::Loop { tier } => DisplayPlan::Loop { tier },
+        DisplayShape::Still { width, height } => DisplayPlan::Thumbnail {
+            width,
+            height,
+            format: policy.resolve(
+                display_format(source_class(mime_type, animated), has_transparency),
+                width,
+                height,
+            ),
+        },
     }
-    let class = source_class(mime_type, animated);
-    if !display_trigger_fires(class, file_size, width, height) {
-        return DisplayPlan::Original;
+}
+
+/// Which loop row answers an animated item's display request, or `None` where
+/// the answer is the original file (R3).
+///
+/// The one derivation, read by [`display_shape`] for the serving side and by
+/// [`animated_plans`] for the set the scan stores. Two copies of it is how
+/// the endpoint comes to look for a row the generator never wrote.
+fn animated_display_loop(file_size: u64, width: u32, height: u32) -> Option<&'static str> {
+    if !display_trigger_fires(SourceClass::Animated, file_size, width, height) {
+        return None;
     }
-    if class == SourceClass::Animated {
-        let plan = loop_display_plan(width, height);
-        return DisplayPlan::Loop {
-            reuse_grid_loop: grid_loop_is_the_display_loop(width, height),
-            width: plan.width,
-            height: plan.height,
-        };
-    }
-    let (width, height) = display_dimensions(width, height);
-    let format = policy.resolve(display_format(class, has_transparency), width, height);
-    // A shape neither container can name. The 2560 cap is on the *short*
-    // side, so a 200x100000 strip keeps every one of its rows: too long for
-    // WebP, which sends it to JPEG, and then too long for JPEG's 16-bit frame
-    // header too. That is a verdict about the shape — there is no rendition
-    // to store — and it has to be reached *here*, or the plan names a
-    // rendition the generator cannot produce and the item is dispatched, made
-    // to fail and dispatched again on every scan forever.
-    if !format.can_hold(width, height) {
-        return DisplayPlan::Original;
-    }
-    DisplayPlan::Thumbnail {
-        width,
-        height,
-        format,
-    }
+    Some(if grid_loop_is_the_display_loop(width, height) {
+        LOOP_TIER
+    } else {
+        LOOP_DISPLAY_TIER
+    })
 }
 
 /// Whether the display trigger fires: dimensions shared across classes, bytes
@@ -924,7 +979,7 @@ fn even_side(side: u32) -> u32 {
 /// Deliberately not [`tier_plan`]: a display surface shows the *whole*
 /// picture, so this never crops. That is the one thing separating it from the
 /// grid loop, and the reason a strip cannot simply reuse one.
-pub(crate) fn loop_display_plan(width: u32, height: u32) -> TierPlan {
+fn loop_display_plan(width: u32, height: u32) -> TierPlan {
     let (out_width, out_height) = display_dimensions(width.max(1), height.max(1));
     TierPlan {
         crop_x: 0,
@@ -947,7 +1002,7 @@ pub(crate) fn loop_display_plan(width: u32, height: u32) -> TierPlan {
 /// `object-contain` display surface. So the rule is written as what its own
 /// justification says: reuse the grid loop when it is the whole picture at
 /// native resolution.
-pub(crate) fn grid_loop_is_the_display_loop(width: u32, height: u32) -> bool {
+fn grid_loop_is_the_display_loop(width: u32, height: u32) -> bool {
     let (width, height) = (width.max(1), height.max(1));
     let grid = loop_plan(width, height);
     let display = loop_display_plan(width, height);
@@ -1020,11 +1075,10 @@ pub(crate) fn animated_plans(
         .map(|(tier, plan)| (tier.as_str(), plan))
         .collect();
     out.push((LOOP_TIER, loop_plan(width, height)));
-    // The second loop row exists only where the display answer is a loop and
-    // the grid loop cannot stand in for it (R3).
-    if display_trigger_fires(SourceClass::Animated, file_size, width, height)
-        && !grid_loop_is_the_display_loop(width, height)
-    {
+    // The second loop row exists only where the display answer is a loop the
+    // grid one cannot stand in for (R3) - which is exactly the row
+    // [`animated_display_loop`] names.
+    if animated_display_loop(file_size, width, height) == Some(LOOP_DISPLAY_TIER) {
         out.push((LOOP_DISPLAY_TIER, loop_display_plan(width, height)));
     }
     out
@@ -1984,41 +2038,34 @@ mod tests {
         // at native resolution: no second encode.
         assert_eq!(
             animated(DISPLAY_MAX_FILE_SIZE_ANIMATED + 1, 900, 900),
-            DisplayPlan::Loop {
-                reuse_grid_loop: true,
-                width: 900,
-                height: 900,
-            }
+            DisplayPlan::Loop { tier: LOOP_TIER }
         );
         // Over the bound and larger than the grid loop's cap: a second row.
-        let plan = animated(6 * MB, 1500, 2000);
         assert_eq!(
-            plan,
+            animated(6 * MB, 1500, 2000),
             DisplayPlan::Loop {
-                reuse_grid_loop: false,
-                width: 1500,
-                height: 2000,
+                tier: LOOP_DISPLAY_TIER
             },
-            "under the 2560 cap the display loop keeps every pixel"
+            "the grid loop is downscaled here, so it is not the display loop"
         );
         // A strip is never a reuse: the grid loop is a top crop, which cannot
         // answer a display request however small its short side is.
-        let plan = animated(6 * MB, 800, 20000);
-        assert!(
-            matches!(
-                plan,
-                DisplayPlan::Loop {
-                    reuse_grid_loop: false,
-                    ..
-                }
-            ),
-            "{plan:?}"
+        assert_eq!(
+            animated(6 * MB, 800, 20000),
+            DisplayPlan::Loop {
+                tier: LOOP_DISPLAY_TIER
+            }
         );
-        assert!(!grid_loop_is_the_display_loop(800, 20000));
-        assert!(grid_loop_is_the_display_loop(900, 900));
+        // The row the endpoint looks for is the row the set writes.
         assert!(
-            !grid_loop_is_the_display_loop(1500, 2000),
-            "the grid loop is downscaled here, so it is not the display loop"
+            animated_plans(6 * MB, 1500, 2000)
+                .iter()
+                .any(|(tier, _)| *tier == LOOP_DISPLAY_TIER)
+        );
+        assert!(
+            !animated_plans(DISPLAY_MAX_FILE_SIZE_ANIMATED + 1, 900, 900)
+                .iter()
+                .any(|(tier, _)| *tier == LOOP_DISPLAY_TIER)
         );
     }
 
