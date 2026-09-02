@@ -154,11 +154,11 @@ pub(crate) struct ClientConfigResponse {
     pub animated_floor: AnimatedThumbnailFloor,
     /// The display-tier loop trigger (see [`DisplayLoopTrigger`]).
     ///
-    /// `null` exactly when `animated_floor` is: no loops at all, so nothing
-    /// mounts a `<video>` and every animated item is an `<img>` on its
-    /// original file. Neither is ever null today — the loop ladder is
-    /// unconditional — and the field is nullable so that a build without it
-    /// says so rather than publishing a bound it does not serve by.
+    /// Always `Some` today: the loop ladder is unconditional. The `Option` is
+    /// reserved for a build that stores no loops at all, which would publish
+    /// `null` here rather than a bound it does not serve by — with nothing to
+    /// evaluate, every animated item is an `<img>` on its original file and
+    /// no client mounts a `<video>`.
     pub display_loop_trigger: Option<DisplayLoopTrigger>,
 }
 

@@ -65,21 +65,20 @@ fn crf(rung: RenditionRung) -> u32 {
 /// an unbounded loop lets one 30-minute animation cost more scan time and more
 /// stored bytes than the rest of a library's animations together. Applied on
 /// the **output** side so it reaches both input paths, and mirrored in
-/// [`WHOLE_ANIMATION`] so the WebP bridge stops decoding frames at the same
+/// [`LOOP_WINDOW`] so the WebP bridge stops decoding frames at the same
 /// boundary rather than decoding an hour of them for ffmpeg to throw away.
-pub(crate) const LOOP_MAX_SECONDS: u32 = 60;
+const LOOP_MAX_SECONDS: u32 = 60;
 
 /// x264's speed/size tradeoff. `medium` is the default and is where the curve
 /// flattens; a scan encodes one of these per animated item, so a slower
 /// preset would buy single-digit percent for a multiple of the scan time.
 const LOOP_PRESET: &str = "medium";
 
-/// The animation a loop is made of, expressed in the bridge's window
-/// vocabulary: from zero to [`LOOP_MAX_SECONDS`]. A span already inside the
-/// window truncates rather than failing — which for a loop is the right
-/// degradation (a shorter loop, never a wrong one) and is exactly how the cap
-/// takes effect on the bridged path.
-const WHOLE_ANIMATION: ItemTime = ItemTime::Span {
+/// The window a loop is made from, in the bridge's own vocabulary: zero to
+/// [`LOOP_MAX_SECONDS`]. A longer animation truncates rather than failing —
+/// which for a loop is the right degradation (a shorter loop, never a wrong
+/// one) and is exactly how the cap takes effect on the bridged path.
+const LOOP_WINDOW: ItemTime = ItemTime::Span {
     start_cs: 0,
     end_cs: LOOP_MAX_SECONDS as i64 * 100,
 };
@@ -372,7 +371,7 @@ fn prepare_input(
     let cancel = AtomicBool::new(false);
     match super::transcode::webp_bridge::extract_within(
         &bytes,
-        WHOLE_ANIMATION,
+        LOOP_WINDOW,
         &cancel,
         BRIDGE_BYTE_BUDGET,
     ) {
@@ -462,9 +461,9 @@ mod tests {
     /// The bridge's window is the same 60 second cap the output-side `-t`
     /// applies, so a bridged animation and a demuxed one truncate alike.
     #[test]
-    fn the_bridge_window_is_the_whole_animation() {
+    fn the_bridge_window_is_the_loop_window() {
         assert_eq!(
-            WHOLE_ANIMATION,
+            LOOP_WINDOW,
             ItemTime::Span {
                 start_cs: 0,
                 end_cs: 6000
@@ -554,7 +553,7 @@ mod tests {
     /// A grid cell is not a video player: an unbounded loop lets one long
     /// animation cost more scan time and more stored bytes than every other
     /// animation in a library put together. The bridge truncates at the same
-    /// boundary through [`WHOLE_ANIMATION`], so this exercises the half that
+    /// boundary through [`LOOP_WINDOW`], so this exercises the half that
     /// only the output-side `-t` reaches.
     #[test]
     fn a_loop_is_capped_at_sixty_seconds() {

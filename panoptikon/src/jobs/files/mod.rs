@@ -3097,9 +3097,8 @@ impl ScanContext {
     }
 
     /// The rendition-ladder dispatch question
-    /// (docs/grid-scroll-performance-implementation.md §3, B1), and the
-    /// seventh the dispatcher asks: "does this item carry exactly the
-    /// renditions the current ladder would produce?"
+    /// (docs/grid-scroll-performance-implementation.md §3, B1): "does this
+    /// item carry exactly the renditions the current ladder would produce?"
     ///
     /// Answered against indexed metadata and *stored geometry* — the width
     /// and height columns of `thumbnails`/`thumbnail_tiers` — never by
@@ -3108,19 +3107,18 @@ impl ScanContext {
     /// grid tiers are legitimately absent for small originals, so "no row"
     /// can never mean "work to do" on its own, and the answer has to be
     /// *exact* or an item is re-dispatched on every scan forever. Which is
-    /// why every dimension the generator writes is one this function can
-    /// predict: [`display_plan`] and [`grid_plans`] are pure functions of
-    /// `(bytes, width, height)`, and the generator resizes to exactly what
-    /// they name.
+    /// why every dimension and every format the generator writes is one this
+    /// function can predict: [`display_plan`] and [`grid_plans`] are pure
+    /// functions of the item's indexed facts and this database's policy, and
+    /// the generator resizes and encodes to exactly what they name.
     ///
     /// `None` means nothing to do — including for every item whose dimensions
     /// were never indexed, which cannot be decided without a decode and so is
     /// deliberately left alone rather than re-examined forever.
     ///
-    /// The comparison is geometry *and* [`TIER_PROCESS_VERSION`]: a generator
-    /// change that keeps the dimensions is invisible to the geometry alone,
-    /// and without the version stamp nothing could ever trigger its
-    /// regeneration.
+    /// The comparison is geometry, media type *and* generator version: a
+    /// format change moves no dimension and a generator change can move
+    /// neither, so geometry alone would call both of them a match forever.
     ///
     /// `image_facts` is what the caller already stat'd and read for this file;
     /// nothing here re-fetches it. `ladder` is [`grid_ladder`]'s answer, and

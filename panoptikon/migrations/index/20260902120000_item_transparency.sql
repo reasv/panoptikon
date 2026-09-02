@@ -22,28 +22,12 @@
 -- content cannot disagree.
 ALTER TABLE items ADD COLUMN has_transparency INTEGER;
 
--- The set of images whose pixels nothing has examined for transparency, as a
--- standing population. Partial on the NULL state, so it drains away as the
--- backfill runs instead of carrying every row in the database forever, and so
--- its size is a direct answer to "how much of this library is left".
+-- The standing population of images whose pixels nothing has examined.
+-- Partial on the NULL state, so it drains away as the backfill runs instead
+-- of carrying every row in the database forever.
 --
--- Deliberately **not** what the scan's dispatch question reads: that one is
--- `item_transparency_pending`, a `sha256 = ?` probe answered from the primary
--- key, which would not touch this index however it were shaped. What the index
--- is for is the sweep — an EXPLAIN-able "which items are still pending"
--- lookup, whether by hand or by any future job that wants the population
--- rather than one item — and consistency with `idx_items_rotation_pending`,
--- whose column this one is modelled on line for line.
---
--- `type` leads because items.type holds the whole mime string ('image/png'),
--- so the population is a half-open range scan (`type >= 'image/' AND type <
--- 'image0'`, '0' being the byte after '/'). Not `LIKE 'image/%'`: SQLite
--- cannot serve a LIKE prefix from an index under the default case-insensitive
--- LIKE, which is the anti-pattern this codebase has already paid for on
--- sha256, tag namespaces and file_scans.
---
--- Only images are ever examined: a video's renditions come from a frame grid
--- this generator wrote as an opaque JPEG, and the other picture-producing
--- types (audio covers, PDF pages, HTML shots) likewise. Their rows keep a NULL
--- forever and the `type` key means the dispatch seek never walks them.
+-- For asking that question by hand: `type` leads so the lookup is a half-open
+-- range scan (`type >= 'image/' AND type < 'image0'`, '0' being the byte
+-- after '/') rather than a `LIKE 'image/%'` SQLite cannot serve from an
+-- index.
 CREATE INDEX idx_items_transparency_pending ON items(type) WHERE has_transparency IS NULL;

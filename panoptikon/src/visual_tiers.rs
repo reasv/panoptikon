@@ -46,7 +46,7 @@
 //! A grid request for an animated item, `still` unset, is answered:
 //!
 //! * **the stored loop** where one exists — `video/mp4`, the exact answer at
-//!   both grid tiers, immutable;
+//!   every grid tier, immutable;
 //! * **the original file, revalidating**, where no loop row exists yet: the
 //!   backfill has not reached this item, so the answer must not be pinned;
 //! * **the original file, immutable**, where the loop row exists and carries
@@ -115,7 +115,7 @@ pub(crate) const DISPLAY_MAX_PIXELS: u64 = 24_000_000;
 /// it does. 2560 fills a 4K monitor 1:1 in either orientation with margin and
 /// removes 32% more bytes than 4096 for a mean screen-fit SSIM loss of 0.0025
 /// (measured 2026-09-01 over the user's four corpora).
-pub(crate) const DISPLAY_RENDITION_SHORT_SIDE: u32 = 2560;
+const DISPLAY_RENDITION_SHORT_SIDE: u32 = 2560;
 
 /// Display tier: the byte bound of a **lossless** original (PNG, BMP, TIFF,
 /// and every still container that is neither JPEG nor WebP).
@@ -134,7 +134,7 @@ pub(crate) const DISPLAY_MAX_FILE_SIZE_LOSSLESS: u64 = 2 * 1024 * 1024;
 /// Its own constant because bytes mean different things per format: a 5 MiB
 /// PNG is a modest picture, a 5 MiB JPEG a large efficient one, and a 600 KiB
 /// 2400x3600 JPEG is already what the gallery wants to paint.
-pub(crate) const DISPLAY_MAX_FILE_SIZE_JPEG: u64 = 4 * 1024 * 1024;
+const DISPLAY_MAX_FILE_SIZE_JPEG: u64 = 4 * 1024 * 1024;
 
 /// Display tier: the byte bound of an **animated** original, above which its
 /// `display` answer becomes a stored H.264 loop (R3).
@@ -148,7 +148,7 @@ pub(crate) const DISPLAY_MAX_FILE_SIZE_ANIMATED: u64 = 5 * 1024 * 1024;
 /// falls back to JPEG at the same quality — in practice the tall strips, whose
 /// display rendition keeps its 800 px short side and runs to tens of thousands
 /// of rows.
-pub(crate) const WEBP_MAX_SIDE: u32 = 16383;
+const WEBP_MAX_SIDE: u32 = 16383;
 
 /// The largest side a JPEG can encode: its frame header carries the
 /// dimensions in 16 bits.
@@ -158,21 +158,21 @@ pub(crate) const WEBP_MAX_SIDE: u32 = 16383;
 /// the 2560 cap and its length with it. Past this there is no container left
 /// to store the rendition in, which is a verdict about the shape and not an
 /// encoder failure to report ([`display_plan`]).
-pub(crate) const JPEG_MAX_SIDE: u32 = 65535;
+const JPEG_MAX_SIDE: u32 = 65535;
 
 /// Grid tiers: JPEG quality. One step below the display tier's, because a
 /// grid cell paints the picture at a fraction of its size and the ladder's
 /// whole point is bytes and decode time per cell.
-pub(crate) const GRID_JPEG_QUALITY: u8 = 83;
+const GRID_JPEG_QUALITY: u8 = 83;
 /// Display renditions: JPEG quality — today's number, unchanged, so a
 /// re-encode is a format decision and never a quality regression.
-pub(crate) const DISPLAY_JPEG_QUALITY: u8 = 85;
+const DISPLAY_JPEG_QUALITY: u8 = 85;
 /// Grid tiers: WebP quality, for the transparent items and the
 /// storage-constrained policy.
-pub(crate) const GRID_WEBP_QUALITY: f32 = 85.0;
+const GRID_WEBP_QUALITY: f32 = 85.0;
 /// Display renditions: WebP quality. 90 is where a WebP of a lossless source
 /// measured 11x smaller at decode parity or better.
-pub(crate) const DISPLAY_WEBP_QUALITY: f32 = 90.0;
+const DISPLAY_WEBP_QUALITY: f32 = 90.0;
 
 /// A stored rendition must be at most this fraction of its source's bytes, or
 /// the source itself is the better answer and a sentinel row records that.
@@ -189,7 +189,7 @@ const KEEP_ORIGINAL_DENOMINATOR: u64 = 4;
 const GRID_DIRECT_NUMERATOR: u64 = 5;
 const GRID_DIRECT_DENOMINATOR: u64 = 4;
 /// Grid tiers: the largest original served directly by byte count.
-pub(crate) const GRID_DIRECT_MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
+const GRID_DIRECT_MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
 
 /// The aspect above which a grid tier becomes a *crop* rather than a
 /// whole-image resize. At or below it, `long <= 2 * short`, and the tier is
@@ -206,15 +206,15 @@ pub(crate) const ANIMATED_RAW_MAX_FILE_SIZE: u64 = 1024 * 1024;
 /// The other half of the animated raw floor: neither side may exceed this.
 pub(crate) const ANIMATED_RAW_MAX_SIDE: u32 = 512;
 
-/// The animated loop's short-side cap. ONE loop per item, reused by both grid
-/// tiers — an H.264 stream is not a ladder: `grid-s` cells paint the same
-/// decode scaled down, and a second encode would double the scan's most
+/// The animated loop's short-side cap. ONE loop per item, reused by every
+/// grid tier — an H.264 stream is not a ladder: a smaller cell paints the
+/// same decode scaled down, and a second encode would double the scan's most
 /// expensive visual for no measurable decode saving.
-pub(crate) const LOOP_MAX_SHORT_SIDE: u32 = 1024;
+const LOOP_MAX_SHORT_SIDE: u32 = 1024;
 
-/// The stored discriminator of the animated loop, in the same column as
-/// `grid-m`/`grid-s` and deliberately not a [`ThumbnailTier`]: the loop is a
-/// rendition *kind*, not a `size=` value. It answers **both** grid tiers.
+/// The stored discriminator of the animated loop, in the same column as the
+/// `grid-*` posters and deliberately not a [`ThumbnailTier`]: the loop is a
+/// rendition *kind*, not a `size=` value. It answers **every** grid tier.
 pub(crate) const LOOP_TIER: &str = "loop";
 
 /// The second loop row, stored only for an animated item whose **display**
@@ -966,9 +966,11 @@ pub(crate) fn render<'a>(image: &'a DynamicImage, plan: &TierPlan) -> Cow<'a, Dy
 /// The grid renditions to store for one already-decoded picture, largest
 /// first.
 ///
-/// `grid-s` cascades off `grid-m` when there is one — the two crops cover the
-/// identical source region by construction, so the cascade is exact and
-/// halves the resize work. It never cascades off the **display** rendition:
+/// Each rung cascades off the one above it where that one exists — the crops
+/// cover the identical source region by construction, so the cascade is exact
+/// and every rung after the first resizes from a picture already at most a
+/// quarter of the source's pixels. It never cascades off the **display**
+/// rendition:
 /// a megapixel-guarded display tier can be *smaller* than `grid-m` (a
 /// 800x60000 strip scales to 653 px wide), and cropping an already-scaled
 /// intermediate would upscale.
@@ -1192,15 +1194,20 @@ pub(crate) fn loop_keeps_original(encoded_len: u64, source_len: u64) -> bool {
     encoded_len >= source_len
 }
 
-/// The **whole** stored set of an animated item above the raw floor: its
-/// posters, then its loop, named by the strings the `tier` column holds.
+/// The **whole** stored set of an animated item above the raw floor.
+///
+/// At most five rows, and never more: the posters `grid-m`, `grid-s` and
+/// `grid-xs` (each stored only where it is genuinely smaller than the one
+/// above it), the `loop` that answers every grid tier, and — only where the
+/// display answer is a loop the grid one cannot stand in for (R3) — a
+/// `loop-display`.
 ///
 /// One function for the dispatcher's prediction and the generator's output,
 /// for the same reason [`grid_plans`] is one function: the backfill compares
 /// the stored geometry against this and never terminates if the two can
 /// disagree. Ordered the way `get_thumbnail_tier_geometry` returns rows —
-/// `grid-m`, `grid-s`, `loop` is already lexicographic — but the comparison
-/// sorts anyway.
+/// posters then loops is already lexicographic — but the comparison sorts
+/// anyway.
 pub(crate) fn animated_plans(
     file_size: u64,
     width: u32,

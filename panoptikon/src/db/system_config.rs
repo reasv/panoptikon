@@ -100,8 +100,10 @@ pub(crate) struct SystemConfig {
     /// not revert visuals already regenerated against a trimmed range (§8.1).
     #[serde(default = "default_true")]
     pub detect_outros: bool,
-    /// Which container formats stored thumbnails may use
+    /// Accepted names: `jpeg`, `webp`; unknown names are ignored
     /// (docs/thumbnail-format-implementation.md §2, R5).
+    ///
+    /// Which container formats stored thumbnails may use.
     ///
     /// It *constrains* the format rules rather than deciding anything: with
     /// `webp` absent every WebP verdict becomes JPEG (alpha flattened), with
@@ -115,6 +117,7 @@ pub(crate) struct SystemConfig {
     /// Changing it regenerates the affected renditions on the next scan; the
     /// database file only shrinks after the maintenance VACUUM.
     #[serde(default = "default_thumbnail_formats")]
+    #[schema(example = json!(["jpeg", "webp"]))]
     pub thumbnail_formats: Vec<String>,
     #[serde(default)]
     pub enable_cron_job: bool,

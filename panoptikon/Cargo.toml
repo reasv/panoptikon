@@ -61,7 +61,10 @@ jpeg-encoder = "0.7"
 # Lossy WebP, which `image-webp` cannot write (it encodes lossless only).
 # Pulls libwebp-sys, whose vendored C builds with `cc` alone — no cmake, no
 # nasm — so every packaging leg needs a C compiler and nothing more.
-webp = "0.3"
+# `default-features = false` drops the `img` feature: its `from_image` refuses
+# any 16-bit `DynamicImage` variant, and the raw `from_rgb`/`from_rgba` level
+# below it is what the encoder deliberately uses.
+webp = { version = "0.3", default-features = false }
 notify = "8.2.0"
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 sqlx = { version = "0.9", features = [

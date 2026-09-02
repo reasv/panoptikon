@@ -102,10 +102,13 @@ pub(crate) struct TierGeometry {
     pub tier: String,
     pub width: i64,
     pub height: i64,
-    /// The `TIER_PROCESS_VERSION` this rendition was generated at. Geometry
-    /// alone cannot see a generator change that keeps the dimensions — a
-    /// different crop anchor, a different filter, a different quality — so
-    /// the dispatcher compares this too and treats an older stamp as work.
+    /// The generator version this rendition was made at — whichever one its
+    /// kind carries ([`RenditionKind::process_version`]), so a still row and
+    /// a loop row in the same set are stamped from different constants.
+    /// Geometry alone cannot see a generator change that keeps the
+    /// dimensions — a different crop anchor, a different filter, a different
+    /// quality, a different CRF — so the dispatcher compares this too and
+    /// treats an older stamp as work.
     pub version: i64,
     /// The stored `media_type`. Compared alongside the geometry, because
     /// nothing else can see a format change: R4's transparency measurement,
