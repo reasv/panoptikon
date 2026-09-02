@@ -122,10 +122,11 @@ CPU profile 100% idle with the cursor parked; per-cell listeners unchanged on
 static cards.
 
 Deviations from §2/§3, all adopted:
-- `animateMode` reaches cells as a latched **prop** (the `tier`/`animatedFloor`
+- `animateMode` reaches cells as a **prop** (the `tier`/`animatedFloor`
   idiom), not via `CellFlagsContext` — the host publishing the flags has no
   access to the measured cell width, and `SearchResultImage` never subscribes
-  to the flags by contract.
+  to the flags by contract. It is a LIVE prop, not latched like the tier; see
+  user-QA item (4) below.
 - One shared `components/LoopVideo.tsx` for grid and filmstrip; `AnimateMode`
   and `SMALL_CELL_THRESHOLD_PX` live in `lib/thumbnailTier.ts`.
 - Extreme-aspect animated cards **never hover-arm**: their whole-image swap
@@ -165,6 +166,11 @@ Always / On hover toggle reached only cells mounted afterwards — it looked
 inert until a refresh. They are live props now: the tier latch guards against
 resize-driven flashes the user did not ask for; these two change only on a
 deliberate act on the grid whose whole point is that the visible cells change.
+Post-review: `smallCell` is no longer a prop at all — the card derives
+`isSmallCell(cellWidth)` from the box the host already hands it
+(`lib/gridCellSize.ts`), so the host's range answer and the card's cannot
+disagree. The host still computes `cellRange(cellWidth)` once for the animate
+mode.
 
 ## 7. Traps carried over
 
