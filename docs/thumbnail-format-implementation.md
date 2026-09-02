@@ -100,7 +100,8 @@ CRF 16, same encoder settings. The rule is the whole picture and not merely a
 short side ≤ 1024, because a strip (aspect > 2) has its grid loop stored as a
 **top crop** — right in a cover cell, wrong on a contain surface — so every
 strip over the trigger gets its own `loop-display`. 60 s duration cap on every loop encode
-(§4). **No sentinel:** a loop is stored whatever its byte count.
+(§4), and a VBV ceiling per rung (§10, the 2026-09-02 note). **No sentinel:**
+a loop is stored whatever its byte count.
 
 **R4 Transparency.** `items.has_transparency` (0/1, NULL = never examined),
 measured from decoded pixels (any alpha < 255) in `build_image_renditions`,
@@ -327,10 +328,12 @@ through in the grid and gallery instead of black; heavy GIFs open as loops
 (one decode per image) and the DB file shrinks only after the maintenance
 VACUUM. Grid-xs at the slider minimum is the visible perf change.
 
-### 2026-09-02: a loop is never a keep-original sentinel
+### 2026-09-02: loops are never sentinels, and are rate-capped
 
-A change to R3, from evidence in the user's real library. It does not bump
-`LOOP_PROCESS_VERSION`. The keep-original rule used to
+Two changes to R3, from evidence in the user's real library. Neither bumps
+`LOOP_PROCESS_VERSION`.
+
+**1. A loop is stored whatever its size.** The keep-original rule used to
 apply to the H.264 loop as well: an encode that came out at or above its
 source's bytes was written as an empty row, and the endpoint answered the
 original file. That inverted the trigger that produced it. Two 8.4 MiB
@@ -355,3 +358,17 @@ path for the window before that scan, but it now revalidates instead of
 answering immutably: a state that changes is not a verdict that settles.
 Migration `20260902130000` is historical for the same reason; it is not
 edited.
+
+**2. A VBV ceiling per rung.** "Store regardless" needs a bound, because CRF
+bounds nothing. Measured on the user's 8.79 MB dithered-noise GIF (79 frames,
+14.3 fps, 5.5 s) through the production filter chain: grid loop 2048x1024 at
+CRF 18 = **11.2 MB**; CRF 23 = 2.4 MB; CRF 18 with `-maxrate 4M -bufsize 8M` =
+**2.6 MB**. Display loop 2438x1080 at CRF 16 = 26.6 MB; CRF 20 = 8.6 MB. So
+every loop encode now carries `-maxrate`/`-bufsize` beside its CRF: **grid
+4 Mbit/s (bufsize 8M), display 10 Mbit/s (bufsize 20M)**, with CRF still
+governing quality everywhere it fits under the ceiling. It costs the existing
+library nothing measurable — across 610 stored grid loops the median rate of a
+loop ≥ 3 s is 0.85 Mbit/s, only 9 exceed 4 Mbit/s and none exceeds 8 MB — and
+it bounds the pathological dithered-GIF case that motivated the sentinel in
+the first place. Not a version bump for the same reason as above: only new and
+repaired encodes get the ceiling.
