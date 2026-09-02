@@ -97,6 +97,12 @@ pub enum Surface {
     Playback,
     Clip,
     Mosaic,
+    /// The grid/filmstrip hover preview
+    /// (docs/video-hover-preview-implementation.md). Its own surface rather
+    /// than a second `Playback` preset: a policy that offers the gallery's
+    /// full-size rendition need not also pay for a preview of every cell the
+    /// pointer crosses, and the UI never offers this one in a dropdown.
+    Preview,
 }
 
 /// Rate control. `Crf` is the quality target every built-in uses (and the
@@ -187,7 +193,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
         &'static [Surface],
     );
 
-    const TABLE: [Row; 8] = [
+    const TABLE: [Row; 9] = [
         (
             "playback",
             "Playback",
@@ -199,6 +205,25 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             None,
             Channel::Fast,
             &[Surface::Playback],
+        ),
+        (
+            "preview",
+            "Hover preview",
+            Container::Mp4,
+            "h264",
+            // Silent by design, not by accident: a grid full of cells the
+            // pointer skims cannot ask for audio, and `-an` costs nothing to
+            // encode. The container carries audio, so this is the one built-in
+            // mp4 that deliberately declines it.
+            None,
+            // A picture at most a few hundred CSS pixels wide, thrown away as
+            // soon as the pointer leaves: latency and bandwidth are the whole
+            // point, quality is not.
+            QualityMode::Crf(26),
+            Some(480),
+            Some(30.0),
+            Channel::Fast,
+            &[Surface::Preview],
         ),
         (
             "clip",
@@ -536,6 +561,7 @@ mod tests {
             ids,
             [
                 "playback",
+                "preview",
                 "clip",
                 "clip-fast",
                 "webp-anim",
@@ -552,6 +578,29 @@ mod tests {
         assert_eq!(playback.max_height, Some(1080));
         assert_eq!(playback.channel, Channel::Fast);
         assert!(playback.surfaces.contains(&Surface::Playback));
+
+        // The hover preview: the one built-in that pairs an audio-capable
+        // container with no audio stream, and the only h264 built-in that caps
+        // both height and frame rate. Every number here is a client contract
+        // in miniature — the 16 s window the UI asks for is trim, not preset,
+        // but the 480 and the silence are what make a skimmed grid affordable.
+        let preview = find_preset(&presets, "preview").unwrap();
+        assert_eq!(preview.container, Container::Mp4);
+        assert_eq!(preview.vcodec, "h264");
+        assert_eq!(preview.acodec, None);
+        assert_eq!(preview.quality, QualityMode::Crf(26));
+        assert_eq!(preview.max_height, Some(480));
+        assert_eq!(preview.fps_max, Some(30.0));
+        assert_eq!(preview.channel, Channel::Fast);
+        assert_eq!(preview.surfaces, vec![Surface::Preview]);
+        assert!(
+            presets
+                .iter()
+                .filter(|preset| preset.surfaces.contains(&Surface::Preview))
+                .count()
+                == 1,
+            "exactly one preset serves the hover surface"
+        );
 
         let clip = find_preset(&presets, "clip").unwrap();
         assert_eq!(clip.quality, QualityMode::Crf(18));
@@ -578,8 +627,19 @@ mod tests {
         assert!(
             presets
                 .iter()
-                .all(|preset| preset.container.is_animated_image() == preset.fps_max.is_some()),
-            "the animated-image presets are exactly the fps-capped ones"
+                .all(|preset| !preset.container.is_animated_image() || preset.fps_max.is_some()),
+            "every animated-image preset is fps-capped"
+        );
+        let capped: Vec<&str> = presets
+            .iter()
+            .filter(|preset| preset.fps_max.is_some())
+            .map(|preset| preset.id.as_str())
+            .collect();
+        assert_eq!(
+            capped,
+            ["preview", "webp-anim", "avif-anim"],
+            "the fps cap is the animated-image containers plus the hover preview, \
+             whose cells are too small for a 60 fps source to be worth decoding"
         );
         let webm = find_preset(&presets, "mosaic-webm").unwrap();
         assert_eq!(webm.vcodec, "vp9");
@@ -625,7 +685,7 @@ mod tests {
         assert_eq!(clip.channel, Channel::Quality);
         assert_eq!(clip.surfaces, vec![Surface::Clip]);
         // Built-in ordering survives a patch, so the presets DTO stays stable.
-        assert_eq!(resolved[1].id, "clip");
+        assert_eq!(resolved[2].id, "clip");
 
         // The clearing conventions: audio = false drops the stream, a 0 cap
         // means uncapped, and bitrate_kbps replaces an inherited crf.
@@ -656,6 +716,16 @@ mod tests {
             .map(|preset| preset.id.as_str())
             .collect();
         assert_eq!(playback_ids, ["playback"]);
+        let preview_ids: Vec<&str> = presets
+            .iter()
+            .filter(|preset| preset.surfaces.contains(&Surface::Preview))
+            .map(|preset| preset.id.as_str())
+            .collect();
+        assert_eq!(
+            preview_ids,
+            ["preview"],
+            "the hover surface is disjoint from the dropdown surfaces"
+        );
 
         let map = profiles(&[("mosaic-webm", "surfaces = [\"clip\", \"mosaic\"]")]);
         let resolved = resolve_presets(Some(&map));

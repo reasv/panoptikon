@@ -1421,6 +1421,31 @@ mod tests {
         assert_eq!(preset("webp-anim").channel, Channel::Fast);
     }
 
+    /// The hover preview's vector, which is the one mp4 built-in that carries
+    /// no audio: `-an` is emitted from the preset's absent `acodec` alone, so
+    /// an audio-capable container gets the same silent treatment webp does.
+    /// The audio stream must also never be *mapped* — `-map 0:a:0?` on a
+    /// silent output would keep the demuxer decoding a track nothing encodes.
+    #[test]
+    fn the_preview_preset_is_silent_capped_and_trimmed() {
+        // 16 s from the start: what a cell asks for (`end_cs = 1600`).
+        let preview = args_of(&spec_for("preview", None, Some(1600)));
+        assert!(
+            preview.contains(&"-an".to_string()),
+            "the preview carries no audio: {preview:?}"
+        );
+        assert!(
+            !preview.contains(&"0:a:0?".to_string()),
+            "and maps no audio stream: {preview:?}"
+        );
+        assert_eq!(preview[at(&preview, "-crf") + 1], "26");
+        assert_eq!(preview[at(&preview, "-fpsmax") + 1], "30");
+        assert_eq!(preview[at(&preview, "-vf") + 1], "scale=-2:'min(ih,480)'");
+        assert_eq!(preview[at(&preview, "-t") + 1], "16.00");
+        // An mp4 all the same: playback must not wait for a trailing moov.
+        assert_eq!(preview[at(&preview, "-movflags") + 1], "+faststart");
+    }
+
     /// Per-container spelling: webp's quality knob is `-q:v`, vp9 needs an
     /// explicit zero bitrate for constant quality, and faststart is an mp4
     /// container feature that must not be handed to the others.
