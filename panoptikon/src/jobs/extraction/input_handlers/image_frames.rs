@@ -10,6 +10,7 @@ use crate::api_error::{ApiError, Blocker};
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::open_index_db_read_no_user_data;
 use crate::db::storage::{StoredImage, get_frames_bytes};
+use crate::visual_tiers::GENERATED_STILL_FORMAT;
 use crate::inferio_client::{InferenceFile, InferenceInput};
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
 use crate::jobs::files::FRAME_PROCESS_VERSION;
@@ -203,6 +204,12 @@ pub(super) async fn load_base_frames(
                     idx: idx as i64,
                     width: img.width() as i64,
                     height: img.height() as i64,
+                    // `storage.frames` has no media type column of its own;
+                    // these are what `encode_jpeg` just wrote, which is the
+                    // format every picture this generator produces takes.
+                    media_type: GENERATED_STILL_FORMAT.media_type().to_string(),
+                    // Stamped by `store_frames`; see `StoredImage::version`.
+                    version: 0,
                     bytes: encode_jpeg(img)?,
                 });
             }

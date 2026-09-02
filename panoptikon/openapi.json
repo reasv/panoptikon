@@ -2003,7 +2003,7 @@
           "items"
         ],
         "summary": "Get thumbnail for an item",
-        "description": "Returns a thumbnail for a given item.\nThe thumbnail may be a stored rendition,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nOn the default (`display`) path GIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).\nThe `size` parameter selects a rendition tier: `display` (default, unchanged behaviour),\n`grid-m` (short side 1024) or `grid-s` (short side 512).\nA tier with no stored rendition falls through to the next larger one.\nAt a grid tier an **animated** item above the raw floor answers with its H.264 loop as\n`video/mp4` (one rendition serves both grid tiers), and `still=true` answers with the\nstatic poster for that tier instead. Animated items at or below the floor - at most\n1 MiB with both sides at most 512 px, reported by `/api/client-config` - are answered\nwith their original file at every tier.",
+        "description": "Returns a thumbnail for a given item.\nThe thumbnail may be a stored rendition,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nOn the default (`display`) path an animated item is returned as the original file unless it is over the display loop trigger reported by `/api/client-config`, in which case it is answered with an H.264 loop as `video/mp4`.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).\nThe `size` parameter selects a rendition tier: `display` (default),\n`grid-m` (short side 1024), `grid-s` (short side 512) or `grid-xs` (short side 256).\nA tier with no stored rendition falls through to the next larger one.\nStill renditions are `image/jpeg` or `image/webp`; the response's Content-Type and filename extension come from the stored row.\nAt a grid tier an **animated** item above the raw floor answers with its H.264 loop as\n`video/mp4` (one rendition serves every grid tier), and `still=true` answers with the\nstatic poster for that tier instead. Animated items at or below the floor - at most\n1 MiB with both sides at most 512 px, reported by `/api/client-config` - are answered\nwith their original file at every tier.\nSupports HTTP Range requests (single byte ranges), which matter for the H.264 loops:\na `<video>` that cannot ask for a range downloads the whole stream before playing.\nConditional GET is supported on every answer; a validated `If-None-Match` returns 304.",
         "operationId": "item_thumbnail",
         "parameters": [
           {
@@ -2085,6 +2085,15 @@
         "responses": {
           "200": {
             "description": "Item thumbnail image"
+          },
+          "206": {
+            "description": "Partial thumbnail contents (Range request)"
+          },
+          "304": {
+            "description": "Not modified (validated If-None-Match)"
+          },
+          "416": {
+            "description": "Requested range not satisfiable"
           }
         }
       }
@@ -6191,6 +6200,17 @@
             "type": "boolean",
             "description": "True only for a policy explicitly marked as the local Desktop client\nwhile the private parent-shell bridge is configured."
           },
+          "display_loop_trigger": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DisplayLoopTrigger",
+                "description": "The display-tier loop trigger (see [`DisplayLoopTrigger`]).\n\nAlways `Some` today: the loop ladder is unconditional. The `Option` is\nreserved for a build that stores no loops at all, which would publish\n`null` here rather than a bound it does not serve by — with nothing to\nevaluate, every animated item is an `<img>` on its original file and\nno client mounts a `<video>`."
+              }
+            ]
+          },
           "policy": {
             "type": "string",
             "description": "Name of the policy that matched this request."
@@ -6851,6 +6871,35 @@
         "properties": {
           "version": {
             "type": "string"
+          }
+        }
+      },
+      "DisplayLoopTrigger": {
+        "type": "object",
+        "description": "The display-tier loop trigger, verbatim from [`crate::visual_tiers`]\n(docs/thumbnail-format-implementation.md §2, R3).\n\nThe gallery's large view decides `<video>` vs `<img>` from four fields of\nthe item it is showing — `type` and `duration` say whether the picture\nmoves, `size` and `width`/`height` say whether it clears the trigger —\nagainst these three numbers, which is the same arithmetic the scan used to\ndecide whether to store a loop at all. Surfaced rather than duplicated in\nthe UI so the two sides cannot drift, and so the client needs no request to\nfind out (a wasted round trip per animated item, and an error latch on the\nones that answer with an image).\n\nAny **one** of the three firing is enough; they are not a conjunction.",
+        "required": [
+          "max_bytes",
+          "max_short_side",
+          "max_pixels"
+        ],
+        "properties": {
+          "max_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes. An animated original larger than this is answered with a loop.",
+            "minimum": 0
+          },
+          "max_pixels": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total pixels.",
+            "minimum": 0
+          },
+          "max_short_side": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The shorter side, in pixels.",
+            "minimum": 0
           }
         }
       },
@@ -11394,6 +11443,17 @@
           "scan_video": {
             "type": "boolean"
           },
+          "thumbnail_formats": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Accepted names: `jpeg`, `webp`; unknown names are ignored\n(docs/thumbnail-format-implementation.md §2, R5).\n\nWhich container formats stored thumbnails may use.\n\nIt *constrains* the format rules rather than deciding anything: with\n`webp` absent every WebP verdict becomes JPEG (alpha flattened), with\n`jpeg` absent every JPEG verdict becomes WebP — the\nstorage-constrained deployment, which knowingly pays WebP's measured\n2.2-2.7x decode cost in the grid. A list naming neither is treated as\nthe default with a warning and never rejected at commit: the settings\nUI round-trips the whole config, so a reject would break every\nunrelated save.\n\nChanging it regenerates the affected renditions on the next scan; the\ndatabase file only shrinks after the maintenance VACUUM.",
+            "example": [
+              "jpeg",
+              "webp"
+            ]
+          },
           "vector_quants": {
             "oneOf": [
               {
@@ -11577,7 +11637,8 @@
         "enum": [
           "display",
           "grid-m",
-          "grid-s"
+          "grid-s",
+          "grid-xs"
         ]
       },
       "TranscodeCacheResize": {

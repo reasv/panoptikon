@@ -6,7 +6,14 @@
 //! owning the resource has (the item file weighs the recorded mtime against
 //! the one on disk; a transcode artifact is content-addressed on both halves
 //! of its key and needs no such caveat). Callers decide that, then hand over a
-//! [`FileServeSpec`].
+//! [`ServeSpec`] and the bytes to go with it.
+//!
+//! Where the bytes come from is the *only* difference between serving a file
+//! and serving a stored rendition, so it is the only thing [`ServeBody`]
+//! carries. Range, `If-Range`, `If-None-Match`, `If-Modified-Since` and the
+//! response assembly are one implementation for both: a database-backed mp4
+//! that answered `Range` differently from a file-backed one would be a
+//! `<video>` element that seeks in one case and not the other.
 
 use axum::{
     body::Body,
@@ -37,19 +44,36 @@ pub(crate) enum RangeOutcome {
     Unsatisfiable,
 }
 
-/// Everything [`serve_file`] needs once the caller has decided the resource's
-/// identity: an open handle plus the validators and headers that describe it.
-pub(crate) struct FileServeSpec {
-    pub(crate) file: tokio::fs::File,
-    /// Authoritative for range math; the caller stats the open handle rather
-    /// than trusting any recorded size.
-    pub(crate) size: u64,
+/// Everything [`serve`] needs once the caller has decided the resource's
+/// identity: the validators and headers that describe it.
+pub(crate) struct ServeSpec {
     pub(crate) mime_type: String,
     pub(crate) etag: String,
     pub(crate) cache_control: &'static str,
+    /// `None` where the resource has no such date — a stored rendition is
+    /// derived from content, not from a file, so its ETag is its only
+    /// validator and its only `If-Range` key.
     pub(crate) last_modified: Option<String>,
     pub(crate) content_disposition_type: &'static str,
     pub(crate) filename: String,
+}
+
+/// Where the bytes of a response come from.
+pub(crate) enum ServeBody {
+    /// An open handle, streamed. `size` is authoritative for range math: the
+    /// caller stats the handle rather than trusting any recorded size.
+    File { file: tokio::fs::File, size: u64 },
+    /// Bytes already in memory — a stored rendition, a placeholder.
+    Bytes(Vec<u8>),
+}
+
+impl ServeBody {
+    fn size(&self) -> u64 {
+        match self {
+            Self::File { size, .. } => *size,
+            Self::Bytes(bytes) => bytes.len() as u64,
+        }
+    }
 }
 
 pub(crate) fn if_none_match_matches(header_value: &str, etag: &str) -> bool {
@@ -177,13 +201,12 @@ pub(crate) fn parse_range_header(value: &str, size: u64) -> RangeOutcome {
 
 /// Serves an open file: conditional GET first, then the range decision, then
 /// the body and headers.
-pub(crate) async fn serve_file(
-    spec: FileServeSpec,
+pub(crate) async fn serve(
+    spec: ServeSpec,
+    body: ServeBody,
     request_headers: &HeaderMap,
 ) -> ApiResult<Response<Body>> {
-    let FileServeSpec {
-        mut file,
-        size,
+    let ServeSpec {
         mime_type,
         etag,
         cache_control,
@@ -191,6 +214,7 @@ pub(crate) async fn serve_file(
         content_disposition_type,
         filename,
     } = spec;
+    let size = body.size();
 
     // Conditional GET: If-None-Match wins over If-Modified-Since (RFC 9110).
     if let Some(if_none_match) = request_headers
@@ -243,14 +267,17 @@ pub(crate) async fn serve_file(
         }
     }
 
-    let (status, body, content_length, content_range) = match range {
-        RangeOutcome::Full => (
+    let (status, body, content_length, content_range) = match (range, body) {
+        (RangeOutcome::Full, ServeBody::File { file, .. }) => (
             StatusCode::OK,
             Body::from_stream(ReaderStream::new(file)),
             size,
             None,
         ),
-        RangeOutcome::Partial { start, end } => {
+        (RangeOutcome::Full, ServeBody::Bytes(bytes)) => {
+            (StatusCode::OK, Body::from(bytes), size, None)
+        }
+        (RangeOutcome::Partial { start, end }, ServeBody::File { mut file, .. }) => {
             file.seek(SeekFrom::Start(start)).await.map_err(|err| {
                 tracing::error!(error = %err, "failed to seek file");
                 ApiError::internal("Failed to read file")
@@ -263,7 +290,16 @@ pub(crate) async fn serve_file(
                 Some(format!("bytes {start}-{end}/{size}")),
             )
         }
-        RangeOutcome::Unsatisfiable => (
+        (RangeOutcome::Partial { start, end }, ServeBody::Bytes(bytes)) => {
+            let slice = bytes[start as usize..=end as usize].to_vec();
+            (
+                StatusCode::PARTIAL_CONTENT,
+                Body::from(slice),
+                end - start + 1,
+                Some(format!("bytes {start}-{end}/{size}")),
+            )
+        }
+        (RangeOutcome::Unsatisfiable, _) => (
             StatusCode::RANGE_NOT_SATISFIABLE,
             Body::empty(),
             0,

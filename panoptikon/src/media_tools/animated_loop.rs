@@ -4,7 +4,8 @@
 //! A GIF in a grid cell is the worst case the whole tier ladder exists for —
 //! an uncompressed-ish palette animation decoded at full resolution, every
 //! frame, in every visible cell. The rendition that replaces it is a plain
-//! progressive mp4: libx264, yuv420p, CRF [`LOOP_CRF`], `+faststart`, source
+//! progressive mp4: libx264, yuv420p, a CRF chosen by the rendition's rung,
+//! `+faststart`, source
 //! frame timing and duration preserved, geometry from the *same*
 //! [`crate::visual_tiers`] crop rule every still tier uses. Not AV1: hardware
 //! decode sessions are finite at 20-30 streams and software AV1 is expensive,
@@ -33,27 +34,53 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use super::transcode::compose::{ItemTime, Transform, orientation_filters};
-use crate::visual_tiers::TierPlan;
+use crate::visual_tiers::{RenditionRung, TierPlan};
 
-/// x264's rate factor for a loop. Visually transparent for the material —
-/// flat-colour animations and short clips — at a fraction of a GIF's bytes.
-/// A change here needs a `TIER_PROCESS_VERSION` bump: the stored geometry
-/// cannot see it.
-const LOOP_CRF: &str = "18";
+/// x264's rate factor for a **grid** loop. Visually transparent for the
+/// material — flat-colour animations and short clips — at a fraction of a
+/// GIF's bytes. A change here needs a `LOOP_PROCESS_VERSION` bump: the stored
+/// geometry cannot see it.
+const LOOP_CRF: u32 = 18;
+
+/// The same for a **display** loop, which is watched at full size rather than
+/// in a grid cell and gets the two steps of quality that costs.
+const LOOP_DISPLAY_CRF: u32 = 16;
+
+/// The rate factor one rung's loop is encoded at.
+///
+/// Looked up from the rung rather than passed in beside it, exactly as the
+/// still encoders look up their qualities: a caller that carries the number
+/// is a caller that can hand a grid loop the display one's.
+fn crf(rung: RenditionRung) -> u32 {
+    match rung {
+        RenditionRung::Grid => LOOP_CRF,
+        RenditionRung::Display => LOOP_DISPLAY_CRF,
+    }
+}
+
+/// The longest loop this encoder will produce, in seconds
+/// (docs/thumbnail-format-implementation.md §4).
+///
+/// A cap rather than a fidelity choice: a grid cell is not a video player, and
+/// an unbounded loop lets one 30-minute animation cost more scan time and more
+/// stored bytes than the rest of a library's animations together. Applied on
+/// the **output** side so it reaches both input paths, and mirrored in
+/// [`LOOP_WINDOW`] so the WebP bridge stops decoding frames at the same
+/// boundary rather than decoding an hour of them for ffmpeg to throw away.
+const LOOP_MAX_SECONDS: u32 = 60;
 
 /// x264's speed/size tradeoff. `medium` is the default and is where the curve
 /// flattens; a scan encodes one of these per animated item, so a slower
 /// preset would buy single-digit percent for a multiple of the scan time.
 const LOOP_PRESET: &str = "medium";
 
-/// The whole animation, expressed in the bridge's window vocabulary: from
-/// zero to a bound no real file reaches. The bridge's own frame budget is
-/// what actually terminates a hostile input, and a span already inside its
-/// window truncates rather than failing — which for a loop is the right
-/// degradation (a shorter loop, never a wrong one).
-const WHOLE_ANIMATION: ItemTime = ItemTime::Span {
+/// The window a loop is made from, in the bridge's own vocabulary: zero to
+/// [`LOOP_MAX_SECONDS`]. A longer animation truncates rather than failing —
+/// which for a loop is the right degradation (a shorter loop, never a wrong
+/// one) and is exactly how the cap takes effect on the bridged path.
+const LOOP_WINDOW: ItemTime = ItemTime::Span {
     start_cs: 0,
-    end_cs: i64::MAX,
+    end_cs: LOOP_MAX_SECONDS as i64 * 100,
 };
 
 /// Why a loop could not be produced.
@@ -120,6 +147,7 @@ pub(crate) fn encode_loop(
     mime_type: &str,
     plan: &TierPlan,
     normalize: Transform,
+    rung: RenditionRung,
 ) -> Result<Vec<u8>, LoopError> {
     let dir = tempfile::tempdir()
         .map_err(|err| LoopError::Host(format!("could not create a loop directory: {err}")))?;
@@ -168,13 +196,20 @@ pub(crate) fn encode_loop(
     }
     args.push("-vf".into());
     args.push(loop_filters(plan, normalize).into());
+    // Output-side, never input-side: an input time option on a concat script
+    // lands on entry boundaries or on nothing at all (the bridge's documented
+    // trap), and here it would also have to disagree with the bridge's own
+    // window. On the output it truncates both paths identically.
+    args.push("-t".into());
+    args.push(LOOP_MAX_SECONDS.to_string().into());
+    let crf = crf(rung).to_string();
     for arg in [
         "-c:v",
         "libx264",
         "-preset",
         LOOP_PRESET,
         "-crf",
-        LOOP_CRF,
+        crf.as_str(),
         "-pix_fmt",
         "yuv420p",
         // Source timing, verbatim: the decoded frames' own timestamps become
@@ -336,7 +371,7 @@ fn prepare_input(
     let cancel = AtomicBool::new(false);
     match super::transcode::webp_bridge::extract_within(
         &bytes,
-        WHOLE_ANIMATION,
+        LOOP_WINDOW,
         &cancel,
         BRIDGE_BYTE_BUDGET,
     ) {
@@ -423,15 +458,15 @@ mod tests {
         );
     }
 
-    /// The whole-animation window is a span from zero that no real file
-    /// reaches the end of, so the bridge writes every frame it decodes.
+    /// The bridge's window is the same 60 second cap the output-side `-t`
+    /// applies, so a bridged animation and a demuxed one truncate alike.
     #[test]
-    fn the_bridge_window_is_the_whole_animation() {
+    fn the_bridge_window_is_the_loop_window() {
         assert_eq!(
-            WHOLE_ANIMATION,
+            LOOP_WINDOW,
             ItemTime::Span {
                 start_cs: 0,
-                end_cs: i64::MAX
+                end_cs: 6000
             }
         );
     }
@@ -513,12 +548,42 @@ mod tests {
         (pts.len(), duration, pts)
     }
 
+    /// The 60 second cap, on the input path that has no window of its own.
+    ///
+    /// A grid cell is not a video player: an unbounded loop lets one long
+    /// animation cost more scan time and more stored bytes than every other
+    /// animation in a library put together. The bridge truncates at the same
+    /// boundary through [`LOOP_WINDOW`], so this exercises the half that
+    /// only the output-side `-t` reaches.
+    #[test]
+    fn a_loop_is_capped_at_sixty_seconds() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ninety.gif");
+        // 90 frames of one second each: 90 s of animation, of which 60 may
+        // be stored.
+        write_gif(&path, 64, &[1000; 90]);
+
+        let (frames, duration, _) = probe_loop(&encoded(&path, "image/gif", 64));
+        assert!(
+            (59.0..=61.0).contains(&duration),
+            "a 90 second animation must be truncated to the cap, not stored whole: {duration}"
+        );
+        assert!(
+            (58..=61).contains(&frames),
+            "and the frames stop with it: {frames}"
+        );
+    }
+
     fn encoded(path: &Path, mime: &str, side: u32) -> Vec<u8> {
         encode_loop(
             path,
             mime,
             &loop_plan(side, side),
             Transform::default(),
+            RenditionRung::Grid,
         )
         .expect("the fixture encodes")
     }
@@ -636,7 +701,7 @@ mod tests {
         let plan = loop_plan(16, 16);
         assert_eq!((plan.width, plan.height), (16, 16));
         let (frames, duration, _) = probe_loop(
-            &encode_loop(&path, "image/webp", &plan, Transform::default())
+            &encode_loop(&path, "image/webp", &plan, Transform::default(), RenditionRung::Grid)
                 .expect("the bridged fixture encodes"),
         );
         assert_eq!(frames, 2, "both frames of the fixture");

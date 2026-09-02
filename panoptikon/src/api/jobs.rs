@@ -529,6 +529,13 @@ pub(crate) async fn update_config(
 /// Older remote Python Inferio servers do not have it, so a 404 preserves
 /// their previous behavior; every other discovery failure is surfaced.
 /// Load-time Inferio validation remains authoritative for current servers.
+///
+/// **Known and unaddressed**: `PUT /api/jobs/config` calls this
+/// unconditionally, so an unreachable inference upstream fails every settings
+/// save with a 5xx, whatever the edit was. Predates this branch and exists
+/// identically on master. The two candidate fixes are to skip the probe when
+/// no cron job names a model, or to degrade an unreachable upstream to
+/// "cannot validate, save anyway".
 async fn validate_external_inputs(inference_ids: &[String]) -> Result<(), ApiError> {
     let status = match job_inference_context()
         .primary
