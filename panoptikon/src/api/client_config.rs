@@ -99,6 +99,39 @@ impl AnimatedThumbnailFloor {
     }
 }
 
+/// The display-tier loop trigger, verbatim from [`crate::visual_tiers`]
+/// (docs/thumbnail-format-implementation.md §2, R3).
+///
+/// The gallery's large view decides `<video>` vs `<img>` from four fields of
+/// the item it is showing — `type` and `duration` say whether the picture
+/// moves, `size` and `width`/`height` say whether it clears the trigger —
+/// against these three numbers, which is the same arithmetic the scan used to
+/// decide whether to store a loop at all. Surfaced rather than duplicated in
+/// the UI so the two sides cannot drift, and so the client needs no request to
+/// find out (a wasted round trip per animated item, and an error latch on the
+/// ones that answer with an image).
+///
+/// Any **one** of the three firing is enough; they are not a conjunction.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DisplayLoopTrigger {
+    /// Bytes. An animated original larger than this is answered with a loop.
+    pub max_bytes: u64,
+    /// The shorter side, in pixels.
+    pub max_short_side: u32,
+    /// Total pixels.
+    pub max_pixels: u64,
+}
+
+impl DisplayLoopTrigger {
+    fn current() -> Self {
+        Self {
+            max_bytes: crate::visual_tiers::DISPLAY_MAX_FILE_SIZE_ANIMATED,
+            max_short_side: crate::visual_tiers::DISPLAY_MAX_SHORT_SIDE,
+            max_pixels: crate::visual_tiers::DISPLAY_MAX_PIXELS,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ClientConfigResponse {
     /// Name of the policy that matched this request.
@@ -119,6 +152,14 @@ pub(crate) struct ClientConfigResponse {
     /// The animated raw floor the thumbnail endpoint serves by (see
     /// [`AnimatedThumbnailFloor`]).
     pub animated_floor: AnimatedThumbnailFloor,
+    /// The display-tier loop trigger (see [`DisplayLoopTrigger`]).
+    ///
+    /// `null` exactly when `animated_floor` is: no loops at all, so nothing
+    /// mounts a `<video>` and every animated item is an `<img>` on its
+    /// original file. Neither is ever null today — the loop ladder is
+    /// unconditional — and the field is nullable so that a build without it
+    /// says so rather than publishing a bound it does not serve by.
+    pub display_loop_trigger: Option<DisplayLoopTrigger>,
 }
 
 /// The probe table: (capability, method, representative real route). Paths
@@ -170,6 +211,9 @@ pub(crate) fn build_client_config(
             crate::api::desktop::desktop_bridge_is_configured(),
         ),
         animated_floor: AnimatedThumbnailFloor::current(),
+        // One condition, one place: the trigger is published exactly while
+        // the floor is.
+        display_loop_trigger: Some(DisplayLoopTrigger::current()),
     }
 }
 
