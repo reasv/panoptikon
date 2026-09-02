@@ -307,16 +307,22 @@ impl RenditionFormat {
         self == Self::Webp && has_transparency == Some(true)
     }
 
-    /// Whether this container can name a rendition of these dimensions at
-    /// all. Both limits are the format's own — libwebp's 16383 and JPEG's
-    /// 16-bit frame header — and neither is a quality or policy question.
-    fn can_hold(self, width: u32, height: u32) -> bool {
-        let long = width.max(height);
-        match self {
-            Self::Jpeg => long <= JPEG_MAX_SIDE,
-            Self::Webp => long <= WEBP_MAX_SIDE,
-        }
-    }
+}
+
+/// Whether a rendition of these dimensions fits libwebp ([`WEBP_MAX_SIDE`]).
+///
+/// Only a **display** rendition can reach the limit, which is why it is asked
+/// there and nowhere else: a grid tier's long side is at most `2 * tier` by
+/// construction ([`tier_plan`]), and a source too big for that is cropped, not
+/// carried.
+fn fits_webp(width: u32, height: u32) -> bool {
+    width.max(height) <= WEBP_MAX_SIDE
+}
+
+/// Whether a rendition of these dimensions fits a JPEG frame header
+/// ([`JPEG_MAX_SIDE`]).
+fn fits_jpeg(width: u32, height: u32) -> bool {
+    width.max(height) <= JPEG_MAX_SIDE
 }
 
 /// Which rung of the ladder a rendition belongs to.
@@ -375,23 +381,20 @@ impl FormatPolicy {
         policy
     }
 
-    /// The format actually stored for a verdict of `wanted`, given the
-    /// policy and the rendition's own dimensions.
+    /// The format actually stored for a verdict of `wanted`, as far as this
+    /// database's policy can say.
     ///
-    /// Two things can override the verdict, and they compose: the policy may
-    /// not allow it, and libwebp cannot encode a side past
-    /// [`WEBP_MAX_SIDE`] — the tall strips, whose display rendition keeps its
-    /// short side and runs to tens of thousands of rows.
-    fn resolve(self, wanted: RenditionFormat, width: u32, height: u32) -> RenditionFormat {
-        let allowed = match wanted {
+    /// Dimensions are deliberately not part of the question. The one size
+    /// limit that binds a rendition is libwebp's, it binds only a *display*
+    /// rendition ([`fits_webp`]), and folding it in here meant every caller
+    /// that had no dimensions to give — the grid tiers, whose limit cannot
+    /// bind — passed a `1, 1` that meant nothing.
+    fn constrain(self, wanted: RenditionFormat) -> RenditionFormat {
+        match wanted {
             RenditionFormat::Jpeg if !self.jpeg => RenditionFormat::Webp,
             RenditionFormat::Webp if !self.webp => RenditionFormat::Jpeg,
             format => format,
-        };
-        if allowed == RenditionFormat::Webp && !allowed.can_hold(width, height) {
-            return RenditionFormat::Jpeg;
         }
-        allowed
     }
 }
 
@@ -529,7 +532,7 @@ pub(crate) fn display_shape(
     // shape rather than to any of them. It has to be reached *here*, or the
     // plan names a rendition the generator cannot produce and the item is
     // dispatched, made to fail and dispatched again on every scan forever.
-    if !RenditionFormat::Jpeg.can_hold(width, height) {
+    if !fits_jpeg(width, height) {
         return DisplayShape::Original;
     }
     DisplayShape::Still { width, height }
@@ -550,15 +553,23 @@ pub(crate) fn display_plan(
     match display_shape(mime_type, animated, file_size, width, height) {
         DisplayShape::Original => DisplayPlan::Original,
         DisplayShape::Loop { tier } => DisplayPlan::Loop { tier },
-        DisplayShape::Still { width, height } => DisplayPlan::Thumbnail {
-            width,
-            height,
-            format: policy.resolve(
-                display_format(source_class(mime_type, animated), has_transparency),
+        DisplayShape::Still { width, height } => {
+            let wanted =
+                policy.constrain(display_format(source_class(mime_type, animated), has_transparency));
+            // libwebp's own limit, and the only rendition that can reach it:
+            // the tall strips, whose display rendition keeps its short side
+            // and runs to tens of thousands of rows. JPEG at the same
+            // quality, alpha flattened as it always is there.
+            let format = match wanted {
+                RenditionFormat::Webp if !fits_webp(width, height) => RenditionFormat::Jpeg,
+                format => format,
+            };
+            DisplayPlan::Thumbnail {
                 width,
                 height,
-            ),
-        },
+                format,
+            }
+        }
     }
 }
 
@@ -612,9 +623,9 @@ fn display_format(class: SourceClass, has_transparency: Option<bool>) -> Renditi
 ///
 /// JPEG unless the pixels carry transparency: grid tiers are what a scrolling
 /// screenful decodes, and WebP decodes 2.2–2.7x slower per megapixel.
-/// The WebP size limit cannot bind here and is deliberately not asked about:
-/// a grid rendition's long side is at most `2 * tier` = 2048 px by
-/// construction ([`tier_plan`]), so only the policy can overrule the verdict.
+/// The WebP size limit cannot bind here and is deliberately not asked about
+/// ([`fits_webp`]): a grid rendition's long side is at most `2 * tier` =
+/// 2048 px by construction, so only the policy can overrule the verdict.
 pub(crate) fn tier_format(
     has_transparency: Option<bool>,
     policy: FormatPolicy,
@@ -624,7 +635,7 @@ pub(crate) fn tier_format(
     } else {
         RenditionFormat::Jpeg
     };
-    policy.resolve(wanted, 1, 1)
+    policy.constrain(wanted)
 }
 
 /// Whether a still rendition is *not* worth storing, so the original is the
@@ -1498,16 +1509,31 @@ mod tests {
             tier_format(Some(false), FormatPolicy::default()),
             RenditionFormat::Jpeg
         );
-        // The size limit still wins: a transparent picture too wide for
-        // libwebp is flattened rather than left unencodable.
         let policy = FormatPolicy::default();
-        assert_eq!(
-            policy.resolve(RenditionFormat::Webp, 600, WEBP_MAX_SIDE + 1),
-            RenditionFormat::Jpeg
+        // The size limit still wins: a transparent picture too tall for
+        // libwebp is flattened rather than left unencodable. Asked of the
+        // display rule, which is the only rendition that can reach it.
+        let over = display_plan(PNG, false, Some(true), 4 * MB, 600, WEBP_MAX_SIDE + 1, policy);
+        assert!(
+            matches!(
+                over,
+                DisplayPlan::Thumbnail {
+                    format: RenditionFormat::Jpeg,
+                    ..
+                }
+            ),
+            "{over:?}"
         );
-        assert_eq!(
-            policy.resolve(RenditionFormat::Webp, 600, WEBP_MAX_SIDE),
-            RenditionFormat::Webp
+        let under = display_plan(PNG, false, Some(true), 4 * MB, 600, WEBP_MAX_SIDE, policy);
+        assert!(
+            matches!(
+                under,
+                DisplayPlan::Thumbnail {
+                    format: RenditionFormat::Webp,
+                    ..
+                }
+            ),
+            "{under:?}"
         );
     }
 
