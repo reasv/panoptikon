@@ -85,7 +85,9 @@ pub(crate) const GIF_DEFAULT_DELAY_CS: u64 = 10;
 /// itself — see [`gif_uniform_pathological_rate`], which the animated loop
 /// encoder (`media_tools::animated_loop`) uses to do exactly that.
 pub(crate) fn gif_animation_seconds(bytes: &[u8]) -> f64 {
-    parse_gif(bytes).map(|timing| timing.seconds()).unwrap_or(0.0)
+    parse_gif(bytes)
+        .map(|timing| timing.seconds())
+        .unwrap_or(0.0)
 }
 
 /// The input frame rate that makes ffmpeg play a **uniformly pathological**
@@ -168,8 +170,10 @@ fn parse_gif(bytes: &[u8]) -> Option<GifTiming> {
                     // walks the chain, so a nonstandard size is tolerated.
                     let size = *bytes.get(at)? as usize;
                     if size >= 3 {
-                        pending_cs =
-                            u64::from(u16::from_le_bytes([*bytes.get(at + 2)?, *bytes.get(at + 3)?]));
+                        pending_cs = u64::from(u16::from_le_bytes([
+                            *bytes.get(at + 2)?,
+                            *bytes.get(at + 3)?,
+                        ]));
                     }
                 }
                 at = skip_gif_sub_blocks(bytes, at)?;
@@ -503,7 +507,10 @@ pub(crate) mod tests {
     #[test]
     fn webp_anmf_durations_are_summed() {
         assert_eq!(webp_animation_seconds(&webp_bytes(true, &[500, 500])), 1.0);
-        assert_eq!(webp_animation_seconds(&webp_bytes(true, &[40, 60, 100])), 0.2);
+        assert_eq!(
+            webp_animation_seconds(&webp_bytes(true, &[40, 60, 100])),
+            0.2
+        );
     }
 
     #[test]
@@ -534,15 +541,24 @@ pub(crate) mod tests {
 
     #[test]
     fn an_avis_sequence_reads_its_movie_header() {
-        assert_eq!(avif_animation_seconds(&avif_bytes(b"avis", Some((0, 1000, 2500)))), 2.5);
+        assert_eq!(
+            avif_animation_seconds(&avif_bytes(b"avis", Some((0, 1000, 2500)))),
+            2.5
+        );
         // Version-1 mvhd: 64-bit duration.
-        assert_eq!(avif_animation_seconds(&avif_bytes(b"avis", Some((1, 25, 75)))), 3.0);
+        assert_eq!(
+            avif_animation_seconds(&avif_bytes(b"avis", Some((1, 25, 75)))),
+            3.0
+        );
     }
 
     #[test]
     fn a_still_avif_measures_zero() {
         // The `avif` brand is a still even when a moov is (bogusly) present.
-        assert_eq!(avif_animation_seconds(&avif_bytes(b"avif", Some((0, 1000, 2500)))), 0.0);
+        assert_eq!(
+            avif_animation_seconds(&avif_bytes(b"avif", Some((0, 1000, 2500)))),
+            0.0
+        );
         // The sequence brand with no moov has no knowable length.
         assert_eq!(avif_animation_seconds(&avif_bytes(b"avis", None)), 0.0);
         // The spec's "unknown duration" sentinel is unknown, not enormous.
@@ -559,7 +575,10 @@ pub(crate) mod tests {
             assert_eq!(avif_animation_seconds(&whole[..len]), 0.0, "cut at {len}");
         }
         assert_eq!(avif_animation_seconds(&[0x00; 32]), 0.0);
-        assert_eq!(avif_animation_seconds(b"\xff\xff\xff\xffgarbage bytes here"), 0.0);
+        assert_eq!(
+            avif_animation_seconds(b"\xff\xff\xff\xffgarbage bytes here"),
+            0.0
+        );
     }
 
     /// The committed decode-probe fixtures (`transcode/fixtures/`) are real

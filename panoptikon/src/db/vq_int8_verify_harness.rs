@@ -88,7 +88,10 @@ async fn vq_int8_verify_build() {
     println!("desired: {desired:?}");
 
     // Metadata pass (writer transaction).
-    sqlx::query("BEGIN IMMEDIATE").execute(&mut conn).await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut conn)
+        .await
+        .unwrap();
     let changed = sync_metadata(&mut conn, desired.clone())
         .await
         .expect("sync metadata");
@@ -130,7 +133,11 @@ async fn vq_int8_verify_build() {
             build.setter_ids
         );
     }
-    assert!(plan.removals.is_empty(), "unexpected removals: {:?}", plan.removals);
+    assert!(
+        plan.removals.is_empty(),
+        "unexpected removals: {:?}",
+        plan.removals
+    );
 
     for build in &plan.builds {
         let profile_id = *profile_ids
@@ -151,7 +158,10 @@ async fn vq_int8_verify_build() {
                 artifact,
                 t_artifact.elapsed().as_secs_f64()
             );
-            sqlx::query("BEGIN IMMEDIATE").execute(&mut conn).await.unwrap();
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut conn)
+                .await
+                .unwrap();
             let rev = start_space_build(
                 &mut conn,
                 profile_id,
@@ -174,11 +184,19 @@ async fn vq_int8_verify_build() {
             let mut written_total: u64 = 0;
             let mut after_id: i64 = 0;
             loop {
-                sqlx::query("BEGIN IMMEDIATE").execute(&mut conn).await.unwrap();
-                let (written, cursor) =
-                    backfill_chunk(&mut conn, profile_id, *setter_id, BACKFILL_CHUNK_ROWS, after_id)
-                        .await
-                        .expect("backfill chunk");
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+                let (written, cursor) = backfill_chunk(
+                    &mut conn,
+                    profile_id,
+                    *setter_id,
+                    BACKFILL_CHUNK_ROWS,
+                    after_id,
+                )
+                .await
+                .expect("backfill chunk");
                 sqlx::query("COMMIT").execute(&mut conn).await.unwrap();
                 after_id = cursor;
                 written_total += written;
@@ -193,7 +211,10 @@ async fn vq_int8_verify_build() {
             );
         }
 
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut conn).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
         finish_space_build(&mut conn, profile_id, &build.setter_ids)
             .await
             .expect("finish space build");
@@ -210,7 +231,10 @@ async fn vq_int8_verify_build() {
             .await
             .unwrap_or_else(|err| panic!("{statement}: {err}"));
     }
-    println!("post-build ANALYZE: {:.1}s", started.elapsed().as_secs_f64());
+    println!(
+        "post-build ANALYZE: {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
 
     let pages_after = used_pages(&mut conn).await;
     let quant_rows: i64 = sqlx::query("SELECT COUNT(*) AS n FROM embedding_quants")
@@ -218,12 +242,14 @@ async fn vq_int8_verify_build() {
         .await
         .expect("quant rows")
         .get("n");
-    let quant_bytes: i64 = sqlx::query("SELECT COALESCE(SUM(length(quant)), 0) AS n \
-                                        FROM embedding_quants")
-        .fetch_one(&mut conn)
-        .await
-        .expect("quant bytes")
-        .get("n");
+    let quant_bytes: i64 = sqlx::query(
+        "SELECT COALESCE(SUM(length(quant)), 0) AS n \
+                                        FROM embedding_quants",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("quant bytes")
+    .get("n");
     println!(
         "SPACE rows={quant_rows} codes={:.3} GiB stored=+{} pages ({:.3} GiB) ratio={:.2}x",
         quant_bytes as f64 / 1024f64.powi(3),
@@ -395,7 +421,11 @@ async fn vq_int8_verify_timing() {
             for quant in [false, true] {
                 let label = format!(
                     "{} / {}",
-                    if composed { "composed RRF" } else { "standalone semantic" },
+                    if composed {
+                        "composed RRF"
+                    } else {
+                        "standalone semantic"
+                    },
                     if quant { "quant" } else { "exact" }
                 );
                 let make = || {
@@ -433,7 +463,10 @@ async fn vq_int8_verify_timing() {
                 println!(
                     "TIMING {model} | {label} | median={:.3}s rows={rows_out} runs={:?}",
                     sorted[sorted.len() / 2],
-                    times.iter().map(|t| (t * 1000.0).round() / 1000.0).collect::<Vec<_>>()
+                    times
+                        .iter()
+                        .map(|t| (t * 1000.0).round() / 1000.0)
+                        .collect::<Vec<_>>()
                 );
             }
         }
@@ -445,7 +478,9 @@ async fn vq_int8_verify_timing() {
 #[ignore = "verification harness; needs PANOPTIKON_INT8_DB"]
 async fn vq_int8_verify_resolve() {
     ensure_sqlite_extensions().expect("register SQLite extensions");
-    let options = SqliteConnectOptions::new().filename(db_path()).read_only(true);
+    let options = SqliteConnectOptions::new()
+        .filename(db_path())
+        .read_only(true);
     let mut conn = SqliteConnection::connect_with(&options)
         .await
         .expect("open index database read-only");

@@ -807,7 +807,9 @@ impl Actor for IndexDbWriter {
             } => {
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move { set_animation_duration(conn, &sha256, seconds).await })
+                        Box::pin(
+                            async move { set_animation_duration(conn, &sha256, seconds).await },
+                        )
                     })
                     .await;
                 let _ = reply.send(result);
@@ -1930,9 +1932,11 @@ mod tests {
     }
 
     async fn recount(index_db: &str) {
-        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::RecountTagItems { reply })
-            .await
-            .unwrap();
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::RecountTagItems {
+            reply,
+        })
+        .await
+        .unwrap();
     }
 
     async fn marker_is_set(index_db: &str) -> bool {
@@ -2192,9 +2196,11 @@ mod tests {
         let (index_db, _job_id) = marker_test_db(0).await;
         clear_marker_behind_the_writer(&index_db).await;
 
-        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::MarkTagsDirty { reply })
-            .await
-            .unwrap();
+        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::MarkTagsDirty {
+            reply,
+        })
+        .await
+        .unwrap();
         assert!(marker_is_set(&index_db).await);
     }
 
@@ -2313,11 +2319,12 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{statement} failed: {err}"));
         }
 
-        let analyzed: i64 = sqlx::query("SELECT COUNT(*) AS n FROM sqlite_stat1 WHERE tbl = 'items'")
-            .fetch_one(&mut *conn)
-            .await
-            .expect("read sqlite_stat1")
-            .get("n");
+        let analyzed: i64 =
+            sqlx::query("SELECT COUNT(*) AS n FROM sqlite_stat1 WHERE tbl = 'items'")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("read sqlite_stat1")
+                .get("n");
         assert!(
             analyzed > 0,
             "post-job maintenance left `items` unanalyzed: {ANALYZE_STATEMENTS:?}"

@@ -43,8 +43,7 @@ impl HostComputeCaps {
         };
         let mut cmd = Command::new(smi);
         cmd.args(["--query-gpu=compute_cap", "--format=csv,noheader"]);
-        let Some(output) = output_with_timeout(cmd, Duration::from_secs(5))
-        else {
+        let Some(output) = output_with_timeout(cmd, Duration::from_secs(5)) else {
             tracing::warn!(
                 "nvidia-smi compute_cap probe failed or timed out; \
                  model availability will not be capability-filtered"
@@ -140,11 +139,7 @@ fn parse_compute_caps(stdout: &str) -> Option<Vec<(u32, u32)>> {
             minor.trim().parse::<u32>().ok()?,
         ));
     }
-    if caps.is_empty() {
-        None
-    } else {
-        Some(caps)
-    }
+    if caps.is_empty() { None } else { Some(caps) }
 }
 
 fn join_caps(caps: &[(u32, u32)]) -> String {
@@ -188,10 +183,7 @@ fn find_nvidia_smi() -> Option<PathBuf> {
 /// Run to completion or give up after `timeout`. On timeout the child is
 /// left to finish on its own (nvidia-smi is short-lived); only the boot
 /// path must not stall behind a wedged driver.
-fn output_with_timeout(
-    mut cmd: Command,
-    timeout: Duration,
-) -> Option<std::process::Output> {
+fn output_with_timeout(mut cmd: Command, timeout: Duration) -> Option<std::process::Output> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(cmd.output());

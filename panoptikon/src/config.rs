@@ -1856,7 +1856,10 @@ base_url = "http://127.0.0.1:9155"
             err.contains("upstreams.ui.api_endpoint references unknown endpoint 'typo'"),
             "unexpected error: {err}"
         );
-        assert!(err.contains("'default'") && err.contains("'public'"), "{err}");
+        assert!(
+            err.contains("'default'") && err.contains("'public'"),
+            "{err}"
+        );
     }
 
     /// A wildcard bind is mapped to a loopback address for the SSR URL, the
@@ -3087,7 +3090,9 @@ surfaces = ["clip"]
             "container is required",
         );
         expect_err(
-            format!("{MINIMAL}\n[transcode.profiles.novel]\ncontainer = \"avi\"\nvcodec = \"h264\"\n"),
+            format!(
+                "{MINIMAL}\n[transcode.profiles.novel]\ncontainer = \"avi\"\nvcodec = \"h264\"\n"
+            ),
             "enum Container does not have variant constructor avi",
         );
 

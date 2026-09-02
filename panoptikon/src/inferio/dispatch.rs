@@ -284,7 +284,13 @@ pub(crate) async fn run_dispatcher(
             );
             let unit_counts: Vec<(usize, usize, Option<u32>)> = queue
                 .iter()
-                .map(|request| (request.inputs.len(), request.payload_bytes, request.max_batch))
+                .map(|request| {
+                    (
+                        request.inputs.len(),
+                        request.payload_bytes,
+                        request.max_batch,
+                    )
+                })
                 .collect();
             let take = window_take_count(&unit_counts, cap, FRAME_INPUT_BYTES_BUDGET);
             let window: Vec<DispatchRequest> = queue.drain(..take).collect();
@@ -482,7 +488,10 @@ async fn run_batch_inner(
     match worker.predict(&combined).await {
         Ok(outputs) => {
             // Split outputs back per request, preserving request order.
-            for (request, slice) in window.into_iter().zip(split_window_outputs(outputs, &counts)) {
+            for (request, slice) in window
+                .into_iter()
+                .zip(split_window_outputs(outputs, &counts))
+            {
                 let _ = request.reply.send(Ok(slice));
             }
             BatchOutcome::Continue

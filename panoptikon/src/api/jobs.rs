@@ -15,16 +15,16 @@ use crate::db::extraction_errors::{
 use crate::db::extraction_log::{LogRecord, get_all_data_logs, get_setters_total_data};
 use crate::db::file_scans::get_all_file_scans;
 use crate::db::folders::get_folders_from_database;
+use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::ledger::ERROR_CLASSES;
 use crate::db::scan_errors::{ScanErrorFilters, count_scan_errors, list_scan_errors};
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
+use crate::db::vector_quants::{RECONCILE_JOB_TAG, VectorQuantStatus};
 use crate::db::{DbConnection, ReadOnly};
 use crate::jobs::continuous_scan;
 use crate::jobs::cron::{self, CronRunOutcome};
 use crate::jobs::files::is_resync_needed;
 use crate::jobs::inference_pool::job_inference_context;
-use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
-use crate::db::vector_quants::{RECONCILE_JOB_TAG, VectorQuantStatus};
 use crate::jobs::queue::{
     BatchDedup, JobModel, JobRequest, JobType, QueueStatusModel, cancel_queued_jobs,
     cancel_running_job, enqueue_db_maintenance, enqueue_job, enqueue_jobs_with_dedup,
@@ -317,11 +317,8 @@ pub(crate) async fn enqueue_maintenance(
 pub(crate) async fn cancel_queued(
     Query(query): Query<QueueCancelQuery>,
 ) -> Result<Json<QueueCancelResponse>, ApiError> {
-    let cancelled = cancel_queued_jobs(
-        query.queue_ids,
-        suppress_maintenance(query.run_maintenance),
-    )
-    .await?;
+    let cancelled =
+        cancel_queued_jobs(query.queue_ids, suppress_maintenance(query.run_maintenance)).await?;
     if cancelled.is_empty() {
         return Err(ApiError::not_found("No matching queued jobs found."));
     }
@@ -974,12 +971,13 @@ pub(crate) async fn get_vector_quants(
     // Invalid config is inert everywhere else (no reconcile action); here it
     // is worth surfacing, since the card is exactly where the user would fix
     // it.
-    let desired = crate::db::vector_quants::load_desired_state(&conn.index_db).ok_or_else(|| {
-        ApiError::bad_request(
-            "The [vector_quants] section of this database's config.toml is invalid; \
+    let desired =
+        crate::db::vector_quants::load_desired_state(&conn.index_db).ok_or_else(|| {
+            ApiError::bad_request(
+                "The [vector_quants] section of this database's config.toml is invalid; \
              fix it to manage quant profiles.",
-        )
-    })?;
+            )
+        })?;
     // Drift alone doesn't mean the user has to do anything: every action that
     // creates drift also enqueues the reconcile that resolves it. Report the
     // in-flight job so the card can say "converging" instead of "act now".

@@ -89,7 +89,11 @@ pub(crate) fn fast_h264_encoder() -> Option<&'static str> {
         let chosen = if setting == Hwaccel::Off {
             None
         } else {
-            select_encoder(setting, &listed_encoders(&encoder_listing()?), validate_encoder)
+            select_encoder(
+                setting,
+                &listed_encoders(&encoder_listing()?),
+                validate_encoder,
+            )
         };
         match chosen {
             Some(encoder) => tracing::info!(encoder, "hardware H.264 encoder validated"),
@@ -121,7 +125,9 @@ pub(crate) fn av1_software_encoder() -> Option<&'static str> {
             .find(|candidate| listed.iter().any(|name| name == candidate));
         match chosen {
             Some(encoder) => tracing::info!(encoder, "software AV1 encoder selected"),
-            None => tracing::info!("this ffmpeg has no software AV1 encoder; av1 presets will fail"),
+            None => {
+                tracing::info!("this ffmpeg has no software AV1 encoder; av1 presets will fail")
+            }
         }
         chosen
     })
@@ -294,7 +300,11 @@ pub(crate) fn listed_encoders(listing: &str) -> Vec<String> {
         let (Some(flags), Some(name)) = (fields.next(), fields.next()) else {
             continue;
         };
-        if flags.len() != 6 || !flags.chars().all(|flag| flag == '.' || flag.is_ascii_uppercase()) {
+        if flags.len() != 6
+            || !flags
+                .chars()
+                .all(|flag| flag == '.' || flag.is_ascii_uppercase())
+        {
             continue;
         }
         names.push(name.to_string());
@@ -489,9 +499,11 @@ Encoders:
             !validate_encoder("definitely_not_an_encoder"),
             "a nonexistent encoder must fail rather than hang"
         );
-        assert!(listed_encoders(&encoder_listing().expect("ffmpeg lists its encoders"))
-            .iter()
-            .any(|name| name == "libx264"));
+        assert!(
+            listed_encoders(&encoder_listing().expect("ffmpeg lists its encoders"))
+                .iter()
+                .any(|name| name == "libx264")
+        );
     }
 
     /// The end-to-end probe: whatever this host has, the answer is either
@@ -504,7 +516,10 @@ Encoders:
         }
         let chosen = fast_h264_encoder();
         if let Some(encoder) = chosen {
-            assert!(CANDIDATES.contains(&encoder), "unexpected encoder {encoder}");
+            assert!(
+                CANDIDATES.contains(&encoder),
+                "unexpected encoder {encoder}"
+            );
         }
         assert_eq!(chosen, fast_h264_encoder());
     }

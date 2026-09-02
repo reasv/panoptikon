@@ -193,7 +193,9 @@ impl TranscodeCache {
             .max_connections(MAX_CONNECTIONS)
             .connect_with(options)
             .await
-            .with_context(|| format!("failed to open the transcode cache db in {}", dir.display()))?;
+            .with_context(|| {
+                format!("failed to open the transcode cache db in {}", dir.display())
+            })?;
         MIGRATOR
             .run(&pool)
             .await
@@ -351,11 +353,7 @@ impl TranscodeCache {
 
     /// Publishes a finished encode: fsync, rename, then the row. Runs an
     /// eviction pass, which can never choose the artifact just written.
-    pub(crate) async fn commit(
-        &self,
-        new: NewArtifact<'_>,
-        temp: &Path,
-    ) -> Result<CachedArtifact> {
+    pub(crate) async fn commit(&self, new: NewArtifact<'_>, temp: &Path) -> Result<CachedArtifact> {
         let (path, size_bytes, sha256) = match self.publish(new.key, temp, new.file_name).await {
             Ok(published) => published,
             Err(err) => {
@@ -563,10 +561,7 @@ impl TranscodeCache {
     /// (the TOML value is what a restart returns to), exactly like the search
     /// result cache. A request above the configured ceiling is refused rather
     /// than silently clamped, so the resize route can answer 422.
-    pub(crate) async fn set_budget_mb(
-        &self,
-        size_mb: u64,
-    ) -> std::result::Result<(), ResizeError> {
+    pub(crate) async fn set_budget_mb(&self, size_mb: u64) -> std::result::Result<(), ResizeError> {
         let requested = mb_to_bytes(size_mb);
         if requested > self.limit_bytes {
             return Err(ResizeError::AboveCeiling(format!(
@@ -711,10 +706,8 @@ impl TranscodeCache {
             .fetch_all(&self.pool)
             .await
             .context("failed to read the artifact index")?;
-        let indexed: Vec<(String, String)> = rows
-            .iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
+        let indexed: Vec<(String, String)> =
+            rows.iter().map(|row| (row.get(0), row.get(1))).collect();
 
         let dir = self.dir.clone();
         let scan = tokio::task::spawn_blocking(move || scan_for_orphans(&dir, indexed))
@@ -805,7 +798,8 @@ impl TranscodeCache {
         hot_since: &str,
         protect: Option<&str>,
     ) -> Result<Vec<(String, String, i64)>> {
-        let mut sql = String::from("SELECT key, file_name, size_bytes FROM artifacts WHERE pinned = 0");
+        let mut sql =
+            String::from("SELECT key, file_name, size_bytes FROM artifacts WHERE pinned = 0");
         if skip_hot {
             sql.push_str(" AND NOT (hit_count >= ? AND last_access > ?)");
         }
@@ -971,9 +965,9 @@ async fn copy_into_place(from: &Path, to: &Path, share_dir: &Path) -> Result<()>
         uuid::Uuid::new_v4().simple()
     ));
     let copied: Result<()> = async {
-        tokio::fs::copy(from, &temp)
-            .await
-            .with_context(|| format!("failed to copy the artifact {} for sharing", from.display()))?;
+        tokio::fs::copy(from, &temp).await.with_context(|| {
+            format!("failed to copy the artifact {} for sharing", from.display())
+        })?;
         tokio::fs::rename(&temp, to)
             .await
             .with_context(|| format!("failed to publish the share entry {}", to.display()))
@@ -1257,14 +1251,22 @@ mod tests {
         assert!(rel.is_relative());
         let cache = TranscodeCache::open(rel.clone(), 64, 1024).await.unwrap();
 
-        assert!(cache.dir.is_absolute(), "open absolutizes: {}", cache.dir.display());
+        assert!(
+            cache.dir.is_absolute(),
+            "open absolutizes: {}",
+            cache.dir.display()
+        );
         assert!(cache.temp_path("mp4").is_absolute());
         let temp = cache.temp_path("mp4");
         let artifact = commit_temp(&cache, "relkey", b"0123456789", &temp)
             .await
             .unwrap();
         assert!(artifact.path.is_absolute(), "{}", artifact.path.display());
-        assert!(cache.share_target(&artifact, Some("name.mp4")).is_absolute());
+        assert!(
+            cache
+                .share_target(&artifact, Some("name.mp4"))
+                .is_absolute()
+        );
         let shared = cache
             .materialize_share(&artifact, Some("name.mp4"))
             .await
@@ -1489,8 +1491,13 @@ mod tests {
         for path in [&abandoned, &publishing] {
             std::fs::write(path, b"junk").unwrap();
         }
-        backdate(&abandoned, UNCLAIMED_ARTIFACT_MIN_AGE + Duration::from_secs(60));
-        let temp = dir.path().join(format!(".tmp-{}-live.mp4", std::process::id()));
+        backdate(
+            &abandoned,
+            UNCLAIMED_ARTIFACT_MIN_AGE + Duration::from_secs(60),
+        );
+        let temp = dir
+            .path()
+            .join(format!(".tmp-{}-live.mp4", std::process::id()));
         std::fs::write(&temp, b"encoding").unwrap();
 
         let cache = cache_with_budget(dir.path(), 1024).await;
@@ -1501,7 +1508,10 @@ mod tests {
             "a fresh rowless file may be a publish that has not inserted yet"
         );
         assert!(dir.path().join("kept.mp4").is_file());
-        assert!(temp.is_file(), "an in-progress encode is not an orphan file");
+        assert!(
+            temp.is_file(),
+            "an in-progress encode is not an orphan file"
+        );
     }
 
     /// The sweeper's only test is age: a pid is reused after a crash, so even
@@ -1510,7 +1520,9 @@ mod tests {
     async fn sweeper_takes_old_temporaries_whatever_the_pid() {
         let dir = tempfile::tempdir().unwrap();
 
-        let own_old = dir.path().join(format!(".tmp-{}-old.mp4", std::process::id()));
+        let own_old = dir
+            .path()
+            .join(format!(".tmp-{}-old.mp4", std::process::id()));
         let own_young = dir
             .path()
             .join(format!(".tmp-{}-young.mp4", std::process::id()));
@@ -1526,7 +1538,10 @@ mod tests {
         sweep_stale_temps(dir.path());
         assert!(!own_old.exists(), "our own pid does not spare an old one");
         assert!(!other_old.exists(), "an abandoned temporary is swept");
-        assert!(own_young.is_file(), "a young temporary may still be written");
+        assert!(
+            own_young.is_file(),
+            "a young temporary may still be written"
+        );
         assert!(artifact.is_file(), "the sweeper only touches temporaries");
     }
 
@@ -1648,7 +1663,10 @@ mod tests {
         .execute(&cache.pool)
         .await
         .unwrap();
-        let legacy = cache.lookup("legacy").await.expect("a pre-column row still hits");
+        let legacy = cache
+            .lookup("legacy")
+            .await
+            .expect("a pre-column row still hits");
         assert_eq!(legacy.sha256, None);
         assert_eq!(legacy.download_name, None);
 
@@ -1677,7 +1695,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(healed.sha256.as_deref(), Some(DIGEST_0123456789));
-        let healed = cache.lookup("legacy").await.expect("the row is still there");
+        let healed = cache
+            .lookup("legacy")
+            .await
+            .expect("the row is still there");
         assert_eq!(
             healed.sha256.as_deref(),
             Some(DIGEST_0123456789),
@@ -1709,7 +1730,10 @@ mod tests {
         assert_eq!(std::fs::read(&shared).unwrap(), b"share me");
 
         // Idempotent: the same path, and nothing accumulates beside it.
-        assert_eq!(cache.materialize_share(&artifact, None).await.unwrap(), shared);
+        assert_eq!(
+            cache.materialize_share(&artifact, None).await.unwrap(),
+            shared
+        );
         assert_eq!(share_entries(&cache, "k1"), ["_CON.mp4"]);
 
         // A short leftover — the only thing a crashed copy fallback can leave
@@ -1717,7 +1741,10 @@ mod tests {
         // so the truncation cannot reach the artifact through the hardlink.
         std::fs::remove_file(&shared).unwrap();
         std::fs::write(&shared, b"tru").unwrap();
-        assert_eq!(cache.materialize_share(&artifact, None).await.unwrap(), shared);
+        assert_eq!(
+            cache.materialize_share(&artifact, None).await.unwrap(),
+            shared
+        );
         assert_eq!(std::fs::read(&shared).unwrap(), b"share me");
 
         // A name that sanitizes away entirely falls back to the on-disk one.
@@ -1780,7 +1807,10 @@ mod tests {
             .materialize_share(&artifact, Some("../sub/dir/100%.mp4"))
             .await
             .unwrap();
-        assert_eq!(escaped.file_name().unwrap().to_string_lossy(), "..subdir100_.mp4");
+        assert_eq!(
+            escaped.file_name().unwrap().to_string_lossy(),
+            "..subdir100_.mp4"
+        );
 
         // A caller with no request to name the file from still gets the
         // stored name, and the names simply coexist under the one key.
@@ -1791,14 +1821,21 @@ mod tests {
         );
         assert_eq!(
             share_entries(&cache, "k1"),
-            ["..subdir100_.mp4", "first-submitter.mp4", "this-request.mp4"]
+            [
+                "..subdir100_.mp4",
+                "first-submitter.mp4",
+                "this-request.mp4"
+            ]
         );
 
         // A caller name that sanitizes away does not fall back to the stored
         // one — it falls all the way through to the on-disk name, because a
         // request that named the file at all was not asking for the first
         // submitter's stem.
-        let nameless = cache.materialize_share(&artifact, Some("///.")).await.unwrap();
+        let nameless = cache
+            .materialize_share(&artifact, Some("///."))
+            .await
+            .unwrap();
         assert_eq!(nameless.file_name().unwrap().to_string_lossy(), "k1.mp4");
     }
 
@@ -1848,7 +1885,10 @@ mod tests {
         let predicted = cache.share_target(&artifact, Some("///."));
         assert_eq!(predicted.file_name().unwrap().to_string_lossy(), "k1.mp4");
         assert_eq!(
-            cache.materialize_share(&artifact, Some("///.")).await.unwrap(),
+            cache
+                .materialize_share(&artifact, Some("///."))
+                .await
+                .unwrap(),
             predicted
         );
 
@@ -2075,7 +2115,10 @@ mod tests {
         // 3 characters plus the separator is the only case where the
         // filesystem's per-component limit is the binding constraint.
         assert_eq!(share_name_ceiling(Path::new("Q:\\")), MAX_SHARE_NAME_BYTES);
-        assert_eq!(share_name_ceiling(Path::new("Q:\\a")), MAX_SHARE_NAME_BYTES - 1);
+        assert_eq!(
+            share_name_ceiling(Path::new("Q:\\a")),
+            MAX_SHARE_NAME_BYTES - 1
+        );
 
         // A realistic one: a profile path plus `share/<64-hex key>/`.
         let deep = "x".repeat(200);

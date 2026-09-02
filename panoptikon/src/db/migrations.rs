@@ -980,9 +980,13 @@ mod tests {
             .await
             .unwrap();
         conn.close().await.unwrap();
-        migrate_path(&path, &migrator_of(vec![create_table, create_index]), "unused")
-            .await
-            .unwrap();
+        migrate_path(
+            &path,
+            &migrator_of(vec![create_table, create_index]),
+            "unused",
+        )
+        .await
+        .unwrap();
         let mut conn = connect(&path).await;
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_stat1")
             .fetch_one(&mut conn)

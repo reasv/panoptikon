@@ -551,13 +551,15 @@ ORDER BY idx
     })?;
     Ok(rows
         .into_iter()
-        .map(|(idx, width, height, media_type, version)| ThumbnailGeometry {
-            idx,
-            width,
-            height,
-            media_type,
-            version,
-        })
+        .map(
+            |(idx, width, height, media_type, version)| ThumbnailGeometry {
+                idx,
+                width,
+                height,
+                media_type,
+                version,
+            },
+        )
         .collect())
 }
 
@@ -829,8 +831,8 @@ WHERE item_sha256 IN (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::visual_tiers::ThumbnailTier;
     use crate::db::migrations::setup_test_databases;
+    use crate::visual_tiers::ThumbnailTier;
 
     // Ensures storage cleanup removes thumbnails that no longer have corresponding items.
     #[tokio::test]
@@ -907,7 +909,10 @@ VALUES
             conn,
             "sha_one",
             "image/png",
-            &[tier(RenditionKind::Still(ThumbnailTier::GridM), 1024), tier(RenditionKind::Still(ThumbnailTier::GridS), 512)],
+            &[
+                tier(RenditionKind::Still(ThumbnailTier::GridM), 1024),
+                tier(RenditionKind::Still(ThumbnailTier::GridS), 512),
+            ],
         )
         .await
         .unwrap();
@@ -916,18 +921,20 @@ VALUES
             conn,
             "sha_two",
             "image/png",
-            &[tier(RenditionKind::Still(ThumbnailTier::GridS), 512)])
-            .await
-            .unwrap();
+            &[tier(RenditionKind::Still(ThumbnailTier::GridS), 512)],
+        )
+        .await
+        .unwrap();
 
         // A rule change that wants only the larger tier: the smaller one goes.
         store_thumbnail_tiers(
             conn,
             "sha_one",
             "image/png",
-            &[tier(RenditionKind::Still(ThumbnailTier::GridM), 900)])
-            .await
-            .unwrap();
+            &[tier(RenditionKind::Still(ThumbnailTier::GridM), 900)],
+        )
+        .await
+        .unwrap();
         assert_eq!(
             get_thumbnail_tier_geometry(conn, "sha_one").await.unwrap(),
             vec![TierGeometry {
@@ -949,11 +956,7 @@ VALUES
         );
 
         // And an empty set is a real instruction: this item wants no tier.
-        store_thumbnail_tiers(
-            conn,
-            "sha_one",
-            "image/png",
-            &[])
+        store_thumbnail_tiers(conn, "sha_one", "image/png", &[])
             .await
             .unwrap();
         assert!(
@@ -1083,10 +1086,16 @@ VALUES
 
         assert_eq!(delete_thumbnails(conn, "sha_one").await.unwrap(), 1);
         assert!(
-            get_thumbnail_bytes(conn, "sha_one", 0).await.unwrap().is_none()
+            get_thumbnail_bytes(conn, "sha_one", 0)
+                .await
+                .unwrap()
+                .is_none()
         );
         assert!(
-            get_thumbnail_bytes(conn, "sha_two", 0).await.unwrap().is_some()
+            get_thumbnail_bytes(conn, "sha_two", 0)
+                .await
+                .unwrap()
+                .is_some()
         );
         // Idempotent: a second pass has nothing left to take.
         assert_eq!(delete_thumbnails(conn, "sha_one").await.unwrap(), 0);
@@ -1138,7 +1147,11 @@ VALUES
         upsert_visual_attempts(
             conn,
             &[
-                VisualVerdict::nothing(VisualKind::Thumbnail).into_record("sha_one", "video/mp4", 1),
+                VisualVerdict::nothing(VisualKind::Thumbnail).into_record(
+                    "sha_one",
+                    "video/mp4",
+                    1,
+                ),
                 VisualVerdict::failed(
                     VisualKind::Frame,
                     VisualFailure {
@@ -1149,7 +1162,11 @@ VALUES
                 )
                 .into_record("sha_one", "video/mp4", 1),
                 // A second item, so the deletes have to discriminate.
-                VisualVerdict::nothing(VisualKind::Thumbnail).into_record("sha_two", "video/mp4", 1),
+                VisualVerdict::nothing(VisualKind::Thumbnail).into_record(
+                    "sha_two",
+                    "video/mp4",
+                    1,
+                ),
             ],
             Some(1),
         )
@@ -1220,9 +1237,21 @@ VALUES (1, 'sha_one', 'md5_one', 'image/png', '2024-01-01T00:00:00')
         upsert_visual_attempts(
             &mut dbs.index_conn,
             &[
-                VisualVerdict::nothing(VisualKind::Thumbnail).into_record("sha_one", "image/png", 1),
-                VisualVerdict::nothing(VisualKind::Thumbnail).into_record("sha_missing", "image/png", 1),
-                VisualVerdict::nothing(VisualKind::Frame).into_record("sha_missing", "image/png", 1),
+                VisualVerdict::nothing(VisualKind::Thumbnail).into_record(
+                    "sha_one",
+                    "image/png",
+                    1,
+                ),
+                VisualVerdict::nothing(VisualKind::Thumbnail).into_record(
+                    "sha_missing",
+                    "image/png",
+                    1,
+                ),
+                VisualVerdict::nothing(VisualKind::Frame).into_record(
+                    "sha_missing",
+                    "image/png",
+                    1,
+                ),
             ],
             Some(1),
         )

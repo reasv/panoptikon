@@ -464,16 +464,17 @@ pub(crate) async fn rekey_scan_error(
     last_modified: &str,
     file_size: i64,
 ) -> ApiResult<u64> {
-    let result = sqlx::query("UPDATE scan_errors SET last_modified = ?, file_size = ? WHERE path = ?")
-        .bind(last_modified)
-        .bind(file_size)
-        .bind(path)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, path, "failed to rekey scan error");
-            ApiError::internal("Failed to rekey scan failure")
-        })?;
+    let result =
+        sqlx::query("UPDATE scan_errors SET last_modified = ?, file_size = ? WHERE path = ?")
+            .bind(last_modified)
+            .bind(file_size)
+            .bind(path)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, path, "failed to rekey scan error");
+                ApiError::internal("Failed to rekey scan failure")
+            })?;
     Ok(result.rows_affected())
 }
 

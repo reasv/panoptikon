@@ -116,11 +116,8 @@ impl AcceleratorReport {
         } else {
             // CPU is a normal outcome — never a warning.
             lines.push("using CPU (no GPU accelerator selected)".into());
-            let other: Vec<&GpuDevice> = self
-                .stacks
-                .iter()
-                .flat_map(|s| s.devices.iter())
-                .collect();
+            let other: Vec<&GpuDevice> =
+                self.stacks.iter().flat_map(|s| s.devices.iter()).collect();
             if !other.is_empty() {
                 lines.push("GPU devices present on host (not selected):".into());
                 for d in other {
@@ -294,7 +291,11 @@ fn probe_nvidia_stack() -> Option<GpuStackPresence> {
     }
     if cfg!(windows)
         && std::env::var_os("SystemRoot")
-            .map(|root| PathBuf::from(root).join("System32/nvidia-smi.exe").is_file())
+            .map(|root| {
+                PathBuf::from(root)
+                    .join("System32/nvidia-smi.exe")
+                    .is_file()
+            })
             .unwrap_or(false)
     {
         evidence.push(r"System32\nvidia-smi.exe exists");
@@ -638,8 +639,7 @@ mod tests {
 
     #[test]
     fn installed_venv_wins_over_config() {
-        let (backend, source) =
-            resolve_backend_from(Accelerator::Cuda, Some(Accelerator::Rocm));
+        let (backend, source) = resolve_backend_from(Accelerator::Cuda, Some(Accelerator::Rocm));
         assert_eq!(backend, Accelerator::Rocm);
         assert_eq!(source, BackendSource::InstalledVenv);
     }

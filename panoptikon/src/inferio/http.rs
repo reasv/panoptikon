@@ -787,8 +787,8 @@ pub struct InferioApiDoc;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::slot_error::{SlotError, SlotErrorClass};
+    use super::*;
     use crate::inferio_client::{
         InferenceApiClient, InferenceFile, InferenceInput, PredictOutput, parse_predict_response,
     };
@@ -826,7 +826,10 @@ mod tests {
         assert_eq!(content_type, "application/octet-stream");
         assert_eq!(body, payload);
 
-        match parse_predict_response(&content_type, &body).unwrap().outputs {
+        match parse_predict_response(&content_type, &body)
+            .unwrap()
+            .outputs
+        {
             PredictOutput::Binary(outputs) => assert_eq!(outputs, vec![payload]),
             other => panic!("client parsed {other:?}"),
         }
@@ -855,7 +858,10 @@ mod tests {
         .concat();
         assert_eq!(body, expected, "byte-for-byte Python framing");
 
-        match parse_predict_response(&content_type, &body).unwrap().outputs {
+        match parse_predict_response(&content_type, &body)
+            .unwrap()
+            .outputs
+        {
             PredictOutput::Binary(outputs) => {
                 assert_eq!(outputs, vec![b"AAA".to_vec(), b"BB".to_vec()]);
             }
@@ -885,7 +891,10 @@ mod tests {
             b"\x01\x02"
         );
 
-        match parse_predict_response(&content_type, &body).unwrap().outputs {
+        match parse_predict_response(&content_type, &body)
+            .unwrap()
+            .outputs
+        {
             PredictOutput::Json(outputs) => assert_eq!(outputs.len(), 2),
             other => panic!("client parsed {other:?}"),
         }

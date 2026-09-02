@@ -304,9 +304,7 @@ impl CacheState {
                     // Newer only if no component went backwards. Mixed
                     // (incomparable) falls through to Older, which drops the
                     // insert — the safe direction.
-                    (a, b)
-                        if a != std::cmp::Ordering::Less && b != std::cmp::Ordering::Less =>
-                    {
+                    (a, b) if a != std::cmp::Ordering::Less && b != std::cmp::Ordering::Less => {
                         EpochOrder::Newer
                     }
                     _ => EpochOrder::Older,
@@ -593,7 +591,12 @@ fn occupied_ranges(
     };
     // A span starting before `from` may still extend into the range, so start
     // the scan at the greatest start not exceeding `from`.
-    let begin = group.starts.range(..=from).next_back().copied().unwrap_or(from);
+    let begin = group
+        .starts
+        .range(..=from)
+        .next_back()
+        .copied()
+        .unwrap_or(from);
     let mut ranges = Vec::new();
     for start in group.starts.range(begin..to) {
         let key = SpanKey {
@@ -921,14 +924,18 @@ pub(crate) fn stats(page: usize, page_size: usize) -> SearchCacheStats {
                 .get(key.query.as_ref())
                 .is_some_and(|group| group.is_current(&key.query));
             SearchCacheEntryInfo {
-                sql: key.query.sql.chars().take(ENTRY_SQL_PREVIEW_CHARS).collect(),
+                sql: key
+                    .query
+                    .sql
+                    .chars()
+                    .take(ENTRY_SQL_PREVIEW_CHARS)
+                    .collect(),
                 kind: match span.value {
                     SpanValue::Rows(_) => "results".to_string(),
                     SpanValue::Count(_) => "count".to_string(),
                 },
                 start: matches!(span.value, SpanValue::Rows(_)).then_some(key.start),
-                end: matches!(span.value, SpanValue::Rows(_))
-                    .then(|| key.start + span.row_len()),
+                end: matches!(span.value, SpanValue::Rows(_)).then(|| key.start + span.row_len()),
                 rows: match &span.value {
                     SpanValue::Rows(rows) => Some(rows.len()),
                     SpanValue::Count(_) => None,
@@ -1052,9 +1059,15 @@ mod tests {
         insert_rows(&key, snapshot, 0, Some(320), &rows(0..320));
 
         // The window that produced it.
-        assert_eq!(ids(&expect_rows(lookup_rows(&key, 0, Some(10)))), (0..10).collect::<Vec<_>>());
+        assert_eq!(
+            ids(&expect_rows(lookup_rows(&key, 0, Some(10)))),
+            (0..10).collect::<Vec<_>>()
+        );
         // A larger page size — the case that misses today.
-        assert_eq!(ids(&expect_rows(lookup_rows(&key, 0, Some(50)))), (0..50).collect::<Vec<_>>());
+        assert_eq!(
+            ids(&expect_rows(lookup_rows(&key, 0, Some(50)))),
+            (0..50).collect::<Vec<_>>()
+        );
         // A window that straddles the SPAN_ROWS grid line at 256.
         assert_eq!(
             ids(&expect_rows(lookup_rows(&key, 250, Some(20)))),
@@ -1066,7 +1079,10 @@ mod tests {
             (200..250).collect::<Vec<_>>()
         );
         // Past what was fetched, with no known end: miss.
-        assert!(matches!(lookup_rows(&key, 300, Some(50)), CacheLookup::Miss));
+        assert!(matches!(
+            lookup_rows(&key, 300, Some(50)),
+            CacheLookup::Miss
+        ));
     }
 
     #[test]
@@ -1117,11 +1133,17 @@ mod tests {
         );
 
         // Asking past the end is a hit on the truncated tail.
-        assert_eq!(ids(&expect_rows(lookup_rows(&key, 20, Some(50)))), (20..30).collect::<Vec<_>>());
+        assert_eq!(
+            ids(&expect_rows(lookup_rows(&key, 20, Some(50)))),
+            (20..30).collect::<Vec<_>>()
+        );
         // Entirely past the end is an empty hit, not a miss.
         assert!(expect_rows(lookup_rows(&key, 30, Some(10))).is_empty());
         // An unpaginated request can be satisfied once the end is known.
-        assert_eq!(ids(&expect_rows(lookup_rows(&key, 0, None))), (0..30).collect::<Vec<_>>());
+        assert_eq!(
+            ids(&expect_rows(lookup_rows(&key, 0, None))),
+            (0..30).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1132,9 +1154,18 @@ mod tests {
         let index_db = "sc-span-unpaginated";
         let key = query_key(index_db, None, "SELECT unpaginated");
         // No LIMIT: the execution returned the whole result set.
-        insert_rows(&key, EpochSnapshot::take(index_db, None), 0, None, &rows(0..500));
+        insert_rows(
+            &key,
+            EpochSnapshot::take(index_db, None),
+            0,
+            None,
+            &rows(0..500),
+        );
 
-        assert_eq!(ids(&expect_rows(lookup_rows(&key, 0, Some(10)))), (0..10).collect::<Vec<_>>());
+        assert_eq!(
+            ids(&expect_rows(lookup_rows(&key, 0, Some(10)))),
+            (0..10).collect::<Vec<_>>()
+        );
         assert_eq!(
             ids(&expect_rows(lookup_rows(&key, 480, Some(50)))),
             (480..500).collect::<Vec<_>>()
@@ -1169,7 +1200,10 @@ mod tests {
         // A second execution at an overlapping window, extending coverage.
         insert_rows(&key, snapshot, 50, Some(100), &rows(50..150));
 
-        assert_eq!(ids(&expect_rows(lookup_rows(&key, 0, Some(150)))), (0..150).collect::<Vec<_>>());
+        assert_eq!(
+            ids(&expect_rows(lookup_rows(&key, 0, Some(150)))),
+            (0..150).collect::<Vec<_>>()
+        );
         // The overlap was not stored twice.
         let listing = stats(1, 100);
         let covered: u64 = listing
@@ -1253,8 +1287,7 @@ mod tests {
         let b_plain = query_key("sc-clear-b", None, "SELECT b");
         let seed = |keys: &[&Arc<QueryKey>]| {
             for key in keys {
-                let snapshot =
-                    EpochSnapshot::take(&key.index_db, key.user_data_db.as_deref());
+                let snapshot = EpochSnapshot::take(&key.index_db, key.user_data_db.as_deref());
                 insert_count(key, snapshot, 0);
             }
         };
@@ -1308,7 +1341,11 @@ mod tests {
             "test data must exceed the 1 MB budget it is about to be squeezed into, got {} bytes",
             before.used_bytes
         );
-        assert!(before.entries >= 4, "expected several spans, got {}", before.entries);
+        assert!(
+            before.entries >= 4,
+            "expected several spans, got {}",
+            before.entries
+        );
 
         // Read the head last, so it is the most recently used and the cold
         // tail is what eviction reaches for.
@@ -1316,14 +1353,23 @@ mod tests {
 
         set_budget_mb(1);
         let after = stats(1, usize::MAX);
-        assert!(after.entries < before.entries, "expected spans to be evicted");
+        assert!(
+            after.entries < before.entries,
+            "expected spans to be evicted"
+        );
         assert!(after.evictions > before.evictions);
         assert!(after.used_bytes <= 1024 * 1024);
 
         // The head is still served; the range that lost spans became a miss,
         // not a silently short or misaligned answer.
-        assert_eq!(ids(&expect_rows(lookup_rows(&key, 0, Some(10)))), (0..10).collect::<Vec<_>>());
-        assert!(matches!(lookup_rows(&key, 0, Some(ROWS)), CacheLookup::Miss));
+        assert_eq!(
+            ids(&expect_rows(lookup_rows(&key, 0, Some(10)))),
+            (0..10).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            lookup_rows(&key, 0, Some(ROWS)),
+            CacheLookup::Miss
+        ));
         set_budget_mb(16);
     }
 

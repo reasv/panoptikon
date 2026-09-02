@@ -442,7 +442,10 @@ impl SimilarTo {
             name: "other_embeddings".to_string(),
         };
         let mut select = Query::select();
-        select.from_as(Alias::new(collection_cte.name.as_str()), other_alias.clone());
+        select.from_as(
+            Alias::new(collection_cte.name.as_str()),
+            other_alias.clone(),
+        );
         select.join_as(
             JoinType::InnerJoin,
             Alias::new(collection_cte.name.as_str()),

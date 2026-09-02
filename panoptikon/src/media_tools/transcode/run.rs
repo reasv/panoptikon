@@ -355,7 +355,9 @@ pub(crate) fn build_compose_args(spec: &ComposeJobSpec, plan: &FilterPlan) -> Ve
     }
     // `-an` is already in the plan's output args when the graph produced no
     // audio, so an audio codec here would contradict it.
-    if plan.has_audio && let Some(acodec) = &preset.acodec {
+    if plan.has_audio
+        && let Some(acodec) = &preset.acodec
+    {
         push!("-c:a", audio_encoder(acodec));
     }
     if preset.container == Container::Mp4 {
@@ -1202,20 +1204,41 @@ mod tests {
         assert_eq!(
             args_of(&spec_for("clip", Some(100), Some(794))),
             [
-                "-nostdin", "-hide_banner", "-nostats", "-v", "error",
-                "-ss", "1.00",
-                "-i", "in.mp4",
-                "-t", "6.94",
-                "-progress", "out.tmp.progress",
-                "-map", "0:v:0",
-                "-map", "0:a:0?",
-                "-sn", "-dn",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-                "-c:a", "aac",
-                "-movflags", "+faststart",
-                "-avoid_negative_ts", "make_zero",
-                "-pix_fmt", "yuv420p",
-                "-y", "out.tmp",
+                "-nostdin",
+                "-hide_banner",
+                "-nostats",
+                "-v",
+                "error",
+                "-ss",
+                "1.00",
+                "-i",
+                "in.mp4",
+                "-t",
+                "6.94",
+                "-progress",
+                "out.tmp.progress",
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-sn",
+                "-dn",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                "out.tmp",
             ]
         );
 
@@ -1322,7 +1345,10 @@ mod tests {
         assert_eq!(mf_quality(51), 0);
         assert_eq!(mf_quality(-5), 100, "a bound outside the scale clamps");
         assert_eq!(mf_quality(80), 0);
-        assert!(mf_quality(18) > mf_quality(28), "lower crf is higher quality");
+        assert!(
+            mf_quality(18) > mf_quality(28),
+            "lower crf is higher quality"
+        );
 
         // A bitrate profile still reaches it as a bitrate, with no quality
         // mode to contradict it.
@@ -1374,7 +1400,10 @@ mod tests {
         // toolchain's actual encoder when the probe answered (static_ffmpeg's
         // "essentials" builds carry only libaom), and the preferred name when
         // it could not — that path fails the encode with ffmpeg's own message.
-        assert_eq!(resolve_encoder(&preset("avif-anim"), None, None), "libsvtav1");
+        assert_eq!(
+            resolve_encoder(&preset("avif-anim"), None, None),
+            "libsvtav1"
+        );
         assert_eq!(
             resolve_encoder(&preset("avif-anim"), None, Some("libsvtav1")),
             "libsvtav1"
@@ -1490,16 +1519,38 @@ mod tests {
         assert_eq!(
             args,
             [
-                "-nostdin", "-hide_banner", "-nostats", "-v", "error",
-                "-ss", "2.00",
-                "-i", "a.mp4",
-                "-progress", "out.tmp.progress",
-                "-filter_complex", "[0:v:0]null[vout]",
-                "-map", "[vout]", "-an", "-sn", "-dn", "-pix_fmt", "yuv420p",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-                "-movflags", "+faststart",
-                "-avoid_negative_ts", "make_zero",
-                "-y", "out.tmp",
+                "-nostdin",
+                "-hide_banner",
+                "-nostats",
+                "-v",
+                "error",
+                "-ss",
+                "2.00",
+                "-i",
+                "a.mp4",
+                "-progress",
+                "out.tmp.progress",
+                "-filter_complex",
+                "[0:v:0]null[vout]",
+                "-map",
+                "[vout]",
+                "-an",
+                "-sn",
+                "-dn",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-movflags",
+                "+faststart",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-y",
+                "out.tmp",
             ]
         );
 
@@ -1551,9 +1602,19 @@ mod tests {
             items: vec![ComposeItem {
                 sha256: "a".repeat(64),
                 source: ItemSource::Thumbnail,
-                src: Rect { x: 0, y: 0, w: 640, h: 360 },
+                src: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 640,
+                    h: 360,
+                },
                 transform: Transform::default(),
-                dest: Rect { x: 0, y: 0, w: 320, h: 240 },
+                dest: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 320,
+                    h: 240,
+                },
                 time: ItemTime::Image,
                 audio: false,
             }],
@@ -1572,8 +1633,7 @@ mod tests {
             _scratch: None,
         };
         let mut bridges = Vec::new();
-        let sources =
-            resolve_compose_sources(&spec, &AtomicBool::new(false), &mut bridges);
+        let sources = resolve_compose_sources(&spec, &AtomicBool::new(false), &mut bridges);
         assert!(bridges.is_empty());
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].path, PathBuf::from("does-not-exist/thumb.jpg"));
@@ -1620,7 +1680,9 @@ mod tests {
         // than re-reported at a different scale.
         assert_eq!(reader.feed("out_time_ms=2500000"), None);
         assert_eq!(
-            reader.feed("out_time=00:00:05.000000").map(|u| u.out_time_s),
+            reader
+                .feed("out_time=00:00:05.000000")
+                .map(|u| u.out_time_s),
             Some(5.0)
         );
         // Past the expected length (a container whose duration was a
@@ -1676,7 +1738,14 @@ mod tests {
     /// The container's own duration, for the trim-window assertion below.
     fn probe_duration_seconds(path: &std::path::Path) -> Option<f64> {
         let output = Command::new(crate::media_tools::ffprobe())
-            .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
             .arg(path)
             .stdin(Stdio::null())
             .output()
@@ -1879,7 +1948,13 @@ mod tests {
         let spec = EncodeJobSpec {
             input: dir.path().join("nothing.mp4"),
             output: dir.path().join("out.mp4"),
-            params: TranscodeParams::new("sha", preset("clip"), ENCODER_X264_FAST.to_string(), None, None),
+            params: TranscodeParams::new(
+                "sha",
+                preset("clip"),
+                ENCODER_X264_FAST.to_string(),
+                None,
+                None,
+            ),
             source_duration_s: None,
         };
 
@@ -1922,7 +1997,14 @@ mod tests {
             Err(_) => {
                 let generated = dir.path().join("src.mp4");
                 let made = std::process::Command::new(crate::media_tools::ffmpeg())
-                    .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10"])
+                    .args([
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc=size=320x240:rate=10",
+                    ])
                     .args(["-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y"])
                     .arg(&generated)
                     .status()
@@ -1951,7 +2033,10 @@ mod tests {
         .expect("the trimmed encode produced an artifact");
 
         assert!(
-            std::fs::metadata(&output).map(|meta| meta.len()).unwrap_or(0) > 0,
+            std::fs::metadata(&output)
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+                > 0,
             "the artifact has bytes"
         );
         // The sidecar is tailed on the retry path too, and removed whichever

@@ -934,7 +934,15 @@ mod tests {
     async fn one_name_carries_every_row_stamped_under_it() {
         let mut dbs = setup_test_databases().await;
         stamp(&mut dbs.index_conn, 1, "uuid_old", "default", "inst", T0).await;
-        stamp(&mut dbs.index_conn, 1, "uuid_new", "default", "inst", T0 + 5).await;
+        stamp(
+            &mut dbs.index_conn,
+            1,
+            "uuid_new",
+            "default",
+            "inst",
+            T0 + 5,
+        )
+        .await;
         let ctx = AssociationContext::for_tests(
             Some("uuid_new"),
             Some("inst"),
@@ -1054,9 +1062,15 @@ mod tests {
         );
 
         assert!(
-            set_board_databases(&mut dbs.index_conn, &ctx, 1, &requested(&["never"]), T0 + 10)
-                .await
-                .is_err()
+            set_board_databases(
+                &mut dbs.index_conn,
+                &ctx,
+                1,
+                &requested(&["never"]),
+                T0 + 10
+            )
+            .await
+            .is_err()
         );
     }
 

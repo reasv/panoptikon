@@ -426,20 +426,18 @@ fn scan_tail(
         ));
     }
     if frame_len == 0 {
-        return Err(OutroProbeError::Decode(
-            match source_dims {
-                Some(dims) => format!(
-                    "ffmpeg did not report scaled geometry and stored dims are \
+        return Err(OutroProbeError::Decode(match source_dims {
+            Some(dims) => format!(
+                "ffmpeg did not report scaled geometry and stored dims are \
                      ambiguous/inconsistent with the {} bytes received ({}x{})",
-                    pending.len(),
-                    dims.0,
-                    dims.1
-                ),
-                None => "ffmpeg did not report scaled geometry and the item has no stored \
+                pending.len(),
+                dims.0,
+                dims.1
+            ),
+            None => "ffmpeg did not report scaled geometry and the item has no stored \
                          dimensions to fall back on"
-                    .to_string(),
-            },
-        ));
+                .to_string(),
+        }));
     }
     if !pending.is_empty() {
         return Err(OutroProbeError::Decode(format!(
@@ -959,7 +957,10 @@ mod tests {
         let median = frame_median(&below);
         assert_eq!(median, [12.0, 13.0, 25.0]);
         assert!(background_fraction(&below, &median) < BGFRAC_MIN);
-        assert!(!frame_is_card(&below), "one pixel short is not a card frame");
+        assert!(
+            !frame_is_card(&below),
+            "one pixel short is not a card frame"
+        );
     }
 
     #[test]
@@ -970,8 +971,18 @@ mod tests {
         // land outside the two middle positions of every channel — which the
         // assert below pins, so the distances really are 12 and 13.
         let mut frame = frame_with_background(216);
-        paint(&mut frame, 0..1, 0..1, [CARD_BG[0] + 12, CARD_BG[1], CARD_BG[2]]);
-        paint(&mut frame, 9..10, 47..48, [CARD_BG[0] + 13, CARD_BG[1], CARD_BG[2]]);
+        paint(
+            &mut frame,
+            0..1,
+            0..1,
+            [CARD_BG[0] + 12, CARD_BG[1], CARD_BG[2]],
+        );
+        paint(
+            &mut frame,
+            9..10,
+            47..48,
+            [CARD_BG[0] + 13, CARD_BG[1], CARD_BG[2]],
+        );
         let median = frame_median(&frame);
         assert_eq!(median, [12.0, 13.0, 25.0], "the median must be the card");
         // The 216 background pixels plus the one at exactly BGFRAC_TOL.
@@ -982,9 +993,8 @@ mod tests {
     fn the_run_floor_and_cap_admit_exactly_one_and_five_seconds() {
         let last = card_with_logo();
         // A one-second lead keeps R1 satisfied whatever the run length is.
-        let with_run = |run: usize| -> Vec<bool> {
-            (0..30 + run).map(|index| index >= 30).collect()
-        };
+        let with_run =
+            |run: usize| -> Vec<bool> { (0..30 + run).map(|index| index >= 30).collect() };
         // R0 rejects only *below* 1.0s: 30 frames is exactly the floor.
         assert_eq!(verdict_from_tail(&with_run(30), &last), Ok(1.0));
         assert_eq!(
@@ -1047,9 +1057,8 @@ mod tests {
     #[test]
     fn the_lead_floor_admits_exactly_twelve_frames() {
         let last = card_with_logo();
-        let with_lead = |lead: usize| -> Vec<bool> {
-            (0..lead + 60).map(|index| index >= lead).collect()
-        };
+        let with_lead =
+            |lead: usize| -> Vec<bool> { (0..lead + 60).map(|index| index >= lead).collect() };
         // 12 frames of content ahead of the run is 0.40s exactly.
         assert_eq!(verdict_from_tail(&with_lead(12), &last), Ok(2.0));
         assert_eq!(
@@ -1109,7 +1118,10 @@ mod tests {
         // Both candidate frame lengths can divide the same stream — a full
         // 210-frame tail of 86-row frames is also a whole number of 28-row
         // frames — and then the byte count is no evidence either way.
-        assert_eq!(corroborated_height(Some((1080, 1920)), frame(86) * 210), None);
+        assert_eq!(
+            corroborated_height(Some((1080, 1920)), frame(86) * 210),
+            None
+        );
         // Neither divides, nothing was received, or nothing was stored.
         assert_eq!(
             corroborated_height(Some((1080, 1920)), frame(86) * 3 + 1),
@@ -1167,7 +1179,10 @@ mod tests {
         let mut scanner = GeometryScanner::default();
         // Nothing in the input block is the output's geometry, whatever it
         // happens to be shaped like.
-        assert_eq!(scanner.feed("Input #0, mov,mp4,m4a, from '/48x64/clip.mp4':"), None);
+        assert_eq!(
+            scanner.feed("Input #0, mov,mp4,m4a, from '/48x64/clip.mp4':"),
+            None
+        );
         assert_eq!(scanner.feed("  Metadata:"), None);
         assert_eq!(
             scanner.feed("  Stream #0:0(und): Video: h264, yuv420p, 1080x1920 [SAR 1:1]"),

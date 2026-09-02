@@ -27,10 +27,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::api::db_params::DbQueryParams;
-use crate::api::http_file::{
-    FILE_IO_TIMEOUT, ServeBody, ServeSpec, open_file_with_timeout, serve,
-};
-use crate::visual_tiers::{GENERATED_STILL_FORMAT, RenditionFormat};
+use crate::api::http_file::{FILE_IO_TIMEOUT, ServeBody, ServeSpec, open_file_with_timeout, serve};
 use crate::api::utils::serve_outro_metadata;
 use crate::api_error::ApiError;
 use crate::config::{PolicyConfig, Settings};
@@ -43,16 +40,17 @@ use crate::media_tools::transcode::compose::{
     self, ComposeLimits, ComposeParams, ComposeRejection, ComposeRequest, ItemSource,
     ResolvedCompose, StreamInfo, Transform,
 };
-use crate::media_tools::transcode::run::ComposeInput;
 use crate::media_tools::transcode::pool::{
     self, ArtifactRef, JobRequest, JobWeight, SubmitOutcome, SubmitRequest, TranscodeJobSnapshot,
 };
 use crate::media_tools::transcode::presets::{
     Channel, Container, ResolvedPreset, Surface, find_preset, resolve_presets,
 };
+use crate::media_tools::transcode::run::ComposeInput;
 use crate::media_tools::transcode::{TranscodeParams, path_stem, transcode_file_name};
 use crate::policy::PolicyContext;
 use crate::proxy::ProxyState;
+use crate::visual_tiers::{GENERATED_STILL_FORMAT, RenditionFormat};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -351,7 +349,9 @@ pub async fn video_transcode(
         body.start_cs,
         end_cs,
         source.item.duration,
-        crate::config::runtime().transcode.max_animated_image_seconds,
+        crate::config::runtime()
+            .transcode
+            .max_animated_image_seconds,
     )?;
 
     let params = resolve_params(source.item.sha256.clone(), preset, body.start_cs, end_cs).await?;
@@ -457,8 +457,7 @@ pub async fn video_compose(
                 // length the index database holds. Refused here, by name,
                 // while the answer can still say which pin to fix — at
                 // dispatch it would fail the whole graph instead.
-                compose::validate_still_bounds(item, source.duration)
-                    .map_err(compose_rejection)?;
+                compose::validate_still_bounds(item, source.duration).map_err(compose_rejection)?;
                 sources.push(ComposeInput::file(source.path));
             }
             ItemSource::Thumbnail => {
@@ -631,7 +630,9 @@ pub async fn video_artifact(
         (status = 404, description = "No such job")
     )
 )]
-pub async fn video_job(AxumPath(job_id): AxumPath<String>) -> ApiResult<Json<TranscodeJobSnapshot>> {
+pub async fn video_job(
+    AxumPath(job_id): AxumPath<String>,
+) -> ApiResult<Json<TranscodeJobSnapshot>> {
     let id = parse_job_id(&job_id)?;
     pool::job_snapshot(id)
         .await?
@@ -699,22 +700,19 @@ pub async fn video_job_events(
 fn job_event_stream(
     receiver: tokio::sync::watch::Receiver<TranscodeJobSnapshot>,
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
-    futures_util::stream::unfold(
-        (Some(receiver), true),
-        |(receiver, first)| async move {
-            let mut receiver = receiver?;
-            if !first && receiver.changed().await.is_err() {
-                return None;
-            }
-            let snapshot = receiver.borrow_and_update().clone();
-            let terminal = snapshot.event.is_terminal();
-            let event = Event::default()
-                .json_data(&snapshot)
-                .unwrap_or_else(|_| Event::default().comment("unserializable job snapshot"));
-            let next = if terminal { None } else { Some(receiver) };
-            Some((Ok(event), (next, false)))
-        },
-    )
+    futures_util::stream::unfold((Some(receiver), true), |(receiver, first)| async move {
+        let mut receiver = receiver?;
+        if !first && receiver.changed().await.is_err() {
+            return None;
+        }
+        let snapshot = receiver.borrow_and_update().clone();
+        let terminal = snapshot.event.is_terminal();
+        let event = Event::default()
+            .json_data(&snapshot)
+            .unwrap_or_else(|_| Event::default().comment("unserializable job snapshot"));
+        let next = if terminal { None } else { Some(receiver) };
+        Some((Ok(event), (next, false)))
+    })
 }
 
 #[utoipa::path(
@@ -1264,14 +1262,12 @@ async fn resolve_params(
     start_cs: Option<i64>,
     end_cs: Option<i64>,
 ) -> ApiResult<TranscodeParams> {
-    tokio::task::spawn_blocking(move || {
-        TranscodeParams::resolve(sha256, preset, start_cs, end_cs)
-    })
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "the encoder probe task failed");
-        ApiError::internal("Failed to resolve the transcode encoder")
-    })
+    tokio::task::spawn_blocking(move || TranscodeParams::resolve(sha256, preset, start_cs, end_cs))
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "the encoder probe task failed");
+            ApiError::internal("Failed to resolve the transcode encoder")
+        })
 }
 
 fn matched_policy<'a>(
@@ -1308,7 +1304,10 @@ fn filter_presets(
     let Some(allowed) = allowed.and_then(serde_json::Value::as_array) else {
         return presets;
     };
-    let names: Vec<&str> = allowed.iter().filter_map(serde_json::Value::as_str).collect();
+    let names: Vec<&str> = allowed
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
     presets
         .into_iter()
         .filter(|preset| names.contains(&preset.id.as_str()))
@@ -1483,7 +1482,10 @@ mod tests {
     /// end where playback's outro skip ended.
     #[test]
     fn the_outro_cut_guards_then_floors_to_centiseconds() {
-        assert_eq!(OUTRO_EXPORT_GUARD_MS, 60, "ui/lib/videoTrim.ts OUTRO_GUARD_MS");
+        assert_eq!(
+            OUTRO_EXPORT_GUARD_MS, 60,
+            "ui/lib/videoTrim.ts OUTRO_GUARD_MS"
+        );
         // 8.000 s of content, minus the 60 ms audio-bang lead.
         assert_eq!(outro_cut_cs(8000), 794);
         // Floored, never rounded: 7.945 s must not become 7.95 s, which is
@@ -1504,9 +1506,7 @@ mod tests {
     /// identical ffmpeg command line.
     #[test]
     fn an_outro_cut_is_indistinguishable_from_the_same_explicit_trim() {
-        use crate::media_tools::transcode::run::{
-            ENCODER_X264_QUALITY, EncodeJobSpec, build_args,
-        };
+        use crate::media_tools::transcode::run::{ENCODER_X264_QUALITY, EncodeJobSpec, build_args};
 
         let presets = builtin_presets();
         let preset = find_preset(&presets, "clip").expect("the clip preset ships");
@@ -1552,10 +1552,19 @@ mod tests {
     #[test]
     fn the_animated_image_cap_bounds_only_the_animated_containers() {
         // The window itself, before any container is involved.
-        assert_eq!(expected_output_seconds(Some(100), Some(600), None), Some(5.0));
-        assert_eq!(expected_output_seconds(None, Some(600), Some(90.0)), Some(6.0));
+        assert_eq!(
+            expected_output_seconds(Some(100), Some(600), None),
+            Some(5.0)
+        );
+        assert_eq!(
+            expected_output_seconds(None, Some(600), Some(90.0)),
+            Some(6.0)
+        );
         // No end bound: the item's duration, less the start bound.
-        assert_eq!(expected_output_seconds(Some(1000), None, Some(45.0)), Some(35.0));
+        assert_eq!(
+            expected_output_seconds(Some(1000), None, Some(45.0)),
+            Some(35.0)
+        );
         assert_eq!(expected_output_seconds(None, None, Some(45.0)), Some(45.0));
         // ...and no way to know at all.
         assert_eq!(expected_output_seconds(None, None, None), None);
@@ -1565,9 +1574,7 @@ mod tests {
             validate_animated_duration(Container::Webp, start_cs, end_cs, duration, 30)
         };
         // Avif is the other animated-image container, capped identically.
-        assert!(
-            validate_animated_duration(Container::Avif, None, None, Some(45.0), 30).is_err()
-        );
+        assert!(validate_animated_duration(Container::Avif, None, None, Some(45.0), 30).is_err());
         assert!(validate_animated_duration(Container::Avif, None, Some(1200), None, 30).is_ok());
         // Under the cap, both ways of knowing the window.
         assert!(webp(Some(100), Some(600), Some(600.0)).is_ok());
@@ -2179,14 +2186,7 @@ transcode_presets = ["playback"]
                 1,
             ),
             (11, 1, WITH_OUTRO, readable_path, readable_name, 0),
-            (
-                12,
-                3,
-                DEGENERATE_OUTRO,
-                degenerate_path,
-                degenerate_name,
-                1,
-            ),
+            (12, 3, DEGENERATE_OUTRO, degenerate_path, degenerate_name, 1),
         ] {
             sqlx::query(
                 "INSERT INTO files \
@@ -2236,7 +2236,9 @@ transcode_presets = ["playback"]
         // A source with no recorded duration cannot be judged for eligibility,
         // so the boundary is taken at face value.
         assert_eq!(
-            resolve_outro_end_cs(&mut db, WITH_OUTRO, None).await.unwrap(),
+            resolve_outro_end_cs(&mut db, WITH_OUTRO, None)
+                .await
+                .unwrap(),
             794
         );
 
@@ -2284,8 +2286,8 @@ transcode_presets = ["playback"]
         // writes: the stamp then provably moved even where mtime granularity
         // is too coarse to record a same-second rewrite, which is the case the
         // length is carried for.
-        let config = crate::db::system_config::SystemConfigStore::from_env()
-            .config_path(OUTRO_INDEX_DB);
+        let config =
+            crate::db::system_config::SystemConfigStore::from_env().config_path(OUTRO_INDEX_DB);
         std::fs::write(&config, "detect_outros = true # re-enabled\n").unwrap();
         assert_eq!(
             resolve_outro_end_cs(&mut db, WITH_OUTRO, Some(12.0))
@@ -2531,7 +2533,9 @@ transcode_presets = ["playback"]
         let _env = crate::test_utils::test_data_dir();
         let fixtures = tempfile::tempdir().unwrap();
         let settings = test_settings();
-        let cap = crate::config::runtime().transcode.max_animated_image_seconds;
+        let cap = crate::config::runtime()
+            .transcode
+            .max_animated_image_seconds;
 
         async fn post(
             settings: &Arc<Settings>,
@@ -2559,10 +2563,21 @@ transcode_presets = ["playback"]
         }
 
         // Untrimmed, on an item far longer than the cap.
-        let long = post(&settings, fixtures.path(), Some(600.0), "webp-anim", None, None)
-            .await
-            .expect_err("over the cap");
-        assert!(long.detail().contains(&cap.to_string()), "{}", long.detail());
+        let long = post(
+            &settings,
+            fixtures.path(),
+            Some(600.0),
+            "webp-anim",
+            None,
+            None,
+        )
+        .await
+        .expect_err("over the cap");
+        assert!(
+            long.detail().contains(&cap.to_string()),
+            "{}",
+            long.detail()
+        );
         assert_eq!(
             long.into_response().status(),
             StatusCode::UNPROCESSABLE_ENTITY
@@ -2708,7 +2723,11 @@ transcode_presets = ["playback"]
         .expect("the fixture document deserializes")
     }
 
-    fn compose_item(sha: &str, dest: (i64, i64, i64, i64), time: serde_json::Value) -> serde_json::Value {
+    fn compose_item(
+        sha: &str,
+        dest: (i64, i64, i64, i64),
+        time: serde_json::Value,
+    ) -> serde_json::Value {
         serde_json::json!({
             "sha256": sha,
             "src": { "x": 0, "y": 0, "w": 640, "h": 480 },
@@ -2784,7 +2803,10 @@ transcode_presets = ["playback"]
         let json = body_json(response).await;
         assert_eq!(json["outcome"], "hit");
         assert_eq!(json["artifact"]["key"], key);
-        assert_eq!(json["artifact"]["url"], format!("/api/video/artifact?key={key}"));
+        assert_eq!(
+            json["artifact"]["url"],
+            format!("/api/video/artifact?key={key}")
+        );
         // No source stem exists for a composition, so the name is fixed.
         assert_eq!(json["artifact"]["filename"], "mosaic-2items.mp4");
 
@@ -2831,7 +2853,11 @@ transcode_presets = ["playback"]
                 (0, 0, 160, 240),
                 serde_json::json!({ "kind": "span", "start_cs": 0, "end_cs": 500 }),
             ),
-            compose_item(&missing, (160, 0, 160, 240), serde_json::json!({ "kind": "image" })),
+            compose_item(
+                &missing,
+                (160, 0, 160, 240),
+                serde_json::json!({ "kind": "image" }),
+            ),
         ]);
         let (db, _attached) = compose_fixture_db(fixtures.path()).await;
         let err = video_compose(
@@ -3017,7 +3043,14 @@ transcode_presets = ["playback"]
         let mut huge = compose_body(vec![ok]);
         huge.canvas.background = "not-a-colour".to_string();
 
-        for body in [odd_dest, outside, frozen_span, unknown_preset, odd_canvas, huge] {
+        for body in [
+            odd_dest,
+            outside,
+            frozen_span,
+            unknown_preset,
+            odd_canvas,
+            huge,
+        ] {
             let err = video_compose(
                 State(test_state(&settings)),
                 Extension(test_context("local")),
@@ -3056,9 +3089,8 @@ transcode_presets = ["playback"]
             id: "job-1".to_string(),
             event,
         };
-        let (events, receiver) = tokio::sync::watch::channel(snapshot(
-            TranscodeJobEvent::Queued { position: 3 },
-        ));
+        let (events, receiver) =
+            tokio::sync::watch::channel(snapshot(TranscodeJobEvent::Queued { position: 3 }));
         let response = Sse::new(job_event_stream(receiver)).into_response();
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],

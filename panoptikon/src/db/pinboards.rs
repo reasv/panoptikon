@@ -1057,7 +1057,9 @@ mod tests {
     const T0: i64 = 1_800_000_000;
 
     async fn board(conn: &mut sqlx::SqliteConnection, name: Option<&str>, now: i64) -> i64 {
-        let id = create_pinboard(conn, "user", name, None, now).await.unwrap();
+        let id = create_pinboard(conn, "user", name, None, now)
+            .await
+            .unwrap();
         append_version(conn, id, &["v2".to_string()], &[], None, None, None, None)
             .await
             .unwrap();
@@ -1413,9 +1415,15 @@ mod tests {
         .await
         .unwrap();
 
-        let boards = list_pinboards(&mut dbs.index_conn, "user", None, PinboardOrder::Updated, T0)
-            .await
-            .unwrap();
+        let boards = list_pinboards(
+            &mut dbs.index_conn,
+            "user",
+            None,
+            PinboardOrder::Updated,
+            T0,
+        )
+        .await
+        .unwrap();
         let counts = |id: i64| {
             let board = boards.iter().find(|board| board.id == id).unwrap();
             (board.present_count, board.item_count)
@@ -1501,8 +1509,13 @@ mod tests {
             .await;
         }
 
-        let hits =
-            ids_in_order(&mut dbs.index_conn, Some("alpha"), PinboardOrder::Activity, T0).await;
+        let hits = ids_in_order(
+            &mut dbs.index_conn,
+            Some("alpha"),
+            PinboardOrder::Activity,
+            T0,
+        )
+        .await;
         let expected: Vec<i64> = ids.iter().rev().copied().collect();
         assert_eq!(hits, expected);
     }

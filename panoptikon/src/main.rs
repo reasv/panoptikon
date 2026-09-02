@@ -3,19 +3,19 @@
 // own suggestion is to raise the limit.
 #![recursion_limit = "256"]
 
+mod accelerator_env;
+mod accelerator_report;
 mod api;
 mod api_error;
 mod config;
 mod db;
 mod desktop;
 mod env_template;
+mod host_paths;
 mod inferio;
 mod inferio_client;
 mod jobs;
 mod logging;
-mod host_paths;
-mod accelerator_env;
-mod accelerator_report;
 mod media_tools;
 mod openapi;
 mod policy;
@@ -488,8 +488,7 @@ async fn async_main() -> anyhow::Result<()> {
                 Router::new()
                     .route(
                         "/api/pinboards",
-                        get(api::pinboards::list_pinboards)
-                            .post(api::pinboards::create_pinboard),
+                        get(api::pinboards::list_pinboards).post(api::pinboards::create_pinboard),
                     )
                     // Content search lives in the pinboard authz domain, not
                     // the search one: under /api/search/ it would inherit
@@ -765,16 +764,20 @@ mod route_tests {
             .route("/api/video/artifact", get(|| async { "artifact" }))
             .route(
                 "/api/video/jobs/{job_id}",
-                get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
-                    format!("job {id}")
-                })
+                get(
+                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        format!("job {id}")
+                    },
+                )
                 .delete(|| async { "cancel" }),
             )
             .route(
                 "/api/video/jobs/{job_id}/events",
-                get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
-                    format!("events {id}")
-                }),
+                get(
+                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        format!("events {id}")
+                    },
+                ),
             )
             .route("/api/video/presets", get(|| async { "presets" }));
 
@@ -839,9 +842,11 @@ mod route_tests {
             .route("/api/pinboards/search", post(|| async { "search" }))
             .route(
                 "/api/pinboards/{pinboard_id}",
-                get(|axum::extract::Path(id): axum::extract::Path<i64>| async move {
-                    format!("board {id}")
-                }),
+                get(
+                    |axum::extract::Path(id): axum::extract::Path<i64>| async move {
+                        format!("board {id}")
+                    },
+                ),
             )
             .route(
                 "/api/pinboards/{pinboard_id}/versions",

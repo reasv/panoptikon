@@ -1064,9 +1064,7 @@ pub(crate) fn build_filtergraph(params: &ComposeParams, sources: &[ComposeSource
         };
         inputs.push(InputSpec {
             args,
-            path: source
-                .map(|source| source.path.clone())
-                .unwrap_or_default(),
+            path: source.map(|source| source.path.clone()).unwrap_or_default(),
         });
         chains.push(video_chain(index, item, doc, probe, &target));
         if item.audio && probe.is_none_or(|probe| probe.has_audio) {
@@ -1184,7 +1182,10 @@ fn input_args(item: &ComposeItem, fps: u32, probe: Option<StreamInfo>) -> Vec<St
             seconds(end_cs),
         ],
         ItemTime::Still { at_cs } => {
-            vec!["-ss".to_string(), seconds(clamped_still_cs(at_cs, fps, probe))]
+            vec![
+                "-ss".to_string(),
+                seconds(clamped_still_cs(at_cs, fps, probe)),
+            ]
         }
         // Deliberately none at all. `-loop 1` on an image demuxer produces an
         // endless stream, which is only bounded by a downstream filter noticing
@@ -1237,7 +1238,11 @@ fn video_chain(
             .map(str::to_string)
             .collect();
         filters.push(format!("crop={}:{}:{}:{}", src.w, src.h, src.x, src.y));
-        filters.extend(orientation_filters(item.transform).into_iter().map(str::to_string));
+        filters.extend(
+            orientation_filters(item.transform)
+                .into_iter()
+                .map(str::to_string),
+        );
         filters.push(format!(
             "scale={}:{}:flags=lanczos",
             item.dest.w, item.dest.h
@@ -1271,10 +1276,7 @@ fn video_chain(
             filters.push(format!("trim=end={target}"));
         }
     }
-    format!(
-        "[{index}:v:{video_index}]{}[v{index}]",
-        filters.join(",")
-    )
+    format!("[{index}:v:{video_index}]{}[v{index}]", filters.join(","))
 }
 
 fn audio_chain(
@@ -1535,7 +1537,10 @@ mod tests {
         };
 
         assert_eq!(
-            reason(&request(Vec::new(), ComposeLength::LongestLoopOnce), "mosaic-mp4"),
+            reason(
+                &request(Vec::new(), ComposeLength::LongestLoopOnce),
+                "mosaic-mp4"
+            ),
             "no_items"
         );
         let many: Vec<ComposeItem> = (0..13).map(|_| item(ItemTime::Image)).collect();
@@ -1646,7 +1651,10 @@ mod tests {
             "span_negative"
         );
         assert_eq!(
-            reason(&with_item(item(ItemTime::Still { at_cs: -1 })), "mosaic-mp4"),
+            reason(
+                &with_item(item(ItemTime::Still { at_cs: -1 })),
+                "mosaic-mp4"
+            ),
             "still_negative"
         );
 
@@ -1682,10 +1690,7 @@ mod tests {
         for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(
                 reason(
-                    &request(
-                        vec![item(ItemTime::Image)],
-                        ComposeLength::Cap { seconds }
-                    ),
+                    &request(vec![item(ItemTime::Image)], ComposeLength::Cap { seconds }),
                     "mosaic-mp4"
                 ),
                 "cap_invalid",
@@ -1717,8 +1722,14 @@ mod tests {
             "an item with no recorded duration cannot be judged this way"
         );
         assert!(
-            validate_still_bounds(&item(ItemTime::Span { start_cs: 0, end_cs: 9_000 }), Some(1.0))
-                .is_ok(),
+            validate_still_bounds(
+                &item(ItemTime::Span {
+                    start_cs: 0,
+                    end_cs: 9_000
+                }),
+                Some(1.0)
+            )
+            .is_ok(),
             "the rule is about stills; a span past the end simply runs short"
         );
         assert!(validate_still_bounds(&item(ItemTime::Image), Some(1.0)).is_ok());
@@ -1868,10 +1879,14 @@ mod tests {
             ComposeLength::Cap { seconds: 30.0 },
         );
         assert!(
-            resolve_compose(&frozen, &preset("mosaic-mp4"), ComposeLimits {
-                max_mosaic_loop_mb: 8,
-                ..limits()
-            })
+            resolve_compose(
+                &frozen,
+                &preset("mosaic-mp4"),
+                ComposeLimits {
+                    max_mosaic_loop_mb: 8,
+                    ..limits()
+                }
+            )
             .is_ok(),
             "twelve frozen items at 640x480 are one frame each, about 5 MB together"
         );
@@ -1974,7 +1989,9 @@ mod tests {
         assert_eq!(plan.inputs[1].args, ["-ss", "1.50"]);
         assert_eq!(
             plan.output_args,
-            ["-map", "[vout]", "-map", "[aout]", "-sn", "-dn", "-pix_fmt", "yuv420p"]
+            [
+                "-map", "[vout]", "-map", "[aout]", "-sn", "-dn", "-pix_fmt", "yuv420p"
+            ]
         );
         assert!(plan.has_audio);
     }
@@ -2112,7 +2129,8 @@ mod tests {
         // covers the whole segment); four passes fill the 10 s target, which
         // is three loops on top of the first.
         assert!(
-            plan.filter_complex.contains("fps=25,loop=3:size=63,trim=end=10.00"),
+            plan.filter_complex
+                .contains("fps=25,loop=3:size=63,trim=end=10.00"),
             "{}",
             plan.filter_complex
         );
@@ -2223,7 +2241,10 @@ mod tests {
             "mosaic-mp4",
         );
         let plan = build_filtergraph(&params, &sources(1));
-        assert!(plan.filter_complex.contains("[base][v0]overlay=0:0,format=yuv420p[vout]"));
+        assert!(
+            plan.filter_complex
+                .contains("[base][v0]overlay=0:0,format=yuv420p[vout]")
+        );
     }
 
     /// The container decides the output format and whether audio exists at
@@ -2260,7 +2281,9 @@ mod tests {
         );
         assert_eq!(
             plan.output_args,
-            ["-map", "[vout]", "-an", "-sn", "-dn", "-pix_fmt", "yuva420p"]
+            [
+                "-map", "[vout]", "-an", "-sn", "-dn", "-pix_fmt", "yuva420p"
+            ]
         );
 
         let plan = build_filtergraph(&params_for(&small, "mosaic-webm"), &sources(2));
@@ -2369,7 +2392,10 @@ mod tests {
     fn jpeg_with_orientation(path: &Path, exif_orientation: u16) {
         let mut base = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 32))
-            .write_to(&mut std::io::Cursor::new(&mut base), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut base),
+                image::ImageFormat::Jpeg,
+            )
             .expect("the fixture encodes");
         let mut payload = b"Exif\x00\x00".to_vec();
         payload.extend_from_slice(&exif_orientation_block(exif_orientation));
@@ -2398,7 +2424,10 @@ mod tests {
 
         let mut base = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 32))
-            .write_to(&mut std::io::Cursor::new(&mut base), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut base),
+                image::ImageFormat::Png,
+            )
             .expect("the fixture encodes");
 
         let mut chunk_body = b"eXIf".to_vec();
@@ -2491,7 +2520,9 @@ mod tests {
         let chain = video_chain(0, &turned, &doc, Some(probe), "2.000");
         let normalize = chain.find("transpose=1").expect("the source is normalized");
         let crop = chain.find("crop=").expect("the crop is applied");
-        let board = chain.find("hflip,vflip").expect("the board transform is applied");
+        let board = chain
+            .find("hflip,vflip")
+            .expect("the board transform is applied");
         assert!(
             normalize < crop && crop < board,
             "normalize, then crop, then the board's own turn: {chain}"
@@ -2617,7 +2648,15 @@ mod tests {
             .arg(format!("color=c=0x00a000:s={w}x{h}:d={seconds}:r=30"))
             .args(["-f", "lavfi", "-i"])
             .arg(format!("sine=frequency=440:duration={seconds}"))
-            .args(["-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-shortest"])
+            .args([
+                "-pix_fmt",
+                "yuv420p",
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
             .arg(path)
             .stdin(Stdio::null())
             .status();
@@ -2757,13 +2796,17 @@ mod tests {
             .output()
             .ok()?;
         let data: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        let stream = data.get("streams")?.as_array()?.iter().max_by_key(|stream| {
-            stream
-                .get("nb_read_frames")
-                .and_then(|value| value.as_str())
-                .and_then(|text| text.parse::<i64>().ok())
-                .unwrap_or(0)
-        })?;
+        let stream = data
+            .get("streams")?
+            .as_array()?
+            .iter()
+            .max_by_key(|stream| {
+                stream
+                    .get("nb_read_frames")
+                    .and_then(|value| value.as_str())
+                    .and_then(|text| text.parse::<i64>().ok())
+                    .unwrap_or(0)
+            })?;
         let number = |value: Option<&serde_json::Value>| -> f64 {
             value
                 .and_then(|value| match value {
@@ -2939,13 +2982,21 @@ mod tests {
                 let bytes = std::fs::read(&output).expect("the artifact is readable");
                 let (width, height, frames) =
                     webp_shape(&bytes).unwrap_or_else(|| panic!("{preset_id} is a WebP"));
-                assert_eq!((width, height), (320, 240), "{preset_id} renders the canvas");
+                assert_eq!(
+                    (width, height),
+                    (320, 240),
+                    "{preset_id} renders the canvas"
+                );
                 assert!(frames > 1, "{preset_id} is animated: {frames} frames");
                 image::open(&output).unwrap_or_else(|err| panic!("{preset_id} decodes: {err}"))
             } else {
                 let (width, height, duration, frames) =
                     probe_artifact(&output).unwrap_or_else(|| panic!("{preset_id} is probeable"));
-                assert_eq!((width, height), (320, 240), "{preset_id} renders the canvas");
+                assert_eq!(
+                    (width, height),
+                    (320, 240),
+                    "{preset_id} renders the canvas"
+                );
                 assert!(frames > 1, "{preset_id} is animated: {frames} frames");
                 assert!(
                     (duration - 2.0).abs() <= 2.0 / 25.0,
@@ -3159,7 +3210,10 @@ mod tests {
         let (width, height, duration, frames) =
             probe_artifact(&output).expect("the artifact is probeable");
         assert_eq!((width, height), (160, 120));
-        assert!(frames > 1, "a frozen thumbnail still runs as a clip: {frames}");
+        assert!(
+            frames > 1,
+            "a frozen thumbnail still runs as a clip: {frames}"
+        );
         assert!(
             (duration - 2.0).abs() <= 2.0 / 25.0,
             "the frozen thumbnail runs for the whole cap: {duration}"
@@ -3197,7 +3251,14 @@ mod tests {
         let status = Command::new(crate::media_tools::ffmpeg())
             .args(["-y", "-v", "error", "-i"])
             .arg(gif)
-            .args(["-vf", "scale=8:8,fps=25", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+            .args([
+                "-vf",
+                "scale=8:8,fps=25",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+            ])
             .arg(&raw)
             .stdin(Stdio::null())
             .status();
@@ -3409,7 +3470,10 @@ mod tests {
             plan.filter_complex
         );
 
-        let plan = build_filtergraph(&with_time(ItemTime::Still { at_cs: 75 }), &[bridged_source()]);
+        let plan = build_filtergraph(
+            &with_time(ItemTime::Still { at_cs: 75 }),
+            &[bridged_source()],
+        );
         assert_eq!(
             plan.inputs[0].args,
             ["-f", "concat"],
@@ -3652,7 +3716,11 @@ mod tests {
                     "only the windowed second frame plays; red would mean the \
                      window was ignored ({at}s)"
                 );
-                assert_eq!(primary(&frame, 10, 110), Some('g'), "background intact ({at}s)");
+                assert_eq!(
+                    primary(&frame, 10, 110),
+                    Some('g'),
+                    "background intact ({at}s)"
+                );
             }
         }
     }
@@ -3903,6 +3971,9 @@ mod tests {
             "the span defines the length: {duration} vs 2.0"
         );
         let probe = probe_source(&output).expect("the artifact probes as a source");
-        assert!(probe.has_audio, "the artifact carries the mixed audio track");
+        assert!(
+            probe.has_audio,
+            "the artifact carries the mixed audio track"
+        );
     }
 }

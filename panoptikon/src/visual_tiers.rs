@@ -94,8 +94,8 @@
 //! type, with no exception anywhere, for either table.
 
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
-use std::borrow::Cow;
 use serde::Deserialize;
+use std::borrow::Cow;
 use utoipa::ToSchema;
 
 /// Display tier: the largest short side served without a stored rendition.
@@ -373,7 +373,6 @@ impl RenditionFormat {
     fn keeps_alpha(self, has_transparency: Option<bool>) -> bool {
         self == Self::Webp && has_transparency == Some(true)
     }
-
 }
 
 /// Whether a rendition of these dimensions fits libwebp ([`WEBP_MAX_SIDE`]).
@@ -651,8 +650,10 @@ pub(crate) fn display_plan(
         DisplayShape::Original => DisplayPlan::Original,
         DisplayShape::Loop { tier } => DisplayPlan::Loop { tier },
         DisplayShape::Still { plan } => {
-            let wanted = policy
-                .constrain(display_format(source_class(mime_type, animated), has_transparency));
+            let wanted = policy.constrain(display_format(
+                source_class(mime_type, animated),
+                has_transparency,
+            ));
             // libwebp's own limit, and the only rendition that can reach it:
             // the tall strips, whose display rendition keeps its short side
             // and runs to tens of thousands of rows. JPEG at the same
@@ -690,7 +691,9 @@ fn animated_display_loop(file_size: u64, width: u32, height: u32) -> Option<&'st
 fn display_trigger_fires(class: SourceClass, file_size: u64, width: u32, height: u32) -> bool {
     let short = width.min(height);
     let pixels = u64::from(width) * u64::from(height);
-    short > DISPLAY_MAX_SHORT_SIDE || pixels > DISPLAY_MAX_PIXELS || bytes_over_bound(class, file_size)
+    short > DISPLAY_MAX_SHORT_SIDE
+        || pixels > DISPLAY_MAX_PIXELS
+        || bytes_over_bound(class, file_size)
 }
 
 /// Whether an item's **bytes** alone put it over the display trigger.
@@ -734,10 +737,7 @@ fn display_format(class: SourceClass, has_transparency: Option<bool>) -> Renditi
 /// The WebP size limit cannot bind here and is deliberately not asked about
 /// ([`fits_webp`]): a grid rendition's long side is at most `2 * tier` =
 /// 2048 px by construction, so only the policy can overrule the verdict.
-pub(crate) fn tier_format(
-    has_transparency: Option<bool>,
-    policy: FormatPolicy,
-) -> RenditionFormat {
+pub(crate) fn tier_format(has_transparency: Option<bool>, policy: FormatPolicy) -> RenditionFormat {
     let wanted = if has_transparency == Some(true) {
         RenditionFormat::Webp
     } else {
@@ -827,7 +827,10 @@ pub(crate) fn tier_plan(width: u32, height: u32, tier: u32) -> TierPlan {
     let cap = u64::from(GRID_MAX_WHOLE_ASPECT) * u64::from(tier);
     let crop_long_cap = cap * u64::from(short) / u64::from(out_short);
     let crop_long = u64::from(long).min(crop_long_cap).max(1) as u32;
-    let out_long = round_div(u64::from(crop_long) * u64::from(out_short), u64::from(short));
+    let out_long = round_div(
+        u64::from(crop_long) * u64::from(out_short),
+        u64::from(short),
+    );
     let out_long = out_long.max(1);
 
     if tall {
@@ -903,12 +906,7 @@ fn within_grid_dimensions(width: u32, height: u32, tier: u32) -> bool {
 
 /// One tier's plan for a source of `width` x `height`: `None` when the source
 /// itself is what gets served.
-fn grid_plan(
-    file_size: u64,
-    width: u32,
-    height: u32,
-    tier: ThumbnailTier,
-) -> Option<TierPlan> {
+fn grid_plan(file_size: u64, width: u32, height: u32, tier: ThumbnailTier) -> Option<TierPlan> {
     let short_side = tier.short_side()?;
     if width == 0 || height == 0 {
         return None;
@@ -1017,11 +1015,7 @@ pub(crate) fn grid_plans_for_stored_thumbnail(
 /// A tier whose source is served as-is is simply absent from the result; the
 /// serving ladder falls through to the next larger tier, and then to the
 /// display path.
-fn cascade(
-    file_size: Option<u64>,
-    width: u32,
-    height: u32,
-) -> Vec<(ThumbnailTier, TierPlan)> {
+fn cascade(file_size: Option<u64>, width: u32, height: u32) -> Vec<(ThumbnailTier, TierPlan)> {
     let mut out: Vec<(ThumbnailTier, TierPlan)> = Vec::with_capacity(ThumbnailTier::GRID.len());
     let mut source = (width, height);
     let mut bytes = file_size;
@@ -1279,10 +1273,7 @@ pub(crate) fn animated_rendition_set(
         .collect()
 }
 
-fn named(
-    plans: Vec<(ThumbnailTier, TierPlan)>,
-    format: RenditionFormat,
-) -> Vec<WantedRendition> {
+fn named(plans: Vec<(ThumbnailTier, TierPlan)>, format: RenditionFormat) -> Vec<WantedRendition> {
     plans
         .into_iter()
         .map(|(tier, plan)| WantedRendition {
@@ -1656,7 +1647,15 @@ mod tests {
         // The size limit still wins: a transparent picture too tall for
         // libwebp is flattened rather than left unencodable. Asked of the
         // display rule, which is the only rendition that can reach it.
-        let over = display_plan(PNG, false, Some(true), 4 * MB, 600, WEBP_MAX_SIDE + 1, policy);
+        let over = display_plan(
+            PNG,
+            false,
+            Some(true),
+            4 * MB,
+            600,
+            WEBP_MAX_SIDE + 1,
+            policy,
+        );
         assert!(
             matches!(
                 over,
@@ -1937,7 +1936,12 @@ mod tests {
             600,
             1024
         ));
-        assert!(grid_serves_original(GRID_DIRECT_MAX_FILE_SIZE, 600, 600, 1024));
+        assert!(grid_serves_original(
+            GRID_DIRECT_MAX_FILE_SIZE,
+            600,
+            600,
+            1024
+        ));
         // The derived-thumbnail form drops only the byte clause.
         assert!(grid_serves_stored_thumbnail(600, 600, 1024));
         assert!(!grid_serves_stored_thumbnail(800, 20000, 1024));
@@ -2120,7 +2124,11 @@ mod tests {
         // Under both: served raw.
         assert!(animated_serves_original(400 * 1024, 480, 320));
         // Exactly on both bounds is still under the floor.
-        assert!(animated_serves_original(ANIMATED_RAW_MAX_FILE_SIZE, 512, 512));
+        assert!(animated_serves_original(
+            ANIMATED_RAW_MAX_FILE_SIZE,
+            512,
+            512
+        ));
         // One byte over.
         assert!(!animated_serves_original(
             ANIMATED_RAW_MAX_FILE_SIZE + 1,
@@ -2334,7 +2342,10 @@ mod tests {
     fn the_animated_set_is_its_posters_plus_its_loops() {
         let plans = animated_plans(MB, 2000, 2000);
         assert_eq!(
-            plans.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>(),
+            plans
+                .iter()
+                .map(|(kind, _)| kind.as_str())
+                .collect::<Vec<_>>(),
             vec!["grid-m", "grid-s", "grid-xs", LOOP_TIER],
             "under the display trigger there is exactly one loop"
         );
@@ -2344,7 +2355,10 @@ mod tests {
         // The smallest possible set: one poster and one loop.
         let plans = animated_plans(MB, 120, 120);
         assert_eq!(
-            plans.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>(),
+            plans
+                .iter()
+                .map(|(kind, _)| kind.as_str())
+                .collect::<Vec<_>>(),
             vec!["grid-m", LOOP_TIER]
         );
 
@@ -2352,7 +2366,10 @@ mod tests {
         // in: the second loop row joins the set.
         let plans = animated_plans(6 * MB, 2000, 2000);
         assert_eq!(
-            plans.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>(),
+            plans
+                .iter()
+                .map(|(kind, _)| kind.as_str())
+                .collect::<Vec<_>>(),
             vec!["grid-m", "grid-s", "grid-xs", LOOP_TIER, LOOP_DISPLAY_TIER]
         );
 
@@ -2360,7 +2377,9 @@ mod tests {
         // display loop: still one row.
         let plans = animated_plans(6 * MB, 900, 900);
         assert!(
-            !plans.iter().any(|(kind, _)| *kind == RenditionKind::LoopDisplay),
+            !plans
+                .iter()
+                .any(|(kind, _)| *kind == RenditionKind::LoopDisplay),
             "no second encode where the grid loop is already native"
         );
     }
@@ -2414,7 +2433,10 @@ mod tests {
     #[test]
     fn an_encode_no_smaller_than_its_source_keeps_the_original() {
         assert!(loop_keeps_original(40_000, 12_000));
-        assert!(loop_keeps_original(12_000, 12_000), "a tie keeps the source");
+        assert!(
+            loop_keeps_original(12_000, 12_000),
+            "a tie keeps the source"
+        );
         assert!(!loop_keeps_original(11_999, 12_000));
         // The ordinary case by a wide margin: a GIF against its H.264.
         assert!(!loop_keeps_original(120_000, 6 * MB));
@@ -2462,7 +2484,10 @@ mod tests {
         .expect("the encoder runs on decoded pixels");
 
         let (marker, sampling) = jpeg_frame(&bytes).expect("a JFIF frame header");
-        assert_eq!(marker, 0xC0, "baseline sequential (SOF0), never progressive");
+        assert_eq!(
+            marker, 0xC0,
+            "baseline sequential (SOF0), never progressive"
+        );
         assert_eq!(
             sampling, 0x11,
             "4:4:4 - the luma component's sampling factors are both 1"
@@ -2497,7 +2522,10 @@ mod tests {
         // ImageMagick quantization, which is mozjpeg's table 3 and where the
         // measured 91%-of-today's-bytes at higher SSIM comes from.
         let ours = jpeg_tables(&bytes, 0xDB);
-        assert!(!ours.is_empty(), "the encoder writes its quantization tables");
+        assert!(
+            !ours.is_empty(),
+            "the encoder writes its quantization tables"
+        );
         assert_ne!(
             ours,
             jpeg_tables(&stock, 0xDB),

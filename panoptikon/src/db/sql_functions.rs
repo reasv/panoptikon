@@ -116,11 +116,15 @@ pub(crate) fn ensure_sqlite_extensions() -> Result<(), ApiError> {
     }
 
     let status = unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(init_custom_functions as *const ())))
+        sqlite3_auto_extension(Some(std::mem::transmute(
+            init_custom_functions as *const (),
+        )))
     };
     if status != SQLITE_OK {
         tracing::error!(status, "failed to register custom SQL functions");
-        return Err(ApiError::internal("Failed to register custom SQL functions"));
+        return Err(ApiError::internal(
+            "Failed to register custom SQL functions",
+        ));
     }
 
     let _ = EXT_LOADED.set(());

@@ -790,7 +790,10 @@ mod tests {
             is_protocol_violation(&err),
             "and it is deterministic, so isolation must not retry it: {err:#}"
         );
-        assert!(format!("{err:#}").contains("mixes 1 binary and 1 JSON"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("mixes 1 binary and 1 JSON"),
+            "{err:#}"
+        );
     }
 
     /// The two unmixed shapes still round-trip: all survivors wrapped is a

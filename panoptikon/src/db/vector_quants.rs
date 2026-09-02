@@ -248,9 +248,7 @@ pub(crate) struct EmbeddingSetter {
     pub dim: Option<i64>,
 }
 
-pub(crate) async fn load_profiles(
-    conn: &mut sqlx::SqliteConnection,
-) -> ApiResult<Vec<ProfileRow>> {
+pub(crate) async fn load_profiles(conn: &mut sqlx::SqliteConnection) -> ApiResult<Vec<ProfileRow>> {
     let rows = sqlx::query(
         "SELECT id, name, quantizer, options, state, is_default \
          FROM vector_quant_profiles ORDER BY id",
@@ -428,20 +426,17 @@ pub(crate) async fn full_vector_count(
     setter_id: i64,
 ) -> ApiResult<i64> {
     let row = sqlx::query(FULL_VECTOR_COUNT_SQL)
-    .bind(setter_id)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to count vectors");
-        ApiError::internal("Failed to count vectors")
-    })?;
+        .bind(setter_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to count vectors");
+            ApiError::internal("Failed to count vectors")
+        })?;
     row.try_get("n").map_err(read_err)
 }
 
-async fn profile_has_quants(
-    conn: &mut sqlx::SqliteConnection,
-    profile_id: i64,
-) -> ApiResult<bool> {
+async fn profile_has_quants(conn: &mut sqlx::SqliteConnection, profile_id: i64) -> ApiResult<bool> {
     let row = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM embedding_quants WHERE profile_id = ?) AS present",
     )
@@ -612,7 +607,8 @@ pub(crate) fn plan_metadata(snapshot: &StateSnapshot) -> Vec<MetaOp> {
                 needs_artifact: desired.needs_artifact(),
             }),
             Some(row) => {
-                if row.quantizer != desired.quantizer || row.options.as_deref() != Some(options.as_str())
+                if row.quantizer != desired.quantizer
+                    || row.options.as_deref() != Some(options.as_str())
                 {
                     ops.push(MetaOp::UpdateRecipe {
                         name: desired.name.clone(),
@@ -629,7 +625,11 @@ pub(crate) fn plan_metadata(snapshot: &StateSnapshot) -> Vec<MetaOp> {
         if desired_names.contains(row.name.as_str()) {
             continue;
         }
-        let has_quants = snapshot.profile_has_quants.get(&row.id).copied().unwrap_or(false);
+        let has_quants = snapshot
+            .profile_has_quants
+            .get(&row.id)
+            .copied()
+            .unwrap_or(false);
         if !has_quants {
             ops.push(MetaOp::DropEmptyProfile {
                 name: row.name.clone(),
@@ -754,7 +754,11 @@ pub(crate) fn plan_data(snapshot: &StateSnapshot) -> DataPlan {
         let undesired = !desired_names.contains(row.name.as_str());
         let removing = row.state == "removing";
         if (undesired || removing)
-            && snapshot.profile_has_quants.get(&row.id).copied().unwrap_or(false)
+            && snapshot
+                .profile_has_quants
+                .get(&row.id)
+                .copied()
+                .unwrap_or(false)
         {
             plan.removals.push(row.id);
         }
@@ -804,7 +808,13 @@ pub(crate) fn plan_data(snapshot: &StateSnapshot) -> DataPlan {
             }
             let total: i64 = members
                 .iter()
-                .map(|setter| snapshot.bounded_counts.get(&setter.id).copied().unwrap_or(0))
+                .map(|setter| {
+                    snapshot
+                        .bounded_counts
+                        .get(&setter.id)
+                        .copied()
+                        .unwrap_or(0)
+                })
                 .sum();
             let gate = if desired.needs_artifact() {
                 total >= ARTIFACT_MIN_VECTORS
@@ -1352,15 +1362,14 @@ pub(crate) async fn write_inline_quants(
         tracing::error!(error = %err, data_id, "failed to write inline embedding quants");
         ApiError::internal("Failed to write embedding quants")
     };
-    let embedding: Option<Vec<u8>> =
-        sqlx::query("SELECT embedding FROM embeddings WHERE id = ?")
-            .bind(data_id)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(inline_err)?
-            .map(|row| row.try_get("embedding"))
-            .transpose()
-            .map_err(read_err)?;
+    let embedding: Option<Vec<u8>> = sqlx::query("SELECT embedding FROM embeddings WHERE id = ?")
+        .bind(data_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(inline_err)?
+        .map(|row| row.try_get("embedding"))
+        .transpose()
+        .map_err(read_err)?;
     if let Some(embedding) = embedding {
         let pairs = sqlx::query(
             "SELECT c.profile_id AS profile_id, c.artifact_rev AS artifact_rev, \
@@ -1490,7 +1499,9 @@ pub(crate) fn quantize_int8(embedding: &[u8], scale: f32) -> Vec<u8> {
     let mut out = Vec::with_capacity(embedding.len() / 4);
     for chunk in embedding.chunks_exact(4) {
         let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let code = (value / scale).round_ties_even().clamp(-128.0, INT8_MAX_CODE) as i8;
+        let code = (value / scale)
+            .round_ties_even()
+            .clamp(-128.0, INT8_MAX_CODE) as i8;
         out.push(code as u8);
     }
     out
@@ -1761,15 +1772,15 @@ async fn quantized_count(
     rev: i64,
 ) -> ApiResult<i64> {
     let row = sqlx::query(QUANTIZED_COUNT_SQL)
-    .bind(setter_id)
-    .bind(profile_id)
-    .bind(rev)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to count embedding quants");
-        ApiError::internal("Failed to count embedding quants")
-    })?;
+        .bind(setter_id)
+        .bind(profile_id)
+        .bind(rev)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to count embedding quants");
+            ApiError::internal("Failed to count embedding quants")
+        })?;
     row.try_get("n").map_err(read_err)
 }
 
@@ -1797,16 +1808,15 @@ pub(crate) async fn resolve_ready_pair(
     profile_name: &str,
     setter_names: &[String],
 ) -> ApiResult<Option<ReadyPair>> {
-    let profile = sqlx::query(
-        "SELECT id FROM vector_quant_profiles WHERE name = ? AND state = 'active'",
-    )
-    .bind(profile_name)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to resolve vector quant profile");
-        ApiError::internal("Failed to resolve vector quant profile")
-    })?;
+    let profile =
+        sqlx::query("SELECT id FROM vector_quant_profiles WHERE name = ? AND state = 'active'")
+            .bind(profile_name)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to resolve vector quant profile");
+                ApiError::internal("Failed to resolve vector quant profile")
+            })?;
     let Some(profile) = profile else {
         return Ok(None);
     };
@@ -1873,16 +1883,15 @@ pub(crate) async fn active_profile_id(
     conn: &mut sqlx::SqliteConnection,
     name: &str,
 ) -> ApiResult<Option<i64>> {
-    let row = sqlx::query(
-        "SELECT id FROM vector_quant_profiles WHERE name = ? AND state = 'active'",
-    )
-    .bind(name)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to look up vector quant profile");
-        ApiError::internal("Failed to look up vector quant profile")
-    })?;
+    let row =
+        sqlx::query("SELECT id FROM vector_quant_profiles WHERE name = ? AND state = 'active'")
+            .bind(name)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to look up vector quant profile");
+                ApiError::internal("Failed to look up vector quant profile")
+            })?;
     match row {
         Some(row) => Ok(Some(row.try_get("id").map_err(read_err)?)),
         None => Ok(None),
@@ -1899,10 +1908,7 @@ pub(crate) async fn space_setter_ids(
     let setters = load_embedding_setters(conn).await?;
     let spaces = group_spaces(&setters);
     for space in spaces {
-        if space
-            .iter()
-            .any(|&idx| setters[idx].name == setter_name)
-        {
+        if space.iter().any(|&idx| setters[idx].name == setter_name) {
             return Ok(space.iter().map(|&idx| setters[idx].id).collect());
         }
     }
@@ -2085,9 +2091,15 @@ mod tests {
         let artifact = compute_int8_scale_artifact(conn, &build.setter_ids, build.dim)
             .await
             .expect("scale artifact");
-        start_space_build(conn, profile_id, &build.setter_ids, artifact.as_deref(), build.dim)
-            .await
-            .expect("start build");
+        start_space_build(
+            conn,
+            profile_id,
+            &build.setter_ids,
+            artifact.as_deref(),
+            build.dim,
+        )
+        .await
+        .expect("start build");
         for setter_id in &build.setter_ids {
             let mut after_id = 0;
             loop {
@@ -2144,8 +2156,14 @@ mod tests {
         let snapshot = load_snapshot(conn, desired(vec!["default"], Some("default")))
             .await
             .expect("snapshot");
-        assert!(plan_metadata(&snapshot).is_empty(), "metadata should be in sync");
-        assert!(plan_data(&snapshot).is_empty(), "below threshold: no data work");
+        assert!(
+            plan_metadata(&snapshot).is_empty(),
+            "metadata should be in sync"
+        );
+        assert!(
+            plan_data(&snapshot).is_empty(),
+            "below threshold: no data work"
+        );
         let work = analyze(conn, desired(vec!["default"], Some("default")))
             .await
             .expect("analyze");
@@ -2201,8 +2219,15 @@ mod tests {
         // The largest magnitude in the space is the last vector's 10.0.
         for idx in 0..ARTIFACT_MIN_VECTORS {
             let offset = (idx % 10) as f32;
-            seed_embedding(conn, item, setter, "clip", idx, &vec8(1.0 + offset, -2.0 - offset))
-                .await;
+            seed_embedding(
+                conn,
+                item,
+                setter,
+                "clip",
+                idx,
+                &vec8(1.0 + offset, -2.0 - offset),
+            )
+            .await;
         }
 
         let state = desired(vec!["default"], Some("default"));
@@ -2280,20 +2305,19 @@ mod tests {
         // scan, and `ORDER BY d.id` must be satisfied by that same scan.
         // A temp b-tree here would sort the whole remaining candidate set
         // per chunk — the exact quadratic this cursor exists to remove.
-        let plan: Vec<String> =
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "EXPLAIN QUERY PLAN {BACKFILL_CHUNK_SQL}"
-            )))
-                .bind(profile_id)
-                .bind(setter)
-                .bind(0_i64)
-                .bind(4_i64)
-                .fetch_all(&mut *conn)
-                .await
-                .expect("plan")
-                .iter()
-                .map(|row| row.get::<String, _>("detail"))
-                .collect();
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {BACKFILL_CHUNK_SQL}"
+        )))
+        .bind(profile_id)
+        .bind(setter)
+        .bind(0_i64)
+        .bind(4_i64)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("plan")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
         assert!(
             !plan.iter().any(|step| step.contains("TEMP B-TREE")),
             "backfill chunk must not sort: {plan:?}"
@@ -2305,7 +2329,9 @@ mod tests {
         );
 
         // One chunk of 4, then "crash".
-        let (written, _) = backfill_chunk(conn, profile_id, setter, 4, 0).await.expect("chunk");
+        let (written, _) = backfill_chunk(conn, profile_id, setter, 4, 0)
+            .await
+            .expect("chunk");
         assert_eq!(written, 4);
         assert_eq!(quant_rows(conn).await, 4);
 
@@ -2316,8 +2342,15 @@ mod tests {
         // on every interruption).
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let plan = plan_data(&snapshot);
-        assert_eq!(plan.builds.len(), 1, "building pair must remain in the plan");
-        assert!(plan.builds[0].resume, "an in-flight build must resume, not restart");
+        assert_eq!(
+            plan.builds.len(),
+            1,
+            "building pair must remain in the plan"
+        );
+        assert!(
+            plan.builds[0].resume,
+            "an in-flight build must resume, not restart"
+        );
         let work = analyze(conn, state.clone()).await.expect("analyze");
         assert_eq!(work, ReconcileWork::DataWork);
 
@@ -2338,7 +2371,10 @@ mod tests {
             .expect("finish");
         assert_eq!(quant_rows(conn).await, ARTIFACT_MIN_VECTORS);
         let coverage = load_coverage(conn).await.expect("coverage");
-        assert_eq!(coverage[0].artifact_rev, 1, "resume must not bump the revision");
+        assert_eq!(
+            coverage[0].artifact_rev, 1,
+            "resume must not bump the revision"
+        );
         assert_eq!(coverage[0].state, "ready");
         let work = analyze(conn, state).await.expect("analyze");
         assert_eq!(work, ReconcileWork::None);
@@ -2367,9 +2403,15 @@ mod tests {
         let artifact = compute_int8_scale_artifact(conn, &build.setter_ids, build.dim)
             .await
             .expect("artifact");
-        start_space_build(conn, profile_id, &build.setter_ids, artifact.as_deref(), build.dim)
-            .await
-            .expect("start");
+        start_space_build(
+            conn,
+            profile_id,
+            &build.setter_ids,
+            artifact.as_deref(),
+            build.dim,
+        )
+        .await
+        .expect("start");
         let (written, after_id) = backfill_chunk(conn, profile_id, setter, 10, 0)
             .await
             .expect("first chunk");
@@ -2387,7 +2429,9 @@ mod tests {
             .expect("post-rebuild chunk");
         assert_eq!(written, 0, "no rows may be written to a non-building pair");
         assert!(
-            finish_space_build(conn, profile_id, &[setter]).await.is_err(),
+            finish_space_build(conn, profile_id, &[setter])
+                .await
+                .is_err(),
             "finish must refuse a pair that left 'building'"
         );
         let coverage = load_coverage(conn).await.expect("coverage");
@@ -2404,7 +2448,10 @@ mod tests {
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let plan = plan_data(&snapshot);
         assert_eq!(plan.builds.len(), 1);
-        assert!(!plan.builds[0].resume, "a cleared artifact forces a fresh build");
+        assert!(
+            !plan.builds[0].resume,
+            "a cleared artifact forces a fresh build"
+        );
         run_build(conn, &plan.builds[0], profile_id).await;
         let coverage = load_coverage(conn).await.expect("coverage");
         assert_eq!(coverage[0].state, "ready");
@@ -2605,7 +2652,11 @@ mod tests {
         }
         pad_to_threshold(conn, item, setter, "clip", 8).await;
         // Same setter, twice the dimension: the odd one out.
-        let wide: Vec<f32> = vec8(1.0, -1.0).iter().chain(vec8(2.0, -2.0).iter()).copied().collect();
+        let wide: Vec<f32> = vec8(1.0, -1.0)
+            .iter()
+            .chain(vec8(2.0, -2.0).iter())
+            .copied()
+            .collect();
         seed_embedding(conn, item, setter, "clip", 8, &wide).await;
 
         let state = desired(vec!["plain"], Some("plain"));
@@ -2642,7 +2693,10 @@ mod tests {
             "the mismatch must be named, not reported as a generic shortfall: {err:?}"
         );
         let coverage = load_coverage(conn).await.expect("coverage");
-        assert_eq!(coverage[0].state, "building", "a refused finish must not flip");
+        assert_eq!(
+            coverage[0].state, "building",
+            "a refused finish must not flip"
+        );
     }
 
     // The inline hook writes quants (same rev, same transform) for building
@@ -2677,13 +2731,16 @@ mod tests {
         // under the same frozen scale the backfill used.
         let vector = vec8(-1.0, 1.0);
         let data_id = seed_embedding(conn, item, setter, "clip", 99, &vector).await;
-        write_inline_quants(conn, data_id).await.expect("inline quants");
-        let row = sqlx::query("SELECT rev, quant FROM embedding_quants WHERE id = ? AND profile_id = ?")
-            .bind(data_id)
-            .bind(profile_id)
-            .fetch_one(&mut *conn)
+        write_inline_quants(conn, data_id)
             .await
-            .expect("inline quant row");
+            .expect("inline quants");
+        let row =
+            sqlx::query("SELECT rev, quant FROM embedding_quants WHERE id = ? AND profile_id = ?")
+                .bind(data_id)
+                .bind(profile_id)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("inline quant row");
         assert_eq!(row.try_get::<i64, _>("rev").expect("rev"), 1);
         assert_eq!(
             row.try_get::<Vec<u8>, _>("quant").expect("quant"),
@@ -2707,7 +2764,11 @@ mod tests {
         sync_metadata(conn, state).await.expect("sync");
         let data_id = seed_embedding(conn, item, setter, "clip", 1, &vec8(3.0, 4.0)).await;
         write_inline_quants(conn, data_id).await.expect("inline");
-        assert_eq!(quant_rows(conn).await, 0, "pending pair must get no inline quants");
+        assert_eq!(
+            quant_rows(conn).await,
+            0,
+            "pending pair must get no inline quants"
+        );
     }
 
     // Removing a profile from the TOML: chunked deletes, then the row drops
@@ -2725,8 +2786,12 @@ mod tests {
         }
         pad_to_threshold(conn, item, setter, "clip", 6).await;
         let with_profile = desired(vec!["plain"], Some("plain"));
-        sync_metadata(conn, with_profile.clone()).await.expect("sync");
-        let snapshot = load_snapshot(conn, with_profile.clone()).await.expect("snapshot");
+        sync_metadata(conn, with_profile.clone())
+            .await
+            .expect("sync");
+        let snapshot = load_snapshot(conn, with_profile.clone())
+            .await
+            .expect("snapshot");
         let profile_id = profile_id_by_name(conn, "plain").await;
         run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
         assert_eq!(quant_rows(conn).await, ARTIFACT_MIN_VECTORS);
@@ -2736,11 +2801,17 @@ mod tests {
             profiles: Vec::new(),
             default_name: None,
         };
-        sync_metadata(conn, empty.clone()).await.expect("sync removal");
+        sync_metadata(conn, empty.clone())
+            .await
+            .expect("sync removal");
         let snapshot = load_snapshot(conn, empty.clone()).await.expect("snapshot");
         let plan = plan_data(&snapshot);
         assert_eq!(plan.removals, vec![profile_id]);
-        while delete_quants_chunk(conn, profile_id, 4).await.expect("delete chunk") > 0 {}
+        while delete_quants_chunk(conn, profile_id, 4)
+            .await
+            .expect("delete chunk")
+            > 0
+        {}
         drop_profile(conn, profile_id).await.expect("drop profile");
         assert_eq!(quant_rows(conn).await, 0);
         assert!(load_profiles(conn).await.expect("profiles").is_empty());
@@ -2762,8 +2833,15 @@ mod tests {
         let text_setter = seed_setter(conn, "tclip/ViT-B-32").await;
         for idx in 0..ARTIFACT_MIN_VECTORS / 2 {
             let offset = (idx % 7) as f32;
-            seed_embedding(conn, item, image_setter, "clip", idx, &vec8(1.0 + offset, -3.0))
-                .await;
+            seed_embedding(
+                conn,
+                item,
+                image_setter,
+                "clip",
+                idx,
+                &vec8(1.0 + offset, -3.0),
+            )
+            .await;
             seed_embedding(
                 conn,
                 item,
@@ -2791,7 +2869,10 @@ mod tests {
         let coverage = load_coverage(conn).await.expect("coverage");
         assert_eq!(coverage.len(), 2);
         assert!(coverage.iter().all(|row| row.state == "ready"));
-        assert_eq!(coverage[0].artifact, coverage[1].artifact, "shared union artifact");
+        assert_eq!(
+            coverage[0].artifact, coverage[1].artifact,
+            "shared union artifact"
+        );
 
         let pair = resolve_ready_pair(
             conn,
@@ -2994,7 +3075,10 @@ mod tests {
                 centered: true,
             }],
         };
-        assert!(normalize_retired(&mut committed), "the save rewrites binary");
+        assert!(
+            normalize_retired(&mut committed),
+            "the save rewrites binary"
+        );
         assert_eq!(committed.profiles[0].quantizer, "int8");
         assert!(!committed.profiles[0].centered);
 
@@ -3024,14 +3108,19 @@ mod tests {
         let coverage = load_coverage(conn).await.expect("coverage");
         assert_eq!(coverage[0].state, "ready");
         assert_eq!(coverage[0].artifact_rev, 5, "the revision bumped once");
-        assert_eq!(quant_rows(conn).await, ARTIFACT_MIN_VECTORS, "every vector covered");
-        let sizes: Vec<i64> = sqlx::query("SELECT DISTINCT length(quant) AS n FROM embedding_quants")
-            .fetch_all(&mut *conn)
-            .await
-            .expect("quant sizes")
-            .iter()
-            .map(|row| row.get::<i64, _>("n"))
-            .collect();
+        assert_eq!(
+            quant_rows(conn).await,
+            ARTIFACT_MIN_VECTORS,
+            "every vector covered"
+        );
+        let sizes: Vec<i64> =
+            sqlx::query("SELECT DISTINCT length(quant) AS n FROM embedding_quants")
+                .fetch_all(&mut *conn)
+                .await
+                .expect("quant sizes")
+                .iter()
+                .map(|row| row.get::<i64, _>("n"))
+                .collect();
         assert_eq!(sizes, vec![8], "every row carries 8 int8 codes now");
         let pair = resolve_ready_pair(conn, "default", &["clip/model".to_string()])
             .await
@@ -3062,16 +3151,15 @@ mod tests {
         sync_metadata(conn, state.clone()).await.expect("sync");
 
         for blank in ["", "   "] {
-            let mut filter: crate::pql::model::SemanticImageSearch = serde_json::from_value(
-                serde_json::json!({
+            let mut filter: crate::pql::model::SemanticImageSearch =
+                serde_json::from_value(serde_json::json!({
                     "image_embeddings": {
                         "query": "q",
                         "model": "clip/model",
                         "variant": blank,
                     }
-                }),
-            )
-            .expect("filter json");
+                }))
+                .expect("filter json");
             filter.image_embeddings._embedding = Some(le_bytes(&vec8(1.0, 1.0)));
             filter.image_embeddings._distance_func_override =
                 Some(crate::pql::model::DistanceFunction::Cosine);
@@ -3090,16 +3178,15 @@ mod tests {
 
         // A real profile name that cannot be resolved synchronously still
         // errors — the fallback the design forbids stays forbidden.
-        let mut filter: crate::pql::model::SemanticImageSearch = serde_json::from_value(
-            serde_json::json!({
+        let mut filter: crate::pql::model::SemanticImageSearch =
+            serde_json::from_value(serde_json::json!({
                 "image_embeddings": {
                     "query": "q",
                     "model": "clip/model",
                     "variant": "plain",
                 }
-            }),
-        )
-        .expect("filter json");
+            }))
+            .expect("filter json");
         filter.image_embeddings._embedding = Some(le_bytes(&vec8(1.0, 1.0)));
         filter.image_embeddings._distance_func_override =
             Some(crate::pql::model::DistanceFunction::Cosine);
@@ -3117,8 +3204,14 @@ mod tests {
     #[test]
     fn resolve_desired_validates() {
         assert!(resolve_desired(&config(vec!["a"], Some("a"))).is_ok());
-        assert!(resolve_desired(&config(vec!["a"], None)).is_err(), "default required");
-        assert!(resolve_desired(&config(vec!["a"], Some("b"))).is_err(), "default must exist");
+        assert!(
+            resolve_desired(&config(vec!["a"], None)).is_err(),
+            "default required"
+        );
+        assert!(
+            resolve_desired(&config(vec!["a"], Some("b"))).is_err(),
+            "default must exist"
+        );
         assert!(
             resolve_desired(&config(vec!["a", "a"], Some("a"))).is_err(),
             "duplicate names"
@@ -3326,8 +3419,7 @@ mod tests {
         ensure_vec_extension_loaded();
         let mut dbs = setup_test_databases().await;
         let conn = &mut dbs.index_conn;
-        let (_setter, profile_id, query_vec, query_quant) =
-            seed_disagreeing_space(conn, "i").await;
+        let (_setter, profile_id, query_vec, query_quant) = seed_disagreeing_space(conn, "i").await;
         let total = disagreeing_vectors().len();
 
         let make_query = |element| crate::pql::model::PqlQuery {
@@ -3350,7 +3442,12 @@ mod tests {
         });
         let quant_order = run_query_order(
             conn,
-            make_query(image_filter("clip/model", query_vec.clone(), quant.clone(), None)),
+            make_query(image_filter(
+                "clip/model",
+                query_vec.clone(),
+                quant.clone(),
+                None,
+            )),
         )
         .await;
         assert_eq!(
@@ -3359,7 +3456,12 @@ mod tests {
         );
         let repeat = run_query_order(
             conn,
-            make_query(image_filter("clip/model", query_vec.clone(), quant.clone(), None)),
+            make_query(image_filter(
+                "clip/model",
+                query_vec.clone(),
+                quant.clone(),
+                None,
+            )),
         )
         .await;
         assert_eq!(quant_order, repeat, "ordering is deterministic");
@@ -3388,8 +3490,7 @@ mod tests {
         ensure_vec_extension_loaded();
         let mut dbs = setup_test_databases().await;
         let conn = &mut dbs.index_conn;
-        let (_setter, profile_id, query_vec, query_quant) =
-            seed_disagreeing_space(conn, "p").await;
+        let (_setter, profile_id, query_vec, query_quant) = seed_disagreeing_space(conn, "p").await;
         let quant = crate::pql::model::QuantResolved {
             profile_id,
             query_quant: Some(query_quant),
@@ -3411,7 +3512,10 @@ mod tests {
         for page in 1..=3 {
             walked.extend(run_query_order(conn, make_query(page, 4)).await);
         }
-        assert_eq!(full, walked, "page walk must equal the single-shot ordering");
+        assert_eq!(
+            full, walked,
+            "page walk must equal the single-shot ordering"
+        );
     }
 
     // New-setter flow: a setter appearing after the profile is ready gets
@@ -3475,8 +3579,15 @@ mod tests {
         let image_setter = seed_setter(conn, "clip/M").await;
         for idx in 0..ARTIFACT_MIN_VECTORS {
             let offset = (idx % 5) as f32;
-            seed_embedding(conn, item, image_setter, "clip", idx, &vec8(2.0 + offset, -1.0))
-                .await;
+            seed_embedding(
+                conn,
+                item,
+                image_setter,
+                "clip",
+                idx,
+                &vec8(2.0 + offset, -1.0),
+            )
+            .await;
         }
         let state = desired(vec!["default"], Some("default"));
         sync_metadata(conn, state.clone()).await.expect("sync");
@@ -3551,13 +3662,12 @@ mod tests {
         run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
 
         let make_filter = |quant: Option<crate::pql::model::QuantResolved>| {
-            let mut filter: crate::pql::model::SimilarTo = serde_json::from_value(
-                serde_json::json!({ "similar_to": {
+            let mut filter: crate::pql::model::SimilarTo =
+                serde_json::from_value(serde_json::json!({ "similar_to": {
                     "target": "s00", "model": "clip/model",
                     "force_distance_function": true
-                } }),
-            )
-            .expect("similar_to json");
+                } }))
+                .expect("similar_to json");
             filter.similar_to._quant = quant;
             crate::pql::model::QueryElement::SimilarTo(filter)
         };
@@ -3637,9 +3747,15 @@ mod tests {
 
         let codes = |values: &[i8]| -> Vec<u8> { values.iter().map(|v| *v as u8).collect() };
         let cases: [(Vec<i8>, Vec<i8>); 3] = [
-            (vec![127, -128, 0, 3, -3, 64, -64, 1], vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            (
+                vec![127, -128, 0, 3, -3, 64, -64, 1],
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ),
             (vec![1, 1, 1, 1, 1, 1, 1, 1], vec![1, 1, 1, 1, 1, 1, 1, 1]),
-            (vec![-5, 20, -33, 44, 0, 12, -7, 100], vec![100, -7, 12, 0, 44, -33, 20, -5]),
+            (
+                vec![-5, 20, -33, 44, 0, 12, -7, 100],
+                vec![100, -7, 12, 0, 44, -33, 20, -5],
+            ),
         ];
         for (left, right) in cases {
             let row = sqlx::query(

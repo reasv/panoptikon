@@ -11,9 +11,7 @@ use std::time::UNIX_EPOCH;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::api::db_params::DbQueryParams;
-use crate::api::http_file::{
-    FILE_IO_TIMEOUT, ServeBody, ServeSpec, open_file_with_timeout, serve,
-};
+use crate::api::http_file::{FILE_IO_TIMEOUT, ServeBody, ServeSpec, open_file_with_timeout, serve};
 use crate::api::utils::{iso_to_system_time, serve_outro_metadata};
 use crate::api_error::ApiError;
 use crate::db::items::{
@@ -1837,11 +1835,8 @@ mod tests {
             } = dbs;
             // Held so the shared-cache in-memory databases outlive the call.
             let _attached = (storage_conn, user_data_conn);
-            let db = DbConnection::<ReadOnlyNoUserData>::for_tests(
-                index_conn,
-                index_db,
-                user_data_db,
-            );
+            let db =
+                DbConnection::<ReadOnlyNoUserData>::for_tests(index_conn, index_db, user_data_db);
             item_meta(
                 db,
                 Query(ItemQuery {
@@ -2562,34 +2557,33 @@ VALUES (?1, 0, 'image/jpeg', 'image/jpeg', 2560, 284, 1, X'')
         .await
         .unwrap();
 
-        let cache = async |conn: &mut sqlx::SqliteConnection,
-                           item: &ItemRecord,
-                           size: ThumbnailTier| {
-            let response = thumbnail_response(
-                conn,
-                item,
-                std::slice::from_ref(&file),
-                true,
-                size,
-                false,
-                &HeaderMap::new(),
-                true,
-            )
-            .await
-            .expect("thumbnail response");
-            assert_eq!(
-                response.headers().get(header::CONTENT_TYPE).unwrap(),
-                "image/jpeg",
-                "every one of these is the original file"
-            );
-            response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string()
-        };
+        let cache =
+            async |conn: &mut sqlx::SqliteConnection, item: &ItemRecord, size: ThumbnailTier| {
+                let response = thumbnail_response(
+                    conn,
+                    item,
+                    std::slice::from_ref(&file),
+                    true,
+                    size,
+                    false,
+                    &HeaderMap::new(),
+                    true,
+                )
+                .await
+                .expect("thumbnail response");
+                assert_eq!(
+                    response.headers().get(header::CONTENT_TYPE).unwrap(),
+                    "image/jpeg",
+                    "every one of these is the original file"
+                );
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            };
 
         assert_eq!(
             cache(&mut index_conn, &item, ThumbnailTier::Display).await,
@@ -2704,7 +2698,13 @@ VALUES (?1, 0, 'image/jpeg', 'image/jpeg', 2560, 284, 1, X'')
 
         // The scan writes the animated set: two posters and one loop.
         for (tier, media, width, height, bytes) in [
-            ("grid-m", "image/jpeg", 1024_i64, 1024_i64, b"poster-m".to_vec()),
+            (
+                "grid-m",
+                "image/jpeg",
+                1024_i64,
+                1024_i64,
+                b"poster-m".to_vec(),
+            ),
             ("grid-s", "image/jpeg", 512, 512, b"poster-s".to_vec()),
             ("loop", "video/mp4", 1024, 1024, b"mp4-bytes".to_vec()),
         ] {
@@ -2756,7 +2756,10 @@ VALUES (?1, 0, ?2, 'image/gif', ?3, ?4, ?5, 1, ?6)
             .unwrap();
         let (_, restamped_loop, _) =
             serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, false).await;
-        assert_eq!(restamped_loop, format!("\"{}-thumb0-loop-v2\"", item.sha256));
+        assert_eq!(
+            restamped_loop,
+            format!("\"{}-thumb0-loop-v2\"", item.sha256)
+        );
         let (_, restamped_poster, _) =
             serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, true).await;
         assert_eq!(
@@ -2871,7 +2874,10 @@ VALUES (?1, 0, ?2, 'image/gif', ?3, ?4, ?5, 1, ?6)
                 CACHE_IMMUTABLE,
                 "{size:?} still={still}"
             );
-            assert_eq!(response.headers().get(header::CONTENT_TYPE).unwrap(), "image/gif");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "image/gif"
+            );
         }
 
         // One pixel over the floor and the same URL is pending, not final.

@@ -75,10 +75,10 @@ use crate::{
     db::{
         file_scans::{FileScanUpdate, get_completed_scan_paths, get_open_file_scan_id},
         files::{
-            FileScanData, FileUpsertResult, ItemScanMeta, PendingOutroItem,
-            get_file_by_path, get_item_content_end_ms, get_item_id, get_item_visual_facts,
-            get_item_visual_meta, get_pending_outro_item, has_blurhash, item_animation_pending,
-            item_codec_pending, item_rotation_pending, item_transparency_pending,
+            FileScanData, FileUpsertResult, ItemScanMeta, PendingOutroItem, get_file_by_path,
+            get_item_content_end_ms, get_item_id, get_item_visual_facts, get_item_visual_meta,
+            get_pending_outro_item, has_blurhash, item_animation_pending, item_codec_pending,
+            item_rotation_pending, item_transparency_pending,
         },
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
@@ -102,13 +102,13 @@ use crate::{
     },
     jobs::queue::ChangeSummary,
     jobs::timing::PhaseTimer,
+    media_tools::animated_loop::LoopError,
     media_tools::outro::{
         OUTRO_DETECTOR_VERSION, OutroProbeError, OutroVerdict, RejectReason, detect_outro,
     },
+    media_tools::transcode::compose::Transform,
     pql::builder::filters::evaluate_match,
     pql::model::{Match, MatchValue},
-    media_tools::animated_loop::LoopError,
-    media_tools::transcode::compose::Transform,
     visual_tiers::{
         DisplayPlan, FormatPolicy, GENERATED_STILL_FORMAT, LOOP_MEDIA_TYPE, RenditionFormat,
         RenditionKind, RenditionRung, ThumbnailTier, TierPlan, UNDECODABLE_HAS_TRANSPARENCY,
@@ -581,7 +581,11 @@ async fn vacuum_is_worthwhile(index_db: &str) -> bool {
         }
     };
     for (schema, free_sql, pages_sql) in [
-        ("main", "PRAGMA main.freelist_count", "PRAGMA main.page_count"),
+        (
+            "main",
+            "PRAGMA main.freelist_count",
+            "PRAGMA main.page_count",
+        ),
         (
             "storage",
             "PRAGMA storage.freelist_count",
@@ -902,7 +906,6 @@ pub(crate) const FRAME_PROCESS_VERSION: i64 = 1;
 /// dispatcher's geometry comparison already catches it
 /// ([`tier_geometry_matches`]).
 pub(crate) const TIER_PROCESS_VERSION: i64 = 2;
-
 
 /// The H.264 loop generator's version, stamped on the `loop`/`loop-display`
 /// rows and on nothing else.
@@ -2344,14 +2347,13 @@ impl ScanContext {
         // write at all.
         if backfill.drop_thumbnails && already_stored {
             wrote_visuals = true;
-            if let Err(err) =
-                call_index_db_writer(&self.index_db, |reply| {
-                    IndexDbWriterMessage::DeleteThumbnails {
-                        sha256: backfill.sha256.clone(),
-                        reply,
-                    }
-                })
-                .await
+            if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+                IndexDbWriterMessage::DeleteThumbnails {
+                    sha256: backfill.sha256.clone(),
+                    reply,
+                }
+            })
+            .await
             {
                 tracing::error!(error = ?err, "failed to drop stale thumbnails");
             }
@@ -2555,10 +2557,7 @@ impl ScanContext {
             // untouched: it decodes stored q85 JPEGs, not the file the marker
             // has a verdict about, and `Retire` is a delete that needs no
             // source at all.
-            if matches!(
-                tier_work,
-                Some(TierWork::Image { .. } | TierWork::Animated)
-            ) {
+            if matches!(tier_work, Some(TierWork::Image { .. } | TierWork::Animated)) {
                 tier_work = None;
             }
             // The transparency question goes with it, and it goes *answered*.
@@ -2831,8 +2830,7 @@ impl ScanContext {
         // extraction stores frames of its own, so an item can have those and
         // no thumbnail. A marker-suppressed item is left alone whatever the
         // probe finds; the verdict that settled its decode still stands.
-        let outro_replaces_visuals =
-            !thumb_suppressed && (thumbnail_stored || work.frames_stored);
+        let outro_replaces_visuals = !thumb_suppressed && (thumbnail_stored || work.frames_stored);
         if let Some(outro) = &mut work.outro {
             outro.replaces_visuals = outro_replaces_visuals;
         }
@@ -5884,7 +5882,9 @@ fn extract_video_frames_into(
         // ffmpeg did its own file I/O, so a broken file and a transient mount
         // hiccup exit identically: this needs a second failure in a later scan
         // before it suppresses anything.
-        return Err(visuals_input_unconfirmed(format!("ffmpeg failed: {detail}")));
+        return Err(visuals_input_unconfirmed(format!(
+            "ffmpeg failed: {detail}"
+        )));
     }
 
     let mut frames = Vec::new();
@@ -6081,15 +6081,20 @@ pub(crate) const CODEC_UNKNOWN: &str = "unknown";
 /// would claim the file was examined *as a video*, and the backfill's
 /// termination predicate is that column.
 fn media_codecs(info: &MediaInfo, mime_type: &str) -> (Option<String>, Option<String>) {
-    let audio_codec = info
-        .audio_tracks
-        .first()
-        .map(|track| track.codec_name.clone().unwrap_or(CODEC_UNKNOWN.to_string()));
+    let audio_codec = info.audio_tracks.first().map(|track| {
+        track
+            .codec_name
+            .clone()
+            .unwrap_or(CODEC_UNKNOWN.to_string())
+    });
     if !mime_type.starts_with("video") {
         return (None, audio_codec);
     }
     let video_codec = match &info.video_track {
-        Some(video) => video.codec_name.clone().unwrap_or(CODEC_UNKNOWN.to_string()),
+        Some(video) => video
+            .codec_name
+            .clone()
+            .unwrap_or(CODEC_UNKNOWN.to_string()),
         None => CODEC_NONE.to_string(),
     };
     (Some(video_codec), audio_codec)
@@ -6620,7 +6625,10 @@ pub(crate) fn jpeg_with_exif_orientation(
         *pixel = image::Rgb([(x * 7 % 251) as u8, (y * 13 % 241) as u8, 32]);
     }
     image::DynamicImage::ImageRgb8(pixels)
-        .write_to(&mut std::io::Cursor::new(&mut base), image::ImageFormat::Jpeg)
+        .write_to(
+            &mut std::io::Cursor::new(&mut base),
+            image::ImageFormat::Jpeg,
+        )
         .expect("the fixture encodes");
 
     let mut tiff = Vec::new();
@@ -7574,8 +7582,9 @@ LIMIT 1
 
         // What the old rule left behind, planted by hand: a long-side-fitted
         // rendition of a strip.
-        let stale = encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(163, 4096)))
-            .expect("a 163x4096 image encodes");
+        let stale =
+            encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(163, 4096)))
+                .expect("a 163x4096 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
             IndexDbWriterMessage::StoreThumbnails {
                 sha256: sha256.clone(),
@@ -7615,7 +7624,6 @@ LIMIT 1
         let mut conn = env.read().await;
         assert_eq!(tier_ids(&mut conn).await, ids);
     }
-
 
     /// The library-wide upgrade this release costs, in **one pass per image**.
     ///
@@ -7708,7 +7716,9 @@ LIMIT 1
     async fn transparency_is_measured_once_and_only_rewrites_on_a_changed_verdict() {
         let test_env = test_data_dir();
         let env = visuals_env(test_env.path(), &["media-transparency"]).await;
-        alpha_logo(1400).save(env.media_dirs[0].join("logo.png")).unwrap();
+        alpha_logo(1400)
+            .save(env.media_dirs[0].join("logo.png"))
+            .unwrap();
         env.scan().await;
 
         {
@@ -7806,7 +7816,9 @@ LIMIT 1
     async fn a_policy_flip_regenerates_only_the_rows_it_moves() {
         let test_env = test_data_dir();
         let mut env = visuals_env(test_env.path(), &["media-policy"]).await;
-        alpha_logo(1400).save(env.media_dirs[0].join("logo.png")).unwrap();
+        alpha_logo(1400)
+            .save(env.media_dirs[0].join("logo.png"))
+            .unwrap();
         image::RgbImage::new(1400, 1400)
             .save(env.media_dirs[0].join("photo.jpg"))
             .unwrap();
@@ -7814,12 +7826,11 @@ LIMIT 1
 
         let (opaque_sha, opaque_ids) = {
             let mut conn = env.read().await;
-            let sha: String = sqlx::query_scalar(
-                "SELECT sha256 FROM items WHERE has_transparency = 0 LIMIT 1",
-            )
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
+            let sha: String =
+                sqlx::query_scalar("SELECT sha256 FROM items WHERE has_transparency = 0 LIMIT 1")
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
             let ids: Vec<i64> = sqlx::query_scalar(
                 "SELECT id FROM storage.thumbnail_tiers WHERE item_sha256 = ?1 ORDER BY id",
             )
@@ -7978,12 +7989,10 @@ LIMIT 1
         // verdict, wearing the item's own type.
         {
             let mut conn = env.write().await;
-            sqlx::query(
-                "UPDATE storage.thumbnails SET thumbnail = X'', media_type = 'image/png'",
-            )
-            .execute(&mut conn)
-            .await
-            .unwrap();
+            sqlx::query("UPDATE storage.thumbnails SET thumbnail = X'', media_type = 'image/png'")
+                .execute(&mut conn)
+                .await
+                .unwrap();
         }
         let (_, totals) = env.scan().await;
         assert_eq!(
@@ -8186,7 +8195,10 @@ LIMIT 1
         let loop_ids = {
             let mut conn = env.read().await;
             let ids = loop_tier_ids(&mut conn).await;
-            assert!(!ids.is_empty(), "the premise: this item is on the animated ladder");
+            assert!(
+                !ids.is_empty(),
+                "the premise: this item is on the animated ladder"
+            );
             ids
         };
         {
@@ -8198,11 +8210,13 @@ LIMIT 1
                 .execute(&mut conn)
                 .await
                 .unwrap();
-            sqlx::query("UPDATE storage.thumbnail_tiers SET thumbnail = ?1 WHERE tier LIKE 'loop%'")
-                .bind(PLANTED.to_vec())
-                .execute(&mut conn)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE storage.thumbnail_tiers SET thumbnail = ?1 WHERE tier LIKE 'loop%'",
+            )
+            .bind(PLANTED.to_vec())
+            .execute(&mut conn)
+            .await
+            .unwrap();
         }
 
         let (_, totals) = env.scan().await;
@@ -8580,8 +8594,8 @@ VALUES (?1, 0, 'grid-m', 'image/gif', 'image/jpeg', 200, 200, ?2, X'00')
             let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
             file.write_all(&vec![
                 0_u8;
-                (crate::visual_tiers::DISPLAY_MAX_FILE_SIZE_ANIMATED
-                    + 1) as usize
+                (crate::visual_tiers::DISPLAY_MAX_FILE_SIZE_ANIMATED + 1)
+                    as usize
             ])
             .unwrap();
         }
@@ -9606,7 +9620,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
 
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
         let after = scan_error_keys(&mut conn).await;
-        assert_eq!(after.len(), 1, "the audit row survived the touch: {after:?}");
+        assert_eq!(
+            after.len(),
+            1,
+            "the audit row survived the touch: {after:?}"
+        );
         assert_eq!(after[0].0, before[0].0);
         assert_eq!(
             after[0].1, 2,
@@ -9614,12 +9632,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         );
         assert_ne!(after[0].2, before[0].2, "the key follows the mtime");
         assert_eq!(after[0].3, before[0].3, "the bytes did not move");
-        let marker: (i64,) = sqlx::query_as(
-            "SELECT attempts FROM storage.visual_attempts WHERE kind = 'thumbnail'",
-        )
-        .fetch_one(&mut conn)
-        .await
-        .unwrap();
+        let marker: (i64,) =
+            sqlx::query_as("SELECT attempts FROM storage.visual_attempts WHERE kind = 'thumbnail'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
         assert_eq!(marker.0, 2, "the sha-keyed marker never noticed the mtime");
     }
 
@@ -10068,11 +10085,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         }
         let test_env = test_data_dir();
         let env = visuals_env(test_env.path(), &["media-no-video-track"]).await;
-        fs::write(
-            env.media_dirs[0].join("audio-only.mp4"),
-            silent_wav_bytes(),
-        )
-        .unwrap();
+        fs::write(env.media_dirs[0].join("audio-only.mp4"), silent_wav_bytes()).unwrap();
 
         env.service().rescan_folders().await.unwrap();
 
@@ -10081,7 +10094,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(items, 1, "the file itself indexes fine; only visuals are nothing");
+        assert_eq!(
+            items, 1,
+            "the file itself indexes fine; only visuals are nothing"
+        );
         let rows = visual_attempt_rows(&mut conn).await;
         assert_eq!(
             rows.iter()
@@ -10175,8 +10191,9 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // Already examined, so the outro question is settled and only the
         // frames gap remains — the state this test has always been about.
         set_outro_kind(&env, sha256, Some("none/1")).await;
-        let thumbnail = encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
-            .expect("an 8x8 image encodes");
+        let thumbnail =
+            encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+                .expect("an 8x8 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
             IndexDbWriterMessage::StoreThumbnails {
                 sha256: sha256.to_string(),
@@ -10287,8 +10304,9 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         .await;
         // A stored thumbnail, so the *only* thing that could dispatch this file
         // is the outro question.
-        let thumbnail = encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
-            .expect("an 8x8 image encodes");
+        let thumbnail =
+            encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+                .expect("an 8x8 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
             IndexDbWriterMessage::StoreThumbnails {
                 sha256: sha256.to_string(),
@@ -10359,8 +10377,9 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             Some("LEHV6nWB2yk8pyo0adR*".to_string()),
         )
         .await;
-        let thumbnail = encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
-            .expect("an 8x8 image encodes");
+        let thumbnail =
+            encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+                .expect("an 8x8 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
             IndexDbWriterMessage::StoreThumbnails {
                 sha256: sha256.to_string(),
@@ -10782,43 +10801,44 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     ) {
         let (last_modified, file_size) = get_last_modified_time_and_size(path).unwrap();
         let scan_time = current_iso_timestamp();
-        let scan_id = call_index_db_writer(&env.index_db, |reply| {
-            IndexDbWriterMessage::AddFileScan {
+        let scan_id =
+            call_index_db_writer(&env.index_db, |reply| IndexDbWriterMessage::AddFileScan {
                 scan_time: scan_time.clone(),
                 path: env.media_dirs[0].to_string_lossy().to_string(),
                 reply,
+            })
+            .await
+            .unwrap();
+        call_index_db_writer(&env.index_db, |reply| {
+            IndexDbWriterMessage::UpdateFileData {
+                time_added: scan_time.clone(),
+                scan_id,
+                data: FileScanData {
+                    sha256: sha256.to_string(),
+                    last_modified: last_modified.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    new_file_hash: true,
+                    file_size: Some(file_size),
+                    item_metadata: Some(ItemScanMeta {
+                        md5: "md5".to_string(),
+                        mime_type: "video/mp4".to_string(),
+                        width: Some(8),
+                        height: Some(8),
+                        rotation: None,
+                        duration: Some(10.0),
+                        audio_tracks: Some(1),
+                        video_tracks: Some(video_tracks),
+                        subtitle_tracks: Some(0),
+                        // Deliberately unprobed: these items stand in for a library
+                        // indexed before the codec columns existed, which is what
+                        // the backfill dispatcher is about.
+                        video_codec: None,
+                        audio_codec: None,
+                    }),
+                    blurhash: blurhash.clone(),
+                },
+                reply,
             }
-        })
-        .await
-        .unwrap();
-        call_index_db_writer(&env.index_db, |reply| IndexDbWriterMessage::UpdateFileData {
-            time_added: scan_time.clone(),
-            scan_id,
-            data: FileScanData {
-                sha256: sha256.to_string(),
-                last_modified: last_modified.clone(),
-                path: path.to_string_lossy().to_string(),
-                new_file_hash: true,
-                file_size: Some(file_size),
-                item_metadata: Some(ItemScanMeta {
-                    md5: "md5".to_string(),
-                    mime_type: "video/mp4".to_string(),
-                    width: Some(8),
-                    height: Some(8),
-                    rotation: None,
-                    duration: Some(10.0),
-                    audio_tracks: Some(1),
-                    video_tracks: Some(video_tracks),
-                    subtitle_tracks: Some(0),
-                    // Deliberately unprobed: these items stand in for a library
-                    // indexed before the codec columns existed, which is what
-                    // the backfill dispatcher is about.
-                    video_codec: None,
-                    audio_codec: None,
-                }),
-                blurhash: blurhash.clone(),
-            },
-            reply,
         })
         .await
         .unwrap();
@@ -10983,8 +11003,9 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         )
         .await;
         set_outro_kind(&env, sha256, Some("none/1")).await;
-        let thumbnail = encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
-            .expect("an 8x8 image encodes");
+        let thumbnail =
+            encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+                .expect("an 8x8 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
             IndexDbWriterMessage::StoreThumbnails {
                 sha256: sha256.to_string(),
@@ -11126,7 +11147,9 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         seed_image_item(&env, &photo, sha256, "image/jpeg", None).await;
         set_coded_dimensions(&env, sha256, 32, 64).await;
         {
-            let mut conn = crate::db::open_index_db_write_no_user_data(&env.index_db).await.unwrap();
+            let mut conn = crate::db::open_index_db_write_no_user_data(&env.index_db)
+                .await
+                .unwrap();
             sqlx::query("UPDATE items SET rotation = 90 WHERE sha256 = ?1")
                 .bind(sha256)
                 .execute(&mut conn)
@@ -11202,40 +11225,41 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     ) {
         let (last_modified, file_size) = get_last_modified_time_and_size(path).unwrap();
         let scan_time = current_iso_timestamp();
-        let scan_id = call_index_db_writer(&env.index_db, |reply| {
-            IndexDbWriterMessage::AddFileScan {
+        let scan_id =
+            call_index_db_writer(&env.index_db, |reply| IndexDbWriterMessage::AddFileScan {
                 scan_time: scan_time.clone(),
                 path: env.media_dirs[0].to_string_lossy().to_string(),
                 reply,
+            })
+            .await
+            .unwrap();
+        call_index_db_writer(&env.index_db, |reply| {
+            IndexDbWriterMessage::UpdateFileData {
+                time_added: scan_time.clone(),
+                scan_id,
+                data: FileScanData {
+                    sha256: sha256.to_string(),
+                    last_modified: last_modified.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    new_file_hash: true,
+                    file_size: Some(file_size),
+                    item_metadata: Some(ItemScanMeta {
+                        md5: "md5".to_string(),
+                        mime_type: mime_type.to_string(),
+                        width: Some(1),
+                        height: Some(1),
+                        rotation: None,
+                        duration,
+                        audio_tracks: None,
+                        video_tracks: None,
+                        subtitle_tracks: None,
+                        video_codec: None,
+                        audio_codec: None,
+                    }),
+                    blurhash: Some("LEHV6nWB2yk8pyo0adR*".to_string()),
+                },
+                reply,
             }
-        })
-        .await
-        .unwrap();
-        call_index_db_writer(&env.index_db, |reply| IndexDbWriterMessage::UpdateFileData {
-            time_added: scan_time.clone(),
-            scan_id,
-            data: FileScanData {
-                sha256: sha256.to_string(),
-                last_modified: last_modified.clone(),
-                path: path.to_string_lossy().to_string(),
-                new_file_hash: true,
-                file_size: Some(file_size),
-                item_metadata: Some(ItemScanMeta {
-                    md5: "md5".to_string(),
-                    mime_type: mime_type.to_string(),
-                    width: Some(1),
-                    height: Some(1),
-                    rotation: None,
-                    duration,
-                    audio_tracks: None,
-                    video_tracks: None,
-                    subtitle_tracks: None,
-                    video_codec: None,
-                    audio_codec: None,
-                }),
-                blurhash: Some("LEHV6nWB2yk8pyo0adR*".to_string()),
-            },
-            reply,
         })
         .await
         .unwrap();
@@ -11640,23 +11664,38 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             FormatPolicy::default(),
         )
         .expect("a missing video track is not a failure");
-        assert_eq!(produced.nothing, vec![VisualKind::Thumbnail, VisualKind::Frame]);
+        assert_eq!(
+            produced.nothing,
+            vec![VisualKind::Thumbnail, VisualKind::Frame]
+        );
         assert!(produced.thumbnails.is_empty() && produced.frames.is_empty());
 
         // A type with no generator at all: also a permanent nothing, but only
         // for the kind that could have existed.
         let plain = dir.path().join("notes.txt");
         fs::write(&plain, b"hello").unwrap();
-        let produced = build_new_item_renditions(&plain, "text/plain", &meta(0, 0.0), None, FormatPolicy::default())
-            .expect("an unsupported type is not a failure");
+        let produced = build_new_item_renditions(
+            &plain,
+            "text/plain",
+            &meta(0, 0.0),
+            None,
+            FormatPolicy::default(),
+        )
+        .expect("an unsupported type is not a failure");
         assert_eq!(produced.nothing, vec![VisualKind::Thumbnail]);
 
         // An image served from its original file: nothing stored, and no
         // marker — the predicate already answers this without decoding.
         let small = dir.path().join("small.png");
         image::RgbImage::new(8, 8).save(&small).unwrap();
-        let produced = build_new_item_renditions(&small, "image/png", &meta(0, 0.0), None, FormatPolicy::default())
-            .expect("a small image is not a failure");
+        let produced = build_new_item_renditions(
+            &small,
+            "image/png",
+            &meta(0, 0.0),
+            None,
+            FormatPolicy::default(),
+        )
+        .expect("a small image is not a failure");
         assert!(
             produced.nothing.is_empty() && produced.thumbnails.is_empty(),
             "the served-directly predicate is the cache for these"
@@ -11666,7 +11705,14 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // 27 MB uncompressed, past the display rule's byte bound.
         let large = dir.path().join("large.bmp");
         image::RgbImage::new(9000, 1000).save(&large).unwrap();
-        let produced = build_new_item_renditions(&large, "image/bmp", &meta(0, 0.0), None, FormatPolicy::default()).unwrap();
+        let produced = build_new_item_renditions(
+            &large,
+            "image/bmp",
+            &meta(0, 0.0),
+            None,
+            FormatPolicy::default(),
+        )
+        .unwrap();
         assert!(produced.nothing.is_empty() && produced.thumbnails.len() == 1);
         // ... and carries the grid tiers of the same decode. A 9:1 strip is
         // cropped rather than resized whole, so every tier exists.
@@ -11969,7 +12015,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             );
             assert_eq!(
                 oriented_dimensions((64, 32), orientation),
-                if turns % 180 == 90 { (32, 64) } else { (64, 32) },
+                if turns % 180 == 90 {
+                    (32, 64)
+                } else {
+                    (64, 32)
+                },
                 "{orientation:?}"
             );
         }
@@ -11983,9 +12033,8 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     // never show up in a dimension — it would just make the column lie.
     #[test]
     fn a_display_matrix_is_read_clockwise() {
-        let stream = |json: &str| {
-            serde_json::from_str::<FfprobeStream>(json).expect("the fixture parses")
-        };
+        let stream =
+            |json: &str| serde_json::from_str::<FfprobeStream>(json).expect("the fixture parses");
         let with_rotation =
             |rotation: &str| format!(r#"{{"side_data_list":[{{"rotation":{rotation}}}]}}"#);
 

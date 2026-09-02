@@ -149,8 +149,8 @@ fn extract_with_budget(
     budget: usize,
     byte_budget: u64,
 ) -> Result<BridgedInput, String> {
-    let dir = tempfile::tempdir()
-        .map_err(|err| format!("could not create a frame directory: {err}"))?;
+    let dir =
+        tempfile::tempdir().map_err(|err| format!("could not create a frame directory: {err}"))?;
     let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
         .map_err(|err| format!("the WebP structure did not decode: {err}"))?;
     // The ceiling is checked against the header's declared canvas before
@@ -385,8 +385,8 @@ fn ms_seconds(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::compose::Transform;
+    use super::*;
 
     /// The committed two-frame fixture: 16x16, red then blue, 500 ms each.
     const FIXTURE: &[u8] = include_bytes!("fixtures/two-frame.webp");
@@ -716,8 +716,7 @@ mod tests {
         // Chunk body starts past the fourcc + size; the 24-bit little-endian
         // minus-one canvas fields sit at body offsets 4..7 and 7..10.
         // 19999 = 0x004E1F.
-        huge[vp8x + 8 + 4..vp8x + 8 + 10]
-            .copy_from_slice(&[0x1F, 0x4E, 0x00, 0x1F, 0x4E, 0x00]);
+        huge[vp8x + 8 + 4..vp8x + 8 + 10].copy_from_slice(&[0x1F, 0x4E, 0x00, 0x1F, 0x4E, 0x00]);
 
         assert!(
             crate::media_tools::animation::webp_animation_seconds(&huge) > 0.0,

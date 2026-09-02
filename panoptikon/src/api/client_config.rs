@@ -428,7 +428,11 @@ disable_backend_open = true
         })
         .unwrap();
         assert_eq!(json["display_loop_trigger"], serde_json::Value::Null);
-        assert!(json.as_object().unwrap().contains_key("display_loop_trigger"));
+        assert!(
+            json.as_object()
+                .unwrap()
+                .contains_key("display_loop_trigger")
+        );
     }
 
     /// allow_all: everything true, client table passed through.

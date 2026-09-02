@@ -396,10 +396,7 @@ pub(super) fn build_new_item_renditions(
 /// [`LOOP_PROCESS_VERSION`] and every still [`TIER_PROCESS_VERSION`], which is
 /// what lets a still-encoder change regenerate posters without re-running
 /// ffmpeg.
-pub(super) fn wanted_tier_geometry(
-    idx: i64,
-    renditions: &[WantedRendition],
-) -> Vec<TierGeometry> {
+pub(super) fn wanted_tier_geometry(idx: i64, renditions: &[WantedRendition]) -> Vec<TierGeometry> {
     let mut wanted: Vec<TierGeometry> = renditions
         .iter()
         .map(|rendition| rendition.geometry(idx))
@@ -857,9 +854,11 @@ pub(super) fn loop_failure(error: LoopError) -> VisualsError {
         // Failing to *start* ffmpeg is never a verdict on the media: a
         // missing toolchain is `blocked` and self-heals when it appears,
         // anything else about this machine stays transient and retries.
-        LoopError::Spawn(err) => VisualsError::animated_loop(
-            FileProcessError::visuals_from_api_error(crate::media_tools::spawn_error("ffmpeg", &err)),
-        ),
+        LoopError::Spawn(err) => {
+            VisualsError::animated_loop(FileProcessError::visuals_from_api_error(
+                crate::media_tools::spawn_error("ffmpeg", &err),
+            ))
+        }
         // ffmpeg did its own file I/O, so a broken file and a transient mount
         // hiccup exit identically: this needs a second failure in a later
         // scan before it suppresses anything.
@@ -940,8 +939,7 @@ pub(super) fn store_rendered_still(
 ) -> Result<(), VisualsError> {
     out.thumbnails
         .push(encode_generated_still(0, &image).map_err(VisualsError::thumbnail)?);
-    out.tiers =
-        Some(tiers_of_stored_thumbnails(&[(0, &image)]).map_err(VisualsError::thumbnail)?);
+    out.tiers = Some(tiers_of_stored_thumbnails(&[(0, &image)]).map_err(VisualsError::thumbnail)?);
     out.blurhash_source = Some(image);
     Ok(())
 }
@@ -1040,8 +1038,8 @@ pub(super) fn rotation_pass_for(
                 // none this build can read". An `Open` failure is I/O and a
                 // `Limits` failure is this machine's ceiling — both can
                 // change, so both stay retries.
-                let deterministic = stage == ImageStage::Header
-                    && !matches!(err, image::ImageError::Limits(_));
+                let deterministic =
+                    stage == ImageStage::Header && !matches!(err, image::ImageError::Limits(_));
                 return deterministic.then_some(RotationPass {
                     quarter_turns: 0,
                     stale_thumbnail: false,
@@ -1487,8 +1485,7 @@ pub(super) fn generate_backfill_visuals(
     // `media_tools::animation` for why the index must not depend on it.
     let animation = if needs_animation {
         let metadata_span = timers.metadata.start();
-        let animation =
-            crate::media_tools::animation::animation_duration_seconds(path, mime_type);
+        let animation = crate::media_tools::animation::animation_duration_seconds(path, mime_type);
         drop(metadata_span);
         animation
     } else {
@@ -1560,10 +1557,13 @@ pub(super) fn generate_backfill_visuals(
     // an image whose stored display rendition is not the one the current rule
     // wants is a *replacement*, so it lifts the same store guard. An image
     // with nothing stored is an ordinary first generation.
-    let image_ladder =
-        matches!(&tier_work, Some(TierWork::Image { .. })) || transparency_work;
-    let ladder_replaces_display =
-        matches!(&tier_work, Some(TierWork::Image { replace_display: true }));
+    let image_ladder = matches!(&tier_work, Some(TierWork::Image { .. })) || transparency_work;
+    let ladder_replaces_display = matches!(
+        &tier_work,
+        Some(TierWork::Image {
+            replace_display: true
+        })
+    );
     let replace_visuals = (pass_content_end_ms.is_some() && replaces_visuals)
         || stale_thumbnail(rotation.as_ref())
         || ladder_replaces_display;
@@ -1687,11 +1687,13 @@ pub(super) fn generate_backfill_visuals(
     // before the work was dispatched.
     let image_pass_attempted = needs_thumb && mime_type.starts_with("image");
     if matches!(tier_work, Some(TierWork::Animated)) && !image_pass_attempted {
-        match image_file_size(path).map_err(|err| err.error).and_then(|file_size| {
-            open_image_oriented(path)
-                .map(|image| (file_size, image))
-                .map_err(|(stage, err)| FileProcessError::visuals_from_image_error(stage, err))
-        }) {
+        match image_file_size(path)
+            .map_err(|err| err.error)
+            .and_then(|file_size| {
+                open_image_oriented(path)
+                    .map(|image| (file_size, image))
+                    .map_err(|(stage, err)| FileProcessError::visuals_from_image_error(stage, err))
+            }) {
             Ok((file_size, image)) => {
                 // The ordinary image pass with its display half switched off.
                 // Through the same function rather than beside it, because
@@ -1709,9 +1711,8 @@ pub(super) fn generate_backfill_visuals(
                     transparency: indexed.as_ref().and_then(|facts| facts.has_transparency),
                     reusable_loops: reusable_loops.clone(),
                 };
-                match build_image_renditions(
-                    &mut produced, path, mime_type, file_size, image, work,
-                ) {
+                match build_image_renditions(&mut produced, path, mime_type, file_size, image, work)
+                {
                     Ok(()) => {
                         measured_transparency = produced.transparency;
                         tiers = produced.tiers;
@@ -1931,9 +1932,8 @@ pub(super) fn build_backfill_renditions(
             out.thumbnails
                 .push(encode_generated_still(0, &grid).map_err(VisualsError::thumbnail)?);
             let labeled_first = overlay_mime_label(frames[0].clone(), mime_type);
-            out.thumbnails.push(
-                encode_generated_still(1, &labeled_first).map_err(VisualsError::thumbnail)?,
-            );
+            out.thumbnails
+                .push(encode_generated_still(1, &labeled_first).map_err(VisualsError::thumbnail)?);
             out.tiers = Some(
                 tiers_of_stored_thumbnails(&[(0, &grid), (1, &labeled_first)])
                     .map_err(VisualsError::thumbnail)?,
@@ -2512,8 +2512,7 @@ mod tests {
                 transparency: None,
                 reusable_loops: Vec::new(),
             },
-        )
-        else {
+        ) else {
             panic!("unreadable bytes cannot yield frames");
         };
         assert_eq!(
@@ -2788,7 +2787,11 @@ mod tests {
     fn served_directly_matches_the_thumbnail_decision() {
         const MB: u64 = 1024 * 1024;
         let served = |mime: &str, bytes: u64, width: i64, height: i64| {
-            image_is_served_directly(mime, &facts(bytes, width, height, None), FormatPolicy::default())
+            image_is_served_directly(
+                mime,
+                &facts(bytes, width, height, None),
+                FormatPolicy::default(),
+            )
         };
         // The dead hole the old rule had: 2.9 MB, 100 MP, served raw to the
         // grid. Under the dimension-first rule it gets a rendition.
@@ -2869,10 +2872,8 @@ mod tests {
                         media_type: tier.media_type.clone(),
                     })
                     .collect();
-                let wanted = wanted_tier_geometry(
-                    0,
-                    &static_rendition_set(50 * MB, width, height, format),
-                );
+                let wanted =
+                    wanted_tier_geometry(0, &static_rendition_set(50 * MB, width, height, format));
                 assert!(
                     tier_geometry_matches(&stored, &wanted),
                     "{width}x{height}: stored {stored:?}"
@@ -2884,13 +2885,10 @@ mod tests {
                 } else {
                     RenditionFormat::Jpeg
                 };
-                let wanted_other = wanted_tier_geometry(
-                    0,
-                    &static_rendition_set(50 * MB, width, height, other),
-                );
+                let wanted_other =
+                    wanted_tier_geometry(0, &static_rendition_set(50 * MB, width, height, other));
                 assert!(
-                    stored.is_empty()
-                        || !tier_geometry_matches(&stored, &wanted_other),
+                    stored.is_empty() || !tier_geometry_matches(&stored, &wanted_other),
                     "{width}x{height}: a format flip has to be work"
                 );
             }
@@ -3062,12 +3060,7 @@ mod tests {
         ] {
             assert!(mime_can_have_renditions(mime), "{mime}");
         }
-        for mime in [
-            "text/plain",
-            "application/zip",
-            "application/epub+zip",
-            "",
-        ] {
+        for mime in ["text/plain", "application/zip", "application/epub+zip", ""] {
             assert!(!mime_can_have_renditions(mime), "{mime}");
         }
     }

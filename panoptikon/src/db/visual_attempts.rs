@@ -621,12 +621,20 @@ mod tests {
         // out": `failed`, with the finer class left to the audit ledgers.
         upsert_visual_attempts(
             conn,
-            &[failed("sha_big", VisualKind::Thumbnail, ApiErrorKind::Resource, 1)],
+            &[failed(
+                "sha_big",
+                VisualKind::Thumbnail,
+                ApiErrorKind::Resource,
+                1,
+            )],
             Some(1),
         )
         .await
         .unwrap();
-        assert_eq!(row(conn, "sha_big", VisualKind::Thumbnail).await.0, OUTCOME_FAILED);
+        assert_eq!(
+            row(conn, "sha_big", VisualKind::Thumbnail).await.0,
+            OUTCOME_FAILED
+        );
 
         // A missing dependency names it, so the auto-heal can find it.
         upsert_visual_attempts(
@@ -735,7 +743,10 @@ mod tests {
         let conn = &mut dbs.index_conn;
         upsert_visual_attempts(
             conn,
-            &[nothing("sha", VisualKind::Thumbnail), nothing("sha", VisualKind::Frame)],
+            &[
+                nothing("sha", VisualKind::Thumbnail),
+                nothing("sha", VisualKind::Frame),
+            ],
             Some(1),
         )
         .await
@@ -767,7 +778,12 @@ mod tests {
         assert!(
             upsert_visual_attempts(
                 conn,
-                &[failed("sha", VisualKind::Thumbnail, ApiErrorKind::Generic, 1)],
+                &[failed(
+                    "sha",
+                    VisualKind::Thumbnail,
+                    ApiErrorKind::Generic,
+                    1
+                )],
                 Some(1)
             )
             .await
@@ -812,7 +828,12 @@ mod tests {
         }
         upsert_visual_attempts(
             conn,
-            &[failed("sha_bad", VisualKind::Thumbnail, ApiErrorKind::Input, 1)],
+            &[failed(
+                "sha_bad",
+                VisualKind::Thumbnail,
+                ApiErrorKind::Input,
+                1,
+            )],
             Some(1),
         )
         .await

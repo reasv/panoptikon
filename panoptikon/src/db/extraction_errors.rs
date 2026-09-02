@@ -1138,7 +1138,9 @@ mod tests {
     fn audit_list_sql_pages_the_ledger_before_it_resolves_paths() {
         let sql = list_sql("WHERE setters.name = ?");
         let open = sql.find("FROM (").expect("the paged subselect must exist");
-        let close = sql.find(") AS paged").expect("the paged subselect must end");
+        let close = sql
+            .find(") AS paged")
+            .expect("the paged subselect must end");
         let (outer_head, inner) = (&sql[..open], &sql[open..close]);
         let outer_tail = &sql[close..];
 

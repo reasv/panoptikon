@@ -120,11 +120,7 @@ impl ArtifactRef {
     /// `cache` is here for [`Self::path`] alone: the share view's path is the
     /// cache's to compute, and predicting it anywhere else would be the second
     /// copy of a rule that must have exactly one.
-    pub(crate) fn new(
-        cache: &TranscodeCache,
-        artifact: &CachedArtifact,
-        filename: String,
-    ) -> Self {
+    pub(crate) fn new(cache: &TranscodeCache, artifact: &CachedArtifact, filename: String) -> Self {
         // The *same* name this response carries, so the path names the file
         // the client was just told it is getting.
         let path = cache.share_target(artifact, Some(&filename));
@@ -147,12 +143,21 @@ impl ArtifactRef {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum TranscodeJobEvent {
     /// 1-based position in the queue.
-    Queued { position: usize },
+    Queued {
+        position: usize,
+    },
     /// `None` while the output length is unknown (a source with no recorded
     /// duration): the job is running, the percentage is not knowable.
-    Running { progress: Option<f32> },
-    Done { artifact: ArtifactRef },
-    Failed { error: String, cancelled: bool },
+    Running {
+        progress: Option<f32>,
+    },
+    Done {
+        artifact: ArtifactRef,
+    },
+    Failed {
+        error: String,
+        cancelled: bool,
+    },
 }
 
 impl TranscodeJobEvent {
@@ -1122,7 +1127,9 @@ mod tests {
 
     fn params(preset_id: &str, start_cs: Option<i64>) -> TranscodeParams {
         let presets = builtin_presets();
-        let preset = find_preset(&presets, preset_id).expect("a built-in").clone();
+        let preset = find_preset(&presets, preset_id)
+            .expect("a built-in")
+            .clone();
         TranscodeParams::new(
             "a".repeat(64),
             preset,
@@ -1184,20 +1191,22 @@ mod tests {
         started: tokio::sync::mpsc::UnboundedSender<String>,
         gate: Arc<Gate>,
     ) -> EncodeRunner {
-        Arc::new(move |task: EncodeTask, cancel: Arc<AtomicBool>, _progress| {
-            let _ = started.send(task.cache_key());
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                    return Err(EncodeError::Cancelled);
+        Arc::new(
+            move |task: EncodeTask, cancel: Arc<AtomicBool>, _progress| {
+                let _ = started.send(task.cache_key());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        return Err(EncodeError::Cancelled);
+                    }
+                    if gate.take() {
+                        std::fs::write(task.output(), b"artifact").expect("write the artifact");
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                if gate.take() {
-                    std::fs::write(task.output(), b"artifact").expect("write the artifact");
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        })
+            },
+        )
     }
 
     struct TestPool {
@@ -1315,7 +1324,9 @@ mod tests {
     #[tokio::test]
     async fn a_finished_job_becomes_a_cache_hit() {
         let pool = TestPool::new(instant_runner(), 1).await;
-        let first = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let first = pool
+            .submit(request(params("clip", None), JobWeight::Light))
+            .await;
         assert!(matches!(first, SubmitOutcome::Created(_)));
         let event = pool.await_terminal(&job_id(&first)).await;
         let TranscodeJobEvent::Done { artifact } = event else {
@@ -1323,7 +1334,10 @@ mod tests {
         };
         assert_eq!(artifact.size_bytes, 8);
         assert_eq!(artifact.mime_type, "video/mp4");
-        assert_eq!(artifact.url, format!("/api/video/artifact?key={}", artifact.key));
+        assert_eq!(
+            artifact.url,
+            format!("/api/video/artifact?key={}", artifact.key)
+        );
         // The download name is computed from the request, not from the key:
         // the `key=` URL above could never carry the source's own name. And it
         // follows the caller's stem rather than the encode input, whose name
@@ -1354,7 +1368,9 @@ mod tests {
             expected_share
         );
 
-        let second = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let second = pool
+            .submit(request(params("clip", None), JobWeight::Light))
+            .await;
         match second {
             SubmitOutcome::Hit(hit) => {
                 assert_eq!(hit.key, artifact.key);
@@ -1381,7 +1397,9 @@ mod tests {
         let gate = Arc::new(Gate::default());
         let pool = TestPool::new(parked_runner(started_tx, Arc::clone(&gate)), 1).await;
 
-        let first = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let first = pool
+            .submit(request(params("clip", None), JobWeight::Light))
+            .await;
         let second = pool
             .submit(request(params("clip", Some(100)), JobWeight::Light))
             .await;
@@ -1421,7 +1439,10 @@ mod tests {
         );
         gate.release(1);
         pool.await_terminal(&job_id(&first)).await;
-        watcher.changed().await.expect("the position was rebroadcast");
+        watcher
+            .changed()
+            .await
+            .expect("the position was rebroadcast");
         assert_eq!(
             watcher.borrow().event,
             TranscodeJobEvent::Queued { position: 1 }
@@ -1441,7 +1462,9 @@ mod tests {
         let gate = Arc::new(Gate::default());
         let pool = TestPool::new(parked_runner(started_tx, gate), 1).await;
 
-        let running = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let running = pool
+            .submit(request(params("clip", None), JobWeight::Light))
+            .await;
         let queued = pool
             .submit(request(params("clip", Some(100)), JobWeight::Light))
             .await;
@@ -1479,7 +1502,9 @@ mod tests {
         // A *running* job frees its key at the cancel too, not at its later
         // completion: the encode is doomed, so joining it would hand the new
         // client a job whose only outcome is "cancelled".
-        let after_cancel = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let after_cancel = pool
+            .submit(request(params("clip", None), JobWeight::Light))
+            .await;
         assert!(
             matches!(after_cancel, SubmitOutcome::Created(_)),
             "a cancelled running job is not joinable, got {}",
@@ -1505,7 +1530,9 @@ mod tests {
         let gate = Arc::new(Gate::default());
         let pool = TestPool::new(parked_runner(started_tx, Arc::clone(&gate)), 2).await;
 
-        let light = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let light = pool
+            .submit(request(params("clip", None), JobWeight::Light))
+            .await;
         let heavy = pool
             .submit(request(params("clip", Some(100)), JobWeight::Exclusive))
             .await;
@@ -1553,7 +1580,9 @@ mod tests {
         let gate = Arc::new(Gate::default());
         let pool = TestPool::new(parked_runner(started_tx, Arc::clone(&gate)), 2).await;
         let heavy = pool.submit(compose.clone()).await;
-        let light = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let light = pool
+            .submit(request(params("clip", None), JobWeight::Light))
+            .await;
         let key = started_rx.recv().await.expect("the composition started");
         assert!(key.starts_with("compose-"), "{key}");
         assert_eq!(
@@ -1583,8 +1612,7 @@ mod tests {
     /// is what keeps the map from being a leak.
     #[tokio::test]
     async fn terminal_jobs_are_retained_up_to_the_ring_size() {
-        let pool =
-            TestPool::with_retention(instant_runner(), 1, TERMINAL_TTL, 2).await;
+        let pool = TestPool::with_retention(instant_runner(), 1, TERMINAL_TTL, 2).await;
         let mut ids = Vec::new();
         for index in 0..3 {
             let outcome = pool
@@ -1606,7 +1634,9 @@ mod tests {
         // channel — which still carries the last value after the job is
         // dropped, exactly as a client mid-stream would see it.
         let pool = TestPool::with_retention(instant_runner(), 1, Duration::ZERO, 512).await;
-        let outcome = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let outcome = pool
+            .submit(request(params("clip", None), JobWeight::Light))
+            .await;
         let id = job_id(&outcome);
         let mut events = pool.subscribe(&id).await.expect("a live job");
         loop {
@@ -1630,7 +1660,9 @@ mod tests {
         let pool = TestPool::new(runner, 1).await;
 
         for _ in 0..2 {
-            let outcome = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+            let outcome = pool
+                .submit(request(params("clip", None), JobWeight::Light))
+                .await;
             assert!(matches!(outcome, SubmitOutcome::Created(_)));
             assert_eq!(
                 pool.await_terminal(&job_id(&outcome)).await,
@@ -1642,7 +1674,9 @@ mod tests {
         }
 
         // Two strikes settle it: the third submit spawns nothing.
-        let outcome = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let outcome = pool
+            .submit(request(params("clip", None), JobWeight::Light))
+            .await;
         match &outcome {
             SubmitOutcome::KnownFailure(job) => assert_eq!(
                 job.event,
@@ -1853,10 +1887,14 @@ mod tests {
             Arc::new(|_spec, _cancel, _progress| Err(EncodeError::Cancelled));
         let pool = TestPool::new(runner, 1).await;
         for _ in 0..3 {
-            let outcome = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+            let outcome = pool
+                .submit(request(params("clip", None), JobWeight::Light))
+                .await;
             pool.await_terminal(&job_id(&outcome)).await;
         }
-        let outcome = pool.submit(request(params("clip", None), JobWeight::Light)).await;
+        let outcome = pool
+            .submit(request(params("clip", None), JobWeight::Light))
+            .await;
         assert!(
             matches!(outcome, SubmitOutcome::Created(_)),
             "a cancelled encode leaves nothing behind to short-circuit on"

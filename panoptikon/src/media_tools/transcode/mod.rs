@@ -101,7 +101,8 @@ impl TranscodeParams {
         start_cs: Option<i64>,
         end_cs: Option<i64>,
     ) -> Self {
-        let encoder = run::resolve_encoder(&preset, hw::fast_h264_encoder(), hw::av1_software_encoder());
+        let encoder =
+            run::resolve_encoder(&preset, hw::fast_h264_encoder(), hw::av1_software_encoder());
         Self::new(source_sha256, preset, encoder, start_cs, end_cs)
     }
 
@@ -190,7 +191,9 @@ mod tests {
 
     fn clip_params(start_cs: Option<i64>, end_cs: Option<i64>) -> TranscodeParams {
         let presets = builtin_presets();
-        let preset = find_preset(&presets, "clip").expect("the clip preset ships").clone();
+        let preset = find_preset(&presets, "clip")
+            .expect("the clip preset ships")
+            .clone();
         TranscodeParams::new(
             "a".repeat(64),
             preset,

@@ -1811,10 +1811,7 @@ mod tests {
         let mut dbs = crate::db::migrations::setup_test_databases().await;
 
         let (sql, values) = match built.with_clause {
-            Some(with_clause) => built
-                .query
-                .with(with_clause)
-                .build_sqlx(SqliteQueryBuilder),
+            Some(with_clause) => built.query.with(with_clause).build_sqlx(SqliteQueryBuilder),
             None => built.query.build_sqlx(SqliteQueryBuilder),
         };
         let _rows = sqlx::query_with(sqlx::AssertSqlSafe(sql.as_str()), values)
@@ -1914,7 +1911,8 @@ mod tests {
     // renderings of a filtered, ordered, paginated query are frozen verbatim.
     #[test]
     fn filtered_ordered_results_and_count_sql_are_pinned() {
-        let results = render_built(build_query(bookmarks_query(json!({})), false).expect("results"));
+        let results =
+            render_built(build_query(bookmarks_query(json!({})), false).expect("results"));
         assert_eq!(
             results,
             r#"WITH "begin_cte" AS (SELECT "files"."id" AS "file_id", "files"."item_id" AS "item_id" FROM "files") SELECT "begin_cte"."item_id", "begin_cte"."file_id", MAX("user_data"."bookmarks"."time_added") AS "order_rank", "files"."sha256" AS "sha256", "files"."path" AS "path" FROM "begin_cte" INNER JOIN "files" ON "files"."id" = "begin_cte"."file_id" INNER JOIN "user_data"."bookmarks" ON "user_data"."bookmarks"."sha256" = "files"."sha256" INNER JOIN "items" ON "items"."id" = "begin_cte"."item_id" WHERE "user_data"."bookmarks"."user" IN ('alice', '*') GROUP BY "begin_cte"."file_id" ORDER BY "order_rank" DESC NULLS LAST, "files"."last_modified" DESC NULLS LAST LIMIT 5 OFFSET 5"#
@@ -1979,7 +1977,10 @@ mod tests {
         };
         let built = build_item_set_preprocessed(query).expect("item set");
 
-        let primary = built.primary_order.clone().expect("explicit order is a key");
+        let primary = built
+            .primary_order
+            .clone()
+            .expect("explicit order is a key");
         assert_eq!(primary.alias, "o0_last_modified");
         assert_eq!(primary.direction, OrderDirection::Asc);
         assert!(
@@ -2120,8 +2121,8 @@ mod tests {
         let plain_sql = render_item_set(&plain);
         assert!(plain_sql.contains(r#""data_id""#), "{plain_sql}");
 
-        let composite = build_item_set_preprocessed(as_text_entity(coalesced_order_query()))
-            .expect("item set");
+        let composite =
+            build_item_set_preprocessed(as_text_entity(coalesced_order_query())).expect("item set");
         let composite_sql = render_item_set(&composite);
         assert!(
             composite_sql.contains(r#""item_set"."data_id""#),

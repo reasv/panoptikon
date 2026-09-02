@@ -1108,15 +1108,11 @@ fn classify_slot_errors(
 /// `None` means "no slots errored", i.e. the identity map: every response an
 /// inference server without error slots can produce takes that path and pays
 /// nothing.
-fn surviving_input_indices(
-    total_inputs: usize,
-    errors: &[PredictSlotError],
-) -> Option<Vec<usize>> {
+fn surviving_input_indices(total_inputs: usize, errors: &[PredictSlotError]) -> Option<Vec<usize>> {
     if errors.is_empty() {
         return None;
     }
-    let failed: std::collections::HashSet<usize> =
-        errors.iter().map(|error| error.index).collect();
+    let failed: std::collections::HashSet<usize> = errors.iter().map(|error| error.index).collect();
     Some(
         (0..total_inputs)
             .filter(|index| !failed.contains(index))
@@ -1336,31 +1332,33 @@ async fn run_chunked_inference(
     let mut base = 0usize;
     let chunk_cap = u32::try_from(chunk_size).unwrap_or(u32::MAX);
     for chunk in inputs.chunks(chunk_size) {
-        let response = match predict_units(setter_name, pool, unit_slots, chunk_cap, counters, chunk)
-            .await
-        {
-            Ok(response) => response,
-            // A protocol violation is deterministic: the server answered with
-            // a shape this client refuses to guess at, and it will answer the
-            // same way one input at a time. Isolating would burn a full extra
-            // GPU pass to learn nothing, so the chunk fails transiently now.
-            Err(err) if is_protocol_violation(&err) => return Err(err),
-            Err(err) if chunk.len() > 1 => {
-                tracing::warn!(
-                    setter = setter_name,
-                    inputs = chunk.len(),
-                    "inference batch failed; retrying this item's inputs one at a time: {err:#}"
-                );
-                // One isolation pass only: the retry itself is never isolated
-                // again, so the worst case is 2x the requests for this chunk.
-                isolate_inputs(chunk, |single, max_batch| async move {
-                    predict_units(setter_name, pool, unit_slots, max_batch, counters, &single).await
-                })
-                .await
-                .with_context(|| format!("batch failed and isolation did not recover it: {err:#}"))?
-            }
-            Err(err) => return Err(err),
-        };
+        let response =
+            match predict_units(setter_name, pool, unit_slots, chunk_cap, counters, chunk).await {
+                Ok(response) => response,
+                // A protocol violation is deterministic: the server answered with
+                // a shape this client refuses to guess at, and it will answer the
+                // same way one input at a time. Isolating would burn a full extra
+                // GPU pass to learn nothing, so the chunk fails transiently now.
+                Err(err) if is_protocol_violation(&err) => return Err(err),
+                Err(err) if chunk.len() > 1 => {
+                    tracing::warn!(
+                        setter = setter_name,
+                        inputs = chunk.len(),
+                        "inference batch failed; retrying this item's inputs one at a time: {err:#}"
+                    );
+                    // One isolation pass only: the retry itself is never isolated
+                    // again, so the worst case is 2x the requests for this chunk.
+                    isolate_inputs(chunk, |single, max_batch| async move {
+                        predict_units(setter_name, pool, unit_slots, max_batch, counters, &single)
+                            .await
+                    })
+                    .await
+                    .with_context(|| {
+                        format!("batch failed and isolation did not recover it: {err:#}")
+                    })?
+                }
+                Err(err) => return Err(err),
+            };
         for mut error in response.errors {
             error.index += base;
             slot_errors.push(error);
@@ -2275,9 +2273,18 @@ mod tests {
 
     #[test]
     fn work_query_keys_match_the_partitioning_build_job_pql_emits() {
-        assert_eq!(work_query_keys(&test_model("items", true)), ("file_id", "item_id"));
-        assert_eq!(work_query_keys(&test_model("files", true)), ("file_id", "file_id"));
-        assert_eq!(work_query_keys(&test_model("text", true)), ("data_id", "data_id"));
+        assert_eq!(
+            work_query_keys(&test_model("items", true)),
+            ("file_id", "item_id")
+        );
+        assert_eq!(
+            work_query_keys(&test_model("files", true)),
+            ("file_id", "file_id")
+        );
+        assert_eq!(
+            work_query_keys(&test_model("text", true)),
+            ("data_id", "data_id")
+        );
     }
 
     // The WAL-growth regression (docs/sqlite-wal-growth.md): the driver must
@@ -2665,7 +2672,13 @@ mod tests {
         // A confirmed verdict, recorded by the *other* setter.
         let mut tagger = image_model();
         tagger.setter_name = "test/tagger".to_string();
-        let record = failure_record(&tagger, 1, STAGE_PREPARE, "sha_one", &ApiError::input("corrupt"));
+        let record = failure_record(
+            &tagger,
+            1,
+            STAGE_PREPARE,
+            "sha_one",
+            &ApiError::input("corrupt"),
+        );
         upsert_extraction_error(conn, &record).await.unwrap();
         assert!(
             work_query_items(conn, &tagger).await.is_empty(),
@@ -2712,7 +2725,13 @@ mod tests {
             "every file row is work before anything failed"
         );
 
-        let record = failure_record(&model, 1, STAGE_PREPARE, "sha_one", &ApiError::input("corrupt"));
+        let record = failure_record(
+            &model,
+            1,
+            STAGE_PREPARE,
+            "sha_one",
+            &ApiError::input("corrupt"),
+        );
         upsert_extraction_error(conn, &record).await.unwrap();
         assert_eq!(
             work_query_column(conn, &model, "file_id").await,
@@ -3059,7 +3078,10 @@ mod tests {
             panic!("expected an input-media verdict, got {verdict:?}");
         };
         assert!(detail.contains("all 2 inputs"), "{detail}");
-        assert!(detail.contains("truncated"), "the worker's own text: {detail}");
+        assert!(
+            detail.contains("truncated"),
+            "the worker's own text: {detail}"
+        );
 
         // A single-input item, same rule.
         assert!(matches!(
@@ -3194,7 +3216,10 @@ mod tests {
                 1
             )
         );
-        assert!(error.contains("truncated"), "the worker's text is audit: {error}");
+        assert!(
+            error.contains("truncated"),
+            "the worker's text is audit: {error}"
+        );
         assert!(
             work_query_items(&mut conn, &model).await.is_empty(),
             "the item leaves the work query"
@@ -3213,7 +3238,10 @@ mod tests {
         .await;
         let guard = counters.lock().await;
         assert_eq!((guard.errors, guard.input_errors), (1, 1));
-        assert_eq!(guard.blocked_errors, 0, "a worker verdict blocks on nothing");
+        assert_eq!(
+            guard.blocked_errors, 0,
+            "a worker verdict blocks on nothing"
+        );
     }
 
     fn json_response(values: Vec<Value>, errors: Vec<PredictSlotError>) -> PredictResponse {
@@ -3377,7 +3405,10 @@ mod tests {
         assert_eq!(
             surviving_input_indices(
                 3,
-                &[slot(0, SlotErrorClass::Input), slot(2, SlotErrorClass::Input)]
+                &[
+                    slot(0, SlotErrorClass::Input),
+                    slot(2, SlotErrorClass::Input)
+                ]
             ),
             Some(vec![1])
         );

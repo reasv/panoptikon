@@ -103,9 +103,8 @@ pub(crate) fn test_proxy_state() -> Arc<ProxyState> {
     // Discard-protocol port: parsed and stored, never connected to.
     const STAND_IN: &str = "http://127.0.0.1:9";
     let upstream = Upstream::parse("api", STAND_IN).expect("stand-in upstream");
-    let inference_client =
-        InferenceApiClient::new_with_metadata_cache(STAND_IN.to_string(), false)
-            .expect("stand-in inference client");
+    let inference_client = InferenceApiClient::new_with_metadata_cache(STAND_IN.to_string(), false)
+        .expect("stand-in inference client");
     let settings: Settings = toml::from_str(
         r#"
 [server]

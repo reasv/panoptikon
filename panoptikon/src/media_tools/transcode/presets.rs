@@ -298,7 +298,18 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
     TABLE
         .iter()
         .map(
-            |(id, label, container, vcodec, acodec, quality, max_height, fps_max, channel, surfaces)| {
+            |(
+                id,
+                label,
+                container,
+                vcodec,
+                acodec,
+                quality,
+                max_height,
+                fps_max,
+                channel,
+                surfaces,
+            )| {
                 ResolvedPreset {
                     id: (*id).to_string(),
                     label: (*label).to_string(),
@@ -352,7 +363,10 @@ pub(crate) fn resolve_presets(
     resolved
 }
 
-pub(crate) fn find_preset<'a>(presets: &'a [ResolvedPreset], id: &str) -> Option<&'a ResolvedPreset> {
+pub(crate) fn find_preset<'a>(
+    presets: &'a [ResolvedPreset],
+    id: &str,
+) -> Option<&'a ResolvedPreset> {
     presets.iter().find(|preset| preset.id == id)
 }
 
@@ -580,7 +594,10 @@ mod tests {
         assert_eq!(resolve_presets(None), builtin_presets());
         assert!(resolve_presets(Some(&BTreeMap::new())).is_empty());
 
-        let map = profiles(&[("small-share", "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 28")]);
+        let map = profiles(&[(
+            "small-share",
+            "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 28",
+        )]);
         let resolved = resolve_presets(Some(&map));
         assert_eq!(resolved.len(), builtin_presets().len() + 1);
         let novel = find_preset(&resolved, "small-share").unwrap();
@@ -697,7 +714,10 @@ mod tests {
         validate_profiles(Some(&profiles(&[
             ("a", "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 51"),
             ("b", "container = \"webm\"\nvcodec = \"vp9\"\ncrf = 63"),
-            ("c", "container = \"webp\"\nvcodec = \"libwebp_anim\"\ncrf = 100"),
+            (
+                "c",
+                "container = \"webp\"\nvcodec = \"libwebp_anim\"\ncrf = 100",
+            ),
             ("d", "container = \"avif\"\nvcodec = \"av1\"\ncrf = 63"),
         ])))
         .expect("the top of each scale is in range");
@@ -733,8 +753,10 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert(
             "not a name".to_string(),
-            toml::from_str::<TranscodeProfileConfig>("container = \"mp4\"\nvcodec = \"h264\"\ncrf = 20")
-                .unwrap(),
+            toml::from_str::<TranscodeProfileConfig>(
+                "container = \"mp4\"\nvcodec = \"h264\"\ncrf = 20",
+            )
+            .unwrap(),
         );
         let err = validate_profiles(Some(&map)).expect_err("ids must be identifier-safe");
         assert!(format!("{err:#}").contains("is invalid"), "{err:#}");

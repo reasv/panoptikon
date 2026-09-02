@@ -3841,8 +3841,7 @@ mod tests {
                 State(crate::proxy::test_proxy_state()),
                 db,
                 Query(
-                    serde_json::from_value(serde_json::json!({}))
-                        .expect("default bookmark params"),
+                    serde_json::from_value(serde_json::json!({})).expect("default bookmark params"),
                 ),
                 None,
                 Some(Json(serde_json::json!({

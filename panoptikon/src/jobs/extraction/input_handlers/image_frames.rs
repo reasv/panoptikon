@@ -10,11 +10,11 @@ use crate::api_error::{ApiError, Blocker};
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::open_index_db_read_no_user_data;
 use crate::db::storage::{StoredImage, get_frames_bytes};
-use crate::visual_tiers::GENERATED_STILL_FORMAT;
 use crate::inferio_client::{InferenceFile, InferenceInput};
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
 use crate::jobs::files::FRAME_PROCESS_VERSION;
 use crate::media_tools::stderr_tail;
+use crate::visual_tiers::GENERATED_STILL_FORMAT;
 
 /// A frame ready to be sent to inference. PDF pages and HTML screenshots
 /// carry their own pixel dimensions (each page differs from the item's stored
@@ -853,7 +853,10 @@ mod tests {
         let plain = {
             let mut bytes = Vec::new();
             image::DynamicImage::ImageRgb8(image::RgbImage::new(9, 4))
-                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
                 .expect("the fixture encodes");
             bytes
         };

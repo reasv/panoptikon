@@ -447,9 +447,8 @@ mod tests {
     // normalizes them, so normalize here too.)
     #[test]
     fn recount_sql_matches_the_migration() {
-        let migration =
-            include_str!("../../migrations/index/20260727130000_tags_item_count.sql")
-                .replace("\r\n", "\n");
+        let migration = include_str!("../../migrations/index/20260727130000_tags_item_count.sql")
+            .replace("\r\n", "\n");
         assert!(
             migration.contains(RECOUNT_TAG_ITEMS_SQL),
             "migration 20260727130000 no longer runs RECOUNT_TAG_ITEMS_SQL verbatim"
@@ -513,13 +512,15 @@ mod tests {
     #[tokio::test]
     async fn tags_items_insert_without_item_id_is_rejected() {
         let mut dbs = setup_tag_db().await;
-        let result =
-            sqlx::query("INSERT INTO tags_items (item_data_id, tag_id, confidence) VALUES (12, 3, 1.0)")
-                .execute(&mut dbs.index_conn)
-                .await;
+        let result = sqlx::query(
+            "INSERT INTO tags_items (item_data_id, tag_id, confidence) VALUES (12, 3, 1.0)",
+        )
+        .execute(&mut dbs.index_conn)
+        .await;
         let err = result.expect_err("insert omitting item_id must be rejected");
         assert!(
-            err.to_string().contains("item_id must be the owning item id"),
+            err.to_string()
+                .contains("item_id must be the owning item id"),
             "unexpected error: {err}"
         );
     }

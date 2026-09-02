@@ -124,7 +124,9 @@ pub fn slot_error_from_parts(
     message: Option<&str>,
 ) -> Result<SlotError, String> {
     let Some(class) = class else {
-        return Err(format!("error slot has no string `class`: {ERROR_SLOT_KEY}"));
+        return Err(format!(
+            "error slot has no string `class`: {ERROR_SLOT_KEY}"
+        ));
     };
     let Some(class) = SlotErrorClass::parse(class) else {
         return Err(format!("error slot has an unknown class {class:?}"));
@@ -144,9 +146,7 @@ pub fn slot_error_from_parts(
 pub fn slot_error_from_json(value: &JsonValue) -> Option<Result<SlotError, String>> {
     let body = value.as_object()?.get(ERROR_SLOT_KEY)?;
     let Some(body) = body.as_object() else {
-        return Some(Err(format!(
-            "`{ERROR_SLOT_KEY}` is not an object: {body}"
-        )));
+        return Some(Err(format!("`{ERROR_SLOT_KEY}` is not an object: {body}")));
     };
     Some(slot_error_from_parts(
         body.get("class").and_then(JsonValue::as_str),

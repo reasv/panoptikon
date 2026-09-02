@@ -497,12 +497,7 @@ mod tests {
                         image::Rgba([200, shade, 40, 255])
                     }
                 });
-                image::Frame::from_parts(
-                    buffer,
-                    0,
-                    0,
-                    image::Delay::from_numer_denom_ms(*ms, 1),
-                )
+                image::Frame::from_parts(buffer, 0, 0, image::Delay::from_numer_denom_ms(*ms, 1))
             })
             .collect();
         encoder.encode_frames(frames).expect("the fixture encodes");
@@ -701,8 +696,14 @@ mod tests {
         let plan = loop_plan(16, 16);
         assert_eq!((plan.width, plan.height), (16, 16));
         let (frames, duration, _) = probe_loop(
-            &encode_loop(&path, "image/webp", &plan, Transform::default(), RenditionRung::Grid)
-                .expect("the bridged fixture encodes"),
+            &encode_loop(
+                &path,
+                "image/webp",
+                &plan,
+                Transform::default(),
+                RenditionRung::Grid,
+            )
+            .expect("the bridged fixture encodes"),
         );
         assert_eq!(frames, 2, "both frames of the fixture");
         assert!(

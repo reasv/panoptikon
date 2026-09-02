@@ -34,10 +34,10 @@ pub(crate) mod vq_int8_verify_harness;
 
 #[allow(unused_imports)] // For the future DB delete/rename/restore flow.
 pub(crate) use connection::invalidate_read_pools;
-#[cfg(test)]
-pub(crate) use connection::{open_index_db_read_at_path, readonly_test_override};
 pub(crate) use connection::{
     DbConnection, ReadOnly, ReadOnlyNoUserData, UserDataWrite, ensure_migrations_allowed,
     open_index_db_read, open_index_db_read_no_user_data, open_index_db_write_no_user_data,
     open_user_data_write, readonly_mode,
 };
+#[cfg(test)]
+pub(crate) use connection::{open_index_db_read_at_path, readonly_test_override};

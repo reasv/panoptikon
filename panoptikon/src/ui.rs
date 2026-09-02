@@ -600,9 +600,7 @@ fn resolve_node(explicit: Option<&Path>, base: &Path) -> PathBuf {
     }
     venv_node_candidates(base)
         .into_iter()
-        .find(|candidate| {
-            candidate.is_file() && crate::host_paths::can_spawn(candidate, &["-v"])
-        })
+        .find(|candidate| candidate.is_file() && crate::host_paths::can_spawn(candidate, &["-v"]))
         .map(absolutize)
         .unwrap_or_else(|| PathBuf::from("node"))
 }

@@ -33,8 +33,7 @@ use crate::jobs::dir_poller::{
 };
 use crate::jobs::files::{
     FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, SCAN_PROGRESS_INTERVAL, ScanOptions,
-    ScanTimers, THUMBNAIL_PROCESS_VERSION, build_extension_set,
-    build_file_scan_data,
+    ScanTimers, THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data,
     check_folder_validity, current_iso_timestamp, deduplicate_paths, folder_is_empty,
     format_system_time, get_last_modified_time_and_size, has_allowed_extension, infer_mime_type,
     is_excluded, is_hidden_or_temp, is_under_junk_dir, normalize_path, override_mime_from_content,

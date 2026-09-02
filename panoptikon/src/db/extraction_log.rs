@@ -311,12 +311,12 @@ pub(crate) async fn get_setters_total_data(
     conn: &mut sqlx::SqliteConnection,
 ) -> ApiResult<Vec<(String, i64)>> {
     let rows = sqlx::query(SETTER_TOTALS_SQL)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to read setter totals");
-        ApiError::internal("Failed to get setters")
-    })?;
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to read setter totals");
+            ApiError::internal("Failed to get setters")
+        })?;
 
     let mut results = Vec::with_capacity(rows.len());
     for row in rows {
@@ -512,16 +512,15 @@ mod tests {
         // item_data heap: the index has to answer it outright. Column order
         // drifting out of sync with the query would not fail anything —
         // SQLite would just quietly go back to scanning every row.
-        let plan: Vec<String> =
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "EXPLAIN QUERY PLAN {SETTER_TOTALS_SQL}"
-            )))
-            .fetch_all(&mut dbs.index_conn)
-            .await
-            .unwrap()
-            .iter()
-            .map(|row| row.get::<String, _>("detail"))
-            .collect();
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {SETTER_TOTALS_SQL}"
+        )))
+        .fetch_all(&mut dbs.index_conn)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
         assert!(
             plan.iter()
                 .any(|step| step.contains("idx_item_data_placeholder_setter")),

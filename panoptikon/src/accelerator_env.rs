@@ -28,10 +28,7 @@ pub fn worker_env(accelerator: Accelerator) -> Vec<(String, String)> {
 
 /// Post-`uv sync` accelerator checks. No-op for cpu/cuda/auto; ROCm runs
 /// a trivial HIP kernel probe (soft-ok with no GPU).
-pub async fn probe_after_setup(
-    accelerator: Accelerator,
-    interpreter: &Path,
-) -> anyhow::Result<()> {
+pub async fn probe_after_setup(accelerator: Accelerator, interpreter: &Path) -> anyhow::Result<()> {
     match accelerator {
         Accelerator::Rocm => probe_rocm_torch(interpreter).await,
         Accelerator::Cpu | Accelerator::Cuda | Accelerator::Auto => Ok(()),
@@ -259,7 +256,8 @@ mod tests {
         #[cfg(target_os = "linux")]
         if env::var_os("MIOPEN_FIND_MODE").is_none() {
             assert!(
-                rocm.iter().any(|(k, v)| k == "MIOPEN_FIND_MODE" && v == "FAST"),
+                rocm.iter()
+                    .any(|(k, v)| k == "MIOPEN_FIND_MODE" && v == "FAST"),
                 "expected MIOPEN_FIND_MODE=FAST in {rocm:?}"
             );
         }

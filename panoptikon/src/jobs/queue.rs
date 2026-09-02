@@ -1332,9 +1332,7 @@ impl Actor for JobRunnerActor {
                         Err(join_err) if join_err.is_cancelled() => {
                             JobRunResult::failed("Job cancelled".to_string())
                         }
-                        Err(join_err) => {
-                            JobRunResult::failed(format!("Job panicked: {join_err}"))
-                        }
+                        Err(join_err) => JobRunResult::failed(format!("Job panicked: {join_err}")),
                     };
                     let _ =
                         runner.send_message(JobRunnerMessage::JobCompleted { queue_id, result });

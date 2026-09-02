@@ -1291,8 +1291,7 @@ pub async fn update_pinboard_version_preview(
     let Some(bytes) = preview.bytes else {
         return Err(ApiError::bad_request("Preview image required"));
     };
-    let (preview_w, preview_h, screenful_h) =
-        (preview.width, preview.height, preview.screenful_h);
+    let (preview_w, preview_h, screenful_h) = (preview.width, preview.height, preview.screenful_h);
 
     begin_transaction(&mut db.conn).await?;
     let updated = match pinboards::update_version_preview(

@@ -520,7 +520,10 @@ mod tests {
 
         let claimed = entry(DbIdentityProbe::Claimed("uuid".into()), now);
         assert!(claimed.is_fresh(stamp(10), now + UNKNOWN_RETRY * 100));
-        assert!(!claimed.is_fresh(stamp(11), now), "a replaced file is stale");
+        assert!(
+            !claimed.is_fresh(stamp(11), now),
+            "a replaced file is stale"
+        );
         assert!(
             !claimed.is_fresh(Some(FileStamp::Missing), now),
             "a deleted file is stale"

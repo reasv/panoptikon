@@ -117,12 +117,16 @@ impl PredictOutput {
 /// output to whatever frame happens to live at that index.
 pub(super) fn input_index(survivors: Option<&[usize]>, position: usize) -> ApiResult<i64> {
     match survivors {
-        Some(map) => map.get(position).copied().map(|index| index as i64).ok_or_else(|| {
-            ApiError::internal(format!(
-                "output position {position} exceeds the {} surviving inputs",
-                map.len()
-            ))
-        }),
+        Some(map) => map
+            .get(position)
+            .copied()
+            .map(|index| index as i64)
+            .ok_or_else(|| {
+                ApiError::internal(format!(
+                    "output position {position} exceeds the {} surviving inputs",
+                    map.len()
+                ))
+            }),
         None => Ok(position as i64),
     }
 }

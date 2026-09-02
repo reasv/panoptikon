@@ -52,12 +52,10 @@ async fn dump_eqp(conn: &mut SqliteConnection, sql: &str, word: &str) {
 #[tokio::test]
 #[ignore = "diagnostic harness; needs PANOPTIKON_FTS_INDEX/_STORAGE"]
 async fn fts_probe() {
-    let index_db = PathBuf::from(
-        std::env::var("PANOPTIKON_FTS_INDEX").expect("set PANOPTIKON_FTS_INDEX"),
-    );
-    let storage_db = PathBuf::from(
-        std::env::var("PANOPTIKON_FTS_STORAGE").expect("set PANOPTIKON_FTS_STORAGE"),
-    );
+    let index_db =
+        PathBuf::from(std::env::var("PANOPTIKON_FTS_INDEX").expect("set PANOPTIKON_FTS_INDEX"));
+    let storage_db =
+        PathBuf::from(std::env::var("PANOPTIKON_FTS_STORAGE").expect("set PANOPTIKON_FTS_STORAGE"));
     let word = env_or("PANOPTIKON_FTS_WORD", "rating");
     let time_it = env_or("PANOPTIKON_FTS_TIME", "0") == "1";
     let variants_filter = env_or("PANOPTIKON_FTS_VARIANTS", "");
@@ -81,7 +79,9 @@ async fn fts_probe() {
             index_db.to_string_lossy().replace('\\', "/")
         ))
         .expect("rw options");
-        let mut rw = SqliteConnection::connect_with(&opts).await.expect("rw conn");
+        let mut rw = SqliteConnection::connect_with(&opts)
+            .await
+            .expect("rw conn");
         for stmt in exec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             let t0 = Instant::now();
             sqlx::query(sqlx::AssertSqlSafe(stmt))

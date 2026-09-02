@@ -100,9 +100,7 @@ fn profile_bin_dirs() -> Vec<PathBuf> {
             dirs.push(home.join(".local/state/nix/profile/bin"));
         }
         if let Ok(user) = env::var("USER") {
-            dirs.push(PathBuf::from(format!(
-                "/etc/profiles/per-user/{user}/bin"
-            )));
+            dirs.push(PathBuf::from(format!("/etc/profiles/per-user/{user}/bin")));
         }
         dirs
     }
@@ -414,7 +412,10 @@ mod tests {
 
     #[test]
     fn can_spawn_rejects_missing() {
-        assert!(!can_spawn(Path::new("/nonexistent/binary-xyz"), &["-version"]));
+        assert!(!can_spawn(
+            Path::new("/nonexistent/binary-xyz"),
+            &["-version"]
+        ));
     }
 
     #[test]

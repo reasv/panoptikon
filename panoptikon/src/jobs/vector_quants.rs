@@ -173,7 +173,12 @@ async fn remove_profile_quants(index_db: &str, profile_id: i64) -> ApiResult<()>
         if deleted == 0 {
             break;
         }
-        tracing::debug!(index_db, profile_id, deleted_total, "quant removal progress");
+        tracing::debug!(
+            index_db,
+            profile_id,
+            deleted_total,
+            "quant removal progress"
+        );
     }
     call_index_db_writer(index_db, |reply| {
         IndexDbWriterMessage::VectorQuantDropProfile { profile_id, reply }

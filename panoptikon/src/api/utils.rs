@@ -644,10 +644,16 @@ mod tests {
         let value = |filename: &str| {
             let header = content_disposition_value("inline", filename)
                 .expect("the header value is constructible");
-            header.to_str().expect("ascii-safe for these cases").to_string()
+            header
+                .to_str()
+                .expect("ascii-safe for these cases")
+                .to_string()
         };
 
-        assert_eq!(value("holiday-clip.mp4"), "inline; filename=\"holiday-clip.mp4\"");
+        assert_eq!(
+            value("holiday-clip.mp4"),
+            "inline; filename=\"holiday-clip.mp4\""
+        );
         assert_eq!(value("a b (1).mp4"), "inline; filename=\"a b (1).mp4\"");
 
         // A quote used to end the value early, so everything after it was
