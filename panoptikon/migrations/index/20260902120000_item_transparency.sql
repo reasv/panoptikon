@@ -22,10 +22,18 @@
 -- content cannot disagree.
 ALTER TABLE items ADD COLUMN has_transparency INTEGER;
 
--- Serves the backfill dispatch question "is there an image whose pixels
--- nothing has examined for transparency". Partial on the NULL state so the
--- population drains away as the backfill runs, instead of carrying every row
--- in the database forever.
+-- The set of images whose pixels nothing has examined for transparency, as a
+-- standing population. Partial on the NULL state, so it drains away as the
+-- backfill runs instead of carrying every row in the database forever, and so
+-- its size is a direct answer to "how much of this library is left".
+--
+-- Deliberately **not** what the scan's dispatch question reads: that one is
+-- `item_transparency_pending`, a `sha256 = ?` probe answered from the primary
+-- key, which would not touch this index however it were shaped. What the index
+-- is for is the sweep — an EXPLAIN-able "which items are still pending"
+-- lookup, whether by hand or by any future job that wants the population
+-- rather than one item — and consistency with `idx_items_rotation_pending`,
+-- whose column this one is modelled on line for line.
 --
 -- `type` leads because items.type holds the whole mime string ('image/png'),
 -- so the population is a half-open range scan (`type >= 'image/' AND type <
