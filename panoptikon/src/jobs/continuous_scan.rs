@@ -33,7 +33,7 @@ use crate::jobs::dir_poller::{
 };
 use crate::jobs::files::{
     FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, SCAN_PROGRESS_INTERVAL, ScanOptions,
-    ScanTimers, THUMBNAIL_PROCESS_VERSION, TIER_PROCESS_VERSION, build_extension_set,
+    ScanTimers, THUMBNAIL_PROCESS_VERSION, build_extension_set,
     build_file_scan_data,
     check_folder_validity, current_iso_timestamp, deduplicate_paths, folder_is_empty,
     format_system_time, get_last_modified_time_and_size, has_allowed_extension, infer_mime_type,
@@ -41,6 +41,7 @@ use crate::jobs::files::{
     parse_filescan_filter, process_file, run_post_job_maintenance,
 };
 use crate::pql::model::Match;
+use crate::visual_tiers::FormatPolicy;
 
 type ApiResult<T> = Result<T, ApiError>;
 
@@ -72,6 +73,9 @@ struct FileWork {
     /// `ScanContext::detect_outros`: detection is subordinate to `scan_video`
     /// (docs/video-outro-detection-design.md §8).
     detect_outros: bool,
+    /// This database's rendition format policy (R5), folded at dispatch — the
+    /// twin of `ScanContext::formats`.
+    formats: FormatPolicy,
     epoch: u64,
     scan_time: String,
     index_db: String,
@@ -107,6 +111,7 @@ impl Worker for ContinuousWorker {
             path,
             filescan_filter,
             detect_outros,
+            formats,
             epoch,
             scan_time,
             index_db,
@@ -184,7 +189,7 @@ impl Worker for ContinuousWorker {
 
         let work_path = path.clone();
         let result = tokio::task::spawn_blocking(move || {
-            process_file(work_path, filescan_filter, detect_outros, &timers)
+            process_file(work_path, filescan_filter, detect_outros, formats, &timers)
         })
         .await
         .map_err(|err| FileProcessError::Worker(err.to_string()))
@@ -944,6 +949,7 @@ impl ContinuousScanState {
             path,
             filescan_filter: self.filescan_filter.clone(),
             detect_outros: self.config.scan_video && self.config.detect_outros,
+            formats: FormatPolicy::from_names(&self.config.thumbnail_formats),
             epoch: self.epoch,
             scan_time,
             index_db: self.index_db.clone(),
@@ -1540,7 +1546,6 @@ impl Actor for ContinuousScanActor {
                         IndexDbWriterMessage::StoreThumbnailTiers {
                             sha256: file_data.sha256.clone(),
                             mime_type: file_data.mime_type.clone(),
-                            process_version: TIER_PROCESS_VERSION,
                             tiers: file_data.tiers.clone(),
                             reply,
                         }
@@ -1689,6 +1694,20 @@ impl Actor for ContinuousScanActor {
                                     sha256: file_data.sha256.clone(),
                                     outro_kind: outro.kind.clone(),
                                     content_end_ms: outro.content_end_ms,
+                                    reply,
+                                }
+                            })
+                            .await;
+                        }
+                        // Likewise: the column lives on the row the write
+                        // above just inserted, and the guard on
+                        // `has_transparency IS NULL` makes a race with the
+                        // batch walker a no-op rather than a disagreement.
+                        if let Some(has_transparency) = file_data.transparency {
+                            let _ = call_index_db_writer(&state.index_db, |reply| {
+                                IndexDbWriterMessage::SetItemTransparency {
+                                    sha256: file_data.sha256.clone(),
+                                    has_transparency,
                                     reply,
                                 }
                             })
@@ -2308,6 +2327,7 @@ mod tests {
             file_path.clone(),
             parse_filescan_filter(&config).map(Arc::new),
             false,
+            FormatPolicy::default(),
             &ScanTimers::default(),
         )
         .unwrap();
@@ -2403,6 +2423,7 @@ mod tests {
             file_path.clone(),
             parse_filescan_filter(&config).map(Arc::new),
             false,
+            FormatPolicy::default(),
             &ScanTimers::default(),
         )
         .unwrap();
@@ -2589,6 +2610,7 @@ mod tests {
             file_path.clone(),
             parse_filescan_filter(&config).map(Arc::new),
             false,
+            FormatPolicy::default(),
             &ScanTimers::default(),
         )
         .unwrap();
