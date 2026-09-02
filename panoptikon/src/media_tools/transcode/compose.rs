@@ -120,6 +120,29 @@ pub(crate) enum ItemTime {
     /// duration, and with both bounds the target length is arithmetic rather
     /// than a probe of every input before the job can even be keyed.
     Span { start_cs: i64, end_cs: i64 },
+    /// A playing range whose end the **server** derives from this item's
+    /// detected outro — the composition's spelling of the clip route's
+    /// `cut=outro` (`api/video.rs`), and for the same reason: the player's cut
+    /// point lives in the browser's decoded timeline and is corrected for it,
+    /// while ffmpeg reads the file's own, where those corrections would move
+    /// the cut *off* the frame the content ends on. The outro is NAMED here,
+    /// never measured by the client.
+    ///
+    /// `end_cs` is still required, and is the client's own FALLBACK — where
+    /// playback would end if the server has no usable outro for this item
+    /// (never detected, `detect_outros` off since the board was drawn, or a
+    /// boundary that does not shorten the span). It is never the authority:
+    /// a resolvable outro always replaces it. Required rather than optional
+    /// because one pin's vanished outro must not fail a whole board, and
+    /// because the client's own length and loop-memory estimates need a number
+    /// before the round trip.
+    ///
+    /// REQUEST-ONLY. `api/video.rs` rewrites every one of these into a plain
+    /// [`ItemTime::Span`] before the document is resolved, so this variant
+    /// never reaches the cache key — which is what makes a composition cut at
+    /// the outro and the identical hand-trimmed one ONE artifact.
+    /// [`validate_item`] refuses one that got this far.
+    OutroSpan { start_cs: i64, end_cs: i64 },
     /// One frame of a video, held for the whole output.
     Still { at_cs: i64 },
     /// A still image file, held for the whole output.
@@ -587,6 +610,17 @@ fn validate_item(item: &ComposeItem, canvas: &Canvas) -> Resolved<()> {
                 ));
             }
         }
+        ItemTime::OutroSpan { .. } => {
+            // The API layer resolves every outro span into a plain one before
+            // it gets here (`api/video.rs`), so reaching this arm means the
+            // resolution was skipped — and letting it through would hash a
+            // document whose end bound nobody has decided yet, under a key the
+            // resolved form of the same board would never produce.
+            return Err(ComposeRejection::new(
+                "unresolved_outro_span",
+                "an outro span reached the resolver unresolved; this is a server bug",
+            ));
+        }
         ItemTime::Still { at_cs } => {
             if at_cs < 0 {
                 return Err(ComposeRejection::new(
@@ -727,10 +761,12 @@ fn check_loop_memory(doc: &ResolvedCompose, limits: ComposeLimits) -> Resolved<(
     let mut bytes: u128 = 0;
     for item in &doc.items {
         let frames: u128 = match item.time {
-            ItemTime::Span { start_cs, end_cs } => match span_loop(end_cs - start_cs, doc) {
-                Some((_, segment)) => segment.max(0) as u128,
-                None => 0,
-            },
+            ItemTime::Span { start_cs, end_cs } | ItemTime::OutroSpan { start_cs, end_cs } => {
+                match span_loop(end_cs - start_cs, doc) {
+                    Some((_, segment)) => segment.max(0) as u128,
+                    None => 0,
+                }
+            }
             // One buffered frame each, held by the infinite loop that freezes
             // them: a still and an image run the same chain.
             ItemTime::Still { .. } | ItemTime::Image => 1,
@@ -1174,7 +1210,7 @@ fn input_args(item: &ComposeItem, fps: u32, probe: Option<StreamInfo>) -> Vec<St
         // Input seeking, and `-to` in the input's own timeline: the decoder
         // skips everything outside the span instead of decoding and throwing
         // it away, and we always re-encode, so the fast seek is exact.
-        ItemTime::Span { start_cs, end_cs } => vec![
+        ItemTime::Span { start_cs, end_cs } | ItemTime::OutroSpan { start_cs, end_cs } => vec![
             "-ss".to_string(),
             seconds(start_cs),
             "-to".to_string(),
@@ -1251,7 +1287,7 @@ fn video_chain(
 
     let mut filters: Vec<String> = Vec::new();
     match item.time {
-        ItemTime::Span { start_cs, end_cs } => {
+        ItemTime::Span { start_cs, end_cs } | ItemTime::OutroSpan { start_cs, end_cs } => {
             filters.push("setpts=PTS-STARTPTS".to_string());
             filters.extend(geometry);
             filters.push(format!("fps={}", doc.fps));
@@ -1655,6 +1691,20 @@ mod tests {
                 "mosaic-mp4"
             ),
             "still_negative"
+        );
+        // The API layer resolves every outro span into a plain one before the
+        // document is resolved, so one arriving here is a server bug — and a
+        // loud one, because hashing an end nobody has decided would fork the
+        // cache against the resolved form of the same board.
+        assert_eq!(
+            reason(
+                &with_item(item(ItemTime::OutroSpan {
+                    start_cs: 0,
+                    end_cs: 500
+                })),
+                "mosaic-mp4"
+            ),
+            "unresolved_outro_span"
         );
 
         // A thumbnail is a still image: a span or a timestamped still over

@@ -354,7 +354,9 @@ fn wants_more(time: ItemTime, decoded: usize, total_ms: u64) -> bool {
     }
     match time {
         ItemTime::Image => false,
-        ItemTime::Span { end_cs, .. } => total_ms < cs_ms(end_cs),
+        ItemTime::Span { end_cs, .. } | ItemTime::OutroSpan { end_cs, .. } => {
+            total_ms < cs_ms(end_cs)
+        }
         ItemTime::Still { at_cs } => total_ms <= cs_ms(at_cs),
     }
 }

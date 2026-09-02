@@ -419,6 +419,30 @@ learns pinboard semantics and never parses the `h` codec.
   trim start / file start, never the live playhead; stopped videos are
   stills — the equal-bounds freeze-frame trim encoding already carries the
   frame choice, so the client sends no playhead state at all.
+- **Outro cut (added 2026-09-03):** a pin whose playback ends at the
+  detected outro must *export* there too. The outro is never written into
+  the pin's `h` field (outro-skip design §1: it is a playback default, not a
+  user trim), so the composition needed its own way to say so, and it is the
+  clip route's rule in the document's own grammar: `time.kind =
+  "outro_span"` — same `start_cs`/`end_cs` as a span, with the end **named
+  rather than measured**. `POST /api/video/compose` rewrites every one into
+  a plain span before the document is validated or hashed, reading the same
+  `items.content_end_ms` with the same 60 ms guard, so nothing below the API
+  edge learns the variant exists and a mosaic cut at the outro is the same
+  cached artifact as the identical hand-trimmed one. The client emits it on
+  exactly playback's conditions (preference on, a detected boundary, no user
+  end bound of their own) and never computes the cut point: its own number
+  lives in the browser's decoded timeline — and, on a pin playing a
+  transcoded rendition, in that rendition's timeline, while the composition
+  always composites the original file.
+  - `end_cs` stays **required** on an outro span and carries the untrimmed
+    end. It is the server's fallback for a pin whose outro it cannot resolve
+    (never detected, `detect_outros` switched off since the board was drawn,
+    or a boundary that would not shorten the span) — one pin's vanished
+    outro must not fail a board of twelve, which is the whole reason this is
+    not the clip route's 404. It is also what the client's own length and
+    loop-memory estimates run on until the answer comes back: an
+    over-estimate of both, which is the safe direction for a guard.
 - **Length policy:** default "longest loop completes once"; explicit length
   cap option; hard server-side cap for animated-image outputs (tunable,
   serde default), no cap needed for real video outputs.

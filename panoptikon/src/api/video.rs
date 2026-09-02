@@ -37,7 +37,7 @@ use crate::db::storage::{StoredImage, get_thumbnail_image};
 use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::media_tools::transcode::cache::{CacheStats, ResizeError};
 use crate::media_tools::transcode::compose::{
-    self, ComposeLimits, ComposeParams, ComposeRejection, ComposeRequest, ItemSource,
+    self, ComposeLimits, ComposeParams, ComposeRejection, ComposeRequest, ItemSource, ItemTime,
     ResolvedCompose, StreamInfo, Transform,
 };
 use crate::media_tools::transcode::pool::{
@@ -413,7 +413,12 @@ fn submit_response(outcome: SubmitOutcome) -> Response<Body> {
         hash of its document, not by an item, and is strictly heavier work, so a policy can \
         allow one and deny the other. The response envelope, the jobs/SSE routes and the \
         artifact route are identical to the single-file path; a single-item save is simply a \
-        composition with one item.",
+        composition with one item.\n\n\
+        An item whose time is `outro_span` asks the server to end that span at the item's \
+        detected outro, the composition's spelling of the clip route's `cut=outro` and resolved \
+        here for the same reason: the boundary belongs to the file's own timeline, not the \
+        browser's. Its `end_cs` is the client's fallback and is used unchanged when this item \
+        has no usable outro — one pin's missing outro never fails the document.",
     params(DbQueryParams),
     request_body = ComposeRequest,
     responses(
@@ -433,9 +438,13 @@ pub async fn video_compose(
     State(state): State<Arc<ProxyState>>,
     axum::Extension(context): axum::Extension<PolicyContext>,
     mut db: DbConnection<ReadOnlyNoUserData>,
-    Json(body): Json<ComposeRequest>,
+    Json(mut body): Json<ComposeRequest>,
 ) -> ApiResult<Response<Body>> {
     let preset = policy_preset(&state.settings, &context, &body.output.preset)?;
+    // Before anything is validated or hashed: the document's outro spans are
+    // the one part of it the client deliberately left for the server to
+    // decide, and every layer below this line sees explicit centiseconds.
+    resolve_outro_spans(&mut db, &mut body).await?;
     let doc = compose::resolve_compose(&body, &preset, ComposeLimits::from_config())
         .map_err(compose_rejection)?;
 
@@ -948,6 +957,82 @@ async fn resolve_outro_end_cs(
         return Err(no_outro());
     }
     Ok(outro_cut_cs(content_end_ms))
+}
+
+/// Rewrites every `outro_span` in a composition document into a plain span,
+/// ending where this item's detected outro says the content does.
+///
+/// The composition's half of the rule the clip route states at
+/// [`resolve_outro_end_cs`]: the outro is *named* by the client and resolved
+/// here, so the resolver, the cache key and the job below all see one kind of
+/// span, and a mosaic cut at the outro is the same artifact as the identical
+/// hand-trimmed one.
+///
+/// Where it deliberately differs from the clip route: **an unusable outro is
+/// not an error here.** A clip cut at the outro *is* the request, so a missing
+/// one is a 404; a composition is a board of pins, and one pin whose outro
+/// went away (never detected, `detect_outros` switched off since the board was
+/// drawn, a boundary that would not shorten this span anyway) must not fail
+/// the other eleven. Its own `end_cs` — the client's fallback, which is where
+/// playback would end without the cut — stands instead.
+///
+/// The two guards on accepting a resolved cut are what "would not shorten this
+/// span" means, and neither needs the item's recorded duration: a *boundary* at
+/// or past the fallback end leaves no card to skip (the clip route's
+/// `content_end >= duration` rule, asked against the bound the client actually
+/// sent), and a cut that fails [`validate_bounds`] against this pin's start is
+/// a freeze frame rather than a clip — the same band playback's own outro
+/// default keeps clear of.
+///
+/// Given the same item, the cut this produces is the *same number* the clip
+/// route produces, from the same [`outro_cut_cs`] on the same column: a mosaic
+/// of one pin and a clip of that pin are cut at one frame.
+async fn resolve_outro_spans(
+    db: &mut DbConnection<ReadOnlyNoUserData>,
+    body: &mut ComposeRequest,
+) -> ApiResult<()> {
+    if !body
+        .items
+        .iter()
+        .any(|item| matches!(item.time, ItemTime::OutroSpan { .. }))
+    {
+        return Ok(());
+    }
+    // One gate read for the whole document rather than one per pin: it is the
+    // same database for every item, and the answer cannot change inside a
+    // request.
+    let serve = serve_outro_metadata(&db.index_db, true).await;
+    for index in 0..body.items.len() {
+        let ItemTime::OutroSpan { start_cs, end_cs } = body.items[index].time else {
+            continue;
+        };
+        let content_end_ms = if serve {
+            get_item_content_end_ms(&mut db.conn, &body.items[index].sha256).await?
+        } else {
+            None
+        };
+        let resolved = match content_end_ms {
+            // The BOUNDARY, not the cut, is what decides eligibility — the
+            // clip route's `content_end >= duration` rule, asked against the
+            // untrimmed end the client sent instead of against a duration this
+            // pass would otherwise have to look up. Testing the guarded cut
+            // here would part company with that route on exactly one item: a
+            // boundary at the file's own end, which is "no card" there and
+            // would quietly shave the guard's 60 ms of real content off here.
+            Some(ms)
+                if ms.div_euclid(MS_PER_CS) < end_cs
+                    && validate_bounds(Some(start_cs), Some(outro_cut_cs(ms))).is_ok() =>
+            {
+                outro_cut_cs(ms)
+            }
+            _ => end_cs,
+        };
+        body.items[index].time = ItemTime::Span {
+            start_cs,
+            end_cs: resolved,
+        };
+    }
+    Ok(())
 }
 
 /// A detected content end (ms) as an export cut (cs): the audio-bang guard
@@ -2296,6 +2381,170 @@ transcode_presets = ["playback"]
                 .unwrap(),
             794
         );
+    }
+
+    /// The composition's `outro_span`, per item: resolved to the same
+    /// frame-exact cut the clip route computes, and — where this item has no
+    /// usable outro — degraded to the `end_cs` the client sent rather than
+    /// failing the document. A board is many pins; one pin's missing card must
+    /// cost that pin's trim and nothing else.
+    #[tokio::test]
+    async fn an_outro_span_resolves_per_item_and_falls_back_to_the_end_the_client_sent() {
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let (mut db, _attached) = outro_fixture_db(fixtures.path()).await;
+        crate::test_utils::write_detect_outros_config(OUTRO_INDEX_DB, true);
+
+        for (case, sha, start_cs, end_cs, expected) in [
+            ("the detected cut wins", WITH_OUTRO, 0, 1200, 794),
+            (
+                "a start bound keeps its own cut",
+                WITH_OUTRO,
+                100,
+                1200,
+                794,
+            ),
+            // Every remaining row is a fallback, and each one is a different
+            // reason for it — none of them an error.
+            ("no boundary was ever detected", NO_OUTRO, 0, 1200, 1200),
+            (
+                "no such item in this database",
+                &"e3".repeat(32),
+                0,
+                1200,
+                1200,
+            ),
+            // The cut has to SHORTEN the span to be a cut: an end bound
+            // already inside the content is the clip route's
+            // `content_end >= duration` rule asked against the bound the
+            // client actually sent, which needs no duration lookup at all.
+            ("the span already ends first", WITH_OUTRO, 0, 500, 500),
+            // The rule is asked of the BOUNDARY (800 cs), not of the guarded
+            // cut (794): a span ending exactly where the content does is the
+            // clip route's "no card to skip", and accepting it here would
+            // shave the guard's 60 ms off real content — the one item on
+            // which the two routes could have disagreed.
+            (
+                "the span ends where the content does",
+                WITH_OUTRO,
+                0,
+                800,
+                800,
+            ),
+            (
+                "…and one centisecond later does cut",
+                WITH_OUTRO,
+                0,
+                801,
+                794,
+            ),
+            // A cut this close to the start is a freeze frame, not a clip —
+            // the band playback's own outro default keeps clear of.
+            (
+                "the cut is inside the freeze band",
+                WITH_OUTRO,
+                793,
+                1200,
+                1200,
+            ),
+            (
+                "the boundary is inside the guard",
+                DEGENERATE_OUTRO,
+                0,
+                1200,
+                1200,
+            ),
+        ] {
+            let mut body = compose_body(vec![compose_item(
+                sha,
+                (0, 0, 320, 240),
+                serde_json::json!({ "kind": "outro_span", "start_cs": start_cs, "end_cs": end_cs }),
+            )]);
+            resolve_outro_spans(&mut db, &mut body).await.unwrap();
+            assert_eq!(
+                body.items[0].time,
+                ItemTime::Span {
+                    start_cs,
+                    end_cs: expected
+                },
+                "{case}"
+            );
+        }
+
+        // The gate withholds the cut from a composition exactly as it
+        // withholds it from a clip — but here that is a pin exporting
+        // untrimmed, not a 404.
+        crate::test_utils::write_detect_outros_config(OUTRO_INDEX_DB, false);
+        let mut gated = compose_body(vec![compose_item(
+            WITH_OUTRO,
+            (0, 0, 320, 240),
+            serde_json::json!({ "kind": "outro_span", "start_cs": 0, "end_cs": 1200 }),
+        )]);
+        resolve_outro_spans(&mut db, &mut gated).await.unwrap();
+        assert_eq!(
+            gated.items[0].time,
+            ItemTime::Span {
+                start_cs: 0,
+                end_cs: 1200
+            },
+            "detect_outros off leaves the client's own end standing"
+        );
+    }
+
+    /// The point of naming the cut instead of measuring it, proven where it
+    /// pays: the resolved document is *indistinguishable* from the one a
+    /// client that spelled the same `end_cs` would have sent, so the two key
+    /// one artifact. Nothing below the API layer ever sees an `outro_span` —
+    /// and the resolver refuses one that got there, since hashing an
+    /// undecided end would fork the cache silently.
+    #[tokio::test]
+    async fn a_resolved_outro_span_keys_exactly_as_the_same_explicit_span_does() {
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let (mut db, _attached) = outro_fixture_db(fixtures.path()).await;
+        crate::test_utils::write_detect_outros_config(OUTRO_INDEX_DB, true);
+
+        let board = |time: serde_json::Value| {
+            compose_body(vec![
+                compose_item(WITH_OUTRO, (0, 0, 160, 240), time),
+                // A still rides along to prove the pass leaves every other
+                // kind of time alone.
+                compose_item(
+                    NO_OUTRO,
+                    (160, 0, 160, 240),
+                    serde_json::json!({ "kind": "still", "at_cs": 50 }),
+                ),
+            ])
+        };
+        let mut named = board(serde_json::json!({
+            "kind": "outro_span", "start_cs": 100, "end_cs": 1200
+        }));
+        let explicit = board(serde_json::json!({
+            "kind": "span", "start_cs": 100, "end_cs": 794
+        }));
+        resolve_outro_spans(&mut db, &mut named).await.unwrap();
+        assert_eq!(named, explicit, "the resolved document IS the explicit one");
+
+        let settings = test_settings();
+        let preset = policy_preset(&settings, &test_context("local"), "mosaic-mp4").unwrap();
+        let limits = ComposeLimits::from_config();
+        let key = |body: &ComposeRequest| {
+            let doc = compose::resolve_compose(body, &preset, limits).expect("a valid document");
+            ComposeParams::resolve(doc, preset.clone()).cache_key()
+        };
+        assert_eq!(key(&named), key(&explicit));
+
+        // And the invariant that makes that hold: an unresolved one never
+        // reaches the hash.
+        let rejection = compose::resolve_compose(
+            &board(serde_json::json!({
+                "kind": "outro_span", "start_cs": 100, "end_cs": 1200
+            })),
+            &preset,
+            limits,
+        )
+        .expect_err("the resolver refuses an unresolved outro span");
+        assert_eq!(rejection.reason, "unresolved_outro_span");
     }
 
     /// The point of resolving `cut=outro` at the edge, proven through the
