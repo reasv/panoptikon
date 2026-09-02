@@ -813,6 +813,58 @@ fn admitted_units(entry: &WorkerEntry, anchor: u64, knee: Option<u64>) -> u64 {
 struct Settled {
     update: Option<ProfileUpdate>,
     death: Option<DeathNegative>,
+    /// What this window taught the ledger, for the log. Owns its strings so
+    /// the line is formatted after the lock is dropped.
+    window: Option<WindowSettled>,
+}
+
+/// One settled window as the log describes it: the outcome, what the ingest
+/// found, and the ramp/ratchet state the update left behind.
+struct WindowSettled {
+    inference_id: String,
+    gpu: String,
+    outcome: &'static str,
+    /// `Some` when the window is a memory negative, which is a user-visible
+    /// degradation and therefore a `warn!` rather than a `debug!`.
+    negative_reason: Option<&'static str>,
+    high_water_samples: usize,
+    throughput_samples: usize,
+    ramp_step: u32,
+    deflation: u32,
+    clean_windows: u32,
+    max_units_measured: u64,
+}
+
+impl WindowSettled {
+    fn emit(self) {
+        match self.negative_reason {
+            Some(reason) => tracing::warn!(
+                model = %self.inference_id,
+                gpu = %self.gpu,
+                outcome = self.outcome,
+                reason,
+                high_water_samples = self.high_water_samples,
+                throughput_samples = self.throughput_samples,
+                ramp_step = self.ramp_step,
+                deflation = self.deflation,
+                clean_windows = self.clean_windows,
+                max_units_measured = self.max_units_measured,
+                "settled a granted window"
+            ),
+            None => tracing::debug!(
+                model = %self.inference_id,
+                gpu = %self.gpu,
+                outcome = self.outcome,
+                high_water_samples = self.high_water_samples,
+                throughput_samples = self.throughput_samples,
+                ramp_step = self.ramp_step,
+                deflation = self.deflation,
+                clean_windows = self.clean_windows,
+                max_units_measured = self.max_units_measured,
+                "settled a granted window"
+            ),
+        }
+    }
 }
 
 /// A replica died mid-window on a unified board and the ledger halved its
@@ -852,6 +904,13 @@ struct Ingested {
     /// High-water (pool-growing, units-bearing, non-negative) samples that
     /// entered the fit. Growth is earned on these and nothing else.
     high_water_samples: usize,
+    /// Warm-pool, budget-spending samples that entered the knee ring.
+    /// Observability only — nothing reads it to make a decision.
+    throughput_samples: usize,
+    /// Which kind of negative was seen, for the settle log's `reason`. Both
+    /// fold into [`Self::negative`], which is what the accounting reads.
+    oom: bool,
+    throughput_collapse: bool,
 }
 
 /// Whether this board's free reading is worth a live driver query right now.
@@ -2018,6 +2077,7 @@ impl VramLedger {
                 Some(inference_id),
             );
         }
+        let seeded_from_store = seed.is_some();
         Self::seed_calibration_locked(
             &mut state,
             &key,
@@ -2027,6 +2087,9 @@ impl VramLedger {
             &gpu,
         );
         let id = state.next_id();
+        // Cloned for the admission line below, which is emitted with the lock
+        // dropped (the same reason the alarms above are).
+        let board = gpu.clone();
         state.workers.insert(
             id,
             WorkerEntry {
@@ -2059,6 +2122,16 @@ impl VramLedger {
             },
         );
         drop(state);
+        tracing::debug!(
+            model = %inference_id,
+            gpu = %board,
+            replica = id,
+            base_mb = ?report.base_mb,
+            base_method = report.base_method.as_deref().unwrap_or("<none>"),
+            reserved_at_load_mb = ?report.reserved_at_load_mb,
+            seeded_from_store,
+            "admitted a worker to a board's ledger"
+        );
         Some(Admission {
             ledger: Arc::clone(self),
             worker: id,
@@ -2281,6 +2354,9 @@ impl VramLedger {
         if cal.local_samples == 0 {
             return None;
         }
+        // Read before the write below moves it on, so the log can say which
+        // of the three watched quantities actually changed.
+        let previously_persisted = cal.persisted;
         let fit_version = cal.fit.map(|fit| fit.version).unwrap_or(0);
         // Only a knee this machine fitted travels, for the same reason only a
         // local fit does. Quantized to a bucket edge, so "changed at all" and
@@ -2307,6 +2383,25 @@ impl VramLedger {
         cal.persisted = Some((max_units_measured, current.1, current.2));
         // Only a locally derived fit travels; see the note above.
         let fit = cal.fit.filter(|_| cal.fit_is_local);
+        let reason = match previously_persisted {
+            Some(persisted) if persisted.1 != current.1 => "fit_changed",
+            Some(persisted) if persisted.2 != current.2 => "knee_changed",
+            Some(_) => "anchor_advanced",
+            None if current.1 > 0 => "fit_changed",
+            None => "anchor_advanced",
+        };
+        // Emitted under the ledger lock, unlike the settle line this rides
+        // inside: the suppression predicate above has already returned for
+        // every unchanged settle, so this fires only when something really
+        // moved — never once per window (cf. `record_free_locked`'s warn).
+        tracing::debug!(
+            model = %key.0,
+            gpu = %key.1,
+            reason,
+            max_units_measured,
+            fit_version,
+            "queued a calibration profile update for the store"
+        );
         Some(ProfileUpdate {
             inference_id: identity.0,
             epoch: identity.1,
@@ -2892,6 +2987,38 @@ impl VramLedger {
                     unit_budget,
                 },
             );
+        // Snapshotted under the lock and emitted with it dropped, exactly as
+        // the registration and settle paths do: formatting a `tracing` event
+        // under the ledger mutex puts every concurrent grant request behind a
+        // log write (review F8).
+        let external_mb = Self::external_locked(&state, &gpu).unwrap_or(0);
+        let issued = state.workers.get(&worker).map(|entry| {
+            let anchor = Self::anchor_locked(&state, entry);
+            (
+                entry.inference_id.clone(),
+                entry.effective_ramp_step(anchor),
+                entry.deflation,
+                Self::pricing_fit_locked(&state, entry).is_none(),
+            )
+        });
+        drop(state);
+        if let Some((model, ramp_step, deflation, pre_fit)) = issued {
+            tracing::debug!(
+                model = %model,
+                gpu = %gpu,
+                unit_budget,
+                mb,
+                share_mb = share.mb,
+                headroom_mb = headroom,
+                external_mb,
+                pre_fit,
+                ramp_step,
+                deflation,
+                squeezed,
+                window_requests,
+                "issued a memory grant"
+            );
+        }
         Some(GrantToken {
             ledger: Arc::clone(self),
             worker,
@@ -2928,6 +3055,9 @@ impl VramLedger {
         // request behind a log write (review F8).
         if let Some(death) = settled.death {
             death.emit();
+        }
+        if let Some(window) = settled.window {
+            window.emit();
         }
         if let (Some(update), Some(profiles)) = (settled.update, self.profiles.as_ref()) {
             profiles.record(update);
@@ -2966,8 +3096,11 @@ impl VramLedger {
             entry.fit_version_sent = 0;
         }
         let ingested = Self::ingest_locked(&mut state, worker, granted_units);
+        // Hoisted for the settle log only; the accounting below is unchanged.
+        let mut responded_negative = false;
         if let WindowOutcome::Responded { oom } = outcome {
             let negative = ingested.negative || oom;
+            responded_negative = negative;
             // Read *after* the ingest: this window's own high-water batches have
             // moved the anchor by now, and the ramp grows from the exponent that
             // anchor implies.
@@ -2996,7 +3129,41 @@ impl VramLedger {
             .is_some()
             .then(|| Self::pending_update_locked(&mut state, worker))
             .flatten();
-        Settled { update, death }
+        // Read after every update this settle performs, so the line describes
+        // the state the next window will be priced against. Formatted by
+        // [`Self::settle`] once the lock is dropped.
+        let window = state.workers.get(&worker).map(|entry| WindowSettled {
+            inference_id: entry.inference_id.clone(),
+            gpu: entry.gpu.clone(),
+            outcome: match outcome {
+                WindowOutcome::Responded { .. } if responded_negative => "negative",
+                WindowOutcome::Responded { .. } => "clean",
+                WindowOutcome::Aborted => "aborted",
+                WindowOutcome::WorkerDied => "worker_died",
+            },
+            negative_reason: if responded_negative {
+                if matches!(outcome, WindowOutcome::Responded { oom: true }) || ingested.oom {
+                    Some("oom")
+                } else {
+                    Some("throughput_collapse")
+                }
+            } else if death.is_some() {
+                Some("unified_board_death")
+            } else {
+                None
+            },
+            high_water_samples: ingested.high_water_samples,
+            throughput_samples: ingested.throughput_samples,
+            ramp_step: entry.ramp_step,
+            deflation: entry.deflation,
+            clean_windows: entry.clean_windows,
+            max_units_measured: Self::anchor_locked(&state, entry),
+        });
+        Settled {
+            update,
+            death,
+            window,
+        }
     }
 
     /// DP-2: a replica that died with a granted window in flight, on a board
@@ -3189,6 +3356,8 @@ impl VramLedger {
         }
 
         let mut negative = false;
+        let mut saw_oom = false;
+        let mut saw_collapse = false;
         let mut new_watermark = watermark;
         let mut fit_samples: Vec<FitSample> = Vec::new();
         let mut transients: Vec<(u64, u64)> = Vec::new();
@@ -3215,6 +3384,8 @@ impl VramLedger {
                 // could never actually take hold. The sample deflates and is
                 // then discarded; only the watermark moves.
                 negative = true;
+                saw_oom |= measurement.oom;
+                saw_collapse |= measurement.throughput_collapse;
                 continue;
             }
             let units = measurement.units.filter(|units| *units > 0);
@@ -3312,6 +3483,7 @@ impl VramLedger {
             entry.fit_watermark = new_watermark;
         }
         let high_water_samples = fit_samples.len();
+        let throughput_samples = throughput.len();
         let cal = state.calibration.entry(key).or_default();
         for sample in fit_samples {
             cal.samples.push_back(sample);
@@ -3362,6 +3534,9 @@ impl VramLedger {
         Ingested {
             negative,
             high_water_samples,
+            throughput_samples,
+            oom: saw_oom,
+            throughput_collapse: saw_collapse,
         }
     }
 
@@ -3400,6 +3575,20 @@ impl VramLedger {
             // be persisted as local evidence.
             cal.fit_is_local = true;
         }
+        // Under the lock for the same reason `pending_update_locked`'s line
+        // is: the `unchanged` gate above has already returned for every settle
+        // that re-derived the same fit, so this is a change event, not a
+        // per-window one.
+        tracing::debug!(
+            model = %key.0,
+            gpu = %key.1,
+            slope_mb_per_unit = fit.slope_mb_per_unit,
+            intercept_mb = fit.intercept_mb,
+            residual_mb = fit.residual_mb,
+            samples = fit.samples,
+            version = fit.version,
+            "refitted the memory cost model"
+        );
     }
 
     /// Re-fit the throughput knee from this model's observation ring.
@@ -3608,6 +3797,8 @@ impl VramLedger {
             let at = Instant::now();
             let mut state = ledger.lock();
             let mut answered = false;
+            // Snapshotted under the lock, logged once it is dropped (review F8).
+            let mut refreshed = Vec::new();
             let uuids: Vec<String> = state.gpus.keys().cloned().collect();
             for uuid in uuids {
                 let found = boards
@@ -3618,6 +3809,13 @@ impl VramLedger {
                     if uuid == gpu {
                         answered = true;
                     }
+                    // Read before the record below replaces it: how stale the
+                    // reading this refresh supersedes had become.
+                    let previous_age_ms = state
+                        .gpus
+                        .get(&uuid)
+                        .and_then(|board| board.free.as_ref())
+                        .map(|sample| at.saturating_duration_since(sample.at).as_millis() as u64);
                     // No total and no model: this is the orchestrator's own
                     // driver reading, not a worker's claim about which board
                     // it is on — and `MemoryQuery::Mps` deliberately reports
@@ -3633,8 +3831,36 @@ impl VramLedger {
                         None,
                         None,
                     );
+                    let total_mb = state.gpus.get(&uuid).map_or(0, |board| board.total_mb);
+                    let external_mb = Self::external_locked(&state, &uuid).unwrap_or(0);
+                    // The record above is allowed to *drop* the reading — a
+                    // fresher sample already overtook it, or a
+                    // non-authoritative source offered it to a board that has
+                    // seen an authoritative one. The line must not claim a
+                    // refresh those paths discarded, so it carries whether the
+                    // board's sample is in fact this probe's.
+                    let recorded = state
+                        .gpus
+                        .get(&uuid)
+                        .and_then(|board| board.free.as_ref())
+                        .is_some_and(|sample| sample.at == at);
+                    refreshed.push((
+                        uuid,
+                        free_mb,
+                        total_mb,
+                        external_mb,
+                        previous_age_ms,
+                        recorded,
+                    ));
                 }
             }
+            // Read before the stamp below overwrites it: it is cleared on
+            // every success, so `Some` here means the previous attempt already
+            // failed and this one continues a streak.
+            let was_failing = state
+                .gpus
+                .get(&gpu)
+                .is_some_and(|board| board.last_refresh_failed_at.is_some());
             // Only the board this refresh was started for clears its own
             // in-flight flag: clearing everyone's would let a second board
             // start a redundant probe while this one is still running, and
@@ -3642,6 +3868,44 @@ impl VramLedger {
             if let Some(board) = state.gpus.get_mut(&gpu) {
                 board.refreshing = false;
                 board.last_refresh_failed_at = if answered { None } else { Some(at) };
+            }
+            drop(state);
+            for (uuid, free_mb, total_mb, external_mb, previous_age_ms, recorded) in refreshed {
+                tracing::debug!(
+                    gpu = %uuid,
+                    source,
+                    free_mb,
+                    total_mb,
+                    external_mb,
+                    previous_age_ms = ?previous_age_ms,
+                    recorded,
+                    "refreshed the board's free memory from the host probe"
+                );
+            }
+            // Only the *first* failure of a streak warns. A board this probe
+            // never enumerates fails every attempt, and the backoff spaces
+            // those one `EXTERNAL_SAMPLE_MAX_AGE` apart for as long as traffic
+            // keeps asking — a warning on each would be six a minute for a
+            // condition the shrink clamp already makes safe.
+            if !answered {
+                if was_failing {
+                    tracing::debug!(
+                        gpu = %gpu,
+                        source,
+                        backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
+                        "the host memory probe still answers nothing for this \
+                         board; still on the previous free sample"
+                    );
+                } else {
+                    tracing::warn!(
+                        gpu = %gpu,
+                        source,
+                        backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
+                        "the host memory probe answered nothing for this board; \
+                         keeping the previous free sample and backing off before \
+                         the next attempt"
+                    );
+                }
             }
         });
     }

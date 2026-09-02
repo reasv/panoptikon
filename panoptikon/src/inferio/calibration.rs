@@ -925,7 +925,7 @@ impl CalibrationStore {
     /// update stays **pending** and rides on the next trigger (a later
     /// window, or the shutdown flush), so nothing is dropped either.
     pub fn write_pending(&self) {
-        let (path, body) = {
+        let (path, body, profiles) = {
             let mut state = self.lock();
             state.flush_scheduled = false;
             if !state.pending {
@@ -956,8 +956,9 @@ impl CalibrationStore {
                 schema: SCHEMA,
                 profile: state.local.clone(),
             };
+            let profiles = file.profile.len();
             match toml::to_string_pretty(&file) {
-                Ok(body) => (self.paths.local_path.clone(), body),
+                Ok(body) => (self.paths.local_path.clone(), body, profiles),
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
@@ -975,6 +976,12 @@ impl CalibrationStore {
                 let mut state = self.lock();
                 state.local_mtime = file_mtime(&path);
                 state.local_loaded = true;
+                drop(state);
+                tracing::info!(
+                    path = %path.display(),
+                    profiles,
+                    "wrote the local calibration store"
+                );
             }
             Err(err) => {
                 tracing::warn!(
