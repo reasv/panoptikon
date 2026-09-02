@@ -724,7 +724,14 @@ mod tests {
                 .fetch_all(&mut conn)
                 .await
                 .unwrap();
-        assert_eq!(cols.len(), 1, "init.sql must not have been executed");
+        let names: Vec<&str> = cols.iter().map(|col| col.1.as_str()).collect();
+        assert!(
+            names.contains(&"fake_marker") && !names.contains(&"item_sha256"),
+            "init.sql must not have been executed: {names:?}"
+        );
+        // ...while the post-snapshot `ALTER TABLE thumbnails` did run on it,
+        // which is the other half of the same guarantee.
+        assert!(names.contains(&"media_type"), "{names:?}");
         // ...and the migration that came after it did run.
         sqlx::query("SELECT COUNT(*) FROM visual_attempts")
             .fetch_one(&mut conn)

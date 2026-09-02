@@ -1,0 +1,41 @@
+-- Whether an image's pixels are anywhere non-opaque
+-- (docs/thumbnail-format-implementation.md §2, R4).
+--
+--   NULL   never examined (pre-upgrade item, or one whose pixels have not
+--          been decoded since this column existed)
+--   0      examined: every pixel is opaque
+--   1      examined: at least one pixel is not
+--
+-- Measured from **pixels**, never from the header: half of all PNGs carry an
+-- alpha channel and only 2.3% of them use it, so trusting the channel would
+-- push a whole library onto a codec the grid decodes 2.2-2.7x slower for
+-- nothing. The measurement rides the one pass that already holds the decoded
+-- image (`build_image_renditions`), so it costs no decode of its own.
+--
+-- Deliberately **unversioned**, like `rotation` and the codec columns: whether
+-- a pixel is opaque is a fact about the file, not a detector verdict a later
+-- threshold could overturn.
+--
+-- Immutable per item, like duration/width/height: any content change yields a
+-- new sha256 and therefore a new item. The write is guarded on
+-- `has_transparency IS NULL` all the same, so two passes over identical
+-- content cannot disagree.
+ALTER TABLE items ADD COLUMN has_transparency INTEGER;
+
+-- Serves the backfill dispatch question "is there an image whose pixels
+-- nothing has examined for transparency". Partial on the NULL state so the
+-- population drains away as the backfill runs, instead of carrying every row
+-- in the database forever.
+--
+-- `type` leads because items.type holds the whole mime string ('image/png'),
+-- so the population is a half-open range scan (`type >= 'image/' AND type <
+-- 'image0'`, '0' being the byte after '/'). Not `LIKE 'image/%'`: SQLite
+-- cannot serve a LIKE prefix from an index under the default case-insensitive
+-- LIKE, which is the anti-pattern this codebase has already paid for on
+-- sha256, tag namespaces and file_scans.
+--
+-- Only images are ever examined: a video's renditions come from a frame grid
+-- this generator wrote as an opaque JPEG, and the other picture-producing
+-- types (audio covers, PDF pages, HTML shots) likewise. Their rows keep a NULL
+-- forever and the `type` key means the dispatch seek never walks them.
+CREATE INDEX idx_items_transparency_pending ON items(type) WHERE has_transparency IS NULL;
