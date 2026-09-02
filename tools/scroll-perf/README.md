@@ -25,6 +25,7 @@ no dependencies. `ffmpeg`/`ffprobe` on PATH are needed only by `gen-images.mjs`.
 | `server.mjs` | static server for the synthetic page (default port 8777) |
 | `grid.html` | the synthetic virtualized grid |
 | `gen-images.mjs` | generates the synthetic image set into `imgtest/` |
+| `trace-summary.mjs` | category + thread breakdown of a saved `--trace` file |
 | `.gitignore` | `imgtest/` and saved traces are build artifacts, never committed |
 
 ## Launching the instrumented browser
@@ -102,7 +103,7 @@ node cdp-scroll-bench.mjs --port 9231 --url "http://127.0.0.1:8777/?mode=t1024&c
 node cdp-scroll-bench.mjs --port 9231 --url "http://127.0.0.1:8777/?mode=full&cols=5"  --dir up   --warm
 ```
 
-`grid.html` query params: `mode=full|t4096|t1024|t512`, `cols`, `ch` (cell
+`grid.html` query params: `mode=full|t4096|t1024|t512|t256|t128`, `cols`, `ch` (cell
 height px), `rows`, `overscan`, `nocache=1` (defeat the HTTP cache for
 cold-transfer runs).
 
@@ -119,7 +120,9 @@ cold-transfer runs).
 | `png-16mp.png` | 4600×3500 | ~7.6 MB | **over** today's rule — decode-cost upper bound |
 | `t4096-*.jpg` | long side ≤ 4096 | ~1.1–1.2 MB | what panoptikon stores **today** |
 | `t1024-*.jpg` | short side 1024 | ~0.2 MB | proposed `grid-m` |
-| `t512-*.jpg` | short side 512 | ~0.06 MB | proposed `grid-s` |
+| `t512-*.jpg` | short side 512 | ~0.06 MB | `grid-s` |
+| `t256-*.jpg` | short side 256 | ~0.02 MB | `grid-xs` -- what a 140 px cell asks for |
+| `t128-*.jpg` | short side 128 | ~0.007 MB | a HYPOTHETICAL rung below `grid-xs` |
 
 Read `mode=full` honestly: the three JPEGs are all within today's
 serve-directly rule, but `png-16mp.png` is not — at 7.6 MB and 4600 px wide it
@@ -183,6 +186,12 @@ node cdp-scroll-bench.mjs --port 9231 \
 --pulse            scroll 600ms of every 1100ms (start/stop, not continuous)
 --blockImages      block image requests via CDP -- isolates JS cost
 --blockPattern <g> override the blocked globs (default: gateway thumbnails + /img/)
+--rewrite <a>=<b>  rewrite substring <a> to <b> in every request URL (comma-separated
+                   for several); --rewrite size=grid-xs=size=grid-s measures the
+                   page unchanged but served the PREVIOUS thumbnail tier
+--dpr <n>          emulate devicePixelRatio <n> over the same PHYSICAL pixel area
+                   (the CSS viewport is rescaled by the dpr ratio, so the run
+                   paints the same device pixels and stays comparable)
 --allowHidden      measure even if the window is hidden (results are junk)
 --trace [file]     record a DevTools trace; with a filename, also save it
                    (e.g. --trace trace-out.json -- gitignored)
@@ -278,6 +287,27 @@ the image tier is the wall; `FunctionCall` / `EventDispatch` dominating means
 the JS is.
 
 Saved traces are ~100 MB each and are gitignored.
+
+### `trace-summary.mjs` — where the time actually went
+
+`traceSummaryMs` flattens every thread into one list of event names, which is
+the wrong shape for the question a tier decision asks: image decode is split
+across the raster workers and the main thread, script is main-thread only, and
+summing them hides exactly that distinction.
+
+```bash
+node cdp-scroll-bench.mjs --port 9231 --url ... --trace trace-s1.json
+node trace-summary.mjs trace-s1.json            # or --json, --top 20, --whole
+```
+
+It reports self time by **category** (`imageDecode`, `raster`, `script`,
+`layout`, `paint`, …) crossed with **thread class** (`main`, `compositor`,
+`raster+pool`, `browser+gpu`), the top events by self time, and the decoded
+image count with their source dimensions where the trace carries them.
+
+It clips to the `scrollbench-start` / `scrollbench-end` user-timing marks the
+driver emits around the measured scroll, so the totals exclude navigation,
+settle and pre-seek. `--whole` reports the untrimmed trace.
 
 ## Scenario matrix (plan §1)
 

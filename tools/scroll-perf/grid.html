@@ -9,7 +9,8 @@
   work, so a run measures image cost alone.
 
   Query params:
-    mode=full|t4096|t1024|t512   image set (see SETS below)
+    mode=full|t4096|t1024|t512|t256|t128
+                                 image set (see SETS below)
     cols=<n>                     columns per row (default 5)
     ch=<px>                      cell height (default 608, ~4K/5-col cell)
     rows=<n>                     row count (default: enough for ~120000px)
@@ -45,12 +46,16 @@ const NOCACHE = Q.get('nocache') ? '&n=' + Math.random().toString(36).slice(2) :
 //          over-the-rule upper bound", not as four of today's served files.
 // t4096  = today's stored thumbs (LONG side capped at 4096)
 // t1024  = proposed grid-m tier (SHORT side 1024)
-// t512   = proposed grid-s tier (SHORT side 512)
+// t512   = grid-s tier (SHORT side 512)
+// t256   = grid-xs tier (SHORT side 256) -- what a 140px cell asks for today
+// t128   = a HYPOTHETICAL rung below grid-xs (SHORT side 128)
 const SETS = {
   full:  ['jpeg-12mp.jpg','jpeg-33mp.jpg','jpeg-100mp.jpg','png-16mp.png'],
   t4096: ['t4096-jpeg-12mp.jpg','t4096-jpeg-33mp.jpg','t4096-jpeg-100mp.jpg','t4096-png-16mp.jpg'],
   t1024: ['t1024-jpeg-12mp.jpg','t1024-jpeg-33mp.jpg','t1024-jpeg-100mp.jpg','t1024-png-16mp.jpg'],
   t512:  ['t512-jpeg-12mp.jpg','t512-jpeg-33mp.jpg','t512-jpeg-100mp.jpg','t512-png-16mp.jpg'],
+  t256:  ['t256-jpeg-12mp.jpg','t256-jpeg-33mp.jpg','t256-jpeg-100mp.jpg','t256-png-16mp.jpg'],
+  t128:  ['t128-jpeg-12mp.jpg','t128-jpeg-33mp.jpg','t128-jpeg-100mp.jpg','t128-png-16mp.jpg'],
 };
 const SET = SETS[MODE];
 if (!SET) throw new Error('unknown mode: ' + MODE + ' (want ' + Object.keys(SETS).join('|') + ')');
