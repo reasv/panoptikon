@@ -529,6 +529,20 @@ pub(crate) async fn update_config(
 /// Older remote Python Inferio servers do not have it, so a 404 preserves
 /// their previous behavior; every other discovery failure is surfaced.
 /// Load-time Inferio validation remains authoritative for current servers.
+///
+/// **Known, unaddressed, and older than any of this**: `PUT /api/jobs/config`
+/// calls this unconditionally, so a *discovery* failure — an inference
+/// upstream that is simply not running — fails the whole save with a 5xx
+/// (observed as a 508 through the gateway) even when the config being saved
+/// changes nothing an inference server has an opinion about. Every unrelated
+/// settings edit, `thumbnail_formats` included, is unsaveable while the
+/// upstream is down. Recorded rather than fixed: the behaviour predates this
+/// branch, exists identically on master, and the right shape of the fix — skip
+/// the probe when no cron job names a model, or degrade an unreachable
+/// upstream to "cannot validate, save anyway" — is a decision about inference
+/// configuration, not about thumbnails. Do not narrow it as a side effect of
+/// an unrelated change; the `binary` quantizer lesson (CLAUDE.md) is that the
+/// commit path must not reject a config the UI round-trips.
 async fn validate_external_inputs(inference_ids: &[String]) -> Result<(), ApiError> {
     let status = match job_inference_context()
         .primary
