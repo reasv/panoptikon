@@ -8077,27 +8077,36 @@ LIMIT 1
         encoded.truncate(200);
         fs::write(env.media_dirs[0].join("truncated.png"), &encoded).unwrap();
 
+        // This item's own column, by path: the shared scan root is not this
+        // test's alone, and the question is about one file.
+        async fn flag(conn: &mut sqlx::SqliteConnection) -> Option<i64> {
+            sqlx::query_scalar(
+                "SELECT i.has_transparency FROM items i \
+                 JOIN files f ON f.sha256 = i.sha256 \
+                 WHERE f.path LIKE '%truncated.png'",
+            )
+            .fetch_one(conn)
+            .await
+            .unwrap()
+        }
+
         // The ledger takes as many attempts to settle as the failure's class
         // is worth — what matters is that the verdict lands at all, and that
-        // it is the marker's arrival that lands it.
+        // the marker's arrival is what lands it.
         let mut settled = None;
         for scan in 1..=6 {
             env.scan().await;
             let mut conn = env.read().await;
-            let flags = transparency_flags(&mut conn).await;
+            let measured = flag(&mut conn).await;
             drop(conn);
-            if flags == vec![Some(0)] {
-                settled = Some(scan);
+            if measured.is_some() {
+                settled = Some((scan, measured));
                 break;
             }
-            assert_eq!(
-                flags,
-                vec![None],
-                "the column holds verdicts: nothing measured these pixels"
-            );
         }
-        assert!(
-            settled.is_some(),
+        assert_eq!(
+            settled.map(|(_, measured)| measured),
+            Some(Some(0)),
             "a picture nobody can decode has no rendition for anything to be \
              transparent in — without that verdict the partial index never \
              drains and every scan dispatches a pass that cannot answer"
@@ -8108,7 +8117,7 @@ LIMIT 1
         let (_, totals) = env.scan().await;
         assert_eq!(totals.backfilled_visuals, 0);
         let mut conn = env.read().await;
-        assert_eq!(transparency_flags(&mut conn).await, vec![Some(0)]);
+        assert_eq!(flag(&mut conn).await, Some(0));
     }
 
     /// Whether every stored display rendition carries bytes — the difference
