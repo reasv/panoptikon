@@ -99,6 +99,22 @@ pub(crate) struct SystemConfig {
     /// not revert visuals already regenerated against a trimmed range (§8.1).
     #[serde(default = "default_true")]
     pub detect_outros: bool,
+    /// Which container formats stored thumbnails may use
+    /// (docs/thumbnail-format-implementation.md §2, R5).
+    ///
+    /// It *constrains* the format rules rather than deciding anything: with
+    /// `webp` absent every WebP verdict becomes JPEG (alpha flattened), with
+    /// `jpeg` absent every JPEG verdict becomes WebP — the
+    /// storage-constrained deployment, which knowingly pays WebP's measured
+    /// 2.2-2.7x decode cost in the grid. A list naming neither is treated as
+    /// the default with a warning and never rejected at commit: the settings
+    /// UI round-trips the whole config, so a reject would break every
+    /// unrelated save.
+    ///
+    /// Changing it regenerates the affected renditions on the next scan; the
+    /// database file only shrinks after the maintenance VACUUM.
+    #[serde(default = "default_thumbnail_formats")]
+    pub thumbnail_formats: Vec<String>,
     #[serde(default)]
     pub enable_cron_job: bool,
     #[serde(default = "default_cron_schedule")]
@@ -160,6 +176,10 @@ fn default_cron_schedule() -> String {
     "0 3 * * *".to_string()
 }
 
+fn default_thumbnail_formats() -> Vec<String> {
+    vec!["jpeg".to_string(), "webp".to_string()]
+}
+
 impl Default for SystemConfig {
     fn default() -> Self {
         Self {
@@ -170,6 +190,7 @@ impl Default for SystemConfig {
             scan_html: false,
             scan_pdf: false,
             detect_outros: true,
+            thumbnail_formats: default_thumbnail_formats(),
             enable_cron_job: false,
             cron_schedule: default_cron_schedule(),
             cron_jobs: Vec::new(),
