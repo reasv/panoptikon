@@ -126,6 +126,16 @@ pub(crate) const DISPLAY_MAX_FILE_SIZE_ANIMATED: u64 = 5 * 1024 * 1024;
 /// of rows.
 pub(crate) const WEBP_MAX_SIDE: u32 = 16383;
 
+/// The largest side a JPEG can encode: its frame header carries the
+/// dimensions in 16 bits.
+///
+/// Four times WebP's, so it is only reached by the shapes that fell back to
+/// JPEG *because* of WebP's — a 200x100000 strip keeps its short side under
+/// the 2560 cap and its length with it. Past this there is no container left
+/// to store the rendition in, which is a verdict about the shape and not an
+/// encoder failure to report ([`display_plan`]).
+pub(crate) const JPEG_MAX_SIDE: u32 = 65535;
+
 /// Grid tiers: JPEG quality. One step below the display tier's, because a
 /// grid cell paints the picture at a fraction of its size and the ladder's
 /// whole point is bytes and decode time per cell.
@@ -263,6 +273,17 @@ impl RenditionFormat {
             Self::Webp => "image/webp",
         }
     }
+
+    /// Whether this container can name a rendition of these dimensions at
+    /// all. Both limits are the format's own — libwebp's 16383 and JPEG's
+    /// 16-bit frame header — and neither is a quality or policy question.
+    fn can_hold(self, width: u32, height: u32) -> bool {
+        let long = width.max(height);
+        match self {
+            Self::Jpeg => long <= JPEG_MAX_SIDE,
+            Self::Webp => long <= WEBP_MAX_SIDE,
+        }
+    }
 }
 
 /// Which quality half of the ladder a rendition belongs to. The two numbers
@@ -331,7 +352,7 @@ impl FormatPolicy {
             RenditionFormat::Webp if !self.webp => RenditionFormat::Jpeg,
             format => format,
         };
-        if allowed == RenditionFormat::Webp && width.max(height) > WEBP_MAX_SIDE {
+        if allowed == RenditionFormat::Webp && !allowed.can_hold(width, height) {
             return RenditionFormat::Jpeg;
         }
         allowed
@@ -449,14 +470,21 @@ pub(crate) fn display_plan(
         };
     }
     let (width, height) = display_dimensions(width, height);
+    let format = policy.resolve(display_format(class, has_transparency), width, height);
+    // A shape neither container can name. The 2560 cap is on the *short*
+    // side, so a 200x100000 strip keeps every one of its rows: too long for
+    // WebP, which sends it to JPEG, and then too long for JPEG's 16-bit frame
+    // header too. That is a verdict about the shape — there is no rendition
+    // to store — and it has to be reached *here*, or the plan names a
+    // rendition the generator cannot produce and the item is dispatched, made
+    // to fail and dispatched again on every scan forever.
+    if !format.can_hold(width, height) {
+        return DisplayPlan::Original;
+    }
     DisplayPlan::Thumbnail {
         width,
         height,
-        format: policy.resolve(
-            display_format(class, has_transparency),
-            width,
-            height,
-        ),
+        format,
     }
 }
 
@@ -1116,8 +1144,10 @@ fn encode_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
     let rgb = image.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     // The container's own limit, not ours: JPEG's frame header carries the
-    // dimensions in 16 bits. Only a rendition of a strip tall enough to have
-    // been scaled *down* to over 65535 rows can reach it.
+    // dimensions in 16 bits. Nothing in the ladder reaches it — [`display_plan`]
+    // refuses to plan a rendition past [`JPEG_MAX_SIDE`], and a grid tier is at
+    // most `2 * tier` on its long side — so this is the encoder's guard
+    // against a caller that has not asked the rule.
     let (Ok(width_16), Ok(height_16)) = (u16::try_from(width), u16::try_from(height)) else {
         return Err(format!("{width}x{height} does not fit a JPEG frame header"));
     };
@@ -1373,6 +1403,35 @@ mod tests {
         assert_eq!(
             policy.resolve(RenditionFormat::Webp, 600, WEBP_MAX_SIDE),
             RenditionFormat::Webp
+        );
+    }
+
+    // The shape that falls off the end of *both* containers. A 200x100000
+    // strip is over the lossless class's byte bound, so a rendition is owed;
+    // the 2560 cap is on the short side, so it keeps all 100000 rows; WebP
+    // refuses them at 16383 and JPEG's 16-bit frame header at 65535. With no
+    // container left the original is the answer — and it has to be answered
+    // by the *rule*, or the dispatcher plans a rendition the generator cannot
+    // make and re-dispatches the item on every scan forever.
+    #[test]
+    fn a_strip_neither_container_can_name_keeps_its_original() {
+        let policy = FormatPolicy::default();
+        assert_eq!(
+            display_plan(PNG, false, None, 4 * MB, 200, 100_000, policy),
+            DisplayPlan::Original
+        );
+        // The boundary: JPEG's own limit, exactly on it, is still a rendition.
+        assert_eq!(
+            display_plan(PNG, false, None, 4 * MB, 200, JPEG_MAX_SIDE, policy),
+            DisplayPlan::Thumbnail {
+                width: 200,
+                height: JPEG_MAX_SIDE,
+                format: RenditionFormat::Jpeg,
+            }
+        );
+        assert_eq!(
+            display_plan(PNG, false, None, 4 * MB, 200, JPEG_MAX_SIDE + 1, policy),
+            DisplayPlan::Original
         );
     }
 
