@@ -789,4 +789,31 @@ mod tests {
             .unwrap();
         assert_eq!(item_id.0, 7);
     }
+
+    // `data_log.batch_size` is NOT NULL, so an auto job (no user cap) writes
+    // the 0 sentinel — the value `jobs::extraction::logged_batch_size`
+    // produces for `None`. The row must insert and read back as 0 rather
+    // than being rejected or silently defaulted.
+    #[tokio::test]
+    async fn an_auto_job_logs_a_zero_batch_size() {
+        let mut dbs = setup_test_databases().await;
+        let job_id = add_data_log(
+            &mut dbs.index_conn,
+            "2026-07-30T00:00:00",
+            None,
+            &["clip".to_string()],
+            "clip/ViT-H-14",
+            0,
+        )
+        .await
+        .unwrap();
+
+        let logged: (i64, Option<f64>) =
+            sqlx::query_as("SELECT batch_size, threshold FROM data_log WHERE job_id = ?")
+                .bind(job_id)
+                .fetch_one(&mut dbs.index_conn)
+                .await
+                .unwrap();
+        assert_eq!(logged, (0, None), "auto logs as the 0 sentinel");
+    }
 }

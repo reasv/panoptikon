@@ -13,16 +13,75 @@ use std::process::Stdio;
 
 use crate::config::Accelerator;
 
+/// The MPS allocator's ceiling, as a fraction of Metal's
+/// `recommendedMaxWorkingSetSize` — the same figure the ledger's MPS board is
+/// budgeted against (docs/unified-memory-admission.md, backend A).
+///
+/// Pinned to 1.0 so torch's hard out-of-memory error fires exactly at that
+/// boundary. The build default has drifted across torch versions and can sit
+/// *above* 1.0, i.e. inside the regime where macOS compresses and swaps
+/// instead of failing — which is the silent-slowdown failure mode the whole
+/// unified design is built to price, and the one the collapse detector has to
+/// catch when nothing raises. The resulting error is a `RuntimeError` whose
+/// text the OOM classifier already recognises.
+///
+/// The **low** watermark is pinned with it, and not for tuning: torch asserts
+/// `high >= low` when the MPS allocator initializes, so an ambient
+/// `PYTORCH_MPS_LOW_WATERMARK_RATIO` above 1.0 — a plausible thing to find in
+/// the shell of someone who has been tuning local ML on this machine — would
+/// make every worker fail at startup once we pin the high one. Setting both
+/// makes the pair coherent whatever the environment says. 1.0 also means the
+/// allocator's near-ceiling garbage collection coincides with its hard error
+/// instead of preceding it (see the peak approximation in
+/// docs/inferio-worker-protocol.md).
+const MPS_WATERMARK_ENV: [(&str, &str); 2] = [
+    ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.0"),
+    ("PYTORCH_MPS_LOW_WATERMARK_RATIO", "1.0"),
+];
+
+/// The device an impl must run on, read by `inferio.impl.utils.get_device`
+/// before it probes for one itself (docs/unified-memory-admission.md, backend
+/// C, "Device coherence").
+///
+/// It exists because the two sides could otherwise disagree about the same
+/// host. `get_device()` probes cuda → mps → cpu and takes the first that
+/// answers, which is a question about the *machine*; the orchestrator's
+/// pricing is a question about the **installed wheels** (the setup sentinel)
+/// and the user's configuration. On a host where those differ — an
+/// `accelerator = "cpu"` Mac, or a box with an NVIDIA card whose venv holds
+/// the CPU wheels — the model would run on a device nothing was budgeted
+/// against. Writing the answer down removes the disagreement instead of
+/// hoping the two probes agree.
+///
+/// `cpu` is the only value defined today; an unknown one is ignored with a
+/// warning worker-side rather than failing a load, so a future value cannot
+/// brick an older worker.
+pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
+
 /// Env vars for an inference worker for a **resolved** accelerator.
 ///
-/// HIP/HSA injection only for [`Accelerator::Rocm`]. `auto` is treated as
-/// empty (resolve first). Explicit `cpu`/`cuda` never inject, even if
-/// `/opt/rocm` exists on the host.
+/// HIP/HSA injection only for [`Accelerator::Rocm`], the MPS watermarks only
+/// for [`Accelerator::Mps`], and [`DEVICE_ENV_VAR`] only for
+/// [`Accelerator::Cpu`]. `auto` is treated as empty (resolve first).
+/// Explicit `cuda` never injects, even if `/opt/rocm` exists on the host.
+///
+/// The CPU arm keys off exactly the same resolved accelerator
+/// `gpu::probe` builds the CPU admission board from, which is what makes
+/// "priced against RAM" and "runs on the CPU" one decision rather than two
+/// that have to agree. It is written even on a CPU host whose RAM statistics
+/// could not be read and which therefore has *no* board: coherence does not
+/// depend on pricing having succeeded, and the failure mode it prevents —
+/// a model quietly running on a GPU the orchestrator does not believe in — is
+/// the same either way.
 pub fn worker_env(accelerator: Accelerator) -> Vec<(String, String)> {
-    if accelerator == Accelerator::Rocm {
-        hip_worker_env()
-    } else {
-        Vec::new()
+    match accelerator {
+        Accelerator::Rocm => hip_worker_env(),
+        Accelerator::Mps => MPS_WATERMARK_ENV
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect(),
+        Accelerator::Cpu => vec![(DEVICE_ENV_VAR.to_owned(), "cpu".to_owned())],
+        Accelerator::Cuda | Accelerator::Auto => Vec::new(),
     }
 }
 
@@ -31,7 +90,7 @@ pub fn worker_env(accelerator: Accelerator) -> Vec<(String, String)> {
 pub async fn probe_after_setup(accelerator: Accelerator, interpreter: &Path) -> anyhow::Result<()> {
     match accelerator {
         Accelerator::Rocm => probe_rocm_torch(interpreter).await,
-        Accelerator::Cpu | Accelerator::Cuda | Accelerator::Auto => Ok(()),
+        Accelerator::Cpu | Accelerator::Cuda | Accelerator::Mps | Accelerator::Auto => Ok(()),
     }
 }
 
@@ -245,10 +304,15 @@ mod tests {
 
     #[test]
     fn worker_env_only_for_resolved_rocm() {
-        assert!(worker_env(Accelerator::Cpu).is_empty());
         assert!(worker_env(Accelerator::Cuda).is_empty());
         // Unresolved auto must not inject; callers resolve first.
         assert!(worker_env(Accelerator::Auto).is_empty());
+        // `cpu` carries the device marker and nothing else — no HIP paths,
+        // no MPS watermarks.
+        assert_eq!(
+            worker_env(Accelerator::Cpu),
+            vec![("INFERIO_DEVICE".to_string(), "cpu".to_string())]
+        );
         // Rocm may be empty of HIP libs on hosts without ROCm, but on Linux
         // still carries MIOpen defaults when those env vars are unset. Off
         // Linux the whole HIP env is empty by design.
@@ -263,6 +327,66 @@ mod tests {
         }
         #[cfg(not(target_os = "linux"))]
         assert!(rocm.is_empty(), "non-Linux HIP env must be empty: {rocm:?}");
+    }
+
+    /// An MPS worker gets the allocator watermarks that make torch raise at
+    /// the recommended-max boundary instead of running on into macOS's
+    /// compression/swap regime, where nothing raises at all — **both** of
+    /// them, because torch asserts `high >= low` at allocator init and an
+    /// ambient low above 1.0 would otherwise fail every worker at startup.
+    #[test]
+    fn an_mps_worker_gets_the_allocator_watermarks() {
+        assert_eq!(
+            worker_env(Accelerator::Mps),
+            vec![
+                (
+                    "PYTORCH_MPS_HIGH_WATERMARK_RATIO".to_string(),
+                    "1.0".to_string()
+                ),
+                (
+                    "PYTORCH_MPS_LOW_WATERMARK_RATIO".to_string(),
+                    "1.0".to_string()
+                )
+            ]
+        );
+        for accelerator in [Accelerator::Cpu, Accelerator::Cuda, Accelerator::Auto] {
+            assert!(
+                !worker_env(accelerator)
+                    .iter()
+                    .any(|(key, _)| key.starts_with("PYTORCH_MPS")),
+                "{accelerator:?} must not carry MPS tuning"
+            );
+        }
+    }
+
+    /// Device coherence (docs/unified-memory-admission.md, backend C): a host
+    /// priced against system RAM must run its impls on the CPU, and no other
+    /// host may be told to. The `mps` case is the one that would otherwise
+    /// bite — an `accelerator = "cpu"` Mac is priced as a CPU board (DP-3)
+    /// and would run on Metal without this, while an `mps` Mac must not be
+    /// forced off it.
+    #[test]
+    fn only_a_cpu_host_pins_the_workers_device() {
+        assert_eq!(
+            worker_env(Accelerator::Cpu)
+                .iter()
+                .find(|(key, _)| key == DEVICE_ENV_VAR)
+                .map(|(_, value)| value.as_str()),
+            Some("cpu")
+        );
+        for accelerator in [
+            Accelerator::Cuda,
+            Accelerator::Rocm,
+            Accelerator::Mps,
+            Accelerator::Auto,
+        ] {
+            assert!(
+                !worker_env(accelerator)
+                    .iter()
+                    .any(|(key, _)| key == DEVICE_ENV_VAR),
+                "{accelerator:?} must not pin the worker's device"
+            );
+        }
     }
 
     #[test]

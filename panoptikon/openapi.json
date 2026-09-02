@@ -2489,7 +2489,7 @@
           {
             "name": "batch_size",
             "in": "query",
-            "description": "Batch Size",
+            "description": "Max Batch Size: an optional cap on how many items are processed at\nonce. Omitted (or null) means auto — the inference server sizes\nbatches itself.",
             "required": false,
             "schema": {
               "type": [
@@ -2575,7 +2575,7 @@
           {
             "name": "batch_size",
             "in": "query",
-            "description": "Batch Size",
+            "description": "Max Batch Size: an optional cap on how many items are processed at\nonce. Omitted (or null) means auto — the inference server sizes\nbatches itself.",
             "required": false,
             "schema": {
               "type": [
@@ -5956,6 +5956,75 @@
           }
         }
       },
+      "BatchHealth": {
+        "type": "object",
+        "description": "One measured GPU batch in [`ReplicaTelemetryHealth`].",
+        "required": [
+          "seq",
+          "age_ms"
+        ],
+        "properties": {
+          "age_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "allocated_before_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "duration_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "items": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Inputs in the batch (not cost-dimension units — see the worker\nprotocol's \"Memory sensing\").",
+            "minimum": 0
+          },
+          "peak_allocated_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "peak_reserved_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_before_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Per-worker sequence number; strictly increasing, gaps mean the ring\nevicted samples between reads.",
+            "minimum": 0
+          }
+        }
+      },
       "BinaryBlob": {
         "type": "string",
         "format": "binary",
@@ -6493,6 +6562,46 @@
           }
         }
       },
+      "CostHealth": {
+        "type": "object",
+        "description": "A model's cost dimension, as resolved from `metadata.cost`.",
+        "required": [
+          "unit",
+          "epoch",
+          "degraded"
+        ],
+        "properties": {
+          "aggregation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`count` | `sum` | `max-times-count`; absent for the `none` class."
+          },
+          "degraded": {
+            "type": "boolean",
+            "description": "True when the registry declared nothing usable and the conservative\n`(item, count)` fallback is in force."
+          },
+          "epoch": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "seed_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "First-touch batch before calibration; absent for the `none` class.",
+            "minimum": 0
+          },
+          "unit": {
+            "type": "string",
+            "description": "`item` | `pixel` | `token` | `audio-second` | `none`."
+          }
+        }
+      },
       "CreatePinboardRequest": {
         "allOf": [
           {
@@ -6523,7 +6632,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Optional cap on GPU batch size; `None` = auto (the default, and what\nthe one-time `batch_auto` migration reset every existing row to)."
           },
           "inference_id": {
             "type": "string"
@@ -7418,6 +7528,40 @@
           }
         }
       },
+      "FitHealth": {
+        "type": "object",
+        "description": "The fitted cost model in `GET /health`.",
+        "required": [
+          "slope_mb_per_unit",
+          "intercept_mb",
+          "residual_mb",
+          "samples",
+          "transient_samples"
+        ],
+        "properties": {
+          "intercept_mb": {
+            "type": "number",
+            "format": "double"
+          },
+          "residual_mb": {
+            "type": "number",
+            "format": "double"
+          },
+          "samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "slope_mb_per_unit": {
+            "type": "number",
+            "format": "double"
+          },
+          "transient_samples": {
+            "type": "integer",
+            "description": "Warm-pool transients retained as the diagnostic/validation series.\nNever used for admission.",
+            "minimum": 0
+          }
+        }
+      },
       "FolderValidation": {
         "type": "object",
         "required": [
@@ -7482,6 +7626,189 @@
           }
         }
       },
+      "GpuBudgetHealth": {
+        "type": "object",
+        "description": "One board's ledger state in `GET /health`.",
+        "required": [
+          "gpu_uuid",
+          "gpu_name",
+          "total_mb",
+          "external_mb",
+          "external_known",
+          "limit_mb",
+          "headroom_mb",
+          "charges_mb",
+          "footprints_mb",
+          "load_reservations_mb",
+          "grants_mb",
+          "grants_outstanding",
+          "margin",
+          "workers"
+        ],
+        "properties": {
+          "cap_fraction": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "charges_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What the residents actually cost the board: `Σ` per-worker\n`footprint + max(0, grants − pool growth)`. This — not\n`footprints_mb + grants_mb` — is what `headroom_mb` is derived from: a\npost-fit grant is denominated in the same memory the footprint's\npool-growth term already counts, so the two overlap per worker.",
+            "minimum": 0
+          },
+          "external_known": {
+            "type": "boolean",
+            "description": "False when no free-memory reading is known yet, in which case\n`external_mb` is 0 by assumption rather than by measurement."
+          },
+          "external_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.",
+            "minimum": 0
+          },
+          "external_sample_age_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "external_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which driver answered the freshest free reading: `\"nvml\"` or\n`\"torch\"` from a worker, `\"nvidia-smi\"` for a ledger-side staleness\nrefresh, and `\"amdgpu-sysfs\"` on ROCm hosts, where it is both."
+          },
+          "footprints_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "gpu_name": {
+            "type": "string"
+          },
+          "gpu_uuid": {
+            "type": "string"
+          },
+          "grants_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "grants_outstanding": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "headroom_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "limit_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The admission budget: `min(total × cap_fraction, total − external ×\n(1 + margin))`.",
+            "minimum": 0
+          },
+          "load_reservations_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "margin": {
+            "type": "number",
+            "format": "double"
+          },
+          "total_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "workers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LedgerWorkerHealth"
+            }
+          }
+        }
+      },
+      "GpuInfo": {
+        "type": "object",
+        "description": "One visible board, from nvidia-smi (CUDA) or KFD topology (ROCm).",
+        "required": [
+          "index",
+          "uuid",
+          "name",
+          "total_mb"
+        ],
+        "properties": {
+          "bdf": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "PCI address `dddd:bb:dd.f`. ROCm only: it is the key into amdgpu's\nper-board sysfs counters (the memory refresh, D5) and the one\nvocabulary a worker can independently report about itself (D3).\n`None` on CUDA, where the UUID already serves both purposes."
+          },
+          "compute_cap": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Compute capability as `major.minor` (`\"12.0\"`), the same value\n`HostComputeCaps` filters models with — per board here, because\ndefault placement picks the fastest one. `None` when nvidia-smi could\nnot report it for this board (`[N/A]` on vGPU slices and some\ndatacenter SKUs): the board is still a usable, pinnable identity, it\njust cannot be ranked or used to unlock a capability-gated model.\nAlways `None` on ROCm — HIP has no analogue at all."
+          },
+          "gfx_target_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "KFD's packed ISA target (`110000` = gfx1100). ROCm only; recorded so\na future gfx-arch allowlist has its datum without another probe\n(D7). `None` on CUDA.",
+            "minimum": 0
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Enumeration index: nvidia-smi's on CUDA, the position within the\nopenable KFD-node set on ROCm (which is the HIP device index). Useful\nonly for resolving registry `devices = [\"3\"]` pins; never an identity.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Marketing name, e.g. `NVIDIA GeForce RTX 5090`; the cost-profile key.\nOn ROCm, the deterministic `AMD gfx…` form `rocm.rs` derives."
+          },
+          "total_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "unified_ram_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Host RAM this board's memory is carved out of, in MiB — present\nexactly on **unified** boards (Apple Silicon today; AMD APUs when\nbackend B lands), absent on a discrete board with private VRAM. Its\npresence *is* the unified flag ([`GpuInfo::unified`]), because the two\nfacts are one: a board is unified precisely when its memory is the\nhost's.\n\nTwo things downstream read it. The ledger records a synthetic negative\nsample when a replica dies mid-window on such a board (DP-2: on a\ndGPU a mid-window death has too many non-memory causes, on a unified\nboard it is overwhelmingly the OS memory killer), and it is the only\nsanity bound on the authoritative total a worker reports back (DP-4)\n— the board's own `total_mb` is a *policy* number there, tunable by\nthe user, so it cannot bound anything.",
+            "minimum": 0
+          },
+          "uuid": {
+            "type": "string",
+            "description": "Board UUID (`GPU-…`), the budget/ledger key and the pin form CUDA\naccepts directly in `CUDA_VISIBLE_DEVICES`. On ROCm it is the fused\nKFD `unique_id` or a synthetic `GPU-BDF-…` (see `rocm.rs`) — an\nidentity, not a pin form, because HIP only accepts indices."
+          },
+          "vram_carveout_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The device-local VRAM carve-out of a unified **ROCm** board (an APU's\n`mem_info_vram_total`), in MiB — the part of [`Self::total_mb`] that\nis not GTT. `None` on every other board, including MPS, where no such\nsplit exists.\n\nIt is carried because the carve-out is a figure other components\nlegitimately mean by \"this board's memory\", and they must not be\nrefused for it. HIP's `total_memory` on an APU may report the\ncarve-out, the carve+GTT sum, or something else again — unverified\nuntil a BC-250 field pass — so the registration cross-check accepts\n**either**. It is also the placement rank\n([`Self::placement_total_mb`]).",
+            "minimum": 0
+          }
+        }
+      },
       "HasUnprocessedData": {
         "type": "object",
         "required": [
@@ -7503,9 +7830,18 @@
           "registry_ok",
           "model_count",
           "models",
-          "prewarm"
+          "prewarm",
+          "gpus",
+          "vram"
         ],
         "properties": {
+          "gpus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GpuInfo"
+            },
+            "description": "Visible GPUs by board UUID (batch-calibration step 1a); empty when\nthe host has no GPU inventory, in which case workers are not pinned."
+          },
           "model_count": {
             "type": "integer",
             "description": "Number of loaded models (== `models.len()`).",
@@ -7533,6 +7869,13 @@
           "status": {
             "type": "string",
             "description": "`\"ok\"` normally, `\"shutting_down\"` once shutdown has begun."
+          },
+          "vram": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GpuBudgetHealth"
+            },
+            "description": "Per-GPU VRAM ledger: budgets, footprints, outstanding grants, ramp and\ndeflation state and the fitted cost model (batch-calibration step 1b).\nEmpty on a host with no GPU inventory, where nothing is admitted and\nevery model takes the unpriced dispatch path."
           }
         }
       },
@@ -8033,7 +8376,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Last-selected cap on GPU batch size for this group/model; `None` =\nauto (the default, and what the one-time `batch_auto` migration reset\nevery stored value to)."
           },
           "default_threshold": {
             "type": [
@@ -8067,6 +8411,157 @@
           "test_panic",
           "test_report"
         ]
+      },
+      "LedgerWorkerHealth": {
+        "type": "object",
+        "description": "One resident replica's ledger state.",
+        "required": [
+          "inference_id",
+          "footprint_mb",
+          "charge_mb",
+          "grants_outstanding",
+          "grants_mb",
+          "pending_requests",
+          "seed_units",
+          "ramp_step",
+          "deflation",
+          "clean_windows",
+          "unit_budget",
+          "max_units_measured",
+          "knee_is_local",
+          "throughput_samples",
+          "local_samples",
+          "effective_margin"
+        ],
+        "properties": {
+          "base_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "charge_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`footprint + max(0, grants − pool growth)`: what this replica charges the\nboard right now, grant overlap netted out.",
+            "minimum": 0
+          },
+          "clean_windows": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive clean windows since the last negative sample.",
+            "minimum": 0
+          },
+          "deflation": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Halvings currently applied by OOM / throughput-collapse deflation.",
+            "minimum": 0
+          },
+          "effective_margin": {
+            "type": "number",
+            "format": "double",
+            "description": "The margin this model's windows are actually priced under: the\nboard's configured margin, widened while the fit is unconfirmed or\nscattered."
+          },
+          "fit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FitHealth"
+              }
+            ]
+          },
+          "footprint_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`base + max(0, reserved − reserved_at_load)`: this resident's footprint.",
+            "minimum": 0
+          },
+          "grants_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "grants_outstanding": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "inference_id": {
+            "type": "string"
+          },
+          "knee_is_local": {
+            "type": "boolean",
+            "description": "Whether that knee was fitted on this machine (as opposed to seeded\nfrom a profile, which may cap but never travels back to the store)."
+          },
+          "knee_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Throughput knee: the largest batch size worth admitting, whatever\nmemory allows. `None` until one is fitted or seeded from a profile.",
+            "minimum": 0
+          },
+          "local_samples": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Local clean high-water samples behind this model's fit, including any\na local calibration profile restored. Below\n`LOCAL_CONFIRMATION_SAMPLES` the effective margin is widened.",
+            "minimum": 0
+          },
+          "max_units_measured": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ratchet anchor: largest locally measured clean high-water batch.",
+            "minimum": 0
+          },
+          "pending_requests": {
+            "type": "integer",
+            "description": "Demand signal behind the contention split.",
+            "minimum": 0
+          },
+          "ramp_step": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Doublings earned by clean windows.",
+            "minimum": 0
+          },
+          "reserved_at_load_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "seed_units": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "throughput_samples": {
+            "type": "integer",
+            "description": "Warm-pool throughput observations behind the knee fit. Runtime-only:\nthe store persists the fitted knee, not the series.",
+            "minimum": 0
+          },
+          "unit_budget": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The ramp+ratchet-bounded unit budget as of this snapshot.",
+            "minimum": 0
+          }
+        }
       },
       "LogRecord": {
         "type": "object",
@@ -9127,7 +9622,9 @@
           "queue_depth",
           "in_flight_windows",
           "total_predict_requests",
-          "total_batches"
+          "total_batches",
+          "cost",
+          "replicas_detail"
         ],
         "properties": {
           "cache_keys": {
@@ -9136,6 +9633,10 @@
               "type": "string"
             },
             "description": "Cache keys currently referencing the model, sorted."
+          },
+          "cost": {
+            "$ref": "#/components/schemas/CostHealth",
+            "description": "Cost dimension resolved from registry metadata at load time\n(batch-calibration step 1a)."
           },
           "generation": {
             "type": "integer",
@@ -9151,13 +9652,22 @@
           "inference_id": {
             "type": "string"
           },
-          "last_effective_cap": {
+          "last_grant_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unit budget of the grant on the most recently dispatched window;\n`null` until a window carries one (nothing dispatched yet, or this\nmodel is on the unpriced path — see `dispatch.rs`).",
+            "minimum": 0
+          },
+          "last_window_items": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int32",
-            "description": "Effective cap of the most recently dispatched window (design §6);\n`null` until the first window dispatches.",
+            "description": "Inputs in the most recently dispatched window; `null` until the first\nwindow dispatches. This is what a user cap bounds on the unpriced path.",
             "minimum": 0
           },
           "queue_depth": {
@@ -9168,6 +9678,13 @@
           "replicas": {
             "$ref": "#/components/schemas/ReplicaHealth",
             "description": "WorkerSet occupancy: `free < total` means replicas are running\nwindows right now."
+          },
+          "replicas_detail": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplicaTelemetryHealth"
+            },
+            "description": "One entry per replica: which GPU it sits on and the freshest memory\nsensing it reported. This is the raw material step 1b's per-GPU\nledger is built from."
           },
           "total_batches": {
             "type": "integer",
@@ -10144,6 +10661,134 @@
           },
           "total": {
             "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ReplicaTelemetryHealth": {
+        "type": "object",
+        "description": "Per-replica GPU placement plus its freshest memory report. Every field\nafter `gpu` is `null` until the worker reports it (no torch, a remote-API\nimpl, or no predict yet). A CPU or MPS host does report: its figures are\ndenominated in system RAM and Metal's budget respectively, not in VRAM\n(docs/unified-memory-admission.md).",
+        "required": [
+          "measurements_recorded",
+          "recent_batches"
+        ],
+        "properties": {
+          "allocated_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "base_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Process-level load footprint and how it was measured.",
+            "minimum": 0
+          },
+          "base_method": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dtype": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Negotiated load precision, part of the calibration profile key."
+          },
+          "free_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Freshest device sample, and how long ago it was recorded.",
+            "minimum": 0
+          },
+          "free_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which driver reported `free_mb`/`total_mb` (`\"nvml\"` |\n`\"amdgpu-sysfs\"` | `\"torch\"`); they disagree by gigabytes, so a reader\ncomparing samples needs it."
+          },
+          "gpu": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Resolved device pin the worker was *spawned* with — a board UUID on a\nknown CUDA inventory, a HIP device index on a known ROCm one (the two\nbackends' visibility variables accept different vocabularies; see\n`gpu::pin_env_var`)."
+          },
+          "gpu_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "gpu_uuid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The board the worker itself reports being on: the pin above can be an\nindex, absent, or a UUID CUDA reordered, and only the worker can see\nwhat it actually got. `null` on a ROCm replica — torch's HIP-rendered\nUUID is a third vocabulary the worker deliberately suppresses, and\nthose replicas are admitted to the ledger by PCI address instead\n(docs/rocm-batch-calibration-parity.md, D3), which this view does not\nsurface yet."
+          },
+          "measurements_recorded": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Measurements this replica has reported since it loaded, including any\nthe bounded ring has since evicted.",
+            "minimum": 0
+          },
+          "memory_age_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "recent_batches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchHealth"
+            },
+            "description": "The tail of the measurement ring, oldest first — a sample of what 1b's\ncost fit consumes, not the whole ring (health is a status page)."
+          },
+          "reserved_at_load_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "torch_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The worker venv's torch, part of the calibration profile key."
+          },
+          "total_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
             "minimum": 0
           }
         }

@@ -199,6 +199,7 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
         .unwrap_or(settings.inference_local.python_env.accelerator);
     let (accelerator, evidence) = resolve_accelerator(requested)?;
     let extra = accelerator_extra(accelerator);
+    let wheels = wheel_extra(accelerator);
 
     // A converged venv only counts when it also holds the right wheels: an
     // explicit `--accelerator X --if-needed` must re-sync a venv installed
@@ -206,9 +207,14 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
     // explicit request (the startup auto-trigger, config-driven runs) the
     // installed extra is left alone — auto-setup must never silently swap
     // the torch build a user deliberately synced.
+    //
+    // Compared in **wheel** extras rather than in sentinel labels, so an
+    // existing Mac carrying `extra=cpu` satisfies a resolved `mps` and is not
+    // re-synced for a label change: the two install the same wheels (DP-3's
+    // "no forced re-setup for existing Macs").
     if options.skip_if_converged && auto_setup_needed().is_none() {
-        let installed = installed_accelerator().map(accelerator_extra);
-        if options.accelerator.is_none() || installed == Some(extra) {
+        let installed = sentinel_accelerator().map(wheel_extra);
+        if options.accelerator.is_none() || installed == Some(wheels) {
             tracing::info!(
                 "the environment converged while waiting for the setup lock \
                  (another panoptikon process finished setup); nothing to do"
@@ -254,10 +260,11 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
 
     tracing::info!(
         extra,
+        wheels,
         "syncing the locked environment (uv sync); the first run downloads \
          several GB of packages and can take a while"
     );
-    let sync_args = uv_sync_args(extra);
+    let sync_args = uv_sync_args(wheels);
     run_uv_logged(&uv.path, &sync_args, &python_dir, &venv, "uv sync").await?;
 
     let interpreter = venv.join(python_relpath());
@@ -469,23 +476,64 @@ fn uv_sync_args(extra: &str) -> Vec<String> {
     ]
 }
 
-/// The pyproject extra for each resolved accelerator.
+/// The sentinel **label** for each resolved accelerator — what `extra=`
+/// records and what [`extra_accelerator`] reads back.
 /// [`Accelerator::Auto`] must be resolved first (see
 /// [`resolve_accelerator`]).
+///
+/// Not always the pyproject extra that is synced: see [`wheel_extra`], which
+/// is what `uv sync --extra` is actually given. The two differ for `mps`
+/// alone, and deliberately — an Apple Silicon host runs the same wheels a
+/// `cpu` one does there, but it is not a CPU host, and the sentinel is what
+/// every runtime decision (profile keys, the worker env, the GPU probe)
+/// reads the host's accelerator back out of.
 fn accelerator_extra(accelerator: Accelerator) -> &'static str {
     match accelerator {
-        // On macOS the source markers route every extra to default PyPI
-        // wheels, so `cpu` doubles as the macOS/MPS selection.
         Accelerator::Cpu => "cpu",
         Accelerator::Cuda => "cu128",
         Accelerator::Rocm => "rocm",
+        Accelerator::Mps => "mps",
         Accelerator::Auto => unreachable!("auto is resolved before extra mapping"),
     }
 }
 
+/// The pyproject extra `uv sync` installs for a resolved accelerator.
+///
+/// On macOS the source markers route every extra to the default PyPI wheels,
+/// and those wheels are the ones that carry MPS — so `mps` is not a
+/// dependency set of its own (there is no `mps` extra in pyproject.toml) and
+/// syncs `cpu`'s. Everything else installs the extra it is named after.
+fn wheel_extra(accelerator: Accelerator) -> &'static str {
+    match accelerator {
+        Accelerator::Mps => "cpu",
+        other => accelerator_extra(other),
+    }
+}
+
+/// What `auto` resolves to on macOS: MPS on Apple Silicon, CPU on the Intel
+/// Macs that are out of scope (releases build macOS aarch64 only, and setup
+/// itself refuses x86_64 macOS outright — but `effective_accelerator` runs
+/// at gateway startup too, where nothing has refused anything, and a
+/// synthetic MPS board on a machine with no Metal-capable GPU would be a
+/// fabricated ledger).
+fn macos_default(arch: &str) -> Accelerator {
+    if arch == "aarch64" {
+        Accelerator::Mps
+    } else {
+        Accelerator::Cpu
+    }
+}
+
 /// Resolve an accelerator request into a concrete choice plus the evidence
-/// for logging. Explicit choices are validated (ROCm is Linux-only);
-/// `auto` runs the platform probes.
+/// for logging. Explicit choices are validated (ROCm is Linux-only, MPS is
+/// Apple Silicon-only); `auto` runs the platform probes.
+///
+/// **Apple Silicon always resolves to the accelerator**
+/// (docs/unified-memory-admission.md, DP-3): `auto` lands on MPS through
+/// [`decide_accelerator`], and an explicit `cuda` — which macOS has never
+/// had wheels for — is coerced there too rather than left naming a backend
+/// this host cannot have. The one and only way such a host runs
+/// unaccelerated is an explicit `accelerator = "cpu"`, which is left alone.
 pub(crate) fn resolve_accelerator(requested: Accelerator) -> Result<(Accelerator, String)> {
     match requested {
         Accelerator::Auto => Ok(decide_accelerator(&DetectionProbes::gather())),
@@ -494,12 +542,20 @@ pub(crate) fn resolve_accelerator(requested: Accelerator) -> Result<(Accelerator
                 "accelerator 'rocm' is only supported on Linux (PyTorch publishes no ROCm wheels elsewhere)"
             )
         }
+        Accelerator::Mps if !cfg!(target_os = "macos") => {
+            bail!("accelerator 'mps' is only supported on macOS (Apple Silicon)")
+        }
+        Accelerator::Mps if std::env::consts::ARCH != "aarch64" => {
+            bail!("accelerator 'mps' is only supported on Apple Silicon (this Mac is x86_64)")
+        }
         Accelerator::Cuda if cfg!(target_os = "macos") => {
+            let resolved = macos_default(std::env::consts::ARCH);
             tracing::warn!(
+                ?resolved,
                 "accelerator 'cuda' requested on macOS, where no CUDA wheels \
-                 exist; the default PyPI wheels (MPS) will be installed"
+                 exist; the default PyPI wheels will be installed"
             );
-            Ok((Accelerator::Cuda, "explicitly configured".into()))
+            Ok((resolved, "explicitly configured".into()))
         }
         explicit => Ok((explicit, "explicitly configured".into())),
     }
@@ -523,6 +579,24 @@ pub(crate) fn effective_accelerator(requested: Accelerator) -> Accelerator {
 /// the hardware, and on a host with `/opt/rocm` that would inject HIP paths
 /// into workers even when the venv was deliberately synced as `cpu`/`cuda`.
 pub(crate) fn installed_accelerator() -> Option<Accelerator> {
+    // On macOS the sentinel carries no accelerator information to read: every
+    // extra routes to the same default-PyPI wheels there, so `extra=cpu` was
+    // written by an `auto` run and by a deliberate CPU run alike. The one
+    // distinction that matters on that platform is therefore a *config*
+    // choice, not a wheel choice, and it is left to the config
+    // (docs/unified-memory-admission.md, DP-3) — which is also what keeps
+    // every existing Mac, whose sentinel predates the `mps` label, on the
+    // accelerator instead of pinning it to CPU forever.
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    sentinel_accelerator()
+}
+
+/// The accelerator the sentinel's `extra=` line names, with no platform rule
+/// applied. Only [`installed_accelerator`] (which applies one) and the
+/// convergence check in [`run`] read this.
+fn sentinel_accelerator() -> Option<Accelerator> {
     let managed = ManagedPython::active();
     let content = std::fs::read_to_string(managed.venv.join(SETUP_SENTINEL)).ok()?;
     sentinel_extra(&content).and_then(extra_accelerator)
@@ -542,6 +616,7 @@ fn extra_accelerator(extra: &str) -> Option<Accelerator> {
         "cpu" => Some(Accelerator::Cpu),
         "cu128" => Some(Accelerator::Cuda),
         "rocm" => Some(Accelerator::Rocm),
+        "mps" => Some(Accelerator::Mps),
         _ => None,
     }
 }
@@ -550,6 +625,10 @@ fn extra_accelerator(extra: &str) -> Option<Accelerator> {
 /// the decision itself is a pure function (tested against the full table).
 struct DetectionProbes {
     os: &'static str,
+    /// `std::env::consts::ARCH`. Only macOS reads it: Apple Silicon
+    /// (`aarch64`) is the platform that has MPS, and an Intel Mac must not
+    /// be handed a synthetic Metal board it does not have.
+    arch: &'static str,
     /// `nvidia-smi` on PATH (any platform).
     nvidia_smi_on_path: bool,
     /// Windows: `%SystemRoot%\System32\nvidia-smi.exe` (driver installs put
@@ -571,6 +650,7 @@ impl DetectionProbes {
                 .unwrap_or(false);
         Self {
             os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
             nvidia_smi_on_path: on_path("nvidia-smi").is_some(),
             system32_nvidia_smi,
             proc_driver_nvidia: cfg!(target_os = "linux")
@@ -582,13 +662,14 @@ impl DetectionProbes {
 }
 
 /// The auto-detection decision table: macOS always takes the default PyPI
-/// wheels (spelled `cpu`; they include MPS on Apple Silicon), NVIDIA
-/// evidence wins over ROCm evidence, ROCm only exists on Linux, and no
-/// evidence means CPU.
+/// wheels — labelled `mps` on Apple Silicon, which is what those wheels
+/// actually give it (DP-3), and `cpu` on the out-of-scope Intel Macs —
+/// NVIDIA evidence wins over ROCm evidence, ROCm only exists on Linux, and
+/// no evidence means CPU.
 fn decide_accelerator(probes: &DetectionProbes) -> (Accelerator, String) {
     if probes.os == "macos" {
         return (
-            Accelerator::Cpu,
+            macos_default(probes.arch),
             "macOS: default PyPI wheels (MPS on Apple Silicon); no CUDA/ROCm builds exist".into(),
         );
     }
@@ -1180,6 +1261,9 @@ mod tests {
     fn probes(os: &'static str) -> DetectionProbes {
         DetectionProbes {
             os,
+            // The platform every release builds for; the Intel-Mac arm is
+            // exercised explicitly where it matters.
+            arch: "aarch64",
             nvidia_smi_on_path: false,
             system32_nvidia_smi: false,
             proc_driver_nvidia: false,
@@ -1193,11 +1277,17 @@ mod tests {
     /// evidence only counts on Linux, and no evidence means CPU.
     #[test]
     fn accelerator_decision_table() {
-        // macOS: always PyPI wheels, even if probes claim GPUs.
+        // macOS: always PyPI wheels, even if probes claim GPUs — and on
+        // Apple Silicon those wheels *are* the accelerator (DP-3).
         let mut mac = probes("macos");
         mac.nvidia_smi_on_path = true;
         mac.rocm_smi_on_path = true;
-        assert_eq!(decide_accelerator(&mac).0, Accelerator::Cpu);
+        assert_eq!(decide_accelerator(&mac).0, Accelerator::Mps);
+        // An Intel Mac has no Metal backend we price; it is out of scope and
+        // must not be handed a synthetic board.
+        let mut intel_mac = probes("macos");
+        intel_mac.arch = "x86_64";
+        assert_eq!(decide_accelerator(&intel_mac).0, Accelerator::Cpu);
 
         // Windows: System32 nvidia-smi or PATH nvidia-smi → CUDA.
         let mut win = probes("windows");
@@ -1235,6 +1325,14 @@ mod tests {
         assert_eq!(accelerator_extra(Accelerator::Cuda), "cu128");
         assert_eq!(accelerator_extra(Accelerator::Rocm), "rocm");
         assert_eq!(accelerator_extra(Accelerator::Cpu), "cpu");
+        // MPS is a *label*: there is no `mps` extra in pyproject.toml, and
+        // the wheels an Apple Silicon host installs are `cpu`'s (which on
+        // macOS are the default-PyPI ones that carry Metal).
+        assert_eq!(accelerator_extra(Accelerator::Mps), "mps");
+        assert_eq!(wheel_extra(Accelerator::Mps), "cpu");
+        for accelerator in [Accelerator::Cuda, Accelerator::Rocm, Accelerator::Cpu] {
+            assert_eq!(wheel_extra(accelerator), accelerator_extra(accelerator));
+        }
         assert_eq!(
             uv_sync_args("cu128"),
             ["sync", "--locked", "--extra", "cu128"]
@@ -1383,7 +1481,12 @@ mod tests {
     /// sentinels without the key degrade to `None` (config-based fallback).
     #[test]
     fn sentinel_extra_round_trips_accelerators() {
-        for accel in [Accelerator::Cpu, Accelerator::Cuda, Accelerator::Rocm] {
+        for accel in [
+            Accelerator::Cpu,
+            Accelerator::Cuda,
+            Accelerator::Rocm,
+            Accelerator::Mps,
+        ] {
             let extra = accelerator_extra(accel);
             let content = format!("extra={extra}\nuv_lock_sha256=abc123\n");
             assert_eq!(
@@ -1394,6 +1497,55 @@ mod tests {
         }
         assert_eq!(sentinel_extra("uv_lock_sha256=abc123\n"), None);
         assert_eq!(extra_accelerator("cu999"), None);
+        // The pre-`mps` sentinel every existing Mac carries. It reads back as
+        // `Cpu` here — the label is genuinely all the file says — and the
+        // *wheels* it names are the ones an `mps` resolution wants, which is
+        // what stops the convergence check from re-syncing such a venv for a
+        // label change (DP-3, "no forced re-setup for existing Macs").
+        assert_eq!(extra_accelerator("cpu"), Some(Accelerator::Cpu));
+        assert_eq!(
+            extra_accelerator("cpu").map(wheel_extra),
+            Some(wheel_extra(Accelerator::Mps))
+        );
+    }
+
+    /// DP-3: on Apple Silicon every request but an explicit `cpu` resolves to
+    /// the accelerator, and `mps` is refused everywhere else. Only the arms
+    /// that do not depend on the host platform are asserted unconditionally;
+    /// the rest are `cfg`-split, because `resolve_accelerator` consults the
+    /// build target (there is no probe injection on this path).
+    #[test]
+    fn apple_silicon_resolves_to_the_accelerator() {
+        assert_eq!(macos_default("aarch64"), Accelerator::Mps);
+        assert_eq!(
+            macos_default("x86_64"),
+            Accelerator::Cpu,
+            "Intel Macs are out of scope and must not get a synthetic board"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            // `auto` and an explicit `cuda` (macOS has never had CUDA wheels)
+            // both land on the accelerator; explicit `cpu` is the one way out.
+            let expected = macos_default(std::env::consts::ARCH);
+            assert_eq!(resolve_accelerator(Accelerator::Auto).unwrap().0, expected);
+            assert_eq!(resolve_accelerator(Accelerator::Cuda).unwrap().0, expected);
+            assert_eq!(
+                resolve_accelerator(Accelerator::Cpu).unwrap().0,
+                Accelerator::Cpu
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                resolve_accelerator(Accelerator::Mps).is_err(),
+                "MPS exists only on Apple Silicon"
+            );
+            assert_eq!(
+                resolve_accelerator(Accelerator::Cuda).unwrap().0,
+                Accelerator::Cuda,
+                "the coercion is macOS-only"
+            );
+        }
     }
 
     /// The auto-trigger decision table: a managed interpreter is judged by

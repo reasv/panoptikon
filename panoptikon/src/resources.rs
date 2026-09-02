@@ -758,6 +758,11 @@ mod tests {
             "inferio_worker/__main__.py",
             "inferio/impl/utils.py",
             "inferio/config/inference.toml",
+            // The shipped calibration baselines live in a subdirectory of the
+            // registry dir, and the orchestrator reads them from the
+            // extracted set. Nothing else guarantees a *sub*directory of
+            // inferio/config survives the archive.
+            "inferio/config/calibration/README.md",
         ] {
             assert!(
                 names.iter().any(|name| name == required),

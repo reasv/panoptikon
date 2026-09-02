@@ -1,3 +1,4 @@
+pub(crate) mod batch_auto;
 pub(crate) mod bookmarks;
 mod connection;
 pub(crate) mod epochs;

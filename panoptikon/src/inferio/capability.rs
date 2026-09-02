@@ -3,10 +3,28 @@
 //! `nvidia-smi --query-gpu=compute_cap` (available since driver R470) is
 //! the source: no torch import (~100 ms vs seconds), independent of venv
 //! state, and any failure degrades to "unknown", which never filters
-//! anything. ROCm/MPS/CPU hosts have no nvidia-smi and are likewise
-//! unknown by design — the only capability floors shipped today are
-//! CUDA-specific (bf16 + FlashAttention 2 want sm_80+), and the Python
-//! impls carry their own load-time backstop guard.
+//! anything. ROCm/MPS/CPU hosts are likewise unknown by design — the only
+//! capability floors shipped today are CUDA-specific (bf16 +
+//! FlashAttention 2 want sm_80+), and the Python impls carry their own
+//! load-time backstop guard. On ROCm that is a decision, not an accident of
+//! tooling: the sysfs probe enumerates boards perfectly well but HIP has no
+//! compute-capability analogue, so every row's `compute_cap` is `None`, the
+//! host view collapses to unknown, and the `/metadata` overlay stays absent
+//! (docs/rocm-batch-calibration-parity.md D7 — the rows do carry
+//! `gfx_target_version` for a future gfx-arch allowlist). On **CPU** it
+//! became one too: a host whose resolved accelerator is `cpu` used to be
+//! routed through the nvidia-smi probe precisely so a card it happened to
+//! have still filtered models, and backend C stopped doing that
+//! (docs/unified-memory-admission.md). Such a host now runs its impls on the
+//! CPU device by construction, so the floors were gating on a board its
+//! CPU-only torch cannot address; the impls' own load-time guard is what
+//! remains, as on every other unknown host.
+//!
+//! The probe itself lives in `gpu.rs`: on CUDA, capabilities and board
+//! identities come out of **one** `nvidia-smi --query-gpu` call,
+//! positionally matched, so the two views can never disagree about which
+//! board is which. This module owns the type, the floor comparison and the
+//! `/metadata` overlay.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,45 +37,27 @@ use serde_json::Value as JsonValue;
 pub struct HostComputeCaps(Option<Vec<(u32, u32)>>);
 
 impl HostComputeCaps {
-    /// Only tests construct states without probing; production goes
-    /// through [`Self::probe`].
-    #[cfg(test)]
+    /// The state every non-CUDA host is in, and what any probe failure or
+    /// unparseable row degrades to. Never filters anything.
     pub fn unknown() -> Self {
         Self(None)
     }
 
-    #[cfg(test)]
-    pub fn known(caps: Vec<(u32, u32)>) -> Self {
+    /// Build from the capabilities of the boards the merged probe found (or
+    /// tests' fixtures). Empty is indistinguishable from unknown: a host
+    /// with no readable board cannot filter.
+    pub fn from_caps(caps: Vec<(u32, u32)>) -> Self {
         if caps.is_empty() {
             Self(None)
         } else {
+            tracing::info!(compute_caps = %join_caps(&caps), "detected GPU compute capabilities");
             Self(Some(caps))
         }
     }
 
-    /// Probe once at startup. Never fails: no nvidia-smi, a timeout, or
-    /// unparseable output all yield "unknown".
-    pub fn probe() -> Self {
-        let Some(smi) = find_nvidia_smi() else {
-            return Self(None);
-        };
-        let mut cmd = Command::new(smi);
-        cmd.args(["--query-gpu=compute_cap", "--format=csv,noheader"]);
-        let Some(output) = output_with_timeout(cmd, Duration::from_secs(5)) else {
-            tracing::warn!(
-                "nvidia-smi compute_cap probe failed or timed out; \
-                 model availability will not be capability-filtered"
-            );
-            return Self(None);
-        };
-        if !output.status.success() {
-            return Self(None);
-        }
-        let caps = parse_compute_caps(&String::from_utf8_lossy(&output.stdout));
-        if let Some(caps) = &caps {
-            tracing::info!(compute_caps = %join_caps(caps), "detected GPU compute capabilities");
-        }
-        Self(caps)
+    #[cfg(test)]
+    pub fn known(caps: Vec<(u32, u32)>) -> Self {
+        Self::from_caps(caps)
     }
 
     /// Whether ANY visible device meets `floor` (e.g. `8.0`); `None` when
@@ -123,23 +123,16 @@ pub fn overlay_metadata(root: &mut JsonValue, caps: &HostComputeCaps) {
     }
 }
 
-/// One capability per line, `major.minor` (`--format=csv,noheader`). Any
-/// unparseable non-empty line (e.g. `N/A`, driver error text) makes the
-/// whole probe unknown — a partial picture must not filter models.
-fn parse_compute_caps(stdout: &str) -> Option<Vec<(u32, u32)>> {
-    let mut caps = Vec::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (major, minor) = line.split_once('.')?;
-        caps.push((
-            major.trim().parse::<u32>().ok()?,
-            minor.trim().parse::<u32>().ok()?,
-        ));
-    }
-    if caps.is_empty() { None } else { Some(caps) }
+/// One `major.minor` capability field as nvidia-smi prints it. `None` for
+/// anything else (`N/A`, driver error text, a changed column shape), which
+/// makes the whole probe unknown in `gpu.rs` — a partial picture must not
+/// filter models.
+pub(super) fn parse_compute_cap(field: &str) -> Option<(u32, u32)> {
+    let (major, minor) = field.trim().split_once('.')?;
+    Some((
+        major.trim().parse::<u32>().ok()?,
+        minor.trim().parse::<u32>().ok()?,
+    ))
 }
 
 fn join_caps(caps: &[(u32, u32)]) -> String {
@@ -150,8 +143,9 @@ fn join_caps(caps: &[(u32, u32)]) -> String {
 }
 
 /// Same locations the setup accelerator probes use: PATH, plus the
-/// Windows driver install location that never touches PATH.
-fn find_nvidia_smi() -> Option<PathBuf> {
+/// Windows driver install location that never touches PATH. Shared with
+/// `gpu.rs`, which probes board identities the same way.
+pub(super) fn find_nvidia_smi() -> Option<PathBuf> {
     let path = std::env::var_os("PATH");
     if let Some(path) = path {
         for dir in std::env::split_paths(&path) {
@@ -183,7 +177,10 @@ fn find_nvidia_smi() -> Option<PathBuf> {
 /// Run to completion or give up after `timeout`. On timeout the child is
 /// left to finish on its own (nvidia-smi is short-lived); only the boot
 /// path must not stall behind a wedged driver.
-fn output_with_timeout(mut cmd: Command, timeout: Duration) -> Option<std::process::Output> {
+pub(super) fn output_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(cmd.output());
@@ -197,21 +194,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parses_single_and_multi_gpu_output() {
-        assert_eq!(parse_compute_caps("8.6\n"), Some(vec![(8, 6)]));
-        assert_eq!(
-            parse_compute_caps("12.0\n6.1\n"),
-            Some(vec![(12, 0), (6, 1)])
-        );
+    fn parses_a_capability_field() {
+        assert_eq!(parse_compute_cap("8.6"), Some((8, 6)));
+        assert_eq!(parse_compute_cap(" 12.0 "), Some((12, 0)));
     }
 
     #[test]
-    fn garbage_or_na_output_is_unknown() {
-        assert_eq!(parse_compute_caps(""), None);
-        assert_eq!(parse_compute_caps("N/A\n"), None);
-        assert_eq!(parse_compute_caps("8.6\nN/A\n"), None);
+    fn garbage_or_na_field_is_unknown() {
+        assert_eq!(parse_compute_cap(""), None);
+        assert_eq!(parse_compute_cap("N/A"), None);
+        assert_eq!(parse_compute_cap("8"), None);
         assert_eq!(
-            parse_compute_caps("Failed to initialize NVML: Driver error\n"),
+            parse_compute_cap("Failed to initialize NVML: Driver error"),
             None
         );
     }

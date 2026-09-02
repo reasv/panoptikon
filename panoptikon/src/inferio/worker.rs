@@ -31,13 +31,14 @@
 //!   `kill_on_drop`, so neither a drop path nor gateway death itself can
 //!   leak a worker tree.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::env;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rmpv::Value;
@@ -46,6 +47,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
+use super::ledger::{FitSnapshot, Grant};
 use super::registry::SpawnSpec;
 use super::slot_error::{ERROR_SLOT_KEY, SlotError, slot_error_from_parts};
 use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_process_group};
@@ -92,6 +94,23 @@ const STDERR_JOIN_GRACE: Duration = Duration::from_secs(1);
 
 /// How long a fatal path waits for the killed child to be reaped.
 const FATAL_REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// Deadline for a `trim` (protocol doc, "Lifecycle and timeouts").
+///
+/// A trim is best-effort hygiene and must never hold a dispatcher for minutes,
+/// but the operation it performs is `cudaFree` over every block in the
+/// allocator pool — which on a multi-gigabyte pool, on a busy board, under
+/// WDDM, is not the milliseconds an idle `empty_cache()` costs. Timing out is
+/// **fatal** (the worker is unresponsive and the stream would desynchronize),
+/// so this budget has to be long enough that a slow-but-healthy release is
+/// never mistaken for a wedged process; a minute is far beyond any plausible
+/// pool teardown and still bounded.
+///
+/// Deliberately **not** floored by the configured handshake deadline: that
+/// deadline is about spawn liveness — how long a fresh process may take to
+/// answer a trivial frame — and an operator who tightened it to 5 s was
+/// describing startup, not a `cudaFree` of a big pool.
+const TRIM_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Lifecycle deadlines from the protocol doc ("Lifecycle and timeouts").
 /// `predict` deliberately has no deadline in v1: models take arbitrarily
@@ -143,6 +162,47 @@ pub struct WorkerSpawnConfig {
     pub env_remove: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub deadlines: WorkerDeadlines,
+    /// The variable a resolved device pin is written to:
+    /// `CUDA_VISIBLE_DEVICES` on CUDA (and on hosts with no accelerator of
+    /// their own), `HIP_VISIBLE_DEVICES` on ROCm — the two vocabularies are
+    /// not interchangeable, so the pin *value* (`gpu::GpuInventory::resolve_pin`)
+    /// and this name are one decision made in one place
+    /// (`gpu::pin_env_var`, from the resolved accelerator; see
+    /// docs/rocm-batch-calibration-parity.md, D2). This layer only writes
+    /// what it is handed.
+    pub pin_env_var: &'static str,
+}
+
+impl WorkerSpawnConfig {
+    /// This config for a replica pinned to a **unified** board: the same
+    /// thing plus `PANOPTIKON_UNIFIED_GPU=<that board's PCI address>`
+    /// (DP-5), or the original untouched when the board is discrete.
+    ///
+    /// A per-replica question, which is why it is not part of the host-level
+    /// worker env (`accelerator_env::worker_env`): on a dGPU+APU host one
+    /// model's replicas can sit on both kinds of board, and this decides
+    /// whether that worker's own memory arithmetic counts GTT. It travels
+    /// through `env` rather than being written beside the pin in
+    /// [`worker_command`] so that both spawners — a fresh load and a pool
+    /// warm-up — get it from the one resolver that also produced the pin
+    /// (`GpuInventory::unified_pin_bdf`), and so a model's own `env` still
+    /// outranks it, as it outranks everything else here.
+    ///
+    /// The value is an address rather than a flag because the pin is a
+    /// *belief* about where the replica will land, and the worker can check
+    /// it against the board it actually came up on — see
+    /// [`gpu::UNIFIED_GPU_ENV_VAR`](super::gpu::UNIFIED_GPU_ENV_VAR).
+    pub fn for_unified_board(&self, bdf: Option<&str>) -> Cow<'_, Self> {
+        let Some(bdf) = bdf else {
+            return Cow::Borrowed(self);
+        };
+        let mut cfg = self.clone();
+        cfg.env.push((
+            super::gpu::UNIFIED_GPU_ENV_VAR.to_owned(),
+            bdf.to_ascii_lowercase(),
+        ));
+        Cow::Owned(cfg)
+    }
 }
 
 /// One entry of a `predict` request: JSON-like `data` and/or raw `file`
@@ -165,6 +225,249 @@ pub enum WorkerOutput {
     /// This input failed on its own; the rest of the batch is unaffected.
     Error(SlotError),
 }
+
+/// One instant's view of the worker's GPU memory, as reported on `load` and
+/// `predict` responses (protocol doc, "Memory sensing"). Every field is
+/// optional: a worker with no torch, no CUDA or no NVML reports what it can
+/// and omits the rest, and absent always means "unknown" — never zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemorySample {
+    pub free_mb: Option<u64>,
+    pub total_mb: Option<u64>,
+    /// Which driver `free_mb`/`total_mb` came from: `"nvml"`,
+    /// `"amdgpu-sysfs"` (the ROCm whole-board counters) or `"torch"`
+    /// (`mem_get_info`). They disagree by gigabytes on the same board — the
+    /// two driver sources see the whole board, `mem_get_info` the calling
+    /// context's view — so any consumer that differences two samples, or
+    /// subtracts our own footprint from `free_mb` to price *other* processes,
+    /// must first check that this matches. `None` when the worker could read
+    /// none of them.
+    pub free_source: Option<String>,
+    /// Caching-allocator pool size (`torch.cuda.memory_reserved`).
+    pub reserved_mb: Option<u64>,
+    /// Live tensor bytes (`torch.cuda.memory_allocated`).
+    pub allocated_mb: Option<u64>,
+}
+
+/// What the `load` response reports about the model's footprint. `base_mb`
+/// is the worker's whole-*process* device footprint (context + workspaces +
+/// weights), which is the currency the ledger charges residents in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadReport {
+    pub base_mb: Option<u64>,
+    /// `"nvml"` | `"fdinfo"` (its ROCm twin) | `"free_delta"` |
+    /// `"alloc_delta"` — provenance for the calibration profile, kept as the
+    /// worker sent it.
+    pub base_method: Option<String>,
+    pub reserved_at_load_mb: Option<u64>,
+    /// Negotiated load precision (`"fp16"`/`"bf16"`/`"fp32"`); part of the
+    /// profile key. `None` when nothing negotiated one.
+    pub dtype: Option<String>,
+    /// The board the worker's CUDA device 0 *actually* resolved to, as the
+    /// worker itself read it (`GPU-…`). This — not the spawn pin, which may
+    /// be an index, absent, or a UUID CUDA reordered — is the authoritative
+    /// ledger identity for step 1b.
+    ///
+    /// Always absent on a ROCm worker: torch renders a UUID there from the
+    /// ASIC serial, but it is a third vocabulary matching neither KFD's nor
+    /// amd-smi's and repeating across same-model consumer boards, so the
+    /// worker suppresses it rather than emit an identity that can silently
+    /// collide (docs/rocm-batch-calibration-parity.md, D3/F5). Those hosts
+    /// are keyed by [`Self::gpu_bdf`].
+    pub gpu_uuid: Option<String>,
+    /// That board's name per torch. **Informational only** — nothing keys on
+    /// it: the profile key uses the board name from the orchestrator's own
+    /// inventory, so every profile this host writes is keyed by one string
+    /// whatever each worker's torch calls the card
+    /// (`VramLedger::register_worker`, and the protocol doc's `gpu_name`
+    /// row).
+    pub gpu_name: Option<String>,
+    /// The board's PCI address (`dddd:bb:dd.0`), as the worker read it from
+    /// `get_device_properties(0)`'s PCI fields — the one identity vocabulary
+    /// the kernel, the driver and the HIP runtime all speak, and therefore
+    /// the ROCm ledger join. Reported on CUDA hosts too (additive; the UUID
+    /// still keys them). Absent on an older torch with no PCI fields and no
+    /// usable fdinfo fallback.
+    ///
+    /// Which today means: **absent on the shipped CUDA build**, whose venv
+    /// pins torch 2.7.1 — `_CudaDeviceProperties` grew the PCI fields in
+    /// 2.8 — so this is live only on the `rocm` extra (torch 2.11) until
+    /// that pin moves, and the identity chain it feeds is load-bearing on
+    /// ROCm alone.
+    pub gpu_bdf: Option<String>,
+    /// That board's total VRAM in MiB, as **torch/HIP** reports it. The
+    /// point is the provenance: registration cross-checks a BDF match
+    /// against this, and it did not come from the sysfs file the inventory's
+    /// own total was read from, so agreement is evidence rather than a file
+    /// compared with itself (D3/F4).
+    pub gpu_total_mb: Option<u64>,
+    /// `torch.__version__`, part of the profile key and knowable only in the
+    /// worker (the orchestrator does not know its venv's torch).
+    pub torch_version: Option<String>,
+    pub memory: Option<MemorySample>,
+}
+
+/// One GPU batch the worker actually ran, from a `predict` response (or an
+/// `error` reply — a window that failed part-way still measured what ran).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BatchMeasurement {
+    /// Inputs in the batch. Deliberately *not* cost-dimension units.
+    pub items: Option<u64>,
+    /// The batch's size in the model's declared cost dimension, as the
+    /// packing harness priced it. Absent when the request carried no grant:
+    /// without a declared dimension the worker has nothing to price in, and
+    /// the ledger's fit only regresses against this.
+    pub units: Option<u64>,
+    pub reserved_before_mb: Option<u64>,
+    pub peak_reserved_mb: Option<u64>,
+    pub allocated_before_mb: Option<u64>,
+    pub peak_allocated_mb: Option<u64>,
+    /// Wall time of `instance.predict(batch)` only — the harness prices units
+    /// outside the timed section so the throughput comparator sees GPU work.
+    pub duration_ms: Option<f64>,
+    /// The batch raised an out-of-memory condition: a negative sample for the
+    /// ledger's deflation path.
+    pub oom: bool,
+    /// A pool-growing batch whose units/sec cratered against the previous
+    /// one. On WDDM the driver's sysmem fallback turns over-admission into a
+    /// silent throughput collapse instead of an OOM, so this is the synthetic
+    /// negative sample that stands in for the exception that never fires.
+    pub throughput_collapse: bool,
+    //
+    // The protocol's `trimmed` flag (protocol doc, "Measurements") is
+    // deliberately **not** parsed into a field here. It marks the first
+    // measurement of a window whose reactive shrink released the pool first,
+    // and the ledger's answer to such a sample is to take it exactly as it
+    // comes: a post-`empty_cache()` regrowth batch is a high-water batch, which
+    // is precisely the kind the fit wants, and knowing it followed a release
+    // would not change how it is priced (see the high-water branch of
+    // `VramLedger::ingest_locked`, which spells out why). It stays on the wire
+    // as operator-facing provenance — it explains an otherwise surprising
+    // pool-growth spike in a log — and a field nothing reads would only invite
+    // someone to give it a meaning the ledger does not have.
+}
+
+/// A telemetry reading plus when it was recorded. The ledger has to be able
+/// to tell a fresh measurement from one taken before another process moved
+/// on the same board, and 1a is where the clock has to start being kept —
+/// timestamps cannot be reconstructed after the fact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Timestamped<T> {
+    pub captured_at: Instant,
+    pub value: T,
+}
+
+impl<T> Timestamped<T> {
+    /// Stamp a reading with the current instant. `pub(super)` so the ledger's
+    /// tests can build telemetry fixtures without a live worker.
+    pub(super) fn now(value: T) -> Self {
+        Self {
+            captured_at: Instant::now(),
+            value,
+        }
+    }
+}
+
+/// One recorded batch measurement: the reading, when it arrived, and a
+/// per-worker sequence number.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchSample {
+    /// Strictly increasing per worker, starting at 1, and never reused —
+    /// including across ring evictions, which is what makes a gap
+    /// detectable.
+    pub seq: u64,
+    pub captured_at: Instant,
+    pub measurement: BatchMeasurement,
+}
+
+/// Everything a worker has told us about its memory, plus the GPU it was
+/// pinned to at spawn. Shared by `Arc` with whoever owns the [`Worker`]
+/// (the dispatcher task, after a load), because the budget arbiter is the
+/// manager, not the dispatcher: the manager keeps a clone of this handle per
+/// replica and reads it without disturbing anything.
+///
+/// Step 1a only records. The ledger that consumes these (grants, cost fits,
+/// eviction) is step 1b.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerTelemetry {
+    /// Resolved device pin, in the vocabulary of the variable it was written
+    /// to ([`WorkerSpawnConfig::pin_env_var`]): a `GPU-…` board UUID on a
+    /// known CUDA inventory, a **HIP device index string** on a known ROCm
+    /// one (`HIP_VISIBLE_DEVICES` accepts nothing else), else whatever the
+    /// registry asked for, else `None` on hosts with no GPU inventory. Never
+    /// changes after spawn.
+    ///
+    /// Operator-facing provenance only — it is surfaced on `/health` and
+    /// nothing keys on it. The identity the ledger keys on is what the
+    /// *worker* reported ([`LoadReport::gpu_uuid`], or [`LoadReport::gpu_bdf`]
+    /// on ROCm), and the two can differ in form as well as in value (an index
+    /// pin, an unknown inventory, a MIG instance, any ROCm host). The board
+    /// key a replica's *pin* names is resolved separately, for the ledger's
+    /// load reservation (`gpu::GpuInventory::resolve_board_key`).
+    pub gpu: Option<String>,
+    pub load: Option<Timestamped<LoadReport>>,
+    /// Freshest sample, from whichever response carried one last.
+    pub memory: Option<Timestamped<MemorySample>>,
+    /// Bounded ring of the most recent measurements, oldest first.
+    measurements: VecDeque<BatchSample>,
+    recorded: u64,
+}
+
+impl WorkerTelemetry {
+    /// Ring capacity.
+    ///
+    /// The ledger reads by watermark once per settled window, and one window
+    /// with a deep grant can be *many* GPU batches — a `max-times-count` model
+    /// bucketing a 64-item window into batches of two produces 32 measurements
+    /// from a single frame, and the packing harness reports one entry per batch.
+    /// 64 left almost no margin above that; 256 covers several such windows even
+    /// if a settle is delayed, at a few tens of KB per replica. Overflow is not
+    /// silent either way (`ingest_locked` names the gap), but the point is for it
+    /// not to happen.
+    pub const RING: usize = 256;
+
+    /// Append the measurements of one `predict`, stamping each with the next
+    /// sequence number. Every measurement gets its own entry: a request that
+    /// the step-1b harness splits into several GPU batches is several fit
+    /// samples, and collapsing them (as last-write-wins did) throws away
+    /// exactly the varied batch sizes the cost model is fitted on.
+    pub(super) fn record_measurements(&mut self, batches: Vec<BatchMeasurement>) {
+        for measurement in batches {
+            self.recorded += 1;
+            self.measurements.push_back(BatchSample {
+                seq: self.recorded,
+                captured_at: Instant::now(),
+                measurement,
+            });
+            while self.measurements.len() > Self::RING {
+                self.measurements.pop_front();
+            }
+        }
+    }
+
+    /// The retained measurements, oldest first. **Non-draining**: several
+    /// readers coexist (today `/health`, in 1b the ledger's cost fit), so
+    /// nobody may consume on another's behalf.
+    ///
+    /// The intended 1b consumption pattern is a *watermark*, not a drain:
+    /// remember the last `seq` fitted and take everything above it. That
+    /// makes ring overflow visible instead of silent — if the oldest retained
+    /// `seq` is already above the watermark, samples were dropped between
+    /// reads (the reader is too slow, or the window rate too high) and the
+    /// fit knows its sample set has a hole rather than assuming continuity.
+    pub fn measurements(&self) -> impl DoubleEndedIterator<Item = &BatchSample> {
+        self.measurements.iter()
+    }
+
+    /// How many measurements this worker has ever reported, including ones
+    /// the ring has since evicted.
+    pub fn recorded_measurements(&self) -> u64 {
+        self.recorded
+    }
+}
+
+/// Shared handle to one worker's [`WorkerTelemetry`].
+pub type TelemetryHandle = Arc<Mutex<WorkerTelemetry>>;
 
 /// A per-request failure reported by a live worker (`error` frame). The
 /// worker remains serviceable after this — do not respawn on it.
@@ -229,6 +532,8 @@ pub struct Worker {
     stderr: Arc<Mutex<StderrTail>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     _job_guard: JobGuard,
+    /// Memory sensing shared with the manager (see [`WorkerTelemetry`]).
+    telemetry: TelemetryHandle,
     deadlines: WorkerDeadlines,
     /// Request ids are strictly increasing per worker (sanity checking only,
     /// per the protocol doc).
@@ -240,12 +545,218 @@ pub struct Worker {
     in_flight: bool,
     /// Poisoned by any fatal error; every further call fails fast.
     dead: bool,
+    /// The worker **stopped answering** — see [`Worker::is_dead`]. A strict
+    /// subset of `dead`: every fatal error poisons the worker, but only some
+    /// of them mean the process went away on its own.
+    unreachable: bool,
+}
+
+/// Why a fatal teardown happened.
+///
+/// The distinction only exists because the ledger reads it: DP-2 turns a
+/// mid-window *death* on a unified board into a synthetic negative sample
+/// (docs/unified-memory-admission.md), and the whole point of that signal is
+/// that an out-of-memory kill there arrives as a SIGKILL nothing in-process
+/// can catch. A stream we tore down ourselves because the protocol state was
+/// unrecoverable is not evidence about memory, so it must not settle as a
+/// death.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FatalCause {
+    /// The worker stopped answering: EOF on stdout, a broken pipe, an
+    /// undecodable frame, a deadline that expired. These are the shapes a
+    /// SIGKILL takes from this side of the pipe.
+    ///
+    /// Counting an expired **deadline** as a death is only safe because
+    /// `predict` carries `deadline: None` (see [`Worker::predict`]): every
+    /// request that can time out — handshake, configure, prewarm, load,
+    /// trim, ping — runs outside any grant, so a timeout can never settle a
+    /// window at all. Putting a deadline on `predict` would make a
+    /// wedged-but-alive worker a memory negative on unified boards, and this
+    /// variant would have to split.
+    Unreachable,
+    /// The exchange itself was fine — the worker was alive and talking — and
+    /// we killed it because the stream can no longer be trusted: a request
+    /// future was dropped mid-flight (what a user cancel produces), or a
+    /// frame answered the wrong id.
+    Desync,
+}
+
+/// The fully environment-shaped child command for one worker, per the
+/// protocol's spawn contract (docs/inferio-worker-protocol.md,
+/// "Environment"). Separate from [`Worker::spawn`] so the environment it
+/// composes — in particular *which* visibility variable a device pin lands
+/// in — is assertable without a Python interpreter on the box.
+///
+/// `device` is the pin `gpu::GpuInventory::resolve_pin` already resolved,
+/// and [`WorkerSpawnConfig::pin_env_var`] is the variable that vocabulary
+/// belongs to. Exactly one of them is ever written: `CUDA_VISIBLE_DEVICES`
+/// is deliberately not also set on ROCm (it is a HIP alias, and AMD
+/// documents setting both as unintended-behaviour territory), and the ROCm
+/// worker env from `accelerator_env` sets no visibility variable at all, so
+/// the two compose without overlapping.
+fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Command> {
+    let mut command = Command::new(&cfg.python);
+    command
+        .arg("-m")
+        .arg("inferio_worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("INFERIO_WORKER", "1")
+        // Defense in depth for the stderr forwarder: keep Python's own
+        // text streams UTF-8 regardless of the console code page
+        // (cp1252 tracebacks on Windows). The Rust side still tolerates
+        // arbitrary bytes — native libraries write to fd 2 directly.
+        .env("PYTHONIOENCODING", "utf-8")
+        // A set PYTHONHOME is never valid for a venv interpreter, and
+        // AppImage-style launchers export one pointing into their mount,
+        // which kills the child before main (missing 'encodings'). The
+        // PYTHONPATH inherit below stays: it is a deliberate dev hook.
+        .env_remove("PYTHONHOME");
+    if !cfg.pythonpath.is_empty() {
+        let mut entries = cfg.pythonpath.clone();
+        if let Some(existing) = env::var_os("PYTHONPATH") {
+            entries.extend(env::split_paths(&existing));
+        }
+        let joined =
+            env::join_paths(&entries).context("PYTHONPATH entries contain the path separator")?;
+        command.env("PYTHONPATH", joined);
+    }
+    if let Some(device) = device {
+        command.env(cfg.pin_env_var, device);
+        // The same value under a name only we write, so the worker can tell
+        // *our* placement from an operator's ambient visibility variable —
+        // see `gpu::DEVICE_PIN_MARKER_ENV_VAR`.
+        command.env(super::gpu::DEVICE_PIN_MARKER_ENV_VAR, device);
+    }
+    for (key, value) in &cfg.env {
+        command.env(key, value);
+    }
+    for key in &cfg.env_remove {
+        command.env_remove(key);
+    }
+    if let Some(cwd) = &cfg.cwd {
+        command.current_dir(cwd);
+    }
+    // An interactive Ctrl-C must reach the gateway alone; the shutdown
+    // ladder (unload → terminate → kill) does the stopping. A worker hit
+    // directly by the console signal dies before `unload` is sent and is
+    // reported as an unexpected death.
+    detach_from_console(&mut command);
+    // And if the gateway dies with no cleanup at all (forced exit, OOM
+    // kill), the kernel reaps the worker: job object on Windows,
+    // PR_SET_PDEATHSIG on Unix.
+    die_with_parent(&mut command);
+    Ok(command)
+}
+
+/// One line when a worker's own env config touches a variable that decides
+/// *where the model runs*, because that config is applied last and therefore
+/// silently outranks what the orchestrator wrote.
+///
+/// Three shapes of collision, all worth the same warning. An entry for the
+/// variable the pin was written to replaces the pin outright (or, via
+/// `env_remove`, deletes it, leaving the worker whatever the gateway
+/// inherited). An entry for a *different* visibility variable does not
+/// overwrite anything, but the AMD stack still resolves the pair by its own
+/// precedence — `HIP_VISIBLE_DEVICES` over its `CUDA_VISIBLE_DEVICES` alias,
+/// both indexing into whatever `ROCR_VISIBLE_DEVICES` already filtered — so
+/// the boards the worker ends up on are not necessarily the ones the pin
+/// named. And an entry for [`DEVICE_ENV_VAR`] moves the device coherence
+/// marker itself (docs/unified-memory-admission.md, backend C): it is what
+/// `get_device()` honours and what the worker measures its memory currency
+/// from, so a model config that sets or deletes it can put the impl on a
+/// device the ledger is not pricing — on a CPU-priced host, the exact hole
+/// the marker exists to close. Neither case is an error: an operator may well
+/// mean it. It is simply the one env interaction whose symptom (a model
+/// running on the wrong board, or on the CPU) points nowhere near its cause.
+///
+/// One line per spawn, listing every colliding variable, and only when there
+/// is a collision to report. Called from [`Worker::spawn_configured`] rather
+/// than from [`worker_command`], because that is the only place the *model's*
+/// own entries are still distinguishable from the orchestrator's — see
+/// [`colliding_device_variables`]. A pooled worker
+/// ([`Worker::spawn`], `prewarm.rs`) is spawned by impl class with no model
+/// env at all, so there is nothing there for this to report.
+fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, spec: &SpawnSpec, device: Option<&str>) {
+    let overrides = colliding_device_variables(cfg, spec);
+    if overrides.is_empty() {
+        return;
+    }
+    // Two messages, because with no pin written the collision has nothing to
+    // override: saying "the worker may not end up on the board it was pinned
+    // to" there reads as an alarm about a pin that does not exist. The entry
+    // is still worth one line — it is controlling device visibility on this
+    // worker, and the orchestrator is not the thing that set it, which is
+    // exactly the state that makes a later "why is this model on the wrong
+    // card" impossible to trace.
+    let message = if device.is_some() {
+        "this worker's env config sets or removes a device-selection variable \
+         (a GPU-visibility one, or the INFERIO_DEVICE coherence marker); it is \
+         applied after the device pin, so an entry naming the pin's own \
+         variable replaces (or deletes) the pin, and an entry naming another \
+         one is resolved against it by the runtime's own precedence — either \
+         way the worker may not end up on the board it was pinned to"
+    } else {
+        "this worker's env config sets or removes a device-selection variable \
+         (a GPU-visibility one, or the INFERIO_DEVICE coherence marker) while \
+         no device pin was written for this replica; the entry alone \
+         therefore decides where the model runs, and the orchestrator's \
+         ledger is pricing it against the board it believes rather than one \
+         it placed it on"
+    };
+    tracing::warn!(
+        variables = overrides.join(", "),
+        pin_variable = cfg.pin_env_var,
+        pin = device.unwrap_or("(none)"),
+        "{message}"
+    );
+}
+
+/// The device-selection variables this spawn's *model configuration* touches,
+/// in a fixed order. Pure, so the decision is testable without a subscriber.
+///
+/// The two families are read from different places, and that asymmetry is the
+/// whole point of splitting this out:
+///
+/// - the **visibility** variables are read from the merged spawn env
+///   (`cfg`), which is where they have always been read from. Nothing the
+///   orchestrator writes is one of them — `accelerator_env::worker_env`
+///   emits HIP/MIOpen paths, the MPS watermarks and the device marker, and
+///   `for_unified_board` emits a PCI address — so every hit there is the
+///   model's anyway, and reading the merged view additionally catches one
+///   arriving by some future route;
+/// - [`DEVICE_ENV_VAR`](crate::accelerator_env::DEVICE_ENV_VAR) is read from
+///   the **model spec alone**, because the orchestrator writes it itself on
+///   every worker of a CPU-priced host. Filtering the merged env for it would
+///   fire on every single spawn on such a host and blame the operator's model
+///   config for the orchestrator's own entry — a warning that is not merely
+///   noise but actively misleading, since it names the one variable whose
+///   whole purpose is that the orchestrator controls it.
+fn colliding_device_variables(cfg: &WorkerSpawnConfig, spec: &SpawnSpec) -> Vec<&'static str> {
+    let touched = |env: &[(String, String)], removed: &[String], var: &str| {
+        env.iter().any(|(key, _)| key.eq_ignore_ascii_case(var))
+            || removed.iter().any(|key| key.eq_ignore_ascii_case(var))
+    };
+    let mut overrides: Vec<&'static str> = super::rocm::VISIBILITY_VARS
+        .into_iter()
+        .filter(|var| touched(&cfg.env, &cfg.env_remove, var))
+        .collect();
+    let marker = crate::accelerator_env::DEVICE_ENV_VAR;
+    if touched(&spec.env, &spec.env_remove, marker) {
+        overrides.push(marker);
+    }
+    overrides
 }
 
 impl Worker {
     /// Spawn `python -m inferio_worker` per the protocol's spawn contract
-    /// (INFERIO_WORKER=1, PYTHONPATH prepend, CUDA_VISIBLE_DEVICES when a
-    /// device pin is given, PYTHONHOME removed, inherited env otherwise)
+    /// (INFERIO_WORKER=1, PYTHONPATH prepend, the backend's device-visibility
+    /// variable when a pin is given, PYTHONHOME removed, inherited env
+    /// otherwise — see [`worker_command`]) — `device` is the *resolved* pin,
+    /// a `GPU-…` board UUID on CUDA and a HIP device index on ROCm
+    /// (`gpu.rs`); this layer only writes what it is handed —
     /// and perform the v2
     /// handshake — identity only (`impl_class` + the config's `impl_dirs`),
     /// no instantiation — within the handshake deadline. On any failure the
@@ -258,56 +769,7 @@ impl Worker {
         impl_class: &str,
         device: Option<String>,
     ) -> Result<Worker> {
-        let mut command = Command::new(&cfg.python);
-        command
-            .arg("-m")
-            .arg("inferio_worker")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .env("INFERIO_WORKER", "1")
-            // Defense in depth for the stderr forwarder: keep Python's own
-            // text streams UTF-8 regardless of the console code page
-            // (cp1252 tracebacks on Windows). The Rust side still tolerates
-            // arbitrary bytes — native libraries write to fd 2 directly.
-            .env("PYTHONIOENCODING", "utf-8")
-            // A set PYTHONHOME is never valid for a venv interpreter, and
-            // AppImage-style launchers export one pointing into their mount,
-            // which kills the child before main (missing 'encodings'). The
-            // PYTHONPATH inherit below stays: it is a deliberate dev hook.
-            .env_remove("PYTHONHOME");
-        if !cfg.pythonpath.is_empty() {
-            let mut entries = cfg.pythonpath.clone();
-            if let Some(existing) = env::var_os("PYTHONPATH") {
-                entries.extend(env::split_paths(&existing));
-            }
-            let joined = env::join_paths(&entries)
-                .context("PYTHONPATH entries contain the path separator")?;
-            command.env("PYTHONPATH", joined);
-        }
-        if let Some(device) = device.as_deref() {
-            command.env("CUDA_VISIBLE_DEVICES", device);
-        }
-        for (key, value) in &cfg.env {
-            command.env(key, value);
-        }
-        for key in &cfg.env_remove {
-            command.env_remove(key);
-        }
-        if let Some(cwd) = &cfg.cwd {
-            command.current_dir(cwd);
-        }
-        // An interactive Ctrl-C must reach the gateway alone; the shutdown
-        // ladder (unload → terminate → kill) does the stopping. A worker hit
-        // directly by the console signal dies before `unload` is sent and is
-        // reported as an unexpected death.
-        detach_from_console(&mut command);
-        // And if the gateway dies with no cleanup at all (forced exit, OOM
-        // kill), the kernel reaps the worker: job object on Windows,
-        // PR_SET_PDEATHSIG on Unix.
-        die_with_parent(&mut command);
-
+        let mut command = worker_command(cfg, device.as_deref())?;
         let mut child = command.spawn().with_context(|| {
             format!(
                 "failed to spawn inferio worker for impl class {impl_class} via {}",
@@ -335,10 +797,15 @@ impl Worker {
             stderr: tail,
             stderr_task: Some(stderr_task),
             _job_guard: job_guard,
+            telemetry: Arc::new(Mutex::new(WorkerTelemetry {
+                gpu: device.clone(),
+                ..WorkerTelemetry::default()
+            })),
             deadlines: cfg.deadlines,
             next_id: 1,
             in_flight: false,
             dead: false,
+            unreachable: false,
         };
 
         let impl_dirs = cfg
@@ -370,9 +837,12 @@ impl Worker {
         let version = map_get(&payload, "protocol_version").and_then(Value::as_u64);
         if version != Some(PROTOCOL_VERSION) {
             return Err(worker
-                .fatal(format!(
-                    "worker answered handshake with protocol_version {version:?}, expected {PROTOCOL_VERSION}"
-                ))
+                .fatal(
+                    format!(
+                        "worker answered handshake with protocol_version {version:?}, expected {PROTOCOL_VERSION}"
+                    ),
+                    FatalCause::Desync,
+                )
                 .await);
         }
         Ok(worker)
@@ -392,6 +862,11 @@ impl Worker {
         let mut spawn_cfg = cfg.clone();
         spawn_cfg.env.extend(spec.env.clone());
         spawn_cfg.env_remove.extend(spec.env_remove.clone());
+        // Before the merge is out of sight: this is the only place the
+        // model's own entries are still separable from the orchestrator's,
+        // which one of the two families the warning covers depends on
+        // ([`colliding_device_variables`]).
+        warn_on_visibility_overrides(&spawn_cfg, spec, device.as_deref());
         let mut worker = Self::spawn(&spawn_cfg, &spec.impl_class, device)
             .await
             .with_context(|| format!("failed to spawn inferio worker for {inference_id}"))?;
@@ -448,24 +923,93 @@ impl Worker {
     /// Send `load` and await `ok` within the load deadline. Requires a
     /// prior successful `configure`. Idempotent on the worker side (the
     /// impl's own load() guard).
+    ///
+    /// The response may carry the base measurement and a memory sample
+    /// (protocol doc, "Memory sensing"); both are recorded in the shared
+    /// [`WorkerTelemetry`] and acted on by nobody yet. A worker that reports
+    /// nothing (no torch, a remote-API impl) leaves the telemetry untouched —
+    /// which no longer includes CPU and MPS hosts, whose workers report in
+    /// system-RAM and Metal-budget currency respectively
+    /// (docs/unified-memory-admission.md).
     pub async fn load(&mut self) -> Result<()> {
         let deadline = self.deadlines.load;
-        self.roundtrip("load", Vec::new(), Some(deadline))
+        let payload = self
+            .roundtrip("load", Vec::new(), Some(deadline))
             .await
-            .map(|_| ())
-            .with_context(|| format!("load failed for inferio worker {}", self.label))
+            .with_context(|| format!("load failed for inferio worker {}", self.label))?;
+        if let Some(report) = LoadReport::parse(&payload) {
+            tracing::debug!(
+                worker = %self.label,
+                base_mb = report.base_mb,
+                base_method = report.base_method.as_deref(),
+                dtype = report.dtype.as_deref(),
+                gpu_uuid = report.gpu_uuid.as_deref(),
+                gpu_name = report.gpu_name.as_deref(),
+                gpu_bdf = report.gpu_bdf.as_deref(),
+                gpu_total_mb = report.gpu_total_mb,
+                torch = report.torch_version.as_deref(),
+                "worker reported its load footprint"
+            );
+            if let Ok(mut telemetry) = self.telemetry.lock() {
+                if let Some(sample) = report.memory.clone() {
+                    telemetry.memory = Some(Timestamped::now(sample));
+                }
+                telemetry.load = Some(Timestamped::now(report));
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared memory-sensing handle for this worker, for the manager to keep
+    /// alongside the replica after the dispatcher takes ownership.
+    pub fn telemetry(&self) -> TelemetryHandle {
+        Arc::clone(&self.telemetry)
+    }
+
+    /// Record the optional memory-sensing fields of a `predict` reply.
+    ///
+    /// Runs for `ok` **and** `error` frames: a window that failed part-way
+    /// still measured whatever ran before the failure, and an out-of-memory
+    /// batch is precisely the negative sample the ledger most needs.
+    fn record_telemetry(&self, payload: &[(Value, Value)]) {
+        let measurements = BatchMeasurement::parse_list(map_get(payload, "measurements"));
+        let sample = MemorySample::parse(map_get(payload, "memory"));
+        if sample.is_none() && measurements.is_empty() {
+            return;
+        }
+        if let Ok(mut telemetry) = self.telemetry.lock() {
+            if let Some(sample) = sample {
+                telemetry.memory = Some(Timestamped::now(sample));
+            }
+            telemetry.record_measurements(measurements);
+        }
     }
 
     /// Send `predict` with the given inputs and return one output per input,
     /// in order. No deadline in v1 (models take arbitrarily long); to cancel,
     /// drop the future and `kill()` the worker.
     ///
+    /// `grant` is the window's memory grant (protocol doc, "Memory grants").
+    /// With one, the worker's packing harness splits the inputs into several
+    /// GPU batches within the budget and reports one measurement per batch;
+    /// without one, the whole array goes to a single `instance.predict` call,
+    /// which is the permanent compatibility path for `none`-class models and
+    /// any host with no inventory at all (CPU and MPS hosts have admission
+    /// boards of their own and do get grants —
+    /// docs/unified-memory-admission.md). `fit` rides along only when the
+    /// fitted cost model moved since the last frame to this worker.
+    ///
     /// A slot may come back as [`WorkerOutput::Error`] — the worker's typed
     /// verdict on *that input alone* (protocol doc, "Per-item error slots").
     /// It is a normal, successful roundtrip: the count still has to match, so
     /// slot alignment downstream is unchanged, and only a malformed error
     /// object (or a wrong count) is fatal.
-    pub async fn predict(&mut self, inputs: &[WorkerInput]) -> Result<Vec<WorkerOutput>> {
+    pub async fn predict(
+        &mut self,
+        inputs: &[WorkerInput],
+        grant: Option<&Grant>,
+        fit: Option<&FitSnapshot>,
+    ) -> Result<Vec<WorkerOutput>> {
         let entries = inputs
             .iter()
             .map(|input| {
@@ -485,34 +1029,42 @@ impl Worker {
                 ])
             })
             .collect();
+        let mut fields = vec![(Value::from("inputs"), Value::Array(entries))];
+        if let Some(grant) = grant {
+            fields.push((Value::from("grant"), encode_grant(grant)));
+        }
+        if let Some(fit) = fit {
+            fields.push((Value::from("fit"), encode_fit(fit)));
+        }
         let mut payload = self
-            .roundtrip(
-                "predict",
-                vec![(Value::from("inputs"), Value::Array(entries))],
-                None,
-            )
+            .roundtrip("predict", fields, None)
             .await
             .with_context(|| format!("predict failed for inferio worker {}", self.label))?;
         let outputs = match take_field(&mut payload, "outputs") {
             Some(Value::Array(outputs)) => outputs,
             other => {
                 return Err(self
-                    .fatal(format!(
-                        "predict ok frame without a valid outputs array: {other:?}"
-                    ))
+                    .fatal(
+                        format!("predict ok frame without a valid outputs array: {other:?}"),
+                        FatalCause::Desync,
+                    )
                     .await);
             }
         };
+        self.record_telemetry(&payload);
         // A count mismatch would silently mis-route outputs once the
         // dispatcher splits batches per request; the worker cannot be
         // trusted after it.
         if outputs.len() != inputs.len() {
             return Err(self
-                .fatal(format!(
-                    "worker returned {} outputs for {} inputs",
-                    outputs.len(),
-                    inputs.len()
-                ))
+                .fatal(
+                    format!(
+                        "worker returned {} outputs for {} inputs",
+                        outputs.len(),
+                        inputs.len()
+                    ),
+                    FatalCause::Desync,
+                )
                 .await);
         }
         let mut converted = Vec::with_capacity(outputs.len());
@@ -525,9 +1077,10 @@ impl Worker {
                 // verdict, which the ledger would then persist.
                 Some(Err(reason)) => {
                     return Err(self
-                        .fatal(format!(
-                            "predict output {index} is a malformed error slot: {reason}"
-                        ))
+                        .fatal(
+                            format!("predict output {index} is a malformed error slot: {reason}"),
+                            FatalCause::Desync,
+                        )
                         .await);
                 }
                 None => match output {
@@ -555,6 +1108,29 @@ impl Worker {
             }
         }
         Ok(converted)
+    }
+
+    /// Send `trim` — release the caching allocator's unused pool
+    /// (`empty_cache()`), keeping weights, live tensors and the CUDA context —
+    /// and record the fresh memory sample the reply carries.
+    ///
+    /// The orchestrator sends this to an **idle** resident whose retained pool
+    /// is squeezing a neighbour (docs/batch-calibration-design.md, "Trim for
+    /// idle residents"). It is hygiene, not work: a worker that cannot trim
+    /// (no torch, no live CUDA) replies `ok` with nothing, an older worker
+    /// replies with a per-request `error` and stays alive, and both are fine.
+    ///
+    /// Recording the sample is the point of the round trip as far as the
+    /// ledger is concerned: it is how the released slack stops being charged
+    /// to a resident that will not run another window for a while.
+    pub async fn trim(&mut self) -> Result<()> {
+        let deadline = TRIM_DEADLINE;
+        let payload = self
+            .roundtrip("trim", Vec::new(), Some(deadline))
+            .await
+            .with_context(|| format!("trim failed for inferio worker {}", self.label))?;
+        self.record_telemetry(&payload);
+        Ok(())
     }
 
     /// Liveness check: send `ping`, await `ok`. Bounded by the handshake
@@ -688,10 +1264,19 @@ impl Worker {
             );
         }
         if self.in_flight {
+            // Classified `Desync` even though the process may in fact be gone:
+            // a stranded stream is discovered here rather than where it
+            // happened, so if the OS killed the worker *after* a cancel
+            // stranded it, this request sees the desync first and DP-2 misses
+            // a real memory negative. A deliberate under-report — the
+            // conservative direction is to lose a negative sample, not to
+            // invent one out of a user pressing cancel.
             return Err(self
-                .fatal(
+                .fatal_request(
+                    request_type,
                     "a previous request future was dropped mid-flight; the stream is desynchronized"
                         .to_owned(),
+                    FatalCause::Desync,
                 )
                 .await);
         }
@@ -735,7 +1320,11 @@ impl Worker {
             Ok(value) => value,
             Err(err) => {
                 return Err(self
-                    .fatal(format!("{request_type} request failed: {err:#}"))
+                    .fatal_request(
+                        request_type,
+                        format!("{request_type} request failed: {err:#}"),
+                        FatalCause::Unreachable,
+                    )
                     .await);
             }
         };
@@ -743,7 +1332,11 @@ impl Worker {
             Value::Map(map) => map,
             other => {
                 return Err(self
-                    .fatal(format!("response frame is not a map: {other}"))
+                    .fatal_request(
+                        request_type,
+                        format!("response frame is not a map: {other}"),
+                        FatalCause::Desync,
+                    )
                     .await);
             }
         };
@@ -753,9 +1346,11 @@ impl Worker {
         let resp_id = map_get(&map, "id").and_then(Value::as_u64);
         if resp_id != Some(id) {
             return Err(self
-                .fatal(format!(
-                    "response id {resp_id:?} does not match request id {id}"
-                ))
+                .fatal_request(
+                    request_type,
+                    format!("response id {resp_id:?} does not match request id {id}"),
+                    FatalCause::Desync,
+                )
                 .await);
         }
         match resp_type.as_deref() {
@@ -768,6 +1363,9 @@ impl Worker {
                 // is still in sync and the worker stays alive (protocol doc,
                 // `error` semantics).
                 self.in_flight = false;
+                // Telemetry on an error frame is advisory but valuable: the
+                // batch that failed is the negative sample the ledger wants.
+                self.record_telemetry(&map);
                 let message = map_get(&map, "message")
                     .and_then(Value::as_str)
                     .unwrap_or("<worker sent an error frame without a message>")
@@ -783,15 +1381,47 @@ impl Worker {
                 }))
             }
             other => Err(self
-                .fatal(format!("unexpected response frame type {other:?}"))
+                .fatal_request(
+                    request_type,
+                    format!("unexpected response frame type {other:?}"),
+                    FatalCause::Desync,
+                )
                 .await),
         }
     }
 
+    /// [`Self::fatal`], plus the one thing the request type is needed for:
+    /// naming a `trim` as the cause of a teardown before it happens.
+    ///
+    /// Every other request type is something a caller asked for, so a model
+    /// dying on one has an obvious cause in the logs right above it. A trim is
+    /// the exception — nobody asked for it, it is memory hygiene the
+    /// orchestrator sent on its own initiative to an *idle* resident — so
+    /// without this line an operator sees a model die with no request of
+    /// theirs anywhere near it. Logged before the teardown so it precedes the
+    /// death, whatever the reap does to ordering.
+    async fn fatal_request(
+        &mut self,
+        request_type: &str,
+        why: String,
+        cause: FatalCause,
+    ) -> anyhow::Error {
+        if request_type == "trim" {
+            tracing::warn!(
+                worker = %self.label,
+                "an idle-resident trim (allocator-pool hygiene, not work) failed \
+                 fatally and is about to take this worker down with it; the model \
+                 will have to be reloaded. Cause: {why}"
+            );
+        }
+        self.fatal(why, cause).await
+    }
+
     /// Poison the worker after an unrecoverable failure: kill, reap, drain
     /// stderr, and build the error carrying exit status + stderr tail.
-    async fn fatal(&mut self, why: String) -> anyhow::Error {
+    async fn fatal(&mut self, why: String, cause: FatalCause) -> anyhow::Error {
         self.dead = true;
+        self.unreachable = matches!(cause, FatalCause::Unreachable);
         self.in_flight = false;
         kill_process_group(&self.child);
         let _ = self.child.start_kill();
@@ -812,6 +1442,32 @@ impl Worker {
         )
     }
 
+    /// Did this worker *die*, as opposed to being poisoned by a desync we
+    /// killed it for — and if so, **claim** that fact.
+    ///
+    /// Deliberately narrower than "unusable": a worker whose stream we tore
+    /// down ourselves ([`FatalCause::Desync`]) — the dropped-future path a
+    /// user cancel produces, a frame answering the wrong id — is just as
+    /// unusable, but it is the *dispatcher's* doing and says nothing about
+    /// memory. The ledger blames a batch size for a death (DP-2's synthetic
+    /// negative on unified boards), so only a worker that stopped answering
+    /// on its own may settle a window as `WorkerDied`. An error that never
+    /// reached [`Self::fatal`] at all — an oversized frame rejected by
+    /// `encode_frame` before a byte hit the wire — leaves this `false`
+    /// alongside a worker that is still perfectly alive.
+    ///
+    /// **Taking** rather than reading is the one-shot guard: one death may
+    /// produce at most one negative sample. Today the dispatcher tears the
+    /// model down on the first fatal error so a second granted window on a
+    /// dead replica is unreachable, but nothing in the type system says so,
+    /// and a future change that made it reachable would halve the model's
+    /// ratchet anchor once per window instead of once per death. Every
+    /// further call answers `false`, which settles as an abort — the correct
+    /// reading, since the death was already accounted.
+    pub(crate) fn take_death(&mut self) -> bool {
+        std::mem::take(&mut self.unreachable)
+    }
+
     fn stderr_tail_snapshot(&self) -> String {
         self.stderr
             .lock()
@@ -827,6 +1483,14 @@ impl Worker {
     pub(crate) async fn kill_child_externally_for_test(&mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
+    }
+
+    /// Test hook: leave the stream in the state a request future dropped
+    /// mid-flight leaves it, without having to race a real cancel. The next
+    /// request desynchronizes and kills a worker that is still alive.
+    #[cfg(test)]
+    pub(crate) fn strand_in_flight_for_test(&mut self) {
+        self.in_flight = true;
     }
 }
 
@@ -942,6 +1606,152 @@ async fn read_frame(stdout: &mut BufReader<ChildStdout>) -> Result<Value> {
     Ok(value)
 }
 
+/// Whole-MiB field: msgpack integers as sent, floats rounded (a worker that
+/// ever switches to fractional MB must not silently read as absent).
+/// Negative or non-finite values are treated as unknown.
+fn field_u64(map: &[(Value, Value)], key: &str) -> Option<u64> {
+    match map_get(map, key)? {
+        Value::Integer(int) => int.as_u64(),
+        Value::F32(float) => float_to_u64(f64::from(*float)),
+        Value::F64(float) => float_to_u64(*float),
+        _ => None,
+    }
+}
+
+fn float_to_u64(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    Some(value.round() as u64)
+}
+
+fn field_f64(map: &[(Value, Value)], key: &str) -> Option<f64> {
+    match map_get(map, key)? {
+        Value::F32(float) => Some(f64::from(*float)),
+        Value::F64(float) => Some(*float),
+        Value::Integer(int) => int.as_f64(),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+}
+
+fn field_string(map: &[(Value, Value)], key: &str) -> Option<String> {
+    map_get(map, key)?.as_str().map(str::to_owned)
+}
+
+impl MemorySample {
+    /// `None` when the field is absent or not a map, or when every value in
+    /// it is nil — an all-unknown sample carries no information.
+    fn parse(value: Option<&Value>) -> Option<Self> {
+        let Value::Map(map) = value? else {
+            return None;
+        };
+        let sample = Self {
+            free_mb: field_u64(map, "free_mb"),
+            total_mb: field_u64(map, "total_mb"),
+            free_source: field_string(map, "free_source"),
+            reserved_mb: field_u64(map, "reserved_mb"),
+            allocated_mb: field_u64(map, "allocated_mb"),
+        };
+        (sample != Self::default()).then_some(sample)
+    }
+}
+
+impl LoadReport {
+    /// `None` when the response carried no memory-sensing fields at all,
+    /// which is how an older worker (or one with no torch) answers.
+    ///
+    /// Visible to the rest of `inferio` (rather than private here) so the
+    /// ledger's registration tests can start from a real msgpack payload
+    /// instead of a hand-built struct: the provenance strings the ledger acts
+    /// on — `free_source`, `base_method` — are carried opaquely from the
+    /// worker to the board, and a round trip is the only test that covers the
+    /// whole of that path.
+    pub(super) fn parse(payload: &[(Value, Value)]) -> Option<Self> {
+        let report = Self {
+            base_mb: field_u64(payload, "base_mb"),
+            base_method: field_string(payload, "base_method"),
+            reserved_at_load_mb: field_u64(payload, "reserved_at_load_mb"),
+            dtype: field_string(payload, "dtype"),
+            gpu_uuid: field_string(payload, "gpu_uuid"),
+            gpu_name: field_string(payload, "gpu_name"),
+            gpu_bdf: field_string(payload, "gpu_bdf"),
+            gpu_total_mb: field_u64(payload, "gpu_total_mb"),
+            torch_version: field_string(payload, "torch_version"),
+            memory: MemorySample::parse(map_get(payload, "memory")),
+        };
+        (report != Self::default()).then_some(report)
+    }
+}
+
+impl BatchMeasurement {
+    fn parse_list(value: Option<&Value>) -> Vec<Self> {
+        let Some(Value::Array(entries)) = value else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let Value::Map(map) = entry else {
+                    return None;
+                };
+                Some(Self {
+                    items: field_u64(map, "items"),
+                    units: field_u64(map, "units"),
+                    reserved_before_mb: field_u64(map, "reserved_before_mb"),
+                    peak_reserved_mb: field_u64(map, "peak_reserved_mb"),
+                    allocated_before_mb: field_u64(map, "allocated_before_mb"),
+                    peak_allocated_mb: field_u64(map, "peak_allocated_mb"),
+                    duration_ms: field_f64(map, "duration_ms"),
+                    oom: field_bool(map, "oom"),
+                    throughput_collapse: field_bool(map, "throughput_collapse"),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Absent or non-boolean reads as `false`: these flags mean "the worker
+/// observed this", so silence is never a signal.
+fn field_bool(map: &[(Value, Value)], key: &str) -> bool {
+    matches!(map_get(map, key), Some(Value::Boolean(true)))
+}
+
+/// The `grant` map on a `predict` request frame (protocol doc, "Memory
+/// grants").
+fn encode_grant(grant: &Grant) -> Value {
+    Value::Map(vec![
+        (Value::from("unit_budget"), Value::from(grant.unit_budget)),
+        (Value::from("mb"), Value::from(grant.mb)),
+        (Value::from("unit"), Value::from(grant.unit.as_str())),
+        (
+            Value::from("aggregation"),
+            Value::from(grant.aggregation.as_str()),
+        ),
+        (
+            Value::from("user_cap_items"),
+            grant
+                .user_cap_items
+                .map(|cap| Value::from(u64::from(cap)))
+                .unwrap_or(Value::Nil),
+        ),
+    ])
+}
+
+/// The `fit` map on a `predict` request frame; sent only when the fitted cost
+/// model moved since the last frame to that worker.
+fn encode_fit(fit: &FitSnapshot) -> Value {
+    Value::Map(vec![
+        (
+            Value::from("slope_mb_per_unit"),
+            Value::F64(fit.slope_mb_per_unit),
+        ),
+        (Value::from("intercept_mb"), Value::F64(fit.intercept_mb)),
+        (Value::from("residual_mb"), Value::F64(fit.residual_mb)),
+        (Value::from("samples"), Value::from(fit.samples as u64)),
+    ])
+}
+
 fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     map.iter()
         .find(|(k, _)| k.as_str() == Some(key))
@@ -1046,21 +1856,23 @@ fn rmpv_to_json(value: &Value) -> Result<JsonValue> {
     })
 }
 
+/// Spawn plumbing shared by the worker's own tests and the dispatcher's,
+/// which needs real worker subprocesses to drive a granted window end to end.
 #[cfg(test)]
-mod tests {
+pub(super) mod testing {
     use super::*;
     use serde_json::json;
     use std::path::Path;
 
     /// Repo root = CARGO_MANIFEST_DIR/.. (the panoptikon crate lives one level
     /// below the workspace root).
-    fn workspace_root() -> PathBuf {
+    pub(crate) fn workspace_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
     }
 
     /// Test interpreter default: the managed venv (`python/.venv`) if
     /// present, else the legacy root `.venv` (pre-restructure installs).
-    fn test_venv_python(root: &Path, rel: &str) -> PathBuf {
+    pub(crate) fn test_venv_python(root: &Path, rel: &str) -> PathBuf {
         let managed = root.join("python/.venv").join(rel);
         if managed.is_file() {
             managed
@@ -1074,7 +1886,7 @@ mod tests {
     /// subprocess must resolve the python/-layout package itself), NO_CUDNN so
     /// startup never probes CUDA paths (which would import torch), and the
     /// test fixture impl dir.
-    fn test_spawn_config() -> WorkerSpawnConfig {
+    pub(crate) fn test_spawn_config() -> WorkerSpawnConfig {
         let root = workspace_root();
         // PANOPTIKON_TEST_PYTHON overrides the repo-venv interpreter (any
         // python with msgpack works), e.g. running the suite under WSL
@@ -1098,10 +1910,13 @@ mod tests {
             env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
+            // The fixture impls echo `CUDA_VISIBLE_DEVICES`, which is also
+            // what every non-ROCm host writes.
+            pin_env_var: crate::inferio::gpu::CUDA_PIN_ENV_VAR,
         }
     }
 
-    fn spec(impl_class: &str) -> SpawnSpec {
+    pub(crate) fn spec(impl_class: &str) -> SpawnSpec {
         SpawnSpec {
             impl_class: impl_class.to_owned(),
             config_kwargs: json!({}),
@@ -1109,6 +1924,238 @@ mod tests {
             env: Vec::new(),
             env_remove: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use serde_json::json;
+
+    /// D2's spawn half: a resolved pin goes into the visibility variable the
+    /// backend dictates and into **no other one**. `CUDA_VISIBLE_DEVICES` is
+    /// deliberately not also set on ROCm — it is a HIP alias, and setting
+    /// both is documented unintended-behaviour territory — and the CUDA
+    /// vocabulary must never reach HIP's variable, where a `GPU-…` string
+    /// hides every board.
+    ///
+    /// Asserted against the composed command rather than a live worker, so
+    /// it holds on any box, with or without an interpreter or a GPU.
+    #[test]
+    fn the_device_pin_goes_into_the_backends_visibility_variable() {
+        use crate::inferio::gpu::{CUDA_PIN_ENV_VAR, HIP_PIN_ENV_VAR};
+
+        fn config(pin_env_var: &'static str) -> WorkerSpawnConfig {
+            WorkerSpawnConfig {
+                python: PathBuf::from("python"),
+                impl_dirs: Vec::new(),
+                pythonpath: Vec::new(),
+                env: Vec::new(),
+                env_remove: Vec::new(),
+                cwd: None,
+                deadlines: WorkerDeadlines::default(),
+                pin_env_var,
+            }
+        }
+        fn pin_env(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Vec<(String, String)> {
+            worker_command(cfg, device)
+                .expect("the command composes")
+                .as_std()
+                .get_envs()
+                .filter(|(key, _)| key.to_string_lossy().ends_with("VISIBLE_DEVICES"))
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.unwrap_or_default().to_string_lossy().into_owned(),
+                    )
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            pin_env(&config(CUDA_PIN_ENV_VAR), Some("GPU-1a2b")),
+            vec![("CUDA_VISIBLE_DEVICES".to_owned(), "GPU-1a2b".to_owned())],
+            "a CUDA host writes the board UUID, and only that variable"
+        );
+        assert_eq!(
+            pin_env(&config(HIP_PIN_ENV_VAR), Some("1")),
+            vec![("HIP_VISIBLE_DEVICES".to_owned(), "1".to_owned())],
+            "a ROCm host writes the HIP device index, and CUDA_VISIBLE_DEVICES \
+             is deliberately left alone"
+        );
+        // No pin: no visibility variable at all, on either backend — the
+        // worker inherits whatever the operator's environment says.
+        assert!(pin_env(&config(CUDA_PIN_ENV_VAR), None).is_empty());
+        assert!(pin_env(&config(HIP_PIN_ENV_VAR), None).is_empty());
+
+        // DP-5 rides alongside the pin: a replica on a **unified** board is
+        // told which board that is, because the worker has no inventory and
+        // its own memory arithmetic has to count GTT there — and because the
+        // pin is only a *belief* about where the replica lands, the value is
+        // the board's address so the worker can check it against the board it
+        // actually came up on. A replica on a discrete board sees no such
+        // variable at all, which is what keeps its numbers byte-identical to
+        // before this existed.
+        let unified_env = |cfg: &WorkerSpawnConfig, bdf: Option<&str>| {
+            let cfg = cfg.for_unified_board(bdf);
+            worker_command(&cfg, Some("0"))
+                .expect("the command composes")
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| key.to_string_lossy() == "PANOPTIKON_UNIFIED_GPU")
+                .map(|(_, value)| value.unwrap_or_default().to_string_lossy().into_owned())
+        };
+        let rocm = config(HIP_PIN_ENV_VAR);
+        assert_eq!(
+            unified_env(&rocm, Some("0000:03:00.0")).as_deref(),
+            Some("0000:03:00.0"),
+            "the board's PCI address, not a flag"
+        );
+        // Lower-cased on the way out, because that is the spelling the worker
+        // renders its own address in and the two are compared as strings.
+        assert_eq!(
+            unified_env(&rocm, Some("0000:0C:00.0")).as_deref(),
+            Some("0000:0c:00.0")
+        );
+        assert_eq!(unified_env(&rocm, None), None);
+        assert_eq!(unified_env(&config(CUDA_PIN_ENV_VAR), None), None);
+        // The pin itself is untouched by either answer.
+        assert_eq!(
+            pin_env(&rocm.for_unified_board(Some("0000:03:00.0")), Some("0")),
+            vec![("HIP_VISIBLE_DEVICES".to_owned(), "0".to_owned())]
+        );
+        // And the config a discrete replica spawns with is the caller's own,
+        // not a copy — the flag is the only reason to clone one.
+        assert!(matches!(
+            rocm.for_unified_board(None),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        // The placement marker: the same pin under a name only we write, so
+        // the worker's pinned-but-invisible tripwire can tell our placement
+        // from an operator's ambient visibility variable (which looks
+        // identical in the child's environment and means the opposite).
+        let marker = |cfg: &WorkerSpawnConfig, device: Option<&str>| {
+            worker_command(cfg, device)
+                .expect("the command composes")
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| key.to_string_lossy() == "PANOPTIKON_DEVICE_PIN")
+                .map(|(_, value)| value.unwrap_or_default().to_string_lossy().into_owned())
+        };
+        assert_eq!(marker(&rocm, Some("1")).as_deref(), Some("1"));
+        assert_eq!(
+            marker(&config(CUDA_PIN_ENV_VAR), Some("GPU-1a2b")).as_deref(),
+            Some("GPU-1a2b")
+        );
+        assert_eq!(
+            marker(&rocm, None),
+            None,
+            "no pin, no marker — an unpinned replica was placed by nobody"
+        );
+    }
+
+    /// The device-override warning fires on the **model's** configuration and
+    /// never on the orchestrator's own entries.
+    ///
+    /// The regression this pins down: `INFERIO_DEVICE` is written by
+    /// `accelerator_env::worker_env` on every worker of a CPU-priced host and
+    /// then merged with the model's env before the spawn, so a check against
+    /// the merged view warned on *every single spawn* on such a host — and
+    /// blamed the operator's model config for the one variable the
+    /// orchestrator is supposed to own.
+    #[test]
+    fn the_device_override_warning_reads_the_models_own_env() {
+        use crate::accelerator_env::DEVICE_ENV_VAR;
+        use crate::inferio::gpu::CUDA_PIN_ENV_VAR;
+
+        /// A spawn config as `http.rs` builds one, plus the model's entries
+        /// merged on top exactly as `spawn_configured` merges them.
+        fn merged(host_env: Vec<(String, String)>, spec: &SpawnSpec) -> WorkerSpawnConfig {
+            let mut cfg = WorkerSpawnConfig {
+                python: PathBuf::from("python"),
+                impl_dirs: Vec::new(),
+                pythonpath: Vec::new(),
+                env: host_env,
+                env_remove: Vec::new(),
+                cwd: None,
+                deadlines: WorkerDeadlines::default(),
+                pin_env_var: CUDA_PIN_ENV_VAR,
+            };
+            cfg.env.extend(spec.env.clone());
+            cfg.env_remove.extend(spec.env_remove.clone());
+            cfg
+        }
+
+        let cpu_host = || vec![(DEVICE_ENV_VAR.to_owned(), "cpu".to_owned())];
+
+        // (a) A CPU host and a model that configures nothing: the marker in
+        // the merged env is ours, so there is nothing to report.
+        let plain = spec("echo_test");
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &plain), &plain),
+            Vec::<&str>::new(),
+            "the orchestrator's own marker must not warn about itself"
+        );
+
+        // (b) The model setting it *is* the collision, on any host — with or
+        // without the orchestrator's entry underneath.
+        let mut overriding = spec("echo_test");
+        overriding
+            .env
+            .push((DEVICE_ENV_VAR.to_owned(), "cuda".to_owned()));
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &overriding), &overriding),
+            vec![DEVICE_ENV_VAR]
+        );
+        assert_eq!(
+            colliding_device_variables(&merged(Vec::new(), &overriding), &overriding),
+            vec![DEVICE_ENV_VAR]
+        );
+        // Deleting it is the same collision: the worker then probes the
+        // hardware and can land off the board it is priced against.
+        let mut deleting = spec("echo_test");
+        deleting.env_remove.push(DEVICE_ENV_VAR.to_owned());
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &deleting), &deleting),
+            vec![DEVICE_ENV_VAR]
+        );
+        // Matched case-insensitively, like every other env comparison here.
+        let mut lower = spec("echo_test");
+        lower
+            .env
+            .push(("inferio_device".to_owned(), "cuda".to_owned()));
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &lower), &lower),
+            vec![DEVICE_ENV_VAR]
+        );
+
+        // (c) The visibility arm is unchanged: still read from the merged
+        // env, still every variant, still in `VISIBILITY_VARS` order — and it
+        // is never the orchestrator's, which writes no visibility variable
+        // through `env` at all.
+        let mut visible = spec("echo_test");
+        visible
+            .env
+            .push(("CUDA_VISIBLE_DEVICES".to_owned(), "0".to_owned()));
+        visible.env_remove.push("ROCR_VISIBLE_DEVICES".to_owned());
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &visible), &visible),
+            vec!["ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"],
+        );
+        // Both families at once, marker last.
+        let mut both = visible.clone();
+        both.env
+            .push((DEVICE_ENV_VAR.to_owned(), "cuda".to_owned()));
+        assert_eq!(
+            colliding_device_variables(&merged(cpu_host(), &both), &both),
+            vec![
+                "ROCR_VISIBLE_DEVICES",
+                "CUDA_VISIBLE_DEVICES",
+                DEVICE_ENV_VAR
+            ]
+        );
     }
 
     /// Full happy path against a real worker subprocess: spawn+handshake
@@ -1140,7 +2187,10 @@ mod tests {
                 file: Some(vec![0x00, 0x01, 0xfe, 0xff]),
             },
         ];
-        let outputs = worker.predict(&inputs).await.expect("predict ok");
+        let outputs = worker
+            .predict(&inputs, None, None)
+            .await
+            .expect("predict ok");
         assert_eq!(outputs.len(), 2, "one output per input, in order");
         assert_eq!(outputs[0], WorkerOutput::Json(json!({"echo": data})));
         assert_eq!(
@@ -1150,6 +2200,217 @@ mod tests {
 
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0), "worker exits 0 after unload");
+    }
+
+    /// `trim` round trip over the real protocol: the worker answers `ok`,
+    /// stays configured and loaded, and serves the next `predict` normally.
+    ///
+    /// The fixture impls never import torch, so there is no pool to release
+    /// and the reply carries no memory sample — which is the *point* of the
+    /// assertion here: a trim on a worker that cannot trim is a plain success,
+    /// not an error path, so the orchestrator never has to know in advance
+    /// which residents are trimmable. The stream staying in sync (the predict
+    /// below) is what proves the response frame was consumed correctly.
+    #[tokio::test]
+    async fn a_trim_is_answered_and_leaves_the_worker_serving() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
+            .await
+            .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+
+        worker.trim().await.expect("trim is answered with ok");
+        worker.trim().await.expect("trim is idempotent");
+
+        let inputs = [WorkerInput {
+            data: Some(json!("still here")),
+            file: None,
+        }];
+        let outputs = worker
+            .predict(&inputs, None, None)
+            .await
+            .expect("the worker still serves predicts after a trim");
+        assert_eq!(
+            outputs[0],
+            WorkerOutput::Json(json!({"echo": "still here"}))
+        );
+        let status = worker.shutdown().await.expect("graceful shutdown");
+        assert_eq!(status.code(), Some(0));
+    }
+
+    /// End to end over the real protocol: a `predict` carrying a **grant**
+    /// makes the worker's packing harness split the window into GPU batches
+    /// inside the unit budget, report one measurement per batch (with the
+    /// dimension-priced `units`), and still answer one output per input in
+    /// the original order.
+    ///
+    /// The batchsize fixture reports the batch size it was actually handed,
+    /// so this asserts the packing happened in the *worker* rather than being
+    /// inferred from telemetry alone.
+    #[tokio::test]
+    async fn a_grant_makes_the_worker_pack_gpu_batches() {
+        let cfg = test_spawn_config();
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/batch", &spec("batchsize_test"), None)
+                .await
+                .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+        let telemetry = worker.telemetry();
+
+        let inputs: Vec<WorkerInput> = (0..5)
+            .map(|index| WorkerInput {
+                data: Some(json!(index)),
+                file: None,
+            })
+            .collect();
+        let grant = Grant {
+            unit_budget: 2,
+            mb: 1024,
+            unit: super::super::cost::CostUnit::Item,
+            aggregation: super::super::cost::CostAggregation::Count,
+            user_cap_items: None,
+        };
+        let outputs = worker
+            .predict(&inputs, Some(&grant), None)
+            .await
+            .expect("granted predict");
+        assert_eq!(outputs.len(), 5, "one output per input");
+        let sizes: Vec<u64> = outputs
+            .iter()
+            .map(|output| match output {
+                WorkerOutput::Json(value) => value["batch"].as_u64().expect("batch"),
+                other => panic!("unexpected output {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![2, 2, 2, 2, 1],
+            "the window was packed into batches of 2, 2, 1 inside the grant"
+        );
+
+        let measurements: Vec<BatchMeasurement> = telemetry
+            .lock()
+            .unwrap()
+            .measurements()
+            .map(|sample| sample.measurement.clone())
+            .collect();
+        assert_eq!(measurements.len(), 3, "one measurement per GPU batch");
+        assert_eq!(
+            measurements
+                .iter()
+                .map(|batch| batch.items)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(2), Some(1)]
+        );
+        assert_eq!(
+            measurements
+                .iter()
+                .map(|batch| batch.units)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(2), Some(1)],
+            "item/count prices one unit per item"
+        );
+        assert!(
+            measurements.iter().all(|batch| !batch.oom
+                && !batch.throughput_collapse
+                && batch.duration_ms.is_some()),
+            "clean batches, each individually timed: {measurements:?}"
+        );
+
+        // The user cap is an item-count constraint at pack time.
+        let capped = Grant {
+            unit_budget: 8,
+            user_cap_items: Some(1),
+            ..grant
+        };
+        let outputs = worker
+            .predict(&inputs, Some(&capped), None)
+            .await
+            .expect("capped predict");
+        assert!(
+            outputs.iter().all(|output| match output {
+                WorkerOutput::Json(value) => value["batch"].as_u64() == Some(1),
+                _ => false,
+            }),
+            "a cap of 1 item overrides a unit budget of 8: {outputs:?}"
+        );
+
+        worker.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// The negative-sample path end to end: a granted window whose *second*
+    /// GPU batch OOMs fails as a whole (per-request semantics unchanged, the
+    /// worker stays alive) but still reports both measurements on the error
+    /// frame, the failing one flagged `oom`, and its message carries the
+    /// whole-window OOM prefix the ledger classifies on.
+    #[tokio::test]
+    async fn a_granted_window_reports_its_oom_batch_on_the_error_frame() {
+        let cfg = test_spawn_config();
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/oomsecond", &spec("oom_second_batch_test"), None)
+                .await
+                .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+        let telemetry = worker.telemetry();
+
+        let inputs: Vec<WorkerInput> = (0..4)
+            .map(|index| WorkerInput {
+                data: Some(json!(index)),
+                file: None,
+            })
+            .collect();
+        let grant = Grant {
+            unit_budget: 2,
+            mb: 1024,
+            unit: super::super::cost::CostUnit::Item,
+            aggregation: super::super::cost::CostAggregation::Count,
+            user_cap_items: None,
+        };
+        let err = worker
+            .predict(&inputs, Some(&grant), None)
+            .await
+            .expect_err("the second batch OOMs, so the window fails");
+        let worker_err = err
+            .downcast_ref::<WorkerError>()
+            .expect("a per-request failure: the worker survives it");
+        assert!(
+            worker_err.message.contains("INFERENCE_OOM_WINDOW:"),
+            "the whole-window OOM signal: {}",
+            worker_err.message
+        );
+        assert!(
+            super::super::ledger::message_reports_oom(&worker_err.message),
+            "and the ledger classifies it as a negative sample"
+        );
+
+        let measurements: Vec<BatchMeasurement> = telemetry
+            .lock()
+            .unwrap()
+            .measurements()
+            .map(|sample| sample.measurement.clone())
+            .collect();
+        assert_eq!(
+            measurements.len(),
+            2,
+            "telemetry is recorded from error frames too: {measurements:?}"
+        );
+        assert!(!measurements[0].oom, "the batch that ran was clean");
+        assert_eq!(measurements[0].units, Some(2), "and priced");
+        assert!(measurements[1].oom, "the batch that failed is the negative");
+        assert_eq!(
+            measurements[1].units, None,
+            "a failed batch is never priced: its peaks stop where the call gave \
+             up, so pricing it would feed the fit an under-stated cost"
+        );
+
+        // The worker survived: a smaller window still succeeds... except this
+        // fixture is now permanently past its first batch, so assert only
+        // liveness, which is the contract that matters.
+        worker
+            .ping()
+            .await
+            .expect("the worker is still serviceable");
+        worker.shutdown().await.expect("graceful shutdown");
     }
 
     /// A handshake naming an impl_class no fixture module provides must fail
@@ -1194,10 +2455,14 @@ mod tests {
             .expect("spawn + handshake");
 
         let err = worker
-            .predict(&[WorkerInput {
-                data: Some(json!("x")),
-                file: None,
-            }])
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!("x")),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect_err("predict before load must fail");
         let worker_err = err
@@ -1231,10 +2496,14 @@ mod tests {
         worker.kill_child_externally_for_test().await;
 
         let err = worker
-            .predict(&[WorkerInput {
-                data: Some(json!(1)),
-                file: None,
-            }])
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!(1)),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect_err("predict against a dead worker must fail");
         assert!(
@@ -1277,7 +2546,10 @@ mod tests {
                 file: None,
             },
         ];
-        let outputs = worker.predict(&inputs).await.expect("predict ok");
+        let outputs = worker
+            .predict(&inputs, None, None)
+            .await
+            .expect("predict ok");
         assert_eq!(
             outputs,
             vec![
@@ -1325,14 +2597,17 @@ mod tests {
             file: None,
         }];
         let outputs = worker
-            .predict(&input)
+            .predict(&input, None, None)
             .await
             .expect("predict succeeds despite stderr garbage");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"bad": true}))]);
 
         // A follow-up predict proves the worker (and its stderr pipe) is
         // still fully serviceable.
-        let outputs = worker.predict(&input).await.expect("second predict");
+        let outputs = worker
+            .predict(&input, None, None)
+            .await
+            .expect("second predict");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"bad": true}))]);
 
         // The forwarder drains asynchronously; poll for the marker line
@@ -1434,7 +2709,10 @@ mod tests {
                 file: None,
             },
         ];
-        let outputs = worker.predict(&inputs).await.expect("predict ok");
+        let outputs = worker
+            .predict(&inputs, None, None)
+            .await
+            .expect("predict ok");
         assert_eq!(outputs.len(), inputs.len(), "one slot per input");
         assert_eq!(outputs[0], WorkerOutput::Json(json!({"ok": "first"})));
         assert_eq!(
@@ -1455,10 +2733,14 @@ mod tests {
 
         // Nothing about the worker changed: it keeps serving.
         let outputs = worker
-            .predict(&[WorkerInput {
-                data: Some(json!("again")),
-                file: None,
-            }])
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!("again")),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect("worker is still serviceable");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": "again"}))]);
@@ -1481,10 +2763,14 @@ mod tests {
         worker.load().await.expect("load ok");
 
         let err = worker
-            .predict(&[WorkerInput {
-                data: Some(json!("malformed")),
-                file: None,
-            }])
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!("malformed")),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect_err("a malformed error slot must fail the predict");
         let text = format!("{err:#}");
@@ -1539,10 +2825,14 @@ mod tests {
             "map": {"inner": {"deep": ["リスト", 2.0, -1]}}
         });
         let outputs = worker
-            .predict(&[WorkerInput {
-                data: Some(data.clone()),
-                file: None,
-            }])
+            .predict(
+                &[WorkerInput {
+                    data: Some(data.clone()),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect("predict ok");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": data}))]);
@@ -1575,10 +2865,14 @@ mod tests {
             .expect("configure instantiates after the park");
         worker.load().await.expect("load ok");
         let outputs = worker
-            .predict(&[WorkerInput {
-                data: Some(json!(1)),
-                file: None,
-            }])
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!(1)),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect("predict ok");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"prepared": true}))]);
@@ -1637,10 +2931,14 @@ mod tests {
 
         // predict before configure is the state-machine sanity error.
         let err = worker
-            .predict(&[WorkerInput {
-                data: Some(json!(1)),
-                file: None,
-            }])
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!(1)),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect_err("predict before configure must fail");
         let worker_err = err
@@ -1693,6 +2991,190 @@ mod tests {
         assert!(
             err.downcast_ref::<WorkerError>().is_none(),
             "version mismatch is a fatal supervision error, not a worker error frame"
+        );
+    }
+
+    fn measurement(items: u64) -> BatchMeasurement {
+        BatchMeasurement {
+            items: Some(items),
+            ..BatchMeasurement::default()
+        }
+    }
+
+    /// Every measurement is kept, not just the last response's: the cost fit
+    /// in step 1b is fitted on a *set* of (units, peak) points, so the
+    /// telemetry is a bounded ring with per-worker sequence numbers rather
+    /// than a last-write-wins slot. Sequence numbers keep climbing across
+    /// ring evictions, which is what lets a watermark reader notice it lost
+    /// samples instead of assuming continuity.
+    #[test]
+    fn successive_predicts_retain_every_measurement() {
+        let mut telemetry = WorkerTelemetry::default();
+        for items in 1..=3 {
+            telemetry.record_measurements(vec![measurement(items)]);
+        }
+        assert_eq!(telemetry.recorded_measurements(), 3);
+        assert_eq!(
+            telemetry
+                .measurements()
+                .map(|sample| (sample.seq, sample.measurement.items))
+                .collect::<Vec<_>>(),
+            vec![(1, Some(1)), (2, Some(2)), (3, Some(3))],
+            "oldest first, one entry per measurement"
+        );
+
+        // One response carrying several GPU batches (the step-1b packing
+        // harness) contributes one sample each.
+        telemetry.record_measurements(vec![measurement(10), measurement(11)]);
+        assert_eq!(telemetry.recorded_measurements(), 5);
+        assert_eq!(telemetry.measurements().next_back().map(|s| s.seq), Some(5));
+
+        // Overflow: the ring is bounded, the counter is not.
+        for items in 0..WorkerTelemetry::RING as u64 {
+            telemetry.record_measurements(vec![measurement(items)]);
+        }
+        assert_eq!(telemetry.measurements().count(), WorkerTelemetry::RING);
+        assert_eq!(
+            telemetry.recorded_measurements(),
+            5 + WorkerTelemetry::RING as u64
+        );
+        let oldest = telemetry.measurements().next().expect("ring is full").seq;
+        assert!(
+            oldest > 1,
+            "the oldest retained seq moved past 1, so a stale watermark is \
+             detectable as a gap"
+        );
+        assert_eq!(
+            telemetry.measurements().next_back().map(|s| s.seq),
+            Some(telemetry.recorded_measurements()),
+            "the newest sample's seq is the running count"
+        );
+    }
+
+    /// The worker is a separate process and its response map is untrusted
+    /// input: a wrong type, a negative count or a nil where a map belongs
+    /// must read as "unknown", never as a wrong number and never as a
+    /// protocol failure (the load itself succeeded).
+    #[test]
+    fn load_report_parse_tolerates_wrong_types() {
+        let garbage = vec![
+            (Value::from("base_mb"), Value::from("4321")),
+            (Value::from("base_method"), Value::from(7i64)),
+            (Value::from("reserved_at_load_mb"), Value::from(-5i64)),
+            (Value::from("dtype"), Value::from(2.5f64)),
+            (Value::from("gpu_uuid"), Value::Nil),
+            (Value::from("memory"), Value::Nil),
+        ];
+        assert_eq!(
+            LoadReport::parse(&garbage),
+            None,
+            "nothing usable is the same as an older worker reporting nothing"
+        );
+
+        // memory as an array (not a map) is ignored while the good fields
+        // around it survive.
+        let mixed = vec![
+            (Value::from("base_mb"), Value::from(4321u64)),
+            (Value::from("base_method"), Value::from("nvml")),
+            (
+                Value::from("memory"),
+                Value::Array(vec![Value::from(1u64), Value::from(2u64)]),
+            ),
+            (Value::from("gpu_uuid"), Value::from("GPU-1a2b")),
+            (Value::from("gpu_name"), Value::from(42i64)),
+            (Value::from("gpu_bdf"), Value::from(3i64)),
+            (Value::from("gpu_total_mb"), Value::from("24576")),
+            (Value::from("torch_version"), Value::from("2.7.1+cu128")),
+        ];
+        let report = LoadReport::parse(&mixed).expect("the good fields are kept");
+        assert_eq!(report.base_mb, Some(4321));
+        assert_eq!(report.base_method.as_deref(), Some("nvml"));
+        assert_eq!(report.memory, None);
+        assert_eq!(report.gpu_uuid.as_deref(), Some("GPU-1a2b"));
+        assert_eq!(report.gpu_name, None, "a non-string name is unknown");
+        assert_eq!(report.gpu_bdf, None, "a non-string address is unknown");
+        assert_eq!(
+            report.gpu_total_mb, None,
+            "a stringified total is unknown, never a parsed number: the \
+             registration cross-check must not admit a board on a guess"
+        );
+        assert_eq!(report.torch_version.as_deref(), Some("2.7.1+cu128"));
+
+        // A whole-MiB float (a worker that ever switches to fractional MB)
+        // rounds rather than reading as absent; a negative one is unknown.
+        let floats = vec![
+            (Value::from("base_mb"), Value::from(1536.4f64)),
+            (Value::from("reserved_at_load_mb"), Value::from(-1.0f64)),
+        ];
+        let report = LoadReport::parse(&floats).expect("float base is usable");
+        assert_eq!(report.base_mb, Some(1536));
+        assert_eq!(report.reserved_at_load_mb, None);
+    }
+
+    /// A ROCm worker's load report: no `gpu_uuid` at all (torch renders a
+    /// third-vocabulary one on HIP and the worker suppresses it), a PCI
+    /// address instead, and the board's total as torch sees it — the pair
+    /// the ledger keys and cross-checks a ROCm replica by.
+    #[test]
+    fn load_report_carries_the_rocm_identity_fields() {
+        let rocm = vec![
+            (Value::from("base_mb"), Value::from(2048u64)),
+            (Value::from("base_method"), Value::from("alloc_delta")),
+            (Value::from("gpu_bdf"), Value::from("0000:03:00.0")),
+            (Value::from("gpu_total_mb"), Value::from(24_560u64)),
+            (
+                Value::from("gpu_name"),
+                Value::from("AMD Radeon RX 7900 XTX"),
+            ),
+            (Value::from("torch_version"), Value::from("2.11.0+rocm7.2")),
+        ];
+        let report = LoadReport::parse(&rocm).expect("a report with no uuid is a report");
+        assert_eq!(report.gpu_uuid, None);
+        assert_eq!(report.gpu_bdf.as_deref(), Some("0000:03:00.0"));
+        assert_eq!(report.gpu_total_mb, Some(24_560));
+        assert_eq!(report.torch_version.as_deref(), Some("2.11.0+rocm7.2"));
+
+        // The new fields alone are enough to make a report: a worker that
+        // could measure nothing else still has an identity to register with.
+        let identity_only = vec![(Value::from("gpu_bdf"), Value::from("0000:0c:00.0"))];
+        assert_eq!(
+            LoadReport::parse(&identity_only).map(|report| report.gpu_bdf),
+            Some(Some("0000:0c:00.0".to_owned()))
+        );
+    }
+
+    /// The measurement array is per-batch data from the same untrusted
+    /// source: entries that are not maps are skipped, not fatal, and a
+    /// non-array field yields no measurements at all.
+    #[test]
+    fn measurement_list_skips_non_map_entries() {
+        let list = Value::Array(vec![
+            Value::Nil,
+            Value::from(7i64),
+            Value::Map(vec![
+                (Value::from("items"), Value::from(8u64)),
+                (Value::from("peak_reserved_mb"), Value::from(1200u64)),
+                (Value::from("duration_ms"), Value::from(12.5f64)),
+            ]),
+            Value::Array(vec![Value::from("items")]),
+            Value::Map(vec![(Value::from("items"), Value::from("eight"))]),
+        ]);
+        let measurements = BatchMeasurement::parse_list(Some(&list));
+        assert_eq!(measurements.len(), 2, "only the two maps became entries");
+        assert_eq!(measurements[0].items, Some(8));
+        assert_eq!(measurements[0].peak_reserved_mb, Some(1200));
+        assert_eq!(measurements[0].duration_ms, Some(12.5));
+        assert_eq!(
+            measurements[1],
+            BatchMeasurement::default(),
+            "a map with only unusable values is an all-unknown measurement"
+        );
+
+        assert!(BatchMeasurement::parse_list(None).is_empty());
+        assert!(BatchMeasurement::parse_list(Some(&Value::Nil)).is_empty());
+        assert!(
+            BatchMeasurement::parse_list(Some(&Value::from("measurements"))).is_empty(),
+            "a non-array field is no measurements, not a panic"
         );
     }
 }

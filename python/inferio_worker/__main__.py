@@ -75,13 +75,27 @@ def _send_ok(proto_out: BinaryIO, req_id: int, **payload: Any) -> None:
 
 
 def _send_error(
-    proto_out: BinaryIO, req_id: int, message: str, tb: str = ""
+    proto_out: BinaryIO, req_id: int, message: str, tb: str = "", **extra: Any
 ) -> None:
+    """Send an `error` frame.
+
+    `extra` carries the optional memory-sensing fields a failed `predict` can
+    still report (`measurements`, `memory`): a window that failed part-way
+    measured whatever ran, and an out-of-memory batch is precisely the
+    negative sample the orchestrator needs. Advisory only — the error
+    semantics are unchanged (the request failed, the worker stays alive).
+    """
     from inferio_worker import protocol
 
     protocol.write_frame(
         proto_out,
-        {"type": "error", "id": req_id, "message": message, "traceback": tb},
+        {
+            "type": "error",
+            "id": req_id,
+            "message": message,
+            "traceback": tb,
+            **extra,
+        },
     )
 
 
@@ -143,7 +157,7 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
 
 
 def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
-    from inferio_worker import protocol
+    from inferio_worker import memory, protocol
     from inferio_worker.inputs import prediction_input_from_frame
 
     impl_cls = _handshake(proto_in, proto_out)
@@ -154,6 +168,9 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
     inference_id = "<unconfigured>"
     prewarmed = False
     loaded = False
+    # One-shot log: an impl with batching off refuses every grant, and saying
+    # so once per window would be noise.
+    batching_off_logged = False
     while True:
         msg = protocol.read_frame(proto_in)
         if msg is None:
@@ -226,11 +243,30 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 )
                 continue
             try:
+                # Memory sensing (docs/batch-calibration-design.md "Base
+                # measurement"): bracket the load so the orchestrator gets
+                # the process-level footprint it charges this worker for.
+                # Every field is optional — `finish_load` returns {} when
+                # nothing could be measured (no torch, CPU/MPS, or a process
+                # that never allocated on the device), and each sensing tier
+                # is backend-specific: NVML on CUDA, DRM fdinfo and amdgpu
+                # sysfs on ROCm, the torch allocator on either.
+                before = memory.begin_load()
                 # Idempotency lives in the impl's own load() guard
                 # (InferenceModel implementations early-return when loaded).
                 instance.load()
+                # A pin that named nothing is a *silent* CPU fallback: the
+                # impl's own device selection falls back happily, the model
+                # runs twenty times slower, and nothing says why. Checked
+                # here rather than before the load because torch is only
+                # importable-and-imported once the impl has done it.
+                pin_problem = memory.pinned_device_missing()
+                if pin_problem is not None:
+                    raise RuntimeError(pin_problem)
                 loaded = True
-                _send_ok(proto_out, req_id)
+                _send_ok(
+                    proto_out, req_id, **memory.finish_load(before, instance)
+                )
             except Exception as e:
                 logger.error(
                     "%s - load failed: %s", inference_id, e, exc_info=True
@@ -252,13 +288,56 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     "predict before a successful load",
                 )
                 continue
+            grant = msg.get("grant")
+            if not isinstance(grant, dict):
+                grant = None
+            if grant is not None:
+                # Admissibility gate (protocol doc, "Memory grants"): an impl
+                # whose own batching is switched off decides its own GPU batch
+                # shape inside predict, so a granted batch's size would not
+                # describe the allocator peaks the harness measures. Ignore the
+                # grant and take the compatibility path, which reports no
+                # `units` and therefore never poisons the cost fit.
+                from inferio_worker import packing
+
+                if packing.batching_disabled(instance):
+                    if not batching_off_logged:
+                        batching_off_logged = True
+                        logger.info(
+                            "%s - this impl has its own batching disabled; "
+                            "ignoring memory grants and running each window in "
+                            "one predict call (no calibration units reported)",
+                            inference_id,
+                        )
+                    grant = None
             try:
                 inputs = [
                     prediction_input_from_frame(entry)
                     for entry in msg.get("inputs") or []
                 ]
-                outputs = list(instance.predict(inputs))
-                _send_ok(proto_out, req_id, outputs=outputs)
+                if grant is None:
+                    # Compatibility path (protocol doc, "Memory grants"): no
+                    # grant means the whole window is one GPU batch, exactly
+                    # as before the packing harness existed. This is what
+                    # `none`-class models, CPU/MPS hosts and hosts with no GPU
+                    # inventory take, permanently.
+                    batch = memory.begin_batch()
+                    outputs = list(instance.predict(inputs))
+                    _send_ok(
+                        proto_out,
+                        req_id,
+                        outputs=outputs,
+                        **memory.finish_batch(batch, items=len(inputs)),
+                    )
+                else:
+                    # Granted window: the harness prices the inputs, packs
+                    # them into GPU batches inside the budget, clamps against
+                    # live free memory before each one, and measures each.
+                    from inferio_worker import packing
+
+                    _send_ok(
+                        proto_out, req_id, **packing.run_window(instance, inputs, grant)
+                    )
             except Exception as e:
                 # Includes serialization failures from write_frame (bad
                 # output type, oversized response): packing happens before
@@ -267,7 +346,18 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 logger.error(
                     "%s - predict failed: %s", inference_id, e, exc_info=True
                 )
-                _send_error(proto_out, req_id, str(e), traceback.format_exc())
+                extra: dict[str, Any] = {}
+                measurements = getattr(e, "measurements", None)
+                if measurements:
+                    # A partially-run window still measured what ran, and the
+                    # failing batch carries its own `oom` flag.
+                    extra["measurements"] = measurements
+                    sample = memory.device_memory_sample()
+                    if sample is not None:
+                        extra["memory"] = sample
+                _send_error(
+                    proto_out, req_id, str(e), traceback.format_exc(), **extra
+                )
 
         elif mtype == "unload":
             # Valid in every state: a parked prewarmed worker with no
@@ -287,6 +377,40 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             proto_out.flush()
             logger.info("Unloaded; exiting.")
             return EXIT_OK
+
+        elif mtype == "trim":
+            # Orchestrator-initiated pool release (protocol doc, "Reactive
+            # shrink and trim"). Trim is NOT unload: `empty_cache()` returns
+            # only the caching allocator's unused blocks, so weights, live
+            # tensors and the CUDA context stay and the model is still
+            # resident — it just pays a re-`cudaMalloc` as its pool regrows.
+            #
+            # Valid in every state and never an error: a worker with no live
+            # CUDA (no torch, CPU/MPS host, remote API, a parked prewarmed
+            # worker with no instance) has no pool to release, and "there was
+            # nothing to free" is a successful trim.
+            from inferio_worker import packing
+
+            released = memory.empty_cache()
+            if released:
+                # The pool regrows from here, so the throughput comparator's
+                # reference rate is stale and the reactive-shrink hysteresis is
+                # counting towards something that has already happened.
+                #
+                # Only when it actually ran: on a worker with no live CUDA the
+                # trim was a no-op, and resetting the comparator for it would
+                # let a stream of trims to an idle-but-torchless resident keep
+                # discarding a signal about batches that really did happen.
+                packing.note_trimmed()
+                logger.info("%s - released the allocator pool on request", inference_id)
+            trim_payload: dict[str, Any] = {}
+            sample = memory.device_memory_sample()
+            if sample is not None:
+                # Taken AFTER the release, so `reserved_mb` is the pool size
+                # the orchestrator should charge from now on — which is the
+                # whole point of the round trip.
+                trim_payload["memory"] = sample
+            _send_ok(proto_out, req_id, **trim_payload)
 
         elif mtype == "ping":
             _send_ok(proto_out, req_id)

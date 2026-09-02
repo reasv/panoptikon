@@ -36,7 +36,9 @@ use crate::jobs::queue::{
 pub(crate) struct InferenceQuery {
     /// Inference ID List
     inference_ids: Vec<String>,
-    /// Batch Size
+    /// Max Batch Size: an optional cap on how many items are processed at
+    /// once. Omitted (or null) means auto — the inference server sizes
+    /// batches itself.
     #[param(nullable)]
     batch_size: Option<i64>,
     /// Confidence Threshold
@@ -163,7 +165,9 @@ pub(crate) async fn enqueue_data_extraction(
             index_db: conn.index_db.clone(),
             user_data_db: conn.user_data_db.clone(),
             metadata: Some(inference_id),
-            batch_size: Some(defaults.batch_size),
+            // The resolved *cap*, `None` = auto: queued as-is so the queue
+            // shows what the job will run with without inventing a number.
+            batch_size: defaults.batch_size,
             threshold: defaults.threshold,
             log_id: None,
             tag: None,

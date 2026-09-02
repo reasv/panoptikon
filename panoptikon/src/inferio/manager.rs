@@ -55,7 +55,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, Timelike};
@@ -64,24 +64,53 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use super::calibration::CalibrationProfiles;
+use super::cost::CostDimension;
 use super::dispatch::{
-    DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, run_dispatcher,
+    DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, Replica, run_dispatcher,
 };
+use super::gpu::{GpuInfo, GpuInventory};
+use super::ledger::{Admission, GpuBudgetHealth, LoadReservation, VramBudgets, VramLedger};
 use super::prewarm::{PrewarmConfig, PrewarmHealth, PrewarmPool};
 use super::registry::{Registry, RegistryCache, SpawnSpec};
-use super::worker::{Worker, WorkerError, WorkerInput, WorkerOutput, WorkerSpawnConfig};
+use super::worker::{
+    LoadReport, MemorySample, TelemetryHandle, Worker, WorkerError, WorkerInput, WorkerOutput,
+    WorkerSpawnConfig,
+};
 
 /// Manager configuration.
 pub struct ManagerConfig {
     /// How worker processes are spawned (python, impl dirs, env, deadlines).
     pub spawn: WorkerSpawnConfig,
-    /// Server-wide default batch cap, applied when neither the drain window
-    /// nor the registry expresses an opinion (replaces `MAX_COMBINED_BATCH`).
+    /// Fixed batch size for the **unpriced** dispatch path (`none`-class
+    /// models, hosts with no inventory at all), used when the registry
+    /// declares no `default_batch_size`. Priced models are sized by the VRAM
+    /// ledger instead — this is no longer a safety cap. Note the path is
+    /// narrower than it once was: MPS and CPU hosts have admission boards of
+    /// their own (docs/unified-memory-admission.md), so a host reaches this
+    /// only when its inventory could not be built.
     pub default_max_batch: u32,
     /// TTL sweeper period (Python: 10 s).
     pub sweep_interval: Duration,
     /// Prewarm pool policy (design §8; `[inference_local.prewarm]`).
     pub prewarm: PrewarmConfig,
+    /// Visible GPUs, probed once at startup. Universal worker→GPU pinning
+    /// resolves every replica's visibility pin against this — written to
+    /// `CUDA_VISIBLE_DEVICES` on CUDA hosts and `HIP_VISIBLE_DEVICES` on ROCm
+    /// ones — and the per-GPU ledger is keyed by these UUIDs. Unknown
+    /// whenever the backend's own probe answers nothing (no nvidia-smi; on
+    /// ROCm, unreadable KFD topology or an ambient visibility restriction),
+    /// which keeps today's unpinned behaviour.
+    pub gpus: GpuInventory,
+    /// VRAM admission limits (`[inference_local.vram]`): the server default
+    /// plus per-board-UUID overrides. Defaults are margin 0.10 on,
+    /// `cap_fraction` off.
+    pub vram: VramBudgets,
+    /// The calibration store: shipped baselines and the local generated
+    /// profile file. `None` leaves the ledger unprimed and unpersisted,
+    /// which is exactly the pre-store behaviour (tests, and any embedder
+    /// that does not want a file).
+    pub calibration: Option<Arc<dyn CalibrationProfiles>>,
 }
 
 /// `GET /health` response (design §7, additive — Python has no such
@@ -104,6 +133,14 @@ pub struct HealthReport {
     /// entry per impl class held (state "warm" | "spawning" |
     /// "failed_prepare").
     pub prewarm: PrewarmHealth,
+    /// Visible GPUs by board UUID (batch-calibration step 1a); empty when
+    /// the host has no GPU inventory, in which case workers are not pinned.
+    pub gpus: Vec<GpuInfo>,
+    /// Per-GPU VRAM ledger: budgets, footprints, outstanding grants, ramp and
+    /// deflation state and the fitted cost model (batch-calibration step 1b).
+    /// Empty on a host with no GPU inventory, where nothing is admitted and
+    /// every model takes the unpriced dispatch path.
+    pub vram: Vec<GpuBudgetHealth>,
 }
 
 /// One loaded model in the [`HealthReport`].
@@ -121,13 +158,24 @@ pub struct ModelHealth {
     pub queue_depth: usize,
     /// Windows currently executing on replicas.
     pub in_flight_windows: usize,
-    /// Effective cap of the most recently dispatched window (design §6);
-    /// `null` until the first window dispatches.
-    pub last_effective_cap: Option<u32>,
+    /// Unit budget of the grant on the most recently dispatched window;
+    /// `null` until a window carries one (nothing dispatched yet, or this
+    /// model is on the unpriced path — see `dispatch.rs`).
+    pub last_grant_units: Option<u64>,
+    /// Inputs in the most recently dispatched window; `null` until the first
+    /// window dispatches. This is what a user cap bounds on the unpriced path.
+    pub last_window_items: Option<u32>,
     /// Predict requests ever queued on this model's dispatcher.
     pub total_predict_requests: u64,
     /// Windows ever dispatched to a replica.
     pub total_batches: u64,
+    /// Cost dimension resolved from registry metadata at load time
+    /// (batch-calibration step 1a).
+    pub cost: CostHealth,
+    /// One entry per replica: which GPU it sits on and the freshest memory
+    /// sensing it reported. This is the raw material step 1b's per-GPU
+    /// ledger is built from.
+    pub replicas_detail: Vec<ReplicaTelemetryHealth>,
 }
 
 /// Replica occupancy of one model's WorkerSet.
@@ -135,6 +183,163 @@ pub struct ModelHealth {
 pub struct ReplicaHealth {
     pub total: usize,
     pub free: usize,
+}
+
+/// A model's cost dimension, as resolved from `metadata.cost`.
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CostHealth {
+    /// `item` | `pixel` | `token` | `audio-second` | `none`.
+    pub unit: String,
+    /// `count` | `sum` | `max-times-count`; absent for the `none` class.
+    pub aggregation: Option<String>,
+    pub epoch: u32,
+    /// First-touch batch before calibration; absent for the `none` class.
+    pub seed_units: Option<u32>,
+    /// True when the registry declared nothing usable and the conservative
+    /// `(item, count)` fallback is in force.
+    pub degraded: bool,
+}
+
+impl From<CostDimension> for CostHealth {
+    fn from(cost: CostDimension) -> Self {
+        Self {
+            unit: cost.unit.as_str().to_owned(),
+            aggregation: cost.aggregation.map(|value| value.as_str().to_owned()),
+            epoch: cost.epoch,
+            seed_units: cost.seed_units,
+            degraded: cost.degraded,
+        }
+    }
+}
+
+/// Per-replica GPU placement plus its freshest memory report. Every field
+/// after `gpu` is `null` until the worker reports it (no torch, a remote-API
+/// impl, or no predict yet). A CPU or MPS host does report: its figures are
+/// denominated in system RAM and Metal's budget respectively, not in VRAM
+/// (docs/unified-memory-admission.md).
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ReplicaTelemetryHealth {
+    /// Resolved device pin the worker was *spawned* with — a board UUID on a
+    /// known CUDA inventory, a HIP device index on a known ROCm one (the two
+    /// backends' visibility variables accept different vocabularies; see
+    /// `gpu::pin_env_var`).
+    pub gpu: Option<String>,
+    /// The board the worker itself reports being on: the pin above can be an
+    /// index, absent, or a UUID CUDA reordered, and only the worker can see
+    /// what it actually got. `null` on a ROCm replica — torch's HIP-rendered
+    /// UUID is a third vocabulary the worker deliberately suppresses, and
+    /// those replicas are admitted to the ledger by PCI address instead
+    /// (docs/rocm-batch-calibration-parity.md, D3), which this view does not
+    /// surface yet.
+    pub gpu_uuid: Option<String>,
+    pub gpu_name: Option<String>,
+    /// The worker venv's torch, part of the calibration profile key.
+    pub torch_version: Option<String>,
+    /// Process-level load footprint and how it was measured.
+    pub base_mb: Option<u64>,
+    pub base_method: Option<String>,
+    pub reserved_at_load_mb: Option<u64>,
+    /// Negotiated load precision, part of the calibration profile key.
+    pub dtype: Option<String>,
+    /// Freshest device sample, and how long ago it was recorded.
+    pub free_mb: Option<u64>,
+    pub total_mb: Option<u64>,
+    /// Which driver reported `free_mb`/`total_mb` (`"nvml"` |
+    /// `"amdgpu-sysfs"` | `"torch"`); they disagree by gigabytes, so a reader
+    /// comparing samples needs it.
+    pub free_source: Option<String>,
+    pub reserved_mb: Option<u64>,
+    pub allocated_mb: Option<u64>,
+    pub memory_age_ms: Option<u64>,
+    /// Measurements this replica has reported since it loaded, including any
+    /// the bounded ring has since evicted.
+    pub measurements_recorded: u64,
+    /// The tail of the measurement ring, oldest first — a sample of what 1b's
+    /// cost fit consumes, not the whole ring (health is a status page).
+    pub recent_batches: Vec<BatchHealth>,
+}
+
+/// One measured GPU batch in [`ReplicaTelemetryHealth`].
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BatchHealth {
+    /// Per-worker sequence number; strictly increasing, gaps mean the ring
+    /// evicted samples between reads.
+    pub seq: u64,
+    pub age_ms: u64,
+    /// Inputs in the batch (not cost-dimension units — see the worker
+    /// protocol's "Memory sensing").
+    pub items: Option<u64>,
+    pub reserved_before_mb: Option<u64>,
+    pub peak_reserved_mb: Option<u64>,
+    pub allocated_before_mb: Option<u64>,
+    pub peak_allocated_mb: Option<u64>,
+    pub duration_ms: Option<f64>,
+}
+
+impl ReplicaTelemetryHealth {
+    /// How many ring entries `/health` shows per replica.
+    const RECENT_BATCHES: usize = 4;
+
+    fn snapshot(handle: &TelemetryHandle) -> Self {
+        let mut telemetry = match handle.lock() {
+            Ok(telemetry) => telemetry.clone(),
+            // A poisoned telemetry mutex must not take the health endpoint
+            // down; it is advisory data.
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let now = Instant::now();
+        let age_ms =
+            |captured_at: Instant| now.saturating_duration_since(captured_at).as_millis() as u64;
+        // The load report's own timestamp is kept in the telemetry for 1b
+        // (a base measured long ago on a busy board is a weaker prior);
+        // health only needs the values.
+        let load = telemetry
+            .load
+            .take()
+            .map_or_else(LoadReport::default, |stamped| stamped.value);
+        let (memory, memory_age_ms) = match telemetry.memory.take() {
+            Some(stamped) => (stamped.value, Some(age_ms(stamped.captured_at))),
+            None => (MemorySample::default(), None),
+        };
+        let measurements_recorded = telemetry.recorded_measurements();
+        let gpu = telemetry.gpu.take();
+        // Read the ring without draining it: 1b's ledger is the other reader
+        // and consumes by watermark (see `WorkerTelemetry::measurements`).
+        let mut recent: Vec<BatchHealth> = telemetry
+            .measurements()
+            .rev()
+            .take(Self::RECENT_BATCHES)
+            .map(|sample| BatchHealth {
+                seq: sample.seq,
+                age_ms: age_ms(sample.captured_at),
+                items: sample.measurement.items,
+                reserved_before_mb: sample.measurement.reserved_before_mb,
+                peak_reserved_mb: sample.measurement.peak_reserved_mb,
+                allocated_before_mb: sample.measurement.allocated_before_mb,
+                peak_allocated_mb: sample.measurement.peak_allocated_mb,
+                duration_ms: sample.measurement.duration_ms,
+            })
+            .collect();
+        recent.reverse();
+        Self {
+            gpu,
+            gpu_uuid: load.gpu_uuid,
+            gpu_name: load.gpu_name,
+            torch_version: load.torch_version,
+            base_mb: load.base_mb,
+            base_method: load.base_method,
+            reserved_at_load_mb: load.reserved_at_load_mb,
+            dtype: load.dtype,
+            free_mb: memory.free_mb,
+            total_mb: memory.total_mb,
+            free_source: memory.free_source,
+            reserved_mb: memory.reserved_mb,
+            allocated_mb: memory.allocated_mb,
+            memory_age_ms,
+            measurements_recorded,
+            recent_batches: recent,
+        }
+    }
 }
 
 /// Per-cache-key entry expiration. `Never` is Python's `datetime.max`.
@@ -418,6 +623,21 @@ impl CacheState {
     }
 }
 
+/// A freshly spawned WorkerSet plus everything the model entry needs to
+/// record about it.
+struct SpawnedModel {
+    workers: Vec<Worker>,
+    /// One per worker, in the same order: `Some` when the replica landed on a
+    /// board the ledger knows and the model's cost dimension scales.
+    admissions: Vec<Option<Admission>>,
+    registry_default_batch: Option<u32>,
+    impl_class: String,
+    /// Whether any replica's resolved pin matched the prewarm pool's, i.e.
+    /// whether keeping a warm worker for this class can ever pay off.
+    claim_eligible: bool,
+    cost: CostDimension,
+}
+
 /// A loaded model: the dispatcher queue plus the task owning its WorkerSet.
 struct ModelHandle {
     tx: mpsc::UnboundedSender<DispatchMsg>,
@@ -428,6 +648,13 @@ struct ModelHandle {
     /// Health counters shared with the dispatcher task (design §7): the
     /// dispatcher writes, `health()` reads — Relaxed atomics, no locking.
     stats: Arc<ModelStats>,
+    /// Cost dimension resolved from registry metadata when this entry loaded
+    /// (batch-calibration step 1a). Resolved at load, not per request, so a
+    /// running model keeps the dimension it was priced with.
+    cost: CostDimension,
+    /// One telemetry handle per replica, shared with the workers the
+    /// dispatcher owns. Step 1b's ledger reads these.
+    telemetry: Vec<TelemetryHandle>,
 }
 
 #[derive(Default)]
@@ -516,6 +743,11 @@ pub struct ModelManager {
     /// Prewarm pool (design §8): one parked warm worker per impl class.
     /// Its own mutex, never held together with `state`.
     prewarm: Arc<PrewarmPool>,
+    /// Per-GPU VRAM budget arbiter (batch-calibration step 1b). Its own
+    /// mutex, never held together with `state`; every operation on it is
+    /// synchronous bounded arithmetic, so it is safe to touch from the
+    /// dispatcher's hot path.
+    ledger: Arc<VramLedger>,
     /// Serializes the slow spawn+load phase, mirroring Python's manager-wide
     /// lock held for the whole `load_model` (see module docs).
     load_lock: TokioMutex<()>,
@@ -527,12 +759,22 @@ pub struct ModelManager {
 impl ModelManager {
     pub fn new(cfg: ManagerConfig, registry: Arc<StdMutex<RegistryCache>>) -> Arc<Self> {
         let sweep_interval = cfg.sweep_interval;
-        let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone());
+        // Pooled workers are pinned to the same default GPU an unpinned
+        // replica resolves to, or the pool's workers could never be claimed
+        // (claim eligibility is pin equality — see `spawn_model`).
+        let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone(), cfg.gpus.clone());
+        // The ledger's board set comes from the same one-shot probe the pins
+        // do, so a grant's board key and the board a worker's spawn pin
+        // selects can never describe different hardware. The calibration store primes
+        // it (fit, expected base, and — from local profiles only — the
+        // ratchet anchor) and receives its updates.
+        let ledger = VramLedger::new(&cfg.gpus, cfg.vram.clone(), cfg.calibration.clone());
         let manager = Arc::new(Self {
             cfg,
             registry,
             state: StdMutex::new(ManagerState::default()),
             prewarm,
+            ledger,
             load_lock: TokioMutex::new(()),
             weak: OnceLock::new(),
             sweeper: StdMutex::new(None),
@@ -617,11 +859,9 @@ impl ModelManager {
             .await?
             .expect("ensure_loaded returns a sender when pinning");
         let (reply_tx, reply_rx) = oneshot::channel();
-        let payload_bytes = inputs.iter().map(super::worker::estimate_input_bytes).sum();
         let request = DispatchRequest {
             inputs,
             max_batch,
-            payload_bytes,
             reply: reply_tx,
         };
         let result = if tx.send(DispatchMsg::Predict(request)).is_err() {
@@ -640,6 +880,11 @@ impl ModelManager {
         // `finally`); dropping explicitly keeps the restore at completion
         // time, and cancellation at `reply_rx.await` runs the same Drop.
         drop(pin);
+        // A window just settled, which is when the ledger's contention picture
+        // is freshest — and this window's own grant request is what may have
+        // flagged an idle neighbour. Waiting for the sweep tick would delay
+        // relief by up to `sweep_interval`.
+        self.deliver_pending_trims();
         result
     }
 
@@ -695,9 +940,10 @@ impl ModelManager {
     /// and released before the state lock (the two are never held together).
     pub fn health(&self) -> HealthReport {
         let registry_ok = self.registry.lock().unwrap().get().is_ok();
-        // Pool snapshot before the state lock: the two mutexes are never
-        // held together.
+        // Pool and ledger snapshots before the state lock: none of these
+        // mutexes are ever held together.
         let prewarm = self.prewarm.health();
+        let vram = self.ledger.health();
         let state = self.state.lock().unwrap();
         let mut models: Vec<ModelHealth> = state
             .models
@@ -714,13 +960,23 @@ impl ModelManager {
                     },
                     queue_depth: stats.queue_len.load(Relaxed),
                     in_flight_windows: stats.in_flight_windows.load(Relaxed),
-                    last_effective_cap: match stats.last_effective_cap.load(Relaxed) {
-                        // 0 = no window dispatched yet (real caps are >= 1).
+                    last_grant_units: match stats.last_grant_units.load(Relaxed) {
+                        // 0 = no grant yet (real budgets are >= 1).
                         0 => None,
-                        cap => Some(cap),
+                        units => Some(units),
+                    },
+                    last_window_items: match stats.last_window_items.load(Relaxed) {
+                        0 => None,
+                        items => Some(items),
                     },
                     total_predict_requests: stats.total_predict_requests.load(Relaxed),
                     total_batches: stats.total_batches.load(Relaxed),
+                    cost: handle.cost.into(),
+                    replicas_detail: handle
+                        .telemetry
+                        .iter()
+                        .map(ReplicaTelemetryHealth::snapshot)
+                        .collect(),
                 }
             })
             .collect();
@@ -737,6 +993,13 @@ impl ModelManager {
             model_count: models.len(),
             models,
             prewarm,
+            gpus: self
+                .cfg
+                .gpus
+                .gpus()
+                .map(<[GpuInfo]>::to_vec)
+                .unwrap_or_default(),
+            vram,
         }
     }
 
@@ -790,6 +1053,12 @@ impl ModelManager {
             }
         };
         tokio::join!(drain, self.prewarm.shutdown());
+        // Last: the calibration a window earned seconds before the quit is
+        // still sitting behind the store's write debounce, and losing it
+        // would silently mean re-ramping on the next run.
+        if let Some(calibration) = self.cfg.calibration.clone() {
+            let _ = tokio::task::spawn_blocking(move || calibration.flush()).await;
+        }
     }
 
     /// Called by a dispatcher task after a fatal worker death: drop the
@@ -827,6 +1096,38 @@ impl ModelManager {
         let unloads = state.cache.expire(Local::now());
         for id in unloads {
             Self::begin_unload(&mut state, &id);
+        }
+        drop(state);
+        self.deliver_pending_trims();
+    }
+
+    /// Route the ledger's idle-resident trim requests to the dispatchers that
+    /// own those replicas (docs/batch-calibration-design.md, "Trim for idle
+    /// residents").
+    ///
+    /// The ledger is the only component that sees a squeezed worker and its
+    /// idle neighbour's pool slack at once, but it cannot call a worker —
+    /// dispatchers own workers. So it raises a signal and this drains it. Two
+    /// callers, deliberately: the sweep tick guarantees delivery on an
+    /// otherwise quiet server, and the predict path makes it prompt on a busy
+    /// one (the drain costs one uncontended lock and a `Vec::is_empty` when
+    /// there is nothing to do, which is the normal case).
+    ///
+    /// A model that is no longer in `state.models` — unloaded, mid-teardown,
+    /// respawned under a new generation — simply gets no message: the entry is
+    /// removed before its dispatcher is told to shut down, so the lookup here
+    /// *is* the generation guard, and a stale send would land on a closed
+    /// channel regardless.
+    fn deliver_pending_trims(&self) {
+        let trims = self.ledger.take_pending_trims();
+        if trims.is_empty() {
+            return;
+        }
+        let state = self.state.lock().unwrap();
+        for trim in trims {
+            if let Some(handle) = state.models.get(&trim.inference_id) {
+                let _ = handle.tx.send(DispatchMsg::Trim(trim.worker));
+            }
         }
     }
 
@@ -908,7 +1209,14 @@ impl ModelManager {
         // Release the spawn pin under the same lock as the bookkeeping
         // below so the sweeper cannot expire the fresh entry in between.
         spawn_pin.release_locked(&mut state.cache);
-        let (workers, registry_default_batch, impl_class, claim_eligible) = match spawn_result {
+        let SpawnedModel {
+            workers,
+            admissions,
+            registry_default_batch,
+            impl_class,
+            claim_eligible,
+            cost,
+        } = match spawn_result {
             Ok(spawned) => spawned,
             Err(err) => {
                 // Python removes the requesting cache key's entry and
@@ -928,6 +1236,10 @@ impl ModelManager {
             // shutdown() (which re-checks after taking load_lock) awaits
             // the graceful stops instead of abandoning them on a detached
             // task.
+            // Dropping `admissions` here is what un-charges the replicas in
+            // the ledger — a set that was never registered as a model must
+            // not keep holding its footprint.
+            drop(admissions);
             let discard = tokio::spawn(async move {
                 futures_util::future::join_all(workers.into_iter().map(Worker::shutdown)).await;
             });
@@ -944,18 +1256,32 @@ impl ModelManager {
         let stats = Arc::new(ModelStats::default());
         stats.replicas_total.store(workers.len(), Relaxed);
         stats.replicas_free.store(workers.len(), Relaxed);
+        // Grab the telemetry handles before the dispatcher takes the workers:
+        // the manager is the budget arbiter, so it keeps its own read path
+        // into every replica's memory reports.
+        let telemetry: Vec<TelemetryHandle> = workers.iter().map(Worker::telemetry).collect();
         let context = DispatcherContext {
             inference_id: inference_id.to_owned(),
             generation,
-            registry_default_batch,
-            server_default_batch: self.cfg.default_max_batch,
+            cost,
+            // The registry's `default_batch_size` keeps exactly one job: the
+            // fixed window size of the unpriced path. Priced models are sized
+            // by the ledger.
+            unpriced_window_items: registry_default_batch.unwrap_or(self.cfg.default_max_batch),
             manager: self.weak.get().cloned().expect("weak self is set in new()"),
             stats: Arc::clone(&stats),
             unload_grace: self.cfg.spawn.deadlines.unload_grace,
         };
-        // The dispatcher owns the whole WorkerSet (design §8): every
-        // replica serves the one shared FIFO queue behind this sender.
-        let task = tokio::spawn(run_dispatcher(context, workers, rx));
+        // The dispatcher owns the whole WorkerSet (design §8): every replica
+        // serves the one shared FIFO queue behind this sender, and carries
+        // its ledger handle so window sizing and grants are per replica (two
+        // replicas can sit on boards with different headroom).
+        let replicas: Vec<Replica> = workers
+            .into_iter()
+            .zip(admissions)
+            .map(|(worker, admission)| Replica { worker, admission })
+            .collect();
+        let task = tokio::spawn(run_dispatcher(context, replicas, rx));
         let sender = if pin_for_predict {
             state.cache.pin(inference_id);
             let guard = PinGuard::adopt(
@@ -974,6 +1300,8 @@ impl ModelManager {
                 task,
                 generation,
                 stats,
+                cost,
+                telemetry,
             },
         );
         drop(state);
@@ -995,47 +1323,122 @@ impl ModelManager {
     /// Spawn + handshake + configure + load the model's whole WorkerSet
     /// (design §8, protocol v2 flow — handshake carries the impl class
     /// identity, `configure` binds the model's kwargs and instantiates):
-    /// one worker per entry of the spec's `device_pins`, each pinned via
-    /// `CUDA_VISIBLE_DEVICES` at spawn, all spawned and loaded
+    /// one worker per entry of the spec's `device_pins`, each pinned via the
+    /// backend's device-visibility variable at spawn, all spawned and loaded
     /// *concurrently*. Any replica failing kills the others — a load either
     /// yields the complete set or nothing (no partial sets to reason
     /// about). The registry is re-resolved at every spawn (design §4:
     /// workers are always born on current config). Errors carry the
     /// worker's traceback/stderr context from `Worker`.
     ///
-    /// Prewarm claim (design §8): at most one replica — the first with no
-    /// device pin, since pooled workers are spawned unpinned — is served
-    /// from the pool's parked worker for the impl class, if one is alive
-    /// (the pool pings before handing it over). The claimed worker skips
-    /// spawn + handshake + heavy imports and only needs `configure` +
-    /// `load`; the remaining replicas fresh-spawn as before.
-    async fn spawn_model(
-        &self,
-        inference_id: &str,
-    ) -> Result<(Vec<Worker>, Option<u32>, String, bool)> {
-        let (spec, registry_default_batch) = {
+    /// Universal worker→GPU pinning (batch-calibration design, "Every worker
+    /// is pinned to exactly one GPU"): the registry has no GPU knowledge, so
+    /// each replica's pin — including the "no pin" default — is resolved
+    /// here against the probed inventory, normally to a board UUID. An
+    /// unknown inventory resolves to exactly what the registry said
+    /// (including `None`), i.e. today's behaviour.
+    ///
+    /// Prewarm claim (design §8): at most one replica is served from the
+    /// pool's parked worker for the impl class, if one is alive (the pool
+    /// pings before handing it over). Eligibility is **pin equality**: a
+    /// pooled worker sits on the default GPU, so it can serve any replica
+    /// whose resolved pin is that same GPU (both-`None` on an unknown
+    /// inventory included). The claimed worker skips spawn + handshake +
+    /// heavy imports and only needs `configure` + `load`; the remaining
+    /// replicas fresh-spawn as before.
+    async fn spawn_model(&self, inference_id: &str) -> Result<SpawnedModel> {
+        let (spec, registry_default_batch, cost) = {
             let mut registry = self.registry.lock().unwrap();
             let snapshot = registry
                 .get()
                 .context("failed to load the inference registry")?;
             let spec = snapshot.spawn_spec(inference_id)?;
-            (spec, registry_default_batch(&snapshot, inference_id))
+            (
+                spec,
+                registry_default_batch(&snapshot, inference_id),
+                CostDimension::resolve(&snapshot, inference_id),
+            )
         };
+        tracing::debug!(
+            model = %inference_id,
+            unit = cost.unit.as_str(),
+            aggregation = cost.aggregation.map(|value| value.as_str()),
+            epoch = cost.epoch,
+            seed_units = cost.seed_units,
+            priced = cost.scales(),
+            degraded = cost.degraded,
+            "resolved cost dimension"
+        );
         let replica_count = spec.device_pins.len();
+        let device_pins: Vec<Option<String>> = spec
+            .device_pins
+            .iter()
+            .map(|pin| self.cfg.gpus.resolve_pin(pin.as_deref()))
+            .collect();
+        // The same registry entries resolved into the *other* vocabulary:
+        // the ledger's board keys. Pin and key are a pair and must be
+        // resolved from the same request — the pin is what the worker's
+        // visibility variable gets, the key is what the ledger's board map
+        // is keyed by, and on ROCm (index pins) or with an abbreviated CUDA
+        // UUID the two are different strings for one board
+        // (`GpuInventory::resolve_board_key`).
+        let board_keys: Vec<Option<String>> = spec
+            .device_pins
+            .iter()
+            .map(|pin| self.cfg.gpus.resolve_board_key(pin.as_deref()))
+            .collect();
+        // And into the third thing one registry entry decides: the address of
+        // the board it names, when that board is a unified one whose worker
+        // has to count GTT as its own (DP-5). Resolved from the same entries
+        // as the other two so the three cannot disagree about which board a
+        // replica is meant to land on — and handed to the worker as an
+        // address rather than a flag, so it can tell whether it did.
+        let unified_boards: Vec<Option<String>> = spec
+            .device_pins
+            .iter()
+            .map(|pin| self.cfg.gpus.unified_pin_bdf(pin.as_deref()))
+            .collect();
         // A prewarmed process was spawned before this model's just-in-time
         // external inputs were resolved. Models with explicit worker env
         // must therefore use a fresh process.
+        let pool_pin = self.cfg.gpus.default_pin();
         let claim_replica = (spec.env.is_empty() && spec.env_remove.is_empty())
-            .then(|| spec.device_pins.iter().position(Option::is_none))
+            .then(|| device_pins.iter().position(|pin| *pin == pool_pin))
             .flatten();
         let mut claimed = match claim_replica {
-            Some(_) => self.prewarm.claim(&spec.impl_class).await,
-            // Every replica is device-pinned; a pooled worker (spawned
-            // without CUDA_VISIBLE_DEVICES) would violate the pin.
+            Some(_) => {
+                self.prewarm
+                    .claim(&spec.impl_class, pool_pin.as_deref())
+                    .await
+            }
+            // Either this model needs explicit worker env, or every replica
+            // sits on a GPU other than the pool's — handing a pooled worker
+            // to one of those would violate its pin.
             None => None,
         };
-        let spawns: Vec<_> = spec
-            .device_pins
+        // Load reservations (design: "A load in progress is a reservation
+        // too"). Charged here — under the manager's load lock, before any
+        // worker is spawned, so a window granted to a *different* model
+        // during this multi-second load cannot collide with the incoming
+        // weights. `dtype` is unknown on a first load (Package-1 negotiation
+        // resolves during it), which is why the ledger reserves at its most
+        // conservative tier in that case. Released when these guards drop,
+        // which happens on every exit path including a cancelled future.
+        //
+        // `cost` goes in because a model that will never be granted a window is
+        // not worth reserving for: the ledger answers `None` for the
+        // `none`-class, and likewise for a model whose earlier load in this run
+        // reported no device footprint at all.
+        //
+        // Keyed by board key, never by the pin: the pin is written in the
+        // backend's visibility vocabulary and only coincides with the ledger
+        // key on a CUDA host with a full-UUID pin.
+        let _load_reservations: Vec<LoadReservation> = board_keys
+            .iter()
+            .flatten()
+            .filter_map(|gpu| self.ledger.reserve_load(inference_id, cost, gpu, None))
+            .collect();
+        let spawns: Vec<_> = device_pins
             .iter()
             .enumerate()
             .map(|(replica, device)| {
@@ -1046,11 +1449,19 @@ impl ModelManager {
                 };
                 let spec = &spec;
                 let device = device.clone();
+                let unified = unified_boards[replica].clone();
                 async move {
+                    let spawn = self.cfg.spawn.for_unified_board(unified.as_deref());
                     let mut worker = match claimed {
                         Some(worker) => {
                             match self
-                                .configure_claimed(worker, inference_id, spec, device.clone())
+                                .configure_claimed(
+                                    worker,
+                                    inference_id,
+                                    spec,
+                                    device.clone(),
+                                    &spawn,
+                                )
                                 .await
                             {
                                 Ok(worker) => worker,
@@ -1058,8 +1469,7 @@ impl ModelManager {
                             }
                         }
                         None => {
-                            Worker::spawn_configured(&self.cfg.spawn, inference_id, spec, device)
-                                .await?
+                            Worker::spawn_configured(&spawn, inference_id, spec, device).await?
                         }
                     };
                     if let Err(err) = worker.load().await {
@@ -1075,18 +1485,37 @@ impl ModelManager {
             })
             .collect();
         let mut workers: Vec<Worker> = Vec::with_capacity(replica_count);
+        let mut admissions: Vec<Option<Admission>> = Vec::with_capacity(replica_count);
         let mut first_error: Option<anyhow::Error> = None;
         for result in futures_util::future::join_all(spawns).await {
             match result {
                 Ok((replica, worker)) => {
-                    if replica_count > 1 {
-                        tracing::debug!(
-                            model = %inference_id,
-                            replica,
-                            device = spec.device_pins[replica].as_deref().unwrap_or("<unpinned>"),
-                            "replica loaded"
-                        );
-                    }
+                    tracing::debug!(
+                        model = %inference_id,
+                        replica,
+                        device = device_pins[replica].as_deref().unwrap_or("<unpinned>"),
+                        "replica loaded"
+                    );
+                    // Register with the ledger now that the load response has
+                    // landed: the board identity, the measured base and the
+                    // pool size at load all come from it, and the board the
+                    // *worker* reports is the authoritative one. `None` means
+                    // this replica gets no admission (a `none`-class model, a
+                    // worker with no GPU, a board outside the inventory) and
+                    // its dispatcher takes the unpriced path.
+                    //
+                    // The board key this replica's *pin* named goes in as
+                    // well, purely as a diagnostic: the ledger admits under
+                    // what the worker reports either way, but a divergence
+                    // between the two is the one observable symptom of a
+                    // board-row order that is not the backend's device order
+                    // (docs/rocm-batch-calibration-parity.md, D2/D3).
+                    admissions.push(self.ledger.register_worker(
+                        inference_id,
+                        cost,
+                        &worker.telemetry(),
+                        board_keys[replica].as_deref(),
+                    ));
                     workers.push(worker);
                 }
                 Err(err) => {
@@ -1097,16 +1526,20 @@ impl ModelManager {
             }
         }
         if let Some(err) = first_error {
-            // Whole-set load atomicity: kill the replicas that did come up.
+            // Whole-set load atomicity: kill the replicas that did come up
+            // and un-charge them (dropping the admissions).
+            drop(admissions);
             futures_util::future::join_all(workers.into_iter().map(Worker::kill)).await;
             return Err(err);
         }
-        Ok((
+        Ok(SpawnedModel {
             workers,
+            admissions,
             registry_default_batch,
-            spec.impl_class,
-            claim_replica.is_some(),
-        ))
+            impl_class: spec.impl_class,
+            claim_eligible: claim_replica.is_some(),
+            cost,
+        })
     }
 
     /// Bind a claimed prewarmed worker to the concrete model. A
@@ -1122,6 +1555,10 @@ impl ModelManager {
         inference_id: &str,
         spec: &SpawnSpec,
         device: Option<String>,
+        // The caller's per-replica spawn config (`for_unified_board`), so a
+        // respawn after a dead pooled worker gets the same environment the
+        // fresh path would have given it.
+        spawn: &WorkerSpawnConfig,
     ) -> Result<Worker> {
         match worker.configure(inference_id, &spec.config_kwargs).await {
             Ok(()) => Ok(worker),
@@ -1135,7 +1572,7 @@ impl ModelManager {
                     "claimed prewarmed worker died before configure; falling back to a fresh spawn: {err:#}"
                 );
                 // The fatal path already killed and reaped the child.
-                Worker::spawn_configured(&self.cfg.spawn, inference_id, spec, device).await
+                Worker::spawn_configured(spawn, inference_id, spec, device).await
             }
         }
     }
@@ -1171,6 +1608,7 @@ fn registry_default_batch(registry: &Registry, full_inference_id: &str) -> Optio
 
 #[cfg(test)]
 mod tests {
+    use super::super::calibration::{ProfileQuery, ProfileSeed, ProfileUpdate};
     use super::super::registry::RegistryConfig;
     use super::super::worker::WorkerDeadlines;
     use super::*;
@@ -1435,6 +1873,9 @@ config.impl_class = "cls"
             env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
+            // The fixture impls echo `CUDA_VISIBLE_DEVICES`, which is also
+            // what every non-ROCm host writes.
+            pin_env_var: crate::inferio::gpu::CUDA_PIN_ENV_VAR,
         }
     }
 
@@ -1490,7 +1931,17 @@ config.impl_class = "does_not_exist"
 [group.device]
 config.impl_class = "device_test"
 config.devices = ["3", "7"]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.epoch = 4
+metadata.cost.seed_units = 1000000
 [group.device.inference_ids.test]
+
+# Same fixture with no devices pin: the universal-pinning path (resolved to
+# the default board's UUID when a GPU inventory is known).
+[group.devplain]
+config.impl_class = "device_test"
+[group.devplain.inference_ids.test]
 
 [group.slowpair]
 config.impl_class = "slow_test"
@@ -1508,6 +1959,9 @@ config.replicas = 2
         _registry_dir: tempfile::TempDir,
     }
 
+    /// Default setup: unknown GPU inventory, i.e. exactly the pre-pinning
+    /// behaviour (no `CUDA_VISIBLE_DEVICES` unless the registry pins one).
+    /// [`test_manager_with_gpus`] covers resolved pinning.
     fn test_manager(sweep_interval: Duration, default_max_batch: u32) -> TestSetup {
         test_manager_with_deadlines(
             sweep_interval,
@@ -1520,6 +1974,55 @@ config.replicas = 2
         sweep_interval: Duration,
         default_max_batch: u32,
         deadlines: WorkerDeadlines,
+    ) -> TestSetup {
+        test_manager_full(
+            sweep_interval,
+            default_max_batch,
+            deadlines,
+            GpuInventory::unknown(),
+            None,
+        )
+    }
+
+    fn test_manager_with_gpus(gpus: GpuInventory) -> TestSetup {
+        test_manager_full(
+            Duration::from_secs(60),
+            32,
+            WorkerDeadlines::default(),
+            gpus,
+            None,
+        )
+    }
+
+    fn test_manager_with_calibration(calibration: Arc<dyn CalibrationProfiles>) -> TestSetup {
+        test_manager_full(
+            Duration::from_secs(60),
+            32,
+            WorkerDeadlines::default(),
+            GpuInventory::unknown(),
+            Some(calibration),
+        )
+    }
+
+    fn test_manager_with_gpus_and_calibration(
+        gpus: GpuInventory,
+        calibration: Arc<dyn CalibrationProfiles>,
+    ) -> TestSetup {
+        test_manager_full(
+            Duration::from_secs(60),
+            32,
+            WorkerDeadlines::default(),
+            gpus,
+            Some(calibration),
+        )
+    }
+
+    fn test_manager_full(
+        sweep_interval: Duration,
+        default_max_batch: u32,
+        deadlines: WorkerDeadlines,
+        gpus: GpuInventory,
+        calibration: Option<Arc<dyn CalibrationProfiles>>,
     ) -> TestSetup {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("registry.toml"), TEST_REGISTRY_TOML).unwrap();
@@ -1540,6 +2043,11 @@ config.replicas = 2
                 lazy: false,
                 always_warm: Vec::new(),
             },
+            gpus,
+            vram: VramBudgets::default(),
+            // Usually no calibration store: these tests assert manager
+            // semantics, and a store would make them write a profile file.
+            calibration,
         };
         TestSetup {
             manager: ModelManager::new(cfg, registry),
@@ -2080,6 +2588,77 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
+    /// Shutdown flushes the calibration store. A window that landed inside
+    /// the write debounce is exactly the desktop case — quitting a few
+    /// seconds after a ramp step — and losing it would silently mean
+    /// re-ramping on the next run.
+    #[tokio::test]
+    async fn shutdown_flushes_the_calibration_store() {
+        use super::super::calibration::{CalibrationStore, ProfileUpdate, StoreEnv, StorePaths};
+        use super::super::ledger::FitSample;
+
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("inferio/calibration.toml");
+        let store = CalibrationStore::with_debounce(
+            StorePaths {
+                shipped_dirs: Vec::new(),
+                local_path: path.clone(),
+            },
+            StoreEnv {
+                platform: "linux".to_owned(),
+                backend: "cuda".to_owned(),
+                generator: "panoptikon test".to_owned(),
+            },
+            Duration::from_secs(3600),
+        );
+        let setup =
+            test_manager_with_calibration(Arc::clone(&store) as Arc<dyn CalibrationProfiles>);
+        let update = |slope: f64| ProfileUpdate {
+            inference_id: "echo/test".to_owned(),
+            epoch: 1,
+            gpu_name: "TEST 9000".to_owned(),
+            torch: "2.7.1+cu128".to_owned(),
+            dtype: "fp16".to_owned(),
+            unit: "item",
+            aggregation: "count",
+            base_mb: 1000,
+            base_method: Some("nvml".to_owned()),
+            slope_mb_per_unit: slope,
+            residual_mb: 0.0,
+            samples: 3,
+            knee_units: None,
+            max_units_measured: 16,
+            local_samples: 3,
+            ring: vec![FitSample {
+                units: 16,
+                delta_mb: 160,
+            }],
+        };
+
+        // The first update has no previous write to wait behind, so it lands
+        // on its own and primes the debounce.
+        store.record(update(0.25));
+        let mut waited = Duration::ZERO;
+        while !path.exists() && waited < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += Duration::from_millis(20);
+        }
+        assert!(path.exists(), "the first update reaches disk");
+
+        // The second is an hour behind the debounce — only a flush saves it.
+        store.record(update(0.75));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !fs::read_to_string(&path).unwrap().contains("0.75"),
+            "still waiting out the debounce"
+        );
+        setup.manager.shutdown().await;
+        assert!(
+            fs::read_to_string(&path).unwrap().contains("0.75"),
+            "the quit flushed what the debounce was holding"
+        );
+    }
+
     /// Graceful manager shutdown: workers are unloaded via the graceful
     /// ladder, the cache empties, and subsequent loads/predicts are
     /// refused.
@@ -2311,6 +2890,14 @@ config.replicas = 2
     /// merge) must be answered by BOTH pins, proving the set has exactly
     /// the two replicas and the dispatcher actually spreads windows across
     /// them.
+    ///
+    /// This is also the **unknown-inventory passthrough** case for
+    /// universal pinning: with no GPU inventory and CUDA's pin vocabulary
+    /// (which is what a default `GpuInventory` carries, as here) the
+    /// registry's raw index strings reach the child unchanged, exactly as
+    /// before pinning existed. The claim is scoped to that vocabulary: an
+    /// uninventoried *ROCm* host canonicalises index pins and drops
+    /// non-numeric ones instead (`gpu.rs::resolve_hip_pin_uninventoried`).
     #[tokio::test]
     async fn multi_replica_devices_serve_shared_queue() {
         let setup = test_manager(Duration::from_secs(60), 32);
@@ -2349,6 +2936,347 @@ config.replicas = 2
             devices,
             std::collections::BTreeSet::from(["3".to_string(), "7".to_string()]),
             "both configured device pins served requests (and no third replica exists)"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// Inventory for the pinning tests: two boards whose indices (0 and 3)
+    /// cover both the default-placement and the index-mapping paths. Equal
+    /// compute capability, so the default pin is decided by index (board 0).
+    fn test_gpus() -> GpuInventory {
+        GpuInventory::known(vec![
+            GpuInfo {
+                index: 0,
+                uuid: "GPU-0000".into(),
+                name: "Test GPU 0".into(),
+                total_mb: 8192,
+                compute_cap: Some("12.0".into()),
+                bdf: None,
+                gfx_target_version: None,
+                unified_ram_mb: None,
+                vram_carveout_mb: None,
+            },
+            GpuInfo {
+                index: 3,
+                uuid: "GPU-3333".into(),
+                name: "Test GPU 3".into(),
+                total_mb: 8192,
+                compute_cap: Some("12.0".into()),
+                bdf: None,
+                gfx_target_version: None,
+                unified_ram_mb: None,
+                vram_carveout_mb: None,
+            },
+        ])
+    }
+
+    /// Universal pinning (batch-calibration design): a replica the registry
+    /// left unpinned is spawned on the default board *by UUID*, not left
+    /// seeing every device. The fixture echoes its CUDA_VISIBLE_DEVICES, so
+    /// the reported value is the proof.
+    #[tokio::test]
+    async fn unpinned_replica_is_pinned_to_the_default_gpu() {
+        let setup = test_manager_with_gpus(test_gpus());
+        let manager = &setup.manager;
+
+        let outputs = manager
+            .predict(
+                "devplain/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("predict on the pinned replica");
+        assert_eq!(
+            reported_device(&outputs[0]),
+            "GPU-0000",
+            "an unpinned replica resolves to the default board's UUID"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// An explicit index pin (`devices = ["3", "7"]`) is mapped to that
+    /// board's UUID so the ledger key is stable across reboots; an index no
+    /// board reports (7 here) passes through unchanged rather than being
+    /// guessed at.
+    #[tokio::test]
+    async fn index_device_pins_map_to_board_uuids() {
+        let setup = test_manager_with_gpus(test_gpus());
+        let manager = setup.manager.clone();
+
+        manager
+            .load_model("device/test", "k", 10, -1, None)
+            .await
+            .expect("load spawns both replicas");
+
+        let mut tasks = Vec::new();
+        for i in 0..4 {
+            let manager = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .predict(
+                        "device/test",
+                        "k",
+                        10,
+                        -1,
+                        Some(1),
+                        None,
+                        vec![data_input(json!(i))],
+                    )
+                    .await
+            }));
+        }
+        let mut devices = std::collections::BTreeSet::new();
+        for task in tasks {
+            let outputs = task.await.unwrap().expect("predict on a pinned replica");
+            devices.insert(reported_device(&outputs[0]));
+        }
+        assert_eq!(
+            devices,
+            std::collections::BTreeSet::from(["GPU-3333".to_string(), "7".to_string()]),
+            "index 3 became its UUID; the invisible index 7 passed through"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// A calibration store that answers nothing and records which *board*
+    /// each question was keyed by. `expected_base_mb` has exactly one caller
+    /// — the load reservation in `spawn_model` — and it is reached only after
+    /// `VramLedger::reserve_load` has found the board in its map, so a
+    /// recorded name is proof the reservation resolved to a real board.
+    #[derive(Default)]
+    struct RecordingProfiles {
+        reservation_boards: StdMutex<Vec<String>>,
+    }
+
+    impl CalibrationProfiles for RecordingProfiles {
+        fn expected_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
+            self.reservation_boards
+                .lock()
+                .unwrap()
+                .push(query.gpu_name.to_owned());
+            None
+        }
+
+        fn lookup(&self, _query: &ProfileQuery<'_>) -> Option<ProfileSeed> {
+            None
+        }
+
+        fn record(&self, _update: ProfileUpdate) {}
+    }
+
+    /// A ROCm-shaped inventory whose row indices are the registry's own
+    /// device pins (`device/test` pins "3" and "7"), so the pin vocabulary
+    /// and the ledger's key vocabulary are guaranteed to differ.
+    fn rocm_test_gpus() -> GpuInventory {
+        let board = |index: u32, bdf: &str| GpuInfo {
+            index,
+            uuid: format!("GPU-BDF-{bdf}"),
+            name: format!("AMD gfx1100 #{index}"),
+            total_mb: 24_576,
+            compute_cap: None,
+            bdf: Some(bdf.to_owned()),
+            gfx_target_version: Some(110_000),
+            unified_ram_mb: None,
+            vram_carveout_mb: None,
+        };
+        GpuInventory::known_rocm(vec![board(3, "0000:03:00.0"), board(7, "0000:0c:00.0")])
+    }
+
+    /// D3's manager half: the load reservation is keyed by the board key,
+    /// never by the resolved pin. On ROCm the two are never the same string —
+    /// the pin is a HIP device index — so keying by the pin misses the
+    /// ledger's board map entirely and reserves nothing, which is precisely
+    /// the gap D2 left open. The recording store is the probe: a reservation
+    /// that found its board consults it, one that missed never gets that far.
+    ///
+    /// Venv-gated like the rest of this suite (it spawns real fixture
+    /// workers via the repo interpreter), so it runs on the dev box and in
+    /// CI rather than on every checkout.
+    #[tokio::test]
+    async fn load_reservations_are_keyed_by_board_not_by_the_hip_pin() {
+        let profiles = Arc::new(RecordingProfiles::default());
+        let setup = test_manager_with_gpus_and_calibration(
+            rocm_test_gpus(),
+            Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>,
+        );
+        let manager = &setup.manager;
+
+        manager
+            .load_model("device/test", "k", 10, -1, None)
+            .await
+            .expect("load spawns both pinned replicas");
+
+        let mut boards = profiles.reservation_boards.lock().unwrap().clone();
+        boards.sort();
+        assert_eq!(
+            boards,
+            vec!["AMD gfx1100 #3".to_string(), "AMD gfx1100 #7".to_string()],
+            "both replicas reserved against the board their index pin names; \
+             keying by the pin string (\"3\", \"7\") would have found no board \
+             at all and reserved nothing"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// `/health` carries the batch-calibration bookkeeping: the resolved
+    /// cost dimension per model (declared for the `device` group, degraded
+    /// for `echo`, which declares nothing), the GPU inventory, and one
+    /// telemetry row per replica carrying its resolved pin. The memory
+    /// fields stay null here — the fixtures have no torch, which is exactly
+    /// the old-worker tolerance the wire contract promises.
+    #[tokio::test]
+    async fn health_reports_cost_dimension_gpus_and_replica_pins() {
+        let setup = test_manager_with_gpus(test_gpus());
+        let manager = &setup.manager;
+
+        manager
+            .load_model("device/test", "k", 10, -1, None)
+            .await
+            .expect("load");
+        manager
+            .load_model("echo/test", "k", 10, -1, None)
+            .await
+            .expect("load");
+
+        let health = manager.health();
+        assert_eq!(
+            health
+                .gpus
+                .iter()
+                .map(|gpu| gpu.uuid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["GPU-0000", "GPU-3333"],
+            "the inventory is reported by board UUID"
+        );
+
+        let device = health
+            .models
+            .iter()
+            .find(|model| model.inference_id == "device/test")
+            .expect("device model in health");
+        assert_eq!(device.cost.unit, "pixel");
+        assert_eq!(device.cost.aggregation.as_deref(), Some("sum"));
+        assert_eq!(device.cost.epoch, 4);
+        assert_eq!(device.cost.seed_units, Some(1_000_000));
+        assert!(!device.cost.degraded);
+        let mut pins: Vec<Option<&str>> = device
+            .replicas_detail
+            .iter()
+            .map(|replica| replica.gpu.as_deref())
+            .collect();
+        pins.sort();
+        assert_eq!(
+            pins,
+            vec![Some("7"), Some("GPU-3333")],
+            "every replica records the GPU it sits on"
+        );
+        assert!(
+            device
+                .replicas_detail
+                .iter()
+                .all(|replica| replica.base_mb.is_none()
+                    && replica.dtype.is_none()
+                    && replica.reserved_mb.is_none()
+                    // The reported identity is absent too: only a worker with
+                    // a live CUDA device can name its board, and the spawn pin
+                    // above is deliberately not copied into it.
+                    && replica.gpu_uuid.is_none()
+                    && replica.torch_version.is_none()),
+            "a torch-less worker reports no memory, and that is not an error: {:?}",
+            device.replicas_detail
+        );
+
+        let echo = health
+            .models
+            .iter()
+            .find(|model| model.inference_id == "echo/test")
+            .expect("echo model in health");
+        assert_eq!(echo.cost.unit, "item", "undeclared degrades to item/count");
+        assert_eq!(echo.cost.aggregation.as_deref(), Some("count"));
+        assert!(echo.cost.degraded);
+
+        manager.shutdown().await;
+    }
+
+    /// A predict must record the measurement plumbing even with no torch in
+    /// the worker: the harness always times the call and counts its inputs,
+    /// so every batch lands in the telemetry ring (sequence-numbered, oldest
+    /// first) while the memory columns stay null. Two predicts must produce
+    /// two retained samples — the cost fit needs the set, not the last one.
+    #[tokio::test]
+    async fn predict_records_batch_measurements_without_torch() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+
+        manager
+            .predict(
+                "echo/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1)), data_input(json!(2))],
+            )
+            .await
+            .expect("predict");
+        manager
+            .predict(
+                "echo/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(3))],
+            )
+            .await
+            .expect("second predict");
+
+        let health = manager.health();
+        let replica = &health
+            .models
+            .iter()
+            .find(|model| model.inference_id == "echo/test")
+            .expect("echo model in health")
+            .replicas_detail[0];
+        assert_eq!(
+            replica.measurements_recorded, 2,
+            "both predicts were retained, not overwritten: {replica:?}"
+        );
+        assert_eq!(
+            replica
+                .recent_batches
+                .iter()
+                .map(|batch| (batch.seq, batch.items))
+                .collect::<Vec<_>>(),
+            vec![(1, Some(2)), (2, Some(1))],
+            "oldest first, with the input counts the worker reported: {replica:?}"
+        );
+        assert!(
+            replica
+                .recent_batches
+                .iter()
+                .all(|batch| batch.duration_ms.is_some_and(|ms| ms >= 0.0)),
+            "every batch was timed: {replica:?}"
+        );
+        assert!(
+            replica
+                .recent_batches
+                .iter()
+                .all(|batch| batch.peak_reserved_mb.is_none())
+                && replica.free_mb.is_none()
+                && replica.gpu.is_none(),
+            "no torch and no GPU inventory means no memory numbers: {replica:?}"
         );
 
         manager.shutdown().await;
@@ -2645,9 +3573,13 @@ config.replicas = 2
         assert_eq!(model.replicas.total, 1, "echo has a single-replica set");
         assert_eq!(model.queue_depth, 0, "nothing left queued");
         assert_eq!(
-            model.last_effective_cap,
-            Some(32),
-            "no explicit or registry opinion -> server default"
+            model.last_window_items,
+            Some(1),
+            "one single-input request formed the window"
+        );
+        assert_eq!(
+            model.last_grant_units, None,
+            "an unknown GPU inventory means the unpriced path: no grant"
         );
         assert_eq!(model.total_predict_requests, 1);
         assert_eq!(model.total_batches, 1);
@@ -2714,13 +3646,15 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// The Phase 2 cap is observable (design §10: "health endpoint exposes
-    /// it"): after traffic where every request carries max_batch=2, the
-    /// last dispatched window was capped at 2 and health reports exactly
-    /// that — not the server default of 32. Six singles capped at 2 need
-    /// at least 3 windows, which total_batches must reflect.
+    /// The user cap is observable (design §10: "health endpoint exposes
+    /// it"): after traffic where every request carries max_batch=2, no
+    /// dispatched window held more than 2 inputs. This is the rewrite of the
+    /// old `last_effective_cap` assertion — the cap now bounds the window
+    /// itself (unpriced path) or the worker's packed batches (priced path),
+    /// never a max-over-caps rule. Six singles capped at 2 need at least 3
+    /// windows, which total_batches must reflect.
     #[tokio::test]
-    async fn health_reports_last_effective_cap_from_capped_traffic() {
+    async fn health_reports_the_capped_window_size() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
@@ -2756,10 +3690,9 @@ config.replicas = 2
             .iter()
             .find(|model| model.inference_id == "batch/test")
             .expect("model loaded");
-        assert_eq!(
-            model.last_effective_cap,
-            Some(2),
-            "every window carried the explicit cap of 2"
+        assert!(
+            model.last_window_items.expect("a window dispatched") <= 2,
+            "the user cap still bounds windows through the new path"
         );
         assert_eq!(model.total_predict_requests, 6);
         assert!(

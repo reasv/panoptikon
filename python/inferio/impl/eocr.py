@@ -58,7 +58,14 @@ class EasyOCRModel(InferenceModel):
             return
 
         self.devices = get_device()
-        use_gpu = self.gpu and torch.cuda.is_available()
+        # Derived from the device we resolved, not from a second probe of the
+        # hardware: `torch.cuda.is_available()` answers about the *machine*,
+        # and on a host the orchestrator priced against system RAM
+        # (`INFERIO_DEVICE=cpu`) that is not the question — the model must run
+        # where it is budgeted (docs/unified-memory-admission.md, backend C).
+        # EasyOCR's `gpu` argument only ever means CUDA/HIP, so any other
+        # device kind (Metal, CPU) is CPU here.
+        use_gpu = self.gpu and self.devices[0].type == "cuda"
         # ROCm/HIP: EasyOCR's CRAFT detector hits MIOpen GEMM paths that warn
         # IsEnoughWorkspace (ptr=0) and can stall for tens of seconds per unique
         # shape under default HYBRID find. Prefer a single device string over

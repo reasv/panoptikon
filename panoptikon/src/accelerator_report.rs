@@ -145,7 +145,8 @@ pub fn stack_id_for_backend(a: Accelerator) -> Option<&'static str> {
         Accelerator::Cuda => Some("nvidia"),
         Accelerator::Rocm => Some("amd-rocm"),
         // Accelerator::Xpu => Some("intel-xpu"),
-        Accelerator::Cpu | Accelerator::Auto => None,
+        // MPS has no driver stack to probe: Metal is part of the OS.
+        Accelerator::Cpu | Accelerator::Mps | Accelerator::Auto => None,
     }
 }
 
@@ -156,6 +157,7 @@ pub fn accelerator_slug(a: Accelerator) -> &'static str {
         Accelerator::Cuda => "cuda",
         Accelerator::Rocm => "rocm",
         Accelerator::Cpu => "cpu",
+        Accelerator::Mps => "mps",
         // Accelerator::Xpu => "xpu",
     }
 }
@@ -523,6 +525,7 @@ mod tests {
         assert_eq!(accelerator_slug(Accelerator::Cpu), "cpu");
         assert_eq!(accelerator_slug(Accelerator::Cuda), "cuda");
         assert_eq!(accelerator_slug(Accelerator::Rocm), "rocm");
+        assert_eq!(accelerator_slug(Accelerator::Mps), "mps");
         assert_eq!(accelerator_slug(Accelerator::Auto), "auto");
     }
 
@@ -677,6 +680,8 @@ mod tests {
         assert_eq!(stack_id_for_backend(Accelerator::Cuda), Some("nvidia"));
         assert_eq!(stack_id_for_backend(Accelerator::Rocm), Some("amd-rocm"));
         assert_eq!(stack_id_for_backend(Accelerator::Cpu), None);
+        assert_eq!(stack_id_for_backend(Accelerator::Mps), None);
+        assert!(!is_gpu_backend(Accelerator::Mps));
         assert!(!is_gpu_backend(Accelerator::Cpu));
         assert!(is_gpu_backend(Accelerator::Cuda));
     }

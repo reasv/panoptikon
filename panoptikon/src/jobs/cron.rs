@@ -904,6 +904,49 @@ mod tests {
             .collect()
     }
 
+    // The cron row's cap reaches the job request untouched, `None` included:
+    // an auto row must not acquire a number on the way to the queue, and the
+    // rest of the chain (group `job_settings`) is then applied at execution
+    // time exactly as it is for an interactive run.
+    #[test]
+    fn cron_rows_pass_their_cap_through_verbatim() {
+        let metadata = metadata(&[("src/a", &["items"]), ("src/b", &["items"])]);
+        let config = SystemConfig {
+            cron_jobs: vec![
+                CronJob {
+                    inference_id: "src/a".to_string(),
+                    batch_size: None,
+                    threshold: None,
+                },
+                CronJob {
+                    inference_id: "src/b".to_string(),
+                    batch_size: Some(8),
+                    threshold: Some(0.3),
+                },
+            ],
+            ..SystemConfig::default()
+        };
+        let requests = build_cron_requests(
+            "one",
+            "user",
+            JobType::FolderRescan,
+            &config,
+            Some(&metadata),
+        );
+        let caps: Vec<(Option<String>, Option<i64>)> = requests
+            .into_iter()
+            .map(|(_, request)| (request.metadata, request.batch_size))
+            .collect();
+        assert_eq!(
+            caps,
+            [
+                (None, None),
+                (Some("src/a".to_string()), None),
+                (Some("src/b".to_string()), Some(8)),
+            ]
+        );
+    }
+
     // Source-data models (items/files) run before derived-data models;
     // unknown models are dropped; config order is otherwise preserved. (The
     // behaviours the old `order_cron_jobs` covered, now expressed through the

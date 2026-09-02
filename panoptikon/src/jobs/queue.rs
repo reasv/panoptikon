@@ -3237,6 +3237,23 @@ mod tests {
         );
     }
 
+    // Auto survives onto the wire: an extraction enqueued without a cap
+    // (`resolve_job_defaults` returning `None` for an empty config) is
+    // reported as `None`, not materialized into a number the user never
+    // chose. The queue table renders that as "Auto".
+    #[test]
+    fn a_job_without_a_cap_is_reported_as_auto() {
+        let auto = queued_job(JobType::DataExtraction, Some("clip/ViT-H-14"));
+        assert_eq!(auto.batch_size, None);
+        assert_eq!(JobModel::from_job(&auto, false).batch_size, None);
+
+        let capped = Job {
+            batch_size: Some(4),
+            ..auto
+        };
+        assert_eq!(JobModel::from_job(&capped, false).batch_size, Some(4));
+    }
+
     // The model-continuity decision, without actors: the batch model survives
     // exactly as long as the next extraction in the queue wants the same
     // setter, and a synthesized maintenance job in between does not count.

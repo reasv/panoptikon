@@ -52,6 +52,19 @@ target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 
+# Cost dimension for batch calibration (docs/batch-calibration-design.md).
+# unit: item | pixel | token | audio-second | none; aggregation: count | sum |
+# max-times-count. `epoch` invalidates stored calibration for this model when
+# its memory behaviour changes without any key component moving; `seed_units`
+# is the first-touch batch on unknown hardware. Per-id blocks below override
+# these key by key.
+# wd_tagger's own preprocess resizes every image to a fixed 448px square.
+[group.tags.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
+
 [group.tags.metadata.input_spec]
 handler = "image_frames"
 opts.max_frames = 4
@@ -94,6 +107,21 @@ config.sub_namespace = "general"
 config.enable_rating = true
 metadata.description = """(Experimental) Moondream 2B Based Tagger. This tagger works \
   for general items and has an open vocabulary as it is a VLM"""
+# Sequential engine, so nothing about a batch is priceable: MoondreamTagger's
+# `predict` loops one image at a time through encode_image/query
+# (impl/md_tagger.py, `for image in image_inputs`) and never calls
+# run_with_oom_retry, so a packed batch's allocator peak is the *largest single
+# image's*, not the batch's — pixel/sum units would describe a batch the GPU
+# never saw and bias the fitted slope low. Same class as faster_whisper. The
+# tiling cap the design asked about is real but moot here: max_crops = 12 plus
+# the global crop at 378px (moondream2 2025-03-27 config.py VisionConfig,
+# image_crops.py select_tiling/overlap_crop_image) bounds any image at ~1.9 MP.
+# The impl carries `enable_batching = False`, which is what makes the worker
+# take the grantless path (inferio_worker/packing.py batching_disabled).
+metadata.cost.unit  = "none"
+# epoch 2: reclassified 2026-07-30 (pixel/sum -> none), invalidating every
+# stored profile measured under the old dimension.
+metadata.cost.epoch = 2
 
 [group.tags.inference_ids."moondream-2b-25-03-clothing"]
 config.impl_class = "moondream_tagger"
@@ -107,6 +135,10 @@ config.prompt = """List all visible articles of clothing in this image. \
 metadata.description = """(Experimental) Moondream 2B Based Tagger prompted to only \
   list items of clothing as tags. This tagger works for general items and \
   has an open vocabulary as it is a VLM"""
+# Sequential engine — see the id above.
+metadata.cost.unit  = "none"
+# epoch 2: reclassified 2026-07-30 (pixel/sum -> none).
+metadata.cost.epoch = 2
 
 
 # ===================================================================
@@ -129,6 +161,10 @@ default_inference_id = "danbooru"
 target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/"]
+
+# Network lookups only (num_gpus = 0): nothing to price, nothing to calibrate.
+[group.tagmatch.metadata.cost]
+unit = "none"
 
 [group.tagmatch.metadata.input_spec]
 handler = "md5"
@@ -170,6 +206,24 @@ target_entities      = ["items"]
 output_type          = "text"
 input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
 
+# Fixed per item on both halves. Detection resizes every page to the arch's
+# fixed canvas (db_resnet50 input_shape = (3, 1024, 1024)) and recognition
+# resizes every crop to (3, 32, 128) (crnn/vitstr defaults); docTR then
+# re-batches internally on its own constants (detection batch 2, recognition
+# batch 128 — doctr/models/{detection,recognition}/zoo.py), so what scales with
+# *our* batch is the preprocessed tensors, which set_device_and_dtype moves to
+# the device in one go for the whole call (doctr/models/utils/pytorch.py:144).
+# That is ~6.3 MB per page in fp16 (fixed) plus ~24 kB per detected word crop
+# (data-dependent): a text-dense page is a few times a photo, never orders of
+# magnitude at the 1536px slice this group submits, so the recognition variance
+# the design flagged is margin-absorbed and item/count stands. dots_ocr and the
+# easyocr ids deviate (see their per-id blocks).
+[group.doctr.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
+
 [group.doctr.metadata.input_spec]
 handler = "image_frames"
 opts.max_frames                = 4
@@ -191,24 +245,47 @@ metadata.description = "DotsOCR - rednote-hilab/dots.ocr (FlashAttention 2 is re
 # bf16 + FlashAttention 2 both need Ampere (sm_80); the gateway marks the
 # model unavailable on older GPUs and jobs refuse to start it.
 metadata.min_compute_capability = 8.0
+# Variable-resolution VLM: image-token count (and the KV cache behind
+# max_new_tokens) scales with decoded pixels.
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units  = 2000000
 
 [group.doctr.inference_ids.easyocr_standard_en]
 config.impl_class = "easyocr"
 config.languages  = ["en"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English Text, Standard Recog Network"
+# The batched CRAFT detector needs uniform dims and pays max-size × batch —
+# the known OOM trap `enable_batching = false` currently works around. The
+# packing harness (step 1b) now buckets max-times-count models largest-first,
+# which is the mechanism meant to retire this flag; flipping it is deliberately
+# left to the rollout's acceptance test (docs/batch-calibration-design.md,
+# rollout item 1: bucketed easyOCR re-batching **under realistic core
+# pipelining**), because window depth — and therefore how much material the
+# bucketer gets — is what decides whether it holds, and that cannot be
+# asserted from a unit test.
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.seed_units  = 2000000
 
 [group.doctr.inference_ids.easyocr_standard_en_ja]
 config.impl_class = "easyocr"
 config.languages  = ["en", "ja"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English/Japanese Text, Standard Recog Network"
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.seed_units  = 2000000
 
 [group.doctr.inference_ids.easyocr_standard_en_ch_sim]
 config.impl_class = "easyocr"
 config.languages  = ["en", "ch_sim"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English/Chinese Simplified Text, Standard Recog Network"
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.seed_units  = 2000000
 
 [group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_small]
 config.detection_model  = "db_resnet50"
@@ -261,6 +338,14 @@ default_inference_id = "msft_large-more-detailed"
 target_entities      = ["items"]
 output_type          = "text"
 input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
+
+# The processor resizes to a fixed 768x768 and the generation budget is fixed
+# per task prompt.
+[group.florence2.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 4
 
 [group.florence2.metadata.input_spec]
 handler = "image_frames"
@@ -385,6 +470,20 @@ target_entities      = ["items"]
 output_type          = "text"
 input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
 
+# Sequential engine: MoondreamCaptioner's `predict` loops one image at a time
+# through encode_image/query/caption (impl/md_captioner.py, `for image in
+# image_inputs`) and never calls run_with_oom_retry, so a packed batch's
+# allocator peak is the largest single image's — batch size buys nothing and
+# prices nothing. Same class as faster_whisper. (The model's own tiling *is*
+# capped — max_crops = 12 + global crop at 378px, moondream2 2025-03-27
+# config.py / image_crops.py, ~1.9 MP — but that only bounds the per-item
+# peak.) The impl carries `enable_batching = False`, which is what makes the
+# worker take the grantless path (inferio_worker/packing.py batching_disabled).
+[group.vlm.metadata.cost]
+unit  = "none"
+# epoch 2: reclassified 2026-07-30 (pixel/sum -> none).
+epoch = 2
+
 [group.vlm.metadata.input_spec]
 handler = "image_frames"
 opts.max_frames                = 4
@@ -463,6 +562,14 @@ default_inference_id = "all-mpnet-base-v2"
 target_entities      = ["text"]
 output_type          = "text-embedding"
 
+# sentence_transformers pre-splits inputs at max_seq_length, then pads each
+# batch to its longest member.
+[group.textembed.metadata.cost]
+unit        = "token"
+aggregation = "max-times-count"
+epoch       = 1
+seed_units  = 4000
+
 [group.textembed.metadata.input_spec]
 handler = "extracted_text"
 
@@ -499,6 +606,8 @@ metadata.description = """Not local (API-based). You must set the JINA_API_KEY \
   env var (or the api_key config option) before using this model. \
   jina-embeddings-v3 is a multilingual multi-task text embedding model \
   designed for a variety of NLP applications."""
+# Remote API: no local GPU memory to price.
+metadata.cost.unit = "none"
 
 [group.textembed.inference_ids.jina-embeddings-v3-api.external_inputs.jina_api_key]
 [group.textembed.inference_ids.jina-embeddings-v3-api.external_inputs.jina_max_retries]
@@ -521,6 +630,12 @@ default_inference_id = "distill-large-v3"
 target_entities      = ["items"]
 output_type          = "text"
 input_mime_types     = ["video/", "audio/"]
+
+# CTranslate2 processes 30s windows sequentially and has no torch allocator to
+# measure: VRAM is ~constant per model. Excluded from calibration v1, as it
+# already is from the OOM retry loop.
+[group.whisper.metadata.cost]
+unit = "none"
 
 [group.whisper.metadata.input_spec]
 handler = "audio_tracks" # { handler="audio_tracks", opts={ max_tracks = 1, sample_rate = 16000 } }
@@ -608,6 +723,14 @@ default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
 target_entities      = ["items"]
 output_type          = "clip"
 
+# openclip preprocesses to a fixed resolution per model (224/378/384px). The
+# qwen3-vl / nemotron / jina ids deviate (see their per-id blocks).
+[group.clip.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
+
 [group.clip.metadata.input_spec]
 handler = "image_frames"
 opts.max_frames                = 4
@@ -635,6 +758,20 @@ metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embeddin
   model. Leads MMEB-V2 across natural images and visual documents. Heavier \
   than CLIP (roughly 16 GB VRAM in bf16); consider smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
+# qwen-vl-utils variable-resolution path, and the pixel cap the design asked
+# to confirm is explicit: MAX_PIXELS = 1800 * 32 * 32 = 1,843,200 px per image
+# (impl/deps/qwen_3_vl_embedding.py MIN_PIXELS/MAX_PIXELS, passed per image in
+# format_model_input), i.e. at most 1800 merged vision tokens. Genuinely
+# batched (one processor call, one forward), so measurements are honest; the
+# vision tower packs variable-length patches rather than padding them, which is
+# what makes `sum` the right aggregation. Two known approximations, both
+# conservative-to-neutral and both left to the fit's margin: the language half
+# of the same forward *is* padded to the batch's longest sequence
+# (`padding=True` in _preprocess_inputs), and the worker prices raw submitted
+# pixels, which saturate against the cap above ~1.8 MP.
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units  = 2000000
 
 
 [group.clip.inference_ids.qwen3-vl-embedding-2b]
@@ -646,6 +783,9 @@ metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embeddin
   (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16); consider \
   smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units  = 2000000
 
 [group.clip.inference_ids.PE-Core-L-14-336_meta]
 config.model_name = "PE-Core-L-14-336"
@@ -708,6 +848,18 @@ metadata.description = """NVIDIA Llama Nemotron Embed VL 1B v2: unified \
   always embedded as a search query, so use it for image embeddings only \
   and do not pair it with a CLIP Text Embeddings (tclip) run."""
 metadata.link = "https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2"
+# Tiles images at their native aspect ratio, so memory follows decoded pixels
+# rather than item count (same class as the qwen3-vl embedders; this model
+# postdates the design's taxonomy table). Verified: the processor's
+# dynamic_preprocess cuts 512px tiles (processing_llama_nemotron_vl.py
+# dynamic_preprocess / image_size = 512) bounded by max_input_tiles = 6 plus the
+# thumbnail, which impl/nemotron_embed_vl.py sets explicitly — a per-item
+# ceiling of ~1.84 MP, the same order as qwen3-vl's cap, so pixel pricing
+# saturates above it exactly as it does there. Genuinely batched through
+# run_with_oom_retry, so measurements describe real GPU batches.
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units  = 2000000
 
 [group.clip.inference_ids.jina-clip-v2-api]
 config.model_name     = "jina-clip-v2"
@@ -723,6 +875,9 @@ metadata.description  = """Not local (API-based). You must set the JINA_API_KEY 
   env var (or the api_key config option) before using this model. \
   jina-clip-v2 is a general-purpose multilingual multimodal embedding model \
   for text & images."""
+
+# Remote API: no local GPU memory to price.
+metadata.cost.unit = "none"
 
 [group.clip.inference_ids.jina-clip-v2-api.external_inputs.jina_api_key]
 [group.clip.inference_ids.jina-clip-v2-api.external_inputs.jina_max_retries]
@@ -882,6 +1037,14 @@ default_batch_size   = 64
 target_entities      = ["text"]
 output_type          = "text-embedding"
 
+# Text through the CLIP text tower: a fixed context length per model, so cost
+# is per item, not per token. The qwen3-vl / jina ids deviate (per-id blocks).
+[group.tclip.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
+
 [group.tclip.metadata.input_spec]
 handler = "extracted_text"
 
@@ -901,6 +1064,20 @@ metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embeddin
   model. Leads MMEB-V2 across natural images and visual documents. Heavier \
   than CLIP (roughly 16 GB VRAM in bf16); consider smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
+# tclip runs the *text* tower (extracted_text handler): a batch here decodes
+# zero pixels, so pricing it per pixel would price every batch at 0. Unlike the
+# openclip text towers this engine has no fixed context: the processor
+# truncates at MAX_LENGTH = 8192 and pads the batch to its longest member
+# (`truncation=True, max_length=self.max_length, padding=True` in
+# Qwen3VLEmbedder._preprocess_inputs, `padding_side='right'` on the processor —
+# impl/deps/qwen_3_vl_embedding.py), so a batch costs longest × count, exactly
+# like sentence_transformers. Extracted OCR/transcript text spans orders of
+# magnitude in length, so item/count would misprice it in both directions.
+metadata.cost.unit        = "token"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.seed_units  = 4000
+# epoch 2: reclassified 2026-07-30 (item/count -> token/max-times-count).
+metadata.cost.epoch       = 2
 
 
 [group.tclip.inference_ids.qwen3-vl-embedding-2b]
@@ -912,6 +1089,13 @@ metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embeddin
   (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16); consider \
   smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
+# Text tower, zero decoded pixels, padded to the batch's longest sequence —
+# see the 8B id above.
+metadata.cost.unit        = "token"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.seed_units  = 4000
+# epoch 2: reclassified 2026-07-30 (item/count -> token/max-times-count).
+metadata.cost.epoch       = 2
 
 [group.tclip.inference_ids.PE-Core-L-14-336_meta]
 config.model_name = "PE-Core-L-14-336"
@@ -974,6 +1158,9 @@ metadata.description  = """Not local (API-based). You must set the JINA_API_KEY 
   env var (or the api_key config option) before using this model. \
   jina-clip-v2 is a general-purpose multilingual multimodal embedding model \
   for text & images."""
+
+# Remote API: no local GPU memory to price.
+metadata.cost.unit = "none"
 
 [group.tclip.inference_ids.jina-clip-v2-api.external_inputs.jina_api_key]
 [group.tclip.inference_ids.jina-clip-v2-api.external_inputs.jina_max_retries]
@@ -1129,6 +1316,22 @@ default_inference_id = "clap-htsat-unfused"
 target_entities      = ["items"]
 output_type          = "clip"
 input_mime_types     = ["video/", "audio/"]
+
+# ClapProcessor pads/truncates audio to a fixed window, so every item costs the
+# same. Window confirmed: max_length_s = 10 at 48 kHz — nb_max_samples = 480000,
+# nb_max_frames = 1000, truncation "rand_trunc", padding "repeatpad" in every
+# shipped checkpoint's preprocessor_config.json, matching transformers'
+# ClapFeatureExtractor defaults — so a 3-second clip and a 3-hour track both
+# become one 1000 x 64 mel tensor. Genuinely batched (impl/clap.py makes a
+# single processor call and a single get_audio_features call for the whole
+# batch), so the harness's measurements describe real GPU batches; note the
+# impl has no run_with_oom_retry, so a batch OOM surfaces to the harness
+# instead of being halved inside predict.
+[group.clap.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
 
 [group.clap.metadata.input_spec]
 handler = "audio_tracks"

@@ -1,0 +1,975 @@
+"""Unit tests for the worker's packing harness (`inferio_worker.packing`).
+
+These run everywhere. The harness only touches torch through
+`inferio_worker.memory`, which uses torch strictly if it is *already* in
+`sys.modules`, so a fake torch injected there drives the defensive clamp and
+the measurement paths without any GPU. PIL is real (it is an inferio
+dependency), so the pixel pricer is exercised against genuine image headers.
+"""
+
+from __future__ import annotations
+
+import io
+import sys
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+
+from inferio_worker import memory, packing
+from inferio_worker.inputs import PredictionInput
+
+MIB = 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+
+class FakeCuda:
+    """Just enough of `torch.cuda` for the harness's measurement + clamp."""
+
+    def __init__(self, free_mb=8000, total_mb=8192):
+        self.free = free_mb * MIB
+        self.total = total_mb * MIB
+        self.reserved = 0
+        self.allocated = 0
+        self.peak_reserved = 0
+        self.peak_allocated = 0
+        self.empty_cache_calls = 0
+
+    def is_available(self):
+        return True
+
+    def is_initialized(self):
+        return True
+
+    def mem_get_info(self):
+        return (self.free, self.total)
+
+    def memory_reserved(self):
+        return self.reserved
+
+    def memory_allocated(self):
+        return self.allocated
+
+    def max_memory_reserved(self):
+        return self.peak_reserved
+
+    def max_memory_allocated(self):
+        return self.peak_allocated
+
+    def reset_peak_memory_stats(self):
+        self.peak_reserved = self.reserved
+        self.peak_allocated = self.allocated
+
+    def empty_cache(self):
+        """Release the pool blocks no live tensor is using.
+
+        The real allocator returns `reserved - allocated`; a test that wants
+        the whole pool released zeroes `allocated` first (which is what a
+        window boundary looks like in reality — the impl's tensors are gone,
+        the pool that held them is not).
+        """
+        self.empty_cache_calls += 1
+        self.reserved = self.allocated
+        self.peak_reserved = max(self.peak_reserved, self.reserved)
+
+    def grow_pool(self, mb):
+        """Pretend a batch grew the caching-allocator pool by `mb`."""
+        self.reserved += mb * MIB
+        self.peak_reserved = max(self.peak_reserved, self.reserved)
+        self.allocated += mb * MIB
+        self.peak_allocated = max(self.peak_allocated, self.allocated)
+
+
+@pytest.fixture(autouse=True)
+def clean_state():
+    """Every test starts with no cross-window throughput comparator and no
+    accumulated reactive-shrink hysteresis."""
+    packing.note_trimmed()
+    yield
+    packing.note_trimmed()
+
+
+class FakeOomRetryUtils:
+    """Stand-in for `inferio.impl.utils` as the harness observes it.
+
+    The harness reads `last_oom_retry()` through `sys.modules` (it must never
+    import the real `inferio` package), so a namespace with that one function is
+    the whole contract. `record()` plays the role of a `run_with_oom_retry` call
+    completing: it bumps the generation, which is how the harness distinguishes
+    "the impl consulted the retry helper for this batch" from a stale reading.
+    """
+
+    def __init__(self):
+        self.generation = 0
+        self.slot = None
+        self.total = 0
+
+    def record(self, largest, halvings=0):
+        self.generation += 1
+        self.slot = (self.generation, largest, halvings)
+        self.total += halvings
+
+    def last_oom_retry(self):
+        return self.slot
+
+    def total_oom_halvings(self):
+        """Halvings across every call, as the real helper accumulates them.
+
+        This is the only reading that survives an impl calling the helper twice
+        in one `predict` — the per-call record above keeps the last call only.
+        """
+        return self.total
+
+
+@pytest.fixture
+def fake_oom_retry():
+    utils = FakeOomRetryUtils()
+    with mock.patch.dict(sys.modules, {"inferio.impl.utils": utils}):
+        yield utils
+
+
+@pytest.fixture
+def fake_torch():
+    """Inject a fake torch so the memory helpers report something."""
+    cuda = FakeCuda()
+    torch = SimpleNamespace(cuda=cuda, __version__="9.9.9+fake", dtype=type)
+    with mock.patch.dict(sys.modules, {"torch": torch}):
+        yield cuda
+
+
+@pytest.fixture
+def fake_rocm_torch():
+    """The same fake allocator behind a ROCm-shaped torch: `version.hip` set,
+    which is the worker's one positive HIP signal (`memory._is_hip`)."""
+    cuda = FakeCuda()
+    torch = SimpleNamespace(
+        cuda=cuda,
+        version=SimpleNamespace(hip="7.2.0", cuda=None),
+        __version__="2.11.0+rocm7.2",
+        dtype=type,
+    )
+    with mock.patch.dict(sys.modules, {"torch": torch}):
+        yield cuda
+
+
+def png_bytes(width: int, height: int) -> bytes:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class Recorder:
+    """Impl stand-in that records the batches it was handed."""
+
+    def __init__(self, fail_on=None, oom=False, wrong_count=False, grow=None):
+        self.batches: list[list] = []
+        self.fail_on = fail_on
+        self.oom = oom
+        self.wrong_count = wrong_count
+        self.grow = grow
+
+    def predict(self, inputs):
+        self.batches.append(list(inputs))
+        if self.grow is not None:
+            self.grow(len(inputs))
+        if self.fail_on is not None and len(self.batches) == self.fail_on:
+            if self.oom:
+                raise RuntimeError("CUDA out of memory. Tried to allocate 2 GiB")
+            raise ValueError("fixture failure")
+        if self.wrong_count:
+            return []
+        return [getattr(entry, "data", None) for entry in inputs]
+
+
+def grant(**overrides):
+    base = {
+        "unit_budget": 4,
+        "mb": 1000,
+        "unit": "item",
+        "aggregation": "count",
+        "user_cap_items": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def items(count: int):
+    return [PredictionInput(data=index) for index in range(count)]
+
+
+# ---------------------------------------------------------------------------
+# Pricing
+# ---------------------------------------------------------------------------
+
+
+def test_pixel_pricing_reads_headers_without_decoding():
+    inputs = [
+        PredictionInput(file=png_bytes(40, 30)),
+        PredictionInput(file=png_bytes(100, 100)),
+    ]
+    assert packing.price_inputs(inputs, "pixel") == [1200, 10_000]
+
+
+def test_pixel_pricing_accepts_a_path(tmp_path):
+    path = tmp_path / "a.png"
+    path.write_bytes(png_bytes(10, 20))
+    assert packing.price_inputs([PredictionInput(file=str(path))], "pixel") == [200]
+
+
+def test_an_unreadable_image_is_charged_the_largest_seen_never_zero():
+    """One corrupt file must not fail the window, and must not be free
+    either: a zero-unit item would pack without limit."""
+    inputs = [
+        PredictionInput(file=b"not an image"),
+        PredictionInput(file=png_bytes(50, 40)),
+    ]
+    assert packing.price_inputs(inputs, "pixel") == [2000, 2000]
+    # No readable input at all: the flat fallback.
+    assert packing.price_inputs([PredictionInput(file=b"junk")], "pixel") == [
+        packing.UNREADABLE_PIXEL_UNITS
+    ]
+    assert packing.price_inputs([PredictionInput()], "pixel") == [
+        packing.UNREADABLE_PIXEL_UNITS
+    ]
+
+
+def test_token_and_item_and_audio_pricing():
+    text = PredictionInput(data="x" * 400)
+    assert packing.price_inputs([text], "token") == [100]
+    assert packing.price_inputs([PredictionInput()], "token") == [1], "never zero"
+    assert packing.price_inputs(items(3), "item") == [1, 1, 1]
+    assert packing.price_inputs(items(2), "audio-second") == [
+        packing.AUDIO_FALLBACK_SECONDS
+    ] * 2
+    # An unknown unit from a newer orchestrator degrades to per-item packing.
+    assert packing.price_inputs(items(2), "furlong") == [1, 1]
+
+
+def test_batch_units_follows_the_aggregation():
+    units = [10, 4, 6]
+    assert packing.batch_units([0, 1, 2], units, "count") == 3
+    assert packing.batch_units([0, 1, 2], units, "sum") == 20
+    assert packing.batch_units([0, 1, 2], units, "max-times-count") == 30
+    assert packing.batch_units([], units, "sum") == 0
+
+
+# ---------------------------------------------------------------------------
+# Packing
+# ---------------------------------------------------------------------------
+
+
+def test_count_packing_is_an_item_count():
+    plan = packing.plan_batches([1] * 7, "count", 3)
+    assert plan == [[0, 1, 2], [3, 4, 5], [6]]
+
+
+def test_sum_packing_is_a_greedy_fifo_running_total():
+    plan = packing.plan_batches([3, 4, 2, 1], "sum", 8)
+    # 3+4 = 7 fits, +2 would be 9 -> new batch; 2+1 = 3 fits.
+    assert plan == [[0, 1], [2, 3]]
+
+
+def test_max_times_count_buckets_largest_first():
+    """The bucketing that retires easyOCR's enable_batching stopgap: one big
+    scan goes through in a small batch instead of taxing the thumbnails."""
+    units = [100, 10, 10, 10, 10]
+    plan = packing.plan_batches(units, "max-times-count", 100)
+    # Largest-first: 100 alone (100*2 > 100), then the four 10s (10*4 = 40).
+    assert plan == [[0], [1, 2, 3, 4]]
+    # Every batch respects max x count.
+    for batch in plan:
+        assert packing.batch_units(batch, units, "max-times-count") <= 100
+
+
+def test_a_single_over_budget_item_goes_through_alone():
+    plan = packing.plan_batches([500, 1, 1], "sum", 10)
+    assert plan[0] == [0], "never smaller than one item"
+    assert packing.batch_units(plan[0], [500, 1, 1], "sum") > 10
+
+
+def test_the_user_cap_bounds_items_on_top_of_the_unit_budget():
+    plan = packing.plan_batches([1] * 6, "sum", 1000, cap_items=2)
+    assert plan == [[0, 1], [2, 3], [4, 5]]
+    # A cap of 1 means one item per batch whatever the budget says.
+    assert packing.plan_batches([1] * 3, "sum", 1000, cap_items=1) == [[0], [1], [2]]
+    # A non-positive cap is not an opinion.
+    assert packing.plan_batches([1] * 3, "count", 3, cap_items=0) == [[0, 1, 2]]
+
+
+def test_the_cap_and_max_times_count_bucketing_compose():
+    """Both bounds hold at once, and the cap is applied to the *bucketed* order
+    rather than the input order: the batches are still similarly-sized
+    neighbours, just shorter."""
+    units = [100, 100, 10, 10, 10, 10]
+    plan = packing.plan_batches(units, "max-times-count", 1000, cap_items=2)
+    # Largest-first, two per batch: the 100s pair up (100 * 2 = 200 <= 1000),
+    # then the 10s in pairs.
+    assert plan == [[0, 1], [2, 3], [4, 5]]
+    for batch in plan:
+        assert len(batch) <= 2
+        assert packing.batch_units(batch, units, "max-times-count") <= 1000
+    # The unit budget can still bind tighter than the cap.
+    tight = packing.plan_batches(units, "max-times-count", 100, cap_items=4)
+    assert tight[0] == [0], "100 * 2 would exceed the budget"
+    assert sorted(index for batch in tight for index in batch) == list(range(6))
+
+
+def test_every_input_is_planned_exactly_once():
+    units = [7, 3, 9, 1, 5, 5]
+    for aggregation in ("count", "sum", "max-times-count"):
+        plan = packing.plan_batches(units, aggregation, 10)
+        flat = [index for batch in plan for index in batch]
+        assert sorted(flat) == list(range(len(units))), aggregation
+
+
+# ---------------------------------------------------------------------------
+# Defensive clamp
+# ---------------------------------------------------------------------------
+
+
+def test_the_clamp_shrinks_when_free_memory_fell(fake_torch):
+    fake_torch.free = 250 * MIB
+    assert packing.clamp_to_live_memory(64, 1000) == 16, "250/1000 of 64"
+    # Never below one item.
+    assert packing.clamp_to_live_memory(2, 1_000_000) == 1
+
+
+def test_the_clamp_never_grows_and_degrades_to_a_no_op(fake_torch):
+    fake_torch.free = 8000 * MIB
+    assert packing.clamp_to_live_memory(64, 1000) == 64, "shrink-only"
+    assert packing.clamp_to_live_memory(64, None) == 64, "no grant MB, no rule"
+    assert packing.clamp_to_live_memory(64, 0) == 64
+
+
+def test_the_clamp_is_a_no_op_without_torch():
+    """No CUDA, no NVML: nothing readable, so the budget stands and the OOM
+    backstop covers the case."""
+    assert packing.clamp_to_live_memory(64, 1000) == 64
+
+
+def test_the_clamp_shrinks_the_batches_actually_run(fake_torch):
+    fake_torch.free = 100 * MIB
+    model = Recorder()
+    payload = packing.run_window(
+        model, items(8), grant(unit_budget=8, mb=1000, aggregation="count")
+    )
+    assert [len(batch) for batch in model.batches] == [1] * 8, (
+        "the clamp cut the budget to one item per batch"
+    )
+    assert payload["outputs"] == list(range(8))
+
+
+# ---------------------------------------------------------------------------
+# Running a window
+# ---------------------------------------------------------------------------
+
+
+def test_a_window_is_split_into_batches_and_order_is_restored(fake_torch):
+    model = Recorder()
+    payload = packing.run_window(model, items(5), grant(unit_budget=2))
+    assert [len(batch) for batch in model.batches] == [2, 2, 1]
+    assert payload["outputs"] == [0, 1, 2, 3, 4]
+    assert len(payload["measurements"]) == 3
+    assert [m["items"] for m in payload["measurements"]] == [2, 2, 1]
+    assert [m["units"] for m in payload["measurements"]] == [2, 2, 1]
+
+
+def test_bucketed_output_order_is_restored(fake_torch):
+    """max-times-count packing reorders items; the dispatcher splits outputs
+    by position, so the reply must be in input order regardless."""
+    inputs = [
+        PredictionInput(data="small-a", file=png_bytes(10, 10)),
+        PredictionInput(data="huge", file=png_bytes(400, 400)),
+        PredictionInput(data="small-b", file=png_bytes(10, 10)),
+    ]
+    model = Recorder()
+    payload = packing.run_window(
+        model,
+        inputs,
+        grant(unit_budget=400, unit="pixel", aggregation="max-times-count"),
+    )
+    assert payload["outputs"] == ["small-a", "huge", "small-b"]
+    # The huge item really did travel in its own batch.
+    assert any(
+        len(batch) == 1 and batch[0].data == "huge" for batch in model.batches
+    )
+
+
+def test_units_are_priced_in_the_declared_dimension(fake_torch):
+    inputs = [PredictionInput(file=png_bytes(20, 10)) for _ in range(3)]
+    payload = packing.run_window(
+        Recorder(),
+        inputs,
+        grant(unit_budget=400, unit="pixel", aggregation="sum"),
+    )
+    assert [m["units"] for m in payload["measurements"]] == [400, 200]
+    assert [m["items"] for m in payload["measurements"]] == [2, 1]
+
+
+def test_a_failing_batch_reports_the_oom_flag_and_the_window_prefix(fake_torch):
+    model = Recorder(fail_on=2, oom=True)
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(model, items(6), grant(unit_budget=2))
+    failure = caught.value
+    assert packing.OOM_WINDOW_PREFIX in str(failure)
+    assert len(failure.measurements) == 2, "the batch that ran plus the one that failed"
+    assert failure.measurements[0].get("oom") is None
+    assert failure.measurements[1]["oom"] is True
+
+
+def test_a_batch_one_oom_keeps_its_existing_prefix(fake_torch):
+    """The single-item case already carries INFERENCE_OOM_BATCH_SIZE_1 from
+    inferio.impl.utils; the harness must not double-wrap it."""
+
+    class SingleOom:
+        def predict(self, inputs):
+            raise RuntimeError("INFERENCE_OOM_BATCH_SIZE_1: single input OOM")
+
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(SingleOom(), items(1), grant(unit_budget=1))
+    assert str(caught.value).startswith("INFERENCE_OOM_BATCH_SIZE_1:")
+    assert packing.OOM_WINDOW_PREFIX not in str(caught.value)
+    assert caught.value.measurements[0]["oom"] is True
+
+
+def test_a_non_oom_failure_is_not_flagged(fake_torch):
+    model = Recorder(fail_on=1)
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(model, items(2), grant(unit_budget=2))
+    assert "fixture failure" in str(caught.value)
+    assert packing.OOM_WINDOW_PREFIX not in str(caught.value)
+    assert caught.value.measurements[0].get("oom") is None
+
+
+def test_the_oom_classifier_covers_the_non_cuda_backends(fake_torch):
+    """The negative-signal widening (docs/unified-memory-admission.md).
+
+    On MPS and on CPU the out-of-memory condition arrives as an untyped
+    `RuntimeError` — or as the interpreter's own `MemoryError` — and the
+    orchestrator's deflation path only ever hears about it through this
+    flag, so the classifier is the whole signal. It stays conservative:
+    a `RuntimeError` that says nothing about memory is not one.
+    """
+    failures = {
+        "mps": RuntimeError(
+            "MPS backend out of memory (MPS allocated: 18.09 GB, max allowed: "
+            "18.13 GB)."
+        ),
+        "cpu-allocator": RuntimeError(
+            "[enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: can't "
+            "allocate memory: you tried to allocate 12884901888 bytes."
+        ),
+        "memory-error": MemoryError(),
+    }
+    for name, failure in failures.items():
+
+        class Failing:
+            def predict(self, inputs):
+                raise failure
+
+        with pytest.raises(packing.WindowFailure) as caught:
+            packing.run_window(Failing(), items(2), grant(unit_budget=2))
+        assert caught.value.measurements[0]["oom"] is True, name
+        assert packing.OOM_WINDOW_PREFIX in str(caught.value), name
+
+    class Buggy:
+        def predict(self, inputs):
+            raise RuntimeError("shape mismatch in forward()")
+
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(Buggy(), items(2), grant(unit_budget=2))
+    assert caught.value.measurements[0].get("oom") is None
+    assert packing.OOM_WINDOW_PREFIX not in str(caught.value)
+
+
+def test_a_wrong_output_count_fails_the_window(fake_torch):
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(Recorder(wrong_count=True), items(2), grant(unit_budget=2))
+    assert "returned 0 outputs" in str(caught.value)
+    assert "units" not in caught.value.measurements[0], (
+        "a batch that did not complete is unpriceable, whatever it failed of"
+    )
+
+
+def test_a_failed_batch_is_never_priced(fake_torch):
+    """A mid-batch failure that is *not* an OOM (an assertion, a processor
+    rejecting an input) would otherwise enter the fit as a clean high-water
+    sample whose peak stops wherever the call gave up — an under-stated cost for
+    the units reported, which drags the fitted slope low and over-admits. So no
+    failure path prices its batch; only the flags carry over."""
+    model = Recorder(fail_on=2)
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(model, items(4), grant(unit_budget=2))
+    measurements = caught.value.measurements
+    assert len(measurements) == 2
+    assert measurements[0]["units"] == 2, "the batch that completed is priced"
+    assert "units" not in measurements[1], "the batch that failed is not"
+    assert measurements[1].get("oom") is None, "and it was not an OOM"
+    # Its peaks are still reported — they are the only record of how far the
+    # call got, and the orchestrator uses them for diagnostics.
+    assert measurements[1]["items"] == 2
+
+
+def test_throughput_collapse_flags_a_spilling_growth_batch(fake_torch):
+    """The WDDM synthetic negative: on Windows an over-budget allocation
+    silently spills to system RAM, so over-admission shows up as a throughput
+    collapse instead of an exception.
+
+    The tail batch is the other half of the rule: a window's last, smaller
+    batch pays the same fixed per-call overhead over less work, so its
+    units/sec is legitimately lower. Comparing it would deflate a healthy
+    worker once per window forever, so only upward-or-equal steps compare.
+    """
+    calls = {"n": 0}
+
+    def grow(_size):
+        fake_torch.grow_pool(100)
+
+    class Slowing:
+        """Each pool-growing batch takes 4x longer than the previous one."""
+
+        def predict(self, inputs):
+            calls["n"] += 1
+            grow(len(inputs))
+            import time
+
+            time.sleep(0.01 * (4 ** (calls["n"] - 1)))
+            return [None] * len(inputs)
+
+    # 5 items at a budget of 2 -> batches of 2, 2, 1: two comparable steps and
+    # one non-comparable tail.
+    payload = packing.run_window(Slowing(), items(5), grant(unit_budget=2))
+    flags = [m.get("throughput_collapse") for m in payload["measurements"]]
+    assert flags[0] is None, "the first growing batch has no comparator"
+    assert flags[1] is True, "units/sec fell far below the previous growth batch"
+    assert not flags[2], (
+        "the 1-unit tail batch is a downward step and is never comparable, "
+        "however slow it is"
+    )
+
+
+def test_throughput_collapse_stays_active_on_a_rocm_worker(fake_rocm_torch):
+    """The collapse detector is platform-neutral by design
+    (docs/rocm-batch-calibration-parity.md, D8): on ROCm the crisp hipMalloc
+    OOM is the primary negative signal, but the comparator stays live as a
+    generic over-admission guard. A HIP-shaped worker must flag the same
+    spilling growth batch a CUDA-shaped one does — same scenario as above,
+    different torch. This also proves the HIP memory-tier differences (NVML
+    refused, amdgpu sysfs absent, free/total from torch) do not starve the
+    detector of the pool-growth signal it keys on."""
+    calls = {"n": 0}
+
+    class Slowing:
+        def predict(self, inputs):
+            calls["n"] += 1
+            fake_rocm_torch.grow_pool(100)
+            import time
+
+            time.sleep(0.01 * (4 ** (calls["n"] - 1)))
+            return [None] * len(inputs)
+
+    payload = packing.run_window(Slowing(), items(5), grant(unit_budget=2))
+    flags = [m.get("throughput_collapse") for m in payload["measurements"]]
+    assert flags[0] is None, "the first growing batch has no comparator"
+    assert flags[1] is True, "the spill is flagged on HIP exactly as on CUDA"
+    assert not flags[2], "the tail batch stays non-comparable on HIP too"
+
+
+def test_the_comparator_ages_out_after_a_run_of_non_comparable_batches(fake_torch):
+    """A collapsed batch must not become the new comparator (that would make a
+    spill the new normal), but a comparator kept forever would eventually be
+    measured against a rate the model no longer runs at — so it retires."""
+
+    def growing(inputs):
+        fake_torch.grow_pool(1)
+        return [None] * len(inputs)
+
+    primer = SimpleNamespace(predict=growing)
+    # One growing batch of 2 units sets the comparator.
+    packing.run_window(primer, items(2), grant(unit_budget=2))
+    assert packing._last_growth is not None
+
+    # Warm (non-growing) batches are non-comparable; COMPARATOR_MAX_AGE of them
+    # retire the comparator.
+    warm = SimpleNamespace(predict=lambda inputs: [None] * len(inputs))
+    for _ in range(packing.COMPARATOR_MAX_AGE):
+        packing.run_window(warm, items(1), grant(unit_budget=1))
+    assert packing._last_growth is None, "the stale comparator was retired"
+
+
+def test_reset_comparator_clears_the_cross_window_state(fake_torch):
+    def growing(inputs):
+        fake_torch.grow_pool(10)
+        return [None] * len(inputs)
+
+    packing.run_window(SimpleNamespace(predict=growing), items(2), grant(unit_budget=2))
+    assert packing._last_growth is not None
+    packing.reset_comparator()
+    assert packing._last_growth is None
+
+
+# ---------------------------------------------------------------------------
+# Impl-internal sub-batching (unpriceable batches)
+# ---------------------------------------------------------------------------
+
+
+def test_an_internally_split_batch_is_reported_unpriced(fake_torch, fake_oom_retry):
+    """Several shipped impls sub-batch inside predict. The allocator peaks then
+    describe a fraction of the packed units, and reporting the packed figure
+    would bias the fitted slope low — which is over-admission, the failure the
+    whole design exists to prevent. So `units` is omitted."""
+
+    class Splitting:
+        def predict(self, inputs):
+            fake_torch.grow_pool(20)
+            # The impl ran one item at a time, whatever it was handed.
+            fake_oom_retry.record(largest=1)
+            return [None] * len(inputs)
+
+    payload = packing.run_window(Splitting(), items(4), grant(unit_budget=4))
+    measurement = payload["measurements"][0]
+    assert measurement["items"] == 4
+    assert "units" not in measurement, (
+        "a batch the impl only partly executed is unpriceable"
+    )
+    assert measurement.get("oom") is None, "no halvings, so no negative sample"
+
+
+def test_a_fully_executed_batch_is_still_priced(fake_torch, fake_oom_retry):
+    """The guard must not withhold `units` from impls that do use
+    `run_with_oom_retry` but ran the whole batch in one chunk."""
+
+    class Whole:
+        def predict(self, inputs):
+            fake_torch.grow_pool(20)
+            fake_oom_retry.record(largest=len(inputs))
+            return [None] * len(inputs)
+
+    payload = packing.run_window(Whole(), items(3), grant(unit_budget=3))
+    assert payload["measurements"][0]["units"] == 3
+
+
+def test_a_stale_retry_record_does_not_unprice_the_next_batch(
+    fake_torch, fake_oom_retry
+):
+    """The generation counter is what makes the reading unambiguous: an impl
+    that consults the retry helper on one batch and not the next must not have
+    the first batch's record applied to the second."""
+    calls = {"n": 0}
+
+    class Sometimes:
+        def predict(self, inputs):
+            calls["n"] += 1
+            fake_torch.grow_pool(5)
+            if calls["n"] == 1:
+                fake_oom_retry.record(largest=1)
+            return [None] * len(inputs)
+
+    payload = packing.run_window(Sometimes(), items(4), grant(unit_budget=2))
+    units = [m.get("units") for m in payload["measurements"]]
+    assert units == [None, 2], (
+        "the first batch is unpriceable; the second consulted nothing and is "
+        "priced normally"
+    )
+
+
+def test_absorbed_halvings_are_reported_as_a_negative_sample(
+    fake_torch, fake_oom_retry
+):
+    """An OOM the impl's own halving loop swallowed is invisible to the
+    orchestrator unless the harness reports it — and it is exactly the signal
+    the deflation path exists for."""
+
+    class Halving:
+        def predict(self, inputs):
+            fake_torch.grow_pool(20)
+            fake_oom_retry.record(largest=2, halvings=2)
+            return [None] * len(inputs)
+
+    payload = packing.run_window(Halving(), items(4), grant(unit_budget=4))
+    measurement = payload["measurements"][0]
+    assert measurement["oom"] is True
+    assert "units" not in measurement, "2 of 4 executed: unpriceable too"
+
+
+def test_a_helper_call_that_ran_nothing_is_unpriceable(fake_torch, fake_oom_retry):
+    """The record moved for this batch and still says nothing ran through the
+    helper: easyOCR's `readtext` shape, where the impl consults the helper, ends
+    up executing zero items there, and does the work by another route. That is
+    'executed nothing here', not 'ran the whole batch' — the GPU batch the
+    allocator saw is unknown, so the batch is unpriceable."""
+
+    class ReadtextFallback:
+        def predict(self, inputs):
+            fake_torch.grow_pool(20)
+            fake_oom_retry.record(largest=0)
+            return [None] * len(inputs)
+
+    payload = packing.run_window(ReadtextFallback(), items(3), grant(unit_budget=3))
+    measurement = payload["measurements"][0]
+    assert measurement["items"] == 3
+    assert "units" not in measurement, (
+        "a record that moved with largest == 0 means nothing ran there"
+    )
+
+
+def test_halvings_in_an_earlier_helper_call_still_flag_the_batch(
+    fake_torch, fake_oom_retry
+):
+    """clip and nemotron-embed-vl call `run_with_oom_retry` twice per `predict`
+    (a text pass and an image pass). Only the last call's record survives, so an
+    OOM the *first* pass absorbed is invisible in it — the process-total halvings
+    counter, diffed across the call, is what catches it."""
+
+    class TwoTowers:
+        def predict(self, inputs):
+            fake_torch.grow_pool(20)
+            # First pass: halved twice before it fit, then ran everything.
+            fake_oom_retry.record(largest=len(inputs), halvings=2)
+            # Second pass: clean, and its record is the one left standing.
+            fake_oom_retry.record(largest=len(inputs))
+            return [None] * len(inputs)
+
+    payload = packing.run_window(TwoTowers(), items(4), grant(unit_budget=4))
+    measurement = payload["measurements"][0]
+    assert measurement["oom"] is True, (
+        "the first pass's absorbed OOM must not be lost with its record"
+    )
+    # Both passes ran the whole batch, so it stays priceable — the `oom` flag is
+    # what keeps it out of the fit and deflates the ramp.
+    assert measurement["units"] == 4
+
+
+def test_an_impl_that_never_uses_the_retry_helper_is_priced(fake_torch):
+    """No `inferio.impl.utils` in sys.modules at all: nothing is known, which
+    is 'no information', not 'ran a smaller batch'."""
+    payload = packing.run_window(Recorder(), items(2), grant(unit_budget=2))
+    assert payload["measurements"][0]["units"] == 2
+
+
+# ---------------------------------------------------------------------------
+# The batching-disabled gate
+# ---------------------------------------------------------------------------
+
+
+def test_batching_disabled_detects_the_registry_knobs():
+    assert packing.batching_disabled(SimpleNamespace(enable_batching=False))
+    assert packing.batching_disabled(SimpleNamespace(enable_batch=False))
+    assert packing.batching_disabled(SimpleNamespace(enable_batching=0))
+    assert not packing.batching_disabled(SimpleNamespace(enable_batching=True))
+    assert not packing.batching_disabled(SimpleNamespace()), (
+        "an impl that never heard of the knob is batched normally"
+    )
+
+
+def test_a_warm_pool_batch_is_never_a_collapse(fake_torch):
+    """Only pool-*growing* batches carry information about admission: a warm
+    repeat that happens to be slow says nothing."""
+
+    class SlowButWarm:
+        def predict(self, inputs):
+            import time
+
+            time.sleep(0.02)
+            return [None] * len(inputs)
+
+    # Prime the comparator with a genuine growth batch.
+    def growing(inputs):
+        fake_torch.grow_pool(50)
+        return [None] * len(inputs)
+
+    primer = SimpleNamespace(predict=growing)
+    packing.run_window(primer, items(1), grant(unit_budget=1))
+    payload = packing.run_window(SlowButWarm(), items(2), grant(unit_budget=1))
+    assert all(
+        m.get("throughput_collapse") is None for m in payload["measurements"]
+    ), "no pool growth, no synthetic negative"
+
+
+def test_measurements_carry_the_allocator_deltas(fake_torch):
+    def growing(inputs):
+        fake_torch.grow_pool(64)
+        return [None] * len(inputs)
+
+    payload = packing.run_window(
+        SimpleNamespace(predict=growing), items(2), grant(unit_budget=2)
+    )
+    measurement = payload["measurements"][0]
+    assert measurement["reserved_before_mb"] == 0
+    assert measurement["peak_reserved_mb"] == 64
+    assert measurement["duration_ms"] is not None
+    assert payload["memory"]["reserved_mb"] == 64
+
+
+def test_a_window_with_no_grant_never_reaches_the_harness():
+    """The compatibility path lives in `__main__`, not here: `finish_batch`
+    reports one measurement for the whole call and no `units`, because with
+    no grant there is no declared cost dimension to price in."""
+    state = memory.begin_batch()
+    payload = memory.finish_batch(state, items=7)
+    assert payload["measurements"][0]["items"] == 7
+    assert "units" not in payload["measurements"][0]
+
+
+# ---------------------------------------------------------------------------
+# Reactive shrink (step 2)
+# ---------------------------------------------------------------------------
+
+
+def idle_impl():
+    """An impl that runs a batch without growing the allocator pool."""
+    return SimpleNamespace(predict=lambda inputs: [None] * len(inputs))
+
+
+def test_reactive_shrink_needs_two_consecutive_under_grant_windows(fake_torch):
+    """A grant that has fallen well below the pool means we are holding memory
+    the ledger has already taken away from us — and freeing tensors gives none
+    of it back, so `empty_cache()` is the only lever. The two-window
+    hysteresis is what keeps a momentary dip from costing a full pool
+    teardown."""
+    fake_torch.reserved = 1000 * MIB
+    fake_torch.allocated = 0
+    impl = idle_impl()
+    squeezed = grant(unit_budget=1, mb=100)  # 100 < 0.8 * 1000
+
+    first = packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 0, "one window is not evidence"
+    assert "trimmed" not in first["measurements"][0]
+
+    second = packing.run_window(impl, items(2), squeezed)
+    assert fake_torch.empty_cache_calls == 1
+    assert fake_torch.reserved == 0, "the pool went back to the driver"
+    assert second["measurements"][0]["trimmed"] is True
+    assert "trimmed" not in second["measurements"][1], (
+        "the flag rides the window's FIRST measurement only — it describes an "
+        "event that happened once, before the window's first batch"
+    )
+    assert packing._under_grant_windows == 0, "the count starts over after a release"
+
+
+def test_a_grant_back_above_the_pool_resets_the_shrink_hysteresis(fake_torch):
+    """Recovery is immediate: the whole point is reacting to a world that
+    moved, and it can move back."""
+    fake_torch.reserved = 1000 * MIB
+    fake_torch.allocated = 0
+    impl = idle_impl()
+
+    packing.run_window(impl, items(1), grant(unit_budget=1, mb=100))
+    assert packing._under_grant_windows == 1
+    packing.run_window(impl, items(1), grant(unit_budget=1, mb=900))
+    assert packing._under_grant_windows == 0, "800 <= 900: no squeeze"
+    assert fake_torch.empty_cache_calls == 0
+    packing.run_window(impl, items(1), grant(unit_budget=1, mb=100))
+    assert fake_torch.empty_cache_calls == 0, "the count restarted from zero"
+
+
+def test_a_shrink_resets_the_throughput_comparator(fake_torch):
+    """Post-`empty_cache()` batches regrow the pool from nothing and are
+    legitimately slower than warm-pool ones. Comparing across the event would
+    flag a healthy regrowth batch as a WDDM memory spill and deflate the
+    worker for it."""
+
+    def growing(inputs):
+        fake_torch.grow_pool(500)
+        return [None] * len(inputs)
+
+    packing.run_window(SimpleNamespace(predict=growing), items(1), grant(unit_budget=1))
+    assert packing._last_growth is not None, "the comparator is primed"
+
+    fake_torch.allocated = 0
+    impl = idle_impl()
+    squeezed = grant(unit_budget=1, mb=100)  # 100 < 0.8 * 500
+    packing.run_window(impl, items(1), squeezed)
+    assert packing._last_growth is not None, "still just counting"
+    packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 1
+    assert packing._last_growth is None, "the released pool retired the comparator"
+
+
+def test_no_grant_mb_and_no_pool_never_shrink(fake_torch):
+    """Two non-signals that must not accumulate towards a release: a grant
+    with no MB reservation (a pre-1b orchestrator, or a contention share that
+    rounded to nothing) and a worker holding no pool at all."""
+    impl = idle_impl()
+    fake_torch.reserved = 1000 * MIB
+    fake_torch.allocated = 0
+    for _ in range(4):
+        packing.run_window(impl, items(1), grant(unit_budget=1, mb=0))
+    assert fake_torch.empty_cache_calls == 0
+    assert packing._under_grant_windows == 0
+
+    fake_torch.reserved = 0
+    for _ in range(4):
+        packing.run_window(impl, items(1), grant(unit_budget=1, mb=100))
+    assert fake_torch.empty_cache_calls == 0
+    assert packing._under_grant_windows == 0
+
+
+def test_a_worker_without_torch_never_shrinks():
+    """No live CUDA, no pool of ours, nothing to release — and crucially no
+    attempt to create a context in order to find that out."""
+    assert packing.maybe_shrink(1) is False
+    assert packing._under_grant_windows == 0
+
+
+def test_the_shrink_compares_the_grant_against_slack_not_the_whole_pool(fake_torch):
+    """The grant is an *incremental* activation reservation; `memory_reserved()`
+    is the whole pool, weights included. Comparing the two would be comparing
+    different quantities — and on any calibrated model the grant is the smaller
+    one essentially always, so the trigger would fire every other window,
+    release a pool with nothing spare in it, and (via `note_trimmed`)
+    permanently discard the WDDM throughput comparator, which needs consecutive
+    comparable batches to say anything at all.
+
+    Only `reserved - allocated` can actually be handed back, so that is what a
+    window's grant is measured against.
+    """
+    # A loaded model: a 3000 MiB pool of which 2400 MiB is live weights.
+    fake_torch.reserved = 3000 * MIB
+    fake_torch.allocated = 2400 * MIB
+    impl = idle_impl()
+    # A window granted 600 MiB against 600 MiB of releasable slack: it wants
+    # essentially everything that could be freed, so freeing it buys nobody
+    # anything. Under the old rule (600 < 0.8 * 3000) this fired on window 2.
+    steady = grant(unit_budget=1, mb=600)
+    for _ in range(6):
+        packing.run_window(impl, items(1), steady)
+    assert fake_torch.empty_cache_calls == 0, (
+        "a pool that is nearly all weights is not slack the worker is hoarding"
+    )
+    assert packing._under_grant_windows == 0
+    assert fake_torch.reserved == 3000 * MIB, "and the weights were never dropped"
+
+
+def test_a_grant_far_below_the_slack_still_releases_the_pool(fake_torch):
+    """The other half of the same rule: when the pool really is holding blocks
+    this window has no use for, two consecutive windows still release it — and
+    then cannot immediately re-trigger, because the slack is gone."""
+    fake_torch.reserved = 3000 * MIB
+    fake_torch.allocated = 2400 * MIB
+    impl = idle_impl()
+    squeezed = grant(unit_budget=1, mb=100)  # 100 < 0.8 * (3000 - 2400)
+
+    first = packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 0, "one window is not evidence"
+    assert "trimmed" not in first["measurements"][0]
+
+    second = packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 1
+    assert second["measurements"][0]["trimmed"] is True
+    assert fake_torch.reserved == 2400 * MIB, (
+        "the free blocks went back to the driver; the weights stayed"
+    )
+
+    # Self-limiting: post-release there is no slack left, so the next window
+    # cannot start counting towards another teardown.
+    packing.run_window(impl, items(1), squeezed)
+    packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 1
+    assert packing._under_grant_windows == 0

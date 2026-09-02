@@ -16,6 +16,7 @@ does not inherit).
 
 from __future__ import annotations
 
+import io
 import os
 import struct
 import subprocess
@@ -589,6 +590,238 @@ def test_oom_error_frame_preserves_prefix(worker: WorkerProcess) -> None:
     assert worker.wait() == 0
 
 
+def test_an_internally_subbatching_impl_reports_no_units(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior (docs/inferio-worker-protocol.md, "Memory sensing"):
+    # this fixture uses the real run_with_oom_retry with initial_chunk_size=1,
+    # so the GPU batch the allocator saw is one item however many the harness
+    # packed. The harness observes that through the helper's own record and
+    # omits `units` — an unpriceable batch must never reach the cost fit, since
+    # a units figure larger than the work behind the peaks biases the fitted
+    # slope low, i.e. towards over-admission.
+    worker.send(handshake_msg(req_id=1, impl_class="subbatching_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    inputs = [{"data": index, "file": None} for index in range(4)]
+    worker.send(
+        {
+            "type": "predict",
+            "id": 4,
+            "inputs": inputs,
+            "grant": {
+                "unit_budget": 4,
+                "mb": 1024,
+                "unit": "item",
+                "aggregation": "count",
+                "user_cap_items": None,
+            },
+        }
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok", resp
+    # The impl really did run one item at a time, and still answered in order.
+    assert resp["outputs"] == [{"chunk": 1}] * 4
+    measurements = resp["measurements"]
+    assert len(measurements) == 1, "the harness packed one batch of 4"
+    assert measurements[0]["items"] == 4
+    assert "units" not in measurements[0], measurements[0]
+    assert measurements[0].get("oom") is None, "no halvings happened"
+
+    worker.send({"type": "unload", "id": 5})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
+def test_an_error_frame_carries_the_measurements_of_a_failed_window(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior (docs/inferio-worker-protocol.md, "Memory sensing on
+    # `error` frames"): the granted window is packed into two batches; the first
+    # runs and is measured, the second raises a bare driver-shaped OOM. The
+    # window fails as a whole — the protocol has no per-input error — but the
+    # error frame still carries both measurements, the failing one flagged
+    # `oom`, and the message carries INFERENCE_OOM_WINDOW so the orchestrator
+    # can classify it from the string alone. The failed batch is *unpriced*: its
+    # peaks stop wherever the call gave up, and pricing it would enter an
+    # under-stated cost into the cost fit, i.e. over-admit.
+    worker.send(handshake_msg(req_id=1, impl_class="oom_second_batch_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    inputs = [{"data": index, "file": None} for index in range(4)]
+    worker.send(
+        {
+            "type": "predict",
+            "id": 4,
+            "inputs": inputs,
+            "grant": {
+                "unit_budget": 2,
+                "mb": 1024,
+                "unit": "item",
+                "aggregation": "count",
+                "user_cap_items": None,
+            },
+        }
+    )
+    resp = worker.recv()
+    assert resp["type"] == "error", resp
+    assert resp["id"] == 4
+    assert resp["message"].startswith("INFERENCE_OOM_WINDOW:"), resp["message"]
+    measurements = resp["measurements"]
+    assert len(measurements) == 2, measurements
+    assert [m["items"] for m in measurements] == [2, 2]
+    assert measurements[0].get("oom") is None, "the first batch ran fine"
+    assert measurements[1]["oom"] is True, "the second is the negative sample"
+    assert "units" not in measurements[1], "a failed batch is never priced"
+
+    # The worker survives a window failure: the request failed, not the process.
+    worker.send({"type": "ping", "id": 5})
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "unload", "id": 6})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
+def test_an_impl_with_batching_off_ignores_the_grant(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior (docs/inferio-worker-protocol.md, "Memory grants"): an
+    # impl carrying a falsy `enable_batching` decides its own GPU batch shape
+    # inside predict, so the worker ignores the grant entirely and takes the
+    # grantless compatibility path — the whole window in one predict call, one
+    # measurement for the call, and NO cost-dimension `units`. Reporting units
+    # for a batch the impl re-split would bias the orchestrator's fitted slope
+    # low, i.e. towards over-admission.
+    worker.send(handshake_msg(req_id=1, impl_class="nobatching_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    inputs = [{"data": index, "file": None} for index in range(4)]
+    worker.send(
+        {
+            "type": "predict",
+            "id": 4,
+            "inputs": inputs,
+            "grant": {
+                "unit_budget": 1,
+                "mb": 1024,
+                "unit": "item",
+                "aggregation": "count",
+                "user_cap_items": None,
+            },
+        }
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok", resp
+    assert resp["outputs"] == [{"batch": 4}] * 4, (
+        "the grant's unit budget of 1 was ignored: one predict call, whole window"
+    )
+    measurements = resp["measurements"]
+    assert len(measurements) == 1, measurements
+    assert measurements[0]["items"] == 4
+    assert "units" not in measurements[0], (
+        "the grantless path prices nothing"
+    )
+
+    worker.send({"type": "unload", "id": 5})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
+MEMORY_SAMPLE_KEYS = (
+    "free_mb",
+    "total_mb",
+    "free_source",
+    "reserved_mb",
+    "allocated_mb",
+)
+
+
+def test_load_memory_fields_are_optional(worker: WorkerProcess) -> None:
+    # Expected behavior: the memory-sensing fields on the load response are
+    # optional (docs/inferio-worker-protocol.md "Memory sensing"). The echo
+    # fixture never imports torch, so the worker has no allocator to measure
+    # and reports no base/dtype at all — the load reply is a plain ok, and a
+    # consumer sees "unknown", never a wrong number. Whatever it does report
+    # must have the declared type.
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "load", "id": 3})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 3
+    assert resp.get("base_mb") is None, resp
+    assert resp.get("base_method") is None, resp
+    assert resp.get("reserved_at_load_mb") is None, resp
+    assert resp.get("dtype") is None, resp
+    # No torch in the fixture, so no board identity and no torch version
+    # either — all three are worker-only knowledge and all three are absent
+    # rather than guessed.
+    assert resp.get("gpu_uuid") is None, resp
+    assert resp.get("gpu_name") is None, resp
+    assert resp.get("torch_version") is None, resp
+    sample = resp.get("memory")
+    if sample is not None:  # only on a host with NVML available
+        assert set(sample) == set(MEMORY_SAMPLE_KEYS)
+
+
+def test_predict_reports_one_measurement_per_call(worker: WorkerProcess) -> None:
+    # Expected behavior: `measurements` is always reported (the input count
+    # and wall time need no torch), one entry per GPU batch — one for the
+    # whole call today. The measured count is `items`, deliberately not
+    # cost-dimension `units`: only the step-1b packing harness sees decoded
+    # inputs. The memory columns are None on a torch-less worker, which is
+    # exactly the degradation the wire contract promises.
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    inputs = [{"data": 1, "file": None}, {"data": 2, "file": None}]
+    worker.send({"type": "predict", "id": 4, "inputs": inputs})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["outputs"] == [{"echo": 1}, {"echo": 2}]
+
+    measurements = resp["measurements"]
+    assert len(measurements) == 1, measurements
+    measurement = measurements[0]
+    assert measurement["items"] == 2
+    assert isinstance(measurement["duration_ms"], float)
+    assert measurement["duration_ms"] >= 0.0
+    for key in (
+        "reserved_before_mb",
+        "peak_reserved_mb",
+        "allocated_before_mb",
+        "peak_allocated_mb",
+    ):
+        assert measurement[key] is None, measurement
+
+    # A second predict re-measures from scratch rather than accumulating.
+    worker.send(
+        {"type": "predict", "id": 5, "inputs": [{"data": 3, "file": None}]}
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["measurements"][0]["items"] == 1
+
+
 def test_broken_module_does_not_prevent_discovery(
     worker: WorkerProcess,
 ) -> None:
@@ -606,3 +839,100 @@ def test_broken_module_does_not_prevent_discovery(
     assert worker.recv()["type"] == "ok"
     assert worker.wait() == 0
     assert "broken_impl" in worker.stderr_text
+
+
+def test_trim_is_ok_in_every_state_and_leaves_the_worker_serving(
+    worker: WorkerProcess,
+) -> None:
+    # Expected behavior (protocol doc, "Reactive shrink and trim"): `trim` is
+    # valid in every state and is never an error path. A parked worker with no
+    # instance, and a loaded one whose impl never imported torch, both have no
+    # allocator pool to release — and "there was nothing to free" is a
+    # successful trim, which is what lets the orchestrator send one without
+    # first knowing which residents are trimmable. The fixture impls are
+    # exactly that case, so no `memory` sample comes back.
+    worker.send(handshake_msg(req_id=1))
+    assert worker.recv()["type"] == "ok"
+
+    # Before configure: valid, and does not disturb the state machine.
+    worker.send({"type": "trim", "id": 2})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 2
+
+    worker.send(configure_msg(req_id=3))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 4})
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "trim", "id": 5})
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["id"] == 5
+    # No torch in the fixture impl -> no pool, no sample. Absent, never zero:
+    # a fabricated 0 would tell the ledger this worker holds nothing when the
+    # truth is that we cannot see what it holds.
+    assert "memory" not in resp
+
+    # Idempotent, and the stream is still in sync afterwards.
+    worker.send({"type": "trim", "id": 6})
+    assert worker.recv()["type"] == "ok"
+    worker.send(
+        {
+            "type": "predict",
+            "id": 7,
+            "inputs": [{"data": {"text": "after trim"}, "file": None}],
+        }
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok"
+    assert resp["outputs"] == [{"echo": {"text": "after trim"}}]
+
+    worker.send({"type": "unload", "id": 8})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
+def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
+    """`note_trimmed()` runs only when `empty_cache()` actually released.
+
+    It exists to invalidate two pieces of cross-window state that a real pool
+    teardown makes meaningless: the throughput comparator (a post-release batch
+    regrows the pool and is legitimately slower than a warm-pool one) and the
+    reactive-shrink hysteresis. A worker with no live CUDA released nothing, so
+    neither is stale — and discarding the comparator anyway would let a stream
+    of trims to an idle-but-torchless resident keep throwing away the WDDM
+    over-admission signal, which needs consecutive comparable batches to exist.
+
+    Driven in-process rather than as a subprocess for the obvious reason: the
+    assertion is about module state the harness holds, which no frame reports.
+    """
+    from inferio_worker import __main__ as harness
+    from inferio_worker import packing
+
+    def frames(*messages: dict) -> io.BytesIO:
+        buffer = io.BytesIO()
+        for message in messages:
+            payload = msgpack.packb(message, use_bin_type=True)
+            buffer.write(struct.pack("<I", len(payload)) + payload)
+        buffer.seek(0)
+        return buffer
+
+    packing._last_growth = (4096, 123.0)
+    packing._under_grant_windows = 1
+    try:
+        proto_in = frames(
+            handshake_msg(req_id=1),
+            {"type": "trim", "id": 2},
+            {"type": "unload", "id": 3},
+        )
+        proto_out = io.BytesIO()
+        assert harness._serve(proto_in, proto_out) == 0
+        assert packing._last_growth == (4096, 123.0), (
+            "a trim that freed nothing must not retire the comparator"
+        )
+        assert packing._under_grant_windows == 1, (
+            "nor reset the hysteresis that is counting towards a real release"
+        )
+    finally:
+        packing.note_trimmed()
