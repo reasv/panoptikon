@@ -1229,7 +1229,7 @@ async fn scan_single_folder(
         scan_time: scan_time.to_string(),
         filescan_filter: parse_filescan_filter(config).map(Arc::new),
         detect_outros: config.scan_video && config.detect_outros,
-        formats: FormatPolicy::from_names(&config.thumbnail_formats),
+        formats: config.format_policy(),
         semaphore: Arc::new(Semaphore::new(options.worker_count)),
         tasks: JoinSet::new(),
         task_paths: HashMap::new(),

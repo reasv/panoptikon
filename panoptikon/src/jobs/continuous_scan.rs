@@ -431,6 +431,10 @@ pub(crate) struct ContinuousScanState {
     roots_valid: bool,
     allowed_extensions: HashSet<String>,
     filescan_filter: Option<Arc<Match>>,
+    /// This database's thumbnail format policy, folded when the config is
+    /// loaded rather than per dispatched file: it is a parse, and a list
+    /// naming no usable format warns once per fold.
+    formats: FormatPolicy,
     scan_id: Option<i64>,
     scan_time: Option<String>,
     stats: ScanStats,
@@ -573,6 +577,7 @@ impl ContinuousScanState {
         self.roots_valid = outcome.valid;
         self.allowed_extensions = build_extension_set(&self.config);
         self.filescan_filter = parse_filescan_filter(&self.config).map(Arc::new);
+        self.formats = self.config.format_policy();
         if !outcome.valid {
             tracing::warn!(
                 index_db = %self.index_db,
@@ -949,7 +954,7 @@ impl ContinuousScanState {
             path,
             filescan_filter: self.filescan_filter.clone(),
             detect_outros: self.config.scan_video && self.config.detect_outros,
-            formats: FormatPolicy::from_names(&self.config.thumbnail_formats),
+            formats: self.formats,
             epoch: self.epoch,
             scan_time,
             index_db: self.index_db.clone(),
@@ -1145,6 +1150,9 @@ impl Actor for ContinuousScanActor {
             roots_valid: true,
             allowed_extensions: HashSet::new(),
             filescan_filter: None,
+            // Replaced by the reload below, which is also what a later config
+            // edit runs; the default stands in until then.
+            formats: FormatPolicy::default(),
             scan_id: None,
             scan_time: None,
             stats: ScanStats::new(),

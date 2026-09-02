@@ -1,3 +1,4 @@
+use crate::visual_tiers::FormatPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{
@@ -174,6 +175,18 @@ fn default_true() -> bool {
 
 fn default_cron_schedule() -> String {
     "0 3 * * *".to_string()
+}
+
+impl SystemConfig {
+    /// [`FormatPolicy`] for this database, folded from `thumbnail_formats`.
+    ///
+    /// Fold it **once** per scan — at job start, and on every config reload —
+    /// and thread the result. It is a parse of a `Vec<String>`, and a list
+    /// naming no usable format warns; doing it per dispatched file put that
+    /// warning in the log once per file in the library.
+    pub(crate) fn format_policy(&self) -> FormatPolicy {
+        FormatPolicy::from_names(&self.thumbnail_formats)
+    }
 }
 
 fn default_thumbnail_formats() -> Vec<String> {
