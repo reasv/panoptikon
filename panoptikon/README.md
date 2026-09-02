@@ -111,10 +111,12 @@ Special handling:
 
 ### Policy-scoped SSR tokens (`x-panoptikon-policy`)
 
-The gateway injects `x-panoptikon-policy: <policy>.<expiry_unix>.<hmac_hex>`
+The gateway injects
+`x-panoptikon-policy: <policy>.<expiry_unix>.<origin_b64url>.<hmac_hex>`
 into every request it proxies to the UI upstream, naming the policy the
-policy layer matched for that request (HMAC-SHA256 over `<policy>.<expiry>`,
-5-minute expiry). When the Next.js server renders a page it echoes the token
+policy layer matched for that request and the loopback base URL of the
+listener it arrived on (HMAC-SHA256 over
+`<policy>.<expiry>.<origin_b64url>`, 5-minute expiry). When the Next.js server renders a page it echoes the token
 on its own API calls back into the gateway; at policy ingress a token that
 parses, verifies (constant-time), is unexpired, and names a configured
 policy selects that policy instead of listener/host matching — so SSR acts
@@ -138,6 +140,21 @@ server to a loopback listener, so listener matching answers "what may the UI
 process do" instead of "what may this visitor do". Point it at the most
 restricted listener with `[upstreams.ui] api_endpoint` (below), so a token
 that ever stops verifying degrades the render instead of escalating it.
+
+The origin claim is for the UI server, not for the gateway. A UI server the
+gateway launched is told where to send its SSR API calls through
+`PANOPTIKON_API_URL`; one it did not launch (`[upstreams.ui] local = false`
+with a hand-run `next start`) used to have only a compiled-in default port,
+which is right for exactly one gateway on the machine and silently wrong for
+every other — a scratch gateway's pages once rendered another instance's
+library that way. With the claim, such a server routes each SSR call to the
+listener that is actually serving the page. Precedence on the UI side is env
+first (`PANOPTIKON_API_URL` always wins when set), and the UI honors only a
+plain-http loopback origin. The gateway never selects or routes on the claim
+— a legitimate SSR call may arrive on a different listener than the one it
+names (`api_endpoint`, or an explicit `PANOPTIKON_API_URL`) — it is inside
+the signed message only so a token cannot be re-pointed without breaking its
+HMAC.
 
 The HMAC key is a random 256 bits generated at gateway boot. `[server]
 policy_token_key` (64 hex chars, env-templatable) pins it — a niche option

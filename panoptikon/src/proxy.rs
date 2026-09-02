@@ -18,7 +18,7 @@ use tokio::sync::watch;
 
 use crate::config::Settings;
 use crate::inferio_client::InferenceApiClient;
-use crate::policy::PolicyContext;
+use crate::policy::{ListenerEndpoint, PolicyContext};
 use crate::policy_token::{POLICY_TOKEN_HEADER, TokenKey};
 
 #[derive(Clone)]
@@ -378,10 +378,19 @@ async fn proxy_request(
     // gateway inherit exactly that policy instead of whatever its own
     // network position would match. Any inbound value was already
     // verified-and-consumed at policy ingress, so this insert cannot be
-    // forwarding a client header.
+    // forwarding a client header. The token also carries the loopback URL
+    // of the listener this request arrived on: a UI server the gateway did
+    // not launch (no PANOPTIKON_API_URL) routes its SSR calls there instead
+    // of to a compiled-in default port. Without a listener extension (only
+    // the case in tests) the primary listener stands in.
     if upstream_kind == UpstreamKind::Ui {
         if let Some(context) = &policy_context {
-            let token = state.token_key.mint(&context.policy_name);
+            let origin = req
+                .extensions()
+                .get::<ListenerEndpoint>()
+                .and_then(|endpoint| state.settings.endpoint_loopback_url(&endpoint.0))
+                .unwrap_or_else(|| state.settings.primary_loopback_url());
+            let token = state.token_key.mint(&context.policy_name, &origin);
             match HeaderValue::from_str(&token) {
                 Ok(value) => {
                     req.headers_mut()
@@ -550,6 +559,17 @@ mod tests {
 host = "127.0.0.1"
 port = 9155
 
+# Extra listeners, for the policy token's origin claim: one inheriting the
+# primary host, one with its own wildcard bind (mints a loopback address).
+[[server.endpoints]]
+name = "test"
+port = 9156
+
+[[server.endpoints]]
+name = "lan"
+host = "0.0.0.0"
+port = 9157
+
 [upstreams.ui]
 base_url = "http://127.0.0.1:6339"
 
@@ -651,7 +671,47 @@ base_url = "http://127.0.0.1:6342"
             .await
             .unwrap();
         let token = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(key.verify(&token), Ok("demo"), "token: {token}");
+        let claims = key.verify(&token).expect("minted token verifies");
+        assert_eq!(claims.policy, "demo", "token: {token}");
+        // No listener extension on this hand-built request: the origin
+        // claim falls back to the primary listener.
+        assert_eq!(
+            claims.origin,
+            state.settings.primary_loopback_url(),
+            "token: {token}"
+        );
+
+        // The origin claim follows the listener the request arrived on
+        // (the ListenerEndpoint extension main mounts per listener): a
+        // named extra listener, one with its own wildcard bind host (minted
+        // as a loopback address), and an unknown name (primary again).
+        for (endpoint, expected) in [
+            ("test", "http://127.0.0.1:9156"),
+            ("lan", "http://127.0.0.1:9157"),
+            ("default", "http://127.0.0.1:9155"),
+            ("no-such-listener", "http://127.0.0.1:9155"),
+        ] {
+            let mut req = Request::builder()
+                .uri("http://gateway/some/page")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(PolicyContext {
+                policy_name: "demo".to_string(),
+                db_action: crate::policy::DbAction::Skipped,
+                selected_by: crate::policy::PolicySelection::ListenerHost,
+                search_cache: true,
+            });
+            req.extensions_mut()
+                .insert(crate::policy::ListenerEndpoint(Arc::from(endpoint)));
+            let response =
+                proxy_request(client_addr, Arc::clone(&state), UpstreamKind::Ui, req).await;
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let token = String::from_utf8(body.to_vec()).unwrap();
+            let claims = key.verify(&token).expect("minted token verifies");
+            assert_eq!(claims.origin, expected, "endpoint {endpoint}: {token}");
+        }
 
         // Without a PolicyContext: no token minted.
         let req = Request::builder()
@@ -1123,13 +1183,35 @@ allow = "*"
         // for the UI-bound handshake, and the query string was left alone —
         // UI-bound requests must reach the Next.js server with exactly the
         // URL the browser sent, or SSR/hydration URL state diverges.
-        let forwarded = head_rx.await.unwrap().to_ascii_lowercase();
+        let raw_head = head_rx.await.unwrap();
+        let forwarded = raw_head.to_ascii_lowercase();
         assert!(forwarded.contains("get /hmr "), "head: {forwarded}");
         assert!(!forwarded.contains("index_db="), "head: {forwarded}");
         assert!(
             forwarded.contains("x-panoptikon-policy:"),
             "head: {forwarded}"
         );
+        // ...and that token names a loopback origin the UI can route SSR
+        // calls to: the primary listener's, since this test gateway mounts
+        // no per-listener extension.
+        // (From the raw head: lowercasing would corrupt the base64url.)
+        let token = raw_head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-panoptikon-policy")
+                    .then(|| value.trim())
+            })
+            .expect("token header present");
+        let origin_segment = token.rsplit('.').nth(1).expect("four-segment token");
+        let origin = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            origin_segment,
+        )
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .expect("origin claim decodes");
+        assert_eq!(origin, "http://127.0.0.1:9155", "token: {token}");
 
         // And the bridge still works end to end.
         client.write_all(b"policy-bridge").await.unwrap();

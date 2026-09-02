@@ -75,14 +75,19 @@ references remain in TOML and redirect edits to Desktop's managed `.env`. See
 ### Policy-scoped SSR
 
 The gateway stamps every UI-bound proxied request with a short-lived HMAC
-token (`x-panoptikon-policy: <policy>.<expiry>.<hmac>`, key random per boot,
-overridable via `[server] policy_token_key` for multi-gateway setups) naming
-the policy that request matched. The Next.js server echoes the token on its
+token (`x-panoptikon-policy: <policy>.<expiry>.<origin>.<hmac>`, key random
+per boot, overridable via `[server] policy_token_key` for multi-gateway
+setups) naming the policy that request matched and the loopback origin of
+the listener it arrived on. The Next.js server echoes the token on its
 SSR API calls back into the gateway, where a verified token selects the
 named policy ahead of listener/host matching — SSR renders with the
 browser request's authority, not the UI server's network position. Invalid
 or absent tokens fall back to normal selection, so the SSR's API base URL
-should point at the most restricted listener. At the same choke point all
+should point at the most restricted listener. The origin claim is routing
+advice for a UI server the gateway did not launch: with no
+`PANOPTIKON_API_URL` in its environment it sends SSR calls to the listener
+that served the page instead of a compiled-in default port (env wins when
+set; only plain-http loopback origins are honored). At the same choke point all
 other inbound `x-panoptikon-*` headers are stripped (except
 `x-panoptikon-hops`, the self-proxy loop guard, which must survive
 gateway→gateway forwarding). `GET /api/client-config` — exempt from ruleset

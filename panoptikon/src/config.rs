@@ -1089,23 +1089,37 @@ impl Settings {
     /// one cannot reach here — falling back to the primary rather than
     /// panicking keeps a future caller that skipped validation honest.
     pub fn ui_api_base_url(&self) -> String {
-        let primary = || loopback_base_url(&self.server.host, self.server.port);
         match self.upstreams.ui.api_endpoint.as_deref() {
-            None => primary(),
-            Some(PRIMARY_ENDPOINT) => primary(),
+            None => self.primary_loopback_url(),
             Some(name) => self
-                .server
-                .endpoints
-                .iter()
-                .find(|entry| entry.name == name)
-                .map(|entry| {
-                    loopback_base_url(
-                        entry.host.as_deref().unwrap_or(&self.server.host),
-                        entry.port,
-                    )
-                })
-                .unwrap_or_else(primary),
+                .endpoint_loopback_url(name)
+                .unwrap_or_else(|| self.primary_loopback_url()),
         }
+    }
+
+    /// Loopback base URL of the primary `[server]` listener.
+    pub fn primary_loopback_url(&self) -> String {
+        loopback_base_url(&self.server.host, self.server.port)
+    }
+
+    /// Loopback base URL of the listener named `name` (`"default"` is the
+    /// primary), or `None` when no `[[server.endpoints]]` entry carries that
+    /// name. The proxy mints this into the policy token's origin claim for
+    /// the listener a UI-bound request arrived on (policy_token.rs).
+    pub fn endpoint_loopback_url(&self, name: &str) -> Option<String> {
+        if name == PRIMARY_ENDPOINT {
+            return Some(self.primary_loopback_url());
+        }
+        self.server
+            .endpoints
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| {
+                loopback_base_url(
+                    entry.host.as_deref().unwrap_or(&self.server.host),
+                    entry.port,
+                )
+            })
     }
 
     /// Empty-string paths mean "unset": the shipped configs template these

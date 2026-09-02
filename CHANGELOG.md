@@ -260,6 +260,17 @@ Desktop release notes.
 
 ### Fixed
 
+- **A UI server the gateway did not launch no longer renders pages against
+  the wrong instance.** Server-side rendering in a hand-run `next start`
+  (`[upstreams.ui] local = false` without `PANOPTIKON_API_URL` in its
+  environment) fetched its data from a compiled-in default port, so a
+  gateway on any other port showed another instance's result count and
+  rows on first paint. The gateway now signs the loopback origin of the
+  listener that served the page into the `x-panoptikon-policy` token, and
+  the UI routes SSR calls there when the environment variable is unset
+  (the variable still wins when set; only plain-http loopback origins are
+  honored). Gateway-launched, Docker, Desktop and Nix deployments already
+  set the variable and are unaffected.
 - **Rotated photos and rotated phone videos are no longer indexed
   sideways.** Their width and height were recorded exactly the wrong way
   round: the scanner read the numbers stored in the file and ignored the

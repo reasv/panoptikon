@@ -37,6 +37,15 @@ port = 6339
 # Next.js frontend base URL; with local = true this is also the host/port
 # the spawned `next start` binds to. Internal upstream only — never an
 # entrypoint (that's what freed 6339 for the legacy_ui listener above).
+# With local = false you run the UI server yourself. Its server-side
+# rendering calls this gateway back: set PANOPTIKON_API_URL in its
+# environment to name the listener (this is what the gateway does for a
+# UI it launches), or leave it unset and the UI follows the loopback
+# origin the gateway signs into each proxied request's policy token —
+# never a fixed port, which may belong to a different instance. The UI
+# cannot verify that token, so bind a hand-run UI to loopback; and if this
+# gateway's [server] host is a specific non-loopback address, the minted
+# origin is not loopback and the UI refuses it: set the variable instead.
 base_url = "http://127.0.0.1:6340"
 local = true
 # Path to the panoptikon-ui checkout. The standard location is the ui/

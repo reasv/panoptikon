@@ -381,8 +381,13 @@ fn consume_policy_token<'a>(
             return None;
         }
     };
+    // Only the policy claim matters here. The origin claim is routing
+    // advice for the UI server (policy_token.rs); a legitimate SSR call may
+    // well arrive on a different listener than the one the claim names
+    // (`[upstreams.ui] api_endpoint`, or a PANOPTIKON_API_URL naming any
+    // listener), so it is neither compared nor acted on.
     let name = match token_key.verify(token) {
-        Ok(name) => name,
+        Ok(claims) => claims.policy,
         Err(err) => {
             tracing::debug!(reason = err.as_str(), "policy token ignored");
             return None;
@@ -1308,7 +1313,7 @@ allow = "*"
 
         // Valid token naming a policy this request would never match by
         // host/endpoint ("both" needs host special.local AND endpoint test).
-        let mut req = request_with_token(&key.mint("both"));
+        let mut req = request_with_token(&key.mint("both", "http://127.0.0.1:9155"));
         let decision = apply_policy(&mut req, &settings, &key).unwrap();
         assert_eq!(decision.policy.name, "both");
         assert_eq!(decision.selected_by, PolicySelection::Token);
@@ -1320,10 +1325,11 @@ allow = "*"
         // Fallback cases: all select "localhost" via listener/host.
         let other_key = TokenKey::random();
         for bad in [
-            other_key.mint("both"),      // forged: wrong key
-            key.sign("both", 42),        // expired long ago
-            key.mint("no-such-policy"),  // unknown policy name
-            "total.garbage".to_string(), // malformed
+            other_key.mint("both", "http://127.0.0.1:9155"), // forged: wrong key
+            key.sign("both", "http://127.0.0.1:9155", 42),   // expired long ago
+            key.mint("no-such-policy", "http://127.0.0.1:9155"), // unknown policy name
+            "total.garbage".to_string(),                     // malformed
+            format!("both.{}.{}", u64::MAX, "ab".repeat(32)), // pre-origin format
         ] {
             let mut req = request_with_token(&bad);
             let decision = apply_policy(&mut req, &settings, &key).unwrap();
@@ -1331,6 +1337,53 @@ allow = "*"
             assert_eq!(decision.selected_by, PolicySelection::ListenerHost);
             assert!(req.headers().get(POLICY_TOKEN_HEADER).is_none());
         }
+    }
+
+    /// The origin claim is routing advice for the UI, never a selection
+    /// input: a valid token whose origin names a different listener than
+    /// the one the SSR call arrived on (the `api_endpoint` / explicit
+    /// PANOPTIKON_API_URL case) still selects the named policy, and one
+    /// naming an origin no listener has is not an error either.
+    #[test]
+    fn token_origin_claim_does_not_affect_selection() {
+        let settings = endpoint_settings();
+        let key = TokenKey::random();
+        for origin in [
+            "http://127.0.0.1:9155",
+            "http://127.0.0.1:9156",
+            "http://[::1]:1",
+            "http://nowhere.invalid:80",
+        ] {
+            let mut req = Request::builder()
+                .uri("http://localhost/api/items")
+                .header("host", "localhost")
+                .header(POLICY_TOKEN_HEADER, key.mint("both", origin))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ListenerEndpoint(Arc::from("default")));
+            let decision = apply_policy(&mut req, &settings, &key).unwrap();
+            assert_eq!(decision.policy.name, "both", "origin: {origin}");
+            assert_eq!(decision.selected_by, PolicySelection::Token);
+        }
+    }
+
+    /// The loopback URL the proxy mints into a token's origin claim, per
+    /// listener name: the primary from `[server]`, extra listeners from
+    /// `[[server.endpoints]]`, and nothing for an unknown name.
+    #[test]
+    fn endpoint_loopback_urls_follow_the_listeners() {
+        let settings = endpoint_settings();
+        assert_eq!(
+            settings.endpoint_loopback_url("default").as_deref(),
+            Some("http://127.0.0.1:9155")
+        );
+        assert_eq!(
+            settings.endpoint_loopback_url("test").as_deref(),
+            Some("http://127.0.0.1:9156")
+        );
+        assert_eq!(settings.endpoint_loopback_url("nope"), None);
+        assert_eq!(settings.primary_loopback_url(), "http://127.0.0.1:9155");
     }
 
     /// Ingress hygiene: client-supplied `x-panoptikon-*` headers are
