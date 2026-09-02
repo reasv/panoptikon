@@ -4,7 +4,7 @@
 -- Until now every row of `thumbnail_tiers` was a q85 JPEG, so the serving
 -- endpoint could name the content type itself. The animated ladder puts an
 -- H.264 loop in the same table -- one row per animated item, `tier = 'loop'`,
--- answering every grid tier -- so the type has to travel with the bytes
+-- answering both grid tiers -- so the type has to travel with the bytes
 -- instead of being assumed from the table.
 --
 -- A column rather than a second table: the loop is a *rendition of an item's
