@@ -851,6 +851,26 @@ async fn sweep_orphaned_visual_attempts(index_db: &str) {
     }
 }
 
+/// Reports what one write-once `items` stamp did.
+///
+/// The three outcomes are the same for every such column, and none of them is
+/// a failure of the scan: `Ok(0)` is the ordinary race — another pass over
+/// identical content measured the same thing first, and the statement's own
+/// `IS NULL` guard is what makes the two agree by construction — and an error
+/// leaves the column unexamined for the next scan to re-measure.
+fn stamp_item_fact(sha256: &str, fact: &'static str, wrote: ApiResult<u64>) {
+    match wrote {
+        Ok(0) => tracing::debug!(sha256, fact, "no unexamined item to stamp"),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            error = ?err,
+            sha256,
+            fact,
+            "failed to stamp an item fact; it will be re-measured next scan"
+        ),
+    }
+}
+
 /// The generator versions, and what a bump to each one regenerates.
 ///
 /// | constant | stamped on | a bump regenerates |
@@ -2226,51 +2246,31 @@ impl ScanContext {
         let Some(quarter_turns) = quarter_turns else {
             return;
         };
-        match call_index_db_writer(&self.index_db, |reply| {
+        let wrote = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::SetItemRotation {
                 sha256: sha256.to_string(),
                 quarter_turns,
                 reply,
             }
         })
-        .await
-        {
-            Ok(0) => tracing::debug!(sha256, "no unexamined item to store a rotation on"),
-            Ok(_) => {}
-            Err(err) => tracing::warn!(
-                error = ?err,
-                sha256,
-                "failed to store a rotation; it will be re-measured next scan"
-            ),
-        }
+        .await;
+        stamp_item_fact(sha256, "rotation", wrote);
     }
 
     /// Stamps one item's measured transparency (R4).
-    ///
-    /// `Ok(0)` is the ordinary race, not an error: another pass over identical
-    /// content measured the same pixels first, and the guard on
-    /// `has_transparency IS NULL` is what makes the two agree by construction.
     async fn record_item_transparency(&mut self, sha256: &str, has_transparency: Option<bool>) {
         let Some(has_transparency) = has_transparency else {
             return;
         };
-        match call_index_db_writer(&self.index_db, |reply| {
+        let wrote = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::SetItemTransparency {
                 sha256: sha256.to_string(),
                 has_transparency,
                 reply,
             }
         })
-        .await
-        {
-            Ok(0) => tracing::debug!(sha256, "no unexamined item to store transparency on"),
-            Ok(_) => {}
-            Err(err) => tracing::warn!(
-                error = ?err,
-                sha256,
-                "failed to store transparency; it will be re-measured next scan"
-            ),
-        }
+        .await;
+        stamp_item_fact(sha256, "transparency", wrote);
     }
 
     /// Writes one item's whole grid tier set. Failures are logged and skipped,
@@ -3304,21 +3304,14 @@ impl ScanContext {
                 height,
                 self.formats,
             );
-            let display_matches = match plan {
+            let display_matches = match (&plan, stored_thumbnails.as_slice()) {
                 // A still item never reaches the loop verdict; the arm is
                 // here so the match stays total.
-                DisplayPlan::Original | DisplayPlan::Loop { .. } => stored_thumbnails.is_empty(),
-                DisplayPlan::Thumbnail { plan, format } => match stored_thumbnails.as_slice() {
-                    [stored] => {
-                        (stored.idx, stored.width, stored.height)
-                            == (0, i64::from(plan.width), i64::from(plan.height))
-                            // Plain equality, sentinel rows included
-                            // (`crate::visual_tiers`, "The keep-the-original
-                            // sentinel").
-                            && stored.media_type == format.media_type()
-                    }
-                    _ => false,
-                },
+                (DisplayPlan::Original | DisplayPlan::Loop { .. }, rows) => rows.is_empty(),
+                (DisplayPlan::Thumbnail { .. }, [stored]) => display_row_matches(stored, &plan),
+                // A rendition is owed and there is not exactly one row to be
+                // it: none yet, or a set an older rule left behind.
+                (DisplayPlan::Thumbnail { .. }, _) => false,
             };
             let wanted = wanted_tier_geometry(
                 0,

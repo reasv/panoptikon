@@ -493,6 +493,29 @@ pub(super) fn reusable_loop_rows(
         .collect()
 }
 
+/// Whether an item's stored **display** row is the rendition the current rule
+/// wants.
+///
+/// The tier rows' [`rendition_row_matches`], one table over, and the same
+/// three questions: index, geometry, media type. No version compare, because
+/// nothing bumps a display generator — a change that moves the picture moves
+/// the geometry or the format, and both are here.
+///
+/// Plain equality on the media type, sentinel rows included: a row that
+/// carries no bytes names the format its encode was *attempted* with
+/// (`crate::visual_tiers`, "The keep-the-original sentinel"), so it counts as
+/// the settled answer it is exactly while that format is still the verdict,
+/// and stops counting the moment a policy edit or a transparency measurement
+/// moves it. Nothing distinguishes the two kinds of row here, and nothing
+/// should: the verdict and the rendition are equally final.
+pub(super) fn display_row_matches(stored: &ThumbnailGeometry, plan: &DisplayPlan) -> bool {
+    let DisplayPlan::Thumbnail { plan, format } = plan else {
+        return false;
+    };
+    (stored.idx, stored.width, stored.height) == (0, i64::from(plan.width), i64::from(plan.height))
+        && stored.media_type == format.media_type()
+}
+
 /// The size of the file a display rendition is decided against. Its own
 /// helper so the two generation passes cannot drift on which error class a
 /// failed stat is (transient io, never a verdict on the content).
