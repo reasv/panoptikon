@@ -170,9 +170,15 @@ has_transparency, policy)` — nothing decodes to decide.
   plan.
 - R3: a `display` request for an animated item consults the loop rows the way
   the grid request does; `still=true` keeps answering the poster.
-- `/api/client-config` publishes `display_loop_bound = { bytes: 5 MiB, short: 2560 }`
-  so the gallery large view decides `<video>` vs `<img>` from item metadata
-  (no wasted request, no error latch).
+- `/api/client-config` publishes the animated class's **trigger** (never the
+  2560 rendition cap): `display_loop_trigger: { max_bytes: 5 MiB,
+  max_short_side: 4096, max_pixels: 24_000_000 } | null` (null under the same
+  condition as `animated_floor: null`), always all three keys. Any `<img>` or
+  canvas consumer of a bare/`display` thumbnail URL must send `still=true`
+  when `exceedsDisplayLoopTrigger(item)` — the gallery large view is the ONLY
+  surface that mounts a `<video>` on the bare URL. `still=true` at the
+  display size always answers an image (poster, or the original for a
+  sentinel/under-bound item), never video, never 404.
 - Downstream JPEG assumptions: `api/video.rs::materialize_thumbnail` writes the
   file with the extension of `media_type`; `api/pinboards.rs` compose/preview
   paths use the existing `sniff_image_media_type`. `build_stored_thumbnail_tiers`
@@ -182,8 +188,12 @@ has_transparency, policy)` — nothing decodes to decide.
 
 - `lib/thumbnailTier.ts`: `grid-xs` (short side 256) in the type, the short-side
   table and `tierForCellWidth` (cell device px ≤ 288 → grid-xs, with the same
-  1.125 slack the other rungs use); `gridcells.test.mjs` extended.
-- Gallery large view: animated item over `display_loop_bound` → mount
+  1.125 slack the other rungs use); `gridcells.test.mjs` extended. The grid
+  must hand it the **binding edge** of the image box (auto layout's box is
+  `cellWidth × 384 CSS px`, not square — the filmstrip's
+  `STRIP_CARD_CSS_BINDING_EDGE` reasoning applies), or a 266 px-wide auto cell
+  asks for grid-xs and upscales 1.5×.
+- Gallery large view: animated item over `display_loop_trigger` → mount
   `<video muted loop autoplay playsinline>` on the bare thumbnail URL; else
   the `<img>` as today. Filmstrip unchanged (posters).
 - Scan settings page (`components/scan/Config.tsx`): `thumbnail_formats`
