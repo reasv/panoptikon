@@ -55,6 +55,21 @@ pub(crate) fn test_data_dir() -> TestDataGuard {
     TestDataGuard { _lock: lock, root }
 }
 
+/// A directory that does not exist, spelled as a native absolute path:
+/// `C:\gone` on Windows, `/gone` elsewhere. Fixtures that need a file row the
+/// handler must never stat put it below this root, so what `Path` makes of
+/// the string — the file name, the stem — is the platform's own answer. A
+/// Windows spelling on Unix is one long file name, backslashes included.
+pub(crate) fn absent_root() -> &'static str {
+    if cfg!(windows) { r"C:\gone" } else { "/gone" }
+}
+
+/// `name` placed directly under [`absent_root`], joined with the native
+/// separator.
+pub(crate) fn absent_path(name: &str) -> String {
+    format!("{}{}{name}", absent_root(), std::path::MAIN_SEPARATOR)
+}
+
 /// Writes a per-database `config.toml` carrying only `detect_outros`, at the
 /// path `SystemConfigStore::from_env()` resolves for `index_db`.
 ///
