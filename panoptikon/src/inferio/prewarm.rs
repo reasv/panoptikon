@@ -104,7 +104,7 @@ enum Slot {
     Spawning,
     /// A parked worker: spawned, handshaken, `prewarm` sent.
     Parked {
-        worker: Worker,
+        worker: Box<Worker>,
         failed_prepare: bool,
     },
 }
@@ -218,7 +218,7 @@ impl PrewarmPool {
                     failed_prepare,
                     "claimed a prewarmed worker from the pool"
                 );
-                Some(worker)
+                Some(*worker)
             }
             Err(err) => {
                 tracing::warn!(
@@ -273,7 +273,7 @@ impl PrewarmPool {
             let workers: Vec<Worker> = std::mem::take(&mut state.slots)
                 .into_values()
                 .filter_map(|slot| match slot {
-                    Slot::Parked { worker, .. } => Some(worker),
+                    Slot::Parked { worker, .. } => Some(*worker),
                     Slot::Spawning => None,
                 })
                 .collect();
@@ -368,7 +368,7 @@ async fn warm_worker_task(pool: Weak<PrewarmPool>, spawn: WorkerSpawnConfig, imp
                     state.slots.insert(
                         impl_class.clone(),
                         Slot::Parked {
-                            worker,
+                            worker: Box::new(worker),
                             failed_prepare,
                         },
                     );

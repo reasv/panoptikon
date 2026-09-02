@@ -60,6 +60,7 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ui: Upstream,
         api: Upstream,
@@ -382,25 +383,25 @@ async fn proxy_request(
     // not launch (no PANOPTIKON_API_URL) routes its SSR calls there instead
     // of to a compiled-in default port. Without a listener extension (only
     // the case in tests) the primary listener stands in.
-    if upstream_kind == UpstreamKind::Ui {
-        if let Some(context) = &policy_context {
-            let origin = req
-                .extensions()
-                .get::<ListenerEndpoint>()
-                .and_then(|endpoint| state.settings.endpoint_loopback_url(&endpoint.0))
-                .unwrap_or_else(|| state.settings.primary_loopback_url());
-            let token = state.token_key.mint(&context.policy_name, &origin);
-            match HeaderValue::from_str(&token) {
-                Ok(value) => {
-                    req.headers_mut()
-                        .insert(HeaderName::from_static(POLICY_TOKEN_HEADER), value);
-                }
-                Err(err) => tracing::warn!(
-                    error = %err,
-                    policy = %context.policy_name,
-                    "policy token not header-safe; UI request sent without one"
-                ),
+    if upstream_kind == UpstreamKind::Ui
+        && let Some(context) = &policy_context
+    {
+        let origin = req
+            .extensions()
+            .get::<ListenerEndpoint>()
+            .and_then(|endpoint| state.settings.endpoint_loopback_url(&endpoint.0))
+            .unwrap_or_else(|| state.settings.primary_loopback_url());
+        let token = state.token_key.mint(&context.policy_name, &origin);
+        match HeaderValue::from_str(&token) {
+            Ok(value) => {
+                req.headers_mut()
+                    .insert(HeaderName::from_static(POLICY_TOKEN_HEADER), value);
             }
+            Err(err) => tracing::warn!(
+                error = %err,
+                policy = %context.policy_name,
+                "policy token not header-safe; UI request sent without one"
+            ),
         }
     }
 

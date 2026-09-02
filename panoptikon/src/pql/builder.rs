@@ -611,12 +611,12 @@ fn raise_if_invalid(input_query: &PqlQuery) -> Result<(), PqlError> {
                 "Tried to order by text columns in a non-text query",
             ));
         }
-        if let Some(partition_by) = &input_query.partition_by {
-            if partition_by.iter().copied().any(is_text_column) {
-                return Err(PqlError::invalid(
-                    "Tried to partition by text columns in a non-text query",
-                ));
-            }
+        if let Some(partition_by) = &input_query.partition_by
+            && partition_by.iter().copied().any(is_text_column)
+        {
+            return Err(PqlError::invalid(
+                "Tried to partition by text columns in a non-text query",
+            ));
         }
     }
     Ok(())
@@ -1118,12 +1118,12 @@ fn combine_order_lists(order_list: &[OrderByFilter], order_args: &[OrderArgs]) -
                 let mut group = vec![filter];
                 let mut j = i + 1;
                 while j < combined.len() {
-                    if let OrderItem::Filter(next_filter) = &combined[j].0 {
-                        if combined[j].1 == priority {
-                            group.push(next_filter.clone());
-                            j += 1;
-                            continue;
-                        }
+                    if let OrderItem::Filter(next_filter) = &combined[j].0
+                        && combined[j].1 == priority
+                    {
+                        group.push(next_filter.clone());
+                        j += 1;
+                        continue;
                     }
                     break;
                 }

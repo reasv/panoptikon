@@ -290,13 +290,15 @@ fn apply_policy(
         && (path.starts_with("/api/relay/pairings/")
             || path.starts_with("/api/relay/pairing-operations/"));
 
-    if is_api && !is_client_config && !is_relay_bootstrap {
-        if !ruleset_allows(settings, &policy, &method, &path) {
-            return Err(EnforcementError {
-                status: StatusCode::FORBIDDEN,
-                reason: "ruleset_denied",
-            });
-        }
+    if is_api
+        && !is_client_config
+        && !is_relay_bootstrap
+        && !ruleset_allows(settings, &policy, &method, &path)
+    {
+        return Err(EnforcementError {
+            status: StatusCode::FORBIDDEN,
+            reason: "ruleset_denied",
+        });
     }
 
     let username = extract_username(&policy, req)?;
@@ -309,9 +311,7 @@ fn apply_policy(
     }
 
     let mut db_action = DbAction::Skipped;
-    let apply_db_params = if is_inference {
-        false
-    } else if is_db_info || is_db_create {
+    let apply_db_params = if is_inference || is_db_info || is_db_create {
         false
     } else if is_client_config || is_relay_bootstrap {
         // Local-mode client-config takes no DB params (same gate as its
@@ -471,10 +471,10 @@ fn needs_db_params(path: &str) -> bool {
 
 fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<String> {
     if trust_forwarded {
-        if let Some(value) = header_to_str(req.headers().get("forwarded")) {
-            if let Some(host) = parse_forwarded_host(value) {
-                return Some(normalize_host(&host));
-            }
+        if let Some(value) = header_to_str(req.headers().get("forwarded"))
+            && let Some(host) = parse_forwarded_host(value)
+        {
+            return Some(normalize_host(&host));
         }
         if let Some(value) = header_to_str(req.headers().get("x-forwarded-host")) {
             let host = value.split(',').next().unwrap_or(value).trim();
@@ -509,10 +509,10 @@ fn parse_forwarded_host(value: &str) -> Option<String> {
 
 pub(crate) fn normalize_host(value: &str) -> String {
     let value = value.trim();
-    if value.starts_with('[') {
-        if let Some(end) = value.find(']') {
-            return value[1..end].to_ascii_lowercase();
-        }
+    if value.starts_with('[')
+        && let Some(end) = value.find(']')
+    {
+        return value[1..end].to_ascii_lowercase();
     }
     value
         .split(':')
@@ -910,10 +910,10 @@ fn filter_db_list(names: Vec<String>, policy: &DbPolicy, username: Option<&str>)
         })
         .collect();
 
-    if let (Some(_username), Some(tenant_default)) = (username, policy.tenant_default.as_deref()) {
-        if !filtered.iter().any(|entry| entry == tenant_default) {
-            filtered.push(tenant_default.to_string());
-        }
+    if let (Some(_username), Some(tenant_default)) = (username, policy.tenant_default.as_deref())
+        && !filtered.iter().any(|entry| entry == tenant_default)
+    {
+        filtered.push(tenant_default.to_string());
     }
 
     let mut deduped = Vec::with_capacity(filtered.len());
@@ -1693,8 +1693,8 @@ allow = ["default"]
             query.get("new_user_data_db").unwrap(),
             &vec!["user_alice_bookmarks".to_string()]
         );
-        assert!(query.get("index_db").is_none());
-        assert!(query.get("user_data_db").is_none());
+        assert!(!query.contains_key("index_db"));
+        assert!(!query.contains_key("user_data_db"));
     }
 
     #[test]

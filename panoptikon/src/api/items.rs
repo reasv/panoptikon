@@ -1358,7 +1358,7 @@ mod tests {
         std::env::temp_dir().join(format!("panoptikon_{label}_{stamp}"))
     }
 
-    fn test_records(file_path: &PathBuf) -> (ItemRecord, FileRecord) {
+    fn test_records(file_path: &Path) -> (ItemRecord, FileRecord) {
         let item = ItemRecord {
             id: 1,
             sha256: "sha256".to_string(),

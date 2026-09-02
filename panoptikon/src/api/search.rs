@@ -466,12 +466,12 @@ pub async fn get_top_tags(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<TopTagsQuery>,
 ) -> ApiResult<Json<TagFrequency>> {
-    if let Some(confidence) = query.confidence_threshold {
-        if !(0.0..=1.0).contains(&confidence) {
-            return Err(ApiError::bad_request(
-                "confidence_threshold must be between 0 and 1",
-            ));
-        }
+    if let Some(confidence) = query.confidence_threshold
+        && !(0.0..=1.0).contains(&confidence)
+    {
+        return Err(ApiError::bad_request(
+            "confidence_threshold must be between 0 and 1",
+        ));
     }
 
     let tags = load_top_tags(
@@ -1581,7 +1581,7 @@ fn is_empty_partition(query: &PqlQuery) -> bool {
     query
         .partition_by
         .as_ref()
-        .map_or(true, |partition| partition.is_empty())
+        .is_none_or(|partition| partition.is_empty())
 }
 
 fn compile_select(built: crate::pql::PqlBuilderResult) -> ApiResult<CompiledQuery> {
@@ -2533,6 +2533,7 @@ mod tests {
     // prefix, which then serves later pages *and* page sizes the execution
     // never ran at. An epoch bump invalidates the lot.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes against the sync cache tests
     async fn prefetch_stores_rows_servable_at_any_page_size() {
         let _guard = search_cache::test_lock();
         search_cache::set_budget_mb(16);
@@ -2588,6 +2589,7 @@ mod tests {
     // it ends, so windows straddling or past the end are served rather than
     // re-executed.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes against the sync cache tests
     async fn short_read_is_cached_with_its_end() {
         let _guard = search_cache::test_lock();
         search_cache::set_budget_mb(16);
@@ -3316,6 +3318,7 @@ mod tests {
     // Without a cache target (bypass/disabled) nothing is stored and no
     // prefetch happens even when requested.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes against the sync cache tests
     async fn bypass_executes_without_storing() {
         let _guard = search_cache::test_lock();
         search_cache::set_budget_mb(16);

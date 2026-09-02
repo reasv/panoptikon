@@ -1297,22 +1297,21 @@ impl Settings {
             // before identity extraction runs, so a user header inside it
             // would never be seen — every request would silently fall back
             // to the un-tenanted defaults, defeating tenant isolation.
-            if let Some(identity) = &policy.identity {
-                if identity
+            if let Some(identity) = &policy.identity
+                && identity
                     .user_header
                     .to_ascii_lowercase()
                     .starts_with("x-panoptikon-")
-                {
-                    anyhow::bail!(
-                        "policy '{}' identity.user_header '{}' is invalid: the \
+            {
+                anyhow::bail!(
+                    "policy '{}' identity.user_header '{}' is invalid: the \
                          x-panoptikon-* header namespace is gateway-reserved and is \
                          stripped from inbound requests at ingress, so this header \
                          would never reach identity extraction; use a different \
                          header name",
-                        policy.name,
-                        identity.user_header
-                    );
-                }
+                    policy.name,
+                    identity.user_header
+                );
             }
             if policy.match_rule.hosts.is_empty() && policy.match_rule.endpoints.is_empty() {
                 anyhow::bail!(
@@ -1341,14 +1340,15 @@ impl Settings {
                     );
                 }
             }
-            if let Some(ruleset_name) = policy.ruleset.as_deref() {
-                if ruleset_name != "allow_all" && !self.rulesets.contains_key(ruleset_name) {
-                    anyhow::bail!(
-                        "policy '{}' references unknown ruleset '{}'",
-                        policy.name,
-                        ruleset_name
-                    );
-                }
+            if let Some(ruleset_name) = policy.ruleset.as_deref()
+                && ruleset_name != "allow_all"
+                && !self.rulesets.contains_key(ruleset_name)
+            {
+                anyhow::bail!(
+                    "policy '{}' references unknown ruleset '{}'",
+                    policy.name,
+                    ruleset_name
+                );
             }
 
             validate_db_policy("index_db", &policy.index_db)?;
@@ -1617,14 +1617,14 @@ fn validate_db_policy(label: &str, policy: &DbPolicy) -> Result<()> {
         }
     }
 
-    if let AllowList::List(items) = &policy.allow {
-        if !items.iter().any(|entry| entry == &policy.default) {
-            anyhow::bail!(
-                "{} default '{}' must appear in allow list",
-                label,
-                policy.default
-            );
-        }
+    if let AllowList::List(items) = &policy.allow
+        && !items.iter().any(|entry| entry == &policy.default)
+    {
+        anyhow::bail!(
+            "{} default '{}' must appear in allow list",
+            label,
+            policy.default
+        );
     }
 
     if let Some(tenant_default) = &policy.tenant_default {
@@ -1660,9 +1660,11 @@ pub fn is_safe_identifier(value: &str, max_len: usize) -> bool {
     if value.is_empty() || value.len() > max_len {
         return false;
     }
-    value.bytes().all(|byte| match byte {
-        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-' => true,
-        _ => false,
+    value.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'
+        )
     })
 }
 
@@ -2802,7 +2804,8 @@ file_command = "run $${{literal}} ${{GW_TEST_LEVEL}}"
             .join("config")
             .join("server");
 
-        for file in ["default.toml"] {
+        {
+            let file = "default.toml";
             unsafe { env::remove_var("LOGLEVEL") };
             let settings = Settings::load(Some(config_dir.join(file))).unwrap_or_else(|err| {
                 panic!("shipped {file} must load: {err:#}");

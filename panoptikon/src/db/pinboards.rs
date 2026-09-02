@@ -612,7 +612,7 @@ pub(crate) async fn get_pinboard(
     user: &str,
 ) -> ApiResult<Option<(PinboardSummary, Option<PinboardVersionRecord>)>> {
     let summaries = {
-        let row = sqlx::query(
+        sqlx::query(
             r#"
             SELECT
                 p.id, p.name, p.flags, p.head_version_id, p.time_added, p.time_updated,
@@ -641,8 +641,7 @@ pub(crate) async fn get_pinboard(
         .bind(user)
         .fetch_optional(conn)
         .await
-        .map_err(internal("Failed to get pinboard"))?;
-        row
+        .map_err(internal("Failed to get pinboard"))?
     };
 
     let Some(row) = summaries else {

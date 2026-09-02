@@ -508,12 +508,12 @@ pub(crate) async fn run_post_job_maintenance(index_db: &str, vacuum: bool, tags_
     // Boxed: opening a connection is a large future, and this one sits inside
     // the job queue's `execute_job` state machine, which is stack-allocated
     // before the task is spawned.
-    if vacuum && Box::pin(vacuum_is_worthwhile(index_db)).await {
-        if let Err(err) =
+    if vacuum
+        && Box::pin(vacuum_is_worthwhile(index_db)).await
+        && let Err(err) =
             call_index_db_writer(index_db, |reply| IndexDbWriterMessage::Vacuum { reply }).await
-        {
-            tracing::error!(error = ?err, index_db, "failed to vacuum index database");
-        }
+    {
+        tracing::error!(error = ?err, index_db, "failed to vacuum index database");
     }
     // Before ANALYZE, so the statistics are sampled from the updated table.
     // Gated, unlike ANALYZE and the checkpoint: this is a full rebuild of
@@ -661,10 +661,10 @@ async fn execute_folder_scan(
     // files failed may be installed now, and the files waiting on it become
     // scannable again in this same run. Usually one indexed query returning
     // nothing.
-    if !starting_points.is_empty() {
-        if let Err(err) = heal_blocked_scan_errors(index_db).await {
-            tracing::warn!(error = ?err, "failed to re-probe blocked scan failures");
-        }
+    if !starting_points.is_empty()
+        && let Err(err) = heal_blocked_scan_errors(index_db).await
+    {
+        tracing::warn!(error = ?err, "failed to re-probe blocked scan failures");
     }
 
     let scan_time = current_iso_timestamp();
@@ -1201,6 +1201,7 @@ struct TrackedTask {
     backfill_sha256: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn scan_single_folder(
     index_db: &str,
     user_data_db: &str,
@@ -1585,22 +1586,22 @@ impl ScanContext {
 
         let existing = get_file_by_path(&mut self.conn, &path_str).await?;
 
-        if let Some(existing) = &existing {
-            if existing.last_modified == last_modified {
-                let sha256 = existing.sha256.clone();
-                let data = FileScanData {
-                    sha256: sha256.clone(),
-                    last_modified: existing.last_modified.clone(),
-                    path: path_str,
-                    new_file_hash: false,
-                    file_size: None,
-                    item_metadata: None,
-                    blurhash: None,
-                };
-                let result = self.update_file_data(data).await?;
-                self.tally(&result);
-                return self.maybe_dispatch_backfill(sha256, mime_type, path).await;
-            }
+        if let Some(existing) = &existing
+            && existing.last_modified == last_modified
+        {
+            let sha256 = existing.sha256.clone();
+            let data = FileScanData {
+                sha256: sha256.clone(),
+                last_modified: existing.last_modified.clone(),
+                path: path_str,
+                new_file_hash: false,
+                file_size: None,
+                item_metadata: None,
+                blurhash: None,
+            };
+            let result = self.update_file_data(data).await?;
+            self.tally(&result);
+            return self.maybe_dispatch_backfill(sha256, mime_type, path).await;
         }
 
         self.dispatch_hash(
@@ -1914,8 +1915,7 @@ impl ScanContext {
     async fn handle_new_item(&mut self, item: NewItemData) -> ApiResult<()> {
         if !item.thumbnails.is_empty()
             && !has_thumbnail(&mut self.conn, &item.sha256, THUMBNAIL_PROCESS_VERSION).await?
-        {
-            if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+            && let Err(err) = call_index_db_writer(&self.index_db, |reply| {
                 IndexDbWriterMessage::StoreThumbnails {
                     sha256: item.sha256.clone(),
                     mime_type: item.mime_type.clone(),
@@ -1925,9 +1925,8 @@ impl ScanContext {
                 }
             })
             .await
-            {
-                tracing::error!(error = ?err, "failed to store thumbnails");
-            }
+        {
+            tracing::error!(error = ?err, "failed to store thumbnails");
         }
 
         // No positive-cache guard, unlike the two stores around it: the tier
@@ -1953,8 +1952,7 @@ impl ScanContext {
 
         if !item.frames.is_empty()
             && !has_frame(&mut self.conn, &item.sha256, FRAME_PROCESS_VERSION).await?
-        {
-            if let Err(err) =
+            && let Err(err) =
                 call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::StoreFrames {
                     sha256: item.sha256.clone(),
                     mime_type: item.mime_type.clone(),
@@ -1963,9 +1961,8 @@ impl ScanContext {
                     reply,
                 })
                 .await
-            {
-                tracing::error!(error = ?err, "failed to store frames");
-            }
+        {
+            tracing::error!(error = ?err, "failed to store frames");
         }
 
         // After the stores, so a marker can never be written for a kind this
@@ -2716,46 +2713,45 @@ impl ScanContext {
             // which consults metadata only when no frames exist).
             work.existing_frames = get_frames_bytes(&mut self.conn, &sha256).await?;
             frames_fetched = true;
-            if work.existing_frames.is_empty() {
-                if let Some((duration, video_tracks)) =
+            if work.existing_frames.is_empty()
+                && let Some((duration, video_tracks)) =
                     get_item_visual_meta(&mut self.conn, &sha256).await?
-                {
-                    let duration = duration.unwrap_or(0.0);
-                    if duration <= 0.0 || video_tracks.unwrap_or(0) <= 0 {
-                        tracing::debug!(
-                            path = %path.display(),
-                            "skipping video thumbnail generation due to missing video track"
-                        );
-                        // The same conclusion `build_new_item_renditions`
-                        // records for this video, and the one that matters
-                        // most: an item indexed before this cache existed has
-                        // never been through the new-item path, so without
-                        // this write every track-less video in an existing
-                        // library is re-dispatched and re-decided on every
-                        // scan, forever. Both kinds, honestly — this branch is
-                        // inside `existing_frames.is_empty()`, so nothing is
-                        // stored for either, and the decision came from
-                        // indexed metadata that only a re-index (new content,
-                        // new key) or a generator bump can change.
-                        self.record_visual_attempts(
-                            &[
-                                VisualVerdict::nothing(VisualKind::Thumbnail),
-                                VisualVerdict::nothing(VisualKind::Frame),
-                            ],
-                            &sha256,
-                            &mime_type,
-                        )
-                        .await;
-                        if !work.any() {
-                            return Ok(());
-                        }
-                        // A probe is still owed and needs neither frames nor a
-                        // duration to reach a verdict, so the dispatch goes
-                        // ahead with the thumbnail half switched off.
-                        work.thumbnail = false;
-                    } else {
-                        work.video_duration = duration;
+            {
+                let duration = duration.unwrap_or(0.0);
+                if duration <= 0.0 || video_tracks.unwrap_or(0) <= 0 {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "skipping video thumbnail generation due to missing video track"
+                    );
+                    // The same conclusion `build_new_item_renditions`
+                    // records for this video, and the one that matters
+                    // most: an item indexed before this cache existed has
+                    // never been through the new-item path, so without
+                    // this write every track-less video in an existing
+                    // library is re-dispatched and re-decided on every
+                    // scan, forever. Both kinds, honestly — this branch is
+                    // inside `existing_frames.is_empty()`, so nothing is
+                    // stored for either, and the decision came from
+                    // indexed metadata that only a re-index (new content,
+                    // new key) or a generator bump can change.
+                    self.record_visual_attempts(
+                        &[
+                            VisualVerdict::nothing(VisualKind::Thumbnail),
+                            VisualVerdict::nothing(VisualKind::Frame),
+                        ],
+                        &sha256,
+                        &mime_type,
+                    )
+                    .await;
+                    if !work.any() {
+                        return Ok(());
                     }
+                    // A probe is still owed and needs neither frames nor a
+                    // duration to reach a verdict, so the dispatch goes
+                    // ahead with the thumbnail half switched off.
+                    work.thumbnail = false;
+                } else {
+                    work.video_duration = duration;
                 }
             }
         }
@@ -4514,6 +4510,7 @@ fn passes_filescan_filter_stage1(
     evaluate_match(filter, &value)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn passes_filescan_filter_stage2(
     filter: Option<&Match>,
     path: &Path,
@@ -5669,14 +5666,14 @@ fn get_audio_thumbnail(path: &Path, mime_type: &str) -> DynamicImage {
                     .title()
                     .map(|value| value.to_string())
                     .unwrap_or_default();
-                if let Some(picture) = tag.pictures().first() {
-                    if let Ok(cover) = decode_image_bytes(picture.data()) {
-                        // Cover art gets no text overlay, but is capped in
-                        // size: embedded art can be arbitrarily large and
-                        // would otherwise be stored full-resolution in the
-                        // database.
-                        return downscale_cover_art(cover);
-                    }
+                if let Some(picture) = tag.pictures().first()
+                    && let Ok(cover) = decode_image_bytes(picture.data())
+                {
+                    // Cover art gets no text overlay, but is capped in
+                    // size: embedded art can be arbitrarily large and
+                    // would otherwise be stored full-resolution in the
+                    // database.
+                    return downscale_cover_art(cover);
                 }
             }
         }
@@ -5888,10 +5885,9 @@ fn extract_video_frames_into(
     }
 
     let mut frames = Vec::new();
-    let mut entries =
-        fs::read_dir(temp_dir).map_err(|err| FileProcessError::Io(err.to_string()))?;
+    let entries = fs::read_dir(temp_dir).map_err(|err| FileProcessError::Io(err.to_string()))?;
     let mut paths = Vec::new();
-    while let Some(entry) = entries.next() {
+    for entry in entries {
         let entry = entry.map_err(|err| FileProcessError::Io(err.to_string()))?;
         if entry.path().extension().and_then(|ext| ext.to_str()) == Some("png") {
             paths.push(entry.path());
@@ -6228,8 +6224,8 @@ pub(crate) fn get_last_modified_time_and_size(path: &Path) -> Result<(String, i6
     let metadata = fs::metadata(path)?;
     let size = metadata.len() as i64;
     let modified = metadata.modified()?;
-    let formatted = format_system_time(modified)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "unrepresentable mtime"))?;
+    let formatted =
+        format_system_time(modified).ok_or_else(|| io::Error::other("unrepresentable mtime"))?;
     Ok((formatted, size))
 }
 
@@ -6338,10 +6334,10 @@ pub(crate) fn deduplicate_paths(paths: &[String]) -> Vec<String> {
 
 pub(crate) fn normalize_path(path: &str, trailing: bool) -> PathBuf {
     let mut buf = PathBuf::from(path.trim());
-    if !buf.is_absolute() {
-        if let Ok(cwd) = env::current_dir() {
-            buf = cwd.join(buf);
-        }
+    if !buf.is_absolute()
+        && let Ok(cwd) = env::current_dir()
+    {
+        buf = cwd.join(buf);
     }
 
     let mut normalized = PathBuf::new();
@@ -6884,8 +6880,10 @@ mod tests {
         image.save(&image_path).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
 
         let service = FileScanService::new(
@@ -6983,8 +6981,10 @@ LIMIT 1
         let broken_path = broken.to_string_lossy().to_string();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
         let service = FileScanService::new(
             index_db.clone(),
@@ -7173,11 +7173,13 @@ LIMIT 1
         image::RgbImage::new(8, 8).save(&in_dot_root).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![
-            media_dir.to_string_lossy().to_string(),
-            dot_root.to_string_lossy().to_string(),
-        ];
+        let config = SystemConfig {
+            included_folders: vec![
+                media_dir.to_string_lossy().to_string(),
+                dot_root.to_string_lossy().to_string(),
+            ],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
         execute_folder_scan(
             &index_db,
@@ -7239,8 +7241,10 @@ LIMIT 1
         fs::write(&garbage, b"this claims to be a png and is not").unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
         execute_folder_scan(
             &index_db,
@@ -8944,8 +8948,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             .unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
         let service = FileScanService::new(
             index_db.clone(),
@@ -9174,8 +9180,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         fs::write(&small, &bytes[..bytes.len() * 6 / 10]).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
         let scan = || {
             execute_folder_scan(
@@ -9192,14 +9200,14 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         let (_, totals) = scan().await.unwrap();
         assert_eq!(totals.new_items, 2, "an undecodable image is still indexed");
         let mut conn = open_index_db_read(&index_db, &user_data_db).await.unwrap();
-        let indexed: Vec<(String, String, Option<i64>, Option<i64>, Option<String>)> =
-            sqlx::query_as(
-                "SELECT files.path, items.sha256, items.width, items.height, items.blurhash \
+        type IndexedRow = (String, String, Option<i64>, Option<i64>, Option<String>);
+        let indexed: Vec<IndexedRow> = sqlx::query_as(
+            "SELECT files.path, items.sha256, items.width, items.height, items.blurhash \
                  FROM items JOIN files ON files.item_id = items.id ORDER BY files.path",
-            )
-            .fetch_all(&mut conn)
-            .await
-            .unwrap();
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
         assert_eq!(indexed.len(), 2);
         let (large_sha, small_sha) = (indexed[0].1.clone(), indexed[1].1.clone());
         assert_eq!(
@@ -9413,8 +9421,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         image::RgbImage::new(8, 8).save(&vanishing).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
         let scan = || {
             execute_folder_scan(
@@ -9493,8 +9503,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         write_undecodable_png(&corrupt, 0.6);
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
         let scan = || {
             execute_folder_scan(
@@ -9581,8 +9593,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         write_undecodable_png(&corrupt, 0.6);
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
         let scan = || {
             execute_folder_scan(
@@ -9663,8 +9677,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             .unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
         let service = FileScanService::new(
             index_db.clone(),
@@ -9790,14 +9806,16 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         for dir in &media_dirs {
             fs::create_dir_all(dir).unwrap();
         }
-        let mut config = SystemConfig::default();
-        // Off by default, and the only indexable type whose generator fails
-        // without a fixture the repository would have to carry.
-        config.scan_pdf = true;
-        config.included_folders = media_dirs
-            .iter()
-            .map(|dir| dir.to_string_lossy().to_string())
-            .collect();
+        let config = SystemConfig {
+            // Off by default, and the only indexable type whose generator fails
+            // without a fixture the repository would have to carry.
+            scan_pdf: true,
+            included_folders: media_dirs
+                .iter()
+                .map(|dir| dir.to_string_lossy().to_string())
+                .collect(),
+            ..Default::default()
+        };
         SystemConfigStore::new(root.to_path_buf())
             .save(&index_db, &config)
             .unwrap();
@@ -10544,7 +10562,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             let frames = stored_frames(&mut conn, &sha256).await;
             assert_eq!(frames.len(), 4);
             assert!(
-                frames.iter().any(|frame| corner_is_card(frame)),
+                frames.iter().any(corner_is_card),
                 "the premise: a card frame is among the stored ones"
             );
             sha256
@@ -10564,7 +10582,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         let frames = stored_frames(&mut conn, &sha256).await;
         assert_eq!(frames.len(), 4, "replaced, not appended to");
         assert!(
-            !frames.iter().any(|frame| corner_is_card(frame)),
+            !frames.iter().any(corner_is_card),
             "every stored frame must now come from the content"
         );
         assert!(
@@ -10675,7 +10693,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             let frames = stored_frames(&mut conn, &sha256).await;
             assert_eq!(frames.len(), 4, "the frames were regenerated");
             assert!(
-                !frames.iter().any(|frame| corner_is_card(frame)),
+                !frames.iter().any(corner_is_card),
                 "the stored boundary must clamp a regeneration, not only the \
                  scan that discovered it"
             );
@@ -10695,7 +10713,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         let frames = stored_frames(&mut conn, &sha256).await;
         assert_eq!(frames.len(), 4);
         assert!(
-            frames.iter().any(|frame| corner_is_card(frame)),
+            frames.iter().any(corner_is_card),
             "with detection off a scan-side regeneration brings the untrimmed \
              visuals back — the storage.frames replacement undoing a false \
              positive has to go through"
@@ -11750,9 +11768,8 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // file I/O, and an SMB blip must not become a permanent verdict on a
         // file nobody could even read. The *stage* is what decides this, not
         // the error variant.
-        let (stage, err) = open_image_staged(dir.path().join("absent.png"))
-            .err()
-            .expect("a missing file must fail");
+        let (stage, err) =
+            open_image_staged(dir.path().join("absent.png")).expect_err("a missing file must fail");
         assert_eq!(stage, ImageStage::Open);
         let missing = FileProcessError::from_image_error(stage, err);
         assert!(
@@ -11769,9 +11786,8 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // one-shot verdict could suppress the finished file forever.
         let garbage = dir.path().join("garbage.png");
         fs::write(&garbage, b"definitely not an image").unwrap();
-        let (stage, err) = image_header_geometry(&garbage)
-            .err()
-            .expect("garbage has no parseable header");
+        let (stage, err) =
+            image_header_geometry(&garbage).expect_err("garbage has no parseable header");
         assert_eq!(stage, ImageStage::Header);
         let err = FileProcessError::from_image_error(stage, err);
         let failure = err.classified().expect("a header failure is recorded");
@@ -11782,9 +11798,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // The decode stage still classifies as the ambiguous input class
         // wherever it reaches the ledger: a decoder that reads as it goes
         // cannot settle a verdict alone.
-        let (stage, err) = open_image_staged(&garbage)
-            .err()
-            .expect("garbage must not decode");
+        let (stage, err) = open_image_staged(&garbage).expect_err("garbage must not decode");
         assert_eq!(stage, ImageStage::Decode);
         let err = FileProcessError::from_image_error(stage, err);
         let failure = err.classified().expect("a decode failure is recorded");
@@ -11893,8 +11907,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         fs::write(&huge, absurdly_wide_png(200_000_000)).unwrap();
 
         let (stage, err) = image_header_geometry(&huge)
-            .err()
-            .expect("a 200-million-pixel row must not fit the default cap");
+            .expect_err("a 200-million-pixel row must not fit the default cap");
         assert_eq!(stage, ImageStage::Header, "no pixel data was read: {err:?}");
         assert!(
             matches!(err, image::ImageError::Limits(_)),
@@ -12098,9 +12111,8 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
              indexes it with its real dimensions"
         );
 
-        let (stage, err) = open_image_staged(&truncated)
-            .err()
-            .expect("a truncated PNG must not decode");
+        let (stage, err) =
+            open_image_staged(&truncated).expect_err("a truncated PNG must not decode");
         assert_eq!(
             stage,
             ImageStage::Decode,
@@ -12686,12 +12698,14 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // Now the user's filter rejects exactly that file, at stage 1 — before
         // anything is hashed, and after the walk has reached it.
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
-        config.filescan_filter = Some(
-            serde_json::from_str(r#"{"match": {"eq": {"filename": "good.png"}}}"#)
-                .expect("the test filter must parse as PQL"),
-        );
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            filescan_filter: Some(
+                serde_json::from_str(r#"{"match": {"eq": {"filename": "good.png"}}}"#)
+                    .expect("the test filter must parse as PQL"),
+            ),
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
 
         FileScanService::new(
@@ -12740,8 +12754,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         image.save(&image_path).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
 
         let service = FileScanService::new(
@@ -12924,8 +12940,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         image::RgbImage::new(1400, 1400).save(&image_path).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
 
         let service = FileScanService::new(
@@ -13013,8 +13031,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         image.save(&image_path).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
 
         let service = FileScanService::new(
@@ -13062,8 +13082,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         image.save(&image_path).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
 
         let service = FileScanService::new(
@@ -13121,8 +13143,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         image.save(&image_path).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
 
         let service = FileScanService::new(
@@ -13161,8 +13185,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         let empty_dir = root.join("empty-watch-target");
         fs::create_dir_all(&empty_dir).unwrap();
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![empty_dir.to_string_lossy().into_owned()];
+        let config = SystemConfig {
+            included_folders: vec![empty_dir.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
 
         let service = FileScanService::new(
@@ -13203,8 +13229,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         image.save(&image_path).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![media_dir.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![media_dir.to_string_lossy().to_string()],
+            ..Default::default()
+        };
         store.save(&index_db, &config).unwrap();
 
         // Simulate an update that committed the folder registration and then

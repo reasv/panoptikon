@@ -450,10 +450,11 @@ fn db_lists() -> Result<(Vec<String>, Vec<String>), ApiError> {
             ApiError::internal("Failed to read database list")
         })?;
         let path = entry.path();
-        if path.is_dir() && path.join("index.db").exists() {
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                index_dbs.push(name.to_string());
-            }
+        if path.is_dir()
+            && path.join("index.db").exists()
+            && let Some(name) = path.file_name().and_then(|name| name.to_str())
+        {
+            index_dbs.push(name.to_string());
         }
     }
 
@@ -468,10 +469,10 @@ fn db_lists() -> Result<(Vec<String>, Vec<String>), ApiError> {
             ApiError::internal("Failed to read database list")
         })?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("db") {
-            if let Some(stem) = path.file_stem().and_then(|name| name.to_str()) {
-                user_data_dbs.push(stem.to_string());
-            }
+        if path.extension().and_then(|ext| ext.to_str()) == Some("db")
+            && let Some(stem) = path.file_stem().and_then(|name| name.to_str())
+        {
+            user_data_dbs.push(stem.to_string());
         }
     }
 
@@ -484,23 +485,23 @@ fn check_dbs(index_db: Option<&str>, user_data_db: Option<&str>) -> Result<(), A
     }
 
     let (index_dbs, user_data_dbs) = db_lists()?;
-    if let Some(index_db) = index_db {
-        if !index_dbs.iter().any(|entry| entry == index_db) {
-            return Err(ApiError::not_found(format!(
-                "Index database {index_db} not found"
-            )));
-        }
+    if let Some(index_db) = index_db
+        && !index_dbs.iter().any(|entry| entry == index_db)
+    {
+        return Err(ApiError::not_found(format!(
+            "Index database {index_db} not found"
+        )));
     }
 
     // Python reports this as "Index database ... not found" (copy-paste bug
     // in api/routers/utils.py); deliberately diverge — the wrong label sends
     // people hunting for a missing index DB when it is the user-data DB.
-    if let Some(user_data_db) = user_data_db {
-        if !user_data_dbs.iter().any(|entry| entry == user_data_db) {
-            return Err(ApiError::not_found(format!(
-                "User data database {user_data_db} not found"
-            )));
-        }
+    if let Some(user_data_db) = user_data_db
+        && !user_data_dbs.iter().any(|entry| entry == user_data_db)
+    {
+        return Err(ApiError::not_found(format!(
+            "User data database {user_data_db} not found"
+        )));
     }
 
     Ok(())
@@ -676,35 +677,33 @@ async fn connect_db(
         conn
     };
 
-    if attach_user_data {
-        if !write_lock || user_data_wl {
-            let user_data_path = user_data_attach_path(&paths.user_db_file, !user_data_wl);
-            sqlx::query("ATTACH DATABASE ? AS user_data")
-                .bind(user_data_path)
+    if attach_user_data && (!write_lock || user_data_wl) {
+        let user_data_path = user_data_attach_path(&paths.user_db_file, !user_data_wl);
+        sqlx::query("ATTACH DATABASE ? AS user_data")
+            .bind(user_data_path)
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to attach user data database");
+                ApiError::internal("Failed to open database")
+            })?;
+        if user_data_wl {
+            sqlx::query("PRAGMA user_data.journal_mode=WAL")
                 .execute(&mut conn)
                 .await
                 .map_err(|err| {
-                    tracing::error!(error = %err, "failed to attach user data database");
+                    tracing::error!(error = %err, "failed to enable WAL for user data");
                     ApiError::internal("Failed to open database")
                 })?;
-            if user_data_wl {
-                sqlx::query("PRAGMA user_data.journal_mode=WAL")
-                    .execute(&mut conn)
-                    .await
-                    .map_err(|err| {
-                        tracing::error!(error = %err, "failed to enable WAL for user data");
-                        ApiError::internal("Failed to open database")
-                    })?;
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "PRAGMA user_data.journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"
-                )))
-                .execute(&mut conn)
-                .await
-                .map_err(|err| {
-                    tracing::error!(error = %err, "failed to set WAL size limit for user data");
-                    ApiError::internal("Failed to open database")
-                })?;
-            }
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA user_data.journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"
+            )))
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to set WAL size limit for user data");
+                ApiError::internal("Failed to open database")
+            })?;
         }
     }
 

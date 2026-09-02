@@ -594,8 +594,7 @@ pub(crate) async fn get_text_by_ids(
         return Ok(Vec::new());
     }
 
-    let placeholders = std::iter::repeat("?")
-        .take(text_ids.len())
+    let placeholders = std::iter::repeat_n("?", text_ids.len())
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
@@ -747,8 +746,7 @@ pub(crate) async fn get_all_tags_for_item(
     );
 
     if !setters.is_empty() {
-        let placeholders = std::iter::repeat("?")
-            .take(setters.len())
+        let placeholders = std::iter::repeat_n("?", setters.len())
             .collect::<Vec<_>>()
             .join(", ");
         sql.push_str(&format!(" AND setters.name IN ({placeholders})"));
@@ -895,7 +893,7 @@ pub(crate) async fn get_all_mime_types(
         mime_types.push(mime_type);
     }
 
-    mime_types.extend(general_types.into_iter());
+    mime_types.extend(general_types);
     mime_types.sort();
     Ok(mime_types)
 }

@@ -330,6 +330,9 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Panoptikon Desktop");
     app.run(|app, event| {
+        // Only the macOS-only Reopen arm below reads `app`.
+        #[cfg(not(target_os = "macos"))]
+        let _ = &app;
         match event {
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen {
@@ -821,11 +824,10 @@ pub(crate) async fn open_pending_action(app: &AppHandle) {
         .state::<RuntimeState>()
         .pending_open
         .swap(false, Ordering::AcqRel)
+        && let Err(error) = open_action_inner(app).await
     {
-        if let Err(error) = open_action_inner(app).await {
-            tracing::warn!(%error, "failed to fulfill pending Desktop open action");
-            let _ = show_control_window(app, true);
-        }
+        tracing::warn!(%error, "failed to fulfill pending Desktop open action");
+        let _ = show_control_window(app, true);
     }
 }
 
@@ -942,7 +944,7 @@ impl SetupMode {
 fn show_setup_window(app: &AppHandle, port: u16, mode: SetupMode) -> tauri::Result<()> {
     let url = local_browser_url(port, &format!("/desktop/setup?mode={}", mode.query()))
         .parse()
-        .map_err(|error| tauri::Error::InvalidUrl(error))?;
+        .map_err(tauri::Error::InvalidUrl)?;
     let window = if let Some(window) = app.get_webview_window("launch") {
         window.navigate(url)?;
         window.set_title(mode.title())?;

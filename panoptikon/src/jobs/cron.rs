@@ -89,10 +89,10 @@ fn reschedule(
     now: DateTime<Local>,
 ) -> Option<DbCronState> {
     let cron_string = cron_string?;
-    if let Some(prev) = prev {
-        if prev.cron_string == cron_string {
-            return Some(prev);
-        }
+    if let Some(prev) = prev
+        && prev.cron_string == cron_string
+    {
+        return Some(prev);
     }
     let cron = Cron::from_str(cron_string).ok()?;
     // inclusive=false: strictly after `now`, like croniter's get_next.
@@ -386,9 +386,11 @@ impl Actor for CronSchedulerActor {
         myself: ActorRef<Self::Msg>,
         _args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let _ = myself.send_interval(RactorDuration::from_secs(TICK_INTERVAL_SECS), || {
-            CronSchedulerMessage::Tick
-        });
+        drop(
+            myself.send_interval(RactorDuration::from_secs(TICK_INTERVAL_SECS), || {
+                CronSchedulerMessage::Tick
+            }),
+        );
         // Initial tick right away so schedules and preload initialize at
         // startup, mirroring the Python lifespan's immediate first run.
         let _ = myself.cast(CronSchedulerMessage::Tick);
@@ -555,10 +557,8 @@ async fn tick_schedule(state: &mut CronSchedulerState, index_db: &str) -> Option
     if let Some(next) = next {
         state.schedules.insert(index_db.to_string(), next);
     }
-    if !had_schedule {
-        if let Some(next_fire) = next_fire {
-            tracing::info!(index_db, next_run = %next_fire, "cron schedule active");
-        }
+    if !had_schedule && let Some(next_fire) = next_fire {
+        tracing::info!(index_db, next_run = %next_fire, "cron schedule active");
     }
 
     if fire {
@@ -686,7 +686,7 @@ pub(crate) async fn ensure_cron_scheduler() -> ApiResult<ActorRef<CronSchedulerM
             Ok(actor)
         })
         .await
-        .map(Clone::clone)
+        .cloned()
 }
 
 /// Stops the scheduler at process shutdown so no further tick can enqueue

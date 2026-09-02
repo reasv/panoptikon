@@ -57,9 +57,7 @@ fn parse_npy_f32(buffer: &[u8]) -> Result<Vec<f32>, String> {
     let row_len = if shape.len() == 1 { shape[0] } else { shape[1] };
     let mut values = Vec::with_capacity(row_len);
     for idx in 0..row_len {
-        let elem_index = if shape.len() == 1 {
-            idx
-        } else if !fortran {
+        let elem_index = if shape.len() == 1 || !fortran {
             idx
         } else {
             idx.checked_mul(shape[0])
@@ -266,7 +264,7 @@ fn parse_scalar(slice: &[u8], dtype: NpyDtype, little_endian: bool) -> Result<f3
 
 fn read_u8(slice: &[u8]) -> Result<u8, String> {
     slice
-        .get(0)
+        .first()
         .copied()
         .ok_or_else(|| "Numpy data truncated".to_string())
 }

@@ -510,26 +510,25 @@ async fn wait_for_readiness(app: &AppHandle, generation: u64, port: u16) -> anyh
                     supervisor.set_state(app, LifecycleState::SettingUp).await;
                 }
             }
-            if let Ok(response) = client.get(&ui).send().await {
-                if response.status().is_success()
-                    && response
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|value| value.contains("text/html"))
-                {
-                    let child_is_still_running = app
-                        .state::<Arc<Supervisor>>()
-                        .child
-                        .lock()
-                        .await
-                        .as_ref()
-                        .is_some_and(|running| running.generation == generation);
-                    if child_is_still_running {
-                        return Ok(());
-                    }
-                    bail!("Server sidecar exited during readiness checks");
+            if let Ok(response) = client.get(&ui).send().await
+                && response.status().is_success()
+                && response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|value| value.contains("text/html"))
+            {
+                let child_is_still_running = app
+                    .state::<Arc<Supervisor>>()
+                    .child
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|running| running.generation == generation);
+                if child_is_still_running {
+                    return Ok(());
                 }
+                bail!("Server sidecar exited during readiness checks");
             }
         }
         tokio::time::sleep(delay).await;

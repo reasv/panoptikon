@@ -376,10 +376,10 @@ pub(crate) fn normalize_folder_list(folder_list: &[String]) -> Vec<String> {
 fn normalize_path(path: &str) -> String {
     let trimmed = path.trim();
     let mut buf = PathBuf::from(trimmed);
-    if !buf.is_absolute() {
-        if let Ok(cwd) = env::current_dir() {
-            buf = cwd.join(buf);
-        }
+    if !buf.is_absolute()
+        && let Ok(cwd) = env::current_dir()
+    {
+        buf = cwd.join(buf);
     }
 
     let mut normalized = PathBuf::new();

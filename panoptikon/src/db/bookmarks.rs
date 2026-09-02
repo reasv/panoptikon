@@ -277,6 +277,7 @@ pub(crate) async fn get_all_bookmark_users(
     Ok(users)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_bookmarks(
     conn: &mut sqlx::SqliteConnection,
     namespace: &str,

@@ -78,6 +78,26 @@ async fn check_frame_budget(inputs: &[InferenceInput], budget: usize) -> ApiResu
     Ok(())
 }
 
+pub(super) fn apply_threshold(
+    mut inputs: Vec<InferenceInput>,
+    threshold: Option<f64>,
+) -> Vec<InferenceInput> {
+    let Some(threshold) = threshold else {
+        return inputs;
+    };
+    for input in &mut inputs {
+        if let Value::Object(map) = &mut input.data {
+            map.insert("threshold".to_string(), Value::from(threshold));
+        } else {
+            input.data = Value::Object(serde_json::Map::from_iter([(
+                "threshold".to_string(),
+                Value::from(threshold),
+            )]));
+        }
+    }
+    inputs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,24 +130,4 @@ mod tests {
                 .is_ok()
         );
     }
-}
-
-pub(super) fn apply_threshold(
-    mut inputs: Vec<InferenceInput>,
-    threshold: Option<f64>,
-) -> Vec<InferenceInput> {
-    let Some(threshold) = threshold else {
-        return inputs;
-    };
-    for input in &mut inputs {
-        if let Value::Object(map) = &mut input.data {
-            map.insert("threshold".to_string(), Value::from(threshold));
-        } else {
-            input.data = Value::Object(serde_json::Map::from_iter([(
-                "threshold".to_string(),
-                Value::from(threshold),
-            )]));
-        }
-    }
-    inputs
 }

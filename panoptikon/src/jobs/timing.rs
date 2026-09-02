@@ -62,10 +62,10 @@ impl PhaseTimer {
         let mut inner = self.inner.lock().expect("phase timer poisoned");
         inner.work_secs += span_work;
         inner.in_flight = inner.in_flight.saturating_sub(1);
-        if inner.in_flight == 0 {
-            if let Some(start) = inner.span_start.take() {
-                inner.busy_secs += start.elapsed().as_secs_f64();
-            }
+        if inner.in_flight == 0
+            && let Some(start) = inner.span_start.take()
+        {
+            inner.busy_secs += start.elapsed().as_secs_f64();
         }
     }
 }

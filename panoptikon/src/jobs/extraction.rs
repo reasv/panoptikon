@@ -574,10 +574,7 @@ async fn run_extraction_job_inner(
 
     let remaining_after = {
         let mut count_conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
-        let remaining =
-            run_compiled_count(&mut count_conn, &compiled_count.sql, &compiled_count.params)
-                .await?;
-        remaining
+        run_compiled_count(&mut count_conn, &compiled_count.sql, &compiled_count.params).await?
     };
 
     let (final_update, failure, processed_data) = {
@@ -1634,7 +1631,7 @@ fn map_row_err(err: sqlx::Error) -> ApiError {
 fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQuery> {
     let mut filters = Vec::new();
     if !model.input_mime_types.is_empty() {
-        filters.push(QueryElement::Match(Match {
+        filters.push(QueryElement::Match(Box::new(Match {
             match_: Matches::Ops(MatchOps {
                 startswith: Some(MatchValues {
                     r#type: Some(OneOrMany::Many(model.input_mime_types.clone())),
@@ -1642,7 +1639,7 @@ fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQ
                 }),
                 ..Default::default()
             }),
-        }));
+        })));
     }
 
     if model.skip_processed_items {
@@ -1685,10 +1682,12 @@ fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQ
         Some(QueryElement::And(AndOperator { and_: filters }))
     };
 
-    let mut pql = PqlQuery::default();
-    pql.query = query;
-    pql.page_size = 0;
-    pql.check_path = false;
+    let mut pql = PqlQuery {
+        query,
+        page_size: 0,
+        check_path: false,
+        ..Default::default()
+    };
 
     match model.target_entities.as_slice() {
         [value] if value == "items" => {
@@ -1794,10 +1793,10 @@ pub(crate) fn resolve_job_defaults(
             if let Some(default_batch) = setting.default_batch_size {
                 chosen_batch = default_batch;
             }
-            if model.default_threshold.is_some() {
-                if let Some(default_threshold) = setting.default_threshold {
-                    chosen_threshold = Some(default_threshold);
-                }
+            if model.default_threshold.is_some()
+                && let Some(default_threshold) = setting.default_threshold
+            {
+                chosen_threshold = Some(default_threshold);
             }
         }
     }
@@ -1808,18 +1807,18 @@ pub(crate) fn resolve_job_defaults(
             if let Some(default_batch) = setting.default_batch_size {
                 chosen_batch = default_batch;
             }
-            if model.default_threshold.is_some() {
-                if let Some(default_threshold) = setting.default_threshold {
-                    chosen_threshold = Some(default_threshold);
-                }
+            if model.default_threshold.is_some()
+                && let Some(default_threshold) = setting.default_threshold
+            {
+                chosen_threshold = Some(default_threshold);
             }
         }
     }
 
-    if let Some(batch) = batch_size {
-        if batch > 0 {
-            chosen_batch = batch;
-        }
+    if let Some(batch) = batch_size
+        && batch > 0
+    {
+        chosen_batch = batch;
     }
     if threshold.is_some() {
         chosen_threshold = threshold;

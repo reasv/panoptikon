@@ -51,6 +51,7 @@ impl InferencePool {
     /// remaining endpoint before giving up — one endpoint being down costs
     /// latency on its share of requests, not failed items (matching the
     /// Python distributed client's shard retry).
+    #[allow(clippy::too_many_arguments)]
     pub async fn predict(
         &self,
         inference_id: &str,

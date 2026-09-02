@@ -176,7 +176,7 @@ impl TokenKey {
 
         let mut mac = HmacSha256::new_from_slice(&self.0).expect("HMAC accepts any key length");
         // The signed message is everything before the tag separator.
-        mac.update(token[..token.len() - tag_hex.len() - 1].as_bytes());
+        mac.update(&token.as_bytes()[..token.len() - tag_hex.len() - 1]);
         // Constant-time comparison: verify_slice goes through subtle's
         // CtOption, never a byte-by-byte early-exit compare.
         mac.verify_slice(&tag).map_err(|_| TokenError::BadHmac)?;

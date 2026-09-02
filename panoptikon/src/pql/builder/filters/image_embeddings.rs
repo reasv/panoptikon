@@ -119,11 +119,12 @@ fn default_embed_args() -> Option<EmbedArgs> {
 }
 
 fn default_sort_asc() -> SortableOptions {
-    let mut options = SortableOptions::default();
-    options.order_by = true;
-    options.direction = OrderDirection::Asc;
-    options.row_n_direction = OrderDirection::Asc;
-    options
+    SortableOptions {
+        order_by: true,
+        direction: OrderDirection::Asc,
+        row_n_direction: OrderDirection::Asc,
+        ..Default::default()
+    }
 }
 
 /// Which vector payload the candidate skeleton joins.
@@ -248,23 +249,22 @@ impl SemanticImageSearch {
                     .collect::<Vec<_>>();
                 conditions.push(Expr::col((src_setters.clone(), Setters::Name)).is_in(setters));
             }
-            if let Some(languages) = &src_args.languages {
-                if !languages.is_empty() {
-                    join_text = true;
-                    let values = languages.iter().cloned().map(Expr::val).collect::<Vec<_>>();
-                    conditions.push(
-                        Expr::col((ExtractedText::Table, ExtractedText::Language)).is_in(values),
-                    );
-                }
+            if let Some(languages) = &src_args.languages
+                && !languages.is_empty()
+            {
+                join_text = true;
+                let values = languages.iter().cloned().map(Expr::val).collect::<Vec<_>>();
+                conditions
+                    .push(Expr::col((ExtractedText::Table, ExtractedText::Language)).is_in(values));
             }
-            if let Some(min_confidence) = src_args.min_confidence {
-                if min_confidence > 0.0 {
-                    join_text = true;
-                    conditions.push(
-                        Expr::col((ExtractedText::Table, ExtractedText::Confidence))
-                            .gte(min_confidence),
-                    );
-                }
+            if let Some(min_confidence) = src_args.min_confidence
+                && min_confidence > 0.0
+            {
+                join_text = true;
+                conditions.push(
+                    Expr::col((ExtractedText::Table, ExtractedText::Confidence))
+                        .gte(min_confidence),
+                );
             }
             if src_args.min_language_confidence > 0.0 {
                 join_text = true;
@@ -280,14 +280,13 @@ impl SemanticImageSearch {
                         .gte(src_args.min_length),
                 );
             }
-            if let Some(max_length) = src_args.max_length {
-                if max_length > 0 {
-                    join_text = true;
-                    conditions.push(
-                        Expr::col((ExtractedText::Table, ExtractedText::TextLength))
-                            .lte(max_length),
-                    );
-                }
+            if let Some(max_length) = src_args.max_length
+                && max_length > 0
+            {
+                join_text = true;
+                conditions.push(
+                    Expr::col((ExtractedText::Table, ExtractedText::TextLength)).lte(max_length),
+                );
             }
             if src_args.confidence_weight != 0.0 || src_args.language_confidence_weight != 0.0 {
                 join_text = true;

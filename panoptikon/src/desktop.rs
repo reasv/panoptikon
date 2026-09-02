@@ -36,6 +36,7 @@ impl RootLock {
         let path = runtime.join("server.lock");
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)

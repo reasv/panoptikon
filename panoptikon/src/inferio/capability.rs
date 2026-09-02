@@ -169,12 +169,12 @@ fn find_nvidia_smi() -> Option<PathBuf> {
             }
         }
     }
-    if cfg!(windows) {
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            let candidate = Path::new(&root).join("System32/nvidia-smi.exe");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    if cfg!(windows)
+        && let Some(root) = std::env::var_os("SystemRoot")
+    {
+        let candidate = Path::new(&root).join("System32/nvidia-smi.exe");
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
     None

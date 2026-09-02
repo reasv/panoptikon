@@ -213,8 +213,10 @@ pub(super) fn generate_new_item_visuals(
         build_new_item_renditions(path, mime_type, metadata, outro.content_end_ms(), formats);
     drop(thumb_span);
 
-    let mut visuals = GeneratedVisuals::default();
-    visuals.outro = outro.record;
+    let mut visuals = GeneratedVisuals {
+        outro: outro.record,
+        ..Default::default()
+    };
     let blurhash_source = match attempt {
         Ok(produced) => {
             visuals.thumbnails = produced.thumbnails;
@@ -2639,15 +2641,14 @@ mod tests {
         // open that never decoded anything is this machine's problem, a decode
         // is a verdict on the content, and the configurable memory ceiling is
         // a budget rather than a property of the file.
-        let (stage, err) = open_image_staged(dir.path().join("absent.png"))
-            .err()
-            .expect("a missing file must fail");
+        let (stage, err) =
+            open_image_staged(dir.path().join("absent.png")).expect_err("a missing file must fail");
         let missing = FileProcessError::visuals_from_image_error(stage, err);
         assert!(missing.visual_failure().is_none(), "{missing:?}");
 
         let garbage = dir.path().join("garbage.png");
         fs::write(&garbage, b"definitely not an image").unwrap();
-        let (stage, err) = open_image_staged(&garbage).err().expect("must not decode");
+        let (stage, err) = open_image_staged(&garbage).expect_err("must not decode");
         expect(
             FileProcessError::visuals_from_image_error(stage, err),
             ApiErrorKind::Input,

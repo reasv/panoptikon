@@ -227,7 +227,9 @@ pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>,
                 Ok(None)
             }
         }
-        QueryElement::Match(filter) => Ok(filter.validate().map(QueryElement::Match)),
+        QueryElement::Match(filter) => {
+            Ok(filter.validate().map(|f| QueryElement::Match(Box::new(f))))
+        }
         QueryElement::MatchPath(filter) => Ok(filter.validate().map(QueryElement::MatchPath)),
         QueryElement::MatchText(filter) => Ok(filter.validate().map(QueryElement::MatchText)),
         QueryElement::SemanticTextSearch(filter) => filter
@@ -512,7 +514,9 @@ fn preprocess_query_async_inner<'a, 'b>(
                     Ok(None)
                 }
             }
-            QueryElement::Match(filter) => Ok(filter.validate().map(QueryElement::Match)),
+            QueryElement::Match(filter) => {
+                Ok(filter.validate().map(|f| QueryElement::Match(Box::new(f))))
+            }
             QueryElement::MatchPath(filter) => Ok(filter.validate().map(QueryElement::MatchPath)),
             QueryElement::MatchText(filter) => Ok(filter.validate().map(QueryElement::MatchText)),
             QueryElement::SemanticTextSearch(filter) => filter
@@ -822,12 +826,11 @@ impl SimilarTo {
         if self.similar_to.model.trim().is_empty() {
             return Ok(None);
         }
-        if !self.similar_to.force_distance_function.unwrap_or(false) {
-            if let Some(override_fn) =
+        if !self.similar_to.force_distance_function.unwrap_or(false)
+            && let Some(override_fn) =
                 get_distance_func_override(state, &self.similar_to.model).await?
-            {
-                self.similar_to.distance_function = override_fn;
-            }
+        {
+            self.similar_to.distance_function = override_fn;
         }
         self.similar_to._quant = resolve_vector_quant(
             state,
@@ -954,17 +957,17 @@ fn embedding_from_predict(response: PredictResponse) -> Result<Vec<u8>, PqlError
 
 fn embedding_from_json_value(value: &Value) -> Result<Vec<u8>, PqlError> {
     if let Some(obj) = value.as_object() {
-        if let Some(Value::String(kind)) = obj.get("__type__") {
-            if kind == "base64" {
-                let content = obj
-                    .get("content")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| PqlError::invalid("base64 output missing content"))?;
-                let decoded = general_purpose::STANDARD
-                    .decode(content.as_bytes())
-                    .map_err(|err| PqlError::invalid(format!("invalid base64 output: {err}")))?;
-                return embedding_from_npy_bytes(&decoded).map_err(PqlError::invalid);
-            }
+        if let Some(Value::String(kind)) = obj.get("__type__")
+            && kind == "base64"
+        {
+            let content = obj
+                .get("content")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| PqlError::invalid("base64 output missing content"))?;
+            let decoded = general_purpose::STANDARD
+                .decode(content.as_bytes())
+                .map_err(|err| PqlError::invalid(format!("invalid base64 output: {err}")))?;
+            return embedding_from_npy_bytes(&decoded).map_err(PqlError::invalid);
         }
         if let Some(Value::Array(array)) = obj.get("embedding") {
             return embedding_from_json_array(array);
@@ -974,10 +977,10 @@ fn embedding_from_json_value(value: &Value) -> Result<Vec<u8>, PqlError> {
         if array.is_empty() {
             return Err(PqlError::invalid("inference output embedding is empty"));
         }
-        if let Some(first) = array.first() {
-            if let Some(nested) = first.as_array() {
-                return embedding_from_json_array(nested);
-            }
+        if let Some(first) = array.first()
+            && let Some(nested) = first.as_array()
+        {
+            return embedding_from_json_array(nested);
         }
         return embedding_from_json_array(array);
     }

@@ -89,16 +89,12 @@ pub(crate) struct DeleteNamespaceQuery {
 
 #[derive(Deserialize, Copy, Clone, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub(crate) enum BookmarkOrderBy {
     LastModified,
     Path,
+    #[default]
     TimeAdded,
-}
-
-impl Default for BookmarkOrderBy {
-    fn default() -> Self {
-        BookmarkOrderBy::TimeAdded
-    }
 }
 
 #[derive(Deserialize, Copy, Clone, ToSchema)]
@@ -427,6 +423,7 @@ async fn load_bookmark_users(conn: &mut sqlx::SqliteConnection) -> ApiResult<Boo
     Ok(BookmarkUsers { users })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_bookmarks_by_namespace(
     conn: &mut sqlx::SqliteConnection,
     namespace: &str,
@@ -639,12 +636,11 @@ fn resolve_metadata(metadata: Option<&Value>, sha256: &str) -> Option<Value> {
     if !is_truthy(metadata) {
         return None;
     }
-    if let Value::Object(map) = metadata {
-        if let Some(entry) = map.get(sha256) {
-            if is_truthy(entry) {
-                return Some(entry.clone());
-            }
-        }
+    if let Value::Object(map) = metadata
+        && let Some(entry) = map.get(sha256)
+        && is_truthy(entry)
+    {
+        return Some(entry.clone());
     }
     Some(metadata.clone())
 }

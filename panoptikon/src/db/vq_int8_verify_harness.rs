@@ -504,11 +504,13 @@ async fn vq_int8_verify_resolve() {
 
     for setter in &setters {
         let resolved = match &default_name {
-            Some(name) => {
-                crate::db::vector_quants::resolve_ready_pair(&mut conn, name, &[setter.clone()])
-                    .await
-                    .expect("resolve ready pair")
-            }
+            Some(name) => crate::db::vector_quants::resolve_ready_pair(
+                &mut conn,
+                name,
+                std::slice::from_ref(setter),
+            )
+            .await
+            .expect("resolve ready pair"),
             None => None,
         };
         match resolved {

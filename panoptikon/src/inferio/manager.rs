@@ -313,10 +313,10 @@ impl CacheState {
                 if self.pins.get(inference_id).copied().unwrap_or(0) > 0 {
                     continue;
                 }
-                if let Expiration::At(at) = expiration {
-                    if now > *at {
-                        expired.push((cache_key.clone(), inference_id.clone()));
-                    }
+                if let Expiration::At(at) = expiration
+                    && now > *at
+                {
+                    expired.push((cache_key.clone(), inference_id.clone()));
                 }
             }
         }
@@ -357,10 +357,10 @@ impl CacheState {
         now: DateTime<Local>,
     ) {
         self.unpin(inference_id);
-        if let Some(lru) = self.lru_caches.get_mut(cache_key) {
-            if let Some(expiration) = lru.get_mut(inference_id) {
-                *expiration = Expiration::new(ttl_seconds, now);
-            }
+        if let Some(lru) = self.lru_caches.get_mut(cache_key)
+            && let Some(expiration) = lru.get_mut(inference_id)
+        {
+            *expiration = Expiration::new(ttl_seconds, now);
         }
     }
 
@@ -594,6 +594,7 @@ impl ModelManager {
     /// TTL afterwards whether the predict succeeded or not (Python's
     /// `finally`). `prewarm_hint` as on [`ModelManager::load_model`]; it
     /// only matters when this predict is the one that auto-loads the model.
+    #[allow(clippy::too_many_arguments)]
     pub async fn predict(
         &self,
         inference_id: &str,
@@ -781,10 +782,10 @@ impl ModelManager {
         // the caller's existing shutdown envelope).
         let drain = async {
             for handle in handles {
-                if let Err(err) = handle.await {
-                    if err.is_panic() {
-                        tracing::error!("inferio dispatcher task panicked during shutdown: {err}");
-                    }
+                if let Err(err) = handle.await
+                    && err.is_panic()
+                {
+                    tracing::error!("inferio dispatcher task panicked during shutdown: {err}");
                 }
             }
         };

@@ -668,43 +668,43 @@ impl Actor for JobQueueActor {
                 let _ = reply.send(Ok(result));
             }
             JobQueueMessage::RunnerFinished { queue_id, result } => {
-                if let Some(running) = state.running_job.as_ref() {
-                    if running.queue_id == queue_id {
-                        let finished = running.clone();
-                        let error = result.error.clone();
-                        record_outcome(
-                            state,
+                if let Some(running) = state.running_job.as_ref()
+                    && running.queue_id == queue_id
+                {
+                    let finished = running.clone();
+                    let error = result.error.clone();
+                    record_outcome(
+                        state,
+                        queue_id,
+                        if result.success {
+                            JobOutcomeStatus::Completed
+                        } else {
+                            JobOutcomeStatus::Failed
+                        },
+                        error.clone(),
+                    );
+                    if !result.success {
+                        tracing::error!(
+                            error = %error.unwrap_or_else(|| "unknown job error".to_string()),
                             queue_id,
-                            if result.success {
-                                JobOutcomeStatus::Completed
-                            } else {
-                                JobOutcomeStatus::Failed
-                            },
-                            error.clone(),
+                            "job failed"
                         );
-                        if !result.success {
-                            tracing::error!(
-                                error = %error.unwrap_or_else(|| "unknown job error".to_string()),
-                                queue_id,
-                                "job failed"
-                            );
-                        }
-                        state.running_job = None;
-                        record_owed(state, &finished, result.summary);
-                        record_batch_load(state, &finished, result.success, result.loaded_model);
-                        // Before starting the next job, so the synthesized
-                        // job is in the queue the two decisions below read.
-                        // It goes to the *back*, so a drained queue runs it
-                        // now and a busy one runs it after everything else.
-                        maybe_schedule_maintenance(state, &finished);
-                        // After synthesis so the model-continuity rule reads
-                        // the queue it will actually run. Belt-and-braces
-                        // rather than load-bearing: `next_batch_setter` skips
-                        // `DbMaintenance`, so today the decision is the same
-                        // either way and no test can tell the orders apart.
-                        maybe_unload_batch_model(state);
-                        start_next_job(state).await;
                     }
+                    state.running_job = None;
+                    record_owed(state, &finished, result.summary);
+                    record_batch_load(state, &finished, result.success, result.loaded_model);
+                    // Before starting the next job, so the synthesized
+                    // job is in the queue the two decisions below read.
+                    // It goes to the *back*, so a drained queue runs it
+                    // now and a busy one runs it after everything else.
+                    maybe_schedule_maintenance(state, &finished);
+                    // After synthesis so the model-continuity rule reads
+                    // the queue it will actually run. Belt-and-braces
+                    // rather than load-bearing: `next_batch_setter` skips
+                    // `DbMaintenance`, so today the decision is the same
+                    // either way and no test can tell the orders apart.
+                    maybe_unload_batch_model(state);
+                    start_next_job(state).await;
                 }
             }
             JobQueueMessage::RecordOwed { index_db, summary } => {
@@ -1504,7 +1504,7 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
             }
             let outcome = extraction::run_extraction_job(job.clone())
                 .await
-                .map_err(|err| format!("{err}"))?;
+                .map_err(|err| err.to_string())?;
             let quant = vector_quants::finishing_phase(&job.index_db).await;
             let mut success = JobSuccess::from_extraction(outcome);
             success.summary.or_with(quant);
@@ -1513,7 +1513,7 @@ async fn execute_job(job: Job) -> Result<JobSuccess, String> {
         JobType::DataDeletion => {
             let summary = extraction::run_data_deletion_job(job.clone())
                 .await
-                .map_err(|err| format!("{err}"))?;
+                .map_err(|err| err.to_string())?;
             let quant = vector_quants::finishing_phase(&job.index_db).await;
             let mut summary = summary;
             summary.or_with(quant);
@@ -1760,7 +1760,7 @@ async fn ensure_job_queue() -> ApiResult<ActorRef<JobQueueMessage>> {
             Ok(actor)
         })
         .await
-        .map(Clone::clone)
+        .cloned()
 }
 
 #[cfg(test)]

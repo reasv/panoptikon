@@ -19,7 +19,7 @@ pub(super) async fn handle_tags_output(
 ) -> ApiResult<OutputDisposition> {
     let values = outputs.into_json("tags")?;
     if values.is_empty() {
-        let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
             job_id,
             setter_name: model.setter_name.clone(),
             item_sha256: item.sha256.clone(),
@@ -51,7 +51,7 @@ pub(super) async fn handle_tags_output(
         })
         .sum();
     if total_tag_groups == 0 {
-        let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
             job_id,
             setter_name: model.setter_name.clone(),
             item_sha256: item.sha256.clone(),
@@ -89,7 +89,7 @@ pub(super) async fn handle_tags_output(
     }
 
     if tags.is_empty() {
-        let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
             job_id,
             setter_name: model.setter_name.clone(),
             item_sha256: item.sha256.clone(),

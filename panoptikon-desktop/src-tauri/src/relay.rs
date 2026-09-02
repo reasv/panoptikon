@@ -306,10 +306,10 @@ pub fn load_config(
                 }
                 migrated = true;
             }
-            if recover_interrupted_actions(&mut config.actions) {
-                if let Err(error) = save_actions(&sidecar, &config.actions) {
-                    tracing::warn!(%error, path = %sidecar.display(), "failed to persist recovered Relay actions");
-                }
+            if recover_interrupted_actions(&mut config.actions)
+                && let Err(error) = save_actions(&sidecar, &config.actions)
+            {
+                tracing::warn!(%error, path = %sidecar.display(), "failed to persist recovered Relay actions");
             }
             if config.bind == LEGACY_DEFAULT_BIND {
                 config.bind = RelayConfig::desktop_default(development).bind;
@@ -900,7 +900,7 @@ impl RelayState {
                     remote_path: item.remote_path.clone(),
                     suggested_remote_root: suggested_remote_root(
                         &item.remote_path,
-                        &config
+                        config
                             .instances
                             .iter()
                             .find(|instance| instance.id == item.instance_id)
@@ -1618,14 +1618,14 @@ async fn request_pairing(
     // recovered without eventually throttling its own idempotent retries.
     {
         let mut config = state.config.write().await;
-        if prune_config(&mut config, &state.in_flight_uploads()) {
-            if let Err(save_error) = save_config(&state.config_path, &config) {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("failed to garbage collect pairing requests: {save_error}"),
-                    Some(&origin),
-                );
-            }
+        if prune_config(&mut config, &state.in_flight_uploads())
+            && let Err(save_error) = save_config(&state.config_path, &config)
+        {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to garbage collect pairing requests: {save_error}"),
+                Some(&origin),
+            );
         }
         if let Some(existing) = config
             .pairing_operations
@@ -1880,10 +1880,9 @@ async fn cancel_pairing(
         .pairing_operations
         .iter()
         .find(|item| item.id == id && item.origin == origin)
+        && let PairingOperationState::ApprovedUnconfirmed { instance_id, .. } = operation.state
     {
-        if let PairingOperationState::ApprovedUnconfirmed { instance_id, .. } = operation.state {
-            config.instances.retain(|item| item.id != instance_id);
-        }
+        config.instances.retain(|item| item.id != instance_id);
     }
     config
         .pairing_operations
@@ -2782,6 +2781,9 @@ fn action_record_response(record: &ActionRecord, origin: &str) -> Response {
     }
 }
 
+// The Err side is a ready-to-send HTTP response; boxing it would only move
+// the size to every early-return site.
+#[allow(clippy::result_large_err)]
 fn validated_origin(headers: &HeaderMap, body_origin: Option<&str>) -> Result<String, Response> {
     let header_origin = headers
         .get(header::ORIGIN)
@@ -2894,8 +2896,8 @@ fn normalize_path(input: &str) -> anyhow::Result<NormalizedPath> {
         bail!("invalid empty path");
     }
     let value = input.replace('\\', "/");
-    let (prefix, rest, windows) = if value.starts_with("//") {
-        let mut parts = value[2..].split('/').filter(|part| !part.is_empty());
+    let (prefix, rest, windows) = if let Some(unc) = value.strip_prefix("//") {
+        let mut parts = unc.split('/').filter(|part| !part.is_empty());
         let server = parts.next().context("UNC path has no server")?;
         let share = parts.next().context("UNC path has no share")?;
         (
@@ -2914,8 +2916,8 @@ fn normalize_path(input: &str) -> anyhow::Result<NormalizedPath> {
             value[2..].trim_start_matches('/').to_owned(),
             true,
         )
-    } else if value.starts_with('/') {
-        ("/".into(), value[1..].to_owned(), false)
+    } else if let Some(rooted) = value.strip_prefix('/') {
+        ("/".into(), rooted.to_owned(), false)
     } else {
         (String::new(), value, cfg!(windows))
     };
@@ -4784,8 +4786,10 @@ mod tests {
         let streaming = parked_record(expired);
         let abandoned = parked_record(expired);
         let (streaming_id, abandoned_id) = (streaming.id, abandoned.id);
-        let mut config = RelayConfig::default();
-        config.actions = vec![streaming, abandoned];
+        let mut config = RelayConfig {
+            actions: vec![streaming, abandoned],
+            ..Default::default()
+        };
 
         let _claim = state
             .claim_upload(streaming_id, 0, default_share_cache_max_bytes())
@@ -4818,8 +4822,10 @@ mod tests {
         finished.state = ActionRecordState::Complete;
         let (mapping_id, bytes_id, finished_id) =
             (pending_mapping.id, pending_bytes.id, finished.id);
-        let mut config = RelayConfig::default();
-        config.actions = vec![pending_mapping, pending_bytes, finished];
+        let mut config = RelayConfig {
+            actions: vec![pending_mapping, pending_bytes, finished],
+            ..Default::default()
+        };
 
         assert!(evict_oldest_action(&mut config, &state));
         assert!(
@@ -4896,8 +4902,10 @@ mod tests {
         newer.state = ActionRecordState::Complete;
         let newer_id = newer.id;
 
-        let mut config = RelayConfig::default();
-        config.actions = vec![oldest, newer];
+        let mut config = RelayConfig {
+            actions: vec![oldest, newer],
+            ..Default::default()
+        };
 
         // Stand in for an upload mid-stream against the oldest record.
         let _claim = state

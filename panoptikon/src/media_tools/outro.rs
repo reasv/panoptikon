@@ -237,7 +237,7 @@ fn corroborated_height(source_dims: Option<(u32, u32)>, received: usize) -> Opti
         .flatten()
     {
         let frame_len = candidate as usize * W * 3;
-        if frame_len == 0 || received % frame_len != 0 {
+        if frame_len == 0 || !received.is_multiple_of(frame_len) {
             continue;
         }
         match accepted {
@@ -1261,7 +1261,7 @@ mod tests {
 
     #[test]
     fn frames_are_read_whole_and_trailing_bytes_reported() {
-        let data = vec![7u8; 10];
+        let data = [7u8; 10];
         let mut seen = 0;
         let trailing = read_frames(&data[..], 4, |frame| {
             assert_eq!(frame.len(), 4);

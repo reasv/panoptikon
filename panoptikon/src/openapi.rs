@@ -352,10 +352,10 @@ mod tests {
         match value {
             Value::Object(map) => {
                 for (key, child) in map {
-                    if key == "$ref" {
-                        if let Some(target) = child.as_str() {
-                            refs.push(target.to_string());
-                        }
+                    if key == "$ref"
+                        && let Some(target) = child.as_str()
+                    {
+                        refs.push(target.to_string());
                     }
                     collect_refs(child, refs);
                 }

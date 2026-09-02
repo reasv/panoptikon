@@ -54,10 +54,10 @@ pub fn resolve_configured_executable(configured: &Path) -> Option<PathBuf> {
     if is_runnable_file(configured) {
         return Some(configured.to_path_buf());
     }
-    if configured.components().count() == 1 {
-        if let Some(name) = configured.to_str() {
-            return find_executable(&[name]);
-        }
+    if configured.components().count() == 1
+        && let Some(name) = configured.to_str()
+    {
+        return find_executable(&[name]);
     }
     None
 }
@@ -86,7 +86,7 @@ fn first_runnable_under(roots: &[PathBuf], relative_paths: &[&str]) -> Option<Pa
 fn profile_bin_dirs() -> Vec<PathBuf> {
     #[cfg(not(unix))]
     {
-        return Vec::new();
+        Vec::new()
     }
     #[cfg(unix)]
     {
@@ -174,10 +174,10 @@ pub fn find_label_font() -> Option<PathBuf> {
             }
         }
         let fonts_dir = root.join("fonts");
-        if fonts_dir.is_dir() {
-            if let Some(path) = find_named_font_under(&fonts_dir, FONT_FILE_CANDIDATES) {
-                return Some(path);
-            }
+        if fonts_dir.is_dir()
+            && let Some(path) = find_named_font_under(&fonts_dir, FONT_FILE_CANDIDATES)
+        {
+            return Some(path);
         }
     }
     None
@@ -328,7 +328,7 @@ pub fn find_html_renderer() -> Option<PathBuf> {
             .filter_map(env::var_os)
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        return first_runnable_under(
+        first_runnable_under(
             &roots,
             &[
                 r"Microsoft\Edge\Application\msedge.exe",
@@ -336,7 +336,7 @@ pub fn find_html_renderer() -> Option<PathBuf> {
                 r"BraveSoftware\Brave-Browser\Application\brave.exe",
                 r"Chromium\Application\chrome.exe",
             ],
-        );
+        )
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {

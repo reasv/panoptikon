@@ -39,10 +39,11 @@ pub(crate) fn db_lists() -> Result<(Vec<String>, Vec<String>)> {
     {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() && path.join("index.db").exists() {
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                index_dbs.push(name.to_string());
-            }
+        if path.is_dir()
+            && path.join("index.db").exists()
+            && let Some(name) = path.file_name().and_then(|name| name.to_str())
+        {
+            index_dbs.push(name.to_string());
         }
     }
 
@@ -52,10 +53,10 @@ pub(crate) fn db_lists() -> Result<(Vec<String>, Vec<String>)> {
     {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("db") {
-            if let Some(stem) = path.file_stem().and_then(|name| name.to_str()) {
-                user_data_dbs.push(stem.to_string());
-            }
+        if path.extension().and_then(|ext| ext.to_str()) == Some("db")
+            && let Some(stem) = path.file_stem().and_then(|name| name.to_str())
+        {
+            user_data_dbs.push(stem.to_string());
         }
     }
 

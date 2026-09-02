@@ -155,19 +155,17 @@ impl FilterCompiler for MatchText {
                     .binary(SqliteBinOper::Match, Expr::val(args.r#match.clone())),
             );
         }
-        if let Some(min_length) = args.min_length {
-            if min_length > 0 {
-                criteria.push(
-                    Expr::col((ExtractedText::Table, ExtractedText::TextLength)).gte(min_length),
-                );
-            }
+        if let Some(min_length) = args.min_length
+            && min_length > 0
+        {
+            criteria
+                .push(Expr::col((ExtractedText::Table, ExtractedText::TextLength)).gte(min_length));
         }
-        if let Some(max_length) = args.max_length {
-            if max_length > 0 {
-                criteria.push(
-                    Expr::col((ExtractedText::Table, ExtractedText::TextLength)).lte(max_length),
-                );
-            }
+        if let Some(max_length) = args.max_length
+            && max_length > 0
+        {
+            criteria
+                .push(Expr::col((ExtractedText::Table, ExtractedText::TextLength)).lte(max_length));
         }
         if !args.setters.is_empty() {
             let setters = args
@@ -188,21 +186,20 @@ impl FilterCompiler for MatchText {
             criteria
                 .push(Expr::col((ExtractedText::Table, ExtractedText::Language)).is_in(languages));
         }
-        if let Some(min_language_confidence) = args.min_language_confidence {
-            if min_language_confidence > 0.0 {
-                criteria.push(
-                    Expr::col((ExtractedText::Table, ExtractedText::LanguageConfidence))
-                        .gte(min_language_confidence),
-                );
-            }
+        if let Some(min_language_confidence) = args.min_language_confidence
+            && min_language_confidence > 0.0
+        {
+            criteria.push(
+                Expr::col((ExtractedText::Table, ExtractedText::LanguageConfidence))
+                    .gte(min_language_confidence),
+            );
         }
-        if let Some(min_confidence) = args.min_confidence {
-            if min_confidence > 0.0 {
-                criteria.push(
-                    Expr::col((ExtractedText::Table, ExtractedText::Confidence))
-                        .gte(min_confidence),
-                );
-            }
+        if let Some(min_confidence) = args.min_confidence
+            && min_confidence > 0.0
+        {
+            criteria.push(
+                Expr::col((ExtractedText::Table, ExtractedText::Confidence)).gte(min_confidence),
+            );
         }
 
         let snippet_expr: Expr = Func::cust("snippet")

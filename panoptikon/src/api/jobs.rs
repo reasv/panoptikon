@@ -802,13 +802,13 @@ pub(crate) struct ScanFailuresResponse {
 /// and new ones are expected to appear, so a stage filter that matches nothing
 /// is a legitimate answer.
 fn validate_error_class(error_class: Option<String>) -> Result<Option<String>, ApiError> {
-    if let Some(class) = &error_class {
-        if !ERROR_CLASSES.contains(&class.as_str()) {
-            return Err(ApiError::bad_request(format!(
-                "Unknown error_class {class:?}; expected one of {}",
-                ERROR_CLASSES.join(", ")
-            )));
-        }
+    if let Some(class) = &error_class
+        && !ERROR_CLASSES.contains(&class.as_str())
+    {
+        return Err(ApiError::bad_request(format!(
+            "Unknown error_class {class:?}; expected one of {}",
+            ERROR_CLASSES.join(", ")
+        )));
     }
     Ok(error_class)
 }

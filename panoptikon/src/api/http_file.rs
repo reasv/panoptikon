@@ -98,10 +98,10 @@ pub(crate) fn not_modified_response(
     if let Ok(value) = header::HeaderValue::from_str(cache_control) {
         headers.insert(header::CACHE_CONTROL, value);
     }
-    if let Some(last_modified) = last_modified {
-        if let Ok(value) = header::HeaderValue::from_str(last_modified) {
-            headers.insert(header::LAST_MODIFIED, value);
-        }
+    if let Some(last_modified) = last_modified
+        && let Ok(value) = header::HeaderValue::from_str(last_modified)
+    {
+        headers.insert(header::LAST_MODIFIED, value);
     }
     response
 }
@@ -231,14 +231,13 @@ pub(crate) async fn serve(
     } else if let Some(if_modified_since) = request_headers
         .get(header::IF_MODIFIED_SINCE)
         .and_then(|value| value.to_str().ok())
+        && last_modified.as_deref() == Some(if_modified_since.trim())
     {
-        if last_modified.as_deref() == Some(if_modified_since.trim()) {
-            return Ok(not_modified_response(
-                &etag,
-                cache_control,
-                last_modified.as_deref(),
-            ));
-        }
+        return Ok(not_modified_response(
+            &etag,
+            cache_control,
+            last_modified.as_deref(),
+        ));
     }
 
     let mut range = request_headers
@@ -250,20 +249,19 @@ pub(crate) async fn serve(
     // If-Range: only honor the range when the validator still matches;
     // otherwise the client's partial state is stale and it needs the full
     // body. The validator may be either our ETag or the Last-Modified date.
-    if range != RangeOutcome::Full {
-        if let Some(if_range) = request_headers
+    if range != RangeOutcome::Full
+        && let Some(if_range) = request_headers
             .get(header::IF_RANGE)
             .and_then(|value| value.to_str().ok())
-        {
-            let if_range = if_range.trim();
-            let matches = if if_range.starts_with('"') || if_range.starts_with("W/") {
-                if_range == etag
-            } else {
-                last_modified.as_deref() == Some(if_range)
-            };
-            if !matches {
-                range = RangeOutcome::Full;
-            }
+    {
+        let if_range = if_range.trim();
+        let matches = if if_range.starts_with('"') || if_range.starts_with("W/") {
+            if_range == etag
+        } else {
+            last_modified.as_deref() == Some(if_range)
+        };
+        if !matches {
+            range = RangeOutcome::Full;
         }
     }
 
@@ -321,15 +319,15 @@ pub(crate) async fn serve(
     if let Ok(value) = header::HeaderValue::from_str(&content_length.to_string()) {
         headers.insert(header::CONTENT_LENGTH, value);
     }
-    if let Some(content_range) = content_range {
-        if let Ok(value) = header::HeaderValue::from_str(&content_range) {
-            headers.insert(header::CONTENT_RANGE, value);
-        }
+    if let Some(content_range) = content_range
+        && let Ok(value) = header::HeaderValue::from_str(&content_range)
+    {
+        headers.insert(header::CONTENT_RANGE, value);
     }
-    if let Some(last_modified) = &last_modified {
-        if let Ok(value) = header::HeaderValue::from_str(last_modified) {
-            headers.insert(header::LAST_MODIFIED, value);
-        }
+    if let Some(last_modified) = &last_modified
+        && let Ok(value) = header::HeaderValue::from_str(last_modified)
+    {
+        headers.insert(header::LAST_MODIFIED, value);
     }
     if let Ok(value) = header::HeaderValue::from_str(&etag) {
         headers.insert(header::ETAG, value);

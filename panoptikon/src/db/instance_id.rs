@@ -203,16 +203,16 @@ fn set_aside_corrupt(path: &Path) {
 /// data folder itself could not be created, which is worth retrying later.
 fn mint(path: &Path) -> Option<String> {
     let uuid = Uuid::new_v4().simple().to_string();
-    if let Some(parent) = path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            // Retried on every call too (the folder may appear later).
-            warn_once_then_debug!(
-                path = %parent.display(),
-                error = %err,
-                "could not create the data folder for the instance id file"
-            );
-            return None;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        // Retried on every call too (the folder may appear later).
+        warn_once_then_debug!(
+            path = %parent.display(),
+            error = %err,
+            "could not create the data folder for the instance id file"
+        );
+        return None;
     }
     match persist(path, &uuid) {
         Ok(()) => tracing::info!(path = %path.display(), "minted this instance's identity"),

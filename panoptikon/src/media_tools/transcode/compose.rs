@@ -853,8 +853,7 @@ pub(crate) fn probe_source(path: &Path) -> Result<StreamInfo, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let probe =
-        parse_probe(&output.stdout).ok_or_else(|| "ffprobe found no usable video stream")?;
+    let probe = parse_probe(&output.stdout).ok_or("ffprobe found no usable video stream")?;
     Ok(apply_still_orientation(probe, path))
 }
 

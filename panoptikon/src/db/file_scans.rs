@@ -385,8 +385,7 @@ pub(crate) async fn mark_unavailable_files(
     let exclusion = if excluded_paths.is_empty() {
         String::new()
     } else {
-        let placeholders = std::iter::repeat("?")
-            .take(excluded_paths.len())
+        let placeholders = std::iter::repeat_n("?", excluded_paths.len())
             .collect::<Vec<_>>()
             .join(",");
         // On Windows the same folder can be re-registered with different

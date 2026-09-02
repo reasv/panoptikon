@@ -336,12 +336,12 @@ async fn async_main() -> anyhow::Result<()> {
     // usable embedding impl class (plus always_warm, which the manager
     // already warmed at construction). The `inferio` subcommand never scans
     // DBs; it gets always_warm only.
-    if let Some(state) = &inferio_state {
-        if settings.inference_local.prewarm.enabled {
-            tokio::spawn(inferio::prewarm::run_eager_prewarm_loop(Arc::downgrade(
-                &state.manager,
-            )));
-        }
+    if let Some(state) = &inferio_state
+        && settings.inference_local.prewarm.enabled
+    {
+        tokio::spawn(inferio::prewarm::run_eager_prewarm_loop(Arc::downgrade(
+            &state.manager,
+        )));
     }
 
     // Production UI ([upstreams.ui] local = true): npm install / next build
@@ -724,6 +724,60 @@ async fn api_not_found(uri: axum::http::Uri) -> api_error::ApiError {
     api_error::ApiError::not_found(format!("Unknown API endpoint: {}", uri.path()))
 }
 
+/// `panoptikon inferio`: the standalone inference service (design
+/// doc §3 "GPU lender" mode). Same config file, same policy layer (host
+/// policies + rulesets apply; inference paths get DB params stripped), but
+/// only `/api/inference/*` and `/health` are served — no proxy, local API,
+/// jobs, cron, or migrations. `inference_local.enabled` is implied by the
+/// subcommand; `[inference_local].port` overrides the listen port
+/// (defaults to `server.port`).
+async fn inferio_main(
+    settings: Arc<config::Settings>,
+    token_key: Arc<policy_token::TokenKey>,
+) -> anyhow::Result<()> {
+    // Same managed-venv auto-setup as gateway mode: this subcommand spawns
+    // the same Python workers (local inference is implied here, so the
+    // config's `enabled` flag is not consulted).
+    setup::maybe_auto_setup(&settings, true).await;
+    let state = inferio::http::InferioState::from_settings(&settings)?;
+    // Single listener: extra [[server.endpoints]] do not apply to the
+    // standalone inference service. Its one listener is the primary.
+    let app = inferio::http::standalone_router(Arc::clone(&state))
+        .layer(TraceLayer::new_for_http())
+        .layer(policy::PolicyLayer::new(Arc::clone(&settings), token_key))
+        .layer(axum::Extension(policy::ListenerEndpoint(Arc::from(
+            config::PRIMARY_ENDPOINT,
+        ))));
+
+    let port = settings
+        .inference_local
+        .port
+        .unwrap_or(settings.server.port);
+    let listen_addr = format!("{}:{}", settings.server.host, port);
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    accelerator_report::log_report(&settings);
+    tracing::info!(address = %listen_addr, "inference service listening (inferio mode)");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let manager = Arc::clone(&state.manager);
+    let cleanup = tokio::spawn(async move {
+        shutdown::wait_for_signal(false).await;
+        let _ = shutdown_tx.send(());
+        shutdown::run_inferio_cleanup(manager).await;
+    });
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+    let _ = cleanup.await;
+    tracing::info!("inference service stopped");
+    Ok(())
+}
+
 #[cfg(test)]
 mod route_tests {
     use super::*;
@@ -894,58 +948,4 @@ mod route_tests {
             (StatusCode::OK, "versions".to_string())
         );
     }
-}
-
-/// `panoptikon inferio`: the standalone inference service (design
-/// doc §3 "GPU lender" mode). Same config file, same policy layer (host
-/// policies + rulesets apply; inference paths get DB params stripped), but
-/// only `/api/inference/*` and `/health` are served — no proxy, local API,
-/// jobs, cron, or migrations. `inference_local.enabled` is implied by the
-/// subcommand; `[inference_local].port` overrides the listen port
-/// (defaults to `server.port`).
-async fn inferio_main(
-    settings: Arc<config::Settings>,
-    token_key: Arc<policy_token::TokenKey>,
-) -> anyhow::Result<()> {
-    // Same managed-venv auto-setup as gateway mode: this subcommand spawns
-    // the same Python workers (local inference is implied here, so the
-    // config's `enabled` flag is not consulted).
-    setup::maybe_auto_setup(&settings, true).await;
-    let state = inferio::http::InferioState::from_settings(&settings)?;
-    // Single listener: extra [[server.endpoints]] do not apply to the
-    // standalone inference service. Its one listener is the primary.
-    let app = inferio::http::standalone_router(Arc::clone(&state))
-        .layer(TraceLayer::new_for_http())
-        .layer(policy::PolicyLayer::new(Arc::clone(&settings), token_key))
-        .layer(axum::Extension(policy::ListenerEndpoint(Arc::from(
-            config::PRIMARY_ENDPOINT,
-        ))));
-
-    let port = settings
-        .inference_local
-        .port
-        .unwrap_or(settings.server.port);
-    let listen_addr = format!("{}:{}", settings.server.host, port);
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-    accelerator_report::log_report(&settings);
-    tracing::info!(address = %listen_addr, "inference service listening (inferio mode)");
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let manager = Arc::clone(&state.manager);
-    let cleanup = tokio::spawn(async move {
-        shutdown::wait_for_signal(false).await;
-        let _ = shutdown_tx.send(());
-        shutdown::run_inferio_cleanup(manager).await;
-    });
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_rx.await;
-    })
-    .await?;
-    let _ = cleanup.await;
-    tracing::info!("inference service stopped");
-    Ok(())
 }

@@ -123,17 +123,17 @@ pub(super) async fn load_base_frames(
 ) -> ApiResult<Vec<BaseFrame>> {
     // Mirrors the Python image_loader guard: absurdly small images are
     // skipped outright (placeholder written) for every media type.
-    if let (Some(width), Some(height)) = (item.width, item.height) {
-        if width < 3 || height < 3 {
-            tracing::warn!(
-                path = %item.path,
-                sha256 = %item.sha256,
-                width,
-                height,
-                "image too small, skipping"
-            );
-            return Ok(Vec::new());
-        }
+    if let (Some(width), Some(height)) = (item.width, item.height)
+        && (width < 3 || height < 3)
+    {
+        tracing::warn!(
+            path = %item.path,
+            sha256 = %item.sha256,
+            width,
+            height,
+            "image too small, skipping"
+        );
+        return Ok(Vec::new());
     }
     if item.item_type.starts_with("image/gif") {
         return gif_to_frames(&item.path);

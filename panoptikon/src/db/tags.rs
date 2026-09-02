@@ -128,8 +128,7 @@ pub(crate) async fn get_most_common_tags_frequency(
         "#,
     );
     if !setters.is_empty() {
-        let placeholders = std::iter::repeat("?")
-            .take(setters.len())
+        let placeholders = std::iter::repeat_n("?", setters.len())
             .collect::<Vec<_>>()
             .join(", ");
         sql.push_str(&format!(
@@ -202,7 +201,7 @@ pub(crate) async fn get_all_tag_namespaces(
             prefixes.insert(prefix.to_string());
         }
     }
-    namespaces.extend(prefixes.into_iter());
+    namespaces.extend(prefixes);
     namespaces.sort();
     Ok(namespaces)
 }
@@ -282,8 +281,7 @@ async fn get_most_common_tags(
         conditions.push("tags_items.confidence >= ?".to_string());
     }
     if !setters.is_empty() {
-        let placeholders = std::iter::repeat("?")
-            .take(setters.len())
+        let placeholders = std::iter::repeat_n("?", setters.len())
             .collect::<Vec<_>>()
             .join(", ");
         conditions.push(format!("setters.name IN ({placeholders})"));
@@ -309,10 +307,10 @@ async fn get_most_common_tags(
             query = query.bind(upper);
         }
     }
-    if let Some(confidence_threshold) = confidence_threshold {
-        if confidence_threshold > 0.0 {
-            query = query.bind(confidence_threshold);
-        }
+    if let Some(confidence_threshold) = confidence_threshold
+        && confidence_threshold > 0.0
+    {
+        query = query.bind(confidence_threshold);
     }
     for setter in setters {
         query = query.bind(setter);

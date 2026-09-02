@@ -2,7 +2,7 @@ use shell_words::split as shell_split;
 
 pub(crate) fn parse_and_escape_query(user_input: &str) -> String {
     let mut working = user_input.replace("\\\"", "\"\"");
-    if working.matches('"').count() % 2 != 0 {
+    if !working.matches('"').count().is_multiple_of(2) {
         working.push('"');
     }
     working = working.replace('\'', "\\'");

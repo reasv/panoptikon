@@ -159,9 +159,9 @@ impl Worker for ContinuousWorker {
                             path,
                             stat,
                             ledger_path,
-                            result: Err(FileProcessError::KnownBad),
+                            result: Box::new(Err(FileProcessError::KnownBad)),
                         });
-                        return Ok(job.key);
+                        return Ok(());
                     }
                 }
                 Ok(None) => {}
@@ -180,9 +180,9 @@ impl Worker for ContinuousWorker {
                     path,
                     stat,
                     ledger_path,
-                    result: Err(FileProcessError::Unchanged),
+                    result: Box::new(Err(FileProcessError::Unchanged)),
                 });
-                return Ok(job.key);
+                return Ok(());
             }
         }
 
@@ -200,9 +200,9 @@ impl Worker for ContinuousWorker {
             path,
             stat,
             ledger_path,
-            result,
+            result: Box::new(result),
         });
-        Ok(job.key)
+        Ok(())
     }
 }
 
@@ -229,7 +229,7 @@ pub(crate) enum ContinuousScanMessage {
     },
     Resume,
     UpdateConfig {
-        config: SystemConfig,
+        config: Box<SystemConfig>,
     },
     FsEvent(FsEvent),
     /// Starts a poll pass on the blocking pool unless one is already running.
@@ -266,7 +266,7 @@ pub(crate) enum ContinuousScanMessage {
         /// Gates the success-side delete (so a healthy file costs no writer
         /// round-trip) and is what that delete binds.
         ledger_path: Option<String>,
-        result: Result<PreparedFile, FileProcessError>,
+        result: Box<Result<PreparedFile, FileProcessError>>,
     },
     /// Point-in-time state for the status endpoint.
     GetStatus {
@@ -352,10 +352,7 @@ fn compute_watch_roots_with_safe_empty(
     let mut included = config.included_folders.clone();
     included.retain(|folder| check_folder_validity(folder) || safe_empty.contains(folder));
     let global_included = deduplicate_paths(&included);
-    let global_included_roots: Vec<PathBuf> = global_included
-        .iter()
-        .map(|path| PathBuf::from(path))
-        .collect();
+    let global_included_roots: Vec<PathBuf> = global_included.iter().map(PathBuf::from).collect();
 
     let global_excluded_roots: Vec<PathBuf> = config
         .excluded_folders
@@ -1236,7 +1233,7 @@ impl Actor for ContinuousScanActor {
                 let prev_extensions = state.allowed_extensions.clone();
                 let prev_interval = state.config.continuous_filescan.poll_interval_secs;
 
-                state.config = config;
+                state.config = *config;
                 let roots_ok = state.refresh_roots().await;
                 let now_enabled = state.config.continuous_filescan.enabled;
                 if !now_enabled || !roots_ok {
@@ -1310,9 +1307,9 @@ impl Actor for ContinuousScanActor {
                         // worker's mtime check.
                         if state.poller.is_some() {
                             let epoch = state.epoch;
-                            let _ = state.actor_ref.send_after(POLL_SETTLE_DELAY, move || {
+                            drop(state.actor_ref.send_after(POLL_SETTLE_DELAY, move || {
                                 ContinuousScanMessage::PollTick { epoch }
-                            });
+                            }));
                         }
                     }
                 }
@@ -1368,26 +1365,28 @@ impl Actor for ContinuousScanActor {
                 // file rows and the removal deletes just the stale one instead
                 // of orphaning the item (which would drop its tags).
                 for path in outcome.removals {
-                    let _ = state.actor_ref.send_after(POLL_SETTLE_DELAY * 2, move || {
+                    drop(state.actor_ref.send_after(POLL_SETTLE_DELAY * 2, move || {
                         ContinuousScanMessage::FsEvent(FsEvent::Remove(path))
-                    });
+                    }));
                 }
                 for change in outcome.changes {
                     let path = change.path;
                     let meta = change.meta;
-                    let _ = state.actor_ref.send_after(POLL_SETTLE_DELAY, move || {
+                    drop(state.actor_ref.send_after(POLL_SETTLE_DELAY, move || {
                         ContinuousScanMessage::SettleCheck {
                             epoch,
                             path,
                             meta,
                             attempts: 0,
                         }
-                    });
+                    }));
                 }
                 if let Some(interval) = interval {
-                    let _ = state
-                        .actor_ref
-                        .send_after(interval, move || ContinuousScanMessage::PollTick { epoch });
+                    drop(
+                        state.actor_ref.send_after(interval, move || {
+                            ContinuousScanMessage::PollTick { epoch }
+                        }),
+                    );
                 }
             }
             ContinuousScanMessage::SettleCheck {
@@ -1414,7 +1413,7 @@ impl Actor for ContinuousScanActor {
                         return;
                     };
                     let stable = last_modified == meta.last_modified
-                        && meta.size.map_or(true, |prev| prev == size);
+                        && meta.size.is_none_or(|prev| prev == size);
                     if stable {
                         let _ = reply.cast(ContinuousScanMessage::DispatchStable { epoch, path });
                         return;
@@ -1423,15 +1422,17 @@ impl Actor for ContinuousScanActor {
                     let delay = POLL_SETTLE_DELAY
                         .saturating_mul(2u32.saturating_pow(attempts.min(5)))
                         .min(SETTLE_MAX_DELAY);
-                    let _ = reply.send_after(delay, move || ContinuousScanMessage::SettleCheck {
-                        epoch,
-                        path,
-                        meta: FileMeta {
-                            last_modified,
-                            size: Some(size),
-                        },
-                        attempts: attempts.saturating_add(1),
-                    });
+                    drop(
+                        reply.send_after(delay, move || ContinuousScanMessage::SettleCheck {
+                            epoch,
+                            path,
+                            meta: FileMeta {
+                                last_modified,
+                                size: Some(size),
+                            },
+                            attempts: attempts.saturating_add(1),
+                        }),
+                    );
                 });
             }
             ContinuousScanMessage::DispatchStable { epoch, path } => {
@@ -1451,7 +1452,7 @@ impl Actor for ContinuousScanActor {
                 if state.paused || epoch != state.epoch {
                     return Ok(());
                 }
-                let processed = match result {
+                let processed = match *result {
                     Ok(processed) => processed,
                     Err(FileProcessError::Unchanged) => {
                         state.stats.unchanged_files += 1;
@@ -1495,36 +1496,32 @@ impl Actor for ContinuousScanActor {
                     }
                 };
 
-                let false_change = file_data.new_file_hash == false && file_data.new_file_timestamp;
+                let false_change = !file_data.new_file_hash && file_data.new_file_timestamp;
                 if false_change {
                     state.stats.false_changes += 1;
                 }
 
-                if !file_data.thumbnails.is_empty() {
-                    if let Ok(mut thumb_conn) =
+                if !file_data.thumbnails.is_empty()
+                    && let Ok(mut thumb_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await
-                    {
-                        if let Ok(has_thumb) = has_thumbnail(
-                            &mut thumb_conn,
-                            &file_data.sha256,
-                            THUMBNAIL_PROCESS_VERSION,
-                        )
-                        .await
-                        {
-                            if !has_thumb {
-                                let _ = call_index_db_writer(&state.index_db, |reply| {
-                                    IndexDbWriterMessage::StoreThumbnails {
-                                        sha256: file_data.sha256.clone(),
-                                        mime_type: file_data.mime_type.clone(),
-                                        process_version: THUMBNAIL_PROCESS_VERSION,
-                                        thumbnails: file_data.thumbnails.clone(),
-                                        reply,
-                                    }
-                                })
-                                .await;
-                            }
+                    && let Ok(has_thumb) = has_thumbnail(
+                        &mut thumb_conn,
+                        &file_data.sha256,
+                        THUMBNAIL_PROCESS_VERSION,
+                    )
+                    .await
+                    && !has_thumb
+                {
+                    let _ = call_index_db_writer(&state.index_db, |reply| {
+                        IndexDbWriterMessage::StoreThumbnails {
+                            sha256: file_data.sha256.clone(),
+                            mime_type: file_data.mime_type.clone(),
+                            process_version: THUMBNAIL_PROCESS_VERSION,
+                            thumbnails: file_data.thumbnails.clone(),
+                            reply,
                         }
-                    }
+                    })
+                    .await;
                 }
 
                 // The grid tier ladder, alongside the display renditions above
@@ -1560,28 +1557,23 @@ impl Actor for ContinuousScanActor {
                     .await;
                 }
 
-                if !file_data.frames.is_empty() {
-                    if let Ok(mut frame_conn) =
+                if !file_data.frames.is_empty()
+                    && let Ok(mut frame_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await
-                    {
-                        if let Ok(has_frame) =
-                            has_frame(&mut frame_conn, &file_data.sha256, FRAME_PROCESS_VERSION)
-                                .await
-                        {
-                            if !has_frame {
-                                let _ = call_index_db_writer(&state.index_db, |reply| {
-                                    IndexDbWriterMessage::StoreFrames {
-                                        sha256: file_data.sha256.clone(),
-                                        mime_type: file_data.mime_type.clone(),
-                                        process_version: FRAME_PROCESS_VERSION,
-                                        frames: file_data.frames.clone(),
-                                        reply,
-                                    }
-                                })
-                                .await;
-                            }
+                    && let Ok(has_frame) =
+                        has_frame(&mut frame_conn, &file_data.sha256, FRAME_PROCESS_VERSION).await
+                    && !has_frame
+                {
+                    let _ = call_index_db_writer(&state.index_db, |reply| {
+                        IndexDbWriterMessage::StoreFrames {
+                            sha256: file_data.sha256.clone(),
+                            mime_type: file_data.mime_type.clone(),
+                            process_version: FRAME_PROCESS_VERSION,
+                            frames: file_data.frames.clone(),
+                            reply,
                         }
-                    }
+                    })
+                    .await;
                 }
 
                 // What that same pass concluded about the kinds it produced
@@ -1630,24 +1622,20 @@ impl Actor for ContinuousScanActor {
                     }
                 }
 
-                if let Some(blurhash) = &file_data.blurhash {
-                    if let Ok(mut blur_conn) =
+                if let Some(blurhash) = &file_data.blurhash
+                    && let Ok(mut blur_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await
-                    {
-                        if let Ok(has_value) = has_blurhash(&mut blur_conn, &file_data.sha256).await
-                        {
-                            if !has_value {
-                                let _ = call_index_db_writer(&state.index_db, |reply| {
-                                    IndexDbWriterMessage::SetBlurhash {
-                                        sha256: file_data.sha256.clone(),
-                                        blurhash: blurhash.clone(),
-                                        reply,
-                                    }
-                                })
-                                .await;
-                            }
+                    && let Ok(has_value) = has_blurhash(&mut blur_conn, &file_data.sha256).await
+                    && !has_value
+                {
+                    let _ = call_index_db_writer(&state.index_db, |reply| {
+                        IndexDbWriterMessage::SetBlurhash {
+                            sha256: file_data.sha256.clone(),
+                            blurhash: blurhash.clone(),
+                            reply,
                         }
-                    }
+                    })
+                    .await;
                 }
 
                 let update_result = call_index_db_writer(&state.index_db, |reply| {
@@ -1858,10 +1846,10 @@ impl Actor for ContinuousScanSupervisor {
             resync_pending,
             shutting_down: false,
         };
-        let _ = myself.send_interval(
+        drop(myself.send_interval(
             RactorDuration::from_secs(SUPERVISOR_RESYNC_INTERVAL.as_secs()),
             || ContinuousScanSupervisorMessage::ResyncFromDisk,
-        );
+        ));
         let _ = resync_from_disk(&mut state).await;
         Ok(state)
     }
@@ -1998,7 +1986,9 @@ async fn resync_from_disk(state: &mut ContinuousScanSupervisorState) -> ApiResul
 
     for (index_db, config) in desired {
         if let Some(actor) = state.actors.get(&index_db) {
-            let _ = actor.cast(ContinuousScanMessage::UpdateConfig { config });
+            let _ = actor.cast(ContinuousScanMessage::UpdateConfig {
+                config: Box::new(config),
+            });
             continue;
         }
         let args = ContinuousScanActorArgs {
@@ -2014,7 +2004,9 @@ async fn resync_from_disk(state: &mut ContinuousScanSupervisorState) -> ApiResul
         )
         .await
         .map_err(|err| ApiError::internal(format!("Failed to spawn continuous scan: {err:?}")))?;
-        let _ = actor.cast(ContinuousScanMessage::UpdateConfig { config });
+        let _ = actor.cast(ContinuousScanMessage::UpdateConfig {
+            config: Box::new(config),
+        });
         state.actors.insert(index_db, actor);
     }
 
@@ -2041,7 +2033,9 @@ async fn sync_single_db(
     }
 
     if let Some(actor) = state.actors.get(index_db) {
-        let _ = actor.cast(ContinuousScanMessage::UpdateConfig { config });
+        let _ = actor.cast(ContinuousScanMessage::UpdateConfig {
+            config: Box::new(config),
+        });
         return Ok(());
     }
 
@@ -2058,7 +2052,9 @@ async fn sync_single_db(
     )
     .await
     .map_err(|err| ApiError::internal(format!("Failed to spawn continuous scan: {err:?}")))?;
-    let _ = actor.cast(ContinuousScanMessage::UpdateConfig { config });
+    let _ = actor.cast(ContinuousScanMessage::UpdateConfig {
+        config: Box::new(config),
+    });
     state.actors.insert(index_db.to_string(), actor);
     Ok(())
 }
@@ -2176,7 +2172,7 @@ pub(crate) async fn ensure_continuous_supervisor()
             Ok(actor)
         })
         .await
-        .map(Clone::clone)
+        .cloned()
 }
 
 /// Stops every continuous scan actor and then the supervisor itself. No-op
@@ -2280,6 +2276,7 @@ impl Drop for JobPauseGuard {
 mod tests {
     use super::*;
     use crate::db::migrations::migrate_databases_on_disk;
+    use crate::db::system_config::ContinuousFilescanConfig;
     use crate::test_utils::test_data_dir;
     use image::{ImageBuffer, Rgb};
     use ractor::Actor;
@@ -2345,7 +2342,7 @@ mod tests {
                 path: file_path.clone(),
                 stat: None,
                 ledger_path: None,
-                result: Ok(prepared),
+                result: Box::new(Ok(prepared)),
             })
             .unwrap();
 
@@ -2445,7 +2442,7 @@ mod tests {
                 path: file_path.clone(),
                 stat: None,
                 ledger_path: None,
-                result: Ok(prepared),
+                result: Box::new(Ok(prepared)),
             })
             .unwrap();
 
@@ -2628,7 +2625,7 @@ mod tests {
                 path: file_path.clone(),
                 stat: None,
                 ledger_path: None,
-                result: Ok(prepared),
+                result: Box::new(Ok(prepared)),
             })
             .unwrap();
 
@@ -2906,9 +2903,14 @@ mod tests {
         fs::write(global_root.join("dummy.txt"), "x").unwrap();
         fs::write(subset.join("dummy.txt"), "x").unwrap();
 
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![global_root.to_string_lossy().to_string()];
-        config.continuous_filescan.included_folders = vec![subset.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![global_root.to_string_lossy().to_string()],
+            continuous_filescan: ContinuousFilescanConfig {
+                included_folders: vec![subset.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let outcome = compute_watch_roots(&config);
         assert!(outcome.valid);
@@ -2926,10 +2928,14 @@ mod tests {
         fs::write(global_root.join("dummy.txt"), "x").unwrap();
         fs::write(outside_root.join("dummy.txt"), "x").unwrap();
 
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![global_root.to_string_lossy().to_string()];
-        config.continuous_filescan.included_folders =
-            vec![outside_root.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![global_root.to_string_lossy().to_string()],
+            continuous_filescan: ContinuousFilescanConfig {
+                included_folders: vec![outside_root.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let outcome = compute_watch_roots(&config);
         assert!(!outcome.valid);
@@ -3022,11 +3028,15 @@ mod tests {
         fs::write(global_root.join("dummy.txt"), "x").unwrap();
         fs::write(excluded_root.join("dummy.txt"), "x").unwrap();
 
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![global_root.to_string_lossy().to_string()];
-        config.excluded_folders = vec![excluded_root.to_string_lossy().to_string()];
-        config.continuous_filescan.included_folders =
-            vec![excluded_root.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![global_root.to_string_lossy().to_string()],
+            excluded_folders: vec![excluded_root.to_string_lossy().to_string()],
+            continuous_filescan: ContinuousFilescanConfig {
+                included_folders: vec![excluded_root.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let outcome = compute_watch_roots(&config);
         assert!(!outcome.valid);
@@ -3213,7 +3223,7 @@ mod tests {
         let dot_root = PathBuf::from(r"C:\watch-dotted\.hidden");
         assert!(path_passes_filters(
             &dot_root.join("a.png"),
-            &[dot_root.clone()],
+            std::slice::from_ref(&dot_root),
             &[],
             &extensions
         ));

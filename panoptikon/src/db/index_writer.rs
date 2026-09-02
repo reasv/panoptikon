@@ -609,10 +609,10 @@ impl Actor for IndexDbWriter {
         myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let _ = myself.send_interval(
+        drop(myself.send_interval(
             RactorDuration::from_secs(args.idle_timeout.as_secs()),
             || IndexDbWriterMessage::IdleCheck,
-        );
+        ));
         Ok(IndexDbWriterState {
             index_db: args.index_db,
             idle_timeout: args.idle_timeout,
@@ -630,15 +630,15 @@ impl Actor for IndexDbWriter {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             IndexDbWriterMessage::IdleCheck => {
-                if let (Some(last_used), Some(_)) = (state.last_used, state.conn.as_ref()) {
-                    if last_used.elapsed() >= state.idle_timeout {
-                        state.conn = None;
-                        state.last_used = None;
-                        tracing::info!(
-                            index_db = %state.index_db,
-                            "index db writer connection closed after idle timeout"
-                        );
-                    }
+                if let (Some(last_used), Some(_)) = (state.last_used, state.conn.as_ref())
+                    && last_used.elapsed() >= state.idle_timeout
+                {
+                    state.conn = None;
+                    state.last_used = None;
+                    tracing::info!(
+                        index_db = %state.index_db,
+                        "index db writer connection closed after idle timeout"
+                    );
                 }
             }
             IndexDbWriterMessage::AddFileScan {
@@ -1534,10 +1534,10 @@ impl Actor for IndexDbSupervisor {
         myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let _ = myself.send_interval(
+        drop(myself.send_interval(
             RactorDuration::from_secs(args.health_interval.as_secs()),
             || IndexDbSupervisorMessage::HealthCheck,
-        );
+        ));
         Ok(IndexDbSupervisorState {
             writers: HashMap::new(),
             idle_timeout: args.idle_timeout,
@@ -1615,13 +1615,12 @@ impl Actor for IndexDbSupervisor {
                         }
                     }
 
-                    if !to_remove.contains(key) {
-                        if writer
+                    if !to_remove.contains(key)
+                        && writer
                             .send_message(IndexDbWriterMessage::IdleCheck)
                             .is_err()
-                        {
-                            to_remove.push(key.clone());
-                        }
+                    {
+                        to_remove.push(key.clone());
                     }
                 }
 

@@ -508,7 +508,7 @@ fn latest_config_mtime(dirs: &[PathBuf]) -> Result<Option<SystemTime>> {
             let modified = fs::metadata(&file)
                 .and_then(|meta| meta.modified())
                 .with_context(|| format!("failed to stat {}", file.display()))?;
-            if latest.map_or(true, |current| modified > current) {
+            if latest.is_none_or(|current| modified > current) {
                 latest = Some(modified);
             }
         }
@@ -958,8 +958,8 @@ mod tests {
     /// The web UI renders model-group tabs and model rows in JSON key order,
     /// and Python serves /metadata in TOML declaration order (tomli + dicts
     /// + FastAPI). Groups and inference ids must keep file order — not sort
-    /// alphabetically — including across files (first mention pins the
-    /// position, later files append).
+    ///   alphabetically — including across files (first mention pins the
+    ///   position, later files append).
     #[test]
     fn metadata_preserves_toml_declaration_order() {
         let dir = tempfile::tempdir().unwrap();

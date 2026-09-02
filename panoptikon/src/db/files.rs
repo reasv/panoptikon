@@ -334,7 +334,8 @@ pub(crate) async fn get_pending_outro_item(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
 ) -> ApiResult<Option<PendingOutroItem>> {
-    let row: Option<(Option<f64>, Option<i64>, Option<i64>, Option<i64>)> = sqlx::query_as(
+    type Row = (Option<f64>, Option<i64>, Option<i64>, Option<i64>);
+    let row: Option<Row> = sqlx::query_as(
         r#"
 SELECT duration, video_tracks, width, height
 FROM items
@@ -786,10 +787,11 @@ pub(crate) async fn update_file_data(
     let mut item_id = get_item_id(conn, &data.sha256).await?;
     let mut item_inserted = false;
 
-    if let Some(meta) = &data.item_metadata {
-        if item_id.is_none() {
-            let result = sqlx::query(
-                r#"
+    if let Some(meta) = &data.item_metadata
+        && item_id.is_none()
+    {
+        let result = sqlx::query(
+            r#"
 INSERT INTO items (
     sha256,
     md5,
@@ -808,33 +810,32 @@ INSERT INTO items (
     audio_codec
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                 "#,
-            )
-            .bind(&data.sha256)
-            .bind(&meta.md5)
-            .bind(&meta.mime_type)
-            .bind(data.file_size)
-            .bind(time_added)
-            .bind(meta.width)
-            .bind(meta.height)
-            .bind(meta.rotation)
-            .bind(meta.duration)
-            .bind(meta.audio_tracks)
-            .bind(meta.video_tracks)
-            .bind(meta.subtitle_tracks)
-            .bind(&data.blurhash)
-            .bind(&meta.video_codec)
-            .bind(&meta.audio_codec)
-            .execute(&mut *conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, sha256 = %data.sha256, "failed to insert item");
-                ApiError::internal("Failed to update file")
-            })?;
+        )
+        .bind(&data.sha256)
+        .bind(&meta.md5)
+        .bind(&meta.mime_type)
+        .bind(data.file_size)
+        .bind(time_added)
+        .bind(meta.width)
+        .bind(meta.height)
+        .bind(meta.rotation)
+        .bind(meta.duration)
+        .bind(meta.audio_tracks)
+        .bind(meta.video_tracks)
+        .bind(meta.subtitle_tracks)
+        .bind(&data.blurhash)
+        .bind(&meta.video_codec)
+        .bind(&meta.audio_codec)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, sha256 = %data.sha256, "failed to insert item");
+            ApiError::internal("Failed to update file")
+        })?;
 
-            let inserted_id = result.last_insert_rowid();
-            item_id = Some(inserted_id);
-            item_inserted = true;
-        }
+        let inserted_id = result.last_insert_rowid();
+        item_id = Some(inserted_id);
+        item_inserted = true;
     }
 
     let item_id = item_id.ok_or_else(|| {
@@ -956,7 +957,7 @@ pub(crate) async fn delete_files_not_allowed(
     job_filters: &[JobFilter],
 ) -> ApiResult<u64> {
     let user_filters = job_filters
-        .into_iter()
+        .iter()
         .filter(|filter| filter.setter_names.iter().any(|name| name == "file_scan"))
         .map(|filter| filter.pql_query.clone())
         .collect::<Vec<_>>();

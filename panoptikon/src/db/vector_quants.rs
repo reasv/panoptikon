@@ -653,10 +653,10 @@ pub(crate) fn plan_metadata(snapshot: &StateSnapshot) -> Vec<MetaOp> {
             }
         }
         // A freshly created default profile also needs the flag set.
-        if let Some(default) = desired_default {
-            if !by_name.contains_key(default) {
-                wrong = true;
-            }
+        if let Some(default) = desired_default
+            && !by_name.contains_key(default)
+        {
+            wrong = true;
         }
         wrong
     };

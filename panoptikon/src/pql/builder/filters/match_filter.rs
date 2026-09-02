@@ -388,7 +388,7 @@ mod tests {
             "match": { "eq": { "file_id": 1 } }
         }))
         .expect("match filter");
-        run_full_pql_query(QueryElement::Match(filter), EntityType::File)
+        run_full_pql_query(QueryElement::Match(Box::new(filter)), EntityType::File)
             .await
             .expect("match query");
     }
@@ -484,7 +484,7 @@ mod tests {
             "match": { "eq": { "video_codec": "hevc" } }
         }))
         .expect("match filter");
-        run_full_pql_query(QueryElement::Match(filter), EntityType::File)
+        run_full_pql_query(QueryElement::Match(Box::new(filter)), EntityType::File)
             .await
             .expect("codec match query");
     }
@@ -495,7 +495,7 @@ mod tests {
             "match": { "startswith": { "outro_kind": "tiktok_card/" } }
         }))
         .expect("match filter");
-        run_full_pql_query(QueryElement::Match(filter), EntityType::File)
+        run_full_pql_query(QueryElement::Match(Box::new(filter)), EntityType::File)
             .await
             .expect("outro match query");
     }

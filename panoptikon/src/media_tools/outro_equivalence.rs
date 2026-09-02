@@ -165,7 +165,7 @@ fn outro_equivalence_harness() {
                     let line = record(job, at.elapsed().as_millis(), &outcome);
                     *results[index].lock().expect("no worker panicked") = line;
                     let seen = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if seen % 50 == 0 {
+                    if seen.is_multiple_of(50) {
                         eprintln!(
                             "outro-equivalence: {seen}/{} ({:.1}s)",
                             jobs.len(),

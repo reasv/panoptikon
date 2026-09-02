@@ -491,6 +491,7 @@ pub(crate) async fn get_setter_data_types(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn add_item_data(
     conn: &mut sqlx::SqliteConnection,
     item_sha256: &str,

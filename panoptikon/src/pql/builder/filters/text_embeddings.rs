@@ -143,11 +143,12 @@ fn default_embed_args() -> Option<EmbedArgs> {
 }
 
 fn default_sort_asc() -> SortableOptions {
-    let mut options = SortableOptions::default();
-    options.order_by = true;
-    options.direction = OrderDirection::Asc;
-    options.row_n_direction = OrderDirection::Asc;
-    options
+    SortableOptions {
+        order_by: true,
+        direction: OrderDirection::Asc,
+        row_n_direction: OrderDirection::Asc,
+        ..Default::default()
+    }
 }
 
 /// Which vector payload the candidate skeletons join.
@@ -174,13 +175,12 @@ impl SemanticTextSearch {
                         .gte(src_text.min_length),
                 );
             }
-            if let Some(max_length) = src_text.max_length {
-                if max_length > 0 {
-                    criteria.push(
-                        Expr::col((ExtractedText::Table, ExtractedText::TextLength))
-                            .lte(max_length),
-                    );
-                }
+            if let Some(max_length) = src_text.max_length
+                && max_length > 0
+            {
+                criteria.push(
+                    Expr::col((ExtractedText::Table, ExtractedText::TextLength)).lte(max_length),
+                );
             }
             if !src_text.setters.is_empty() {
                 let setters = src_text
@@ -191,13 +191,12 @@ impl SemanticTextSearch {
                     .collect::<Vec<_>>();
                 criteria.push(Expr::col((text_setters.clone(), Setters::Name)).is_in(setters));
             }
-            if let Some(languages) = &src_text.languages {
-                if !languages.is_empty() {
-                    let values = languages.iter().cloned().map(Expr::val).collect::<Vec<_>>();
-                    criteria.push(
-                        Expr::col((ExtractedText::Table, ExtractedText::Language)).is_in(values),
-                    );
-                }
+            if let Some(languages) = &src_text.languages
+                && !languages.is_empty()
+            {
+                let values = languages.iter().cloned().map(Expr::val).collect::<Vec<_>>();
+                criteria
+                    .push(Expr::col((ExtractedText::Table, ExtractedText::Language)).is_in(values));
             }
             if src_text.min_language_confidence > 0.0 {
                 criteria.push(
@@ -205,13 +204,13 @@ impl SemanticTextSearch {
                         .gte(src_text.min_language_confidence),
                 );
             }
-            if let Some(min_confidence) = src_text.min_confidence {
-                if min_confidence > 0.0 {
-                    criteria.push(
-                        Expr::col((ExtractedText::Table, ExtractedText::Confidence))
-                            .gte(min_confidence),
-                    );
-                }
+            if let Some(min_confidence) = src_text.min_confidence
+                && min_confidence > 0.0
+            {
+                criteria.push(
+                    Expr::col((ExtractedText::Table, ExtractedText::Confidence))
+                        .gte(min_confidence),
+                );
             }
             if src_text.confidence_weight != 0.0 || src_text.language_confidence_weight != 0.0 {
                 weights_used = true;

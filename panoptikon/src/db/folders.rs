@@ -46,8 +46,7 @@ pub(crate) async fn delete_folders_not_in_list(
         return Ok(result.rows_affected());
     }
 
-    let placeholders = std::iter::repeat("?")
-        .take(folder_paths.len())
+    let placeholders = std::iter::repeat_n("?", folder_paths.len())
         .collect::<Vec<_>>()
         .join(",");
     // Mixing numbered and bare placeholders misbinds parameters under sqlx,

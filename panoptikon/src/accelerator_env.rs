@@ -42,7 +42,7 @@ pub async fn probe_after_setup(accelerator: Accelerator, interpreter: &Path) -> 
 fn hip_library_dirs() -> Vec<PathBuf> {
     #[cfg(not(target_os = "linux"))]
     {
-        return Vec::new();
+        Vec::new()
     }
     #[cfg(target_os = "linux")]
     {
@@ -98,7 +98,7 @@ fn is_hip_related_lib_dir(dir: &Path) -> bool {
 fn hip_worker_env() -> Vec<(String, String)> {
     #[cfg(not(target_os = "linux"))]
     {
-        return Vec::new();
+        Vec::new()
     }
     #[cfg(target_os = "linux")]
     {
@@ -300,7 +300,7 @@ mod tests {
         unsafe {
             env::set_var("LD_LIBRARY_PATH", &b);
         }
-        let joined = merge_ld_library_path(&[a.clone()]).expect("join");
+        let joined = merge_ld_library_path(std::slice::from_ref(&a)).expect("join");
         let parts: Vec<_> = env::split_paths(&joined).collect();
         assert_eq!(parts.first().map(Path::new), Some(a.as_path()));
         assert!(parts.iter().any(|p| p == &b));

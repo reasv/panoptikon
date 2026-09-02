@@ -3,7 +3,7 @@ use anyhow::{Context as _, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct DesktopSettings {
     #[serde(default)]
     pub local_server: LocalServerSettings,
@@ -114,15 +114,6 @@ impl Default for UpdateSettings {
             ribbon_dismissed_version: None,
             reminder_version: None,
             reminder_at_unix: None,
-        }
-    }
-}
-impl Default for DesktopSettings {
-    fn default() -> Self {
-        Self {
-            local_server: LocalServerSettings::default(),
-            startup: StartupSettings::default(),
-            updates: UpdateSettings::default(),
         }
     }
 }

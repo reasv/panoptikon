@@ -394,10 +394,10 @@ fn parse_nvidia_query_lines(text: &str) -> Vec<GpuDevice> {
 }
 
 fn amd_device_names() -> Vec<String> {
-    if let Some(names) = rocm_smi_product_names() {
-        if !names.is_empty() {
-            return names;
-        }
+    if let Some(names) = rocm_smi_product_names()
+        && !names.is_empty()
+    {
+        return names;
     }
     rocminfo_marketing_names()
 }
@@ -455,13 +455,12 @@ fn parse_rocminfo_gpu_marketing_names(text: &str) -> Vec<String> {
                  names: &mut Vec<String>| {
         let name = marketing.take();
         let dtype = device_type.take();
-        if let (Some(name), Some(dtype)) = (name, dtype) {
-            if dtype.eq_ignore_ascii_case("GPU")
-                && !name.is_empty()
-                && !name.eq_ignore_ascii_case("N/A")
-            {
-                names.push(name);
-            }
+        if let (Some(name), Some(dtype)) = (name, dtype)
+            && dtype.eq_ignore_ascii_case("GPU")
+            && !name.is_empty()
+            && !name.eq_ignore_ascii_case("N/A")
+        {
+            names.push(name);
         }
     };
 

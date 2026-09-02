@@ -511,7 +511,7 @@ pub(crate) enum QueryElement {
     Or(OrOperator),
     #[schema(no_recursion)]
     Not(NotOperator),
-    Match(Match),
+    Match(Box<Match>),
     MatchPath(MatchPath),
     MatchText(MatchText),
     SemanticTextSearch(SemanticTextSearch),

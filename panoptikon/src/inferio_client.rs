@@ -140,6 +140,7 @@ impl InferenceApiClient {
         Self::new_with_metadata_cache(inference.base_url.clone(), cache_metadata)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn predict(
         &self,
         inference_id: &str,
@@ -194,12 +195,12 @@ impl InferenceApiClient {
                     }
 
                     let status = response.status();
-                    if should_retry_status(status) {
-                        if let Some(delay) = next_retry_delay(attempts) {
-                            attempts += 1;
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
+                    if should_retry_status(status)
+                        && let Some(delay) = next_retry_delay(attempts)
+                    {
+                        attempts += 1;
+                        tokio::time::sleep(delay).await;
+                        continue;
                     }
 
                     let body = response.text().await.unwrap_or_default();
@@ -207,12 +208,12 @@ impl InferenceApiClient {
                     bail!("inference predict failed ({status})");
                 }
                 Err(err) => {
-                    if should_retry_error(&err) {
-                        if let Some(delay) = next_retry_delay(attempts) {
-                            attempts += 1;
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
+                    if should_retry_error(&err)
+                        && let Some(delay) = next_retry_delay(attempts)
+                    {
+                        attempts += 1;
+                        tokio::time::sleep(delay).await;
+                        continue;
                     }
                     warn!(%url, error = %err, "inference predict request failed");
                     return Err(err).context("inference predict request failed");
@@ -292,10 +293,10 @@ impl InferenceApiClient {
         let cache = METADATA_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
         {
             let guard = cache.read().await;
-            if let Some(entry) = guard.get(&self.base_url) {
-                if entry.fetched_at.elapsed() < METADATA_CACHE_TTL {
-                    return Ok(entry.value.clone());
-                }
+            if let Some(entry) = guard.get(&self.base_url)
+                && entry.fetched_at.elapsed() < METADATA_CACHE_TTL
+            {
+                return Ok(entry.value.clone());
             }
         }
 
