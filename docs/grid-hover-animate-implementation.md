@@ -147,6 +147,16 @@ Deviations from §2/§3, all adopted:
   cost a per-cell state update per arm. The two are coupled — documented at
   `showsMotionBadge`.
 
+User QA, 2026-09-02, two chrome fixes: (1) the two bottom buttons were not on
+one baseline — the fanout's anchor was `bottom-3 left-1` against the details
+button's `bottom-2 right-2` *before* this package, a 4 px stagger that the
+"pixel-identical to today" criterion preserved and the ramp widened to ~6 px
+at the smallest cells; the verifier's own screenshot showed it and its
+geometry table listed both values, and nobody (coordinator included) read
+alignment as a criterion because D11 never named it. Every corner anchor is
+now the one `--cell-chrome-inset`. (2) The grid's file-action fanout moves to
+bottom-right to match the filmstrip; the details button takes bottom-left.
+
 ## 7. Traps carried over
 
 - React Compiler is ON: bare allocations hoist into dependency-free memo slots;
