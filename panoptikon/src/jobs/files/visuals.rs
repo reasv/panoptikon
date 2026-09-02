@@ -1335,14 +1335,15 @@ pub(super) struct PendingBackfillWork {
     /// work — which is what backfills an existing library with no separate
     /// job. The examination rides the pass that decodes anyway.
     pub(super) transparency: bool,
-    /// `items.rotation` as it stands *now*, which is what orients an animated
-    /// item's loop when this pass measures no orientation of its own
-    /// ([`indexed_display_transform`]). `None` for a non-image, which has no
-    /// animated ladder to orient.
-    pub(super) indexed_rotation: Option<i64>,
-    /// `items.has_transparency` as it stands *now*. See
-    /// [`ImageLadderWork::transparency`].
-    pub(super) indexed_transparency: Option<bool>,
+    /// What the dispatcher measured and read about this image, whole
+    /// ([`ScanContext::image_facts`]), and `None` for a non-image.
+    ///
+    /// The facts themselves rather than a copy of the two fields the worker
+    /// happens to read today: they were gathered from one stat and one index
+    /// read, they are what every question above was *answered with*, and
+    /// picking two out of five is how the third comes to be re-derived from
+    /// something else.
+    pub(super) indexed: Option<ImageFacts>,
     /// The rendition-ladder question
     /// (docs/grid-scroll-performance-implementation.md §3, B1).
     pub(super) tier: Option<TierWork>,
@@ -1423,8 +1424,7 @@ pub(super) fn generate_backfill_visuals(
         animation: needs_animation,
         rotation: rotation_work,
         transparency: transparency_work,
-        indexed_rotation,
-        indexed_transparency,
+        indexed,
         tier: tier_work,
         formats,
         ladder,
@@ -1479,7 +1479,7 @@ pub(super) fn generate_backfill_visuals(
     let display_rotation = rotation
         .as_ref()
         .map(|pass| pass.quarter_turns)
-        .or(indexed_rotation);
+        .or_else(|| indexed.as_ref().and_then(|facts| facts.rotation));
     // Inside the thumbgen span, and first within it: everything below samples
     // frames, and design §7 requires detection to have happened by then. The
     // ~85ms of process spawn belongs to the visuals phase it clamps rather
@@ -1553,7 +1553,7 @@ pub(super) fn generate_backfill_visuals(
         tiers: ladder,
         rotation: display_rotation,
         formats,
-        transparency: indexed_transparency,
+        transparency: indexed.as_ref().and_then(|facts| facts.has_transparency),
         reusable_loops: reusable_loops.clone(),
     };
     // An image owing renditions runs the ordinary image pass: display tier
@@ -1672,7 +1672,7 @@ pub(super) fn generate_backfill_visuals(
                     tiers: GridLadder::Animated,
                     rotation: display_rotation,
                     formats,
-                    transparency: indexed_transparency,
+                    transparency: indexed.as_ref().and_then(|facts| facts.has_transparency),
                     reusable_loops: reusable_loops.clone(),
                 };
                 match build_image_renditions(
@@ -2012,12 +2012,28 @@ pub(super) fn resize_for_blurhash(image: &DynamicImage) -> DynamicImage {
 /// would decode them on every single scan.
 pub(super) fn image_is_served_directly(
     mime_type: &str,
-    animated: bool,
     facts: &ImageFacts,
-    width: i64,
-    height: i64,
     policy: FormatPolicy,
 ) -> bool {
+    let animated = is_animated_image(mime_type, facts.duration);
+    let Some((width, height)) = facts.dimensions else {
+        // Dimensions were never recorded: the byte bound is the only clause
+        // of the display rule that needs none, so it is the only one that can
+        // be asked, and it is asked here rather than at the call site so both
+        // halves of "is a rendition stored for this image?" live in one
+        // predicate.
+        //
+        // It is *stricter* than the old <=5 MB escape, so an image between
+        // 5 and 24 MiB whose dimensions were never indexed no longer gets a
+        // display thumbnail out of this pass. That is a convergence, not a
+        // hole: the orientation question (docs/display-dimensions-design.md
+        // §4) fills `width`/`height` for any image whose header reads at all,
+        // and on the next pass the measured branch below answers instead —
+        // and the ladder question can finally see it too. An image whose
+        // header does not read has no dimensions for anyone to decide with,
+        // and its decode failure is already a marker.
+        return !display_bytes_trigger(mime_type, animated, facts.file_size);
+    };
     let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
         // Nonsensical indexed dimensions: let the worker decode and decide.
         return false;
@@ -2742,14 +2758,7 @@ mod tests {
     fn served_directly_matches_the_thumbnail_decision() {
         const MB: u64 = 1024 * 1024;
         let served = |mime: &str, bytes: u64, width: i64, height: i64| {
-            image_is_served_directly(
-                mime,
-                false,
-                &facts(bytes, width, height, None),
-                width,
-                height,
-                FormatPolicy::default(),
-            )
+            image_is_served_directly(mime, &facts(bytes, width, height, None), FormatPolicy::default())
         };
         // The dead hole the old rule had: 2.9 MB, 100 MP, served raw to the
         // grid. Under the dimension-first rule it gets a rendition.
@@ -2773,10 +2782,7 @@ mod tests {
         // its size: its display answer is its file or a stored loop.
         assert!(image_is_served_directly(
             "image/gif",
-            true,
             &facts(30 * MB, 2000, 2000, Some(2.0)),
-            2000,
-            2000,
             FormatPolicy::default(),
         ));
         // Whatever the generator decides, the two agree — including for the

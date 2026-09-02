@@ -111,13 +111,11 @@ use crate::{
     media_tools::transcode::compose::Transform,
     visual_tiers::{
         DisplayPlan, FormatPolicy, LOOP_DISPLAY_TIER, LOOP_MEDIA_TYPE, RenditionFormat, RenditionRung, ThumbnailTier, TierPlan, WantedRendition,
-        animated_plans, animated_rendition_set, animated_serves_original, display_byte_bound,
-        display_plan, encode_rendition, grid_plans, grid_plans_for_stored_thumbnail,
-        grid_renditions, has_alpha_pixels, is_animated_image, is_loop_tier, loop_keeps_original,
-        render,
-        UNDECODABLE_HAS_TRANSPARENCY, poster_plans, source_class, static_rendition_set,
-        still_keeps_original,
-        stored_thumbnail_rendition_set, tier_format,
+        UNDECODABLE_HAS_TRANSPARENCY, animated_plans, animated_rendition_set,
+        animated_serves_original, display_bytes_trigger, display_plan, encode_rendition, grid_plans,
+        grid_plans_for_stored_thumbnail, grid_renditions, has_alpha_pixels, is_animated_image,
+        is_loop_tier, loop_keeps_original, poster_plans, render, static_rendition_set,
+        still_keeps_original, stored_thumbnail_rendition_set, tier_format,
     },
 };
 
@@ -2473,44 +2471,7 @@ impl ScanContext {
             generate_thumbnail = match &image_facts {
                 // Unreadable now: leave the visuals to a later scan.
                 None => false,
-                Some(facts) => match facts.dimensions {
-                    Some((width, height)) => !image_is_served_directly(
-                        &mime_type,
-                        is_animated_image(&mime_type, facts.duration),
-                        facts,
-                        width,
-                        height,
-                        self.formats,
-                    ),
-                    // Dimensions were never recorded; fall back to the
-                    // size-only check and let the worker decode. The
-                    // byte bound is the only clause of the display rule
-                    // that needs no dimensions, so it is the only one
-                    // that can be asked here.
-                    //
-                    // It is *stricter* than the old ≤5 MB escape, so an
-                    // image between 5 and 24 MiB whose dimensions were
-                    // never indexed no longer gets a display thumb out of
-                    // this pass. That is a convergence, not a hole: the
-                    // orientation question (the display-dimensions
-                    // backfill, docs/display-dimensions-design.md §4)
-                    // fills `width`/`height` for any image whose header
-                    // reads at all, and on the next pass this branch is
-                    // no longer reachable for it — the measured branch
-                    // above answers instead, and the ladder question can
-                    // finally see it too. An image whose header does not
-                    // read has no dimensions for anyone to decide with,
-                    // and its decode failure is already a marker.
-                    //
-                    // The bound is the source class's own, since the mime type
-                    // is known even when the dimensions are not; a WebP has
-                    // none at all, so bytes never dispatch one.
-                    None => display_byte_bound(source_class(
-                        &mime_type,
-                        is_animated_image(&mime_type, facts.duration),
-                    ))
-                    .is_some_and(|bound| facts.file_size > bound),
-                },
+                Some(facts) => !image_is_served_directly(&mime_type, facts, self.formats),
             };
         }
         // Which rendition ladder this item's grid tiers come from. Answered
@@ -2710,10 +2671,7 @@ impl ScanContext {
             animation: animation_work,
             rotation: rotation_work,
             transparency: transparency_work,
-            indexed_rotation: image_facts.as_ref().and_then(|facts| facts.rotation),
-            indexed_transparency: image_facts
-                .as_ref()
-                .and_then(|facts| facts.has_transparency),
+            indexed: image_facts,
             tier: tier_work,
             formats: self.formats,
             ladder,

@@ -414,7 +414,7 @@ pub(crate) enum SourceClass {
 
 /// Which class an item's original belongs to. `animated` is
 /// [`is_animated_image`]'s verdict, which the callers already hold.
-pub(crate) fn source_class(mime_type: &str, animated: bool) -> SourceClass {
+fn source_class(mime_type: &str, animated: bool) -> SourceClass {
     if animated {
         return SourceClass::Animated;
     }
@@ -433,7 +433,7 @@ pub(crate) fn source_class(mime_type: &str, animated: bool) -> SourceClass {
 /// WebP is the `None`: measured, a rendition of a WebP source saved under 50%
 /// and tripped the keep-the-original sentinel half the time, so its bytes say
 /// nothing worth acting on.
-pub(crate) fn display_byte_bound(class: SourceClass) -> Option<u64> {
+fn display_byte_bound(class: SourceClass) -> Option<u64> {
     match class {
         SourceClass::Lossless => Some(DISPLAY_MAX_FILE_SIZE_LOSSLESS),
         SourceClass::Jpeg => Some(DISPLAY_MAX_FILE_SIZE_JPEG),
@@ -612,9 +612,22 @@ fn animated_display_loop(file_size: u64, width: u32, height: u32) -> Option<&'st
 fn display_trigger_fires(class: SourceClass, file_size: u64, width: u32, height: u32) -> bool {
     let short = width.min(height);
     let pixels = u64::from(width) * u64::from(height);
-    short > DISPLAY_MAX_SHORT_SIDE
-        || pixels > DISPLAY_MAX_PIXELS
-        || display_byte_bound(class).is_some_and(|bound| file_size > bound)
+    short > DISPLAY_MAX_SHORT_SIDE || pixels > DISPLAY_MAX_PIXELS || bytes_over_bound(class, file_size)
+}
+
+/// Whether an item's **bytes** alone put it over the display trigger.
+///
+/// The one clause of the rule that needs no dimensions, which is what makes
+/// it the whole answer for an image whose width and height were never
+/// indexed. Exposed as its own question so that caller reads the same
+/// statement [`display_trigger_fires`] does rather than reassembling it out
+/// of the class table.
+pub(crate) fn display_bytes_trigger(mime_type: &str, animated: bool, file_size: u64) -> bool {
+    bytes_over_bound(source_class(mime_type, animated), file_size)
+}
+
+fn bytes_over_bound(class: SourceClass, file_size: u64) -> bool {
+    display_byte_bound(class).is_some_and(|bound| file_size > bound)
 }
 
 /// The unconstrained format verdict for a still display rendition, before the
