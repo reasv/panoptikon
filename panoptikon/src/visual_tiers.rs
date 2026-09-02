@@ -297,6 +297,16 @@ impl RenditionFormat {
         }
     }
 
+    /// Whether alpha survives into this container for a picture whose pixels
+    /// carry it (R4's other half).
+    ///
+    /// Only WebP does. Every JPEG here flattens — including the fallback a
+    /// policy without `webp`, or a side past [`WEBP_MAX_SIDE`], forces — so
+    /// the question is the format's own and not the caller's to re-derive.
+    fn keeps_alpha(self, has_transparency: Option<bool>) -> bool {
+        self == Self::Webp && has_transparency == Some(true)
+    }
+
     /// Whether this container can name a rendition of these dimensions at
     /// all. Both limits are the format's own — libwebp's 16383 and JPEG's
     /// 16-bit frame header — and neither is a quality or policy question.
@@ -309,11 +319,14 @@ impl RenditionFormat {
     }
 }
 
-/// Which quality half of the ladder a rendition belongs to. The two numbers
-/// per format live here rather than at the call sites so a grid tier and a
+/// Which rung of the ladder a rendition belongs to.
+///
+/// Every per-rung encoder setting is looked up *from this* rather than passed
+/// in beside it — the two JPEG and WebP qualities here, the two H.264 rate
+/// factors in [`crate::media_tools::animated_loop`] — so a grid tier and a
 /// display rendition can never be encoded at each other's settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RenditionScale {
+pub(crate) enum RenditionRung {
     Grid,
     Display,
 }
@@ -1154,6 +1167,15 @@ fn named(
         .collect()
 }
 
+/// The transparency verdict for a picture nothing can decode.
+///
+/// Named rather than spelled `false` where the dispatcher's marker gate
+/// writes it, because it is a *verdict* and not a measurement: a picture
+/// nobody can decode has no rendition for anything to be transparent in, and
+/// the column has to hold something or the pending index never drains and the
+/// item is dispatched again on every scan for the rest of its life.
+pub(crate) const UNDECODABLE_HAS_TRANSPARENCY: bool = false;
+
 /// Whether a decoded picture has a single non-opaque pixel (R4).
 ///
 /// The header is not the question: half of all PNGs carry an alpha *channel*
@@ -1181,30 +1203,31 @@ pub(crate) fn has_alpha_pixels(image: &DynamicImage) -> bool {
 
 /// Encodes one rendition in the format and at the quality its rung wants.
 ///
-/// `keep_alpha` is R4's other half: a transparent picture goes to WebP with
-/// its alpha channel, and every JPEG — including the flattening fallback when
-/// the policy or the size limit refuses WebP — drops it.
+/// `has_transparency` is the item's R4 verdict, not a keep-alpha instruction:
+/// whether the channel survives is [`RenditionFormat::keeps_alpha`]'s to say,
+/// and folding it in at the call site is how three copies of one condition
+/// came to exist.
 pub(crate) fn encode_rendition(
     image: &DynamicImage,
     format: RenditionFormat,
-    scale: RenditionScale,
-    keep_alpha: bool,
+    rung: RenditionRung,
+    has_transparency: Option<bool>,
 ) -> Result<Vec<u8>, String> {
     match format {
         RenditionFormat::Jpeg => encode_jpeg(
             image,
-            match scale {
-                RenditionScale::Grid => GRID_JPEG_QUALITY,
-                RenditionScale::Display => DISPLAY_JPEG_QUALITY,
+            match rung {
+                RenditionRung::Grid => GRID_JPEG_QUALITY,
+                RenditionRung::Display => DISPLAY_JPEG_QUALITY,
             },
         ),
         RenditionFormat::Webp => encode_webp(
             image,
-            match scale {
-                RenditionScale::Grid => GRID_WEBP_QUALITY,
-                RenditionScale::Display => DISPLAY_WEBP_QUALITY,
+            match rung {
+                RenditionRung::Grid => GRID_WEBP_QUALITY,
+                RenditionRung::Display => DISPLAY_WEBP_QUALITY,
             },
-            keep_alpha,
+            format.keeps_alpha(has_transparency),
         ),
     }
 }
@@ -2249,8 +2272,8 @@ mod tests {
         let bytes = encode_rendition(
             &image,
             RenditionFormat::Jpeg,
-            RenditionScale::Grid,
-            false,
+            RenditionRung::Grid,
+            Some(false),
         )
         .expect("the encoder runs on decoded pixels");
 
@@ -2322,8 +2345,8 @@ mod tests {
         let bytes = encode_rendition(
             &image,
             RenditionFormat::Webp,
-            RenditionScale::Display,
-            true,
+            RenditionRung::Display,
+            Some(true),
         )
         .expect("the encoder runs on decoded pixels");
         assert!(
@@ -2341,8 +2364,8 @@ mod tests {
         let flattened = encode_rendition(
             &image,
             RenditionFormat::Webp,
-            RenditionScale::Display,
-            false,
+            RenditionRung::Display,
+            Some(false),
         )
         .expect("the encoder runs");
         let decoded = image::load_from_memory(&flattened).expect("the WebP decodes");

@@ -44,9 +44,8 @@ pub(super) struct ProducedVisuals {
     /// predicate is already the cache for those, and marking them would put a
     /// row in the table for the majority of every image library.
     pub(super) nothing: Vec<VisualKind>,
-    /// What this pass measured about the item's pixels (R4), or `None` when
-    /// it decoded nothing. Written once, guarded on `has_transparency IS
-    /// NULL`, by the one pass that holds the decoded image.
+    /// What this pass measured about the item's pixels, or `None` when it
+    /// decoded nothing. See [`ImageLadderWork::transparency`] for R4.
     pub(super) transparency: Option<bool>,
     /// Verdicts the **animated ladder** owes, which the pass carries rather
     /// than returning as an error.
@@ -531,17 +530,22 @@ pub(super) struct ImageLadderWork {
     /// This database's format policy (R5), folded once per scan. It only
     /// *constrains* what the rules below decide.
     pub(super) formats: FormatPolicy,
-    /// `items.has_transparency` as the index holds it *now*, and the value
-    /// this pass must choose formats by whenever it is `Some`.
+    /// `items.has_transparency` as the index holds it *now* — R4's canonical
+    /// statement, which every other mention of the question points here for.
     ///
-    /// The pass measures its own (R4) and reports it for the write-once
-    /// column, but a stored answer outranks it. The two are the same
-    /// measurement of the same pixels, so they agree in practice — and where
-    /// they could not, the dispatcher predicted with the *index*, so a
-    /// generator that followed its own decode instead would write a set the
-    /// dispatcher never asked for and re-dispatch the item on every scan
-    /// forever. Deferring to the column is what makes that impossible by
-    /// construction.
+    /// **The pass measures; the index decides.** A pass that decodes always
+    /// measures the pixels (`has_alpha_pixels`) and reports the answer for
+    /// the write-once column, because it is the only thing in the scan that
+    /// holds them. But wherever this field is `Some`, *it* chooses the
+    /// formats. The two are the same measurement of the same pixels, so they
+    /// agree in practice — and where they could not, the dispatcher predicted
+    /// the wanted set with the **index**, so a generator that followed its
+    /// own decode instead would write a set nobody asked for and re-dispatch
+    /// the item on every scan forever. Deferring to the column is what makes
+    /// that impossible by construction.
+    ///
+    /// `None` is an unexamined item, and then the pass's own measurement is
+    /// the only answer there is.
     pub(super) transparency: Option<bool>,
     /// See [`PendingBackfillWork::reusable_loops`]: the stored H.264 rows the
     /// dispatcher verified against this same plan, named rather than encoded.
@@ -568,19 +572,13 @@ pub(super) fn build_image_renditions(
 ) -> Result<(), FileProcessError> {
     let (width, height) = image.dimensions();
     // R4, measured here and nowhere else: this is the one place in the scan
-    // that holds an item's decoded pixels, and the answer decides the *format*
-    // of every rendition below. This pass's measurement outranks the index's —
-    // for a pending item the index holds nothing at all — and it is what the
-    // dispatcher reads next scan instead of decoding again.
+    // that holds an item's decoded pixels, and it is what the dispatcher
+    // reads next scan instead of decoding again. The pass measures; the index
+    // decides — see [`ImageLadderWork::transparency`].
     let measured = Some(has_alpha_pixels(&image));
     out.transparency = measured;
-    // The indexed answer decides the format wherever there is one; see
-    // [`ImageLadderWork::transparency`].
     let transparency = work.transparency.or(measured);
     let grid_format = tier_format(transparency, work.formats);
-    // Alpha only ever survives into WebP; every JPEG here flattens, which is
-    // the documented fallback when the policy or the size limit refuses one.
-    let keep_alpha = grid_format == RenditionFormat::Webp && transparency == Some(true);
     match work.tiers {
         _ if !work.replace_tiers => {}
         GridLadder::Static => {
@@ -589,7 +587,7 @@ pub(super) fn build_image_renditions(
                 &image,
                 &grid_plans(file_size, width, height),
                 grid_format,
-                keep_alpha,
+                transparency,
             )?);
         }
         GridLadder::Animated => {
@@ -600,7 +598,7 @@ pub(super) fn build_image_renditions(
                 &image,
                 work.rotation,
                 grid_format,
-                keep_alpha,
+                transparency,
                 &work.reusable_loops,
             );
             out.tiers = tiers;
@@ -637,8 +635,7 @@ pub(super) fn build_image_renditions(
             format,
         } => {
             let thumb = render_display_rendition(&image, target_width, target_height);
-            let keep_alpha = format == RenditionFormat::Webp && transparency == Some(true);
-            let encoded = encode_image(0, &thumb, format, RenditionScale::Display, keep_alpha)?;
+            let encoded = encode_image(0, &thumb, format, RenditionRung::Display, transparency)?;
             // The keep-the-original sentinel (§2 R2, and `crate::visual_tiers`'s
             // module docs): a rendition that is not comfortably smaller than
             // the file it stands in for is not worth a second copy of the
@@ -729,7 +726,7 @@ pub(super) fn build_animated_tiers(
     first_frame: &DynamicImage,
     rotation: Option<i64>,
     format: RenditionFormat,
-    keep_alpha: bool,
+    transparency: Option<bool>,
     reusable_loops: &[TierGeometry],
 ) -> (Option<Vec<StoredTier>>, Vec<VisualVerdict>) {
     let (width, height) = first_frame.dimensions();
@@ -738,7 +735,7 @@ pub(super) fn build_animated_tiers(
         first_frame,
         &poster_plans(width, height),
         format,
-        keep_alpha,
+        transparency,
     ) {
         Ok(tiers) => tiers,
         Err(err) => {
@@ -776,17 +773,17 @@ pub(super) fn build_animated_tiers(
             });
             continue;
         }
-        let crf = if tier == LOOP_DISPLAY_TIER {
-            crate::media_tools::animated_loop::LOOP_DISPLAY_CRF
+        let rung = if tier == LOOP_DISPLAY_TIER {
+            RenditionRung::Display
         } else {
-            crate::media_tools::animated_loop::LOOP_CRF
+            RenditionRung::Grid
         };
         let bytes = match crate::media_tools::animated_loop::encode_loop(
             path,
             mime_type,
             &plan,
             indexed_display_transform(rotation),
-            crf,
+            rung,
         ) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -1154,8 +1151,7 @@ pub(super) struct ImageFacts {
     /// which is the one the animated ladder's loop is cropped against
     /// ([`indexed_display_transform`]). `None` where nothing has examined it.
     pub(super) rotation: Option<i64>,
-    /// `items.has_transparency` — the fact that decides every rendition's
-    /// *format* (R4), `None` where nothing has examined the pixels.
+    /// `items.has_transparency`. See [`ImageLadderWork::transparency`].
     pub(super) has_transparency: Option<bool>,
 }
 
@@ -1358,9 +1354,8 @@ pub(super) struct PendingBackfillWork {
     /// ([`indexed_display_transform`]). `None` for a non-image, which has no
     /// animated ladder to orient.
     pub(super) indexed_rotation: Option<i64>,
-    /// `items.has_transparency` as it stands *now* — what the dispatcher
-    /// predicted this item's rendition formats with, and therefore what the
-    /// generator must decide them by. See [`ImageLadderWork::transparency`].
+    /// `items.has_transparency` as it stands *now*. See
+    /// [`ImageLadderWork::transparency`].
     pub(super) indexed_transparency: Option<bool>,
     /// The rendition-ladder question
     /// (docs/grid-scroll-performance-implementation.md §3, B1).
@@ -1678,29 +1673,45 @@ pub(super) fn generate_backfill_visuals(
                 .map_err(|(stage, err)| FileProcessError::visuals_from_image_error(stage, err))
         }) {
             Ok((file_size, image)) => {
-                // The posters come out of this decode, so its pixels answer
-                // R4 too — the same measurement the image pass makes, from
-                // the same place, rather than a second decode for one column.
-                let measured = Some(has_alpha_pixels(&image));
-                measured_transparency = measured;
-                // The index decides where it has an answer, for the same
-                // reason the image pass defers to it.
-                let transparency = indexed_transparency.or(measured);
-                let format = tier_format(transparency, formats);
-                let keep_alpha =
-                    format == RenditionFormat::Webp && transparency == Some(true);
-                let (produced, tier_verdicts) = build_animated_tiers(
-                    path,
-                    mime_type,
-                    file_size,
-                    &image,
-                    display_rotation,
-                    format,
-                    keep_alpha,
-                    &reusable_loops,
-                );
-                tiers = produced;
-                verdicts.extend(tier_verdicts);
+                // The ordinary image pass with its display half switched off.
+                // Through the same function rather than beside it, because
+                // everything between the decode and the loop encoder — the
+                // R4 measurement, the index-outranks-the-pass rule, the
+                // format verdict — is the same work, and a second copy of it
+                // is a second thing to keep in step.
+                let mut produced = ProducedVisuals::default();
+                let work = ImageLadderWork {
+                    display: false,
+                    replace_tiers: true,
+                    tiers: GridLadder::Animated,
+                    rotation: display_rotation,
+                    formats,
+                    transparency: indexed_transparency,
+                    reusable_loops: reusable_loops.clone(),
+                };
+                match build_image_renditions(
+                    &mut produced, path, mime_type, file_size, image, work,
+                ) {
+                    Ok(()) => {
+                        measured_transparency = produced.transparency;
+                        tiers = produced.tiers;
+                        verdicts.extend(produced.tier_verdicts);
+                        // The same decode, handed on rather than repeated:
+                        // with the thumbnail half off there is no other
+                        // source, and the fallback below is a second full
+                        // decode of the original.
+                        blurhash_source = produced.blurhash_source;
+                    }
+                    Err(err) => {
+                        let err = VisualsError::thumbnail(err);
+                        tracing::debug!(
+                            error = ?err,
+                            path = %path.display(),
+                            "failed to build an animated item's ladder"
+                        );
+                        verdicts.extend(failure_verdicts(&err));
+                    }
+                }
             }
             Err(err) => {
                 // The decode this ladder is made of, and the same verdict the
@@ -2052,12 +2063,12 @@ pub(super) fn encode_tiers(
     image: &DynamicImage,
     plans: &[(ThumbnailTier, TierPlan)],
     format: RenditionFormat,
-    keep_alpha: bool,
+    transparency: Option<bool>,
 ) -> Result<Vec<StoredTier>, FileProcessError> {
     grid_renditions(image, plans)
         .into_iter()
         .map(|(tier, rendition)| {
-            let encoded = encode_image(idx, &rendition, format, RenditionScale::Grid, keep_alpha)?;
+            let encoded = encode_image(idx, &rendition, format, RenditionRung::Grid, transparency)?;
             Ok(StoredTier {
                 idx,
                 tier: tier.as_str(),
@@ -2085,26 +2096,25 @@ pub(super) fn encode_stored_thumbnail_tiers(
         image,
         &grid_plans_for_stored_thumbnail(width, height),
         RenditionFormat::Jpeg,
-        false,
+        Some(false),
     )
 }
 
 /// One encoded rendition, in the format and at the quality its rung asks for
 /// (docs/thumbnail-format-implementation.md §2).
 ///
-/// `keep_alpha` only ever reaches WebP: every JPEG here flattens, including
-/// the fallback a policy without `webp` or a side past the WebP size limit
-/// forces.
+/// `transparency` is the item's R4 verdict; whether the alpha channel
+/// survives is the format's own question ([`RenditionFormat::keeps_alpha`]).
 pub(super) fn encode_image(
     idx: i64,
     image: &DynamicImage,
     format: RenditionFormat,
-    scale: RenditionScale,
-    keep_alpha: bool,
+    rung: RenditionRung,
+    transparency: Option<bool>,
 ) -> Result<StoredImage, FileProcessError> {
     // In-memory, on pixels already decoded: no file I/O to be ambiguous
     // about, so one attempt settles it.
-    let bytes = encode_rendition(image, format, scale, keep_alpha).map_err(visuals_input)?;
+    let bytes = encode_rendition(image, format, rung, transparency).map_err(visuals_input)?;
     Ok(StoredImage {
         idx,
         width: image.width() as i64,
@@ -2132,8 +2142,8 @@ pub(super) fn encode_generated_still(
         idx,
         image,
         RenditionFormat::Jpeg,
-        RenditionScale::Display,
-        false,
+        RenditionRung::Display,
+        Some(false),
     )
 }
 
@@ -2243,7 +2253,7 @@ mod tests {
             &image,
             None,
             RenditionFormat::Jpeg,
-            false,
+            Some(false),
             &[],
         );
         let tiers = tiers.expect("the ladder is produced");
@@ -2306,7 +2316,7 @@ mod tests {
             &image,
             None,
             RenditionFormat::Jpeg,
-            false,
+            Some(false),
             &[],
         );
         assert!(
@@ -2825,7 +2835,7 @@ mod tests {
                 let image = DynamicImage::ImageRgb8(image::RgbImage::new(width, height));
                 let plans = grid_plans(50 * MB, width, height);
                 let stored =
-                    encode_tiers(0, &image, &plans, format, false).expect("tiers encode");
+                    encode_tiers(0, &image, &plans, format, Some(false)).expect("tiers encode");
                 let stored: Vec<TierGeometry> = stored
                     .iter()
                     .map(|tier| TierGeometry {

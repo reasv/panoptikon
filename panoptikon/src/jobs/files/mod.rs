@@ -109,11 +109,12 @@ use crate::{
     media_tools::animated_loop::LoopError,
     media_tools::transcode::compose::Transform,
     visual_tiers::{
-        DisplayPlan, FormatPolicy, LOOP_DISPLAY_TIER, LOOP_MEDIA_TYPE, RenditionFormat, RenditionScale, ThumbnailTier, TierPlan, WantedRendition,
+        DisplayPlan, FormatPolicy, LOOP_DISPLAY_TIER, LOOP_MEDIA_TYPE, RenditionFormat, RenditionRung, ThumbnailTier, TierPlan, WantedRendition,
         animated_plans, animated_rendition_set, animated_serves_original, display_byte_bound,
         display_plan, encode_rendition, grid_plans, grid_plans_for_stored_thumbnail,
         grid_renditions, has_alpha_pixels, is_animated_image, is_loop_tier, loop_keeps_original,
-        poster_plans, source_class, static_rendition_set, still_keeps_original,
+        UNDECODABLE_HAS_TRANSPARENCY, poster_plans, source_class, static_rendition_set,
+        still_keeps_original,
         stored_thumbnail_rendition_set, tier_format,
     },
 };
@@ -2603,7 +2604,8 @@ impl ScanContext {
             // construction.
             if transparency_work {
                 transparency_work = false;
-                self.record_item_transparency(&sha256, Some(false)).await;
+                self.record_item_transparency(&sha256, Some(UNDECODABLE_HAS_TRANSPARENCY))
+                    .await;
             }
         }
         // The animated ladder's own marker, and deliberately a separate
