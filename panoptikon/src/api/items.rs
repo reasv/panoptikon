@@ -666,7 +666,7 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
 /// | 6 | animated grid, `still=true`, no poster | the file | the file's | + `-still` | as row 4 |
 /// | 7 | static ladder, tier rendition found | `thumbnail_tiers` row | stored | `…-{tier}-v{ver}` + variant | exact or `fall_up_is_final` ? immutable : no-cache |
 /// | 8 | static ladder, display rendition found | `thumbnails` row | stored | `sha-thumb{idx}-{w}x{h}-{fmt}` + variant | `size == display` or `fall_up_is_final` ? immutable : no-cache |
-/// | 8b | display rendition is the sentinel (no bytes) | the file | the file's | + variant | immutable / drifted |
+/// | 8b | display rendition is the sentinel (no bytes) | the file | the file's | + variant | `size == display` or `fall_up_is_final` ? immutable/drifted : no-cache |
 /// | 2b | animated `display`, over the trigger | `thumbnail_tiers.loop`/`loop-display` | stored (`video/mp4`) | `sha-thumb0-{tier}-v{ver}` | immutable |
 /// | 9 | image, nothing stored | the file | the file's | + variant | `fall_up_is_final` ? immutable/drifted : no-cache |
 /// | 10 | non-image, nothing stored | `PLACEHOLDER_PNG` | `image/png` | `sha-placeholder` | `max-age=300` |
@@ -846,7 +846,14 @@ async fn thumbnail_response(
                 files,
                 still_suffix,
                 request_headers,
-                content_addressed,
+                // Final for a `display` request, which is the row's own tier:
+                // the verdict is about the content and cannot change under
+                // this URL. A **grid** request reaching this row is a
+                // fall-up, and one that happens while the tier rows are still
+                // being written must revalidate rather than pin the original
+                // for a year — the same rule, and deliberately the same
+                // expression, as the rendition branch ten lines below.
+                content_addressed && (size == ThumbnailTier::Display || fall_up_is_final),
             )
             .await;
         }
@@ -2518,6 +2525,108 @@ VALUES (?1, 0, 'image/jpeg', 'image/jpeg', 2560, 284, 1, X'')
             body_bytes(response).await,
             b"pretend this is a jpeg".to_vec(),
             "the original file's bytes, not the empty sentinel blob"
+        );
+    }
+
+    /// A **grid** request that falls up onto a display sentinel is still a
+    /// fall-up, and pays the fall-up's cache rule.
+    ///
+    /// The sentinel is final for the tier it belongs to — `display` — because
+    /// the verdict is about the content. It says nothing at all about the
+    /// grid tiers, which for a large item are simply not written yet: serving
+    /// the original `immutable` for a year to a `grid-xs` request, on exactly
+    /// the items the ladder exists to shrink, is what this guards against.
+    #[tokio::test]
+    async fn a_grid_request_falling_up_to_a_sentinel_follows_the_fall_up_rule() {
+        let file_path = temp_path("sentinel_fall_up.jpg");
+        std::fs::write(&file_path, b"pretend this is a jpeg").unwrap();
+        let (mut item, mut file) = test_records(&file_path);
+        item.mime_type = "image/jpeg".to_string();
+        // A strip far outside every grid tier's budget: all three renditions
+        // are owed and none is stored yet.
+        item.width = Some(9000);
+        item.height = Some(1000);
+        item.size = Some(27 * 1024 * 1024);
+        file.last_modified =
+            format_system_time(std::fs::metadata(&file_path).unwrap().modified().unwrap()).unwrap();
+
+        let crate::db::migrations::InMemoryDatabases {
+            mut index_conn,
+            storage_conn,
+            user_data_conn,
+        } = crate::db::migrations::setup_test_databases().await;
+        let _attached = (storage_conn, user_data_conn);
+
+        sqlx::query(
+            r#"
+INSERT INTO storage.thumbnails (
+    item_sha256, idx, item_mime_type, media_type, width, height, version, thumbnail
+)
+VALUES (?1, 0, 'image/jpeg', 'image/jpeg', 2560, 284, 1, X'')
+            "#,
+        )
+        .bind(&item.sha256)
+        .execute(&mut index_conn)
+        .await
+        .unwrap();
+
+        let cache = async |conn: &mut sqlx::SqliteConnection,
+                           item: &ItemRecord,
+                           size: ThumbnailTier| {
+            let response = thumbnail_response(
+                conn,
+                item,
+                std::slice::from_ref(&file),
+                true,
+                size,
+                false,
+                &HeaderMap::new(),
+                true,
+            )
+            .await
+            .expect("thumbnail response");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "image/jpeg",
+                "every one of these is the original file"
+            );
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        assert_eq!(
+            cache(&mut index_conn, &item, ThumbnailTier::Display).await,
+            CACHE_IMMUTABLE,
+            "the sentinel's own tier: a settled verdict about the content"
+        );
+        for size in [
+            ThumbnailTier::GridM,
+            ThumbnailTier::GridS,
+            ThumbnailTier::GridXs,
+        ] {
+            assert_eq!(
+                cache(&mut index_conn, &item, size).await,
+                CACHE_REVALIDATE,
+                "{size:?} is still owed a rendition, so the file standing in \
+                 for it must revalidate"
+            );
+        }
+
+        // And the other half of the same rule: an item small enough that
+        // `grid-m` will never store anything is final there too, sentinel or
+        // not.
+        item.width = Some(1280);
+        item.height = Some(2560);
+        item.size = Some(5 * 1024 * 1024);
+        assert_eq!(
+            cache(&mut index_conn, &item, ThumbnailTier::GridM).await,
+            CACHE_IMMUTABLE,
+            "nothing will ever be stored for this tier, so the file is the answer"
         );
     }
 
