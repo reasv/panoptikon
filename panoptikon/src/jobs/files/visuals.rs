@@ -629,12 +629,8 @@ pub(super) fn build_image_renditions(
         work.formats,
     );
     match plan {
-        DisplayPlan::Thumbnail {
-            width: target_width,
-            height: target_height,
-            format,
-        } => {
-            let thumb = render_display_rendition(&image, target_width, target_height);
+        DisplayPlan::Thumbnail { plan, format } => {
+            let thumb = render(&image, &plan);
             let encoded = encode_image(0, &thumb, format, RenditionRung::Display, transparency)?;
             // The keep-the-original sentinel (§2 R2, and `crate::visual_tiers`'s
             // module docs): a rendition that is not comfortably smaller than
@@ -650,7 +646,13 @@ pub(super) fn build_image_renditions(
             } else {
                 out.thumbnails.push(encoded);
             }
-            out.blurhash_source = Some(thumb);
+            // The rendition where one was really made, and the original where
+            // the plan was the identity — the same picture either way, and no
+            // copy of it.
+            out.blurhash_source = Some(match thumb {
+                Cow::Owned(thumb) => thumb,
+                Cow::Borrowed(_) => image,
+            });
         }
         // Served from the original file, or — for an animated item over the
         // trigger — from a stored loop, which is a `thumbnail_tiers` row and
@@ -665,22 +667,6 @@ pub(super) fn build_image_renditions(
         }
     }
     Ok(())
-}
-
-/// Resizes one decoded image onto exactly the dimensions [`display_plan`]
-/// named.
-///
-/// `resize_exact`, never `resize`: the stored dimensions have to be *exactly*
-/// the ones the plan predicts, or the backfill's "is this the rendition the
-/// current rule wants?" comparison never settles. A rendition that kept every
-/// pixel (only the byte bound fired) is cloned rather than resampled — a full
-/// Lanczos pass onto its own dimensions would cost the same picture, slightly
-/// blurrier.
-fn render_display_rendition(image: &DynamicImage, width: u32, height: u32) -> DynamicImage {
-    if (image.width(), image.height()) == (width, height) {
-        return image.clone();
-    }
-    image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
 }
 
 /// The animated ladder of one item: its static posters and its H.264 loop

@@ -37,6 +37,7 @@ mod visuals;
 use visuals::*;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     env,
     ffi::OsStr,
@@ -113,6 +114,7 @@ use crate::{
         animated_plans, animated_rendition_set, animated_serves_original, display_byte_bound,
         display_plan, encode_rendition, grid_plans, grid_plans_for_stored_thumbnail,
         grid_renditions, has_alpha_pixels, is_animated_image, is_loop_tier, loop_keeps_original,
+        render,
         UNDECODABLE_HAS_TRANSPARENCY, poster_plans, source_class, static_rendition_set,
         still_keeps_original,
         stored_thumbnail_rendition_set, tier_format,
@@ -3341,14 +3343,10 @@ impl ScanContext {
                 // A still item never reaches the loop verdict; the arm is
                 // here so the match stays total.
                 DisplayPlan::Original | DisplayPlan::Loop { .. } => stored_thumbnails.is_empty(),
-                DisplayPlan::Thumbnail {
-                    width: expected_width,
-                    height: expected_height,
-                    format,
-                } => match stored_thumbnails.as_slice() {
+                DisplayPlan::Thumbnail { plan, format } => match stored_thumbnails.as_slice() {
                     [stored] => {
                         (stored.idx, stored.width, stored.height)
-                            == (0, i64::from(expected_width), i64::from(expected_height))
+                            == (0, i64::from(plan.width), i64::from(plan.height))
                             // Plain equality, sentinel rows included
                             // (`crate::visual_tiers`, "The keep-the-original
                             // sentinel").

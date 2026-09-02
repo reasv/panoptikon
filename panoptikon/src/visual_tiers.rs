@@ -94,6 +94,7 @@
 //! type, with no exception anywhere, for either table.
 
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
+use std::borrow::Cow;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
@@ -446,10 +447,9 @@ pub(crate) fn display_byte_bound(class: SourceClass) -> Option<u64> {
 pub(crate) enum DisplayPlan {
     /// Serve the original file; store nothing.
     Original,
-    /// Store a still rendition of exactly these dimensions, in this format.
+    /// Store a still rendition of exactly this geometry, in this format.
     Thumbnail {
-        width: u32,
-        height: u32,
+        plan: TierPlan,
         format: RenditionFormat,
     },
     /// Serve a stored H.264 loop (R3), named by the row that holds it:
@@ -472,8 +472,10 @@ pub(crate) enum DisplayPlan {
 pub(crate) enum DisplayShape {
     /// Serve the original file; store nothing.
     Original,
-    /// Store a still rendition of exactly these dimensions.
-    Still { width: u32, height: u32 },
+    /// Store a still rendition of exactly this geometry: the whole picture,
+    /// resized. A [`TierPlan`] like every other rendition's, so one `render`
+    /// serves them all.
+    Still { plan: TierPlan },
     /// Serve the stored H.264 loop this row holds (R3).
     Loop { tier: &'static str },
 }
@@ -523,7 +525,7 @@ pub(crate) fn display_shape(
             None => DisplayShape::Original,
         };
     }
-    let (width, height) = display_dimensions(width, height);
+    let (out_width, out_height) = display_dimensions(width, height);
     // A shape no container can name. The 2560 cap is on the *short* side, so
     // a 200x100000 strip keeps every one of its rows: too long for WebP,
     // which sends it to JPEG, and too long for JPEG's 16-bit frame header
@@ -532,10 +534,27 @@ pub(crate) fn display_shape(
     // shape rather than to any of them. It has to be reached *here*, or the
     // plan names a rendition the generator cannot produce and the item is
     // dispatched, made to fail and dispatched again on every scan forever.
-    if !fits_jpeg(width, height) {
+    if !fits_jpeg(out_width, out_height) {
         return DisplayShape::Original;
     }
-    DisplayShape::Still { width, height }
+    DisplayShape::Still {
+        plan: whole_image_plan(width, height, out_width, out_height),
+    }
+}
+
+/// The plan that resizes the whole picture onto `(width, height)`.
+///
+/// A display surface shows all of it, so this never crops — which is the one
+/// thing separating a display rendition, still or loop, from every grid one.
+fn whole_image_plan(source_width: u32, source_height: u32, width: u32, height: u32) -> TierPlan {
+    TierPlan {
+        crop_x: 0,
+        crop_y: 0,
+        crop_width: source_width.max(1),
+        crop_height: source_height.max(1),
+        width,
+        height,
+    }
 }
 
 /// [`display_shape`] with the format decided: the whole display rule, and
@@ -553,22 +572,20 @@ pub(crate) fn display_plan(
     match display_shape(mime_type, animated, file_size, width, height) {
         DisplayShape::Original => DisplayPlan::Original,
         DisplayShape::Loop { tier } => DisplayPlan::Loop { tier },
-        DisplayShape::Still { width, height } => {
-            let wanted =
-                policy.constrain(display_format(source_class(mime_type, animated), has_transparency));
+        DisplayShape::Still { plan } => {
+            let wanted = policy
+                .constrain(display_format(source_class(mime_type, animated), has_transparency));
             // libwebp's own limit, and the only rendition that can reach it:
             // the tall strips, whose display rendition keeps its short side
             // and runs to tens of thousands of rows. JPEG at the same
             // quality, alpha flattened as it always is there.
             let format = match wanted {
-                RenditionFormat::Webp if !fits_webp(width, height) => RenditionFormat::Jpeg,
+                RenditionFormat::Webp if !fits_webp(plan.width, plan.height) => {
+                    RenditionFormat::Jpeg
+                }
                 format => format,
             };
-            DisplayPlan::Thumbnail {
-                width,
-                height,
-                format,
-            }
+            DisplayPlan::Thumbnail { plan, format }
         }
     }
 }
@@ -829,21 +846,30 @@ fn grid_plan_for_stored_thumbnail(
 
 /// Applies a [`TierPlan`]. `crop_imm` is a view copy, so the resize reads
 /// only the pixels the crop kept.
-pub(crate) fn render(image: &DynamicImage, plan: &TierPlan) -> DynamicImage {
+/// A plan that neither crops nor resizes borrows: a display rendition of a
+/// picture that only broke the *byte* bound keeps every pixel, and a full
+/// Lanczos pass onto its own dimensions would cost the same picture slightly
+/// blurrier. `resize_exact`, never `resize`, because the stored dimensions
+/// have to be exactly the ones the plan predicts or the backfill's "is this
+/// the rendition the current rule wants?" comparison never settles.
+pub(crate) fn render<'a>(image: &'a DynamicImage, plan: &TierPlan) -> Cow<'a, DynamicImage> {
     let (width, height) = image.dimensions();
-    let cropped = if plan.crop_x == 0
+    let whole = plan.crop_x == 0
         && plan.crop_y == 0
         && plan.crop_width == width
-        && plan.crop_height == height
-    {
-        image.clone()
+        && plan.crop_height == height;
+    if whole && plan.width == width && plan.height == height {
+        return Cow::Borrowed(image);
+    }
+    let cropped = if whole {
+        Cow::Borrowed(image)
     } else {
-        image.crop_imm(plan.crop_x, plan.crop_y, plan.crop_width, plan.crop_height)
+        Cow::Owned(image.crop_imm(plan.crop_x, plan.crop_y, plan.crop_width, plan.crop_height))
     };
     if cropped.width() == plan.width && cropped.height() == plan.height {
         return cropped;
     }
-    cropped.resize_exact(plan.width, plan.height, FilterType::Lanczos3)
+    Cow::Owned(cropped.resize_exact(plan.width, plan.height, FilterType::Lanczos3))
 }
 
 /// The grid renditions to store for one already-decoded picture, largest
@@ -862,7 +888,9 @@ pub(crate) fn grid_renditions(
     let mut out: Vec<(ThumbnailTier, DynamicImage)> = Vec::with_capacity(plans.len());
     for (tier, plan) in plans {
         let source = out.last().map(|(_, image)| image).unwrap_or(image);
-        out.push((*tier, render(source, plan)));
+        // Owned, and it has to be: the next rung reads this one out of the
+        // vector it is being pushed into.
+        out.push((*tier, render(source, plan).into_owned()));
     }
     out
 }
@@ -1005,14 +1033,7 @@ fn even_side(side: u32) -> u32 {
 /// grid loop, and the reason a strip cannot simply reuse one.
 fn loop_display_plan(width: u32, height: u32) -> TierPlan {
     let (out_width, out_height) = display_dimensions(width.max(1), height.max(1));
-    TierPlan {
-        crop_x: 0,
-        crop_y: 0,
-        crop_width: width.max(1),
-        crop_height: height.max(1),
-        width: even_side(out_width),
-        height: even_side(out_height),
-    }
+    whole_image_plan(width, height, even_side(out_width), even_side(out_height))
 }
 
 /// Whether an animated item's **grid** loop row is also its display loop (R3),
@@ -1257,7 +1278,12 @@ pub(crate) fn encode_rendition(
 fn encode_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
     use jpeg_encoder::{ColorType, Encoder, QuantizationTableType, SamplingFactor};
 
-    let rgb = image.to_rgb8();
+    // Borrowed where the picture is already 8-bit RGB, which every rendition
+    // of a decoded photograph is: `to_rgb8` copies the whole buffer even then.
+    let rgb = match image.as_rgb8() {
+        Some(rgb) => Cow::Borrowed(rgb),
+        None => Cow::Owned(image.to_rgb8()),
+    };
     let (width, height) = (rgb.width(), rgb.height());
     // The container's own limit, not ours: JPEG's frame header carries the
     // dimensions in 16 bits. Nothing in the ladder reaches it — [`display_plan`]
@@ -1289,11 +1315,17 @@ fn encode_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
 /// half of the codec entirely.
 fn encode_webp(image: &DynamicImage, quality: f32, keep_alpha: bool) -> Result<Vec<u8>, String> {
     let memory = if keep_alpha {
-        let rgba = image.to_rgba8();
+        let rgba = match image.as_rgba8() {
+            Some(rgba) => Cow::Borrowed(rgba),
+            None => Cow::Owned(image.to_rgba8()),
+        };
         let (width, height) = (rgba.width(), rgba.height());
         webp::Encoder::from_rgba(&rgba, width, height).encode_simple(false, quality)
     } else {
-        let rgb = image.to_rgb8();
+        let rgb = match image.as_rgb8() {
+            Some(rgb) => Cow::Borrowed(rgb),
+            None => Cow::Owned(image.to_rgb8()),
+        };
         let (width, height) = (rgb.width(), rgb.height());
         webp::Encoder::from_rgb(&rgb, width, height).encode_simple(false, quality)
     };
@@ -1335,9 +1367,10 @@ mod tests {
 
         // 100 MP under 3 MB: the hole. 12000x8333 = 99.996 MP.
         let plan = plan_of(JPEG, 3 * MB, 12000, 8333);
-        let DisplayPlan::Thumbnail { width, height, .. } = plan else {
+        let DisplayPlan::Thumbnail { plan, .. } = plan else {
             panic!("a 100 MP original must not be served directly: {plan:?}");
         };
+        let (width, height) = (plan.width, plan.height);
         assert!(u64::from(width) * u64::from(height) <= DISPLAY_MAX_PIXELS);
         assert!(width.min(height) <= DISPLAY_RENDITION_SHORT_SIDE);
 
@@ -1436,8 +1469,7 @@ mod tests {
         assert_eq!(
             plan_of(PNG, 30 * MB, 2000, 1500),
             DisplayPlan::Thumbnail {
-                width: 2000,
-                height: 1500,
+                plan: whole_image_plan(2000, 1500, 2000, 1500),
                 format: RenditionFormat::Webp,
             },
             "only the byte bound broke, so every pixel is kept"
@@ -1555,8 +1587,7 @@ mod tests {
         assert_eq!(
             display_plan(PNG, false, None, 4 * MB, 200, JPEG_MAX_SIDE, policy),
             DisplayPlan::Thumbnail {
-                width: 200,
-                height: JPEG_MAX_SIDE,
+                plan: whole_image_plan(200, JPEG_MAX_SIDE, 200, JPEG_MAX_SIDE),
                 format: RenditionFormat::Jpeg,
             }
         );
