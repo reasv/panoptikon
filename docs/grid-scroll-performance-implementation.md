@@ -55,8 +55,9 @@ Converged with the user 2026-08-31:
 
 - **Thumbnail ladder**: keep a 4096-class `display` tier (gallery quality +
   the browser-safety bound; rule change below). Add grid tiers capping the
-  **short side**: `grid-m` = 1024, `grid-s` = 512. JPEG q85 via the
-  existing encoder.
+  **short side**: `grid-m` = 1024, `grid-s` = 512. *(Superseded: a third rung
+  `grid-xs` = 256, and both the encoder and the container are now
+  `docs/thumbnail-format-implementation.md`'s R1/R4/R5 to decide.)*
 - **Extreme aspect ratios (comic strips, webtoons) are cropped, not
   blurred.** These are real content in the target datasets and cluster in
   search results, so neither "let the long side run" (30 × 26 MP cells =
@@ -114,7 +115,9 @@ Converged with the user 2026-08-31:
 - **Display tier rule is re-based on the short side**: serve the original
   iff short side ≤ 4096 AND total ≤ 32 MP AND bytes ≤ 24 MB; otherwise
   store a display thumb scaled by `min(4096/short_side, sqrt(32MP/(w*h)),
-  1)`. This drops the ≤5 MB-any-dimensions escape (the 100 MP hole) AND
+  1)`. *(Superseded: the pixel bound is 24 MP, the byte bound is per source
+  class, and a stored rendition is capped at 2560 on the short side — see
+  `docs/thumbnail-format-implementation.md` §2 R2.)* This drops the ≤5 MB-any-dimensions escape (the 100 MP hole) AND
   fixes an existing quality bug: today anything with long side > 4096 gets
   a 4096-fit thumb, so a 800×20000 webtoon renders 163px wide in the
   gallery. Under the new rule its original serves directly (16 MP, one

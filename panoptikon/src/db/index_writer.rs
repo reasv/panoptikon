@@ -33,7 +33,7 @@ use crate::db::{
         FileScanData, FileUpsertResult, delete_file_by_path, delete_files_not_allowed,
         delete_item_if_orphan, delete_items_without_files, rename_file_path,
         set_animation_duration, set_blurhash, set_item_codecs, set_item_rotation,
-        set_outro_verdict, update_file_data,
+        set_item_transparency, set_outro_verdict, update_file_data,
     },
     folders::{
         add_folder_to_database, delete_files_not_under_included_folders,
@@ -145,10 +145,12 @@ pub(crate) enum IndexDbWriterMessage {
     /// (docs/grid-scroll-performance-implementation.md §2). An empty `tiers`
     /// is a legitimate instruction — "this item wants no stored tier" — so
     /// the caller must not short-circuit on it the way the two above do.
+    /// The generator version rides on each [`StoredTier`] rather than on the
+    /// message: one set can hold posters at `TIER_PROCESS_VERSION` beside
+    /// loops at `LOOP_PROCESS_VERSION`.
     StoreThumbnailTiers {
         sha256: String,
         mime_type: String,
-        process_version: i64,
         tiers: Vec<StoredTier>,
         reply: Reply<()>,
     },
@@ -204,6 +206,15 @@ pub(crate) enum IndexDbWriterMessage {
     SetItemRotation {
         sha256: String,
         quarter_turns: i64,
+        reply: Reply<u64>,
+    },
+    /// One item's measured transparency
+    /// (docs/thumbnail-format-implementation.md §2, R4). Like
+    /// [`Self::SetAnimationDuration`] it carries no marker delete and is
+    /// guarded on `has_transparency IS NULL`, so it can only ever fill a gap.
+    SetItemTransparency {
+        sha256: String,
+        has_transparency: bool,
         reply: Reply<u64>,
     },
     RenameFilePath {
@@ -738,21 +749,13 @@ impl Actor for IndexDbWriter {
             IndexDbWriterMessage::StoreThumbnailTiers {
                 sha256,
                 mime_type,
-                process_version,
                 tiers,
                 reply,
             } => {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move {
-                            store_thumbnail_tiers(
-                                conn,
-                                &sha256,
-                                &mime_type,
-                                process_version,
-                                &tiers,
-                            )
-                            .await
+                            store_thumbnail_tiers(conn, &sha256, &mime_type, &tiers).await
                         })
                     })
                     .await;
@@ -819,6 +822,20 @@ impl Actor for IndexDbWriter {
                         Box::pin(
                             async move { set_item_rotation(conn, &sha256, quarter_turns).await },
                         )
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::SetItemTransparency {
+                sha256,
+                has_transparency,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            set_item_transparency(conn, &sha256, has_transparency).await
+                        })
                     })
                     .await;
                 let _ = reply.send(result);

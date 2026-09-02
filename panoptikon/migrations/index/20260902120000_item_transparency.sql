@@ -1,0 +1,33 @@
+-- Whether an image's pixels are anywhere non-opaque
+-- (docs/thumbnail-format-implementation.md §2, R4).
+--
+--   NULL   never examined (pre-upgrade item, or one whose pixels have not
+--          been decoded since this column existed)
+--   0      examined: every pixel is opaque
+--   1      examined: at least one pixel is not
+--
+-- Measured from **pixels**, never from the header: half of all PNGs carry an
+-- alpha channel and only 2.3% of them use it, so trusting the channel would
+-- push a whole library onto a codec the grid decodes 2.2-2.7x slower for
+-- nothing. The measurement rides the one pass that already holds the decoded
+-- image (`build_image_renditions`), so it costs no decode of its own.
+--
+-- Deliberately **unversioned**, like `rotation` and the codec columns: whether
+-- a pixel is opaque is a fact about the file, not a detector verdict a later
+-- threshold could overturn.
+--
+-- Immutable per item, like duration/width/height: any content change yields a
+-- new sha256 and therefore a new item. The write is guarded on
+-- `has_transparency IS NULL` all the same, so two passes over identical
+-- content cannot disagree.
+ALTER TABLE items ADD COLUMN has_transparency INTEGER;
+
+-- The standing population of images whose pixels nothing has examined.
+-- Partial on the NULL state, so it drains away as the backfill runs instead
+-- of carrying every row in the database forever.
+--
+-- For asking that question by hand: `type` leads so the lookup is a half-open
+-- range scan (`type >= 'image/' AND type < 'image0'`, '0' being the byte
+-- after '/') rather than a `LIKE 'image/%'` SQLite cannot serve from an
+-- index.
+CREATE INDEX idx_items_transparency_pending ON items(type) WHERE has_transparency IS NULL;

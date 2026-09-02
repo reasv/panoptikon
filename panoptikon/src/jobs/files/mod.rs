@@ -37,6 +37,7 @@ mod visuals;
 use visuals::*;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     env,
     ffi::OsStr,
@@ -55,8 +56,6 @@ use std::{
 use ab_glyph::{FontVec, PxScale};
 use base64::Engine;
 use blurhash::encode as blurhash_encode;
-use image::ColorType;
-use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, GenericImageView, ImageDecoder, Rgb, RgbImage};
 use imageproc::drawing::{draw_text_mut, text_size};
@@ -79,7 +78,7 @@ use crate::{
             FileScanData, FileUpsertResult, ItemScanMeta, PendingOutroItem,
             get_file_by_path, get_item_content_end_ms, get_item_id, get_item_visual_facts,
             get_item_visual_meta, get_pending_outro_item, has_blurhash, item_animation_pending,
-            item_codec_pending, item_rotation_pending,
+            item_codec_pending, item_rotation_pending, item_transparency_pending,
         },
         folders::get_folders_from_database,
         index_writer::{IndexDbWriterMessage, call_index_db_writer},
@@ -90,9 +89,10 @@ use crate::{
             stage_blocks_indexing,
         },
         storage::{
-            StoredImage, StoredTier, TierGeometry, get_frames_bytes, get_thumbnail_bytes,
-            get_thumbnail_geometry, get_thumbnail_tier_geometry, has_any_frame, has_frame,
-            has_thumbnail, has_thumbnail_tiers,
+            StoredImage, StoredTier, ThumbnailGeometry, TierGeometry, TierPayload,
+            get_frames_bytes, get_thumbnail_bytes, get_thumbnail_geometry,
+            get_thumbnail_tier_geometry, has_any_frame, has_frame, has_thumbnail,
+            has_thumbnail_tiers,
         },
         system_config::{SystemConfig, SystemConfigStore},
         visual_attempts::{
@@ -110,10 +110,13 @@ use crate::{
     media_tools::animated_loop::LoopError,
     media_tools::transcode::compose::Transform,
     visual_tiers::{
-        DISPLAY_MAX_FILE_SIZE, DisplayPlan, LOOP_MEDIA_TYPE, LOOP_TIER, TIER_MEDIA_TYPE,
-        ThumbnailTier, TierPlan, animated_plans, animated_serves_original, display_plan,
-        grid_plans, grid_plans_for_stored_thumbnail, grid_renditions, is_animated_image,
-        loop_keeps_original, loop_plan, poster_plans,
+        DisplayPlan, FormatPolicy, GENERATED_STILL_FORMAT, LOOP_MEDIA_TYPE, RenditionFormat,
+        RenditionKind, RenditionRung, ThumbnailTier, TierPlan, UNDECODABLE_HAS_TRANSPARENCY,
+        WantedRendition, animated_plans, animated_rendition_set, animated_serves_original,
+        display_bytes_trigger, display_plan, encode_rendition, grid_plans,
+        grid_plans_for_stored_thumbnail, grid_renditions, has_alpha_pixels, is_animated_image,
+        loop_keeps_original, poster_plans, render, static_rendition_set, still_keeps_original,
+        stored_thumbnail_rendition_set, tier_format,
     },
 };
 
@@ -848,9 +851,43 @@ async fn sweep_orphaned_visual_attempts(index_db: &str) {
     }
 }
 
+/// Reports what one write-once `items` stamp did.
+///
+/// The three outcomes are the same for every such column, and none of them is
+/// a failure of the scan: `Ok(0)` is the ordinary race — another pass over
+/// identical content measured the same thing first, and the statement's own
+/// `IS NULL` guard is what makes the two agree by construction — and an error
+/// leaves the column unexamined for the next scan to re-measure.
+fn stamp_item_fact(sha256: &str, fact: &'static str, wrote: ApiResult<u64>) {
+    match wrote {
+        Ok(0) => tracing::debug!(sha256, fact, "no unexamined item to stamp"),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            error = ?err,
+            sha256,
+            fact,
+            "failed to stamp an item fact; it will be re-measured next scan"
+        ),
+    }
+}
+
+/// The generator versions, and what a bump to each one regenerates.
+///
+/// | constant | stamped on | a bump regenerates |
+/// |---|---|---|
+/// | `THUMBNAIL_PROCESS_VERSION` | `storage.thumbnails` | every display rendition, and for a video every frame extraction that feeds one |
+/// | `FRAME_PROCESS_VERSION` | `storage.frames` | every stored video frame |
+/// | `TIER_PROCESS_VERSION` | the **still** rows of `storage.thumbnail_tiers` | every grid tier and every animated poster — a re-encode of pictures the pass already holds |
+/// | `LOOP_PROCESS_VERSION` | the `loop`/`loop-display` rows | every H.264 loop — an ffmpeg run per animated item |
+///
+/// [`RenditionKind::process_version`] reads the bottom two, and
+/// [`visual_process_version`] reads the version a *marker* of each kind is
+/// stamped with and consulted at. Kept in one block because the whole point
+/// of splitting them is the cost difference in the right-hand column, and a
+/// reader deciding which to bump has to see all four.
 pub(crate) const THUMBNAIL_PROCESS_VERSION: i64 = 1;
 pub(crate) const FRAME_PROCESS_VERSION: i64 = 1;
-/// The grid tier generator's version, stamped on every
+/// The grid tier generator's version, stamped on every **still**
 /// `storage.thumbnail_tiers` row.
 ///
 /// Its own constant, independent of [`THUMBNAIL_PROCESS_VERSION`], because
@@ -864,7 +901,22 @@ pub(crate) const FRAME_PROCESS_VERSION: i64 = 1;
 /// quality. A change that moves the dimensions needs no bump: the
 /// dispatcher's geometry comparison already catches it
 /// ([`tier_geometry_matches`]).
-pub(crate) const TIER_PROCESS_VERSION: i64 = 1;
+pub(crate) const TIER_PROCESS_VERSION: i64 = 2;
+
+
+/// The H.264 loop generator's version, stamped on the `loop`/`loop-display`
+/// rows and on nothing else.
+///
+/// Split out of [`TIER_PROCESS_VERSION`] because the two regenerate work of
+/// completely different cost: a still-encoder change (a new JPEG library, a
+/// new quality, a new tier) is a re-encode of pictures the pass already holds,
+/// while a loop is an ffmpeg run per animated item. Bumping the still tiers
+/// must not drag every animation in the library through one
+/// (docs/thumbnail-format-implementation.md §3).
+///
+/// Starts at 1 rather than inheriting the tier version's number: the loops
+/// stored today were produced by exactly this encoder, so they are current.
+pub(crate) const LOOP_PROCESS_VERSION: i64 = 1;
 /// Minimum interval between mid-scan writes of the running counters to the
 /// file_scans row (progress display only; the final update is unconditional).
 pub(crate) const SCAN_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
@@ -953,6 +1005,8 @@ struct NewItemData {
     tiers: Vec<StoredTier>,
     frames: Vec<StoredImage>,
     blurhash: Option<String>,
+    /// See [`GeneratedVisuals::transparency`].
+    transparency: Option<bool>,
     /// What the visuals pass concluded about the kinds it produced nothing
     /// for. Empty on the healthy path.
     visual_verdicts: Vec<VisualVerdict>,
@@ -997,6 +1051,9 @@ struct BackfillResult {
     /// or unparseable"). Like the codecs there is no new-item twin: the
     /// measurement rides the `items` INSERT itself.
     animation: Option<f64>,
+    /// What this pass measured about the item's pixels (R4), or `None` when
+    /// it decoded nothing. See [`GeneratedVisuals::transparency`].
+    transparency: Option<bool>,
     /// This file's measured orientation in clockwise quarter turns
     /// (docs/display-dimensions-design.md §4), when the backfill examined one.
     /// `None` whenever the stage did not run or the probe failed — the column
@@ -1036,6 +1093,7 @@ impl BackfillResult {
             outro: None,
             codecs: None,
             animation: None,
+            transparency: None,
             rotation: None,
             replace_visuals: false,
         }
@@ -1093,6 +1151,13 @@ struct ScanContext {
     /// question. Off leaves already-stored verdicts alone — it only stops
     /// future examinations.
     detect_outros: bool,
+    /// This database's rendition format policy (R5), folded from
+    /// `SystemConfig::thumbnail_formats` once per scan so every question and
+    /// every generator in it reads the same one. Folding per item would let a
+    /// mid-scan config edit make the dispatcher's prediction and the
+    /// generator's output disagree, which is the one thing that stops the
+    /// backfill terminating.
+    formats: FormatPolicy,
     semaphore: Arc<Semaphore>,
     tasks: JoinSet<TaskOutcome>,
     // Path (and whether the task is a visuals backfill) per in-flight task, so
@@ -1164,6 +1229,7 @@ async fn scan_single_folder(
         scan_time: scan_time.to_string(),
         filescan_filter: parse_filescan_filter(config).map(Arc::new),
         detect_outros: config.scan_video && config.detect_outros,
+        formats: config.format_policy(),
         semaphore: Arc::new(Semaphore::new(options.worker_count)),
         tasks: JoinSet::new(),
         task_paths: HashMap::new(),
@@ -1920,6 +1986,9 @@ impl ScanContext {
         // Strictly after the write that inserts the `items` row this updates.
         self.record_outro_verdict(&item.sha256, item.outro.as_ref())
             .await;
+        // Likewise: the column lives on the row the write above just inserted.
+        self.record_item_transparency(&item.sha256, item.transparency)
+            .await;
         // Strictly after the file write, because that write clears this path's
         // ledger row: the item indexed, so whatever verdict the path carried
         // from a previous version of itself is spent — and the row this pass
@@ -2177,23 +2246,31 @@ impl ScanContext {
         let Some(quarter_turns) = quarter_turns else {
             return;
         };
-        match call_index_db_writer(&self.index_db, |reply| {
+        let wrote = call_index_db_writer(&self.index_db, |reply| {
             IndexDbWriterMessage::SetItemRotation {
                 sha256: sha256.to_string(),
                 quarter_turns,
                 reply,
             }
         })
-        .await
-        {
-            Ok(0) => tracing::debug!(sha256, "no unexamined item to store a rotation on"),
-            Ok(_) => {}
-            Err(err) => tracing::warn!(
-                error = ?err,
-                sha256,
-                "failed to store a rotation; it will be re-measured next scan"
-            ),
-        }
+        .await;
+        stamp_item_fact(sha256, "rotation", wrote);
+    }
+
+    /// Stamps one item's measured transparency (R4).
+    async fn record_item_transparency(&mut self, sha256: &str, has_transparency: Option<bool>) {
+        let Some(has_transparency) = has_transparency else {
+            return;
+        };
+        let wrote = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::SetItemTransparency {
+                sha256: sha256.to_string(),
+                has_transparency,
+                reply,
+            }
+        })
+        .await;
+        stamp_item_fact(sha256, "transparency", wrote);
     }
 
     /// Writes one item's whole grid tier set. Failures are logged and skipped,
@@ -2205,7 +2282,6 @@ impl ScanContext {
             IndexDbWriterMessage::StoreThumbnailTiers {
                 sha256: sha256.to_string(),
                 mime_type: mime_type.to_string(),
-                process_version: TIER_PROCESS_VERSION,
                 tiers: tiers.clone(),
                 reply,
             }
@@ -2348,6 +2424,8 @@ impl ScanContext {
             .await;
         self.record_item_rotation(&backfill.sha256, backfill.rotation)
             .await;
+        self.record_item_transparency(&backfill.sha256, backfill.transparency)
+            .await;
 
         if wrote_visuals {
             self.stats.backfilled_visuals += 1;
@@ -2400,33 +2478,7 @@ impl ScanContext {
             generate_thumbnail = match &image_facts {
                 // Unreadable now: leave the visuals to a later scan.
                 None => false,
-                Some(facts) => match facts.dimensions {
-                    Some((width, height)) => !image_is_served_directly(
-                        facts.file_size,
-                        width,
-                        height,
-                    ),
-                    // Dimensions were never recorded; fall back to the
-                    // size-only check and let the worker decode. The
-                    // byte bound is the only clause of the display rule
-                    // that needs no dimensions, so it is the only one
-                    // that can be asked here.
-                    //
-                    // It is *stricter* than the old ≤5 MB escape, so an
-                    // image between 5 and 24 MiB whose dimensions were
-                    // never indexed no longer gets a display thumb out of
-                    // this pass. That is a convergence, not a hole: the
-                    // orientation question (the display-dimensions
-                    // backfill, docs/display-dimensions-design.md §4)
-                    // fills `width`/`height` for any image whose header
-                    // reads at all, and on the next pass this branch is
-                    // no longer reachable for it — the measured branch
-                    // above answers instead, and the ladder question can
-                    // finally see it too. An image whose header does not
-                    // read has no dimensions for anyone to decide with,
-                    // and its decode failure is already a marker.
-                    None => facts.file_size > DISPLAY_MAX_FILE_SIZE,
-                },
+                Some(facts) => !image_is_served_directly(&mime_type, facts, self.formats),
             };
         }
         // Which rendition ladder this item's grid tiers come from. Answered
@@ -2445,8 +2497,27 @@ impl ScanContext {
         // [`GridLadder::Nothing`] is not "no question": it is the answer "the
         // set this item wants is empty", and an item carrying a stale set has
         // to be told so (see [`TierWork::Retire`]).
-        let mut tier_work = self
+        let question = self
             .pending_tier_work(&sha256, &mime_type, &path, image_facts.as_ref(), ladder)
+            .await;
+        let mut tier_work = question.work;
+        // The transparency question
+        // (docs/thumbnail-format-implementation.md §2, R4): "is this an image
+        // whose pixels nothing has examined?" Asked here because its answer is
+        // only ever reachable through a pass that decodes, and because an
+        // image that owes nothing else must still be examined once — or the
+        // partial index's population never drains and the item is reconsidered
+        // on every scan forever.
+        //
+        // It travels as itself, never disguised as a ladder verdict: an image
+        // with nothing else owing rides the ordinary image pass to have its
+        // pixels looked at, and that pass owes no rendition at all — not the
+        // display one, not the tier set the geometry comparison already found
+        // correct. Answering it with a `TierWork` said the opposite, and a
+        // whole-set delete-and-insert per already-correct image is the
+        // library-wide cost of saying it.
+        let mut transparency_work = self
+            .pending_transparency_work(&sha256, &mime_type, &path)
             .await;
         if matches!(tier_work, Some(TierWork::Image { .. })) {
             generate_thumbnail = true;
@@ -2466,8 +2537,13 @@ impl ScanContext {
         // which is exactly what a marker has a verdict about, and an animated
         // item is usually served directly at the display tier (so
         // `needs_thumb` is false for it and the gate would never be reached).
+        //
+        // The transparency question joins them for the same reason: its only
+        // answer is that decode, so an item whose decode a marker has already
+        // settled must be turned away here or the question is asked on every
+        // scan for the rest of the file's life.
         let animated_ladder = matches!(tier_work, Some(TierWork::Animated));
-        if (generate_thumbnail || animated_ladder)
+        if (generate_thumbnail || animated_ladder || transparency_work)
             && self.thumbnail_marker_suppresses(&sha256, &path).await
         {
             if generate_thumbnail {
@@ -2479,8 +2555,27 @@ impl ScanContext {
             // untouched: it decodes stored q85 JPEGs, not the file the marker
             // has a verdict about, and `Retire` is a delete that needs no
             // source at all.
-            if matches!(tier_work, Some(TierWork::Image { .. } | TierWork::Animated)) {
+            if matches!(
+                tier_work,
+                Some(TierWork::Image { .. } | TierWork::Animated)
+            ) {
                 tier_work = None;
+            }
+            // The transparency question goes with it, and it goes *answered*.
+            // Its only answer is a decode of the original, which is precisely
+            // what the marker has a verdict about — so leaving the column NULL
+            // would dispatch a visuals task with nothing to do on every scan
+            // for the rest of this file's life, and never drain the pending
+            // index. `0` is the same terminal verdict `rotation_pass_for`
+            // writes for a header this build deterministically cannot read: a
+            // picture nobody can decode has no renditions for anything to be
+            // transparent in. Through the same write-once setter, so a pass
+            // over identical content that *can* decode still wins the race by
+            // construction.
+            if transparency_work {
+                transparency_work = false;
+                self.record_item_transparency(&sha256, Some(UNDECODABLE_HAS_TRANSPARENCY))
+                    .await;
             }
         }
         // The animated ladder's own marker, and deliberately a separate
@@ -2582,9 +2677,12 @@ impl ScanContext {
             codec: codec_work,
             animation: animation_work,
             rotation: rotation_work,
-            indexed_rotation: image_facts.as_ref().and_then(|facts| facts.rotation),
+            transparency: transparency_work,
+            indexed: image_facts,
             tier: tier_work,
+            formats: self.formats,
             ladder,
+            reusable_loops: question.reusable_loops,
             existing_frames: Vec::new(),
             existing_thumb: None,
             frames_stored: false,
@@ -2963,10 +3061,44 @@ impl ScanContext {
         }
     }
 
+    /// The transparency dispatch question
+    /// (docs/thumbnail-format-implementation.md §2, R4), answered against the
+    /// index alone.
+    ///
+    /// `false` means the item has been examined already, has no pixels of its
+    /// own, or is not indexed. Like the codec and animation questions there is
+    /// no config gate and no negative-cache consult of its own: the pass that
+    /// answers it is the image pass, whose decode the thumbnail marker already
+    /// governs.
+    async fn pending_transparency_work(
+        &mut self,
+        sha256: &str,
+        mime_type: &str,
+        path: &Path,
+    ) -> bool {
+        // The mime gate first, so every non-image — most of a general-purpose
+        // library — costs no query at all.
+        if !mime_type.starts_with("image") {
+            return false;
+        }
+        match item_transparency_pending(&mut self.conn, sha256).await {
+            Ok(pending) => pending,
+            // Advisory, like every other read on this path: without the answer
+            // the file is simply left alone this run.
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    path = %path.display(),
+                    "failed to read the transparency state; skipping the measurement"
+                );
+                false
+            }
+        }
+    }
+
     /// The rendition-ladder dispatch question
-    /// (docs/grid-scroll-performance-implementation.md §3, B1), and the
-    /// seventh the dispatcher asks: "does this item carry exactly the
-    /// renditions the current ladder would produce?"
+    /// (docs/grid-scroll-performance-implementation.md §3, B1): "does this
+    /// item carry exactly the renditions the current ladder would produce?"
     ///
     /// Answered against indexed metadata and *stored geometry* — the width
     /// and height columns of `thumbnails`/`thumbnail_tiers` — never by
@@ -2975,19 +3107,18 @@ impl ScanContext {
     /// grid tiers are legitimately absent for small originals, so "no row"
     /// can never mean "work to do" on its own, and the answer has to be
     /// *exact* or an item is re-dispatched on every scan forever. Which is
-    /// why every dimension the generator writes is one this function can
-    /// predict: [`display_plan`] and [`grid_plans`] are pure functions of
-    /// `(bytes, width, height)`, and the generator resizes to exactly what
-    /// they name.
+    /// why every dimension and every format the generator writes is one this
+    /// function can predict: [`display_plan`] and [`grid_plans`] are pure
+    /// functions of the item's indexed facts and this database's policy, and
+    /// the generator resizes and encodes to exactly what they name.
     ///
     /// `None` means nothing to do — including for every item whose dimensions
     /// were never indexed, which cannot be decided without a decode and so is
     /// deliberately left alone rather than re-examined forever.
     ///
-    /// The comparison is geometry *and* [`TIER_PROCESS_VERSION`]: a generator
-    /// change that keeps the dimensions is invisible to the geometry alone,
-    /// and without the version stamp nothing could ever trigger its
-    /// regeneration.
+    /// The comparison is geometry, media type *and* generator version: a
+    /// format change moves no dimension and a generator change can move
+    /// neither, so geometry alone would call both of them a match forever.
     ///
     /// `image_facts` is what the caller already stat'd and read for this file;
     /// nothing here re-fetches it. `ladder` is [`grid_ladder`]'s answer, and
@@ -3001,7 +3132,7 @@ impl ScanContext {
         path: &Path,
         image_facts: Option<&ImageFacts>,
         ladder: GridLadder,
-    ) -> Option<TierWork> {
+    ) -> TierQuestion {
         // Before any storage read at all. This question is asked once per
         // file per scan, forever, and most of the files in a general-purpose
         // library are types no generator has ever produced a picture for — a
@@ -3018,7 +3149,7 @@ impl ScanContext {
         // reclassification that also has to survive re-hashing to reach this
         // point at all.
         if !mime_can_have_renditions(mime_type) {
-            return None;
+            return TierQuestion::none();
         }
         let stored_tiers = match get_thumbnail_tier_geometry(&mut self.conn, sha256).await {
             Ok(tiers) => tiers,
@@ -3030,7 +3161,7 @@ impl ScanContext {
                     path = %path.display(),
                     "failed to read the stored tiers; skipping the ladder question"
                 );
-                return None;
+                return TierQuestion::none();
             }
         };
         match ladder {
@@ -3048,32 +3179,104 @@ impl ScanContext {
                 // has no use for it, and raw-floor animated items should not
                 // pay a second query to be told nothing.
                 if stored_tiers.is_empty() {
-                    return None;
+                    return TierQuestion::none();
                 }
-                return Some(TierWork::Retire);
+                return TierQuestion::work(TierWork::Retire);
             }
             // Not enough indexed metadata to say what this item wants. Left
             // exactly as it is: guessing "empty" would retire a correct set,
             // and guessing "animated" would need geometry nobody measured.
-            GridLadder::Unknown => return None,
+            GridLadder::Unknown => return TierQuestion::none(),
             GridLadder::Animated => {
-                // The animated ladder is a *replacement* for the static one,
-                // not an addition to it, and it touches no display rendition
-                // at all — so unlike the still branch below this reads no
-                // display geometry.
-                let facts = image_facts?;
-                let (width, height) = facts.dimensions?;
-                let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
-                    return None;
-                };
-                let wanted = wanted_named_tier_geometry(0, &animated_plans(width, height));
-                if tier_geometry_matches(&stored_tiers, &wanted) {
-                    return None;
-                }
-                return Some(TierWork::Animated);
+                return self
+                    .animated_tier_question(sha256, path, image_facts, &stored_tiers)
+                    .await;
             }
             GridLadder::Static => {}
         }
+        match self
+            .static_tier_work(sha256, mime_type, path, image_facts, &stored_tiers)
+            .await
+        {
+            Some(work) => TierQuestion::work(work),
+            None => TierQuestion::none(),
+        }
+    }
+
+    /// The ladder question for an animated item above the raw floor.
+    ///
+    /// Split out because it is the one branch that answers two things: what
+    /// this dispatch owes, and which stored loop rows the current plan still
+    /// wants. The reuse is computed on **every** path out of here, the ones
+    /// that owe no [`TierWork::Animated`] included — a stale still to retire,
+    /// or nothing at all while some *other* question drags the item through
+    /// the image pass — because all of them end in `build_animated_tiers`,
+    /// and one that arrived without the list re-ran ffmpeg over a loop that
+    /// was already correct.
+    async fn animated_tier_question(
+        &mut self,
+        sha256: &str,
+        path: &Path,
+        image_facts: Option<&ImageFacts>,
+        stored_tiers: &[TierGeometry],
+    ) -> TierQuestion {
+        let Some(facts) = image_facts else {
+            return TierQuestion::none();
+        };
+        let Some((width, height)) = facts.dimensions else {
+            return TierQuestion::none();
+        };
+        let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+            return TierQuestion::none();
+        };
+        let set = animated_rendition_set(
+            facts.file_size,
+            width,
+            height,
+            tier_format(facts.has_transparency, self.formats),
+        );
+        let reusable_loops = reusable_loop_rows(stored_tiers, &set);
+        let wanted = wanted_tier_geometry(0, &set);
+        let tiers_match = tier_geometry_matches(stored_tiers, &wanted);
+        // A moving picture never carries a still display rendition: its
+        // `display` answer is its own file or a stored loop (R3). The one
+        // thing that can leave one behind is an older rule — an animated WebP
+        // big enough that the pre-format display rule froze it into a static
+        // JPEG, which the serving path would go on preferring to the
+        // animation forever.
+        let Some(stored_thumbnails) = self.stored_geometry(sha256, path).await else {
+            return TierQuestion::none();
+        };
+        let work = if !stored_thumbnails.is_empty() {
+            // The image pass, whose ladder is `Animated`: it produces the
+            // animated set out of the decode it performs *and* retires the
+            // stale still in the same pass.
+            Some(TierWork::Image {
+                replace_display: true,
+            })
+        } else if tiers_match {
+            None
+        } else {
+            Some(TierWork::Animated)
+        };
+        TierQuestion {
+            work,
+            reusable_loops,
+        }
+    }
+
+    /// The ladder question for everything on the static ladder: an image,
+    /// whose whole ladder comes from one decode of the original, and every
+    /// other kind, whose tiers are derived from the display renditions
+    /// already stored.
+    async fn static_tier_work(
+        &mut self,
+        sha256: &str,
+        mime_type: &str,
+        path: &Path,
+        image_facts: Option<&ImageFacts>,
+        stored_tiers: &[TierGeometry],
+    ) -> Option<TierWork> {
         let stored_thumbnails = self.stored_geometry(sha256, path).await?;
 
         if mime_type.starts_with("image") {
@@ -3090,18 +3293,34 @@ impl ScanContext {
             if width == 0 || height == 0 {
                 return None;
             }
-            let display_matches = match display_plan(file_size, width, height) {
-                DisplayPlan::Original => stored_thumbnails.is_empty(),
-                DisplayPlan::Thumbnail {
-                    width: expected_width,
-                    height: expected_height,
-                } => {
-                    stored_thumbnails.as_slice()
-                        == [(0, i64::from(expected_width), i64::from(expected_height))]
-                }
+            let plan = display_plan(
+                mime_type,
+                false,
+                facts.has_transparency,
+                file_size,
+                width,
+                height,
+                self.formats,
+            );
+            let display_matches = match (&plan, stored_thumbnails.as_slice()) {
+                // A still item never reaches the loop verdict; the arm is
+                // here so the match stays total.
+                (DisplayPlan::Original | DisplayPlan::Loop { .. }, rows) => rows.is_empty(),
+                (DisplayPlan::Thumbnail { .. }, [stored]) => display_row_matches(stored, &plan),
+                // A rendition is owed and there is not exactly one row to be
+                // it: none yet, or a set an older rule left behind.
+                (DisplayPlan::Thumbnail { .. }, _) => false,
             };
-            let wanted = wanted_tier_geometry(0, &grid_plans(file_size, width, height));
-            if display_matches && tier_geometry_matches(&stored_tiers, &wanted) {
+            let wanted = wanted_tier_geometry(
+                0,
+                &static_rendition_set(
+                    file_size,
+                    width,
+                    height,
+                    tier_format(facts.has_transparency, self.formats),
+                ),
+            );
+            if display_matches && tier_geometry_matches(stored_tiers, &wanted) {
                 return None;
             }
             return Some(TierWork::Image {
@@ -3123,21 +3342,24 @@ impl ScanContext {
             return None;
         }
         let mut wanted = Vec::new();
-        for (idx, width, height) in &stored_thumbnails {
-            let (Ok(width), Ok(height)) = (u32::try_from(*width), u32::try_from(*height)) else {
+        for stored in &stored_thumbnails {
+            let (Ok(width), Ok(height)) =
+                (u32::try_from(stored.width), u32::try_from(stored.height))
+            else {
                 return None;
             };
             wanted.extend(wanted_tier_geometry(
-                *idx,
-                &grid_plans_for_stored_thumbnail(width, height),
+                stored.idx,
+                &stored_thumbnail_rendition_set(width, height),
             ));
         }
-        if tier_geometry_matches(&stored_tiers, &wanted) {
+        if tier_geometry_matches(stored_tiers, &wanted) {
             return None;
         }
         // Only now, with work established, are the blobs worth reading.
         let mut sources = Vec::with_capacity(stored_thumbnails.len());
-        for (idx, _, _) in &stored_thumbnails {
+        for stored in &stored_thumbnails {
+            let idx = &stored.idx;
             match get_thumbnail_bytes(&mut self.conn, sha256, *idx).await {
                 Ok(Some(bytes)) => sources.push((*idx, bytes)),
                 Ok(None) => return None,
@@ -3182,13 +3404,18 @@ impl ScanContext {
                 .as_ref()
                 .and_then(|facts| facts.width.zip(facts.height)),
             duration: facts.as_ref().and_then(|facts| facts.duration),
-            rotation: facts.and_then(|facts| facts.rotation),
+            rotation: facts.as_ref().and_then(|facts| facts.rotation),
+            has_transparency: facts.and_then(|facts| facts.has_transparency),
         })
     }
 
-    /// The stored display renditions of an item as `(idx, width, height)`.
+    /// The stored display renditions of an item, geometry and media type.
     /// `None` on a read failure, which leaves the file alone this run.
-    async fn stored_geometry(&mut self, sha256: &str, path: &Path) -> Option<Vec<(i64, i64, i64)>> {
+    async fn stored_geometry(
+        &mut self,
+        sha256: &str,
+        path: &Path,
+    ) -> Option<Vec<ThumbnailGeometry>> {
         match get_thumbnail_geometry(&mut self.conn, sha256).await {
             Ok(rows) => Some(rows),
             Err(err) => {
@@ -3283,6 +3510,7 @@ impl ScanContext {
             .map_err(|_| ApiError::internal("Failed to schedule scan work"))?;
         let filter = self.filescan_filter.clone();
         let detect_outros = self.detect_outros;
+        let formats = self.formats;
         let tracked = TrackedTask {
             path: path.to_string_lossy().to_string(),
             backfill_sha256: None,
@@ -3302,6 +3530,7 @@ impl ScanContext {
                     sha256,
                     filter,
                     detect_outros,
+                    formats,
                     &timers,
                 )
             })
@@ -3361,6 +3590,7 @@ fn prepare_new_item(
     sha256: String,
     filter: Option<Arc<Match>>,
     detect_outros: bool,
+    formats: FormatPolicy,
     timers: &ScanTimers,
 ) -> TaskOutcome {
     // Every failure below is about this exact file, so they all carry the same
@@ -3416,6 +3646,7 @@ fn prepare_new_item(
         &mime_type,
         &metadata,
         detect_outros,
+        formats,
         timers,
     ) {
         Ok(visuals) => visuals,
@@ -3446,6 +3677,7 @@ fn prepare_new_item(
         tiers: visuals.tiers,
         frames: visuals.frames,
         blurhash: visuals.blurhash,
+        transparency: visuals.transparency,
         visual_verdicts: visuals.verdicts,
         visuals_scan_error,
         outro: visuals.outro,
@@ -3483,6 +3715,8 @@ pub(crate) struct PreparedFile {
     pub(crate) tiers: Vec<StoredTier>,
     pub(crate) frames: Vec<StoredImage>,
     pub(crate) blurhash: Option<String>,
+    /// See [`GeneratedVisuals::transparency`].
+    pub(crate) transparency: Option<bool>,
     /// What the visuals pass concluded about the kinds it produced nothing
     /// for. Empty on the healthy path.
     pub(crate) visual_verdicts: Vec<VisualVerdict>,
@@ -3503,6 +3737,9 @@ pub(crate) struct FileWriteData {
     pub(crate) tiers: Vec<StoredTier>,
     pub(crate) frames: Vec<StoredImage>,
     pub(crate) blurhash: Option<String>,
+    /// See [`GeneratedVisuals::transparency`]. Written *after* the file/item
+    /// write, which is what creates the row it updates.
+    pub(crate) transparency: Option<bool>,
     /// See [`PreparedFile::visual_verdicts`].
     pub(crate) visual_verdicts: Vec<VisualVerdict>,
     /// See [`NewItemData::visuals_scan_error`].
@@ -3533,6 +3770,7 @@ impl FileWriteData {
             tiers: prepared.tiers,
             frames: prepared.frames,
             blurhash: prepared.blurhash,
+            transparency: prepared.transparency,
             visual_verdicts: prepared.visual_verdicts,
             visuals_scan_error: prepared.visuals_scan_error,
             outro: prepared.outro,
@@ -3874,9 +4112,10 @@ fn visuals_blocked(blocker: Blocker, message: impl Into<String>) -> FileProcessE
 }
 
 /// The generator version a marker of this kind is stamped with, and compared
-/// against when it is consulted. Exhaustive on purpose: a new kind must fail to
-/// compile here rather than silently inherit the thumbnail generator's version,
-/// which would make every one of its markers expire on the wrong bump.
+/// against when it is consulted (see the version table above). Exhaustive on
+/// purpose: a new kind must fail to compile here rather than silently inherit
+/// the thumbnail generator's version, which would make every one of its
+/// markers expire on the wrong bump.
 fn visual_process_version(kind: VisualKind) -> i64 {
     match kind {
         VisualKind::Thumbnail => THUMBNAIL_PROCESS_VERSION,
@@ -3886,14 +4125,16 @@ fn visual_process_version(kind: VisualKind) -> i64 {
         // `version >= ?` consult while the unrecognised suffix recovers the
         // negatives (docs/video-outro-detection-design.md §7.2).
         VisualKind::Outro => OUTRO_DETECTOR_VERSION,
-        // The *tier* generator's version, never the thumbnail's: a loop is a
+        // The *loop* row's own version, never the thumbnail's: a loop is a
         // `thumbnail_tiers` rendition, and §2 forbids bumping
         // `THUMBNAIL_PROCESS_VERSION` for tier work (that would regenerate
         // every video thumbnail in the library to fix an encoder setting).
         // This is also the only thing that gives a loop failure a heal path:
-        // bump the tier version and the ledger's `version >= ?` consult
-        // retires every one of these markers for free.
-        VisualKind::Loop => TIER_PROCESS_VERSION,
+        // bump the loop version and the ledger's `version >= ?` consult
+        // retires every one of these markers for free. Read from the row's
+        // own kind, so a still-encoder bump neither retires a loop marker nor
+        // re-runs the ffmpeg the marker exists to stop.
+        VisualKind::Loop => RenditionKind::Loop.process_version(),
     }
 }
 
@@ -4128,6 +4369,11 @@ pub(crate) struct GeneratedVisuals {
     /// outlive a deindexed item.
     pub(crate) tiers: Vec<StoredTier>,
     pub(crate) blurhash: Option<String>,
+    /// What this pass measured about the item's pixels
+    /// (docs/thumbnail-format-implementation.md §2, R4), or `None` when it
+    /// decoded nothing. Written to `items.has_transparency` after the row
+    /// exists.
+    pub(crate) transparency: Option<bool>,
     /// Empty on the healthy path, which is what keeps this free: a pass that
     /// stored something owes no marker, and the store clears any stale one.
     pub(crate) verdicts: Vec<VisualVerdict>,
@@ -4161,6 +4407,7 @@ pub(crate) fn process_file(
     path: PathBuf,
     filescan_filter: Option<Arc<Match>>,
     detect_outros: bool,
+    formats: FormatPolicy,
     timers: &ScanTimers,
 ) -> Result<PreparedFile, FileProcessError> {
     let (last_modified, file_size) = get_last_modified_time_and_size(&path)
@@ -4213,7 +4460,7 @@ pub(crate) fn process_file(
     // The probe runs inside this call, before the generation it clamps,
     // exactly as in `prepare_new_item`.
     let visuals =
-        generate_new_item_visuals(&path, &mime_type, &metadata, detect_outros, timers)?;
+        generate_new_item_visuals(&path, &mime_type, &metadata, detect_outros, formats, timers)?;
     let visuals_scan_error = visuals.audit.map(|failure| ScanErrorRecord {
         path: path.to_string_lossy().to_string(),
         last_modified: last_modified.clone(),
@@ -4236,6 +4483,7 @@ pub(crate) fn process_file(
         tiers: visuals.tiers,
         frames: visuals.frames,
         blurhash: visuals.blurhash,
+        transparency: visuals.transparency,
         visual_verdicts: visuals.verdicts,
         visuals_scan_error,
         outro: visuals.outro,
@@ -6405,6 +6653,7 @@ mod tests {
     use super::*;
     use crate::db::migrations::migrate_databases_on_disk;
     use crate::test_utils::test_data_dir;
+    use crate::visual_tiers::LOOP_TIER;
 
     fn next_db_name() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -7079,6 +7328,86 @@ LIMIT 1
         encoder.encode_frames(built).unwrap();
     }
 
+    /// A 1400x1400 picture with an alpha channel that is actually *used* — a
+    /// transparent 32px corner — over a cheap gradient.
+    ///
+    /// The size is the point twice over: past 1.25x every grid tier, so all
+    /// three are stored, and the corner makes R4's verdict `1` from the
+    /// pixels rather than from the header (only 2.3% of PNGs that carry an
+    /// alpha channel use it).
+    fn alpha_logo(side: u32) -> image::RgbaImage {
+        image::RgbaImage::from_fn(side, side, |x, y| {
+            let alpha = if x < 32 && y < 32 { 0 } else { 255 };
+            image::Rgba([(x / 8) as u8, (y / 8) as u8, 40, alpha])
+        })
+    }
+
+    /// [`alpha_logo`] filled with noise instead of a gradient, so the PNG is
+    /// far past the lossless class's 2 MiB byte bound and a display rendition
+    /// is genuinely owed rather than merely allowed.
+    ///
+    /// A fixed xorshift rather than a random source: a fixture whose byte
+    /// count moves between runs is a byte-bound test that passes by luck.
+    fn noise_rgba(side: u32) -> image::RgbaImage {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        image::RgbaImage::from_fn(side, side, |x, y| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let bytes = state.to_le_bytes();
+            let alpha = if x < 32 && y < 32 { 0 } else { 255 };
+            image::Rgba([bytes[0], bytes[1], bytes[2], alpha])
+        })
+    }
+
+    /// One row of `storage.thumbnail_tiers` as the tests read it back.
+    #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+    struct TierSnapshot {
+        id: i64,
+        idx: i64,
+        tier: String,
+        width: i64,
+        height: i64,
+        version: i64,
+        media_type: String,
+        thumbnail: Vec<u8>,
+    }
+
+    /// Every stored grid rendition, in the dispatcher's own order.
+    ///
+    /// One read behind every projection below. Seven queries for seven views
+    /// of one table is seven chances for two assertions in the same test to
+    /// be looking at rows in different orders — and the rowid assertions in
+    /// particular are only evidence while the order is fixed.
+    async fn tier_snapshot(conn: &mut sqlx::SqliteConnection) -> Vec<TierSnapshot> {
+        sqlx::query_as(
+            "SELECT id, idx, tier, width, height, version, media_type, thumbnail \
+             FROM storage.thumbnail_tiers ORDER BY idx, tier, id",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
+    }
+
+    /// One row of `storage.thumbnails` as the tests read it back.
+    #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+    struct DisplaySnapshot {
+        id: i64,
+        idx: i64,
+        media_type: String,
+        thumbnail: Vec<u8>,
+    }
+
+    /// Every stored display rendition, by index. See [`tier_snapshot`].
+    async fn display_snapshot(conn: &mut sqlx::SqliteConnection) -> Vec<DisplaySnapshot> {
+        sqlx::query_as(
+            "SELECT id, idx, media_type, thumbnail FROM storage.thumbnails ORDER BY idx, id",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
+    }
+
     /// (kind, outcome, attempts, skip_after, version) per marker, by kind.
     async fn visual_attempt_rows(
         conn: &mut sqlx::SqliteConnection,
@@ -7104,26 +7433,28 @@ LIMIT 1
     /// proof no pass rewrote them — which is exactly what the ladder's
     /// write-once discipline claims.
     async fn tier_ids(conn: &mut sqlx::SqliteConnection) -> Vec<i64> {
-        sqlx::query_scalar("SELECT id FROM storage.thumbnail_tiers ORDER BY id")
-            .fetch_all(conn)
+        tier_snapshot(conn)
             .await
-            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
     }
 
     fn tier(name: &str, width: i64, height: i64) -> (String, i64, i64) {
         (name.to_string(), width, height)
     }
 
-    // The ladder on the new-item path, and its write-once discipline. 1400x1400
-    // uncompressed is 5.88 MB: inside every display bound, so the original
-    // serves and nothing is stored for it — and past 1.25x both grid tiers, so
-    // both are. That is the shape most of a photo library is in.
+    // The ladder on the new-item path, and its write-once discipline. A
+    // 1400x1400 JPEG is inside every bound of its class, so the original
+    // serves the display tier and nothing is stored for it — and it is past
+    // 1.25x all three grid tiers, so all three are. That is the shape most of
+    // a photo library is in.
     #[tokio::test]
     async fn a_scanned_image_stores_its_grid_tiers_exactly_once() {
         let test_env = test_data_dir();
         let env = visuals_env(test_env.path(), &["media-tier-new"]).await;
         image::RgbImage::new(1400, 1400)
-            .save(env.media_dirs[0].join("photo.bmp"))
+            .save(env.media_dirs[0].join("photo.jpg"))
             .unwrap();
 
         env.scan().await;
@@ -7135,7 +7466,11 @@ LIMIT 1
         );
         assert_eq!(
             tier_rows(&mut conn).await,
-            vec![tier("grid-m", 1024, 1024), tier("grid-s", 512, 512)]
+            vec![
+                tier("grid-m", 1024, 1024),
+                tier("grid-s", 512, 512),
+                tier("grid-xs", 256, 256)
+            ]
         );
         let ids = tier_ids(&mut conn).await;
         drop(conn);
@@ -7166,7 +7501,7 @@ LIMIT 1
         let test_env = test_data_dir();
         let env = visuals_env(test_env.path(), &["media-tier-backfill"]).await;
         image::RgbImage::new(1400, 1400)
-            .save(env.media_dirs[0].join("photo.bmp"))
+            .save(env.media_dirs[0].join("photo.jpg"))
             .unwrap();
         env.scan().await;
 
@@ -7187,7 +7522,11 @@ LIMIT 1
         let mut conn = env.read().await;
         assert_eq!(
             tier_rows(&mut conn).await,
-            vec![tier("grid-m", 1024, 1024), tier("grid-s", 512, 512)]
+            vec![
+                tier("grid-m", 1024, 1024),
+                tier("grid-s", 512, 512),
+                tier("grid-xs", 256, 256)
+            ]
         );
         let ids = tier_ids(&mut conn).await;
         drop(conn);
@@ -7209,10 +7548,10 @@ LIMIT 1
     async fn a_superseded_display_rendition_is_dropped() {
         let test_env = test_data_dir();
         let env = visuals_env(test_env.path(), &["media-tier-superseded"]).await;
-        // 900x3000 uncompressed = 8.1 MB: every display bound clear, so the
-        // original serves. A 10:3 strip, so both grid tiers are top crops.
+        // A 900x3000 JPEG: every bound of its class clear, so the original
+        // serves. A 10:3 strip, so every grid tier is a top crop.
         image::RgbImage::new(900, 3000)
-            .save(env.media_dirs[0].join("strip.bmp"))
+            .save(env.media_dirs[0].join("strip.jpg"))
             .unwrap();
         env.scan().await;
 
@@ -7221,7 +7560,11 @@ LIMIT 1
             assert_eq!(thumbnail_count(&mut conn).await, 0);
             assert_eq!(
                 tier_rows(&mut conn).await,
-                vec![tier("grid-m", 900, 2048), tier("grid-s", 512, 1024)]
+                vec![
+                    tier("grid-m", 900, 2048),
+                    tier("grid-s", 512, 1024),
+                    tier("grid-xs", 256, 512)
+                ]
             );
             sqlx::query_scalar("SELECT sha256 FROM items")
                 .fetch_one(&mut conn)
@@ -7231,7 +7574,7 @@ LIMIT 1
 
         // What the old rule left behind, planted by hand: a long-side-fitted
         // rendition of a strip.
-        let stale = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(163, 4096)))
+        let stale = encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(163, 4096)))
             .expect("a 163x4096 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
             IndexDbWriterMessage::StoreThumbnails {
@@ -7255,7 +7598,11 @@ LIMIT 1
         );
         assert_eq!(
             tier_rows(&mut conn).await,
-            vec![tier("grid-m", 900, 2048), tier("grid-s", 512, 1024)]
+            vec![
+                tier("grid-m", 900, 2048),
+                tier("grid-s", 512, 1024),
+                tier("grid-xs", 256, 512)
+            ]
         );
         let ids = tier_ids(&mut conn).await;
         drop(conn);
@@ -7269,12 +7616,694 @@ LIMIT 1
         assert_eq!(tier_ids(&mut conn).await, ids);
     }
 
-    /// The `version` stamp on every tier row, in rowid order.
-    async fn tier_versions(conn: &mut sqlx::SqliteConnection) -> Vec<i64> {
-        sqlx::query_scalar("SELECT version FROM storage.thumbnail_tiers ORDER BY id")
+
+    /// The library-wide upgrade this release costs, in **one pass per image**.
+    ///
+    /// The pre-upgrade state is all three changes at once: a display rendition
+    /// stored as JPEG where the rule now wants WebP, a tier set at the
+    /// superseded generator version and without `grid-xs`, and
+    /// `has_transparency` unexamined. One scan converges every one of them,
+    /// and the next writes nothing — which is what makes the whole thing a
+    /// single decode of each file rather than three.
+    #[tokio::test]
+    async fn the_format_upgrade_converges_in_one_pass_per_image() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-format-upgrade"]).await;
+        // 1400x1400 uncompressed is 5.88 MB: past the lossless class's 2 MiB
+        // byte bound, so this item owes a display rendition, and past 1.25x
+        // every grid tier, so it owes all three of those too.
+        image::RgbImage::new(1400, 1400)
+            .save(env.media_dirs[0].join("art.bmp"))
+            .unwrap();
+        env.scan().await;
+
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/webp".to_string()],
+                "a lossless source's display rendition is a WebP"
+            );
+            assert_eq!(transparency_flags(&mut conn).await, vec![Some(0)]);
+        }
+
+        // Rewound to what a pre-upgrade library holds.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE storage.thumbnails SET media_type = 'image/jpeg'")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM storage.thumbnail_tiers WHERE tier = 'grid-xs'")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE storage.thumbnail_tiers SET version = ?1")
+                .bind(TIER_PROCESS_VERSION - 1)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE items SET has_transparency = NULL")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 1,
+            "one dispatch, and therefore one decode, for all three changes"
+        );
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/webp".to_string()]
+            );
+            assert_eq!(
+                tier_rows(&mut conn).await,
+                vec![
+                    tier("grid-m", 1024, 1024),
+                    tier("grid-s", 512, 512),
+                    tier("grid-xs", 256, 256)
+                ]
+            );
+            assert_eq!(
+                tier_versions(&mut conn).await,
+                vec![TIER_PROCESS_VERSION; 3]
+            );
+            assert_eq!(transparency_flags(&mut conn).await, vec![Some(0)]);
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "and it settles: nothing is rewritten on the next scan"
+        );
+    }
+
+    /// R4 end to end: the measurement is taken from pixels, written once, and
+    /// only moves a rendition when it actually changes the verdict.
+    #[tokio::test]
+    async fn transparency_is_measured_once_and_only_rewrites_on_a_changed_verdict() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-transparency"]).await;
+        alpha_logo(1400).save(env.media_dirs[0].join("logo.png")).unwrap();
+        env.scan().await;
+
+        {
+            let mut conn = env.read().await;
+            assert_eq!(transparency_flags(&mut conn).await, vec![Some(1)]);
+            assert!(
+                tier_media_types(&mut conn)
+                    .await
+                    .iter()
+                    .all(|(_, media)| media == "image/webp"),
+                "every rendition of a transparent item is a WebP with alpha"
+            );
+        }
+
+        // The write is guarded on `has_transparency IS NULL`, so a scan over
+        // an examined item never touches the column — and, the column being
+        // unchanged, never rewrites a rendition either.
+        let ids = {
+            let mut conn = env.read().await;
+            tier_ids(&mut conn).await
+        };
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0);
+        {
+            let mut conn = env.read().await;
+            assert_eq!(tier_ids(&mut conn).await, ids);
+        }
+
+        // Unexamined again: the measurement is re-taken, reaches the same
+        // answer, and the verdict it feeds is unchanged — so nothing is
+        // rewritten. The rowids are the assertion that matters: the tier
+        // write is a whole-set delete and insert, so a set re-emitted for an
+        // unchanged verdict would show up here even though every byte in it
+        // is identical.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE items SET has_transparency = NULL")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        env.scan().await;
+        {
+            let mut conn = env.read().await;
+            assert_eq!(transparency_flags(&mut conn).await, vec![Some(1)]);
+            assert!(
+                tier_media_types(&mut conn)
+                    .await
+                    .iter()
+                    .all(|(_, media)| media == "image/webp")
+            );
+            assert_eq!(
+                tier_ids(&mut conn).await,
+                ids,
+                "a re-measurement that changed no verdict rewrote the set"
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+
+        // The other direction, planted by hand: a stored verdict of "opaque"
+        // moves every rendition to JPEG, and the generator follows the
+        // *column* rather than its own decode — which is what stops the two
+        // disagreeing forever.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE items SET has_transparency = 0")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1, "the verdict changed");
+        {
+            let mut conn = env.read().await;
+            assert!(
+                tier_media_types(&mut conn)
+                    .await
+                    .iter()
+                    .all(|(_, media)| media == "image/jpeg")
+            );
+            assert_eq!(
+                transparency_flags(&mut conn).await,
+                vec![Some(0)],
+                "the pass measured 1 and wrote nothing: the column is written once"
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+    }
+
+    /// R5: a policy edit regenerates exactly the rows whose format it moves,
+    /// and leaves every other item's set alone.
+    #[tokio::test]
+    async fn a_policy_flip_regenerates_only_the_rows_it_moves() {
+        let test_env = test_data_dir();
+        let mut env = visuals_env(test_env.path(), &["media-policy"]).await;
+        alpha_logo(1400).save(env.media_dirs[0].join("logo.png")).unwrap();
+        image::RgbImage::new(1400, 1400)
+            .save(env.media_dirs[0].join("photo.jpg"))
+            .unwrap();
+        env.scan().await;
+
+        let (opaque_sha, opaque_ids) = {
+            let mut conn = env.read().await;
+            let sha: String = sqlx::query_scalar(
+                "SELECT sha256 FROM items WHERE has_transparency = 0 LIMIT 1",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            let ids: Vec<i64> = sqlx::query_scalar(
+                "SELECT id FROM storage.thumbnail_tiers WHERE item_sha256 = ?1 ORDER BY id",
+            )
+            .bind(&sha)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(ids.len(), 3, "the opaque item's three JPEG tiers");
+            (sha, ids)
+        };
+
+        // The storage-constrained deployment's opposite: `webp` withdrawn, so
+        // every WebP verdict becomes a flattened JPEG.
+        env.config.thumbnail_formats = vec!["jpeg".to_string()];
+        SystemConfigStore::new(env.root.clone())
+            .save(&env.index_db, &env.config)
+            .unwrap();
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 1,
+            "only the item whose rows the policy moves is dispatched"
+        );
+        {
+            let mut conn = env.read().await;
+            assert!(
+                tier_media_types(&mut conn)
+                    .await
+                    .iter()
+                    .all(|(_, media)| media == "image/jpeg"),
+                "with webp absent the alpha is flattened, as before the feature"
+            );
+            let ids: Vec<i64> = sqlx::query_scalar(
+                "SELECT id FROM storage.thumbnail_tiers WHERE item_sha256 = ?1 ORDER BY id",
+            )
+            .bind(&opaque_sha)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(ids, opaque_ids, "the already-JPEG item is untouched");
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+    }
+
+    /// A **JPEG** item's JPEG display rendition still follows the policy.
+    ///
+    /// The regression this pins: the dispatcher used to accept any display row
+    /// whose media type was the item's own, as a stand-in for recognising the
+    /// keep-the-original sentinel. For every JPEG source with a real JPEG
+    /// rendition — most of a photo library — that made the display row match
+    /// *every* verdict, so a `thumbnail_formats` edit moved the grid tiers and
+    /// silently left the display rendition on the old format forever.
+    #[tokio::test]
+    async fn a_jpeg_display_rendition_follows_the_format_policy() {
+        let test_env = test_data_dir();
+        let mut env = visuals_env(test_env.path(), &["media-jpeg-display"]).await;
+        // Past the 4096 short-side trigger, so a rendition is owed; capped at
+        // 2560, so it is a real downscale the encode comfortably wins.
+        image::RgbImage::from_fn(4100, 4100, |x, y| {
+            image::Rgb([(x / 16) as u8, (y / 16) as u8, 128])
+        })
+        .save(env.media_dirs[0].join("big.jpg"))
+        .unwrap();
+        env.scan().await;
+
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/jpeg".to_string()],
+                "a JPEG source keeps JPEG: a WebP of one decodes 2.33x slower"
+            );
+            assert!(
+                display_has_bytes(&mut conn).await,
+                "the premise: a real rendition, not the keep-the-original verdict"
+            );
+        }
+
+        // The storage-constrained deployment: `jpeg` withdrawn, so every JPEG
+        // verdict — the display rendition included — becomes a WebP.
+        env.config.thumbnail_formats = vec!["webp".to_string()];
+        SystemConfigStore::new(env.root.clone())
+            .save(&env.index_db, &env.config)
+            .unwrap();
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/webp".to_string()],
+                "the display row moves with the policy, not only the grid tiers"
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+
+        // ... and back, which is the half a one-way comparison can pass by
+        // accident.
+        env.config.thumbnail_formats = SystemConfig::default().thumbnail_formats;
+        SystemConfigStore::new(env.root.clone())
+            .save(&env.index_db, &env.config)
+            .unwrap();
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/jpeg".to_string()]
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles again");
+    }
+
+    /// A display **sentinel** is an answer about one encoder, not about the
+    /// item forever.
+    ///
+    /// Two halves. First the row a pre-fix build wrote — empty bytes carrying
+    /// the *source's* mime type — which the dispatcher used to read as "this
+    /// item is settled" under every verdict there is: a database that visited
+    /// `["jpeg"]` once, where a flattened JPEG of a transparent PNG need not
+    /// come out comfortably smaller, went on serving the multi-megabyte
+    /// original after the policy was put back. It has to be retried exactly
+    /// once and replaced by the WebP the current rule wants.
+    ///
+    /// Then the row this build writes, which names the format it attempted:
+    /// honoured while that format is still the verdict, re-attempted the
+    /// moment the verdict moves. (The writer's half of that convention is
+    /// `visuals::tests::a_display_sentinel_names_the_format_it_attempted`.)
+    #[tokio::test]
+    async fn a_display_sentinel_is_retried_when_the_format_verdict_moves() {
+        let test_env = test_data_dir();
+        let mut env = visuals_env(test_env.path(), &["media-sentinel-retry"]).await;
+        // Past the lossless class's 2 MiB bound, so a rendition is genuinely
+        // owed; the alpha corner makes it WebP by R4 as well as by class.
+        noise_rgba(1400)
+            .save(env.media_dirs[0].join("logo.png"))
+            .unwrap();
+        env.scan().await;
+
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/webp".to_string()]
+            );
+            assert!(display_has_bytes(&mut conn).await);
+        }
+
+        // Rewound to what a pre-fix build left behind: the keep-the-original
+        // verdict, wearing the item's own type.
+        {
+            let mut conn = env.write().await;
+            sqlx::query(
+                "UPDATE storage.thumbnails SET thumbnail = X'', media_type = 'image/png'",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 1,
+            "a verdict about a format nobody can name is no verdict at all"
+        );
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/webp".to_string()]
+            );
+            assert!(
+                display_has_bytes(&mut conn).await,
+                "the rendition is restored rather than the original served forever"
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+
+        // The row this build writes: the same verdict, naming the encoder that
+        // reached it. Unchanged policy, so it is final and nothing is asked
+        // for again.
+        //
+        // Planted rather than provoked: reaching this state honestly needs a
+        // source whose WebP re-encode comes out over three quarters of its
+        // bytes, which is a property of a real photograph's entropy and not
+        // of anything a fixture can be written to have. The verdict is what
+        // the test is about; how the encoder arrived at it is not.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE storage.thumbnails SET thumbnail = X''")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "a sentinel naming the current verdict is an answer, not a stale row"
+        );
+        {
+            let mut conn = env.read().await;
+            assert!(!display_has_bytes(&mut conn).await, "still the sentinel");
+        }
+
+        // Move the verdict and it is re-attempted, which is the whole
+        // difference between "this encoder could not win" and "nothing can".
+        env.config.thumbnail_formats = vec!["jpeg".to_string()];
+        SystemConfigStore::new(env.root.clone())
+            .save(&env.index_db, &env.config)
+            .unwrap();
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/jpeg".to_string()],
+                "the other encoder gets its turn"
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+    }
+
+    /// An image nothing can decode still **answers** the transparency
+    /// question, rather than asking it forever.
+    ///
+    /// Its header reads, so it is indexed and `has_transparency` starts NULL;
+    /// its pixels do not, so the one pass that could measure them is exactly
+    /// the pass the negative cache exists to stop running. Without a terminal
+    /// verdict the column stays NULL, the partial index never drains, and
+    /// every scan for the rest of this file's life dispatches a visuals task
+    /// with nothing in it — the Wave-5 rotation bug, one column over.
+    #[tokio::test]
+    async fn an_undecodable_image_settles_the_transparency_question() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-undecodable"]).await;
+        // A real PNG header over pixel data that stops mid-stream: the
+        // metadata phase reads the dimensions out of IHDR and indexes the
+        // file, and every decode after that fails. (The indexing gate is a
+        // header read on purpose — docs/failed-media-retry-design.md, "Scan
+        // policy for undecodable images".)
+        let mut encoded = Vec::new();
+        image::RgbImage::from_fn(1400, 1400, |x, y| {
+            image::Rgb([(x / 8) as u8, (y / 8) as u8, 40])
+        })
+        .write_to(
+            &mut std::io::Cursor::new(&mut encoded),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        encoded.truncate(200);
+        fs::write(env.media_dirs[0].join("truncated.png"), &encoded).unwrap();
+
+        // This item's own column, by path: the shared scan root is not this
+        // test's alone, and the question is about one file.
+        async fn flag(conn: &mut sqlx::SqliteConnection) -> Option<i64> {
+            sqlx::query_scalar(
+                "SELECT i.has_transparency FROM items i \
+                 JOIN files f ON f.sha256 = i.sha256 \
+                 WHERE f.path LIKE '%truncated.png'",
+            )
+            .fetch_one(conn)
+            .await
+            .unwrap()
+        }
+
+        // The ledger takes as many attempts to settle as the failure's class
+        // is worth — what matters is that the verdict lands at all, and that
+        // the marker's arrival is what lands it.
+        let mut settled = None;
+        for scan in 1..=6 {
+            env.scan().await;
+            let mut conn = env.read().await;
+            let measured = flag(&mut conn).await;
+            drop(conn);
+            if measured.is_some() {
+                settled = Some((scan, measured));
+                break;
+            }
+        }
+        assert_eq!(
+            settled.map(|(_, measured)| measured),
+            Some(Some(0)),
+            "a picture nobody can decode has no rendition for anything to be \
+             transparent in — without that verdict the partial index never \
+             drains and every scan dispatches a pass that cannot answer"
+        );
+
+        // Written once and never revisited: the item owes nothing more, and
+        // the marker keeps the decode from being attempted again. The marker
+        // is half the claim — without one there is nothing for the next
+        // scan's consult to find, and the verdict above would be re-derived
+        // by a fresh decode every time.
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0);
+        let mut conn = env.read().await;
+        assert_eq!(flag(&mut conn).await, Some(0));
+        assert!(
+            visual_attempt_rows(&mut conn)
+                .await
+                .iter()
+                .any(|(kind, _, _, _, _)| kind == "thumbnail"),
+            "the settle rides a marker; without one the decode is retried forever"
+        );
+    }
+
+    /// Whether every stored display rendition carries bytes — the difference
+    /// between a picture and the keep-the-original verdict.
+    async fn display_has_bytes(conn: &mut sqlx::SqliteConnection) -> bool {
+        let rows = display_snapshot(conn).await;
+        !rows.is_empty() && rows.iter().all(|row| !row.thumbnail.is_empty())
+    }
+
+    /// The rowids of the stored H.264 loop rows.
+    ///
+    /// A rewritten set deletes and re-inserts, so a *new* rowid is a
+    /// re-encode however the bytes compare — which is the property the
+    /// retained payload exists for, and the one a byte comparison alone would
+    /// miss for a deterministic encoder.
+    async fn loop_tier_ids(conn: &mut sqlx::SqliteConnection) -> Vec<i64> {
+        tier_snapshot(conn)
+            .await
+            .into_iter()
+            .filter(|row| row.tier.starts_with("loop"))
+            .map(|row| row.id)
+            .collect()
+    }
+
+    /// The whole point of `LOOP_PROCESS_VERSION` being separate: a
+    /// still-encoder bump regenerates every poster in the library and re-runs
+    /// ffmpeg over none of it.
+    ///
+    /// Proven twice over: bytes no encoder would produce are planted in the
+    /// loop row, and the row's identity is watched. Both matter — the bytes
+    /// catch an encode, the rowid catches a rewrite that would have produced
+    /// the same bytes.
+    #[tokio::test]
+    async fn a_tier_version_bump_regenerates_posters_and_never_the_loop() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-loop-version"]).await;
+        write_animated_gif(
+            &env.media_dirs[0].join("clip.gif"),
+            1400,
+            2,
+            100,
+            |x, y, index| {
+                let shade = (index as u8).wrapping_mul(90);
+                image::Rgba([shade, (x / 64) as u8, (y / 64) as u8, 255])
+            },
+        );
+        env.scan().await;
+
+        const PLANTED: &[u8] = b"not an mp4, planted";
+        let loop_ids = {
+            let mut conn = env.read().await;
+            let ids = loop_tier_ids(&mut conn).await;
+            assert!(!ids.is_empty(), "the premise: this item is on the animated ladder");
+            ids
+        };
+        {
+            let mut conn = env.write().await;
+            // Every still row rewound to the superseded generator; the loop
+            // rows left exactly as the current one wrote them.
+            sqlx::query("UPDATE storage.thumbnail_tiers SET version = ?1 WHERE tier LIKE 'grid-%'")
+                .bind(TIER_PROCESS_VERSION - 1)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE storage.thumbnail_tiers SET thumbnail = ?1 WHERE tier LIKE 'loop%'")
+                .bind(PLANTED.to_vec())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        {
+            let mut conn = env.read().await;
+            let rows: Vec<(String, i64, Vec<u8>)> = sqlx::query_as(
+                "SELECT tier, version, thumbnail FROM storage.thumbnail_tiers ORDER BY tier",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            let is_loop = |tier: &str| {
+                [RenditionKind::Loop, RenditionKind::LoopDisplay]
+                    .iter()
+                    .any(|kind| kind.as_str() == tier)
+            };
+            for (tier, version, bytes) in &rows {
+                if is_loop(tier) {
+                    assert_eq!(
+                        bytes.as_slice(),
+                        PLANTED,
+                        "{tier} was re-encoded when it should have been reused"
+                    );
+                    assert_eq!(*version, LOOP_PROCESS_VERSION);
+                } else {
+                    assert_eq!(*version, TIER_PROCESS_VERSION, "{tier} restamped");
+                    assert!(!bytes.is_empty(), "{tier} carries a real picture");
+                }
+            }
+            assert_eq!(
+                loop_tier_ids(&mut conn).await,
+                loop_ids,
+                "the loop rows were rewritten, not retained"
+            );
+        }
+        let bumped_ids = {
+            let mut conn = env.read().await;
+            tier_ids(&mut conn).await
+        };
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+
+        // The other pass that reaches `build_animated_tiers` without ever
+        // being `TierWork::Animated`: the transparency question, which decodes
+        // for one column and used to arrive with no loops to reuse at all.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE items SET has_transparency = NULL")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        env.scan().await;
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                loop_tier_ids(&mut conn).await,
+                loop_ids,
+                "a transparency pass re-ran ffmpeg over an already correct loop"
+            );
+            assert_eq!(
+                tier_ids(&mut conn).await,
+                bumped_ids,
+                "a re-measurement that changed no verdict rewrote the set"
+            );
+            let planted: Vec<Vec<u8>> = sqlx::query_scalar(
+                "SELECT thumbnail FROM storage.thumbnail_tiers WHERE tier LIKE 'loop%'",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            assert!(planted.iter().all(|bytes| bytes.as_slice() == PLANTED));
+        }
+    }
+
+    /// `items.has_transparency`, in `items` order.
+    async fn transparency_flags(conn: &mut sqlx::SqliteConnection) -> Vec<Option<i64>> {
+        sqlx::query_scalar("SELECT has_transparency FROM items ORDER BY id")
             .fetch_all(conn)
             .await
             .unwrap()
+    }
+
+    /// The media type of every stored display rendition, by index.
+    async fn display_media_types(conn: &mut sqlx::SqliteConnection) -> Vec<String> {
+        display_snapshot(conn)
+            .await
+            .into_iter()
+            .map(|row| row.media_type)
+            .collect()
+    }
+
+    /// The `version` stamp on every tier row.
+    async fn tier_versions(conn: &mut sqlx::SqliteConnection) -> Vec<i64> {
+        tier_snapshot(conn)
+            .await
+            .into_iter()
+            .map(|row| row.version)
+            .collect()
     }
 
     // A generator change the stored geometry cannot see — a different crop
@@ -7286,17 +8315,21 @@ LIMIT 1
         let test_env = test_data_dir();
         let env = visuals_env(test_env.path(), &["media-tier-version"]).await;
         image::RgbImage::new(1400, 1400)
-            .save(env.media_dirs[0].join("photo.bmp"))
+            .save(env.media_dirs[0].join("photo.jpg"))
             .unwrap();
         env.scan().await;
 
-        let wanted = vec![tier("grid-m", 1024, 1024), tier("grid-s", 512, 512)];
+        let wanted = vec![
+            tier("grid-m", 1024, 1024),
+            tier("grid-s", 512, 512),
+            tier("grid-xs", 256, 256),
+        ];
         {
             let mut conn = env.read().await;
             assert_eq!(tier_rows(&mut conn).await, wanted);
             assert_eq!(
                 tier_versions(&mut conn).await,
-                vec![TIER_PROCESS_VERSION; 2]
+                vec![TIER_PROCESS_VERSION; 3]
             );
         }
 
@@ -7326,7 +8359,7 @@ LIMIT 1
             // count).
             assert_eq!(
                 tier_versions(&mut conn).await,
-                vec![TIER_PROCESS_VERSION; 2],
+                vec![TIER_PROCESS_VERSION; 3],
                 "restamped at the current version"
             );
             assert_eq!(
@@ -7377,7 +8410,11 @@ LIMIT 1
             let mut conn = env.read().await;
             assert_eq!(
                 tier_rows(&mut conn).await,
-                vec![tier("grid-m", 1024, 1024), tier("grid-s", 512, 512)],
+                vec![
+                    tier("grid-m", 1024, 1024),
+                    tier("grid-s", 512, 512),
+                    tier("grid-xs", 256, 256)
+                ],
                 "the premise: a scan that believed this item still wrote stills"
             );
         }
@@ -7399,23 +8436,31 @@ LIMIT 1
         let mut conn = env.read().await;
         // 5.88 MB uncompressed at 1400x1400: past the raw floor on both
         // clauses, so this item wants the animated ladder — posters at the
-        // same geometry the stills had, plus the one loop that answers both
-        // grid tiers.
+        // same geometry the stills had, the one loop that answers every grid
+        // tier, and (past the animated class's 5 MiB display bound, with a
+        // grid loop that is downscaled rather than native) a display loop.
         assert_eq!(
             tier_rows(&mut conn).await,
             vec![
                 tier("grid-m", 1024, 1024),
                 tier("grid-s", 512, 512),
+                tier("grid-xs", 256, 256),
                 tier(LOOP_TIER, 1024, 1024),
+                tier(crate::visual_tiers::LOOP_DISPLAY_TIER, 1400, 1400),
             ],
             "the stale still set is replaced by the animated one"
         );
         assert_eq!(
             tier_media_types(&mut conn).await,
             vec![
-                ("grid-m".to_string(), TIER_MEDIA_TYPE.to_string()),
-                ("grid-s".to_string(), TIER_MEDIA_TYPE.to_string()),
+                ("grid-m".to_string(), "image/jpeg".to_string()),
+                ("grid-s".to_string(), "image/jpeg".to_string()),
+                ("grid-xs".to_string(), "image/jpeg".to_string()),
                 (LOOP_TIER.to_string(), LOOP_MEDIA_TYPE.to_string()),
+                (
+                    crate::visual_tiers::LOOP_DISPLAY_TIER.to_string(),
+                    LOOP_MEDIA_TYPE.to_string(),
+                ),
             ],
             "an uncompressed 5.88 MB source dwarfs its H.264 encode, so the \
              loop is stored rather than the keep-the-original verdict"
@@ -7433,7 +8478,7 @@ LIMIT 1
             "and it settles: the animated set is the one the ladder wants"
         );
         let mut conn = env.read().await;
-        assert_eq!(tier_rows(&mut conn).await.len(), 3);
+        assert_eq!(tier_rows(&mut conn).await.len(), 5);
     }
 
     // The raw floor's other side: an animated item small enough to serve as
@@ -7504,13 +8549,17 @@ VALUES (?1, 0, 'grid-m', 'image/gif', 'image/jpeg', 200, 200, ?2, X'00')
         );
     }
 
-    /// R2-C's bite case, and the reason the loop has a kind of its own: a
-    /// loop failure must not cost this item its **display** rendition. The
-    /// dispatcher consults the two markers separately, so a `loop` marker
-    /// retires the animated ladder while a display rendition the rule starts
-    /// wanting later is still generated.
+    /// The reason the loop has a kind of its own: a loop failure retires the
+    /// animated ladder and **nothing else**. The dispatcher consults the two
+    /// markers separately, so the thumbnail consult is untouched — which is
+    /// what keeps a file ffmpeg cannot encode eligible for the still ladder
+    /// the moment the animation question reclassifies it.
+    ///
+    /// The item is deliberately over the display loop trigger (R3), so its
+    /// wanted set holds both loop rows: the `display` answer for a moving
+    /// picture is its own file or a loop, never a stored still.
     #[tokio::test]
-    async fn a_loop_marker_retires_the_ladder_without_touching_the_display_half() {
+    async fn a_loop_marker_retires_the_ladder_and_nothing_else() {
         if !crate::media_tools::ffmpeg_available() {
             return;
         }
@@ -7521,31 +8570,40 @@ VALUES (?1, 0, 'grid-m', 'image/gif', 'image/jpeg', 200, 200, ?2, X'00')
             let shade = (index as u8).wrapping_mul(90);
             image::Rgba([shade, (x / 32) as u8, (y / 32) as u8, 255])
         });
-        // Past the display rule's *byte* bound, so this item genuinely owes a
-        // display rendition — the half a loop marker must never touch. GIF
-        // decoders stop at the trailer, so padding changes the file's size
-        // and nothing else about it; both the dispatcher and the generator
-        // read the same `image_file_size`, so they agree.
+        // Past the animated class's byte bound, so this item's display answer
+        // is a loop of its own (R3) rather than its file. GIF decoders stop at
+        // the trailer, so padding changes the file's size and nothing else
+        // about it; both the dispatcher and the generator read the same
+        // `image_file_size`, so they agree.
         {
             use std::io::Write;
             let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-            file.write_all(&vec![0_u8; (DISPLAY_MAX_FILE_SIZE + 1) as usize])
-                .unwrap();
+            file.write_all(&vec![
+                0_u8;
+                (crate::visual_tiers::DISPLAY_MAX_FILE_SIZE_ANIMATED
+                    + 1) as usize
+            ])
+            .unwrap();
         }
         env.scan().await;
         let sha: String = {
             let mut conn = env.read().await;
             assert_eq!(
                 thumbnail_count(&mut conn).await,
-                1,
-                "the premise: past the byte bound, this item owes a display rendition"
+                0,
+                "a moving picture never stores a still display rendition"
+            );
+            let stored = tier_rows(&mut conn).await;
+            assert!(
+                stored.iter().any(|(tier, _, _)| tier == LOOP_TIER),
+                "the premise: it is on the animated ladder"
             );
             assert!(
-                tier_rows(&mut conn)
-                    .await
+                !stored
                     .iter()
-                    .any(|(tier, _, _)| tier == LOOP_TIER),
-                "the premise: and it is on the animated ladder"
+                    .any(|(tier, _, _)| tier == crate::visual_tiers::LOOP_DISPLAY_TIER),
+                "900x900 is already the whole picture at native resolution, so \
+                 the grid loop IS the display loop and no second row is stored"
             );
             sqlx::query_scalar("SELECT sha256 FROM items LIMIT 1")
                 .fetch_one(&mut conn)
@@ -7575,7 +8633,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
                 "#,
             )
             .bind(&sha)
-            .bind(TIER_PROCESS_VERSION)
+            .bind(LOOP_PROCESS_VERSION)
             .execute(&mut conn)
             .await
             .unwrap();
@@ -7583,34 +8641,28 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
 
         env.scan().await;
         let mut conn = env.read().await;
-        // The bite case. Had the loop failure marked `thumbnail` — the kind
-        // the ladder's decode shares — this would be 0, and a file ffmpeg
-        // cannot encode would have lost the still it is perfectly capable of
-        // producing.
-        assert_eq!(
-            thumbnail_count(&mut conn).await,
-            1,
-            "a loop marker must never suppress a display rendition"
-        );
         assert!(
             tier_rows(&mut conn).await.is_empty(),
-            "and it must retire the animated ladder, including the pass the \
-             display half is running anyway"
+            "the marker retires the animated ladder, including the pass the \
+             item is running for its other questions"
         );
 
-        // The heal path the kind exists for: the tier version moves and the
-        // ledger's `version >= ?` consult stops finding the marker.
+        // The heal path the kind exists for: the *loop* version moves and the
+        // ledger's `version >= ?` consult stops finding the marker. Keyed to
+        // `LOOP_PROCESS_VERSION` rather than the still tiers', so a
+        // still-encoder bump neither retires this nor re-runs the ffmpeg it
+        // exists to stop.
         assert!(
-            visuals_suppressed(&mut conn, &sha, VisualKind::Loop, TIER_PROCESS_VERSION)
+            visuals_suppressed(&mut conn, &sha, VisualKind::Loop, LOOP_PROCESS_VERSION)
                 .await
                 .unwrap(),
             "the marker suppresses at the version it was written for"
         );
         assert!(
-            !visuals_suppressed(&mut conn, &sha, VisualKind::Loop, TIER_PROCESS_VERSION + 1)
+            !visuals_suppressed(&mut conn, &sha, VisualKind::Loop, LOOP_PROCESS_VERSION + 1)
                 .await
                 .unwrap(),
-            "a TIER_PROCESS_VERSION bump retires it for free"
+            "a LOOP_PROCESS_VERSION bump retires it for free"
         );
         // And it is invisible to the thumbnail consult by construction: the
         // ledger's key is (content, kind).
@@ -7656,6 +8708,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
                 vec![
                     tier("grid-m", 1024, 1024),
                     tier("grid-s", 512, 512),
+                    tier("grid-xs", 256, 256),
                     tier(LOOP_TIER, 1024, 1024),
                 ],
                 "the premise: a measured animation takes the animated ladder"
@@ -7677,7 +8730,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         let mut conn = env.read().await;
         assert_eq!(
             tier_rows(&mut conn).await,
-            vec![tier("grid-m", 1024, 1024), tier("grid-s", 512, 512)],
+            vec![
+                tier("grid-m", 1024, 1024),
+                tier("grid-s", 512, 512),
+                tier("grid-xs", 256, 256)
+            ],
             "a measured-still GIF wants static tiers and no loop"
         );
         assert!(
@@ -7699,12 +8756,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     /// Every stored grid rendition as `(tier, media_type)`, in the
     /// dispatcher's own order.
     async fn tier_media_types(conn: &mut sqlx::SqliteConnection) -> Vec<(String, String)> {
-        sqlx::query_as(
-            "SELECT tier, media_type FROM storage.thumbnail_tiers ORDER BY idx, tier",
-        )
-        .fetch_all(conn)
-        .await
-        .unwrap()
+        tier_snapshot(conn)
+            .await
+            .into_iter()
+            .map(|row| (row.tier, row.media_type))
+            .collect()
     }
 
     // An item whose display rendition is already the one the current rule
@@ -7713,9 +8769,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     // display rendition (and its blurhash) for every already-correct item is
     // the bulk of a library-wide upgrade, and it buys nothing.
     //
-    // 9000x1000 uncompressed is 27 MB: past the 24 MB byte bound while every
-    // pixel bound is clear, so the display rendition is a plain re-encode at
-    // the original dimensions — stored, and stable across rescans.
+    // 9000x1000 uncompressed is 27 MB: past the lossless class's 2 MiB byte
+    // bound while every pixel bound is clear, so the display rendition is a
+    // plain re-encode at the original dimensions — stored, and stable across
+    // rescans.
     #[tokio::test]
     async fn a_tier_only_backfill_leaves_the_display_rendition_alone() {
         let test_env = test_data_dir();
@@ -7725,7 +8782,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             .unwrap();
         env.scan().await;
 
-        let wanted = vec![tier("grid-m", 2048, 1000), tier("grid-s", 1024, 512)];
+        let wanted = vec![
+            tier("grid-m", 2048, 1000),
+            tier("grid-s", 1024, 512),
+            tier("grid-xs", 512, 256),
+        ];
         let (display_before, blurhash_before) = {
             let mut conn = env.read().await;
             assert_eq!(thumbnail_count(&mut conn).await, 1);
@@ -7760,10 +8821,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     /// The stored display renditions as `(rowid, bytes)`. The store is a
     /// delete-then-insert, so an unchanged rowid is proof nothing rewrote it.
     async fn display_rows(conn: &mut sqlx::SqliteConnection) -> Vec<(i64, Vec<u8>)> {
-        sqlx::query_as("SELECT id, thumbnail FROM storage.thumbnails ORDER BY id")
-            .fetch_all(conn)
+        display_snapshot(conn)
             .await
-            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.thumbnail))
+            .collect()
     }
 
     async fn blurhash_of(conn: &mut sqlx::SqliteConnection) -> Option<String> {
@@ -7777,8 +8839,8 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     // its 2x2 frame grid and its first frame — not from a fresh ffmpeg run
     // over the source. The clip's frames are 576x1024, so the grid is
     // 1152x2048: past 1.25x `grid-s` and inside 1.25x `grid-m`, while the
-    // first frame is inside both. One tier, and the dispatcher predicts
-    // exactly that.
+    // first frame is inside both of those and past `grid-xs`. Three rows
+    // across the two pictures, and the dispatcher predicts exactly that.
     #[tokio::test]
     async fn a_video_backfills_tiers_from_its_stored_thumbnails() {
         let test_env = test_data_dir();
@@ -7791,7 +8853,14 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         {
             let mut conn = env.read().await;
             assert_eq!(thumbnail_count(&mut conn).await, 2, "the grid and frame 0");
-            assert_eq!(tier_rows(&mut conn).await, vec![tier("grid-s", 512, 910)]);
+            assert_eq!(
+                tier_rows(&mut conn).await,
+                vec![
+                    tier("grid-s", 512, 910),
+                    tier("grid-xs", 256, 455),
+                    tier("grid-xs", 256, 455)
+                ]
+            );
         }
 
         // The state an existing library is in, and the one that proves the
@@ -7819,7 +8888,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         let mut conn = env.read().await;
         assert_eq!(
             tier_rows(&mut conn).await,
-            vec![tier("grid-s", 512, 910)],
+            vec![
+                tier("grid-s", 512, 910),
+                tier("grid-xs", 256, 455),
+                tier("grid-xs", 256, 455)
+            ],
             "the tiers came back from the stored pictures, not from the file"
         );
     }
@@ -7848,9 +8921,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         fs::create_dir_all(&media_dir).unwrap();
         // An image the display rule really does store a rendition for, so a
         // missing one is meaningful rather than the normal state of most
-        // images. Under the dimension-first rule that takes *bytes*: 9000x1000
-        // uncompressed is 27 MB, past the 24 MB bound while every pixel bound
-        // is clear, so the rendition is a plain re-encode.
+        // images. Under the dimension-first rule that takes *bytes*: a BMP is
+        // a lossless source, and 9000x1000 uncompressed is 27 MB — far past
+        // that class's 2 MiB bound, while every pixel bound is clear, so the
+        // rendition is a plain re-encode.
         image::RgbImage::new(9000, 1000)
             .save(media_dir.join("large.bmp"))
             .unwrap();
@@ -8057,8 +9131,8 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         fs::create_dir_all(&media_dir).unwrap();
 
         // 9000x1000 uncompressed = 27 MB. Truncating 100 KB leaves it well
-        // past the display rule's 24 MB byte bound, so this one really would
-        // get a stored rendition.
+        // past the lossless class's 2 MiB byte bound, so this one really
+        // would get a stored rendition.
         let large = media_dir.join("large.bmp");
         image::RgbImage::new(9000, 1000).save(&large).unwrap();
         let full_len = fs::metadata(&large).unwrap().len();
@@ -9101,7 +10175,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // Already examined, so the outro question is settled and only the
         // frames gap remains — the state this test has always been about.
         set_outro_kind(&env, sha256, Some("none/1")).await;
-        let thumbnail = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+        let thumbnail = encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
             .expect("an 8x8 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
             IndexDbWriterMessage::StoreThumbnails {
@@ -9213,7 +10287,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         .await;
         // A stored thumbnail, so the *only* thing that could dispatch this file
         // is the outro question.
-        let thumbnail = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+        let thumbnail = encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
             .expect("an 8x8 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
             IndexDbWriterMessage::StoreThumbnails {
@@ -9285,7 +10359,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             Some("LEHV6nWB2yk8pyo0adR*".to_string()),
         )
         .await;
-        let thumbnail = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+        let thumbnail = encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
             .expect("an 8x8 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
             IndexDbWriterMessage::StoreThumbnails {
@@ -9909,7 +10983,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         )
         .await;
         set_outro_kind(&env, sha256, Some("none/1")).await;
-        let thumbnail = encode_image(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
+        let thumbnail = encode_generated_still(0, &DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)))
             .expect("an 8x8 image encodes");
         call_index_db_writer(&env.index_db, |reply| {
             IndexDbWriterMessage::StoreThumbnails {
@@ -10563,6 +11637,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
             "video/mp4",
             &meta(0, 10.0),
             None,
+            FormatPolicy::default(),
         )
         .expect("a missing video track is not a failure");
         assert_eq!(produced.nothing, vec![VisualKind::Thumbnail, VisualKind::Frame]);
@@ -10572,7 +11647,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // for the kind that could have existed.
         let plain = dir.path().join("notes.txt");
         fs::write(&plain, b"hello").unwrap();
-        let produced = build_new_item_renditions(&plain, "text/plain", &meta(0, 0.0), None)
+        let produced = build_new_item_renditions(&plain, "text/plain", &meta(0, 0.0), None, FormatPolicy::default())
             .expect("an unsupported type is not a failure");
         assert_eq!(produced.nothing, vec![VisualKind::Thumbnail]);
 
@@ -10580,7 +11655,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // marker — the predicate already answers this without decoding.
         let small = dir.path().join("small.png");
         image::RgbImage::new(8, 8).save(&small).unwrap();
-        let produced = build_new_item_renditions(&small, "image/png", &meta(0, 0.0), None)
+        let produced = build_new_item_renditions(&small, "image/png", &meta(0, 0.0), None, FormatPolicy::default())
             .expect("a small image is not a failure");
         assert!(
             produced.nothing.is_empty() && produced.thumbnails.is_empty(),
@@ -10591,17 +11666,21 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // 27 MB uncompressed, past the display rule's byte bound.
         let large = dir.path().join("large.bmp");
         image::RgbImage::new(9000, 1000).save(&large).unwrap();
-        let produced = build_new_item_renditions(&large, "image/bmp", &meta(0, 0.0), None).unwrap();
+        let produced = build_new_item_renditions(&large, "image/bmp", &meta(0, 0.0), None, FormatPolicy::default()).unwrap();
         assert!(produced.nothing.is_empty() && produced.thumbnails.len() == 1);
         // ... and carries the grid tiers of the same decode. A 9:1 strip is
-        // cropped rather than resized whole, so both tiers exist.
+        // cropped rather than resized whole, so every tier exists.
         let tiers = produced.tiers.expect("an image pass always plans tiers");
         assert_eq!(
             tiers
                 .iter()
-                .map(|tier| (tier.tier, tier.width, tier.height))
+                .map(|tier| (tier.tier.as_str(), tier.width, tier.height))
                 .collect::<Vec<_>>(),
-            vec![("grid-m", 2048, 1000), ("grid-s", 1024, 512)]
+            vec![
+                ("grid-m", 2048, 1000),
+                ("grid-s", 1024, 512),
+                ("grid-xs", 512, 256)
+            ]
         );
     }
 
@@ -11789,9 +12868,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         // process, so a leftover file would show up in another scan.
         let media_dir = root.join("media-served-directly");
         fs::create_dir_all(&media_dir).unwrap();
-        let image_path = media_dir.join("large.bmp");
-        // 1400x1400 uncompressed = 5.88 MB: over the small-file cutoff, but
-        // well inside the dimension and file-size limits.
+        let image_path = media_dir.join("large.jpg");
+        // A 1400x1400 JPEG: past 1.25x every grid tier, so tiers are stored,
+        // and comfortably inside its own class's display bounds, so the
+        // display tier serves the original and nothing is stored for it.
         image::RgbImage::new(1400, 1400).save(&image_path).unwrap();
 
         let store = SystemConfigStore::new(root.to_path_buf());
@@ -11817,6 +12897,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         let square_tiers = vec![
             ("grid-m".to_string(), 1024_i64, 1024_i64),
             ("grid-s".to_string(), 512, 512),
+            ("grid-xs".to_string(), 256, 256),
         ];
         assert_eq!(tier_rows(&mut conn).await, square_tiers);
         drop(conn);
@@ -11857,12 +12938,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     /// Every stored grid tier as `(tier, width, height)`, in the order the
     /// dispatcher's own read returns them.
     async fn tier_rows(conn: &mut sqlx::SqliteConnection) -> Vec<(String, i64, i64)> {
-        sqlx::query_as(
-            "SELECT tier, width, height FROM storage.thumbnail_tiers ORDER BY idx, tier",
-        )
-        .fetch_all(conn)
-        .await
-        .unwrap()
+        tier_snapshot(conn)
+            .await
+            .into_iter()
+            .map(|row| (row.tier, row.width, row.height))
+            .collect()
     }
 
     // VACUUM must run outside the writer's usual transaction wrapper; both

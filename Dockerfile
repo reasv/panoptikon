@@ -27,6 +27,9 @@ RUN npm ci \
 # Built on the same Ubuntu release as the runtime stage so the binary never
 # links glibc symbols newer than what the runtime provides.
 FROM ubuntu:24.04 AS rust-build
+# `build-essential` is load-bearing beyond the -sys crates' headers: the WebP
+# encoder (libwebp-sys) vendors its C sources and builds them with `cc` alone
+# -- no cmake, no nasm -- so a C compiler is all the thumbnail encoders need.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config libssl-dev curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

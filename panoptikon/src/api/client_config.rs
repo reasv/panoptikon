@@ -99,6 +99,39 @@ impl AnimatedThumbnailFloor {
     }
 }
 
+/// The display-tier loop trigger, verbatim from [`crate::visual_tiers`]
+/// (docs/thumbnail-format-implementation.md §2, R3).
+///
+/// The gallery's large view decides `<video>` vs `<img>` from four fields of
+/// the item it is showing — `type` and `duration` say whether the picture
+/// moves, `size` and `width`/`height` say whether it clears the trigger —
+/// against these three numbers, which is the same arithmetic the scan used to
+/// decide whether to store a loop at all. Surfaced rather than duplicated in
+/// the UI so the two sides cannot drift, and so the client needs no request to
+/// find out (a wasted round trip per animated item, and an error latch on the
+/// ones that answer with an image).
+///
+/// Any **one** of the three firing is enough; they are not a conjunction.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DisplayLoopTrigger {
+    /// Bytes. An animated original larger than this is answered with a loop.
+    pub max_bytes: u64,
+    /// The shorter side, in pixels.
+    pub max_short_side: u32,
+    /// Total pixels.
+    pub max_pixels: u64,
+}
+
+impl DisplayLoopTrigger {
+    fn current() -> Self {
+        Self {
+            max_bytes: crate::visual_tiers::DISPLAY_MAX_FILE_SIZE_ANIMATED,
+            max_short_side: crate::visual_tiers::DISPLAY_MAX_SHORT_SIDE,
+            max_pixels: crate::visual_tiers::DISPLAY_MAX_PIXELS,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ClientConfigResponse {
     /// Name of the policy that matched this request.
@@ -119,6 +152,14 @@ pub(crate) struct ClientConfigResponse {
     /// The animated raw floor the thumbnail endpoint serves by (see
     /// [`AnimatedThumbnailFloor`]).
     pub animated_floor: AnimatedThumbnailFloor,
+    /// The display-tier loop trigger (see [`DisplayLoopTrigger`]).
+    ///
+    /// Always `Some` today: the loop ladder is unconditional. The `Option` is
+    /// reserved for a build that stores no loops at all, which would publish
+    /// `null` here rather than a bound it does not serve by — with nothing to
+    /// evaluate, every animated item is an `<img>` on its original file and
+    /// no client mounts a `<video>`.
+    pub display_loop_trigger: Option<DisplayLoopTrigger>,
 }
 
 /// The probe table: (capability, method, representative real route). Paths
@@ -170,6 +211,9 @@ pub(crate) fn build_client_config(
             crate::api::desktop::desktop_bridge_is_configured(),
         ),
         animated_floor: AnimatedThumbnailFloor::current(),
+        // One condition, one place: the trigger is published exactly while
+        // the floor is.
+        display_loop_trigger: Some(DisplayLoopTrigger::current()),
     }
 }
 
@@ -329,6 +373,62 @@ disable_backend_open = true
             response.animated_floor.max_side,
             crate::visual_tiers::ANIMATED_RAW_MAX_SIDE
         );
+    }
+
+    /// The display-tier loop trigger on the wire (§5): three keys, always all
+    /// three, carrying the same numbers the scan decided with.
+    ///
+    /// The gallery large view mounts a `<video>` on the bare thumbnail URL for
+    /// an animated item over this trigger and an `<img>` under it, with no
+    /// request to find out which — so a client and a server that disagree here
+    /// produce an error latch on one class of item and a still frame where a
+    /// loop was stored on the other. Server-derived, like the floor beside it:
+    /// a restricted policy sees the same numbers, because they are a property
+    /// of what the scan wrote.
+    #[test]
+    fn the_display_loop_trigger_is_published_verbatim() {
+        let settings = two_policy_settings();
+        let response = build_client_config(&settings, &settings.policies[1]);
+        let trigger = response
+            .display_loop_trigger
+            .as_ref()
+            .expect("the loop ladder is unconditional today");
+        assert_eq!(
+            (
+                trigger.max_bytes,
+                trigger.max_short_side,
+                trigger.max_pixels
+            ),
+            (
+                crate::visual_tiers::DISPLAY_MAX_FILE_SIZE_ANIMATED,
+                crate::visual_tiers::DISPLAY_MAX_SHORT_SIDE,
+                crate::visual_tiers::DISPLAY_MAX_PIXELS
+            )
+        );
+        // Written out, because these are the numbers the UI hard-codes nothing
+        // against and every one of them is a frozen client contract.
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["display_loop_trigger"],
+            serde_json::json!({
+                "max_bytes": 5_242_880u64,
+                "max_short_side": 4096u32,
+                "max_pixels": 24_000_000u64,
+            }),
+            "all three keys, always, and never the 2560 rendition cap"
+        );
+
+        // And the absent case is a JSON `null`, not a missing key: a build
+        // that serves no loops has to *say* so, or a client reading the field
+        // as optional would read "no answer" as "no trigger" and mount a
+        // `<video>` on every animation there is.
+        let json = serde_json::to_value(ClientConfigResponse {
+            display_loop_trigger: None,
+            ..response
+        })
+        .unwrap();
+        assert_eq!(json["display_loop_trigger"], serde_json::Value::Null);
+        assert!(json.as_object().unwrap().contains_key("display_loop_trigger"));
     }
 
     /// allow_all: everything true, client table passed through.

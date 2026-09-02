@@ -77,10 +77,15 @@ rendition is stored, and *what shape* it has once it is.
   `DISPLAY_RENDITION_SHORT_SIDE = 2560` is the cap. `DISPLAY_MAX_FILE_SIZE`
   becomes a per-class table; `DISPLAY_MAX_PIXELS` becomes 24,000,000.
 - **Keep-original sentinel**: if the encoded rendition is not ≤ 75% of the
-  source bytes, store a sentinel row (empty bytes, `media_type` = source mime)
-  meaning "the original is the rendition" — the loop's existing convention,
-  now on `thumbnails`. This is what protects an efficient 6 MiB JPEG whose
-  re-encode would save nothing.
+  source bytes, store a sentinel row (empty bytes) meaning "the original is
+  the rendition" — the loop's existing convention, now on `thumbnails` too.
+  This is what protects an efficient 6 MiB JPEG whose re-encode would save
+  nothing. In **both** tables the row's `media_type` names the format the
+  generator *attempted*, never the source's own mime type: the verdict is
+  about that encoder, so recording which one reached it is what lets a later
+  format flip (a policy edit, a transparency measurement) retry instead of
+  freezing on it, and it is what makes every stored-versus-wanted comparison
+  plain equality with no exception for either kind of row.
 - **WebP size limit**: if either side of the rendition would exceed 16383,
   encode JPEG instead (same q85 settings).
 
@@ -88,10 +93,13 @@ rendition is stored, and *what shape* it has once it is.
 `display` request serves the original unless the R2 trigger fires
 (`bytes > 5 MiB` — the animated class's byte bound — OR `short > 4096` OR
 `pixels > 24 MP`); then a stored H.264
-loop: if the source short side ≤ 1024 the **existing grid loop row is the
-display loop** (it is already native resolution — no second encode); else a
-second row `tier = "loop-display"` capped at 2560 short, CRF 16, same encoder
-settings otherwise. 60 s duration cap on every loop encode
+loop: where the grid loop row is already **the whole picture at native
+resolution** it *is* the display loop and no second encode happens; otherwise
+a second row `tier = "loop-display"`, whole image, capped at 2560 short,
+CRF 16, same encoder settings. The rule is the whole picture and not merely a
+short side ≤ 1024, because a strip (aspect > 2) has its grid loop stored as a
+**top crop** — right in a cover cell, wrong on a contain surface — so every
+strip over the trigger gets its own `loop-display`. 60 s duration cap on every loop encode
 (§4). Sentinel as today.
 
 **R4 Transparency.** `items.has_transparency` (0/1, NULL = never examined),
@@ -116,8 +124,11 @@ has_transparency, policy)` — nothing decodes to decide.
 
 - Migration: `ALTER TABLE thumbnails ADD COLUMN media_type TEXT NOT NULL DEFAULT 'image/jpeg'`
   (metadata-only, mirrors `20260901093000`). `StoredImage` gains `media_type`;
-  `store_thumbnails`, `get_thumbnail_bytes`, `get_thumbnail_image`,
-  `get_thumbnail_geometry` carry it. Sentinel rows = empty `thumbnail` blob.
+  `store_thumbnails`, `get_thumbnail_image` and `get_thumbnail_geometry` carry
+  it. `get_thumbnail_bytes` does not: it is the scan's own blob read (a
+  blurhash source, a tier's derived picture) and has no response to name a
+  type for. The serving path reads geometry and blob together through
+  `get_thumbnail_image`. Sentinel rows = empty `thumbnail` blob.
 - Migration (index): `ALTER TABLE items ADD COLUMN has_transparency INTEGER` +
   partial index `ON items(type) WHERE has_transparency IS NULL`, same shape as
   `20260824120000_item_rotation.sql` (half-open `type` ranges, never `LIKE`).
@@ -169,7 +180,10 @@ has_transparency, policy)` — nothing decodes to decide.
   the loop's three-state read). `tier_fall_up_is_final` learns the new display
   plan.
 - R3: a `display` request for an animated item consults the loop rows the way
-  the grid request does; `still=true` keeps answering the poster.
+  the grid request does. `still=true` at the display size answers the largest
+  stored poster — `grid-m`, since the poster ladder has no display rung — for
+  an animated item above the raw floor, and the original file only below it,
+  where nothing is stored at all.
 - `/api/client-config` publishes the animated class's **trigger** (never the
   2560 rendition cap): `display_loop_trigger: { max_bytes: 5 MiB,
   max_short_side: 4096, max_pixels: 24_000_000 } | null` (null under the same
@@ -201,6 +215,9 @@ has_transparency, policy)` — nothing decodes to decide.
   change regenerates renditions on the next scan and that the DB file shrinks
   only after the maintenance VACUUM.
 - Display request URLs gain `r=2` (§5).
+- A pinboard **pin** of an animated item over the display trigger is a static
+  poster by contract: the compose and preview paths ask for a picture, so they
+  send `still=true` and get one. Nothing on a board mounts a `<video>`.
 
 ## 7. Verification
 
@@ -247,3 +264,65 @@ adjudication → fixer, per wave. Nothing pushed.
   a per-frame decode trace; today static and animated share the 5 MiB bound.
 - Video stills as WebP; PQL-rule-driven per-item format policy (the row-level
   `media_type` and expected-vs-stored comparison already leave room for it).
+
+## 10. Outcome (2026-09-02)
+
+Implemented and merged: backend `2b76ac7` (35 commits), UI `rust-ui@47ea696`
+(23 commits), gitlink bump `a40a180`. Nothing pushed. Two adversarial rounds
+per branch, an integration round and a final round on isolated stacks, then
+five Fable architectural reviews applied (backend 17 commits, UI 15).
+
+**Verified on real fixtures** (final round, 2,991 files incl. every Phase-C
+worst case): zero ffmpeg spawns across eight rescans — a library-wide
+transparency pass and a full static-tier regeneration over 37 animated items
+left all 42 loop rows byte- and rowid-identical; the loop-sentinel migration
+flipped exactly the five empty rows of a pre-review database and the next
+scan wrote nothing; a `["jpeg"]` policy flip and restore returned the store
+byte-identical; at the slider minimum the grid decodes 4× fewer megapixels
+and transfers 4.1× fewer bytes, and at every other size the request stream is
+identical to the pre-package build (the per-item orientation-aware tier
+choice never asks for a larger rung than width-only did on the measured
+corpora). 1171 backend tests, 20 UI suites under the new `npm test`.
+
+**Corrections adopted after the reviews** (each with a test):
+- Loop reuse now runs on every animated-ladder dispatch path, per row, with
+  retained rows *named* (`TierPayload::Retained`) instead of copied through
+  the worker — before this the real upgrade pass would have re-encoded every
+  loop despite the unit test proving the tier bump did not.
+- One sentinel convention on both tables: the row names the format the
+  generator *tried* (loops: `video/mp4`); a sentinel is final only while that
+  format is still the verdict. Migration `20260902130000` rewrites the
+  pre-review loop sentinels.
+- `JPEG_MAX_SIDE` (65535) joins `WEBP_MAX_SIDE`: a shape no container can hold
+  serves the original by rule instead of failing as a file verdict.
+- Display ETag = `{sha}-thumb{idx}-{w}x{h}-{fmt}-v{ver}[-still]`.
+- The display rule is `display_shape` (geometry + trigger, what the serve side
+  asks) composed with the policy (what the generator asks).
+- Gallery large view: on a `<video>` error the fallback is the bare URL first
+  (a keep-original sentinel answers the animating original), `still=true`
+  second — `still=true` at the display size answers the ≤1024 poster for any
+  animated item above the raw floor, never the original.
+- The grid card chooses its tier per row from the box edge its picture's
+  short side must cover under `object-cover` (`coverBindingEdge`), latched at
+  mount; `smallCell` is derived in the card, not passed.
+- One URL builder per element kind (`lib/thumbnailURL.ts`): a bare-URL
+  builder that takes a sha, and a picture builder that *requires* the row and
+  the trigger, so an `<img>` consumer cannot forget `still=true`.
+
+**Traps recorded:** a hand-launched `next start` behind a scratch gateway does
+its SSR fetches against the default API base (production) unless
+`PANOPTIKON_API_URL` is set; Edge without
+`--disable-features=CalculateNativeWinOcclusion` never issues a `<video>`
+request while occluded (poster forever, no error — looks exactly like a broken
+fallback); tailwind-merge does not know a custom `@utility`, so a shadcn
+`<Button>` under one keeps its own `rounded-md`; editing a committed migration's
+comment changes its checksum (self-healed, but a WARN on upgrade).
+
+**User QA:** the format switch is invisible by design except: the gallery's
+14 MiB PNGs now load as ~1 MiB WebP; transparent PNGs show the background
+through in the grid and gallery instead of black; heavy GIFs open as loops
+(sentinel ones as the animating original); the scan settings page gains
+"Thumbnail Formats"; the first scan after upgrade regenerates every tier once
+(one decode per image) and the DB file shrinks only after the maintenance
+VACUUM. Grid-xs at the slider minimum is the visible perf change.
+
