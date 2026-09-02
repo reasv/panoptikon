@@ -226,20 +226,6 @@ fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths> {
     })
 }
 
-/// Runs the index migrator over one file, hook included. Test-only: the
-/// production paths always go through `migrate_databases_on_disk` or the
-/// startup sweep.
-#[cfg(test)]
-pub(crate) async fn migrate_index_path_for_test(path: &Path) -> Result<()> {
-    migrate_path(path, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD, DbKind::Index).await
-}
-
-/// The same for a `storage.db`, used to prove the hook is index-only.
-#[cfg(test)]
-pub(crate) async fn migrate_storage_path_for_test(path: &Path) -> Result<()> {
-    migrate_path(path, &STORAGE_MIGRATOR, STORAGE_ALEMBIC_HEAD, DbKind::Other).await
-}
-
 async fn migrate_path(
     path: &Path,
     migrator: &Migrator,
@@ -315,12 +301,19 @@ async fn migrate_path(
 }
 
 /// Applies the index migrator to an arbitrary index database file, exactly
-/// as a gateway start would. Test/verification-harness only: the shipped
-/// paths all go through [`migrate_databases_on_disk`], which derives its
-/// paths from the runtime config.
+/// as a gateway start would — the post-migration hook (`db::batch_auto`)
+/// included. Test/verification-harness only: the shipped paths all go
+/// through [`migrate_databases_on_disk`], which derives its paths from the
+/// runtime config.
 #[cfg(test)]
 pub(crate) async fn migrate_index_db_file(path: &Path) -> Result<()> {
     migrate_path(path, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD, DbKind::Index).await
+}
+
+/// The same for a `storage.db`, used to prove the hook is index-only.
+#[cfg(test)]
+pub(crate) async fn migrate_storage_db_file(path: &Path) -> Result<()> {
+    migrate_path(path, &STORAGE_MIGRATOR, STORAGE_ALEMBIC_HEAD, DbKind::Other).await
 }
 
 /// Applies the user_data migrator to an arbitrary user_data database file.

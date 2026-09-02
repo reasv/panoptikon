@@ -1370,7 +1370,8 @@ struct ItemInference {
 /// so the multi-unit boundary in this process is one item's chunk. When a
 /// chunk of more than one unit fails as a whole, its units are re-submitted
 /// one at a time, once (`isolate_inputs`), each advertising
-/// [`ISOLATION_MAX_BATCH`] so the dispatcher cannot merge them back together:
+/// [`ISOLATION_MAX_BATCH`] so the dispatcher never merges a retry into
+/// another chunk's window:
 /// a batch-level failure that is not about any single unit then still
 /// completes the item. If one unit fails alone the whole item fails
 /// transiently — partial data is never written for an unclassified failure,
@@ -1508,9 +1509,14 @@ fn is_protocol_violation(err: &anyhow::Error) -> bool {
 /// The `max_batch` an isolated retry advertises on the wire. Splitting the
 /// request locally is not isolation on its own — the dispatcher merges queued
 /// requests into windows — but windows never mix cap values
-/// (`dispatch::window_take_count`) and the cap bounds the GPU batches the
-/// worker packs, so a request advertising 1 is guaranteed a worker batch of
-/// its own.
+/// (`dispatch::window_take_count`), so a retry never shares a window with a
+/// job chunk. Within a window of cap-1 requests the unpriced path sends each
+/// request alone and the priced path's worker packer honours the cap as a
+/// hard item count, so the retry normally runs as a GPU batch of its own.
+/// The exception is an impl with its own batching switched off (the easyOCR
+/// entries): it ignores the cap and runs its whole window in one call, and a
+/// failure there is attributed by the dispatcher's per-request fallback
+/// instead — the same verdict, one extra pass.
 const ISOLATION_MAX_BATCH: u32 = 1;
 
 /// Isolation retry: re-submit `inputs` one at a time, sequentially, and

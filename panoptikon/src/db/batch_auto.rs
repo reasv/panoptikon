@@ -191,7 +191,7 @@ fn store_for_index_db(index_db_file: &Path) -> Option<(SystemConfigStore, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::migrations::{migrate_index_path_for_test, migrate_storage_path_for_test};
+    use crate::db::migrations::{migrate_index_db_file, migrate_storage_db_file};
     use crate::db::system_config::SystemConfigStore;
     use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
     use std::fs;
@@ -247,7 +247,7 @@ mod tests {
     async fn fresh_database_is_stamped_without_seeding_a_config() {
         let tmp = TempDir::new().unwrap();
         let path = index_db_file(tmp.path(), "fresh");
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
 
         assert!(stamped(&path).await);
         let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("fresh");
@@ -263,12 +263,12 @@ mod tests {
     async fn existing_caps_are_removed_from_the_config_and_the_database_is_stamped() {
         let tmp = TempDir::new().unwrap();
         let path = index_db_file(tmp.path(), "default");
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
         unstamp(&path).await;
         let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("default");
         fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
 
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
 
         let rewritten = fs::read_to_string(&config_path).unwrap();
         assert!(
@@ -294,11 +294,11 @@ mod tests {
     async fn a_second_run_leaves_a_newly_entered_cap_alone() {
         let tmp = TempDir::new().unwrap();
         let path = index_db_file(tmp.path(), "default");
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
         unstamp(&path).await;
         let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("default");
         fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
 
         // The user re-enters a cap after the upgrade.
         let after_upgrade = fs::read_to_string(&config_path)
@@ -306,7 +306,7 @@ mod tests {
             .replace("default_threshold = 0.5", "default_batch_size = 16");
         fs::write(&config_path, &after_upgrade).unwrap();
 
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
 
         assert_eq!(
             fs::read_to_string(&config_path).unwrap(),
@@ -321,7 +321,7 @@ mod tests {
     async fn a_crash_before_the_stamp_is_harmless_on_re_run() {
         let tmp = TempDir::new().unwrap();
         let path = index_db_file(tmp.path(), "default");
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
         unstamp(&path).await;
         let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("default");
         let already_nulled = CONFIG_WITH_CAPS
@@ -329,7 +329,7 @@ mod tests {
             .replace("batch_size = 4\n", "");
         fs::write(&config_path, &already_nulled).unwrap();
 
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
 
         assert_eq!(fs::read_to_string(&config_path).unwrap(), already_nulled);
         assert!(stamped(&path).await);
@@ -341,10 +341,10 @@ mod tests {
     async fn a_database_without_a_config_is_stamped_and_no_file_appears() {
         let tmp = TempDir::new().unwrap();
         let path = index_db_file(tmp.path(), "default");
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
         unstamp(&path).await;
 
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
 
         assert!(stamped(&path).await);
         assert!(
@@ -362,7 +362,7 @@ mod tests {
     async fn an_unreadable_config_warns_stamps_and_is_left_untouched() {
         let tmp = TempDir::new().unwrap();
         let path = index_db_file(tmp.path(), "default");
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
         unstamp(&path).await;
         let store = SystemConfigStore::new(tmp.path().to_path_buf());
         let config_path = store.config_path("default");
@@ -372,7 +372,7 @@ mod tests {
         // The failure the warning is made of.
         assert!(clear_config_batch_sizes(&store, "default").is_err());
 
-        migrate_index_path_for_test(&path)
+        migrate_index_db_file(&path)
             .await
             .expect("a broken config must not fail startup");
 
@@ -385,7 +385,7 @@ mod tests {
     async fn an_unwritable_config_warns_stamps_and_is_left_intact() {
         let tmp = TempDir::new().unwrap();
         let path = index_db_file(tmp.path(), "default");
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
         unstamp(&path).await;
         let store = SystemConfigStore::new(tmp.path().to_path_buf());
         let config_path = store.config_path("default");
@@ -397,7 +397,7 @@ mod tests {
 
         assert!(clear_config_batch_sizes(&store, "default").is_err());
 
-        migrate_index_path_for_test(&path)
+        migrate_index_db_file(&path)
             .await
             .expect("an unwritable config must not fail startup");
 
@@ -423,7 +423,7 @@ mod tests {
     async fn folder_lists_survive_the_rewrite_byte_for_byte() {
         let tmp = TempDir::new().unwrap();
         let path = index_db_file(tmp.path(), "default");
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
         unstamp(&path).await;
         let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("default");
         let folders = concat!(
@@ -433,7 +433,7 @@ mod tests {
         let raw = format!("{folders}{CONFIG_WITH_CAPS}");
         fs::write(&config_path, &raw).unwrap();
 
-        migrate_index_path_for_test(&path).await.unwrap();
+        migrate_index_db_file(&path).await.unwrap();
 
         let rewritten = fs::read_to_string(&config_path).unwrap();
         assert!(
@@ -533,7 +533,7 @@ mod tests {
         fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
         let storage = dir.join("storage.db");
 
-        migrate_storage_path_for_test(&storage).await.unwrap();
+        migrate_storage_db_file(&storage).await.unwrap();
 
         assert_eq!(fs::read_to_string(&config_path).unwrap(), CONFIG_WITH_CAPS);
         let mut conn = open(&storage).await;

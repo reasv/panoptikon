@@ -221,7 +221,8 @@ pub(crate) struct WindowItem {
     pub bytes: usize,
     /// Inputs in the request.
     pub items: usize,
-    /// The request's user cap; windows never mix cap values.
+    /// The request's user cap, normalised by [`effective_cap`]; windows
+    /// never mix cap values.
     pub cap: Option<u32>,
 }
 
@@ -403,10 +404,17 @@ pub(crate) fn window_take_count(queued: &[WindowItem], bounds: WindowBounds) -> 
     taken
 }
 
+/// The user cap as an opinion: `0` means "no cap" on the wire (the API
+/// accepts it as auto), so it is folded into `None` here, once, before the
+/// value partitions windows or bounds anything.
+fn effective_cap(max_batch: Option<u32>) -> Option<u32> {
+    max_batch.filter(|cap| *cap > 0)
+}
+
 /// Item bound for the unpriced path: the user cap when present, otherwise the
 /// model's fixed batch size, always at least 1 so dispatch makes progress.
 fn unpriced_item_bound(cap: Option<u32>, fixed: u32) -> usize {
-    let bound = cap.filter(|cap| *cap > 0).unwrap_or(fixed).max(1);
+    let bound = effective_cap(cap).unwrap_or(fixed).max(1);
     bound as usize
 }
 
@@ -424,7 +432,7 @@ fn unpriced_item_bound(cap: Option<u32>, fixed: u32) -> usize {
 /// re-evaluated. Bounding items by the cap keeps a capped window the same *shape*
 /// as an uncapped one: a few batches deep.
 fn priced_item_bound(cap: Option<u32>) -> usize {
-    match cap.filter(|cap| *cap > 0) {
+    match effective_cap(cap) {
         Some(cap) => usize::try_from(u64::from(cap).saturating_mul(WINDOW_DEPTH_MULTIPLIER))
             .unwrap_or(usize::MAX),
         None => usize::MAX,
@@ -812,7 +820,7 @@ fn enqueue(request: DispatchRequest, cost: &CostDimension) -> Queued {
         units: request_units(&request.inputs, cost),
         bytes: request_bytes(&request.inputs),
         items: request.inputs.len(),
-        cap: request.max_batch,
+        cap: effective_cap(request.max_batch),
     };
     Queued { request, shape }
 }
@@ -1283,8 +1291,11 @@ mod tests {
         );
         // Extraction's isolation retry (`ISOLATION_MAX_BATCH`): a request
         // advertising 1 is never merged into a job chunk's window, whichever
-        // side of the chunk it is queued on, so it gets a GPU batch of its own
-        // on every path — the cap bounds items at pack time too.
+        // side of the chunk it is queued on. Within a cap-1 window the
+        // unpriced path sends each request alone and the priced path's
+        // packer honours the cap as a hard item count; an impl with its own
+        // batching switched off ignores the cap and is attributed by the
+        // per-request fallback instead (see `ISOLATION_MAX_BATCH`).
         let queued = [shape(7, 7, Some(8)), shape(1, 1, Some(1))];
         assert_eq!(
             window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
@@ -1297,8 +1308,9 @@ mod tests {
         );
     }
 
-    /// The payload-byte bound is what keeps a window clear of the 512 MiB
-    /// frame limit, independently of how the model is priced.
+    /// The payload-byte bound is what keeps a window clear of the worker's
+    /// hard frame limit ([`MAX_FRAME_BYTES`]), independently of how the model
+    /// is priced.
     #[test]
     fn the_payload_byte_bound_ends_a_window() {
         let queued = [
@@ -1339,6 +1351,31 @@ mod tests {
         let queued: Vec<WindowItem> = (0..6).map(|_| shape(1, 1, Some(2))).collect();
         assert_eq!(
             window_take_count(&queued, bounds(u64::MAX, 2, usize::MAX)),
+            2
+        );
+    }
+
+    /// `max_batch = 0` is "no opinion", the same as an absent cap: it must
+    /// neither bound anything nor split windows away from cap-less requests.
+    #[test]
+    fn a_zero_cap_is_no_opinion() {
+        assert_eq!(effective_cap(None), None);
+        assert_eq!(effective_cap(Some(0)), None);
+        assert_eq!(effective_cap(Some(3)), Some(3));
+        let (reply, _rx) = oneshot::channel();
+        let queued = enqueue(
+            DispatchRequest {
+                inputs: Vec::new(),
+                max_batch: Some(0),
+                reply,
+            },
+            &item_cost(8),
+        );
+        assert_eq!(queued.shape.cap, None, "normalised once, at enqueue");
+        // So a zero-capped request and a cap-less one share a window.
+        let queued = [shape(1, 1, queued.shape.cap), shape(1, 1, None)];
+        assert_eq!(
+            window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
             2
         );
     }

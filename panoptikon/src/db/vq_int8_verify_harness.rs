@@ -57,6 +57,13 @@ async fn used_pages(conn: &mut SqliteConnection) -> i64 {
 /// it as a rowid table and resets every coverage pair to pending — so a
 /// build run through this harness starts from the same state a real
 /// upgrade leaves behind.
+///
+/// The index migrator's post-migration hook (`db::batch_auto`) runs too,
+/// against the copy: if the copy was made as a whole database *directory*,
+/// its sibling `config.toml` has its stored batch sizes nulled and the copy
+/// is stamped; a lone `index.db` copy has no sibling and is skipped. Either
+/// way nothing outside the copy's own directory is touched — which is one
+/// more reason this must never be pointed at the live database.
 async fn open_write() -> SqliteConnection {
     ensure_sqlite_extensions().expect("register SQLite extensions");
     let started = Instant::now();

@@ -441,7 +441,7 @@ enabled = true
 # margin = 0.25           # per-board override; absent keys inherit
 
 # [inference_local.python_env]  # managed venv policy (`panoptikon setup`)
-# accelerator = "auto"    # "auto" | "cuda" | "rocm" | "cpu"
+# accelerator = "auto"    # "auto" | "cuda" | "rocm" | "mps" | "cpu"
 # auto_setup = true       # run setup at startup when python/.venv is missing
 ```
 
