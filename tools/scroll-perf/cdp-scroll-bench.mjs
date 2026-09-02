@@ -49,6 +49,11 @@ if (args.help || args.h) {
   --pulse              scroll 600ms of every 1100ms instead of continuously
   --blockImages        block image requests via CDP (isolates JS cost)
   --blockPattern <g>   override the blocked URL patterns (comma-separated globs)
+  --rewrite <a>::<b>   rewrite substring <a> to <b> in every request URL
+                       (comma-separated for several; e.g.
+                       --rewrite size=grid-xs::size=grid-s serves the OLD tier)
+  --dpr <n>            emulate devicePixelRatio <n> over the SAME physical pixel
+                       area (CSS viewport is rescaled by the dpr ratio)
   --allowHidden        measure even if the window is hidden (results are junk)
   --trace [file]       record a DevTools trace; with a filename, also save it
                        (e.g. --trace trace-out.json -- gitignored)`);
@@ -68,6 +73,36 @@ const blockPatterns = typeof args.blockPattern === 'string'
   : DEFAULT_BLOCK;
 
 function fail(msg) { console.error(msg); process.exit(1); }
+
+// --rewrite: counterfactual serving. A scenario like "what did this grid cost
+// on the PREVIOUS thumbnail tier" needs the page unchanged and only the bytes
+// it is answered with swapped, which is a URL substring rewrite at the network
+// layer -- not a page edit and not a server change.
+//
+// The value is `<from>::<to>`. The separator is '::' and NOT '=' because the
+// substrings this flag exists to swap are themselves query parameters:
+// `size=grid-xs=size=grid-s` has four '=' and no rule over them recovers the
+// intended split. ('=' is still accepted for a spec containing exactly one, so
+// `/img/::/thumb/`-shaped and `a=b`-shaped both work.) Comma-separates several
+// rewrites; each is applied in order to every intercepted URL.
+const rewrites = (typeof args.rewrite === 'string' ? args.rewrite.split(',') : [])
+  .map(s => s.trim()).filter(Boolean)
+  .map(spec => {
+    let i = spec.indexOf('::'), width = 2;
+    if (i < 0) {
+      if ((spec.match(/=/g) || []).length !== 1) {
+        fail(`--rewrite wants <from>::<to>, got "${spec}"\n` +
+          "'=' only works when the spec contains exactly one '='; a swap between two\n" +
+          'query parameters must use "::" ' +
+          '(e.g. --rewrite size=grid-xs::size=grid-s).');
+      }
+      i = spec.indexOf('='); width = 1;
+    }
+    if (i <= 0 || i + width >= spec.length) fail(`--rewrite wants <from>::<to>, got "${spec}"`);
+    return { from: spec.slice(0, i), to: spec.slice(i + width) };
+  });
+const dprOverride = args.dpr != null && args.dpr !== true ? Number(args.dpr) : null;
+if (dprOverride != null && !(dprOverride > 0)) fail(`--dpr wants a positive number, got "${args.dpr}"`);
 
 // The pre-scroll leaves the viewport at the END of the range, which is the
 // start of an up-scroll -- there is no warm variant of a down-scroll.
@@ -159,6 +194,41 @@ if (args.blockImages) {
   await send('Network.setBlockedURLs', { urls: blockPatterns });
 }
 
+// URL rewriting. Fetch.enable pauses every request matching a pattern, so the
+// patterns are narrowed to the `from` substrings rather than '*': a bench that
+// round-trips every request through the driver measures the driver.
+let rewriteCount = 0;
+if (rewrites.length) {
+  eventHandlers.set('Fetch.requestPaused', async (p) => {
+    let url = p.request.url;
+    for (const r of rewrites) if (url.includes(r.from)) url = url.split(r.from).join(r.to);
+    const changed = url !== p.request.url;
+    if (changed) rewriteCount++;
+    await send('Fetch.continueRequest', changed
+      ? { requestId: p.requestId, url }
+      : { requestId: p.requestId }).catch(() => {});
+  });
+  await send('Fetch.enable', {
+    patterns: rewrites.map(r => ({ urlPattern: `*${r.from}*`, requestStage: 'Request' })),
+  });
+}
+
+// DPR emulation over the SAME physical pixel area: the CSS viewport is scaled
+// by the dpr ratio so the run paints the same number of device pixels, which
+// is what makes an emulated row comparable to the native one. Without the
+// rescale, a dpr change would silently also change how much grid is on screen.
+let dprEmulation = null;
+if (dprOverride != null) {
+  const cur = await evalJs(`({w: innerWidth, h: innerHeight, dpr: devicePixelRatio})`, 20000);
+  const width = Math.round(cur.w * cur.dpr / dprOverride);
+  const height = Math.round(cur.h * cur.dpr / dprOverride);
+  await send('Emulation.setDeviceMetricsOverride', {
+    width, height, deviceScaleFactor: dprOverride, mobile: false,
+  });
+  dprEmulation = { nativeDpr: cur.dpr, dpr: dprOverride, cssViewport: `${width}x${height}`,
+    devicePixels: `${Math.round(cur.w * cur.dpr)}x${Math.round(cur.h * cur.dpr)}` };
+}
+
 // A "cold" run is only cold if the HTTP cache is empty. In a reused browser the
 // second run onwards would otherwise serve every image from the disk cache,
 // silently turning cold rows warm (netKB collapses to ~0). Done before the
@@ -222,6 +292,11 @@ window.__viewport = (() => {
       || scrollables.sort((a,b) => b.scrollHeight - a.scrollHeight)[0]
       || document.scrollingElement;
 })();
+// The resource-timing buffer holds 250 entries by DEFAULT, and a dense grid
+// blows through that during the settle alone -- after which netReqs/netKB read
+// ZERO for the measured window and a transfer-heavy run looks like a cached
+// one. Raise it before the run so the window's own entries are recorded.
+try { performance.setResourceTimingBufferSize(50000); } catch { /* older engines */ }
 window.__measure = async function(velocity, ms){
   const el = window.__viewport;
   const frames=[]; const longtasks=[]; let added=0, removed=0;
@@ -238,6 +313,10 @@ window.__measure = async function(velocity, ms){
   const mp = () => Math.round([...document.querySelectorAll('img')].reduce((a,i)=>a+i.naturalWidth*i.naturalHeight,0)/1e6);
   let megapixelsMountedMid = null;
   const midTimer = setTimeout(()=>{ megapixelsMountedMid = mp(); }, Math.round(ms/2));
+  // User-timing marks delimiting the MEASURED window. trace-summary.mjs clips
+  // to them, so a --trace run's category totals exclude the navigation, the
+  // settle and the pre-seek that the raw trace also contains.
+  performance.mark('scrollbench-start');
   const t0 = performance.now(); let lastT = t0; let lastFrame = t0;
   const pulse = ${args.pulse ? 'true' : 'false'};
   await new Promise(resolve=>{
@@ -251,6 +330,7 @@ window.__measure = async function(velocity, ms){
     }
     requestAnimationFrame(step);
   });
+  performance.mark('scrollbench-end');
   await new Promise(r=>setTimeout(r,300));
   clearTimeout(midTimer);
   po.disconnect(); mo.disconnect();
@@ -400,9 +480,27 @@ if (args.trace) {
   }
 }
 
+// A rewrite that matched NOTHING is the failure mode this flag invites -- a
+// mistyped substring produces a run that looks perfectly normal and silently
+// measures the unmodified page. Say so rather than letting it pass as a result.
+if (rewrites.length && rewriteCount === 0) {
+  console.error(`WARNING: --rewrite matched 0 requests. This run measured the page UNCHANGED.\n` +
+    `Rules: ${rewrites.map(r => `"${r.from}" -> "${r.to}"`).join(', ')}\n` +
+    'Check the substring against a real request URL (DevTools Network, or the page\'s\n' +
+    'resource timings). Remember the separator is "::", not "=".');
+}
+
+// Emulation overrides SURVIVE this connection closing, so a --dpr run would
+// leave every later run on the same browser at the emulated viewport -- and
+// those runs report the native dpr, so nothing in their output says the
+// viewport is wrong. Clear it explicitly.
+if (dprOverride != null) await send('Emulation.clearDeviceMetricsOverride').catch(() => {});
+
 console.log(JSON.stringify({
   scenario: { url: typeof args.url === 'string' ? args.url : page.url, dir, velocity, ms, blockImages: !!args.blockImages, warm: !!args.warm, pulse: !!args.pulse },
   info, result, renderer, traceSummaryMs: traceSummary,
+  rewrite: rewrites.length ? { rules: rewrites, rewritten: rewriteCount } : null,
+  dprEmulation,
 }, null, 1));
 ws.close();
 process.exit(0);
