@@ -229,3 +229,6 @@ data/
 !/panoptikon-desktop/dist/**
 /result
 /result-*
+
+# calibration test protocol recordings (docs/batch-calibration-test-protocol.md)
+tools/calibration-protocol/results/
