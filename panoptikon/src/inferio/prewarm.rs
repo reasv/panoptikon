@@ -111,7 +111,7 @@ enum Slot {
     Spawning,
     /// A parked worker: spawned, handshaken, `prewarm` sent.
     Parked {
-        worker: Worker,
+        worker: Box<Worker>,
         failed_prepare: bool,
         /// The device pin this process was spawned with — the default
         /// GPU's UUID when a CUDA inventory is known, its HIP device index
@@ -232,11 +232,7 @@ impl PrewarmPool {
     /// to a replica that must run on board B would put its footprint on the
     /// wrong ledger (and on the wrong GPU). A mismatch leaves the worker
     /// parked for a replica that can use it.
-    pub(crate) async fn claim(
-        &self,
-        impl_class: &str,
-        wanted_pin: Option<&str>,
-    ) -> Option<Worker> {
+    pub(crate) async fn claim(&self, impl_class: &str, wanted_pin: Option<&str>) -> Option<Worker> {
         if !self.cfg.enabled {
             return None;
         }
@@ -274,7 +270,7 @@ impl PrewarmPool {
                     failed_prepare,
                     "claimed a prewarmed worker from the pool"
                 );
-                Some(worker)
+                Some(*worker)
             }
             Err(err) => {
                 tracing::warn!(
@@ -329,7 +325,7 @@ impl PrewarmPool {
             let workers: Vec<Worker> = std::mem::take(&mut state.slots)
                 .into_values()
                 .filter_map(|slot| match slot {
-                    Slot::Parked { worker, .. } => Some(worker),
+                    Slot::Parked { worker, .. } => Some(*worker),
                     Slot::Spawning => None,
                 })
                 .collect();
@@ -436,7 +432,7 @@ async fn warm_worker_task(
                     state.slots.insert(
                         impl_class.clone(),
                         Slot::Parked {
-                            worker,
+                            worker: Box::new(worker),
                             failed_prepare,
                             pin,
                         },

@@ -304,7 +304,7 @@ async fn prefetch_static_ffmpeg(interpreter: &Path) {
             tracing::info!("ffmpeg/ffprobe are ready");
         }
         Ok(output) => tracing::warn!(
-            stderr = %crate::jobs::files::stderr_tail(&output.stderr),
+            stderr = %crate::media_tools::stderr_tail(&output.stderr),
             "static-ffmpeg prefetch failed; video/audio jobs fall back to \
              ffmpeg from PATH"
         ),
@@ -1151,7 +1151,7 @@ async fn run_uv_logged(
         .wait()
         .await
         .with_context(|| format!("failed to wait for {what}"))?;
-    drop(job_guard);
+    job_guard.release();
     let _ = stdout_task.await;
     let _ = stderr_task.await;
     if !status.success() {

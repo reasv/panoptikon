@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex;
 
 use crate::config::InferenceEndpointConfig;
-use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictOutput};
+use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictResponse};
 
 #[derive(Clone)]
 pub(crate) struct InferencePool {
@@ -51,6 +51,7 @@ impl InferencePool {
     /// remaining endpoint before giving up — one endpoint being down costs
     /// latency on its share of requests, not failed items (matching the
     /// Python distributed client's shard retry).
+    #[allow(clippy::too_many_arguments)]
     pub async fn predict(
         &self,
         inference_id: &str,
@@ -60,7 +61,7 @@ impl InferencePool {
         max_batch: Option<u32>,
         prewarm: Option<bool>,
         inputs: &[InferenceInput],
-    ) -> Result<PredictOutput> {
+    ) -> Result<PredictResponse> {
         let mut tried = Vec::new();
         let mut last_err: Option<anyhow::Error> = None;
         loop {

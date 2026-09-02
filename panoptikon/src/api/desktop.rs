@@ -76,6 +76,8 @@ pub(crate) struct DesktopSetupCompleteRequest {
     pub scan_pdf: bool,
     #[serde(default)]
     pub scan_html: bool,
+    #[serde(default = "default_true")]
+    pub detect_outros: bool,
     #[serde(default)]
     pub cron_jobs: Vec<CronJob>,
     #[serde(default)]
@@ -982,6 +984,11 @@ pub(crate) async fn complete_setup(
     Json(request): Json<DesktopSetupCompleteRequest>,
 ) -> Result<Json<DesktopSetupCompleteResponse>, ApiError> {
     ensure_desktop_managed()?;
+    // Setup is a write workflow throughout (folder config, per-DB settings,
+    // and — with new_index_db — database creation via migrations). In
+    // readonly mode the migration DDL must not run, and the later writes
+    // would only fail with opaque internal errors; refuse up front instead.
+    crate::db::ensure_migrations_allowed()?;
     if request
         .included_folders
         .iter()
@@ -1095,6 +1102,7 @@ pub(crate) async fn complete_setup(
     config.scan_audio = request.scan_audio;
     config.scan_pdf = request.scan_pdf;
     config.scan_html = request.scan_html;
+    config.detect_outros = request.detect_outros;
     config.cron_jobs = if request.new_index_db.is_some() {
         // A database created by this run has no prior schedule to preserve.
         request.cron_jobs
@@ -1126,13 +1134,12 @@ fn merge_cron_batch_caps(incoming: Vec<CronJob>, existing: &[CronJob]) -> Vec<Cr
     incoming
         .into_iter()
         .map(|mut job| {
-            if job.batch_size.is_none() {
-                if let Some(stored) = existing
+            if job.batch_size.is_none()
+                && let Some(stored) = existing
                     .iter()
                     .find(|candidate| candidate.inference_id == job.inference_id)
-                {
-                    job.batch_size = stored.batch_size;
-                }
+            {
+                job.batch_size = stored.batch_size;
             }
             job
         })

@@ -180,7 +180,7 @@ def main():
           f"(clip: {clip_models}, text: {text_models})")
 
     report = []
-    for model in clip_models[:1]:
+    for model in clip_models:
         print(f"\nSemantic image search — {model}")
         for query in queries:
             compare(
@@ -189,7 +189,7 @@ def main():
                     "image_embeddings", query, model, index, variant),
                 ready_profiles, report,
             )
-    for model in text_models[:1]:
+    for model in text_models:
         print(f"\nSemantic text search — {model}")
         for query in queries:
             compare(
@@ -199,7 +199,11 @@ def main():
                 ready_profiles, report,
             )
     if args.similar > 0 and clip_models:
-        model = clip_models[0]
+        # Seed similarity from an actual image-CLIP model, not whichever
+        # audio/other model sorts first in the stats listing.
+        model = next(
+            (name for name in clip_models if name.startswith("clip/")), clip_models[0]
+        )
         seed_rows, _ = search(
             base, dbs, semantic_filter("image_embeddings", queries[0], model, "exact"))
         print(f"\nItem similarity — {model}")

@@ -24,6 +24,11 @@ use sqlite_vec::sqlite3_vec_init;
 
 use crate::api_error::ApiError;
 
+/// The entry-point signature `sqlite3_auto_extension` expects; both
+/// registered initialisers are cast to it through a pointer.
+type AutoExtensionInit =
+    unsafe extern "C" fn(*mut sqlite3, *mut *mut c_char, *const sqlite3_api_routines) -> c_int;
+
 /// splitmix64's finalizer: a full-avalanche 64-bit mixer.
 fn mix64(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -108,19 +113,26 @@ pub(crate) fn ensure_sqlite_extensions() -> Result<(), ApiError> {
         return Ok(());
     }
 
-    let status =
-        unsafe { sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ()))) };
+    let status = unsafe {
+        sqlite3_auto_extension(Some(std::mem::transmute::<*const (), AutoExtensionInit>(
+            sqlite3_vec_init as *const (),
+        )))
+    };
     if status != SQLITE_OK {
         tracing::error!(status, "failed to register sqlite-vec extension");
         return Err(ApiError::internal("Failed to load sqlite-vec extension"));
     }
 
     let status = unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(init_custom_functions as *const ())))
+        sqlite3_auto_extension(Some(std::mem::transmute::<*const (), AutoExtensionInit>(
+            init_custom_functions as *const (),
+        )))
     };
     if status != SQLITE_OK {
         tracing::error!(status, "failed to register custom SQL functions");
-        return Err(ApiError::internal("Failed to register custom SQL functions"));
+        return Err(ApiError::internal(
+            "Failed to register custom SQL functions",
+        ));
     }
 
     let _ = EXT_LOADED.set(());

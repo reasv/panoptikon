@@ -204,6 +204,7 @@ Panoptikon Desktop (Tauri process)
 ├── signed updater
 ├── Relay loopback service (when enabled)
 ├── bundled control webview assets
+├── bundled PDFium dynamic library + redistribution notices
 └── Panoptikon Server sidecar
     ├── gateway/API/jobs/cron/databases
     ├── local inference and workers
@@ -331,6 +332,10 @@ sidecar.
 Activation behavior:
 
 - normal launch: run the state-aware Open action in section 11;
+- on macOS, a native reopen request for the already-running app with no visible
+  bundled window: run the same state-aware Open action, then restore accessory
+  activation if the action opens only the external browser; this Launch
+  Services path does not pass through the single-instance plugin;
 - launch from login/autostart: do not open a browser or window;
 - update relaunch: show nothing unless recovery is required;
 - future deep-link/file activation: forward the complete activation payload.
@@ -452,6 +457,12 @@ Requirements:
   Relay when enabled, flushes logs, and exits Tauri.
 - Closing a control window hides/destroys that window as appropriate but does
   not quit Desktop.
+- On macOS, Desktop uses the regular application activation policy while any
+  bundled webview window is visible, so that window remains available from the
+  Dock and application switcher. Once the last bundled window is hidden or
+  destroyed, Desktop switches to the accessory policy and remains available
+  only from its menu-bar icon. If tray creation fails, Desktop remains a
+  regular application so the visible fallback cannot become undiscoverable.
 - “Start Panoptikon automatically” is opt-in and user-scoped. It launches
   Desktop in the background and never opens a browser at login. The same
   setting is exposed on the control window's Overview tab and in the tray menu.
@@ -486,9 +497,9 @@ The Open action is state-aware:
 Login startup never invokes Open automatically. A normal/manual launch MUST
 show the bundled launch-progress webview immediately when the Server is not
 ready; it cannot wait for the Next.js UI. The view uses the animated Panoptikon
-logo, coarse current activity, a safe-to-close/background explanation, and
-redacted copyable diagnostics. Login/autostart does not open a window on its
-own.
+logo pinned to its white-bordered dark-background palette, coarse current
+activity, a safe-to-close/background explanation, and redacted copyable
+diagnostics. Login/autostart does not open a window on its own.
 
 If the progress window remains open, readiness navigates that same
 privilege-free webview to `/desktop/setup?mode=onboarding` when the configured
@@ -606,7 +617,12 @@ existing daily 03:00 schedule. Every automatic or later manual routine run
 performs a full rescan followed by the persisted model list. The first run is
 always queued when the wizard finishes, even if later automatic runs are
 disabled; it uses the folder-update scan path so a new database is not scanned
-twice while its folder rows are first synchronized.
+twice while its folder rows are first synchronized. Daily, hourly, and weekly
+choices are locally known-valid and do not block Continue while their next-run
+preview is loading. An enabled custom cron expression must finish validation;
+disabling automatic runs removes schedule validation from the wizard's
+navigation gate, but an invalid custom draft is replaced by the most recent
+valid schedule when setup is saved.
 
 The wizard fills its webview as three independent vertical regions: a fixed
 step indicator, a `min-height: 0` internally scrolling step-content region,
@@ -1031,18 +1047,20 @@ For Windows, Linux, and macOS release candidates:
    setup;
 6. verify Open launches `/search` in the default browser;
 7. launch Desktop again and verify the existing process handles activation;
-8. verify only one gateway and one tray exist;
-9. restart and quit with graceful database/job shutdown;
-10. crash Desktop and verify no sidecar/process tree remains;
-11. induce invalid config, port collision, and sidecar crash and verify Recovery;
-12. enable Relay, pair a test remote origin, map a fixture path, and exercise
+8. on macOS, close every bundled window, click a pinned Dock icon, and verify
+   `/search` opens in the browser while Desktop returns to accessory mode;
+9. verify only one gateway and one tray exist;
+10. restart and quit with graceful database/job shutdown;
+11. crash Desktop and verify no sidecar/process tree remains;
+12. induce invalid config, port collision, and sidecar crash and verify Recovery;
+13. enable Relay, pair a test remote origin, map a fixture path, and exercise
     open/reveal without shell injection or traversal;
-13. revoke the pair and verify requests fail;
-14. install a signed test update containing a different sidecar version;
-15. verify both Desktop and sidecar update together and resources reconcile;
-16. verify a tampered update is rejected; and
-17. verify login startup remains silent and single-instance.
-18. disable the local Server, verify the Server root is not touched on a fresh
+14. revoke the pair and verify requests fail;
+15. install a signed test update containing a different sidecar version;
+16. verify both Desktop and sidecar update together and resources reconcile;
+17. verify a tampered update is rejected; and
+18. verify login startup remains silent and single-instance.
+19. disable the local Server, verify the Server root is not touched on a fresh
     profile, and exercise Relay-only startup, update, and shutdown.
 
 Linux testing MUST cover at least GNOME and KDE tray behavior plus one

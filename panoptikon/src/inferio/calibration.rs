@@ -622,11 +622,7 @@ impl CalibrationStore {
             // (we are the only writer), so the file contributes exactly the
             // keys we are not already holding.
             for profile in disk {
-                if !state
-                    .local
-                    .iter()
-                    .any(|held| held.same_entry(&profile))
-                {
+                if !state.local.iter().any(|held| held.same_entry(&profile)) {
                     state.local.push(profile);
                 }
             }
@@ -676,10 +672,10 @@ impl CalibrationStore {
                 if !profile.matches_key(query, &self.env) {
                     continue;
                 }
-                if let Some(dtype) = query.dtype {
-                    if profile.dtype != dtype {
-                        continue;
-                    }
+                if let Some(dtype) = query.dtype
+                    && profile.dtype != dtype
+                {
+                    continue;
                 }
                 let exact_torch = match query.torch {
                     Some(torch) => {
@@ -1339,10 +1335,10 @@ fn shipped_stamp(dirs: &[PathBuf]) -> ShippedStamp {
     for dir in dirs {
         for file in toml_files(dir) {
             stamp.files += 1;
-            if let Some(modified) = file_mtime(&file) {
-                if stamp.latest.is_none_or(|current| modified > current) {
-                    stamp.latest = Some(modified);
-                }
+            if let Some(modified) = file_mtime(&file)
+                && stamp.latest.is_none_or(|current| modified > current)
+            {
+                stamp.latest = Some(modified);
             }
         }
     }
@@ -1447,7 +1443,11 @@ mod tests {
         }
     }
 
-    fn query<'a>(inference_id: &'a str, torch: Option<&'a str>, dtype: Option<&'a str>) -> ProfileQuery<'a> {
+    fn query<'a>(
+        inference_id: &'a str,
+        torch: Option<&'a str>,
+        dtype: Option<&'a str>,
+    ) -> ProfileQuery<'a> {
         ProfileQuery {
             inference_id,
             epoch: 1,
@@ -1572,7 +1572,10 @@ sample_reserved_mb = [80, 160]
             .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
             .expect("matches");
         assert!(!seed.local, "a shipped baseline is never local");
-        assert!((seed.slope_mb_per_unit - 0.5).abs() < 1e-9, "the fit is used");
+        assert!(
+            (seed.slope_mb_per_unit - 0.5).abs() < 1e-9,
+            "the fit is used"
+        );
         assert_eq!(seed.max_units_measured, 0, "no foreign ratchet anchor");
         assert_eq!(seed.local_samples, 0, "no foreign local-sample credit");
         assert!(seed.ring.is_empty(), "no foreign sample ring");
@@ -1725,7 +1728,10 @@ sample_reserved_mb = [80, 160]
         // host — same gpu name, same platform, same torch string.
         let rocm_block = |backend: &str| {
             shipped_toml("clip/shipped", "2.11.0+rocm7.2", "fp16", 0.5)
-                .replace(&format!("gpu = \"{GPU}\""), &format!("gpu = \"{ROCM_GPU}\""))
+                .replace(
+                    &format!("gpu = \"{GPU}\""),
+                    &format!("gpu = \"{ROCM_GPU}\""),
+                )
                 .replace("platform = \"windows\"", "platform = \"linux\"")
                 .replace("backend = \"cuda\"", &format!("backend = \"{backend}\""))
         };
@@ -1771,7 +1777,9 @@ sample_reserved_mb = [80, 160]
             "the cuda-keyed baseline is the one it can see"
         );
         assert!(
-            cuda_host.lookup(&rocm_query(Some("2.11.0+rocm7.2"))).is_none(),
+            cuda_host
+                .lookup(&rocm_query(Some("2.11.0+rocm7.2")))
+                .is_none(),
             "the rocm local entry is not a candidate on a cuda host"
         );
     }
@@ -1920,7 +1928,8 @@ sample_reserved_mb = [80, 160]
         write_shipped(
             root.path(),
             "future.toml",
-            &shipped_toml("clip/vit", "2.7.1+cu128", "fp16", 0.5).replace("schema = 1", "schema = 9"),
+            &shipped_toml("clip/vit", "2.7.1+cu128", "fp16", 0.5)
+                .replace("schema = 1", "schema = 9"),
         );
         write_shipped(
             root.path(),
@@ -2017,9 +2026,14 @@ sample_reserved_mb = [80, 160]
             Some(1000),
             "a known dtype keys exactly"
         );
-        assert_eq!(store.expected_base_mb(&query("clip/nope", None, None)), None);
+        assert_eq!(
+            store.expected_base_mb(&query("clip/nope", None, None)),
+            None
+        );
         assert!(
-            store.lookup(&query("clip/vit", None, Some("fp16"))).is_none(),
+            store
+                .lookup(&query("clip/vit", None, Some("fp16")))
+                .is_none(),
             "a full seed needs the torch build too"
         );
         assert!(
@@ -2094,7 +2108,8 @@ sample_reserved_mb = [80, 160]
         assert_eq!(entries.len(), 3, "{entries:?}");
         let by_key = by_key(&entries);
         assert!(
-            (by_key[&("clip/vit".into(), GPU.into(), "fp16".into())].slope_mb_per_unit - 0.80).abs()
+            (by_key[&("clip/vit".into(), GPU.into(), "fp16".into())].slope_mb_per_unit - 0.80)
+                .abs()
                 < 1e-9,
             "the re-record replaced in place"
         );
@@ -2355,7 +2370,10 @@ metadata.cost.unit = "none"
         let entries = store.local_entries();
         assert_eq!(entries.len(), 1, "one key, one entry: {entries:?}");
         let merged = &entries[0];
-        assert_eq!(merged.max_units_measured, 1024, "the anchor never goes back");
+        assert_eq!(
+            merged.max_units_measured, 1024,
+            "the anchor never goes back"
+        );
         assert_eq!(merged.local_samples, 12, "nor does the confirmation count");
         assert!(
             (merged.slope_mb_per_unit - 0.79).abs() < 1e-9,
@@ -2457,9 +2475,7 @@ metadata.cost.unit = "none"
                 .abs()
                 < 1e-9
         );
-        let edited = fs::read_to_string(&path)
-            .unwrap()
-            .replace("0.79", "0.11");
+        let edited = fs::read_to_string(&path).unwrap().replace("0.79", "0.11");
         fs::write(&path, edited).unwrap();
         // Stamp the mtime forward explicitly: a rewrite inside the
         // filesystem's timestamp granularity can otherwise land on the same
@@ -2530,7 +2546,8 @@ metadata.cost.unit = "none"
         assert_eq!(entries.len(), 2, "both models survived: {entries:?}");
         let by_key = by_key(&entries);
         assert!(
-            (by_key[&("clip/vit".into(), GPU.into(), "fp16".into())].slope_mb_per_unit - 0.79).abs()
+            (by_key[&("clip/vit".into(), GPU.into(), "fp16".into())].slope_mb_per_unit - 0.79)
+                .abs()
                 < 1e-9,
             "the pending update was never dropped"
         );
@@ -2617,13 +2634,20 @@ metadata.cost.unit = "none"
         let seed = store
             .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
             .expect("matches");
-        assert_eq!(seed.ring.len(), SAMPLE_RING, "a 200-pair file reads back 64");
+        assert_eq!(
+            seed.ring.len(),
+            SAMPLE_RING,
+            "a 200-pair file reads back 64"
+        );
         assert_eq!(
             seed.ring.last().unwrap().units,
             200,
             "and it is the newest 64 that survive"
         );
-        assert_eq!(seed.ring.first().unwrap().units, 200 - SAMPLE_RING as u64 + 1);
+        assert_eq!(
+            seed.ring.first().unwrap().units,
+            200 - SAMPLE_RING as u64 + 1
+        );
     }
 
     /// The load-reservation tier takes the **maximum** base over every

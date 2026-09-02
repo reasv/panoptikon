@@ -1,9 +1,10 @@
-use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictOutput};
+use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictOutput, PredictResponse};
 use crate::pql::embedding_utils::{embedding_from_npy_bytes, extract_embeddings, serialize_f32};
 use crate::pql::model::{
-    DistanceFunction, EmbedArgs, HasUnprocessedData, InBookmarks, IndexMode, Match, MatchAnd,
-    MatchOps, MatchOr, MatchPath, MatchTags, MatchText, MatchValue, MatchValues, Matches,
-    ProcessedBy, QuantResolved, QueryElement, SemanticImageSearch, SemanticTextSearch, SimilarTo,
+    DistanceFunction, EmbedArgs, FailedFor, HasUnprocessedData, InBookmarks, InPinboard, IndexMode,
+    Match, MatchAnd, MatchOps, MatchOr, MatchPath, MatchTags, MatchText, MatchValue, MatchValues,
+    Matches, ProcessedBy, QuantResolved, QueryElement, SemanticImageSearch, SemanticTextSearch,
+    SimilarTo,
 };
 use crate::pql::utils::parse_and_escape_query;
 use base64::{Engine as _, engine::general_purpose};
@@ -226,7 +227,9 @@ pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>,
                 Ok(None)
             }
         }
-        QueryElement::Match(filter) => Ok(filter.validate().map(QueryElement::Match)),
+        QueryElement::Match(filter) => {
+            Ok(filter.validate().map(|f| QueryElement::Match(Box::new(f))))
+        }
         QueryElement::MatchPath(filter) => Ok(filter.validate().map(QueryElement::MatchPath)),
         QueryElement::MatchText(filter) => Ok(filter.validate().map(QueryElement::MatchText)),
         QueryElement::SemanticTextSearch(filter) => filter
@@ -244,6 +247,8 @@ pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>,
         QueryElement::HasUnprocessedData(filter) => {
             Ok(filter.validate().map(QueryElement::HasUnprocessedData))
         }
+        QueryElement::FailedFor(filter) => Ok(filter.validate().map(QueryElement::FailedFor)),
+        QueryElement::InPinboard(filter) => Ok(filter.validate().map(QueryElement::InPinboard)),
     }
 }
 
@@ -377,14 +382,9 @@ async fn resolve_vector_quant(
                 }
                 return Ok(None);
             }
-            let quant = crate::db::vector_quants::compute_query_quant(
-                conn,
-                embedding,
-                pair.artifact.as_deref(),
-            )
-            .await
-            .map_err(|err| PqlError::invalid(format!("{err:?}")))?;
-            Some(quant)
+            Some(crate::db::vector_quants::compute_query_quant(
+                embedding, pair.scale,
+            ))
         }
         None => None,
     };
@@ -396,26 +396,29 @@ async fn resolve_vector_quant(
 
 /// Whether the filter is asking for a quant profile at all.
 ///
-/// **Release policy: a bare `auto` resolves to exact.** Measured on the
-/// `default` index 2026-07-21 (harness: `pql::explain_plan`), the two-stage
-/// scorer is a win only on the RRF-composed search shape and a loss
-/// everywhere else — `similar_to` t2t went 12.8s → 55s, i2i 0.68s → 1.7s,
-/// pure semantic search 0.60s → 1.55s. Until the coarse pass stops being a
-/// row-at-a-time join (see docs/vector-quant-measurements.md), `auto` must
-/// not silently choose it.
+/// **Release policy: a bare `auto` resolves to the default quant profile,
+/// non-strictly.** Decided 2026-07-30 when the `quant` index mode was
+/// remapped to single-pass int8-gsym (docs/vector-int8-quant.md). int8
+/// measured effectively-parity recall against exact search — overlap@100
+/// 0.989/0.960 on mpnet, 0.969/0.920 on clip, candidate-recall@10k 1.000,
+/// true-distance ratio 1.00001 — while never being slower (mpnet 2.94 →
+/// 1.374s at 690k, clip 0.577 → 0.367s at 90k). There is no size gate: the
+/// payload is strictly smaller than the full-precision vector, so the quant
+/// pass cannot lose.
 ///
-/// An explicit `variant` under `auto` stays a strict selection, exactly like
-/// `quant`: naming a profile is an opt-in, and the sync validator already
-/// treats it as one (unresolvable ⇒ error, never a silent fallback), so
-/// short-circuiting it here would turn those queries into 400s.
-fn quant_requested(index: IndexMode, variant: &Option<String>) -> bool {
+/// Non-strict is what makes this safe: `resolve_vector_quant` falls back to
+/// exact whenever there is no default profile, or the setter's coverage is
+/// not ready, or the query embedding's dimension disagrees. An explicit
+/// `variant` under `auto` stays a strict selection, exactly like `quant`:
+/// naming a profile is an opt-in, and the sync validator already treats it
+/// as one (unresolvable ⇒ error, never a silent fallback).
+fn quant_requested(index: IndexMode, _variant: &Option<String>) -> bool {
     match index {
         IndexMode::Exact => false,
         // Rejected by validate_quant_args before this is reached; false is
         // the safe answer either way.
         IndexMode::Ann => false,
-        IndexMode::Auto => normalize_variant(variant).is_some(),
-        IndexMode::Quant => true,
+        IndexMode::Auto | IndexMode::Quant => true,
     }
 }
 
@@ -429,7 +432,9 @@ fn normalize_variant(variant: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Argument checks shared by sync and async validation.
+/// Argument checks shared by sync and async validation. `k` is deprecated
+/// and ignored (reserved for a future ANN mode), but a nonsensical value is
+/// still rejected rather than silently accepted.
 fn validate_quant_args(index: IndexMode, k: i64) -> Result<(), PqlError> {
     if matches!(index, IndexMode::Ann) {
         return Err(PqlError::invalid(
@@ -509,7 +514,9 @@ fn preprocess_query_async_inner<'a, 'b>(
                     Ok(None)
                 }
             }
-            QueryElement::Match(filter) => Ok(filter.validate().map(QueryElement::Match)),
+            QueryElement::Match(filter) => {
+                Ok(filter.validate().map(|f| QueryElement::Match(Box::new(f))))
+            }
             QueryElement::MatchPath(filter) => Ok(filter.validate().map(QueryElement::MatchPath)),
             QueryElement::MatchText(filter) => Ok(filter.validate().map(QueryElement::MatchText)),
             QueryElement::SemanticTextSearch(filter) => filter
@@ -534,6 +541,8 @@ fn preprocess_query_async_inner<'a, 'b>(
             QueryElement::HasUnprocessedData(filter) => {
                 Ok(filter.validate().map(QueryElement::HasUnprocessedData))
             }
+            QueryElement::FailedFor(filter) => Ok(filter.validate().map(QueryElement::FailedFor)),
+            QueryElement::InPinboard(filter) => Ok(filter.validate().map(QueryElement::InPinboard)),
         }
     })
 }
@@ -601,9 +610,29 @@ impl InBookmarks {
     }
 }
 
+impl InPinboard {
+    fn validate(self) -> Option<Self> {
+        if self.in_pinboard.filter {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
 impl ProcessedBy {
     fn validate(self) -> Option<Self> {
         if self.processed_by.trim().is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
+impl FailedFor {
+    fn validate(self) -> Option<Self> {
+        if self.failed_for.trim().is_empty() {
             None
         } else {
             Some(self)
@@ -797,12 +826,11 @@ impl SimilarTo {
         if self.similar_to.model.trim().is_empty() {
             return Ok(None);
         }
-        if !self.similar_to.force_distance_function.unwrap_or(false) {
-            if let Some(override_fn) =
+        if !self.similar_to.force_distance_function.unwrap_or(false)
+            && let Some(override_fn) =
                 get_distance_func_override(state, &self.similar_to.model).await?
-            {
-                self.similar_to.distance_function = override_fn;
-            }
+        {
+            self.similar_to.distance_function = override_fn;
         }
         self.similar_to._quant = resolve_vector_quant(
             state,
@@ -899,8 +927,19 @@ fn inference_error<E: std::fmt::Display>(context: &'static str, err: E) -> PqlEr
     PqlError::invalid(context)
 }
 
-fn embedding_from_predict(output: PredictOutput) -> Result<Vec<u8>, PqlError> {
-    match output {
+/// A search-time embed is a single input: a typed error slot on it means the
+/// model rejected the query itself, so there is no embedding to be had. It is
+/// surfaced like every other embed failure (never persisted anywhere — the
+/// ledger is about indexed media, not queries).
+fn embedding_from_predict(response: PredictResponse) -> Result<Vec<u8>, PqlError> {
+    if let Some(error) = response.errors.first() {
+        warn!(
+            class = error.class.as_str(),
+            "inference rejected the embed input: {}", error.message
+        );
+        return Err(PqlError::invalid("inference embed error"));
+    }
+    match response.outputs {
         PredictOutput::Binary(values) => {
             let first = values
                 .first()
@@ -918,17 +957,17 @@ fn embedding_from_predict(output: PredictOutput) -> Result<Vec<u8>, PqlError> {
 
 fn embedding_from_json_value(value: &Value) -> Result<Vec<u8>, PqlError> {
     if let Some(obj) = value.as_object() {
-        if let Some(Value::String(kind)) = obj.get("__type__") {
-            if kind == "base64" {
-                let content = obj
-                    .get("content")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| PqlError::invalid("base64 output missing content"))?;
-                let decoded = general_purpose::STANDARD
-                    .decode(content.as_bytes())
-                    .map_err(|err| PqlError::invalid(format!("invalid base64 output: {err}")))?;
-                return embedding_from_npy_bytes(&decoded).map_err(PqlError::invalid);
-            }
+        if let Some(Value::String(kind)) = obj.get("__type__")
+            && kind == "base64"
+        {
+            let content = obj
+                .get("content")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| PqlError::invalid("base64 output missing content"))?;
+            let decoded = general_purpose::STANDARD
+                .decode(content.as_bytes())
+                .map_err(|err| PqlError::invalid(format!("invalid base64 output: {err}")))?;
+            return embedding_from_npy_bytes(&decoded).map_err(PqlError::invalid);
         }
         if let Some(Value::Array(array)) = obj.get("embedding") {
             return embedding_from_json_array(array);
@@ -938,10 +977,10 @@ fn embedding_from_json_value(value: &Value) -> Result<Vec<u8>, PqlError> {
         if array.is_empty() {
             return Err(PqlError::invalid("inference output embedding is empty"));
         }
-        if let Some(first) = array.first() {
-            if let Some(nested) = first.as_array() {
-                return embedding_from_json_array(nested);
-            }
+        if let Some(first) = array.first()
+            && let Some(nested) = first.as_array()
+        {
+            return embedding_from_json_array(nested);
         }
         return embedding_from_json_array(array);
     }
@@ -1174,6 +1213,10 @@ impl MatchValue {
             && self.video_tracks.is_none()
             && self.subtitle_tracks.is_none()
             && self.blurhash.is_none()
+            && self.outro_kind.is_none()
+            && self.content_end_ms.is_none()
+            && self.video_codec.is_none()
+            && self.audio_codec.is_none()
             && self.data_id.is_none()
             && self.language.is_none()
             && self.language_confidence.is_none()
@@ -1207,6 +1250,10 @@ impl MatchValues {
             && self.video_tracks.is_none()
             && self.subtitle_tracks.is_none()
             && self.blurhash.is_none()
+            && self.outro_kind.is_none()
+            && self.content_end_ms.is_none()
+            && self.video_codec.is_none()
+            && self.audio_codec.is_none()
             && self.data_id.is_none()
             && self.language.is_none()
             && self.language_confidence.is_none()
@@ -1223,17 +1270,29 @@ impl MatchValues {
 
 #[cfg(test)]
 mod quant_policy_tests {
-    use super::{IndexMode, quant_requested};
+    use super::{IndexMode, normalize_variant, quant_requested};
 
-    // Guards the release policy: a bare `auto` must never pick a quant
-    // profile. The two-stage scorer regresses every query shape except the
-    // RRF-composed search (measured — see `quant_requested`), so it stays
-    // opt-in until the coarse pass is rebuilt.
+    // The release policy since the int8 remap: a bare `auto` asks for the
+    // default profile. It is only safe because the resolution is non-strict
+    // (see `strict` below) — `auto` never turns an unready profile into an
+    // error, it searches exact.
     #[test]
-    fn bare_auto_does_not_request_quants() {
-        assert!(!quant_requested(IndexMode::Auto, &None));
-        assert!(!quant_requested(IndexMode::Auto, &Some(String::new())));
-        assert!(!quant_requested(IndexMode::Auto, &Some("   ".to_string())));
+    fn bare_auto_requests_quants() {
+        assert!(quant_requested(IndexMode::Auto, &None));
+        assert!(quant_requested(IndexMode::Auto, &Some(String::new())));
+        assert!(quant_requested(IndexMode::Auto, &Some("   ".to_string())));
+        assert!(quant_requested(IndexMode::Auto, &Some("plain".to_string())));
+        assert!(quant_requested(IndexMode::Quant, &None));
+        assert!(quant_requested(
+            IndexMode::Quant,
+            &Some("plain".to_string())
+        ));
+    }
+
+    // `exact` is the one mode that never consults a profile, whatever the
+    // variant says.
+    #[test]
+    fn exact_never_requests_quants() {
         assert!(!quant_requested(IndexMode::Exact, &None));
         assert!(!quant_requested(
             IndexMode::Exact,
@@ -1241,17 +1300,18 @@ mod quant_policy_tests {
         ));
     }
 
-    // Naming a profile is an explicit opt-in under either mode. If this
-    // regressed to `false`, the sync validator would reject the very same
-    // queries as unresolvable strict selections (400s), not silently run
-    // them exact.
+    // Strictness (the `strict` flag in `resolve_vector_quant`) is what keeps
+    // bare `auto` a fallback and a named profile an opt-in. Pinned here as a
+    // truth table over its two inputs.
     #[test]
-    fn explicit_selection_still_requests_quants() {
-        assert!(quant_requested(IndexMode::Auto, &Some("plain".to_string())));
-        assert!(quant_requested(IndexMode::Quant, &None));
-        assert!(quant_requested(
-            IndexMode::Quant,
-            &Some("plain".to_string())
-        ));
+    fn strictness_follows_mode_and_named_variant() {
+        let strict = |index, variant: Option<&str>| {
+            let variant = variant.map(str::to_string);
+            index == IndexMode::Quant || normalize_variant(&variant).is_some()
+        };
+        assert!(!strict(IndexMode::Auto, None), "bare auto falls back");
+        assert!(!strict(IndexMode::Auto, Some("  ")), "blank is unset");
+        assert!(strict(IndexMode::Auto, Some("plain")), "named is opt-in");
+        assert!(strict(IndexMode::Quant, None), "quant demands a profile");
     }
 }

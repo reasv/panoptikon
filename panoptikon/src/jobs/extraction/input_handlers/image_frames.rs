@@ -2,21 +2,29 @@ use std::path::PathBuf;
 
 use image::AnimationDecoder;
 use image::codecs::gif::GifDecoder;
-use image::{DynamicImage, GenericImageView};
+use image::metadata::Orientation;
+use image::{DynamicImage, GenericImageView, ImageDecoder};
 use serde_json::{Value, json};
 
-use crate::api_error::ApiError;
+use crate::api_error::{ApiError, Blocker};
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::open_index_db_read_no_user_data;
 use crate::db::storage::{StoredImage, get_frames_bytes};
 use crate::inferio_client::{InferenceFile, InferenceInput};
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
-use crate::jobs::files::{FRAME_PROCESS_VERSION, stderr_tail};
+use crate::jobs::files::FRAME_PROCESS_VERSION;
+use crate::media_tools::stderr_tail;
+use crate::visual_tiers::GENERATED_STILL_FORMAT;
 
 /// A frame ready to be sent to inference. PDF pages and HTML screenshots
 /// carry their own pixel dimensions (each page differs from the item's stored
 /// size); frames without dimensions are sliced using the item's stored
 /// width/height, mirroring the Python loader.
+///
+/// Dimensions are *display* dimensions throughout, because so are the pixels
+/// the models end up seeing (docs/display-dimensions-design.md §5): the
+/// slicer orients what it decodes before cutting, and a whole-file send keeps
+/// its EXIF for inferio's loader to apply.
 pub(super) struct BaseFrame {
     pub bytes: Vec<u8>,
     pub width: Option<i64>,
@@ -31,12 +39,33 @@ impl BaseFrame {
             height: None,
         }
     }
+
+    fn sized(bytes: Vec<u8>, (width, height): (u32, u32)) -> Self {
+        Self {
+            bytes,
+            width: Some(i64::from(width)),
+            height: Some(i64::from(height)),
+        }
+    }
 }
 
+/// `detect_outros` is the job's folded `scan_video && detect_outros` config
+/// pair. It gates the outro clamp below, per design §8's "consumers ignore the
+/// metadata".
+///
+/// Note what that does *not* buy on this side: `load_base_frames` returns
+/// `storage.frames` before it ever reaches the clamp, and §7.1's recovery path
+/// (erase a setter's `item_data`, re-run its extraction) does not touch
+/// `storage.frames`. So turning detection off and re-running extraction reuses
+/// whatever frames are cached, trimmed ones included. Undoing a false positive
+/// takes a scan-side regeneration — that is the path that actually replaces
+/// `storage.frames`; this gate only decides how frames are sampled when there
+/// is no cache to reuse.
 pub(super) async fn build_image_frames_inputs(
     index_db: &str,
     item: &JobInputData,
     model: &ModelMetadata,
+    detect_outros: bool,
 ) -> ApiResult<Vec<InferenceInput>> {
     let opts = &model.input_handler_opts;
     let max_frames = opts.get("max_frames").and_then(Value::as_i64).unwrap_or(4) as usize;
@@ -57,7 +86,7 @@ pub(super) async fn build_image_frames_inputs(
         None
     };
 
-    let frames = load_base_frames(index_db, item).await?;
+    let frames = load_base_frames(index_db, item, detect_outros).await?;
     if frames.is_empty() {
         return Ok(Vec::new());
     }
@@ -85,23 +114,26 @@ pub(super) async fn build_image_frames_inputs(
     Ok(outputs)
 }
 
+/// `detect_outros` gates the outro clamp on video frame sampling; see
+/// [`build_image_frames_inputs`].
 pub(super) async fn load_base_frames(
     index_db: &str,
     item: &JobInputData,
+    detect_outros: bool,
 ) -> ApiResult<Vec<BaseFrame>> {
     // Mirrors the Python image_loader guard: absurdly small images are
     // skipped outright (placeholder written) for every media type.
-    if let (Some(width), Some(height)) = (item.width, item.height) {
-        if width < 3 || height < 3 {
-            tracing::warn!(
-                path = %item.path,
-                sha256 = %item.sha256,
-                width,
-                height,
-                "image too small, skipping"
-            );
-            return Ok(Vec::new());
-        }
+    if let (Some(width), Some(height)) = (item.width, item.height)
+        && (width < 3 || height < 3)
+    {
+        tracing::warn!(
+            path = %item.path,
+            sha256 = %item.sha256,
+            width,
+            height,
+            "image too small, skipping"
+        );
+        return Ok(Vec::new());
     }
     if item.item_type.starts_with("image/gif") {
         return gif_to_frames(&item.path);
@@ -111,8 +143,15 @@ pub(super) async fn load_base_frames(
             tracing::error!(error = %err, path = %item.path, "failed to read image");
             ApiError::internal("Failed to read image")
         })?;
-        ensure_image_readable(&buffer, &item.path)?;
-        return Ok(vec![BaseFrame::sized_by_item(buffer)]);
+        // The header's own dimensions, not the item's — read from the same
+        // bytes the models will see, so a file that changed on disk after
+        // indexing can never be sliced against a stale shape. Display
+        // dimensions, like everything downstream: the slicer orients this
+        // buffer before cutting, and when no slicing happens the bytes go out
+        // whole with their EXIF intact, which inferio's loader applies
+        // (docs/display-dimensions-design.md §5).
+        let dimensions = ensure_image_readable(&buffer, &item.path)?;
+        return Ok(vec![BaseFrame::sized(buffer, dimensions)]);
     }
     if item.item_type.starts_with("video") {
         let mut conn = open_index_db_read_no_user_data(index_db).await?;
@@ -122,13 +161,38 @@ pub(super) async fn load_base_frames(
         if !cached.is_empty() {
             return Ok(cached.into_iter().map(BaseFrame::sized_by_item).collect());
         }
-        if item.duration.unwrap_or(0.0) > 0.0 && item.video_tracks.unwrap_or(0) > 0 {
+        let duration = item.duration.unwrap_or(0.0);
+        if duration > 0.0 && item.video_tracks.unwrap_or(0) > 0 {
+            // Where the item's real content ends, when the scan's outro
+            // detector found a boundary (docs/video-outro-detection-design.md
+            // §7). Selected by the work query alongside `duration`, so it is
+            // a chunk-boundary snapshot: a verdict written after this item's
+            // work chunk was fetched is not seen, and the frames cached below
+            // are then unclamped until a scan-side replacement rewrites them.
+            // `None` — never examined, examined and negative, or detection
+            // switched off — clamps nothing.
+            let content_end_ms = if detect_outros {
+                item.content_end_ms
+            } else {
+                None
+            };
             let extracted = tokio::task::spawn_blocking({
                 let path = item.path.clone();
-                move || extract_video_frames(&path, 4)
+                move || extract_video_frames(&path, 4, duration, content_end_ms)
             })
             .await
             .map_err(|_| ApiError::internal("Failed to extract frames"))??;
+            // No frames to store: skip straight to the empty-inputs
+            // placeholder rather than calling the writer. Storing an empty set
+            // is not *wrong* (`store_frames` deletes and inserts nothing, and
+            // the read side treats zero rows as "not cached"), but it costs a
+            // writer transaction that unconditionally bumps the search-cache
+            // epoch, and its DELETE (`WHERE item_sha256 = ? AND version <= ?`)
+            // could race a concurrent scan that just stored real frames for
+            // this item.
+            if extracted.is_empty() {
+                return Ok(Vec::new());
+            }
             let frames = extracted
                 .iter()
                 .map(encode_jpeg)
@@ -140,6 +204,12 @@ pub(super) async fn load_base_frames(
                     idx: idx as i64,
                     width: img.width() as i64,
                     height: img.height() as i64,
+                    // `storage.frames` has no media type column of its own;
+                    // these are what `encode_jpeg` just wrote, which is the
+                    // format every picture this generator produces takes.
+                    media_type: GENERATED_STILL_FORMAT.media_type().to_string(),
+                    // Stamped by `store_frames`; see `StoredImage::version`.
+                    version: 0,
                     bytes: encode_jpeg(img)?,
                 });
             }
@@ -169,19 +239,50 @@ pub(super) async fn load_base_frames(
 /// header cannot even be parsed, without decoding pixel data. Without this,
 /// a corrupt file reaches the inference server where it can fail an entire
 /// coalesced GPU batch instead of just this item.
-fn ensure_image_readable(buffer: &[u8], path: &str) -> ApiResult<()> {
-    image::ImageReader::new(std::io::Cursor::new(buffer))
+///
+/// The bytes were read successfully by the gateway, so a parse failure here
+/// is unambiguously a verdict on the payload (`input`, confirmed at one
+/// attempt). Deliberately still *only* a header parse: fully decoding a still
+/// image would make the gateway stricter than the PIL consumer that actually
+/// arbitrates it (docs/failed-media-retry-design.md, arbiter principle).
+/// Returns the header's **display** dimensions — the coded numbers with the
+/// EXIF orientation applied — because that is the space every consumer of the
+/// returned frame works in: the slice grid is computed from them, and the
+/// pixels they describe are oriented wherever they are actually decoded (the
+/// slicer here, inferio's loader for a whole-file send).
+fn ensure_image_readable(buffer: &[u8], path: &str) -> ApiResult<(u32, u32)> {
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(buffer))
         .with_guessed_format()
         .map_err(|err| {
             tracing::error!(error = %err, path, "image format detection failed");
-            ApiError::internal(format!("Image {path} is not readable"))
+            ApiError::input(format!("Image {path} has an unrecognizable format: {err}"))
         })?
-        .into_dimensions()
+        .into_decoder()
         .map_err(|err| {
             tracing::error!(error = %err, path, "image is not readable");
-            ApiError::internal(format!("Image {path} is not readable"))
+            classify_image_error(err, format!("Image {path} has an unreadable header"))
         })?;
-    Ok(())
+    let coded = decoder.dimensions();
+    // An unreadable orientation is never a verdict on the pixels; the same
+    // degradation as the scan's `open_image_oriented`.
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    Ok(crate::jobs::files::oriented_dimensions(coded, orientation))
+}
+
+/// The scan-side rule ([`crate::jobs::files`]'s image classifier), applied to
+/// the extraction-side image-crate stages: `Limits` is a verdict on this
+/// machine's decode budget, never on the file, so it is `resource` — settled
+/// at one attempt and clearable by a retry directive after the ceiling is
+/// raised. Everything else these stages produce is a verdict on bytes already
+/// in memory, so it stays `input` confirmed at one attempt. (The header parse
+/// runs under the image crate's default 512 MiB caps; the full decodes under
+/// the configurable `image_decode_memory_limit_mb` ceiling — filing either as
+/// `input` would mark a perfectly good file corrupt forever.)
+fn classify_image_error(err: image::ImageError, context: String) -> ApiError {
+    match err {
+        image::ImageError::Limits(_) => ApiError::resource(format!("{context}: {err}")),
+        err => ApiError::input(format!("{context}: {err}")),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -392,11 +493,32 @@ fn slice_image_grid(image_bytes: &[u8], rows: usize, cols: usize) -> ApiResult<V
     Ok(output)
 }
 
+/// Decode for slicing: oriented, because the slice grid was computed from
+/// display dimensions and the cuts must land in the same space
+/// (docs/display-dimensions-design.md §5). Slices are re-encoded without
+/// EXIF, so orienting here is also what keeps them from reaching the models
+/// sideways — a whole-file send keeps its EXIF and inferio's loader applies
+/// it instead.
 fn load_dynamic_image(buffer: &[u8]) -> ApiResult<DynamicImage> {
-    crate::jobs::files::decode_image_bytes(buffer).map_err(|err| {
+    let mut image = crate::jobs::files::decode_image_bytes(buffer).map_err(|err| {
         tracing::error!(error = %err, "failed to decode image");
         ApiError::internal("Failed to decode image")
-    })
+    })?;
+    image.apply_orientation(buffer_orientation(buffer));
+    Ok(image)
+}
+
+/// The EXIF orientation of an in-memory image, header-only, degrading to
+/// `NoTransforms` on any failure: a missing or unreadable orientation is
+/// never a verdict on pixels that decoded fine (the scan's
+/// `open_image_oriented` rule).
+fn buffer_orientation(buffer: &[u8]) -> Orientation {
+    image::ImageReader::new(std::io::Cursor::new(buffer))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_decoder().ok())
+        .and_then(|mut decoder| decoder.orientation().ok())
+        .unwrap_or(Orientation::NoTransforms)
 }
 
 fn encode_jpeg(image: &DynamicImage) -> ApiResult<Vec<u8>> {
@@ -418,27 +540,37 @@ fn encode_jpeg(image: &DynamicImage) -> ApiResult<Vec<u8>> {
 }
 
 fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
+    // The read itself is the gateway's own I/O: a vanished file or an SMB
+    // hiccup says nothing about the payload, so it stays transient.
     let buffer = std::fs::read(path).map_err(|err| {
-        tracing::error!(error = %err, "failed to open gif");
-        ApiError::internal("Failed to open gif")
+        tracing::error!(error = %err, path, "failed to open gif");
+        ApiError::internal(format!("Failed to open gif {path}: {err}"))
     })?;
+    // Everything below decodes bytes already in memory, so every failure is a
+    // confirmed verdict on the payload.
+    //
     // Files are routed here by extension-derived mime type; a mis-named
     // non-GIF (which PIL decoded regardless of extension) is handled as a
     // single still frame instead of failing the item.
     if !matches!(image::guess_format(&buffer), Ok(image::ImageFormat::Gif)) {
-        let image = crate::jobs::files::decode_image_bytes(&buffer).map_err(|err| {
+        let mut image = crate::jobs::files::decode_image_bytes(&buffer).map_err(|err| {
             tracing::error!(error = %err, path, "failed to decode mis-named gif");
-            ApiError::internal("Failed to decode gif")
+            classify_image_error(err, format!("Failed to decode mis-named gif {path}"))
         })?;
+        // Oriented like every other decode headed for the models: the JPEG
+        // re-encode below drops the EXIF, and the item dims this frame falls
+        // back to are display dims (the scan content-sniffs, so a mis-named
+        // still was indexed with its orientation applied).
+        image.apply_orientation(buffer_orientation(&buffer));
         return Ok(vec![BaseFrame::sized_by_item(encode_jpeg(&image)?)]);
     }
     let decoder = GifDecoder::new(std::io::Cursor::new(&buffer)).map_err(|err| {
-        tracing::error!(error = %err, "failed to decode gif");
-        ApiError::internal("Failed to decode gif")
+        tracing::error!(error = %err, path, "failed to decode gif");
+        classify_image_error(err, format!("Failed to decode gif {path}"))
     })?;
     let frames = decoder.into_frames().collect_frames().map_err(|err| {
-        tracing::error!(error = %err, "failed to collect gif frames");
-        ApiError::internal("Failed to decode gif")
+        tracing::error!(error = %err, path, "failed to collect gif frames");
+        classify_image_error(err, format!("Failed to collect gif frames of {path}"))
     })?;
     if frames.is_empty() {
         return Ok(Vec::new());
@@ -459,58 +591,90 @@ fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     Ok(output)
 }
 
-fn extract_video_frames(path: &str, num_frames: usize) -> ApiResult<Vec<DynamicImage>> {
-    let duration = probe_duration(path)?;
-    // The caller already checked the DB-recorded duration; a zero here means
-    // the file on disk disagrees (truncated or corrupt). Fail the item so it
-    // is retried instead of being permanently marked processed as "no data".
+/// `duration` comes from the item's own `items` row, exactly like the
+/// scan-side extractor (`jobs::files::extract_video_frames`) takes it. It
+/// cannot be stale: any change to the file's content yields a new sha256 and
+/// therefore a new item, so re-probing it here would only buy an extra ffprobe
+/// spawn per uncached video. The caller already gates on a positive duration;
+/// the guard below mirrors the scan side rather than relying on that.
+fn extract_video_frames(
+    path: &str,
+    num_frames: usize,
+    duration: f64,
+    content_end_ms: Option<i64>,
+) -> ApiResult<Vec<DynamicImage>> {
     if duration <= 0.0 {
-        return Err(ApiError::internal("Video has no probeable duration"));
+        return Ok(Vec::new());
     }
-    let interval = duration / num_frames as f64;
+    // The same window the scan side samples, computed by the same helper: the
+    // interval spreads the N frames across the content, and the decode bound
+    // is what keeps `fps=1/interval` from emitting a card frame past it.
+    let (window, bounded) = crate::jobs::files::frame_sampling_window(duration, content_end_ms);
+    let interval = window / num_frames as f64;
     let temp_dir = temp_dir_path();
     std::fs::create_dir_all(&temp_dir).map_err(|err| {
         tracing::error!(error = %err, "failed to create temp dir");
         ApiError::internal("Failed to extract frames")
     })?;
-    let result = extract_video_frames_into(path, num_frames, interval, &temp_dir);
+    let result = extract_video_frames_into(
+        path,
+        num_frames,
+        interval,
+        bounded.then_some(window),
+        &temp_dir,
+    );
     if let Err(err) = std::fs::remove_dir_all(&temp_dir) {
         tracing::debug!(error = %err, path = %temp_dir.display(), "failed to remove temp frame dir");
     }
     result
 }
 
+/// `decode_limit` is the outro clamp, in seconds, passed as an *input* option
+/// (`-t` before `-i`) so it bounds the decode rather than only what the muxer
+/// writes. The twin of the scan side's.
 fn extract_video_frames_into(
     path: &str,
     num_frames: usize,
     interval: f64,
+    decode_limit: Option<f64>,
     temp_dir: &std::path::Path,
 ) -> ApiResult<Vec<DynamicImage>> {
     let output_pattern = temp_dir.join("frame_%04d.png");
     // stdout is silenced, but stderr is captured so a failure can say why
     // (corrupt file, missing codec, disk full); it is only surfaced on a
     // non-zero exit.
-    let output = std::process::Command::new(crate::media_tools::ffmpeg())
-        .arg("-i")
-        .arg(path)
-        .arg("-vf")
-        .arg(format!("fps=1/{interval}"))
-        .arg("-vsync")
-        .arg("vfr")
-        .arg(&output_pattern)
-        .stdout(std::process::Stdio::null())
-        .output()
-        .map_err(|err| {
-            tracing::error!(error = %err, "ffmpeg failed");
-            ApiError::internal("Failed to extract frames")
-        })?;
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(limit) = decode_limit {
+        args.push("-t".into());
+        args.push(format!("{limit}").into());
+    }
+    args.push("-i".into());
+    args.push(path.into());
+    args.push("-vf".into());
+    args.push(format!("fps=1/{interval}").into());
+    args.push("-vsync".into());
+    args.push("vfr".into());
+    args.push(output_pattern.clone().into());
+    // The retry wrapper, not a bare spawn: the decode clamp above is an
+    // *input* `-t`, which is one of the triggers of the Windows/SMB
+    // input-open bug (see `media_tools::cache_wrapped_args`) — so without it
+    // a clamped video on a network mount fails to open at all.
+    let output = crate::media_tools::ffmpeg_output_with_input_retry(&args, |command| {
+        command.stdout(std::process::Stdio::null());
+    })
+    .map_err(|err| {
+        tracing::error!(error = %err, path, "ffmpeg failed to start");
+        crate::media_tools::spawn_error("ffmpeg", &err)
+    })?;
     if !output.status.success() {
-        tracing::error!(
-            path,
-            stderr = %stderr_tail(&output.stderr),
-            "ffmpeg failed to extract frames"
-        );
-        return Err(ApiError::internal("ffmpeg failed to extract frames"));
+        let stderr = stderr_tail(&output.stderr);
+        tracing::error!(path, stderr = %stderr, "ffmpeg failed to extract frames");
+        // ffmpeg opened the file itself, so a corrupt video and a transient
+        // mount hiccup look identical here; the ambiguous threshold is what
+        // keeps a single NAS blip from suppressing a healthy file.
+        return Err(ApiError::input_unconfirmed(format!(
+            "ffmpeg failed to extract frames from {path}: {stderr}"
+        )));
     }
     let mut paths = std::fs::read_dir(temp_dir)
         .map_err(|err| ApiError::internal(format!("Failed to read frames: {err}")))?
@@ -529,30 +693,6 @@ fn extract_video_frames_into(
         frames.push(image);
     }
     Ok(frames)
-}
-
-fn probe_duration(path: &str) -> ApiResult<f64> {
-    let output = std::process::Command::new(crate::media_tools::ffprobe())
-        .arg("-v")
-        .arg("error")
-        .arg("-show_entries")
-        .arg("format=duration")
-        .arg("-of")
-        .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(path)
-        .output()
-        .map_err(|err| {
-            tracing::error!(error = %err, "ffprobe failed");
-            ApiError::internal("Failed to probe video")
-        })?;
-    if !output.status.success() {
-        return Err(ApiError::internal("ffprobe failed"));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.trim().parse::<f64>().map_err(|err| {
-        tracing::error!(error = %err, "failed to parse duration");
-        ApiError::internal("Failed to probe video")
-    })
 }
 
 fn temp_dir_path() -> PathBuf {
@@ -574,9 +714,10 @@ fn temp_dir_path() -> PathBuf {
 }
 
 /// Renders every PDF page natively via the shared pdfium binding (same
-/// library the scan pipeline uses for thumbnails). Any failure — including
-/// pdfium not being installed — is an error so the item is recorded as
-/// failed and retried on the next run, never silently marked processed.
+/// library the scan pipeline uses for thumbnails). Both failure modes are
+/// classified: a missing pdfium blocks the item until the library appears,
+/// and a document pdfium rejects is a payload verdict — unconfirmed, because
+/// pdfium read the file itself.
 async fn render_pdf_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     let owned = path.to_string();
     let pages = tokio::task::spawn_blocking(move || {
@@ -586,7 +727,15 @@ async fn render_pdf_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     .map_err(|_| ApiError::internal("PDF render task failed"))?
     .map_err(|err| {
         tracing::error!(error = %err, path, "failed to render PDF");
-        ApiError::internal("Failed to render PDF")
+        match err {
+            crate::jobs::files::PdfRenderError::Unavailable => ApiError::blocked(
+                Blocker::Pdfium,
+                format!("pdfium is not available to render {path}"),
+            ),
+            crate::jobs::files::PdfRenderError::Document(detail) => {
+                ApiError::input_unconfirmed(format!("Failed to render PDF {path}: {detail}"))
+            }
+        }
     })?;
     let mut frames = Vec::with_capacity(pages.len());
     for page in pages {
@@ -601,22 +750,125 @@ async fn render_pdf_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
 
 /// Renders an HTML file via the shared headless-browser screenshot path used
 /// by the scan pipeline (replacing the Python weasyprint HTML->PDF chain).
-/// Failure — including no browser being installed — is an error so the item
-/// is recorded as failed and retried, never silently marked processed.
+/// Uses the classified variant: no browser blocks the item until one is
+/// installed, a render failure is an unconfirmed payload verdict, and the
+/// gateway's own I/O around the render stays transient.
 async fn render_html_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     let owned = path.to_string();
     let shot = tokio::task::spawn_blocking(move || {
-        crate::jobs::files::render_html_screenshot(std::path::Path::new(&owned))
+        crate::jobs::files::render_html_screenshot_classified(std::path::Path::new(&owned))
     })
     .await
     .map_err(|_| ApiError::internal("HTML render task failed"))?
-    .ok_or_else(|| {
-        tracing::error!(path, "failed to render HTML page");
-        ApiError::internal("Failed to render HTML page")
+    .map_err(|err| {
+        tracing::error!(error = %err, path, "failed to render HTML page");
+        match err {
+            crate::jobs::files::HtmlRenderError::NoBrowser => ApiError::blocked(
+                Blocker::HtmlRenderer,
+                format!("no headless browser is available to render {path}"),
+            ),
+            crate::jobs::files::HtmlRenderError::Io(detail) => {
+                ApiError::internal(format!("Failed to render HTML page {path}: {detail}"))
+            }
+            crate::jobs::files::HtmlRenderError::Render(detail) => {
+                ApiError::input_unconfirmed(format!("Failed to render HTML page {path}: {detail}"))
+            }
+        }
     })?;
     Ok(vec![BaseFrame {
         width: Some(shot.width() as i64),
         height: Some(shot.height() as i64),
         bytes: encode_jpeg(&shot)?,
     }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::files::{corner_is_card, jpeg_with_exif_orientation, write_clip};
+
+    /// The extraction side has its own ffmpeg invocation, so the scan side's
+    /// clamp test proves nothing about it. Both values of the gate are here:
+    /// `Some` is what `detect_outros` on produces, `None` is both "never
+    /// examined" and — per design §8 — "detection switched off, so the
+    /// consumer ignores the metadata".
+    ///
+    /// The `None` case is narrower than an undo, though: it only governs what
+    /// a *fresh* extraction samples. `load_base_frames` serves
+    /// `storage.frames` before reaching this call, so re-running extraction
+    /// with detection off reuses trimmed cached frames. See that function's
+    /// note.
+    #[test]
+    fn sampling_is_clamped_only_when_a_boundary_is_supplied() {
+        let dir = tempfile::TempDir::new().expect("a temp dir");
+        let clip = dir.path().join("card.mp4");
+        if !write_clip(&clip, Some(2), None) {
+            return;
+        }
+        let path = clip.to_string_lossy().to_string();
+
+        let clamped = extract_video_frames(&path, 4, 7.0, Some(5000)).expect("ffmpeg runs");
+        assert_eq!(
+            clamped.len(),
+            4,
+            "the interval shrinks with the window, so the count is unchanged"
+        );
+        assert!(
+            !clamped.iter().any(corner_is_card),
+            "no frame sent to inference may come from the card"
+        );
+
+        let unclamped = extract_video_frames(&path, 4, 7.0, None).expect("ffmpeg runs");
+        assert_eq!(unclamped.len(), 4);
+        assert!(
+            unclamped.iter().any(corner_is_card),
+            "unclamped sampling lands in the card — that is what the gate turns back on"
+        );
+    }
+
+    // What the models see is the picture, in the same space the slice grid is
+    // computed in (docs/display-dimensions-design.md §5). The gate reports
+    // display dimensions and the slicer's decode orients — one disagreeing
+    // with the other would tile an EXIF-rotated photo with its rows and
+    // columns swapped, which is exactly the coded/display split this closes.
+    #[test]
+    fn the_slicer_and_its_grid_agree_on_the_picture() {
+        // Orientation 6: coded 64x32, painted 32x64.
+        let rotated = jpeg_with_exif_orientation(64, 32, 6);
+
+        assert_eq!(
+            ensure_image_readable(&rotated, "portrait.jpg").expect("the fixture parses"),
+            (32, 64),
+            "the gate reports what a browser paints, not the header's numbers"
+        );
+        assert_eq!(
+            load_dynamic_image(&rotated)
+                .expect("the fixture decodes")
+                .dimensions(),
+            (32, 64),
+            "the slicer cuts the oriented pixels those dimensions describe"
+        );
+
+        // And a missing orientation stays a no-op, coded == display.
+        let plain = {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(9, 4))
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .expect("the fixture encodes");
+            bytes
+        };
+        assert_eq!(
+            ensure_image_readable(&plain, "plain.png").expect("the fixture parses"),
+            (9, 4)
+        );
+        assert_eq!(
+            load_dynamic_image(&plain)
+                .expect("the fixture decodes")
+                .dimensions(),
+            (9, 4)
+        );
+    }
 }

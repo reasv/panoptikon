@@ -323,15 +323,14 @@ fn commit_and_reload(
     if rendered != source {
         panoptikon_config::atomic_write(config_path, rendered.as_bytes())?;
     }
-    if rendered_dotenv != dotenv_source {
-        if let Err(error) =
+    if rendered_dotenv != dotenv_source
+        && let Err(error) =
             panoptikon_config::atomic_write_private(env_path, rendered_dotenv.as_bytes())
-        {
-            if rendered != source {
-                let _ = panoptikon_config::atomic_write(config_path, source.as_bytes());
-            }
-            return Err(error).context("failed to commit environment-backed settings");
+    {
+        if rendered != source {
+            let _ = panoptikon_config::atomic_write(config_path, source.as_bytes());
         }
+        return Err(error).context("failed to commit environment-backed settings");
     }
     load(server_root, config_path)
 }
@@ -448,19 +447,19 @@ fn validate_update(update: &ServerConfigurationUpdate) -> Result<()> {
     if update.performance.embedding_cache_size > 65_536 {
         bail!("embedding cache size must be at most 65536");
     }
-    if update.lan.enabled {
-        if let Some(databases) = &update.lan.allowed_databases {
-            let databases = databases
-                .iter()
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-                .collect::<BTreeSet<_>>();
-            if databases.is_empty() {
-                bail!("choose at least one LAN database, or allow all databases");
-            }
-            if !databases.contains(update.lan.default_database.trim()) {
-                bail!("the default LAN database must be in the LAN allowlist");
-            }
+    if update.lan.enabled
+        && let Some(databases) = &update.lan.allowed_databases
+    {
+        let databases = databases
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<BTreeSet<_>>();
+        if databases.is_empty() {
+            bail!("choose at least one LAN database, or allow all databases");
+        }
+        if !databases.contains(update.lan.default_database.trim()) {
+            bail!("the default LAN database must be in the LAN allowlist");
         }
     }
     Ok(())
@@ -1083,7 +1082,10 @@ mod tests {
         let mut update = unchanged_update(&current);
         update.lan = LanConfigurationUpdate {
             enabled: true,
-            port: 16437,
+            // Not 16437: the LAN-port availability probe binds the port, and
+            // `environment_bound_lan_port_keeps_its_reference` probes 16437
+            // concurrently under the parallel test runner.
+            port: 16439,
             allowed_databases: None,
             default_database: "default".into(),
         };

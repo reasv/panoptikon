@@ -60,7 +60,40 @@ to. The fix below was implemented the same day.
 Neither change affects durability: checkpointing is what SQLite does anyway,
 only sooner and with the file bounded.
 
+## Second fix: the extraction driver was itself a job-long reader (2026-07-30)
+
+A field report on v0.1.6 showed the gap in the fix above: a 1.2M-item WD
+tagger job reached a 33 GB WAL with inserts degrading to 60-115s (which then
+starved the model's 60s inferio cache TTL into a reload loop). The 2026-07-25
+findings had concluded "writes are short transactions, not one long one" and
+treated long readers as transient search traffic — but the extraction driver
+streamed its entire work query through one sqlx cursor
+(`jobs/extraction.rs`), an open statement whose read snapshot lasted the whole
+job. During a multi-week job:
+
+- no passive checkpoint can advance past the driver's own pinned snapshot,
+  so every per-item commit accumulates in the log;
+- the post-job checkpoint and `journal_size_limit` reset never run, because
+  both only act between jobs;
+- reads slow roughly linearly with WAL frame count (one wal-index hash
+  segment per ~4096 frames is probed per page lookup), which is what degraded
+  the inserts.
+
+The driver now drains the work query in keyset chunks
+(`WORK_CHUNK_ROWS`-sized, ordered by `file_id`/`data_id`, cursor `> last`)
+on short-lived read connections, releasing each snapshot before any
+processing awaits. A per-job dispatched set on the partition key keeps every
+work unit at-most-once even when the predicate never shrinks
+(`skip_processed_items = false`) or a GROUP BY representative row shifts
+between chunk queries. With no job-long reader, autocheckpoints advance
+throughout the job and the `journal_size_limit` bound actually engages
+mid-run. Regression test:
+`jobs::extraction::tests::chunked_work_query_fetches_each_item_exactly_once`.
+
 What remains, by design: VACUUM still pushes the whole database through the
-log while it runs, and a genuinely long reader still accumulates all writes
-made during its snapshot — both are inherent peaks that now recover at the
-next checkpoint instead of persisting until full idle.
+log while it runs, and a genuinely long *external* reader (a slow search, an
+open API stream) still accumulates all writes made during its snapshot — both
+are inherent peaks that recover at the next checkpoint instead of persisting
+until full idle. The remaining in-tree long cursor,
+`compute_mean_artifact` (`db/vector_quants.rs`), streams at full read speed
+with no awaits on external work, so its snapshot lasts minutes at most.

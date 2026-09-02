@@ -1,5 +1,13 @@
 # Vector quantization — measured results (2026-07-21)
 
+> **HISTORICAL. Current state: `docs/vector-int8-quant.md` (2026-07-30).**
+> Everything below measures the *binary two-stage* scorer, which has since
+> been deleted. `quant` now means single-pass int8, and the conclusion this
+> document reached — "`auto` resolves to exact" — was reversed on new
+> evidence (int8 is at parity with exact and never slower). The measurement
+> methodology and the execution-model lessons here are still worth reading;
+> the numbers and the policy are not current.
+
 Empirical follow-up to `docs/vector-index-design.md`. The two-stage quant
 scorer shipped implemented but unmeasured; this is the first end-to-end
 benchmark against a real index. **Headline: it is a win on exactly one

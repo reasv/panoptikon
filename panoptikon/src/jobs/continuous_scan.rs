@@ -14,7 +14,7 @@ use ractor::factory::{
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::sync::{OnceCell, oneshot};
 
-use crate::api_error::ApiError;
+use crate::api_error::{ApiError, Blocker};
 use crate::db::files::has_blurhash;
 use crate::db::{
     file_scans::{FileScanUpdate, get_open_file_scan_id},
@@ -24,7 +24,8 @@ use crate::db::{
     },
     index_writer::{IndexDbWriterMessage, call_index_db_writer},
     open_index_db_read,
-    storage::{has_frame, has_thumbnail},
+    scan_errors::{ScanErrorRecord, get_scan_error},
+    storage::{has_frame, has_thumbnail, has_thumbnail_tiers},
     system_config::{SystemConfig, SystemConfigStore},
 };
 use crate::jobs::dir_poller::{
@@ -34,10 +35,12 @@ use crate::jobs::files::{
     FRAME_PROCESS_VERSION, FileProcessError, PreparedFile, SCAN_PROGRESS_INTERVAL, ScanOptions,
     ScanTimers, THUMBNAIL_PROCESS_VERSION, build_extension_set, build_file_scan_data,
     check_folder_validity, current_iso_timestamp, deduplicate_paths, folder_is_empty,
-    get_last_modified_time_and_size, has_allowed_extension, is_excluded, is_hidden_or_temp,
-    normalize_path, parse_filescan_filter, process_file, run_post_job_maintenance,
+    format_system_time, get_last_modified_time_and_size, has_allowed_extension, infer_mime_type,
+    is_excluded, is_hidden_or_temp, is_under_junk_dir, normalize_path, override_mime_from_content,
+    parse_filescan_filter, process_file, run_post_job_maintenance,
 };
 use crate::pql::model::Match;
+use crate::visual_tiers::FormatPolicy;
 
 type ApiResult<T> = Result<T, ApiError>;
 
@@ -65,6 +68,13 @@ const WATCHER_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(60);
 struct FileWork {
     path: PathBuf,
     filescan_filter: Option<Arc<Match>>,
+    /// Folded from the config pair at dispatch, the twin of the batch walker's
+    /// `ScanContext::detect_outros`: detection is subordinate to `scan_video`
+    /// (docs/video-outro-detection-design.md §8).
+    detect_outros: bool,
+    /// This database's rendition format policy (R5), folded at dispatch — the
+    /// twin of `ScanContext::formats`.
+    formats: FormatPolicy,
     epoch: u64,
     scan_time: String,
     index_db: String,
@@ -99,6 +109,8 @@ impl Worker for ContinuousWorker {
         let FileWork {
             path,
             filescan_filter,
+            detect_outros,
+            formats,
             epoch,
             scan_time,
             index_db,
@@ -111,41 +123,86 @@ impl Worker for ContinuousWorker {
         // the full-scan dedup: spurious watcher events and re-dispatched paths
         // cost one stat and one point query instead of a full re-process.
         let stat_path = path.clone();
-        let disk_mtime = tokio::task::spawn_blocking(move || {
-            get_last_modified_time_and_size(&stat_path).map(|(mtime, _)| mtime)
-        })
-        .await
-        .ok()
-        .and_then(|res| res.ok());
-        if let Some(disk_mtime) = &disk_mtime {
-            if let Ok(mut conn) = open_index_db_read(&index_db, &user_data_db).await {
-                if let Ok(Some(existing)) =
-                    get_file_by_path(&mut conn, path.to_string_lossy().as_ref()).await
-                {
-                    if &existing.last_modified == disk_mtime {
+        let stat = tokio::task::spawn_blocking(move || get_last_modified_time_and_size(&stat_path))
+            .await
+            .ok()
+            .and_then(|res| res.ok());
+        let path_str = path.to_string_lossy().to_string();
+        // The path *as the ledger stores it*, when it has a row at all. Gates
+        // the success-side delete below and carries the stored casing, which
+        // on Windows need not be the casing this event reported. The batch
+        // walker gets the same thing from its per-root preload; an
+        // event-driven scan gets it from the lookup it is doing here anyway.
+        let mut ledger_path: Option<String> = None;
+
+        if let Some((disk_mtime, file_size)) = &stat
+            && let Ok(mut conn) = open_index_db_read(&index_db, &user_data_db).await
+        {
+            // The recorded-failure check comes first: a file the scan
+            // already gave up on has no `files` row for the mtime shortcut
+            // to find, so this is the only thing between a watcher event
+            // and a full re-hash of a file that will fail again.
+            match get_scan_error(&mut conn, &path_str).await {
+                Ok(Some(skip)) => {
+                    let suppressed = skip.suppresses(disk_mtime, *file_size);
+                    // Only a row a success actually spends is handed on to be
+                    // cleared: an audit-only row (a visuals decode failure on a
+                    // file that indexes fine every time) survives its own
+                    // file's success and is cleared only once its bytes move.
+                    if skip.cleared_by_success(disk_mtime, *file_size) {
+                        ledger_path = Some(skip.path);
+                    }
+                    if suppressed {
                         let _ = reply_to.cast(ContinuousScanMessage::WorkerResult {
                             epoch,
                             scan_time,
-                            result: Err(FileProcessError::Unchanged),
+                            path,
+                            stat,
+                            ledger_path,
+                            result: Box::new(Err(FileProcessError::KnownBad)),
                         });
-                        return Ok(job.key);
+                        return Ok(());
                     }
                 }
+                Ok(None) => {}
+                // Advisory: without the verdict the file is simply
+                // processed, which is exactly the old behavior.
+                Err(err) => {
+                    tracing::warn!(error = ?err, path = %path.display(), "scan failure lookup failed")
+                }
+            }
+            if let Ok(Some(existing)) = get_file_by_path(&mut conn, &path_str).await
+                && &existing.last_modified == disk_mtime
+            {
+                let _ = reply_to.cast(ContinuousScanMessage::WorkerResult {
+                    epoch,
+                    scan_time,
+                    path,
+                    stat,
+                    ledger_path,
+                    result: Box::new(Err(FileProcessError::Unchanged)),
+                });
+                return Ok(());
             }
         }
 
-        let result =
-            tokio::task::spawn_blocking(move || process_file(path, filescan_filter, &timers))
-                .await
-                .map_err(|err| FileProcessError::Worker(err.to_string()))
-                .and_then(|res| res);
+        let work_path = path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            process_file(work_path, filescan_filter, detect_outros, formats, &timers)
+        })
+        .await
+        .map_err(|err| FileProcessError::Worker(err.to_string()))
+        .and_then(|res| res);
 
         let _ = reply_to.cast(ContinuousScanMessage::WorkerResult {
             epoch,
             scan_time,
-            result,
+            path,
+            stat,
+            ledger_path,
+            result: Box::new(result),
         });
-        Ok(job.key)
+        Ok(())
     }
 }
 
@@ -172,7 +229,7 @@ pub(crate) enum ContinuousScanMessage {
     },
     Resume,
     UpdateConfig {
-        config: SystemConfig,
+        config: Box<SystemConfig>,
     },
     FsEvent(FsEvent),
     /// Starts a poll pass on the blocking pool unless one is already running.
@@ -199,7 +256,17 @@ pub(crate) enum ContinuousScanMessage {
     WorkerResult {
         epoch: u64,
         scan_time: String,
-        result: Result<PreparedFile, FileProcessError>,
+        /// The path the worker handled. Carried because the failure half needs
+        /// an identity: `FileProcessError` says what went wrong, not to what.
+        path: PathBuf,
+        /// The file as the worker saw it — the `scan_errors` retry key. `None`
+        /// when the stat itself failed, which is transient and never recorded.
+        stat: Option<(String, i64)>,
+        /// The path the ledger stores for this file, when it had a row at all.
+        /// Gates the success-side delete (so a healthy file costs no writer
+        /// round-trip) and is what that delete binds.
+        ledger_path: Option<String>,
+        result: Box<Result<PreparedFile, FileProcessError>>,
     },
     /// Point-in-time state for the status endpoint.
     GetStatus {
@@ -249,6 +316,11 @@ struct ScanStats {
     modified_files: i64,
     marked_unavailable: i64,
     errors: i64,
+    /// Events skipped on an active recorded scan failure. Deliberately not
+    /// folded into `errors` (nothing was attempted) and not persisted on the
+    /// scan row (`file_scans` has no column for it); logged when the scan
+    /// record closes.
+    known_bad: i64,
     total_available: i64,
     false_changes: i64,
 }
@@ -262,6 +334,7 @@ impl ScanStats {
             modified_files: 0,
             marked_unavailable: 0,
             errors: 0,
+            known_bad: 0,
             total_available: 0,
             false_changes: 0,
         }
@@ -279,10 +352,7 @@ fn compute_watch_roots_with_safe_empty(
     let mut included = config.included_folders.clone();
     included.retain(|folder| check_folder_validity(folder) || safe_empty.contains(folder));
     let global_included = deduplicate_paths(&included);
-    let global_included_roots: Vec<PathBuf> = global_included
-        .iter()
-        .map(|path| PathBuf::from(path))
-        .collect();
+    let global_included_roots: Vec<PathBuf> = global_included.iter().map(PathBuf::from).collect();
 
     let global_excluded_roots: Vec<PathBuf> = config
         .excluded_folders
@@ -357,6 +427,10 @@ pub(crate) struct ContinuousScanState {
     roots_valid: bool,
     allowed_extensions: HashSet<String>,
     filescan_filter: Option<Arc<Match>>,
+    /// This database's thumbnail format policy, folded when the config is
+    /// loaded rather than per dispatched file: it is a parse, and a list
+    /// naming no usable format warns once per fold.
+    formats: FormatPolicy,
     scan_id: Option<i64>,
     scan_time: Option<String>,
     stats: ScanStats,
@@ -380,7 +454,55 @@ pub(crate) struct ContinuousScanState {
     watcher_fallback: bool,
     enable_watcher: bool,
     deletions_since_maintenance: u64,
+    /// Files this session already classified as failing, with the
+    /// `(last_modified, file_size)` they failed at.
+    ///
+    /// The ledger alone cannot stop the re-attempt storm here: an ambiguous
+    /// verdict needs two attempts, and `attempts` is deduped on the *scan id*,
+    /// which for a continuous scan spans the whole session — so a file that
+    /// keeps generating watcher events would be re-hashed, re-decoded and
+    /// re-upserted (bumping the search-cache epoch each time) forever without
+    /// its count ever moving. This is the per-session half of that gate: the
+    /// second event for an unchanged failing file costs one stat.
+    ///
+    /// Not persistence, and not a substitute for the ledger: it is dropped on
+    /// every scan restart, so "attempts stays 1 per session" is unchanged.
+    failed_stats: HashMap<PathBuf, (String, i64)>,
 }
+
+/// The admission test every candidate path passes, whatever produced it: the
+/// native watcher's events, the poller's settled changes, the rename handler
+/// and the removal handler all reach dispatch through
+/// [`ContinuousScanState::should_process_path`]. A free function so it can be
+/// exercised without an actor.
+fn path_passes_filters(
+    path: &Path,
+    roots: &[PathBuf],
+    excluded: &[PathBuf],
+    extensions: &HashSet<String>,
+) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    if is_hidden_or_temp(path) {
+        return false;
+    }
+    if !has_allowed_extension(path, extensions) {
+        return false;
+    }
+    let is_included = roots.iter().any(|root| path.starts_with(root));
+    if !is_included {
+        return false;
+    }
+    if is_excluded(path, excluded) {
+        return false;
+    }
+    // An event carries an absolute path rather than a traversal, so the
+    // directories it sits under are only ever judged here — the batch walk
+    // prunes the same directories on the way down.
+    !is_under_junk_dir(path, roots)
+}
+
 impl ContinuousScanState {
     fn reset_stats(&mut self) {
         self.stats = ScanStats::new();
@@ -451,6 +573,7 @@ impl ContinuousScanState {
         self.roots_valid = outcome.valid;
         self.allowed_extensions = build_extension_set(&self.config);
         self.filescan_filter = parse_filescan_filter(&self.config).map(Arc::new);
+        self.formats = self.config.format_policy();
         if !outcome.valid {
             tracing::warn!(
                 index_db = %self.index_db,
@@ -462,6 +585,15 @@ impl ContinuousScanState {
     }
 
     async fn start_scan(&mut self) -> ApiResult<()> {
+        // Before anything is processed, exactly like the batch scan: a
+        // dependency that was missing when these files failed may be installed
+        // now, and this is the only place a long-lived watching session ever
+        // re-probes. Cheap — one indexed query returning nothing — when the
+        // ledger has no blocked rows, which is the normal case.
+        if let Err(err) = crate::jobs::files::heal_blocked_scan_errors(&self.index_db).await {
+            tracing::warn!(error = ?err, "failed to re-probe blocked scan failures");
+        }
+
         let scan_time = current_iso_timestamp();
         let scan_id =
             call_index_db_writer(&self.index_db, |reply| IndexDbWriterMessage::AddFileScan {
@@ -473,13 +605,158 @@ impl ContinuousScanState {
         self.scan_id = Some(scan_id);
         self.scan_time = Some(scan_time);
         self.reset_stats();
+        // The session cache is scoped to the scan record it counts attempts
+        // against, so a new record starts with an empty one.
+        self.failed_stats.clear();
         Ok(())
+    }
+
+    /// Logs one file failure and, when its class is one the ledger stores,
+    /// records it. Before this the error variant was discarded outright: the
+    /// counter moved and nothing said which file or why.
+    ///
+    /// The scan id is the continuous scan's own `file_scans` row, which is
+    /// what dedups `attempts`. That row is long-lived — it spans the whole
+    /// watching session — so a `skip_after = 2` verdict written here is
+    /// normally confirmed by the next *batch* scan (or by the next session)
+    /// rather than by a second event. That is the intended conservatism: an
+    /// ambiguous verdict from an external tool should not be settled by two
+    /// events seconds apart on the same flaky mount.
+    async fn record_file_failure(
+        &mut self,
+        path: &Path,
+        stat: Option<(String, i64)>,
+        error: &FileProcessError,
+    ) {
+        if matches!(error, FileProcessError::Filtered) {
+            tracing::debug!(
+                path = %path.display(),
+                "file does not match the filescan filter, skipping"
+            );
+            return;
+        }
+        let classified = error.classified();
+        tracing::error!(
+            error = ?error,
+            path = %path.display(),
+            stage = classified.map(|failure| failure.stage).unwrap_or("-"),
+            error_class = classified
+                .and_then(|failure| failure.kind.persisted_class())
+                .unwrap_or("transient"),
+            blocker = classified
+                .and_then(|failure| failure.kind.blocker())
+                .map(Blocker::as_str)
+                .unwrap_or("none"),
+            "failed to process file"
+        );
+
+        // Transient classes are never recorded: the file simply fails this
+        // event and is retried untouched.
+        let (Some(failure), Some((last_modified, file_size))) = (classified, stat) else {
+            return;
+        };
+        // The session cache goes in *with* the ledger row, so the next event
+        // for these same bytes is answered by one stat instead of another full
+        // process + upsert + epoch bump. See `failed_stats`.
+        self.failed_stats
+            .insert(path.to_path_buf(), (last_modified.clone(), file_size));
+        let mut record = ScanErrorRecord {
+            path: path.to_string_lossy().to_string(),
+            last_modified,
+            file_size,
+            stage: failure.stage.to_string(),
+            kind: failure.kind,
+            // Re-guessed rather than threaded back from the worker: it is a
+            // pure function of the file name and only runs on the failure
+            // path. `None` when the guess is what failed.
+            mime_type: infer_mime_type(path).ok(),
+            error: failure.message.clone(),
+            skip_after: failure.skip_after,
+        };
+        // The guess above is the *name's*. Where the bytes can contradict it
+        // outright, ask the bytes — the batch walker records the same way.
+        override_mime_from_content(&mut record, path);
+        let scan_id = self.scan_id;
+        if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::UpsertScanError {
+                record: record.clone(),
+                scan_id,
+                reply,
+            }
+        })
+        .await
+        {
+            tracing::warn!(
+                error = ?err,
+                path = %path.display(),
+                "failed to record a scan failure; it will be re-attempted"
+            );
+        }
+    }
+
+    /// Records the audit row an indexed-without-visuals image owes, so a
+    /// failure that no longer blocks anything stays visible in the failures
+    /// surface. The batch walker's twin, with the same rules: never fails the
+    /// file, never touched on the healthy path.
+    ///
+    /// Deliberately *not* also cached in `failed_stats`: the file is indexed,
+    /// so the next event for it must take the ordinary mtime shortcut, not a
+    /// failure shortcut.
+    async fn record_visuals_scan_error(&self, record: ScanErrorRecord) {
+        let scan_id = self.scan_id;
+        if let Err(err) = call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::UpsertScanError {
+                record: record.clone(),
+                scan_id,
+                reply,
+            }
+        })
+        .await
+        {
+            tracing::warn!(
+                error = ?err,
+                path = %record.path,
+                "failed to record a visuals decode failure for auditing"
+            );
+        }
+    }
+
+    /// Success path: the file made it through, so its verdict goes away.
+    /// Called only when the worker's lookup found a row, so a healthy file
+    /// never pays a writer round-trip (or a search-cache epoch bump) for it.
+    /// `path` is the *stored* path the worker's lookup returned, which on
+    /// Windows need not be the casing the event reported; the delete binds
+    /// bytes.
+    async fn clear_file_failure(&self, path: String) {
+        match call_index_db_writer(&self.index_db, |reply| {
+            IndexDbWriterMessage::DeleteScanError {
+                path: path.clone(),
+                reply,
+            }
+        })
+        .await
+        {
+            Ok(cleared) => {
+                if cleared > 0 {
+                    tracing::info!(path, "cleared a recorded scan failure after a good pass");
+                }
+            }
+            // Advisory: a lost delete costs one wasted re-attempt, never
+            // correctness.
+            Err(err) => tracing::warn!(error = ?err, path, "failed to clear a scan failure"),
+        }
     }
 
     async fn close_scan(&mut self) -> ApiResult<()> {
         let Some(scan_id) = self.scan_id.take() else {
             return Ok(());
         };
+        if self.stats.known_bad > 0 {
+            tracing::info!(
+                known_bad = self.stats.known_bad,
+                "skipped files with an active recorded scan failure"
+            );
+        }
         let end_time = current_iso_timestamp();
         // Stored times are phase wall-clock (busy) from the shared timers, not
         // sums of per-file spans across concurrent workers.
@@ -528,23 +805,12 @@ impl ContinuousScanState {
     }
 
     fn should_process_path(&self, path: &Path) -> bool {
-        if self.watch_roots.is_empty() {
-            return false;
-        }
-        if is_hidden_or_temp(path) {
-            return false;
-        }
-        if !has_allowed_extension(path, &self.allowed_extensions) {
-            return false;
-        }
-        let is_included = self.watch_roots.iter().any(|root| path.starts_with(root));
-        if !is_included {
-            return false;
-        }
-        if is_excluded(path, &self.excluded_roots) {
-            return false;
-        }
-        true
+        path_passes_filters(
+            path,
+            &self.watch_roots,
+            &self.excluded_roots,
+            &self.allowed_extensions,
+        )
     }
 
     async fn handle_remove(&mut self, path: PathBuf) -> ApiResult<()> {
@@ -635,19 +901,46 @@ impl ContinuousScanState {
         Ok(())
     }
 
-    fn dispatch_path(&self, path: PathBuf) {
+    fn dispatch_path(&mut self, path: PathBuf) {
         if self.paused {
             return;
         }
         if !self.should_process_path(&path) {
             return;
         }
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            if !metadata.is_file() {
-                return;
-            }
-        } else {
+        let Ok(metadata) = std::fs::metadata(&path) else {
             return;
+        };
+        if !metadata.is_file() {
+            return;
+        }
+
+        // The session cache, consulted on the stat this function already had
+        // to take. A file that failed earlier in this session and has not
+        // moved since is not dispatched at all: no worker, no re-hash, no
+        // re-upsert, no epoch bump. See `failed_stats`.
+        if let Some((failed_mtime, failed_size)) = self.failed_stats.get(&path) {
+            let current = metadata
+                .modified()
+                .ok()
+                .and_then(format_system_time)
+                .map(|mtime| (mtime, metadata.len() as i64));
+            match current {
+                Some((mtime, size)) if &mtime == failed_mtime && size == *failed_size => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "skipping a file that already failed in this session"
+                    );
+                    self.stats.known_bad += 1;
+                    return;
+                }
+                // Its bytes moved (or the stat is unreadable): the verdict was
+                // about different content, so it is re-attempted and the cache
+                // entry goes.
+                _ => {
+                    self.failed_stats.remove(&path);
+                }
+            }
         }
         let scan_time = match &self.scan_time {
             Some(value) => value.clone(),
@@ -656,6 +949,8 @@ impl ContinuousScanState {
         let msg = FileWork {
             path,
             filescan_filter: self.filescan_filter.clone(),
+            detect_outros: self.config.scan_video && self.config.detect_outros,
+            formats: self.formats,
             epoch: self.epoch,
             scan_time,
             index_db: self.index_db.clone(),
@@ -851,6 +1146,9 @@ impl Actor for ContinuousScanActor {
             roots_valid: true,
             allowed_extensions: HashSet::new(),
             filescan_filter: None,
+            // Replaced by the reload below, which is also what a later config
+            // edit runs; the default stands in until then.
+            formats: FormatPolicy::default(),
             scan_id: None,
             scan_time: None,
             stats: ScanStats::new(),
@@ -867,6 +1165,7 @@ impl Actor for ContinuousScanActor {
             watcher_fallback: false,
             enable_watcher: args.enable_watcher,
             deletions_since_maintenance: 0,
+            failed_stats: HashMap::new(),
         };
 
         let roots_ok = state.refresh_roots().await;
@@ -934,7 +1233,7 @@ impl Actor for ContinuousScanActor {
                 let prev_extensions = state.allowed_extensions.clone();
                 let prev_interval = state.config.continuous_filescan.poll_interval_secs;
 
-                state.config = config;
+                state.config = *config;
                 let roots_ok = state.refresh_roots().await;
                 let now_enabled = state.config.continuous_filescan.enabled;
                 if !now_enabled || !roots_ok {
@@ -1008,9 +1307,9 @@ impl Actor for ContinuousScanActor {
                         // worker's mtime check.
                         if state.poller.is_some() {
                             let epoch = state.epoch;
-                            let _ = state.actor_ref.send_after(POLL_SETTLE_DELAY, move || {
+                            drop(state.actor_ref.send_after(POLL_SETTLE_DELAY, move || {
                                 ContinuousScanMessage::PollTick { epoch }
-                            });
+                            }));
                         }
                     }
                 }
@@ -1066,26 +1365,28 @@ impl Actor for ContinuousScanActor {
                 // file rows and the removal deletes just the stale one instead
                 // of orphaning the item (which would drop its tags).
                 for path in outcome.removals {
-                    let _ = state.actor_ref.send_after(POLL_SETTLE_DELAY * 2, move || {
+                    drop(state.actor_ref.send_after(POLL_SETTLE_DELAY * 2, move || {
                         ContinuousScanMessage::FsEvent(FsEvent::Remove(path))
-                    });
+                    }));
                 }
                 for change in outcome.changes {
                     let path = change.path;
                     let meta = change.meta;
-                    let _ = state.actor_ref.send_after(POLL_SETTLE_DELAY, move || {
+                    drop(state.actor_ref.send_after(POLL_SETTLE_DELAY, move || {
                         ContinuousScanMessage::SettleCheck {
                             epoch,
                             path,
                             meta,
                             attempts: 0,
                         }
-                    });
+                    }));
                 }
                 if let Some(interval) = interval {
-                    let _ = state
-                        .actor_ref
-                        .send_after(interval, move || ContinuousScanMessage::PollTick { epoch });
+                    drop(
+                        state.actor_ref.send_after(interval, move || {
+                            ContinuousScanMessage::PollTick { epoch }
+                        }),
+                    );
                 }
             }
             ContinuousScanMessage::SettleCheck {
@@ -1112,7 +1413,7 @@ impl Actor for ContinuousScanActor {
                         return;
                     };
                     let stable = last_modified == meta.last_modified
-                        && meta.size.map_or(true, |prev| prev == size);
+                        && meta.size.is_none_or(|prev| prev == size);
                     if stable {
                         let _ = reply.cast(ContinuousScanMessage::DispatchStable { epoch, path });
                         return;
@@ -1121,15 +1422,17 @@ impl Actor for ContinuousScanActor {
                     let delay = POLL_SETTLE_DELAY
                         .saturating_mul(2u32.saturating_pow(attempts.min(5)))
                         .min(SETTLE_MAX_DELAY);
-                    let _ = reply.send_after(delay, move || ContinuousScanMessage::SettleCheck {
-                        epoch,
-                        path,
-                        meta: FileMeta {
-                            last_modified,
-                            size: Some(size),
-                        },
-                        attempts: attempts.saturating_add(1),
-                    });
+                    drop(
+                        reply.send_after(delay, move || ContinuousScanMessage::SettleCheck {
+                            epoch,
+                            path,
+                            meta: FileMeta {
+                                last_modified,
+                                size: Some(size),
+                            },
+                            attempts: attempts.saturating_add(1),
+                        }),
+                    );
                 });
             }
             ContinuousScanMessage::DispatchStable { epoch, path } => {
@@ -1141,20 +1444,35 @@ impl Actor for ContinuousScanActor {
             ContinuousScanMessage::WorkerResult {
                 epoch,
                 scan_time,
+                path,
+                stat,
+                ledger_path,
                 result,
             } => {
                 if state.paused || epoch != state.epoch {
                     return Ok(());
                 }
-                let processed = match result {
+                let processed = match *result {
                     Ok(processed) => processed,
                     Err(FileProcessError::Unchanged) => {
                         state.stats.unchanged_files += 1;
                         state.maybe_report_progress().await;
                         return Ok(());
                     }
-                    Err(_) => {
+                    Err(FileProcessError::KnownBad) => {
+                        // Nothing was attempted, so this is not an error of
+                        // this run; the file keeps its recorded verdict until
+                        // its bytes move.
+                        state.stats.known_bad += 1;
+                        state.maybe_report_progress().await;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        // Used to be discarded outright — no log line, no path,
+                        // no class. Now it is both visible and, when the class
+                        // is one the ledger stores, remembered.
                         state.stats.errors += 1;
+                        state.record_file_failure(&path, stat, &error).await;
                         state.maybe_report_progress().await;
                         return Ok(());
                     }
@@ -1178,80 +1496,146 @@ impl Actor for ContinuousScanActor {
                     }
                 };
 
-                let false_change = file_data.new_file_hash == false && file_data.new_file_timestamp;
+                let false_change = !file_data.new_file_hash && file_data.new_file_timestamp;
                 if false_change {
                     state.stats.false_changes += 1;
                 }
 
-                if !file_data.thumbnails.is_empty() {
-                    if let Ok(mut thumb_conn) =
+                if !file_data.thumbnails.is_empty()
+                    && let Ok(mut thumb_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await
-                    {
-                        if let Ok(has_thumb) = has_thumbnail(
-                            &mut thumb_conn,
-                            &file_data.sha256,
-                            THUMBNAIL_PROCESS_VERSION,
-                        )
+                    && let Ok(has_thumb) = has_thumbnail(
+                        &mut thumb_conn,
+                        &file_data.sha256,
+                        THUMBNAIL_PROCESS_VERSION,
+                    )
+                    .await
+                    && !has_thumb
+                {
+                    let _ = call_index_db_writer(&state.index_db, |reply| {
+                        IndexDbWriterMessage::StoreThumbnails {
+                            sha256: file_data.sha256.clone(),
+                            mime_type: file_data.mime_type.clone(),
+                            process_version: THUMBNAIL_PROCESS_VERSION,
+                            thumbnails: file_data.thumbnails.clone(),
+                            reply,
+                        }
+                    })
+                    .await;
+                }
+
+                // The grid tier ladder, alongside the display renditions above
+                // (docs/grid-scroll-performance-implementation.md §2). No
+                // positive-cache guard: the write replaces the item's whole
+                // set, so identical content racing it rewrites the same bytes
+                // rather than colliding.
+                //
+                // An empty set is skipped only when there is also nothing
+                // stored to contradict, and the EXISTS is paid only in that
+                // case — `||` short-circuits over the await, so the common
+                // path (a set to write) costs no extra query. Two things
+                // reach it: `storage.thumbnail_tiers` is keyed by content
+                // hash and outlives a deindexed item until the orphan sweep,
+                // so content that reappears can meet a set from an older
+                // rule; and an animated item's wanted set is empty by rule,
+                // which makes this the latency path's retirement of a stale
+                // static set — the job `TierWork::Retire` does for the folder
+                // scan. Mirrors `handle_new_item`.
+                if !file_data.tiers.is_empty()
+                    || has_thumbnail_tiers(&mut conn, &file_data.sha256)
                         .await
-                        {
-                            if !has_thumb {
-                                let _ = call_index_db_writer(&state.index_db, |reply| {
-                                    IndexDbWriterMessage::StoreThumbnails {
-                                        sha256: file_data.sha256.clone(),
-                                        mime_type: file_data.mime_type.clone(),
-                                        process_version: THUMBNAIL_PROCESS_VERSION,
-                                        thumbnails: file_data.thumbnails.clone(),
-                                        reply,
-                                    }
-                                })
-                                .await;
-                            }
+                        .unwrap_or(false)
+                {
+                    let _ = call_index_db_writer(&state.index_db, |reply| {
+                        IndexDbWriterMessage::StoreThumbnailTiers {
+                            sha256: file_data.sha256.clone(),
+                            mime_type: file_data.mime_type.clone(),
+                            tiers: file_data.tiers.clone(),
+                            reply,
                         }
+                    })
+                    .await;
+                }
+
+                if !file_data.frames.is_empty()
+                    && let Ok(mut frame_conn) =
+                        open_index_db_read(&state.index_db, &state.user_data_db).await
+                    && let Ok(has_frame) =
+                        has_frame(&mut frame_conn, &file_data.sha256, FRAME_PROCESS_VERSION).await
+                    && !has_frame
+                {
+                    let _ = call_index_db_writer(&state.index_db, |reply| {
+                        IndexDbWriterMessage::StoreFrames {
+                            sha256: file_data.sha256.clone(),
+                            mime_type: file_data.mime_type.clone(),
+                            process_version: FRAME_PROCESS_VERSION,
+                            frames: file_data.frames.clone(),
+                            reply,
+                        }
+                    })
+                    .await;
+                }
+
+                // What that same pass concluded about the kinds it produced
+                // nothing for, so the next batch scan does not regenerate the
+                // same nothing. Empty for every healthy file, and checked
+                // before the writer is touched.
+                //
+                // This half writes but does not consult, unlike the batch
+                // walker. Not because the key is unavailable — `process_file`
+                // hashes before it generates — but because of where the
+                // generation happens: the whole pass runs inside one
+                // synchronous worker with no database handle, so a consult
+                // would mean either handing every worker a connection or
+                // splitting the pass in two around one. The cost of not doing
+                // it is bounded and small: an event fires only when a file's
+                // mtime moved, so this is one regeneration per file the user
+                // actually touched. Every path that re-attempts visuals for
+                // content the index already has goes through the batch scan's
+                // `maybe_dispatch_backfill`, which does consult.
+                if !file_data.visual_verdicts.is_empty() {
+                    let records = crate::jobs::files::visual_attempt_records(
+                        &file_data.visual_verdicts,
+                        &file_data.sha256,
+                        &file_data.mime_type,
+                    );
+                    // The continuous scan's own long-lived `file_scans` row,
+                    // which is what dedups `attempts`. A `skip_after = 2`
+                    // verdict written here is therefore normally confirmed by
+                    // the next batch scan rather than by a second event —
+                    // deliberately, for the same reason as the scan ledger.
+                    let scan_id = state.scan_id;
+                    if let Err(err) = call_index_db_writer(&state.index_db, |reply| {
+                        IndexDbWriterMessage::UpsertVisualAttempts {
+                            records: records.clone(),
+                            scan_id,
+                            reply,
+                        }
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            error = ?err,
+                            path = %path.display(),
+                            "failed to record a visuals attempt; it will be regenerated"
+                        );
                     }
                 }
 
-                if !file_data.frames.is_empty() {
-                    if let Ok(mut frame_conn) =
+                if let Some(blurhash) = &file_data.blurhash
+                    && let Ok(mut blur_conn) =
                         open_index_db_read(&state.index_db, &state.user_data_db).await
-                    {
-                        if let Ok(has_frame) =
-                            has_frame(&mut frame_conn, &file_data.sha256, FRAME_PROCESS_VERSION)
-                                .await
-                        {
-                            if !has_frame {
-                                let _ = call_index_db_writer(&state.index_db, |reply| {
-                                    IndexDbWriterMessage::StoreFrames {
-                                        sha256: file_data.sha256.clone(),
-                                        mime_type: file_data.mime_type.clone(),
-                                        process_version: FRAME_PROCESS_VERSION,
-                                        frames: file_data.frames.clone(),
-                                        reply,
-                                    }
-                                })
-                                .await;
-                            }
+                    && let Ok(has_value) = has_blurhash(&mut blur_conn, &file_data.sha256).await
+                    && !has_value
+                {
+                    let _ = call_index_db_writer(&state.index_db, |reply| {
+                        IndexDbWriterMessage::SetBlurhash {
+                            sha256: file_data.sha256.clone(),
+                            blurhash: blurhash.clone(),
+                            reply,
                         }
-                    }
-                }
-
-                if let Some(blurhash) = &file_data.blurhash {
-                    if let Ok(mut blur_conn) =
-                        open_index_db_read(&state.index_db, &state.user_data_db).await
-                    {
-                        if let Ok(has_value) = has_blurhash(&mut blur_conn, &file_data.sha256).await
-                        {
-                            if !has_value {
-                                let _ = call_index_db_writer(&state.index_db, |reply| {
-                                    IndexDbWriterMessage::SetBlurhash {
-                                        sha256: file_data.sha256.clone(),
-                                        blurhash: blurhash.clone(),
-                                        reply,
-                                    }
-                                })
-                                .await;
-                            }
-                        }
-                    }
+                    })
+                    .await;
                 }
 
                 let update_result = call_index_db_writer(&state.index_db, |reply| {
@@ -1282,6 +1666,48 @@ impl Actor for ContinuousScanActor {
                             state.stats.new_files += 1;
                         }
                         state.stats.total_available += 1;
+                        // The file made it through, so it owes no verdict.
+                        // Gated on the worker's lookup, so the healthy path
+                        // pays nothing.
+                        state.failed_stats.remove(&path);
+                        if let Some(stored) = ledger_path {
+                            state.clear_file_failure(stored).await;
+                        }
+                        // After the clear, which is keyed by the same path:
+                        // this row describes the bytes that just went in, and
+                        // the one the clear spends described whatever was
+                        // there before.
+                        if let Some(record) = file_data.visuals_scan_error {
+                            state.record_visuals_scan_error(record).await;
+                        }
+                        // Strictly after the write that inserts the `items`
+                        // row this updates, and only on its success: a verdict
+                        // with no item to hang it on is simply re-probed.
+                        if let Some(outro) = &file_data.outro {
+                            let _ = call_index_db_writer(&state.index_db, |reply| {
+                                IndexDbWriterMessage::SetOutroVerdict {
+                                    sha256: file_data.sha256.clone(),
+                                    outro_kind: outro.kind.clone(),
+                                    content_end_ms: outro.content_end_ms,
+                                    reply,
+                                }
+                            })
+                            .await;
+                        }
+                        // Likewise: the column lives on the row the write
+                        // above just inserted, and the guard on
+                        // `has_transparency IS NULL` makes a race with the
+                        // batch walker a no-op rather than a disagreement.
+                        if let Some(has_transparency) = file_data.transparency {
+                            let _ = call_index_db_writer(&state.index_db, |reply| {
+                                IndexDbWriterMessage::SetItemTransparency {
+                                    sha256: file_data.sha256.clone(),
+                                    has_transparency,
+                                    reply,
+                                }
+                            })
+                            .await;
+                        }
                     }
                     Err(err) => {
                         tracing::error!(error = ?err, "failed to update file data");
@@ -1420,10 +1846,10 @@ impl Actor for ContinuousScanSupervisor {
             resync_pending,
             shutting_down: false,
         };
-        let _ = myself.send_interval(
+        drop(myself.send_interval(
             RactorDuration::from_secs(SUPERVISOR_RESYNC_INTERVAL.as_secs()),
             || ContinuousScanSupervisorMessage::ResyncFromDisk,
-        );
+        ));
         let _ = resync_from_disk(&mut state).await;
         Ok(state)
     }
@@ -1560,12 +1986,14 @@ async fn resync_from_disk(state: &mut ContinuousScanSupervisorState) -> ApiResul
 
     for (index_db, config) in desired {
         if let Some(actor) = state.actors.get(&index_db) {
-            let _ = actor.cast(ContinuousScanMessage::UpdateConfig { config });
+            let _ = actor.cast(ContinuousScanMessage::UpdateConfig {
+                config: Box::new(config),
+            });
             continue;
         }
         let args = ContinuousScanActorArgs {
             index_db: index_db.clone(),
-            user_data_db: index_db.clone(),
+            user_data_db: crate::db::info::db_defaults().1,
             data_dir: state.data_dir.clone(),
             enable_watcher: true,
         };
@@ -1576,7 +2004,9 @@ async fn resync_from_disk(state: &mut ContinuousScanSupervisorState) -> ApiResul
         )
         .await
         .map_err(|err| ApiError::internal(format!("Failed to spawn continuous scan: {err:?}")))?;
-        let _ = actor.cast(ContinuousScanMessage::UpdateConfig { config });
+        let _ = actor.cast(ContinuousScanMessage::UpdateConfig {
+            config: Box::new(config),
+        });
         state.actors.insert(index_db, actor);
     }
 
@@ -1603,13 +2033,15 @@ async fn sync_single_db(
     }
 
     if let Some(actor) = state.actors.get(index_db) {
-        let _ = actor.cast(ContinuousScanMessage::UpdateConfig { config });
+        let _ = actor.cast(ContinuousScanMessage::UpdateConfig {
+            config: Box::new(config),
+        });
         return Ok(());
     }
 
     let args = ContinuousScanActorArgs {
         index_db: index_db.to_string(),
-        user_data_db: index_db.to_string(),
+        user_data_db: crate::db::info::db_defaults().1,
         data_dir: state.data_dir.clone(),
         enable_watcher: true,
     };
@@ -1620,7 +2052,9 @@ async fn sync_single_db(
     )
     .await
     .map_err(|err| ApiError::internal(format!("Failed to spawn continuous scan: {err:?}")))?;
-    let _ = actor.cast(ContinuousScanMessage::UpdateConfig { config });
+    let _ = actor.cast(ContinuousScanMessage::UpdateConfig {
+        config: Box::new(config),
+    });
     state.actors.insert(index_db.to_string(), actor);
     Ok(())
 }
@@ -1738,7 +2172,7 @@ pub(crate) async fn ensure_continuous_supervisor()
             Ok(actor)
         })
         .await
-        .map(Clone::clone)
+        .cloned()
 }
 
 /// Stops every continuous scan actor and then the supervisor itself. No-op
@@ -1842,6 +2276,7 @@ impl Drop for JobPauseGuard {
 mod tests {
     use super::*;
     use crate::db::migrations::migrate_databases_on_disk;
+    use crate::db::system_config::ContinuousFilescanConfig;
     use crate::test_utils::test_data_dir;
     use image::{ImageBuffer, Rgb};
     use ractor::Actor;
@@ -1895,6 +2330,8 @@ mod tests {
         let prepared = process_file(
             file_path.clone(),
             parse_filescan_filter(&config).map(Arc::new),
+            false,
+            FormatPolicy::default(),
             &ScanTimers::default(),
         )
         .unwrap();
@@ -1902,7 +2339,10 @@ mod tests {
             .cast(ContinuousScanMessage::WorkerResult {
                 epoch: 0,
                 scan_time: current_iso_timestamp(),
-                result: Ok(prepared),
+                path: file_path.clone(),
+                stat: None,
+                ledger_path: None,
+                result: Box::new(Ok(prepared)),
             })
             .unwrap();
 
@@ -1939,6 +2379,196 @@ mod tests {
                 .unwrap();
         assert!(row.is_some());
         assert!(row.unwrap().0.is_some());
+    }
+
+    // The continuous scan's own visuals-marker write. It deliberately never
+    // *consults* the negative cache (the pass runs in a worker with no database
+    // handle), but it must still record what it concluded — otherwise a file
+    // the user touched arrives in the index with a nothing that the next batch
+    // scan has to rediscover the hard way.
+    #[tokio::test]
+    async fn the_continuous_scan_records_visual_attempts() {
+        let test_env = test_data_dir();
+        let root = test_env.path().to_path_buf();
+        let index_db = unique_db_name("cont-visuals");
+        migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
+
+        let watch_dir = root.join("watch-visuals");
+        fs::create_dir_all(&watch_dir).unwrap();
+        // A PDF nothing can render: `blocked` where pdfium is missing, `failed`
+        // where it is present — either way a verdict the pass owes a marker
+        // for, with no toolchain to depend on.
+        let file_path = watch_dir.join("broken.pdf");
+        fs::write(&file_path, b"%PDF-1.7\nnothing in here parses\n").unwrap();
+
+        let store = SystemConfigStore::new(root.clone());
+        let mut config = store.load(&index_db).unwrap();
+        config.continuous_filescan.enabled = true;
+        config.scan_pdf = true;
+        config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let (actor, _handle) = Actor::spawn(
+            None,
+            ContinuousScanActor,
+            ContinuousScanActorArgs {
+                index_db: index_db.clone(),
+                user_data_db: index_db.clone(),
+                data_dir: root.clone(),
+                enable_watcher: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let prepared = process_file(
+            file_path.clone(),
+            parse_filescan_filter(&config).map(Arc::new),
+            false,
+            FormatPolicy::default(),
+            &ScanTimers::default(),
+        )
+        .unwrap();
+        assert!(
+            !prepared.visual_verdicts.is_empty(),
+            "the premise: this file's visuals are a verdict, not a success"
+        );
+        actor
+            .cast(ContinuousScanMessage::WorkerResult {
+                epoch: 0,
+                scan_time: current_iso_timestamp(),
+                path: file_path.clone(),
+                stat: None,
+                ledger_path: None,
+                result: Box::new(Ok(prepared)),
+            })
+            .unwrap();
+
+        let mut markers = 0;
+        for _ in 0..40 {
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
+            markers = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM storage.visual_attempts WHERE kind = 'thumbnail'",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            if markers > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        actor.stop(None);
+        assert_eq!(markers, 1, "the pass's conclusion must reach the cache");
+    }
+
+    // Image parity with the batch walker, which matters because the two reach
+    // the same code by different routes: a file whose pixels do not decode is
+    // indexed from its header, with its real dimensions and no visuals, and
+    // the failure is both remembered (the marker) and auditable (the row).
+    // The continuous scan is the half that indexes a file the moment the user
+    // touches it, so a stricter gate here would keep it out of the index until
+    // the next batch scan disagreed.
+    #[tokio::test]
+    async fn the_continuous_scan_indexes_an_undecodable_image() {
+        let test_env = test_data_dir();
+        let root = test_env.path().to_path_buf();
+        let index_db = unique_db_name("cont-undecodable");
+        migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
+
+        let watch_dir = root.join("watch-undecodable");
+        fs::create_dir_all(&watch_dir).unwrap();
+        let file_path = watch_dir.join("truncated.png");
+        let mut noise = image::RgbImage::new(64, 64);
+        for (x, y, pixel) in noise.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x * 7 % 251) as u8,
+                (y * 13 % 241) as u8,
+                (x * y % 239) as u8,
+            ]);
+        }
+        noise.save(&file_path).unwrap();
+        let bytes = fs::read(&file_path).unwrap();
+        fs::write(&file_path, &bytes[..bytes.len() * 6 / 10]).unwrap();
+
+        let store = SystemConfigStore::new(root.clone());
+        let mut config = store.load(&index_db).unwrap();
+        config.continuous_filescan.enabled = true;
+        config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let (actor, _handle) = Actor::spawn(
+            None,
+            ContinuousScanActor,
+            ContinuousScanActorArgs {
+                index_db: index_db.clone(),
+                user_data_db: index_db.clone(),
+                data_dir: root.clone(),
+                enable_watcher: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The event path end to end, so the audit row's write site is covered
+        // and not just the worker's construction of it.
+        actor
+            .cast(ContinuousScanMessage::DispatchStable {
+                epoch: 0,
+                path: file_path.clone(),
+            })
+            .unwrap();
+
+        let mut indexed = None;
+        for _ in 0..120 {
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
+            let row: Option<(Option<i64>, Option<i64>, Option<String>)> =
+                sqlx::query_as("SELECT width, height, blurhash FROM items")
+                    .fetch_optional(&mut conn)
+                    .await
+                    .unwrap();
+            if row.is_some() {
+                indexed = row;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            indexed,
+            Some((Some(64), Some(64), None)),
+            "indexed with header dimensions and no blurhash"
+        );
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let markers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM storage.visual_attempts \
+             WHERE kind = 'thumbnail' AND outcome = 'failed'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(markers, 1, "the decode verdict is remembered");
+        let audit: Option<(String, String)> =
+            sqlx::query_as("SELECT stage, error_class FROM scan_errors")
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            audit,
+            Some(("decode".to_string(), "input".to_string())),
+            "and stays visible in the failures surface"
+        );
+        actor.stop(None);
     }
 
     #[tokio::test]
@@ -1983,6 +2613,8 @@ mod tests {
         let prepared = process_file(
             file_path.clone(),
             parse_filescan_filter(&config).map(Arc::new),
+            false,
+            FormatPolicy::default(),
             &ScanTimers::default(),
         )
         .unwrap();
@@ -1990,7 +2622,10 @@ mod tests {
             .cast(ContinuousScanMessage::WorkerResult {
                 epoch: 0,
                 scan_time: current_iso_timestamp(),
-                result: Ok(prepared),
+                path: file_path.clone(),
+                stat: None,
+                ledger_path: None,
+                result: Box::new(Ok(prepared)),
             })
             .unwrap();
 
@@ -2129,6 +2764,136 @@ mod tests {
         assert!(found, "poll mode did not index the new file in time");
     }
 
+    // The continuous scan used to throw the error variant away entirely — the
+    // counter moved and nothing said which file or why, so a broken file was
+    // re-hashed on every watcher event forever. It now records the verdict and
+    // consults it before dispatching the next event for the same path.
+    #[tokio::test]
+    async fn continuous_scan_records_and_then_skips_a_broken_file() {
+        let test_env = test_data_dir();
+        let root = test_env.path().to_path_buf();
+        let index_db = unique_db_name("contledger");
+        let _ = migrate_databases_on_disk(Some(&index_db), Some(&index_db))
+            .await
+            .unwrap();
+
+        let watch_dir = root.join("ledgerwatch");
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let broken = watch_dir.join("broken.png");
+        std::fs::write(&broken, b"this claims to be a png and is not").unwrap();
+
+        let store = SystemConfigStore::new(root.clone());
+        let mut config = store.load(&index_db).unwrap();
+        config.continuous_filescan.enabled = true;
+        config.included_folders = vec![watch_dir.to_string_lossy().to_string()];
+        store.save(&index_db, &config).unwrap();
+
+        let (actor, handle) = Actor::spawn(
+            None,
+            ContinuousScanActor,
+            ContinuousScanActorArgs {
+                index_db: index_db.clone(),
+                user_data_db: index_db.clone(),
+                data_dir: root.clone(),
+                // No watcher and no poller: the events under test are cast by
+                // hand, so nothing else can dispatch this path.
+                enable_watcher: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        async fn row(index_db: &str) -> Option<(String, String, i64, i64)> {
+            let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+                .await
+                .unwrap();
+            sqlx::query_as("SELECT stage, error_class, attempts, skip_after FROM scan_errors")
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap()
+        }
+
+        actor
+            .cast(ContinuousScanMessage::DispatchStable {
+                epoch: 0,
+                path: broken.clone(),
+            })
+            .unwrap();
+
+        let mut recorded = None;
+        for _ in 0..120 {
+            if let Some(found) = row(&index_db).await {
+                recorded = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            recorded,
+            Some(("header".to_string(), "input".to_string(), 1, 2)),
+            "an unparseable header is an input verdict awaiting a later run's confirmation"
+        );
+
+        // A second event for the same unchanged file must not re-process it.
+        // The session cache answers it before the ledger is even consulted (one
+        // stat, no query), which is what keeps an *unconfirmed* verdict from
+        // being re-hashed and re-upserted on every event: `attempts` dedups on
+        // the scan id, and a continuous scan's id spans the whole session, so
+        // the ledger alone could not stop that. The recorded row is unchanged
+        // either way; the scan's own error counter, asserted after the stop
+        // below, is what distinguishes "suppressed" from "silently redone".
+        actor
+            .cast(ContinuousScanMessage::DispatchStable {
+                epoch: 0,
+                path: broken.clone(),
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            row(&index_db).await,
+            Some(("header".to_string(), "input".to_string(), 1, 2)),
+            "a suppressed file is not re-attempted"
+        );
+
+        // Repairing it clears the verdict and indexes the file.
+        write_test_image(&broken);
+        actor
+            .cast(ContinuousScanMessage::DispatchStable {
+                epoch: 0,
+                path: broken.clone(),
+            })
+            .unwrap();
+        let mut cleared = false;
+        for _ in 0..120 {
+            if row(&index_db).await.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        actor.stop(None);
+        let _ = handle.await;
+        assert!(cleared, "a file that works owes no verdict");
+
+        // Stopping closes the scan record, which is where the counters land.
+        // Exactly one failure was ever *processed*: the second event was
+        // answered from the session cache with a single stat.
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let errors: i64 = sqlx::query_scalar(
+            "SELECT errors FROM file_scans WHERE path = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(CONTINUOUS_PATH_SENTINEL)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            errors, 1,
+            "the second event must be suppressed, not re-processed"
+        );
+    }
+
     #[test]
     fn continuous_includes_subset_of_global() {
         let tmp = TempDir::new().unwrap();
@@ -2138,9 +2903,14 @@ mod tests {
         fs::write(global_root.join("dummy.txt"), "x").unwrap();
         fs::write(subset.join("dummy.txt"), "x").unwrap();
 
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![global_root.to_string_lossy().to_string()];
-        config.continuous_filescan.included_folders = vec![subset.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![global_root.to_string_lossy().to_string()],
+            continuous_filescan: ContinuousFilescanConfig {
+                included_folders: vec![subset.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let outcome = compute_watch_roots(&config);
         assert!(outcome.valid);
@@ -2158,10 +2928,14 @@ mod tests {
         fs::write(global_root.join("dummy.txt"), "x").unwrap();
         fs::write(outside_root.join("dummy.txt"), "x").unwrap();
 
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![global_root.to_string_lossy().to_string()];
-        config.continuous_filescan.included_folders =
-            vec![outside_root.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![global_root.to_string_lossy().to_string()],
+            continuous_filescan: ContinuousFilescanConfig {
+                included_folders: vec![outside_root.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let outcome = compute_watch_roots(&config);
         assert!(!outcome.valid);
@@ -2254,11 +3028,15 @@ mod tests {
         fs::write(global_root.join("dummy.txt"), "x").unwrap();
         fs::write(excluded_root.join("dummy.txt"), "x").unwrap();
 
-        let mut config = SystemConfig::default();
-        config.included_folders = vec![global_root.to_string_lossy().to_string()];
-        config.excluded_folders = vec![excluded_root.to_string_lossy().to_string()];
-        config.continuous_filescan.included_folders =
-            vec![excluded_root.to_string_lossy().to_string()];
+        let config = SystemConfig {
+            included_folders: vec![global_root.to_string_lossy().to_string()],
+            excluded_folders: vec![excluded_root.to_string_lossy().to_string()],
+            continuous_filescan: ContinuousFilescanConfig {
+                included_folders: vec![excluded_root.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let outcome = compute_watch_roots(&config);
         assert!(!outcome.valid);
@@ -2408,5 +3186,52 @@ mod tests {
         );
         assert!(gate.load(Ordering::SeqCst), "probe never re-opens the gate");
         actor.stop(None);
+    }
+
+    // Event paths arrive absolute, so the directories they sit under are only
+    // ever judged at admission — every dispatch route (native watcher, the
+    // poller's settled changes, renames, removals) passes through here. A
+    // junk directory below the root takes its whole subtree with it, while the
+    // root itself is exempt, exactly as in the batch walk.
+    #[test]
+    fn junk_directories_are_rejected_at_admission() {
+        let root = PathBuf::from(r"C:\watch");
+        let roots = vec![root.clone()];
+        let excluded = vec![root.join("excluded")];
+        let extensions = HashSet::from([".png".to_string()]);
+        let admits = |path: PathBuf| path_passes_filters(&path, &roots, &excluded, &extensions);
+
+        assert!(admits(root.join("a.png")));
+        assert!(admits(root.join("sub/a.png")));
+        assert!(!admits(root.join(".Trashes/a.png")));
+        assert!(!admits(root.join("__MACOSX/a.png")));
+        assert!(!admits(root.join("sub/__macosx/deep/a.png")));
+        // The pre-existing rules are unchanged by the new one.
+        assert!(!admits(root.join("._a.png")));
+        assert!(!admits(root.join("a.txt")));
+        assert!(!admits(root.join("excluded/a.png")));
+        assert!(!admits(PathBuf::from(r"C:\elsewhere\a.png")));
+        assert!(!path_passes_filters(
+            &root.join("a.png"),
+            &[],
+            &excluded,
+            &extensions
+        ));
+
+        // A dot-named watch root is watched: the exemption is the root's, not
+        // the name's.
+        let dot_root = PathBuf::from(r"C:\watch-dotted\.hidden");
+        assert!(path_passes_filters(
+            &dot_root.join("a.png"),
+            std::slice::from_ref(&dot_root),
+            &[],
+            &extensions
+        ));
+        assert!(!path_passes_filters(
+            &dot_root.join(".Trashes/a.png"),
+            &[dot_root],
+            &[],
+            &extensions
+        ));
     }
 }

@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::jobs::files::{
-    format_system_time, has_allowed_extension, is_excluded, is_hidden_or_temp,
+    format_system_time, has_allowed_extension, is_excluded, is_hidden_or_temp, is_junk_dir_name,
+    is_under_junk_dir,
 };
 
 /// Path filters mirroring `should_process_path` in the continuous scan actor.
@@ -97,7 +98,10 @@ pub(crate) fn seed_snapshot(rows: &[(String, String)], filters: &PollFilters) ->
         if !filters.roots.iter().any(|root| path.starts_with(root)) {
             continue;
         }
-        if is_excluded(&path, &filters.excluded_roots) || is_hidden_or_temp(&path) {
+        if is_excluded(&path, &filters.excluded_roots)
+            || is_hidden_or_temp(&path)
+            || is_under_junk_dir(&path, &filters.roots)
+        {
             continue;
         }
         if !has_allowed_extension(&path, &filters.allowed_extensions) {
@@ -149,6 +153,12 @@ fn enumerate_dir(dir: &Path, filters: &PollFilters) -> std::io::Result<DirListin
             Err(_) => continue,
         };
         if metadata.is_dir() {
+            // A junk directory is not descended into at all. Children of an
+            // enumerated directory are always strictly below a watched root,
+            // so the walk's root exemption has nothing to answer here.
+            if is_junk_dir_name(&name) {
+                continue;
+            }
             subdirs.insert(name);
         } else if metadata.is_file() {
             if is_hidden_or_temp(&path)
@@ -538,5 +548,83 @@ mod tests {
         let dir = snapshot.dirs.get(&root).unwrap();
         assert_eq!(dir.files.len(), 1);
         assert!(dir.files.contains_key(&OsString::from("keep.png")));
+    }
+
+    // The poller's half of the macOS-junk rules: a junk directory is not
+    // descended into, so nothing under it is stat'd, enumerated or reported —
+    // and its whole subtree goes with it, since the deeper directories are
+    // only ever reached through it.
+    #[test]
+    fn junk_subdirs_are_never_enumerated() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.png"), "a").unwrap();
+        for junk in [".Trashes", "__MACOSX"] {
+            let dir = root.join(junk);
+            fs::create_dir(&dir).unwrap();
+            // Ordinary names inside: the file-name rules never see these.
+            fs::write(dir.join("sidecar.png"), "x").unwrap();
+        }
+        let deep = root.join("__MACOSX").join("deep");
+        fs::create_dir(&deep).unwrap();
+        fs::write(deep.join("deeper.png"), "x").unwrap();
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("b.png"), "b").unwrap();
+
+        let filters = png_filters(root);
+        let listing = enumerate_dir(root, &filters).unwrap();
+        assert_eq!(
+            listing.subdirs,
+            HashSet::from([OsString::from("sub")]),
+            "a junk directory is not a directory the poller will visit"
+        );
+
+        let outcome = run_poll_pass(PollerSnapshot::default(), &filters);
+        assert_eq!(
+            change_paths(&outcome),
+            HashSet::from([root.join("a.png"), sub.join("b.png")])
+        );
+    }
+
+    // Seeding reads paths out of the database rather than walking to them, so
+    // the directories a row passed through are only ever judged here. Rows
+    // written before the traversal rules existed are exactly what this filters.
+    #[test]
+    fn seed_snapshot_drops_rows_under_a_junk_directory() {
+        let root = PathBuf::from("C:\\watch");
+        let filters = PollFilters {
+            roots: vec![root.clone()],
+            excluded_roots: Vec::new(),
+            allowed_extensions: HashSet::from([".png".to_string()]),
+        };
+        let mtime = "2024-01-01T00:00:00".to_string();
+        let path = |relative: &str| root.join(relative).to_string_lossy().to_string();
+        let rows = vec![
+            (path("keep.png"), mtime.clone()),
+            (path("sub/keep.png"), mtime.clone()),
+            (path(".Trashes/no.png"), mtime.clone()),
+            (path("__MACOSX/deep/no.png"), mtime.clone()),
+        ];
+
+        let snapshot = seed_snapshot(&rows, &filters);
+        let mut dirs: Vec<PathBuf> = snapshot.dirs.keys().cloned().collect();
+        dirs.sort();
+        assert_eq!(dirs, vec![root.clone(), root.join("sub")]);
+
+        // A dot-named root judges only what is below it: the root's own name
+        // is what the user registered.
+        let dot_root = root.join(".dotted");
+        let dotted_filters = PollFilters {
+            roots: vec![dot_root.clone()],
+            ..filters
+        };
+        let rows = vec![(
+            dot_root.join("inside.png").to_string_lossy().to_string(),
+            mtime,
+        )];
+        let snapshot = seed_snapshot(&rows, &dotted_filters);
+        assert_eq!(snapshot.dir_count(), 1);
+        assert!(snapshot.dirs.contains_key(&dot_root));
     }
 }

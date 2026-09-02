@@ -97,7 +97,7 @@ pub(crate) fn start(settings: &Settings) -> Result<UiServerHandle> {
         host,
         port,
         base_url: ui.base_url.clone(),
-        api_url: crate::config::loopback_base_url(&settings.server.host, settings.server.port),
+        api_url: settings.ui_api_base_url(),
         node_override: ui.node.clone(),
         build: ui.build,
     };
@@ -390,13 +390,13 @@ async fn run_logged(
         _ = stopped(stop) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            // Dropping the guard closes the job object, reaping any
+            // Releasing the guard closes the job object, reaping any
             // grandchildren start_kill did not reach.
-            drop(job_guard);
+            job_guard.release();
             return Ok(CommandEnd::Stopped);
         }
     };
-    drop(job_guard);
+    job_guard.release();
     // The forwarders end on pipe EOF; join so trailing output lands in the
     // log before the exit status does.
     let _ = stdout_task.await;
@@ -600,9 +600,7 @@ fn resolve_node(explicit: Option<&Path>, base: &Path) -> PathBuf {
     }
     venv_node_candidates(base)
         .into_iter()
-        .find(|candidate| {
-            candidate.is_file() && crate::host_paths::can_spawn(candidate, &["-v"])
-        })
+        .find(|candidate| candidate.is_file() && crate::host_paths::can_spawn(candidate, &["-v"]))
         .map(absolutize)
         .unwrap_or_else(|| PathBuf::from("node"))
 }

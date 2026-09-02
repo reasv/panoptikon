@@ -1,6 +1,6 @@
 [package]
 name = "panoptikon"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -53,6 +53,18 @@ walkdir = "2"
 mime_guess = "2"
 md-5 = "0.10"
 image = { version = "0.25", default-features = true }
+# Grid/display still encoders (docs/thumbnail-format-implementation.md §2).
+# jpeg-encoder: pure Rust, baseline 4:4:4 with optimized Huffman tables and
+# mozjpeg's quantization table — 91% of the `image` crate's bytes at higher
+# SSIM, and no `nasm` on any release leg (mozjpeg would need one, §9).
+jpeg-encoder = "0.7"
+# Lossy WebP, which `image-webp` cannot write (it encodes lossless only).
+# Pulls libwebp-sys, whose vendored C builds with `cc` alone — no cmake, no
+# nasm — so every packaging leg needs a C compiler and nothing more.
+# `default-features = false` drops the `img` feature: its `from_image` refuses
+# any 16-bit `DynamicImage` variant, and the raw `from_rgb`/`from_rgba` level
+# below it is what the encoder deliberately uses.
+webp = { version = "0.3", default-features = false }
 notify = "8.2.0"
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 sqlx = { version = "0.9", features = [
@@ -63,6 +75,7 @@ sqlx = { version = "0.9", features = [
 ] }
 anyhow = "1"
 panoptikon-config = { path = "../panoptikon-config" }
+panoptikon-clipboard = { path = "../panoptikon-clipboard" }
 config = "0.14"
 url = "2"
 clap = { version = "4", features = ["derive"] }
@@ -85,6 +98,7 @@ sqlite-vec = "0.1.9"
 # (up from 3.45.x on the old 0.28 pin).
 libsqlite3-sys = "0.37"
 base64 = "0.22"
+tungstenite = "0.29"
 tempfile = "3"
 ractor = "0.15"
 blurhash = "0.2.3"

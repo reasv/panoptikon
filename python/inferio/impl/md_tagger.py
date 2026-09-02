@@ -6,7 +6,13 @@ from typing import List, Sequence, Tuple, Type
 
 from PIL import Image as PILImage
 
-from inferio.impl.utils import clear_cache, extract_partial_json_array, get_device, load_image_from_buffer
+from inferio.impl.utils import (
+    assemble_slots,
+    clear_cache,
+    decode_image_inputs,
+    extract_partial_json_array,
+    get_device,
+)
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 
@@ -110,14 +116,12 @@ class MoondreamTagger(InferenceModel):
 
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
-        image_inputs: List[PILImage.Image] = []
         configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
-        for input_item in inputs:
-            if input_item.file:
-                image: PILImage.Image = load_image_from_buffer(input_item.file)
-                image_inputs.append(image)
-            else:
-                raise ValueError("Moondream requires image inputs.")
+        # Undecodable payloads are excluded before anything is encoded and
+        # come back as error slots (docs/inferio-worker-protocol.md).
+        image_inputs, kept, slots = decode_image_inputs(
+            inputs, what="Moondream", logger=logger
+        )
 
         results: List[Tuple[str, str | None]] = []
         for image in image_inputs:
@@ -147,7 +151,7 @@ class MoondreamTagger(InferenceModel):
         ), "Mismatch in input and output."
 
         outputs: List[dict] = []
-        for (file_text, rating_text), config in zip(results, configs):
+        for file_text, rating_text in results:
             # Parse the JSON output
             try:
                 tag_list = json.loads(file_text)
@@ -206,10 +210,7 @@ class MoondreamTagger(InferenceModel):
                 }
             )
 
-        assert len(outputs) == len(
-            inputs
-        ), f"Expected {len(inputs)} outputs but got {len(outputs)}"
-        return outputs
+        return assemble_slots(len(inputs), kept, outputs, slots)
 
     def unload(self) -> None:
         if self._model_loaded:

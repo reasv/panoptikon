@@ -7,7 +7,7 @@ from typing import List, Sequence, Type, Union
 from PIL import Image as PILImage
 from PIL import ImageFile
 
-from inferio.impl.utils import load_image_from_buffer, serialize_array
+from inferio.impl.utils import load_image_or_slot, serialize_array
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 import logging
@@ -90,7 +90,7 @@ class JinaClipModel(InferenceModel):
         # Ensure model (API key presence) is 'loaded'
         self.load()
 
-        results: List[None | bytes] = [None] * len(inputs)
+        results: List[None | bytes | dict] = [None] * len(inputs)
 
         text_inputs = []
         image_inputs = []
@@ -98,9 +98,15 @@ class JinaClipModel(InferenceModel):
         # Separate text and image inputs, storing their original indices
         for idx, input_item in enumerate(inputs):
             if input_item.file:
-                # Convert raw bytes to base64 data URL
+                # Convert raw bytes to base64 data URL. Decoding is only a
+                # format probe here, but it is still this input's own payload,
+                # so an undecodable one takes its own slot instead of the whole
+                # batch (docs/inferio-worker-protocol.md).
                 image_bytes = input_item.file
-                image = load_image_from_buffer(input_item.file)
+                image, slot = load_image_or_slot(input_item.file, logger=logger)
+                if slot is not None:
+                    results[idx] = slot
+                    continue
 
                 # If the format is unknown, fallback to 'png'
                 mime = image.format.lower() if image.format else "png"
@@ -136,9 +142,11 @@ class JinaClipModel(InferenceModel):
             image_map.append(idx)
             jina_input.append({"image": img_url})
 
-        # If nothing to send, return empty
+        # Nothing left to send: every input was excluded, so the response is
+        # the error slots alone (never an empty batch, which would be a count
+        # mismatch).
         if not jina_input:
-            return []
+            return [res for res in results if res is not None]
 
         # Make the request
         api_key = self.api_key  # already checked in load()

@@ -249,7 +249,11 @@ pub(super) fn build(
             ));
         };
         let Some(row) = identify(roots, *node, props, index) else {
-            return Err(ProbeFailure::logged("identity read failed", gpu_nodes, count));
+            return Err(ProbeFailure::logged(
+                "identity read failed",
+                gpu_nodes,
+                count,
+            ));
         };
         rows.push(row);
     }
@@ -642,7 +646,8 @@ fn unified_facts(
     device: &Path,
     vram_total_mb: u64,
 ) -> Option<UnifiedFacts> {
-    let Some(gtt_total_mb) = read_mb(&device.join("mem_info_gtt_total")).filter(|mb| *mb > 0) else {
+    let Some(gtt_total_mb) = read_mb(&device.join("mem_info_gtt_total")).filter(|mb| *mb > 0)
+    else {
         tracing::warn!(
             node,
             bdf = %bdf,
@@ -1498,7 +1503,9 @@ mod tests {
             io::ErrorKind::PermissionDenied,
             "the premise of this test"
         );
-        let rows = fixture.build().expect("the hidden node is skipped, not fatal");
+        let rows = fixture
+            .build()
+            .expect("the hidden node is skipped, not fatal");
         assert_eq!(
             rows.iter()
                 .map(|row| (row.index, row.bdf.as_deref().unwrap_or("")))
@@ -1697,12 +1704,8 @@ mod tests {
             discrete("GPU-a", "0000:03:00.0"),
             discrete("GPU-b", "0000:0c:00.0"),
         ];
-        let readings = query_memory(
-            &fixture.roots.pci_devices,
-            &fixture.roots.meminfo,
-            &boards,
-        )
-        .expect("read");
+        let readings = query_memory(&fixture.roots.pci_devices, &fixture.roots.meminfo, &boards)
+            .expect("read");
         assert_eq!(
             readings,
             vec![
@@ -1754,9 +1757,11 @@ mod tests {
         // 512 MiB carve-out (half used), a 64 GiB GTT window with 4 GiB of it
         // taken, and 8 GiB of RAM the OS says it could deliver.
         let fixture = Fixture::new().meminfo(MEM_TOTAL_KB, 8 * 1024 * 1024);
-        fixture
-            .pci("0000:03:00.0", CARVE_512M, CARVE_512M / 2)
-            .gtt("0000:03:00.0", 64 * gib, 4 * gib);
+        fixture.pci("0000:03:00.0", CARVE_512M, CARVE_512M / 2).gtt(
+            "0000:03:00.0",
+            64 * gib,
+            4 * gib,
+        );
         let roots = &fixture.roots;
         let read = |board: BoardRef| {
             query_memory(&roots.pci_devices, &roots.meminfo, &[board]).map(|mut r| r.remove(0))
@@ -1773,9 +1778,11 @@ mod tests {
         );
         // Plenty of RAM: the GTT term is the driver's own figure again.
         let roomy = Fixture::new().meminfo(MEM_TOTAL_KB, 100 * 1024 * 1024);
-        roomy
-            .pci("0000:03:00.0", CARVE_512M, CARVE_512M / 2)
-            .gtt("0000:03:00.0", 64 * gib, 4 * gib);
+        roomy.pci("0000:03:00.0", CARVE_512M, CARVE_512M / 2).gtt(
+            "0000:03:00.0",
+            64 * gib,
+            4 * gib,
+        );
         assert_eq!(
             query_memory(
                 &roomy.roots.pci_devices,
@@ -1903,7 +1910,10 @@ mod tests {
             apu_board_name("gfx90c", 32 * 1024 - 8),
             "AMD gfx90c APU (32 GB)"
         );
-        assert_eq!(apu_board_name("gfx90c", 30 * 1024), "AMD gfx90c APU (32 GB)");
+        assert_eq!(
+            apu_board_name("gfx90c", 30 * 1024),
+            "AMD gfx90c APU (32 GB)"
+        );
         assert_eq!(apu_board_name("gfx90c", 0), "AMD gfx90c APU (4 GB)");
         // Sizes that price differently still separate.
         assert_eq!(capacity_gb_up_4(64 * 1024 - 1800), 64);

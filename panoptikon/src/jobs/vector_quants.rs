@@ -12,11 +12,19 @@ use crate::api_error::ApiError;
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::vector_quants::{
     BACKFILL_CHUNK_ROWS, DELETE_CHUNK_ROWS, DesiredState, RECONCILE_JOB_TAG, ReconcileWork,
-    SpaceBuild, analyze, compute_mean_artifact, load_desired_state, load_snapshot, plan_data,
+    SpaceBuild, analyze, compute_int8_scale_artifact, load_desired_state, load_snapshot, plan_data,
 };
-use crate::jobs::queue::{BatchDedup, JobRequest, JobType, enqueue_jobs_with_dedup};
+use crate::jobs::queue::{BatchDedup, ChangeSummary, JobRequest, JobType, enqueue_jobs_with_dedup};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
+
+/// One reconcile pass's report: whether it did anything (drives the
+/// convergence loop) and what it changed (drives the job boundary's
+/// deferred-maintenance accounting).
+struct PassOutcome {
+    worked: bool,
+    summary: ChangeSummary,
+}
 
 /// Bound on desired-state re-checks within one job run (see below); real
 /// convergence takes one or two passes, the bound only guards against a
@@ -30,14 +38,25 @@ const MAX_CONVERGENCE_PASSES: usize = 8;
 /// remains: a config commit that lands *while* this job is running would
 /// otherwise be lost — its reconcile enqueue is deduplicated against this
 /// very job, so this job must be the one to converge to the newest TOML.
-pub(crate) async fn run_reconcile(index_db: &str) -> ApiResult<()> {
+///
+/// Returns what the run changed so the job boundary can owe deferred
+/// maintenance for it. This is load-bearing since the int8 remap: a rebuild
+/// fills `embedding_quants` with fresh rows the planner has no statistics
+/// for, and without the post-maintenance ANALYZE it drives the quant
+/// distance CTE from the *whole* quant table (every model's rows) instead
+/// of the setter's — measured on the production index, that mis-plan
+/// consumed int8's entire speed win (docs/vector-int8-quant.md §3a).
+pub(crate) async fn run_reconcile(index_db: &str) -> ApiResult<ChangeSummary> {
+    let mut total = ChangeSummary::default();
     for pass in 0..MAX_CONVERGENCE_PASSES {
         let Some(desired) = load_desired_state(index_db) else {
             // Invalid config is inert by design; nothing to converge to.
-            return Ok(());
+            return Ok(total);
         };
-        if !run_reconcile_pass(index_db, desired).await? {
-            return Ok(());
+        let outcome = run_reconcile_pass(index_db, desired).await?;
+        total.or_with(outcome.summary);
+        if !outcome.worked {
+            return Ok(total);
         }
         tracing::debug!(index_db, pass, "vector quant reconcile pass complete");
     }
@@ -46,12 +65,14 @@ pub(crate) async fn run_reconcile(index_db: &str) -> ApiResult<()> {
         "vector quant reconcile did not converge within the pass bound; \
          the remainder converges at the next batch job"
     );
-    Ok(())
+    Ok(total)
 }
 
-/// One reconcile pass against a fixed desired state. Returns whether any
-/// work was performed (false = nothing to do, converged).
-async fn run_reconcile_pass(index_db: &str, desired: DesiredState) -> ApiResult<bool> {
+/// One reconcile pass against a fixed desired state. `worked == false`
+/// means nothing to do, converged. On the error path (per-space failures)
+/// the flags are lost with it — the queue then falls back to the
+/// pessimistic summary, which owes the same maintenance.
+async fn run_reconcile_pass(index_db: &str, desired: DesiredState) -> ApiResult<PassOutcome> {
     // Metadata first: profiles/coverage rows exist before any data work.
     let changed = call_index_db_writer(index_db, |reply| {
         IndexDbWriterMessage::VectorQuantSyncMetadata {
@@ -70,8 +91,12 @@ async fn run_reconcile_pass(index_db: &str, desired: DesiredState) -> ApiResult<
         load_snapshot(&mut conn, desired.clone()).await?
     };
     let plan = plan_data(&snapshot);
+    let mut summary = ChangeSummary::default();
     if plan.is_empty() {
-        return Ok(changed);
+        return Ok(PassOutcome {
+            worked: changed,
+            summary,
+        });
     }
     tracing::info!(
         index_db,
@@ -90,6 +115,8 @@ async fn run_reconcile_pass(index_db: &str, desired: DesiredState) -> ApiResult<
         if let Err(err) = remove_profile_quants(index_db, *profile_id).await {
             tracing::error!(index_db, profile_id, error = ?err, "quant profile removal failed");
             failures += 1;
+        } else {
+            summary.deleted_data = true;
         }
     }
 
@@ -113,6 +140,8 @@ async fn run_reconcile_pass(index_db: &str, desired: DesiredState) -> ApiResult<
                 "quant space build failed; pair(s) stay non-ready (exact search)"
             );
             failures += 1;
+        } else {
+            summary.wrote_data = true;
         }
     }
 
@@ -123,7 +152,10 @@ async fn run_reconcile_pass(index_db: &str, desired: DesiredState) -> ApiResult<
             "Vector quant reconcile completed with failures; see logs",
         ));
     }
-    Ok(true)
+    Ok(PassOutcome {
+        worked: true,
+        summary,
+    })
 }
 
 async fn remove_profile_quants(index_db: &str, profile_id: i64) -> ApiResult<()> {
@@ -141,7 +173,12 @@ async fn remove_profile_quants(index_db: &str, profile_id: i64) -> ApiResult<()>
         if deleted == 0 {
             break;
         }
-        tracing::debug!(index_db, profile_id, deleted_total, "quant removal progress");
+        tracing::debug!(
+            index_db,
+            profile_id,
+            deleted_total,
+            "quant removal progress"
+        );
     }
     call_index_db_writer(index_db, |reply| {
         IndexDbWriterMessage::VectorQuantDropProfile { profile_id, reply }
@@ -155,7 +192,8 @@ async fn build_space(index_db: &str, profile_id: i64, build: &SpaceBuild) -> Api
     if !build.resume {
         let artifact = if build.needs_artifact {
             let mut conn = crate::db::open_index_db_read_no_user_data(index_db).await?;
-            let artifact = compute_mean_artifact(&mut conn, &build.setter_ids, build.dim).await?;
+            let artifact =
+                compute_int8_scale_artifact(&mut conn, &build.setter_ids, build.dim).await?;
             match artifact {
                 Some(artifact) => Some(artifact),
                 // Vectors vanished since the plan was computed; nothing to do.
@@ -238,9 +276,15 @@ async fn build_space(index_db: &str, profile_id: i64, build: &SpaceBuild) -> Api
 /// discrepant. Never fails the parent job — a reconcile error leaves the
 /// discrepancy standing (search stays exact, converges at the next natural
 /// point).
-pub(crate) async fn finishing_phase(index_db: &str) {
+///
+/// Returns what the inline reconcile changed so the parent job can fold it
+/// into its own change summary — a parent that itself changed nothing (a
+/// no-op rescan) would otherwise let a quant rebuild slip past the deferred
+/// ANALYZE it needs (see `run_reconcile`). A reconcile *error* reports both
+/// flags set: chunks committed before the failure are real writes.
+pub(crate) async fn finishing_phase(index_db: &str) -> ChangeSummary {
     let Some(desired) = load_desired_state(index_db) else {
-        return;
+        return ChangeSummary::default();
     };
     let work = {
         let conn = crate::db::open_index_db_read_no_user_data(index_db).await;
@@ -250,14 +294,21 @@ pub(crate) async fn finishing_phase(index_db: &str) {
         }
     };
     match work {
-        Ok(ReconcileWork::None) => {}
-        Ok(_) => {
-            if let Err(err) = run_reconcile(index_db).await {
+        Ok(ReconcileWork::None) => ChangeSummary::default(),
+        Ok(_) => match run_reconcile(index_db).await {
+            Ok(summary) => summary,
+            Err(err) => {
                 tracing::error!(index_db, error = ?err, "vector quant finishing phase failed");
+                ChangeSummary {
+                    wrote_data: true,
+                    deleted_data: true,
+                    tags_changed: false,
+                }
             }
-        }
+        },
         Err(err) => {
             tracing::error!(index_db, error = ?err, "vector quant check failed");
+            ChangeSummary::default()
         }
     }
 }

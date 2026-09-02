@@ -8,9 +8,12 @@
 //! the chunked data operations (artifact build, backfill, removal) the
 //! reconcile job drives through the writer.
 //!
-//! Quantization itself happens entirely in SQL via sqlite-vec scalar
-//! functions (`vec_quantize_binary`, `vec_sub`), on both the write and the
-//! query side, so bit order is definitionally consistent everywhere.
+//! Quantization itself is one Rust codec (see the "int8 codec" section
+//! below), used by the backfill, the inline hook and the query path alike,
+//! so the stored codes and a query's codes are byte-compatible by
+//! construction. Only the *distance* runs in SQL, through sqlite-vec's
+//! int8 kernels (`vec_distance_L2` / `vec_distance_cosine` over
+//! `vec_int8(...)`). See docs/vector-int8-quant.md.
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,8 +28,9 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 
 /// Below this many vectors in an embedding space, no artifact is computed
 /// and the pair stays `pending` (search is exact — instant at that size).
-/// Artifacts freeze: a mean from a handful of vectors frozen forever is the
-/// dangerous case. Compile-time constant in v1 by design.
+/// Artifacts freeze: a scale derived from a handful of vectors and frozen
+/// forever is the dangerous case (every later vector clamps against it).
+/// Compile-time constant in v1 by design.
 pub(crate) const ARTIFACT_MIN_VECTORS: i64 = 1024;
 
 /// Rows per backfill writer transaction.
@@ -52,24 +56,34 @@ pub(crate) fn xmodal_text_sibling_name(model: &str) -> String {
 // Desired state
 // ---------------------------------------------------------------------------
 
+/// The only quantizer kind. `binary` is retired (docs/vector-int8-quant.md).
+pub(crate) const QUANTIZER_INT8: &str = "int8";
+
+/// The retired binary quantizer's TOML spelling, still accepted on the load
+/// path (mapped to int8) so an existing hand-written config keeps working.
+const QUANTIZER_BINARY_RETIRED: &str = "binary";
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DesiredProfile {
     pub name: String,
+    /// Always [`QUANTIZER_INT8`]; carried explicitly because it is what the
+    /// profile row stores and what a recipe-change diff compares.
     pub quantizer: String,
-    pub centered: bool,
 }
 
 impl DesiredProfile {
     /// Canonical recipe-options JSON stored on the profile row and compared
-    /// against it to detect recipe edits.
+    /// against it to detect recipe edits. Binary-era rows carry
+    /// `{"centered":...}`, so the diff resets them on sight — before the
+    /// quantizer string is even compared.
     pub(crate) fn options_json(&self) -> String {
-        format!("{{\"centered\":{}}}", self.centered)
+        "{\"scheme\":\"gsym\"}".to_string()
     }
 
-    /// Whether the recipe requires a data-derived artifact (the per-space
-    /// mean). Plain sign-binarization needs none.
+    /// Whether the recipe requires a data-derived artifact. int8-gsym always
+    /// does: the per-space absmax scale.
     pub(crate) fn needs_artifact(&self) -> bool {
-        self.centered
+        true
     }
 }
 
@@ -79,12 +93,33 @@ pub(crate) struct DesiredState {
     pub default_name: Option<String>,
 }
 
-/// Validates and normalizes the desired state. Returns a user-addressable
-/// message on invalid config; the config-commit API rejects before saving,
-/// while load-time callers log and treat the section as no work.
+/// Rewrites retired quantizer kinds to their successors in place: `binary`
+/// becomes `int8` (and the binary-only `centered` flag is cleared). Returns
+/// whether anything changed. The config-commit path runs this before
+/// validating and saving, so a legacy section converges to `int8` *in the
+/// file* at the first settings save — after which the load-path mapping in
+/// [`resolve_desired`] has nothing left to warn about. Rejecting the retired
+/// kind there instead would break every unrelated settings save on a DB
+/// whose section predates the remap (the UI round-trips the full config).
+pub(crate) fn normalize_retired(config: &mut VectorQuantsConfig) -> bool {
+    let mut changed = false;
+    for profile in &mut config.profiles {
+        if profile.quantizer == QUANTIZER_BINARY_RETIRED {
+            profile.quantizer = QUANTIZER_INT8.to_string();
+            profile.centered = false;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Validates and normalizes the desired state, mapping the retired `binary`
+/// quantizer to int8. Returns a user-addressable message on invalid config;
+/// load-time callers log and treat the section as no work.
 pub(crate) fn resolve_desired(config: &VectorQuantsConfig) -> Result<DesiredState, String> {
     let mut names = HashSet::new();
     let mut profiles = Vec::with_capacity(config.profiles.len());
+    let mut retired_seen = false;
     for profile in &config.profiles {
         let name = profile.name.trim();
         if name.is_empty() {
@@ -93,17 +128,35 @@ pub(crate) fn resolve_desired(config: &VectorQuantsConfig) -> Result<DesiredStat
         if !names.insert(name.to_string()) {
             return Err(format!("Duplicate vector quant profile name: {name}"));
         }
-        if profile.quantizer != "binary" {
-            return Err(format!(
-                "Unknown quantizer '{}' for profile '{name}': only 'binary' is supported",
-                profile.quantizer
-            ));
+        match profile.quantizer.as_str() {
+            QUANTIZER_INT8 => {}
+            QUANTIZER_BINARY_RETIRED => {
+                // Migration path: the profile keeps its name, the quantizer
+                // change is a recipe change, and the existing reconcile
+                // machinery resets the pairs and rebuilds them as int8.
+                retired_seen = true;
+            }
+            other => {
+                return Err(format!(
+                    "Unknown quantizer '{other}' for profile '{name}': only 'int8' is supported"
+                ));
+            }
         }
         profiles.push(DesiredProfile {
             name: name.to_string(),
-            quantizer: profile.quantizer.clone(),
-            centered: profile.centered,
+            quantizer: QUANTIZER_INT8.to_string(),
         });
+    }
+    if retired_seen {
+        // Repeats at every load until the file is rewritten — deliberately
+        // informational in tone: the mapping alone triggers no work (a
+        // rebuild happens only when actual coverage disagrees, and the one
+        // recipe-change rebuild already ran at the first post-remap
+        // reconcile).
+        tracing::warn!(
+            "config.toml still lists the retired 'binary' quantizer; reading it as 'int8'. \
+             No rebuild is pending; the section is rewritten at the next settings save."
+        );
     }
     let default_name = match (&config.default, profiles.is_empty()) {
         (Some(default), false) => {
@@ -195,9 +248,7 @@ pub(crate) struct EmbeddingSetter {
     pub dim: Option<i64>,
 }
 
-pub(crate) async fn load_profiles(
-    conn: &mut sqlx::SqliteConnection,
-) -> ApiResult<Vec<ProfileRow>> {
+pub(crate) async fn load_profiles(conn: &mut sqlx::SqliteConnection) -> ApiResult<Vec<ProfileRow>> {
     let rows = sqlx::query(
         "SELECT id, name, quantizer, options, state, is_default \
          FROM vector_quant_profiles ORDER BY id",
@@ -375,20 +426,17 @@ pub(crate) async fn full_vector_count(
     setter_id: i64,
 ) -> ApiResult<i64> {
     let row = sqlx::query(FULL_VECTOR_COUNT_SQL)
-    .bind(setter_id)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to count vectors");
-        ApiError::internal("Failed to count vectors")
-    })?;
+        .bind(setter_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to count vectors");
+            ApiError::internal("Failed to count vectors")
+        })?;
     row.try_get("n").map_err(read_err)
 }
 
-async fn profile_has_quants(
-    conn: &mut sqlx::SqliteConnection,
-    profile_id: i64,
-) -> ApiResult<bool> {
+async fn profile_has_quants(conn: &mut sqlx::SqliteConnection, profile_id: i64) -> ApiResult<bool> {
     let row = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM embedding_quants WHERE profile_id = ?) AS present",
     )
@@ -559,7 +607,8 @@ pub(crate) fn plan_metadata(snapshot: &StateSnapshot) -> Vec<MetaOp> {
                 needs_artifact: desired.needs_artifact(),
             }),
             Some(row) => {
-                if row.quantizer != desired.quantizer || row.options.as_deref() != Some(options.as_str())
+                if row.quantizer != desired.quantizer
+                    || row.options.as_deref() != Some(options.as_str())
                 {
                     ops.push(MetaOp::UpdateRecipe {
                         name: desired.name.clone(),
@@ -576,7 +625,11 @@ pub(crate) fn plan_metadata(snapshot: &StateSnapshot) -> Vec<MetaOp> {
         if desired_names.contains(row.name.as_str()) {
             continue;
         }
-        let has_quants = snapshot.profile_has_quants.get(&row.id).copied().unwrap_or(false);
+        let has_quants = snapshot
+            .profile_has_quants
+            .get(&row.id)
+            .copied()
+            .unwrap_or(false);
         if !has_quants {
             ops.push(MetaOp::DropEmptyProfile {
                 name: row.name.clone(),
@@ -600,10 +653,10 @@ pub(crate) fn plan_metadata(snapshot: &StateSnapshot) -> Vec<MetaOp> {
             }
         }
         // A freshly created default profile also needs the flag set.
-        if let Some(default) = desired_default {
-            if !by_name.contains_key(default) {
-                wrong = true;
-            }
+        if let Some(default) = desired_default
+            && !by_name.contains_key(default)
+        {
+            wrong = true;
         }
         wrong
     };
@@ -701,7 +754,11 @@ pub(crate) fn plan_data(snapshot: &StateSnapshot) -> DataPlan {
         let undesired = !desired_names.contains(row.name.as_str());
         let removing = row.state == "removing";
         if (undesired || removing)
-            && snapshot.profile_has_quants.get(&row.id).copied().unwrap_or(false)
+            && snapshot
+                .profile_has_quants
+                .get(&row.id)
+                .copied()
+                .unwrap_or(false)
         {
             plan.removals.push(row.id);
         }
@@ -724,17 +781,6 @@ pub(crate) fn plan_data(snapshot: &StateSnapshot) -> DataPlan {
                 continue;
             };
             if members.iter().any(|setter| setter.dim != Some(dim)) {
-                continue;
-            }
-            // sqlite-vec bit vectors require dimensions divisible by 8.
-            // Every real embedding model satisfies this; skip (and keep
-            // searching exact) rather than fail if one ever doesn't.
-            if dim % 8 != 0 {
-                tracing::warn!(
-                    profile = %desired.name,
-                    dim,
-                    "embedding dimension not divisible by 8; pair stays exact"
-                );
                 continue;
             }
             let pairs: Vec<Option<&CoverageRow>> = members
@@ -762,7 +808,13 @@ pub(crate) fn plan_data(snapshot: &StateSnapshot) -> DataPlan {
             }
             let total: i64 = members
                 .iter()
-                .map(|setter| snapshot.bounded_counts.get(&setter.id).copied().unwrap_or(0))
+                .map(|setter| {
+                    snapshot
+                        .bounded_counts
+                        .get(&setter.id)
+                        .copied()
+                        .unwrap_or(0)
+                })
                 .sum();
             let gate = if desired.needs_artifact() {
                 total >= ARTIFACT_MIN_VECTORS
@@ -1023,12 +1075,14 @@ pub(crate) async fn start_space_build(
     Ok(rev)
 }
 
-/// One chunked backfill transaction for a pair, resuming after `after_id`.
-/// Returns rows written and the cursor for the next chunk; zero rows means
-/// the pair's quants are complete at its current revision — or that the
-/// pair is no longer `building` (e.g. an explicit rebuild was marked
-/// mid-build, which cleared the artifact; writing plain-binarized rows at
-/// the frozen rev then would corrupt the pair).
+/// The chunk's outstanding rows, with the pair's frozen artifact alongside
+/// them. Quantization itself is Rust (`quantize_int8`), so this select and
+/// the inserts that follow it are two halves of one writer transaction —
+/// which is what keeps the `c.state = 'building'` guard effective: a
+/// rebuild that lands mid-build (clearing the artifact, moving the pair to
+/// pending) either commits before this transaction's snapshot, in which
+/// case the select returns nothing, or after it, in which case its own
+/// write wins. See `finish_space_build`'s doc comment.
 ///
 /// The cursor is what keeps a full backfill linear. `NOT EXISTS` alone is
 /// enough for correctness (and remains the resume mechanism after a crash,
@@ -1038,26 +1092,40 @@ pub(crate) async fn start_space_build(
 /// whole time. `ORDER BY d.id` makes the LIMIT window match the cursor by
 /// construction rather than by luck of the query plan; it is free, since
 /// `idx_item_data_setter_id` already yields rowid order within a setter.
-const BACKFILL_CHUNK_SQL: &str = "INSERT OR REPLACE INTO embedding_quants (id, profile_id, rev, quant) \
-         SELECT e.id, c.profile_id, c.artifact_rev, \
-                vec_quantize_binary( \
-                    CASE WHEN c.artifact IS NOT NULL \
-                         THEN vec_sub(e.embedding, c.artifact) \
-                         ELSE e.embedding END) \
+const BACKFILL_CHUNK_SQL: &str = "SELECT d.id AS id, e.embedding AS embedding, \
+                c.artifact AS artifact, c.artifact_rev AS artifact_rev \
          FROM vector_quant_coverage c \
          JOIN item_data d ON d.setter_id = c.setter_id \
          JOIN embeddings e ON e.id = d.id \
          WHERE c.profile_id = ? AND c.setter_id = ? \
            AND c.state = 'building' \
+           AND c.artifact IS NOT NULL \
            AND d.id > ? \
            AND length(e.embedding) = c.dim * 4 \
            AND NOT EXISTS (SELECT 1 FROM embedding_quants q \
                            WHERE q.id = e.id AND q.profile_id = c.profile_id \
                              AND q.rev = c.artifact_rev) \
          ORDER BY d.id \
-         LIMIT ? \
-         RETURNING id";
+         LIMIT ?";
 
+/// Upsert rather than `INSERT OR REPLACE`. Both are correct against the
+/// `UNIQUE (id, profile_id)` constraint the rowid table carries, but REPLACE
+/// deletes the conflicting row and inserts a fresh one, which takes a new
+/// rowid off the end of the table; a rebuild done that way rewrites the
+/// profile's rows into whatever pages the freelist hands back, scattering
+/// the very locality the rowid layout exists to buy (see the
+/// 20260730150000 migration). `DO UPDATE` keeps the row — same rowid, same
+/// page, same size, since a rebuild of a space never changes `dim`.
+const INSERT_QUANT_SQL: &str = "INSERT INTO embedding_quants (id, profile_id, rev, quant) \
+     VALUES (?, ?, ?, ?) \
+     ON CONFLICT (id, profile_id) DO UPDATE SET rev = excluded.rev, quant = excluded.quant";
+
+/// One chunked backfill transaction for a pair, resuming after `after_id`.
+/// Returns rows written and the cursor for the next chunk; zero rows means
+/// the pair's quants are complete at its current revision — or that the
+/// pair is no longer `building` (e.g. an explicit rebuild was marked
+/// mid-build, which cleared the artifact; writing codes at the frozen rev
+/// under a new scale would corrupt the pair).
 pub(crate) async fn backfill_chunk(
     conn: &mut sqlx::SqliteConnection,
     profile_id: i64,
@@ -1066,19 +1134,42 @@ pub(crate) async fn backfill_chunk(
     after_id: i64,
 ) -> ApiResult<(u64, i64)> {
     let rows = sqlx::query(BACKFILL_CHUNK_SQL)
-    .bind(profile_id)
-    .bind(setter_id)
-    .bind(after_id)
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(write_err)?;
+        .bind(profile_id)
+        .bind(setter_id)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(write_err)?;
+
     let mut cursor = after_id;
+    let mut written: u64 = 0;
     for row in &rows {
         let id: i64 = row.try_get("id").map_err(read_err)?;
+        let embedding: Vec<u8> = row.try_get("embedding").map_err(read_err)?;
+        let artifact: Vec<u8> = row.try_get("artifact").map_err(read_err)?;
+        let rev: i64 = row.try_get("artifact_rev").map_err(read_err)?;
+        let Some(scale) = artifact_scale(&artifact) else {
+            tracing::error!(
+                profile_id,
+                setter_id,
+                bytes = artifact.len(),
+                "vector quant artifact is not a scale; refusing to backfill"
+            );
+            return Err(ApiError::internal("Invalid vector quant scale artifact"));
+        };
+        sqlx::query(INSERT_QUANT_SQL)
+            .bind(id)
+            .bind(profile_id)
+            .bind(rev)
+            .bind(quantize_int8(&embedding, scale))
+            .execute(&mut *conn)
+            .await
+            .map_err(write_err)?;
         cursor = cursor.max(id);
+        written += 1;
     }
-    Ok((rows.len() as u64, cursor))
+    Ok((written, cursor))
 }
 
 /// Completing transaction of a space build: verifies the coverage invariant
@@ -1183,6 +1274,13 @@ async fn count_dim_mismatched(
 }
 
 /// One chunked delete transaction for a removing profile's quants.
+///
+/// Keyed on `rowid`, not `id`: since the 20260730150000 migration
+/// `embedding_quants` is a rowid table, so `id` is an ordinary column and
+/// the outer statement would have to re-find each row through the unique
+/// index. `rowid` addresses the leaf directly, and the inner select is
+/// still served from `embedding_quants_profile_rev_id` (whose entries carry
+/// the rowid), so the chunk never touches a payload page to pick its work.
 pub(crate) async fn delete_quants_chunk(
     conn: &mut sqlx::SqliteConnection,
     profile_id: i64,
@@ -1190,10 +1288,9 @@ pub(crate) async fn delete_quants_chunk(
 ) -> ApiResult<u64> {
     let result = sqlx::query(
         "DELETE FROM embedding_quants \
-         WHERE profile_id = ? AND id IN ( \
-            SELECT id FROM embedding_quants WHERE profile_id = ? LIMIT ?)",
+         WHERE rowid IN ( \
+            SELECT rowid FROM embedding_quants WHERE profile_id = ? LIMIT ?)",
     )
-    .bind(profile_id)
     .bind(profile_id)
     .bind(limit)
     .execute(&mut *conn)
@@ -1254,37 +1351,66 @@ pub(crate) async fn mark_space_rebuild(
 
 /// Inline maintenance hook: called from `add_embedding` inside the same
 /// writer transaction that inserts the vector. Writes a quant row for every
-/// active profile whose pair for this setter is building or ready (artifact
-/// frozen, or artifact-free recipe), stamped with the pair's current
-/// revision. Pairs without a frozen artifact get nothing (they aren't
-/// consulted by search).
+/// active profile whose pair for this setter is building or ready with its
+/// scale artifact frozen, stamped with the pair's current revision. Pairs
+/// without a frozen artifact get nothing (they aren't consulted by search).
 pub(crate) async fn write_inline_quants(
     conn: &mut sqlx::SqliteConnection,
     data_id: i64,
 ) -> ApiResult<()> {
-    sqlx::query(
-        "INSERT OR REPLACE INTO embedding_quants (id, profile_id, rev, quant) \
-         SELECT d.id, c.profile_id, c.artifact_rev, \
-                vec_quantize_binary( \
-                    CASE WHEN c.artifact IS NOT NULL \
-                         THEN vec_sub(e.embedding, c.artifact) \
-                         ELSE e.embedding END) \
-         FROM item_data d \
-         JOIN embeddings e ON e.id = d.id \
-         JOIN vector_quant_coverage c ON c.setter_id = d.setter_id \
-         JOIN vector_quant_profiles p ON p.id = c.profile_id AND p.state = 'active' \
-         WHERE d.id = ? \
-           AND c.state IN ('building', 'ready') \
-           AND (c.artifact IS NOT NULL OR c.needs_artifact = 0) \
-           AND length(e.embedding) = c.dim * 4",
-    )
-    .bind(data_id)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
+    let inline_err = |err: sqlx::Error| {
         tracing::error!(error = %err, data_id, "failed to write inline embedding quants");
         ApiError::internal("Failed to write embedding quants")
-    })?;
+    };
+    let embedding: Option<Vec<u8>> = sqlx::query("SELECT embedding FROM embeddings WHERE id = ?")
+        .bind(data_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(inline_err)?
+        .map(|row| row.try_get("embedding"))
+        .transpose()
+        .map_err(read_err)?;
+    if let Some(embedding) = embedding {
+        let pairs = sqlx::query(
+            "SELECT c.profile_id AS profile_id, c.artifact_rev AS artifact_rev, \
+                    c.artifact AS artifact, c.dim AS dim \
+             FROM item_data d \
+             JOIN vector_quant_coverage c ON c.setter_id = d.setter_id \
+             JOIN vector_quant_profiles p ON p.id = c.profile_id AND p.state = 'active' \
+             WHERE d.id = ? \
+               AND c.state IN ('building', 'ready') \
+               AND c.artifact IS NOT NULL",
+        )
+        .bind(data_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(inline_err)?;
+        for pair in &pairs {
+            let dim: Option<i64> = pair.try_get("dim").map_err(read_err)?;
+            // A dim mismatch is handled by the downgrade below, exactly as
+            // the SQL `length(e.embedding) = c.dim * 4` guard did.
+            if dim.map(|dim| dim * 4) != Some(embedding.len() as i64) {
+                continue;
+            }
+            let artifact: Vec<u8> = pair.try_get("artifact").map_err(read_err)?;
+            let Some(scale) = artifact_scale(&artifact) else {
+                tracing::error!(
+                    data_id,
+                    bytes = artifact.len(),
+                    "vector quant artifact is not a scale; skipping inline quant"
+                );
+                continue;
+            };
+            sqlx::query(INSERT_QUANT_SQL)
+                .bind(data_id)
+                .bind(pair.try_get::<i64, _>("profile_id").map_err(read_err)?)
+                .bind(pair.try_get::<i64, _>("artifact_rev").map_err(read_err)?)
+                .bind(quantize_int8(&embedding, scale))
+                .execute(&mut *conn)
+                .await
+                .map_err(inline_err)?;
+        }
+    }
 
     // A vector whose dimensionality doesn't match the pair's snapshot is
     // skipped above — silently leaving it out of quant-mode membership
@@ -1321,21 +1447,88 @@ pub(crate) async fn write_inline_quants(
 }
 
 // ---------------------------------------------------------------------------
+// int8 codec (docs/vector-int8-quant.md)
+// ---------------------------------------------------------------------------
+
+/// The largest representable code magnitude: `s = absmax / 127` puts the
+/// corpus absmax exactly on +127.
+const INT8_MAX_CODE: f32 = 127.0;
+
+/// Serializes a scale as the 4-byte little-endian f32 artifact payload.
+pub(crate) fn scale_artifact(scale: f32) -> Vec<u8> {
+    scale.to_le_bytes().to_vec()
+}
+
+/// Reads a scale artifact. `None` for anything that is not a usable positive
+/// finite scale — callers treat that as "this pair is not usable", never as
+/// an excuse to divide by zero.
+pub(crate) fn artifact_scale(artifact: &[u8]) -> Option<f32> {
+    let bytes: [u8; 4] = artifact.try_into().ok()?;
+    let scale = f32::from_le_bytes(bytes);
+    (scale.is_finite() && scale > 0.0).then_some(scale)
+}
+
+/// The scale for a corpus whose largest component magnitude is `absmax`.
+/// A degenerate all-zero corpus yields 1.0 (every code is zero) rather than
+/// a division by zero.
+pub(crate) fn scale_from_absmax(absmax: f32) -> f32 {
+    if absmax > 0.0 && absmax.is_finite() {
+        absmax / INT8_MAX_CODE
+    } else {
+        1.0
+    }
+}
+
+/// The largest component magnitude of a little-endian f32 blob.
+fn blob_absmax(blob: &[u8]) -> f32 {
+    let mut absmax = 0f32;
+    for chunk in blob.chunks_exact(4) {
+        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]).abs();
+        if value > absmax {
+            absmax = value;
+        }
+    }
+    absmax
+}
+
+/// Quantizes a little-endian f32 blob to `dim` int8 codes, in component
+/// order: `clamp(rint(x / s), -128, 127)`, round-half-to-even. Clamping is
+/// what absorbs an out-of-range query component (a query vector is not part
+/// of the corpus the scale was derived from) — measured as harmless.
+pub(crate) fn quantize_int8(embedding: &[u8], scale: f32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(embedding.len() / 4);
+    for chunk in embedding.chunks_exact(4) {
+        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let code = (value / scale)
+            .round_ties_even()
+            .clamp(-128.0, INT8_MAX_CODE) as i8;
+        out.push(code as u8);
+    }
+    out
+}
+
+/// Quantizes a query embedding with the pair's frozen scale. Identical code
+/// path to the write side, so the two are byte-compatible by construction.
+pub(crate) fn compute_query_quant(embedding: &[u8], scale: f32) -> Vec<u8> {
+    quantize_int8(embedding, scale)
+}
+
+// ---------------------------------------------------------------------------
 // Artifact computation (read side)
 // ---------------------------------------------------------------------------
 
 /// Streams every vector of the given setters (one row at a time — never the
-/// whole space in memory) and returns the per-dimension mean as a
-/// little-endian f32 blob (the artifact payload — same layout as the
-/// embedding blobs). Errors on dimensionality mismatches.
-pub(crate) async fn compute_mean_artifact(
+/// whole space in memory) and returns the space's int8 scale as the 4-byte
+/// little-endian f32 artifact payload. `None` when the space holds no
+/// vectors at all. Errors on dimensionality mismatches.
+pub(crate) async fn compute_int8_scale_artifact(
     conn: &mut sqlx::SqliteConnection,
     setter_ids: &[i64],
     dim: i64,
 ) -> ApiResult<Option<Vec<u8>>> {
     use futures_util::TryStreamExt;
     let dim = usize::try_from(dim).map_err(|_| ApiError::internal("Invalid dimension"))?;
-    let mut sums = vec![0f64; dim];
+    let mut absmax = 0f32;
     let mut count: u64 = 0;
     for setter_id in setter_ids {
         let mut rows = sqlx::query(
@@ -1361,22 +1554,14 @@ pub(crate) async fn compute_mean_artifact(
                     "Setter has vectors of mismatched dimensionality",
                 ));
             }
-            for (idx, chunk) in blob.chunks_exact(4).enumerate() {
-                let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                sums[idx] += f64::from(value);
-            }
+            absmax = absmax.max(blob_absmax(&blob));
             count += 1;
         }
     }
     if count == 0 {
         return Ok(None);
     }
-    let mut out = Vec::with_capacity(dim * 4);
-    for sum in sums {
-        let mean = (sum / count as f64) as f32;
-        out.extend_from_slice(&mean.to_le_bytes());
-    }
-    Ok(Some(out))
+    Ok(Some(scale_artifact(scale_from_absmax(absmax))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1398,7 +1583,6 @@ pub(crate) struct VectorQuantSetterStatus {
 pub(crate) struct VectorQuantProfileStatus {
     pub name: String,
     pub quantizer: String,
-    pub centered: bool,
     /// active | removing | missing (desired but not yet in the DB)
     pub state: String,
     pub is_default: bool,
@@ -1494,8 +1678,8 @@ pub(crate) async fn load_status(
                     (0, 0)
                 };
                 if let Some(dim) = coverage.dim {
-                    // Binary quant: dim bits, rounded up to bytes.
-                    size_bytes += quantized * ((dim + 7) / 8);
+                    // int8 quant: one byte per component.
+                    size_bytes += quantized * dim;
                 }
                 setters.push(VectorQuantSetterStatus {
                     setter_name: (*name).to_string(),
@@ -1510,7 +1694,6 @@ pub(crate) async fn load_status(
         profiles.push(VectorQuantProfileStatus {
             name: desired_profile.name.clone(),
             quantizer: desired_profile.quantizer.clone(),
-            centered: desired_profile.centered,
             state: row
                 .map(|row| row.state.clone())
                 .unwrap_or_else(|| "missing".to_string()),
@@ -1534,11 +1717,6 @@ pub(crate) async fn load_status(
         profiles.push(VectorQuantProfileStatus {
             name: row.name.clone(),
             quantizer: row.quantizer.clone(),
-            centered: row
-                .options
-                .as_deref()
-                .map(|options| options.contains("\"centered\":true"))
-                .unwrap_or(false),
             state: "removing".to_string(),
             is_default: false,
             size_bytes: 0,
@@ -1556,24 +1734,35 @@ pub(crate) async fn load_status(
 /// Polled by the status card, so like [`FULL_VECTOR_COUNT_SQL`] it must not
 /// be O(vector bytes) — and here that is the whole trick.
 ///
-/// `embedding_quants` is WITHOUT ROWID: its rows *are* its b-tree leaves,
-/// each carrying the `quant` blob. Any plan that reaches a quant row to
-/// read a column pages in every quant byte it walks past. Written as a
-/// join, this one did: the planner drove the loop off `profile_id` alone
-/// and fell through to the row for `rev`, seconds per count on a large
-/// index.
+/// Every `embedding_quants` row carries the `quant` blob, so any plan that
+/// reaches one to read a column pages in every quant byte it walks past.
+/// Written as a join, this one did: the planner drove the loop off
+/// `profile_id` alone and fell through to the row for `rev`, seconds per
+/// count on a large index. (It was worse still when the table was WITHOUT
+/// ROWID, where the payload sat in the index b-tree itself; the
+/// 20260730150000 migration moved it out, but the shape below is what keeps
+/// the count off the payload either way.)
 ///
 /// As a semi-join both sides stay in their indexes —
 /// `idx_item_data_setter_id` supplies the setter's ids, and
 /// `embedding_quants_profile_rev_id` answers the probe from the entry.
-/// `EXISTS` rather than `JOIN` is what makes the planner pick that shape
-/// without an `INDEXED BY` hint; the counted set is identical, since the
-/// `(id, profile_id)` primary key admits at most one quant per row anyway.
-/// Pinned by a test.
+/// `EXISTS` rather than `JOIN` is what gets the planner into that shape at
+/// all; the counted set is identical, since the `UNIQUE (id, profile_id)`
+/// constraint admits at most one quant per row anyway.
+///
+/// The `INDEXED BY` is not decoration. Once `embedding_quants` became a
+/// rowid table it gained a second candidate for this probe — the unique
+/// index behind `UNIQUE (id, profile_id)` — and the planner prefers it,
+/// being unique and two columns of equality instead of three. That index
+/// does not carry `rev`, so every probe falls through to the table row,
+/// which carries the quant blob: measured on a 694k-vector setter,
+/// 0.542s per count against 0.182s for the covering plan, twice per status
+/// poll. Pinned by a test.
 const QUANTIZED_COUNT_SQL: &str = "SELECT COUNT(*) AS n \
          FROM item_data d \
          WHERE d.setter_id = ? \
            AND EXISTS (SELECT 1 FROM embedding_quants q \
+                       INDEXED BY embedding_quants_profile_rev_id \
                        WHERE q.profile_id = ? AND q.rev = ? AND q.id = d.id)";
 
 async fn quantized_count(
@@ -1583,15 +1772,15 @@ async fn quantized_count(
     rev: i64,
 ) -> ApiResult<i64> {
     let row = sqlx::query(QUANTIZED_COUNT_SQL)
-    .bind(setter_id)
-    .bind(profile_id)
-    .bind(rev)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to count embedding quants");
-        ApiError::internal("Failed to count embedding quants")
-    })?;
+        .bind(setter_id)
+        .bind(profile_id)
+        .bind(rev)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to count embedding quants");
+            ApiError::internal("Failed to count embedding quants")
+        })?;
     row.try_get("n").map_err(read_err)
 }
 
@@ -1600,12 +1789,12 @@ async fn quantized_count(
 // ---------------------------------------------------------------------------
 
 /// A ready (profile, setter) pair as the query preprocessor needs it: the
-/// artifact to center the query embedding with (None for artifact-free
-/// recipes) and the profile id for the quant join.
+/// frozen int8 scale to quantize the query embedding with, and the profile
+/// id for the quant join.
 #[derive(Debug, Clone)]
 pub(crate) struct ReadyPair {
     pub profile_id: i64,
-    pub artifact: Option<Vec<u8>>,
+    pub scale: f32,
     pub dim: i64,
 }
 
@@ -1619,16 +1808,15 @@ pub(crate) async fn resolve_ready_pair(
     profile_name: &str,
     setter_names: &[String],
 ) -> ApiResult<Option<ReadyPair>> {
-    let profile = sqlx::query(
-        "SELECT id FROM vector_quant_profiles WHERE name = ? AND state = 'active'",
-    )
-    .bind(profile_name)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to resolve vector quant profile");
-        ApiError::internal("Failed to resolve vector quant profile")
-    })?;
+    let profile =
+        sqlx::query("SELECT id FROM vector_quant_profiles WHERE name = ? AND state = 'active'")
+            .bind(profile_name)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to resolve vector quant profile");
+                ApiError::internal("Failed to resolve vector quant profile")
+            })?;
     let Some(profile) = profile else {
         return Ok(None);
     };
@@ -1665,21 +1853,23 @@ pub(crate) async fn resolve_ready_pair(
         };
         let artifact: Option<Vec<u8>> = row.try_get("artifact").map_err(read_err)?;
         let dim: Option<i64> = row.try_get("dim").map_err(read_err)?;
-        let Some(dim) = dim else {
+        let (Some(dim), Some(scale)) = (dim, artifact.as_deref().and_then(artifact_scale)) else {
+            // No dimension or no usable scale: the pair cannot be queried,
+            // whatever its state column says.
             return Ok(None);
         };
         match &result {
             None => {
                 result = Some(ReadyPair {
                     profile_id,
-                    artifact,
+                    scale,
                     dim,
                 });
             }
             Some(existing) => {
                 // Xmodal siblings must share one artifact; a mismatch means
                 // a rebuild is pending — treat as not ready.
-                if existing.artifact != artifact || existing.dim != dim {
+                if existing.scale != scale || existing.dim != dim {
                     return Ok(None);
                 }
             }
@@ -1688,48 +1878,20 @@ pub(crate) async fn resolve_ready_pair(
     Ok(result)
 }
 
-/// Binarizes a query embedding for a pair: centered against the artifact
-/// when one exists, plain sign-binarization otherwise. Computed in SQL by
-/// the same sqlite-vec functions the write path uses, so bit order is
-/// definitionally consistent.
-pub(crate) async fn compute_query_quant(
-    conn: &mut sqlx::SqliteConnection,
-    embedding: &[u8],
-    artifact: Option<&[u8]>,
-) -> ApiResult<Vec<u8>> {
-    let row = match artifact {
-        Some(artifact) => sqlx::query("SELECT vec_quantize_binary(vec_sub(?, ?)) AS q")
-            .bind(embedding)
-            .bind(artifact)
-            .fetch_one(&mut *conn)
-            .await,
-        None => sqlx::query("SELECT vec_quantize_binary(?) AS q")
-            .bind(embedding)
-            .fetch_one(&mut *conn)
-            .await,
-    }
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to quantize query embedding");
-        ApiError::internal("Failed to quantize query embedding")
-    })?;
-    row.try_get("q").map_err(read_err)
-}
-
 /// Looks up an active profile's id by name.
 pub(crate) async fn active_profile_id(
     conn: &mut sqlx::SqliteConnection,
     name: &str,
 ) -> ApiResult<Option<i64>> {
-    let row = sqlx::query(
-        "SELECT id FROM vector_quant_profiles WHERE name = ? AND state = 'active'",
-    )
-    .bind(name)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to look up vector quant profile");
-        ApiError::internal("Failed to look up vector quant profile")
-    })?;
+    let row =
+        sqlx::query("SELECT id FROM vector_quant_profiles WHERE name = ? AND state = 'active'")
+            .bind(name)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to look up vector quant profile");
+                ApiError::internal("Failed to look up vector quant profile")
+            })?;
     match row {
         Some(row) => Ok(Some(row.try_get("id").map_err(read_err)?)),
         None => Ok(None),
@@ -1746,10 +1908,7 @@ pub(crate) async fn space_setter_ids(
     let setters = load_embedding_setters(conn).await?;
     let spaces = group_spaces(&setters);
     for space in spaces {
-        if space
-            .iter()
-            .any(|&idx| setters[idx].name == setter_name)
-        {
+        if space.iter().any(|&idx| setters[idx].name == setter_name) {
             return Ok(space.iter().map(|&idx| setters[idx].id).collect());
         }
     }
@@ -1788,27 +1947,28 @@ mod tests {
         ensure_sqlite_extensions().expect("failed to register SQLite extensions for tests");
     }
 
-    // sqlite-vec bit vectors need dims divisible by 8; all test vectors are
-    // 8-dimensional, varying only the first two dimensions.
+    /// All test vectors are 8-dimensional, varying only the first two
+    /// dimensions. The fixed tail carries the fixtures' absmax (3.0) unless
+    /// a test deliberately exceeds it.
     fn vec8(a: f32, b: f32) -> [f32; 8] {
         [a, b, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0]
     }
 
-    fn config(profiles: Vec<(&str, bool)>, default: Option<&str>) -> VectorQuantsConfig {
+    fn config(profiles: Vec<&str>, default: Option<&str>) -> VectorQuantsConfig {
         VectorQuantsConfig {
             default: default.map(str::to_string),
             profiles: profiles
                 .into_iter()
-                .map(|(name, centered)| VectorQuantProfileConfig {
+                .map(|name| VectorQuantProfileConfig {
                     name: name.to_string(),
-                    quantizer: "binary".to_string(),
-                    centered,
+                    quantizer: "int8".to_string(),
+                    centered: false,
                 })
                 .collect(),
         }
     }
 
-    fn desired(profiles: Vec<(&str, bool)>, default: Option<&str>) -> DesiredState {
+    fn desired(profiles: Vec<&str>, default: Option<&str>) -> DesiredState {
         resolve_desired(&config(profiles, default)).expect("valid desired state")
     }
 
@@ -1873,17 +2033,73 @@ mod tests {
         data_id
     }
 
+    /// Pads a setter with `count` extra vectors so its space clears
+    /// [`ARTIFACT_MIN_VECTORS`] — the gate every int8 build passes through.
+    /// The fillers hang off `item`, which owns no `files` row in the query
+    /// fixtures, so they never surface in a search result; their magnitudes
+    /// stay inside the fixtures' own range, so they never move the absmax.
+    /// Bulk-inserted: a per-row loop at this size dominates the test suite.
+    async fn pad_space(
+        conn: &mut SqliteConnection,
+        item: i64,
+        setter: i64,
+        data_type: &str,
+        count: i64,
+    ) {
+        if count <= 0 {
+            return;
+        }
+        sqlx::query(
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?) \
+             INSERT INTO item_data (item_id, setter_id, data_type, idx, is_origin, is_placeholder) \
+             SELECT ?, ?, ?, 100000 + n, 1, 0 FROM seq",
+        )
+        .bind(count)
+        .bind(item)
+        .bind(setter)
+        .bind(data_type)
+        .execute(&mut *conn)
+        .await
+        .expect("insert filler item_data");
+        sqlx::query(
+            "INSERT INTO embeddings (id, embedding) \
+             SELECT d.id, ? FROM item_data d \
+             WHERE d.setter_id = ? AND d.idx >= 100000 \
+               AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.id = d.id)",
+        )
+        .bind(le_bytes(&vec8(0.5, -0.5)))
+        .bind(setter)
+        .execute(&mut *conn)
+        .await
+        .expect("insert filler embeddings");
+    }
+
+    /// Pads a setter to exactly [`ARTIFACT_MIN_VECTORS`] vectors, given how
+    /// many the test seeded itself.
+    async fn pad_to_threshold(
+        conn: &mut SqliteConnection,
+        item: i64,
+        setter: i64,
+        data_type: &str,
+        seeded: i64,
+    ) {
+        pad_space(conn, item, setter, data_type, ARTIFACT_MIN_VECTORS - seeded).await;
+    }
+
     async fn run_build(conn: &mut SqliteConnection, build: &SpaceBuild, profile_id: i64) {
-        let artifact = if build.needs_artifact {
-            compute_mean_artifact(conn, &build.setter_ids, build.dim)
-                .await
-                .expect("mean artifact")
-        } else {
-            None
-        };
-        start_space_build(conn, profile_id, &build.setter_ids, artifact.as_deref(), build.dim)
+        assert!(build.needs_artifact, "int8 always needs its scale artifact");
+        let artifact = compute_int8_scale_artifact(conn, &build.setter_ids, build.dim)
             .await
-            .expect("start build");
+            .expect("scale artifact");
+        start_space_build(
+            conn,
+            profile_id,
+            &build.setter_ids,
+            artifact.as_deref(),
+            build.dim,
+        )
+        .await
+        .expect("start build");
         for setter_id in &build.setter_ids {
             let mut after_id = 0;
             loop {
@@ -1920,10 +2136,10 @@ mod tests {
             .expect("count")
     }
 
-    // Below the artifact threshold a centered pair stays pending: metadata
-    // syncs, but no data work is planned and search would stay exact.
+    // Below the artifact threshold a pair stays pending: metadata syncs, but
+    // no data work is planned and search stays exact.
     #[tokio::test]
-    async fn centered_pair_below_threshold_stays_pending() {
+    async fn pair_below_threshold_stays_pending() {
         ensure_vec_extension_loaded();
         let mut dbs = setup_test_databases().await;
         let conn = &mut dbs.index_conn;
@@ -1933,16 +2149,22 @@ mod tests {
             seed_embedding(conn, item, setter, "clip", idx, &vec8(1.0, -1.0)).await;
         }
 
-        let changed = sync_metadata(conn, desired(vec![("default", true)], Some("default")))
+        let changed = sync_metadata(conn, desired(vec!["default"], Some("default")))
             .await
             .expect("sync");
         assert!(changed);
-        let snapshot = load_snapshot(conn, desired(vec![("default", true)], Some("default")))
+        let snapshot = load_snapshot(conn, desired(vec!["default"], Some("default")))
             .await
             .expect("snapshot");
-        assert!(plan_metadata(&snapshot).is_empty(), "metadata should be in sync");
-        assert!(plan_data(&snapshot).is_empty(), "below threshold: no data work");
-        let work = analyze(conn, desired(vec![("default", true)], Some("default")))
+        assert!(
+            plan_metadata(&snapshot).is_empty(),
+            "metadata should be in sync"
+        );
+        assert!(
+            plan_data(&snapshot).is_empty(),
+            "below threshold: no data work"
+        );
+        let work = analyze(conn, desired(vec!["default"], Some("default")))
             .await
             .expect("analyze");
         assert_eq!(work, ReconcileWork::None);
@@ -1951,10 +2173,9 @@ mod tests {
         assert_eq!(coverage[0].state, "pending");
     }
 
-    // Artifact-free (uncentered) recipes gate at a single vector: full
-    // build flow ends ready with every vector quantized.
+    // Full build flow ends ready with every vector quantized.
     #[tokio::test]
-    async fn uncentered_build_flow_reaches_ready() {
+    async fn build_flow_reaches_ready() {
         ensure_vec_extension_loaded();
         let mut dbs = setup_test_databases().await;
         let conn = &mut dbs.index_conn;
@@ -1964,13 +2185,14 @@ mod tests {
             let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
             seed_embedding(conn, item, setter, "clip", idx, &vec8(sign, -sign)).await;
         }
+        pad_to_threshold(conn, item, setter, "clip", 7).await;
 
-        let state = desired(vec![("plain", false)], Some("plain"));
+        let state = desired(vec!["plain"], Some("plain"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let plan = plan_data(&snapshot);
         assert_eq!(plan.builds.len(), 1);
-        assert!(!plan.builds[0].needs_artifact);
+        assert!(plan.builds[0].needs_artifact);
         assert_eq!(plan.builds[0].dim, 8);
 
         let profile_id = profile_id_by_name(conn, "plain").await;
@@ -1979,30 +2201,36 @@ mod tests {
         let coverage = load_coverage(conn).await.expect("coverage");
         assert_eq!(coverage[0].state, "ready");
         assert_eq!(coverage[0].artifact_rev, 1);
-        assert_eq!(coverage[0].n_at_artifact, Some(7));
-        assert_eq!(quant_rows(conn).await, 7);
+        assert_eq!(coverage[0].n_at_artifact, Some(ARTIFACT_MIN_VECTORS));
+        assert_eq!(quant_rows(conn).await, ARTIFACT_MIN_VECTORS);
         let work = analyze(conn, state).await.expect("analyze");
         assert_eq!(work, ReconcileWork::None);
     }
 
-    // A centered space at the threshold builds with a mean artifact, and the
-    // stored quants match centering the vectors against that mean in SQL.
+    // The artifact is the space's absmax scale, and the stored codes are
+    // exactly what the Rust codec produces from it.
     #[tokio::test]
-    async fn centered_build_uses_mean_artifact() {
+    async fn build_uses_absmax_scale_artifact() {
         ensure_vec_extension_loaded();
         let mut dbs = setup_test_databases().await;
         let conn = &mut dbs.index_conn;
         let item = seed_item(conn, "aa").await;
         let setter = seed_setter(conn, "clip/model").await;
-        // All positive values: plain sign-binarization would be all-ones;
-        // mean-centering splits each dimension around its mean.
+        // The largest magnitude in the space is the last vector's 10.0.
         for idx in 0..ARTIFACT_MIN_VECTORS {
             let offset = (idx % 10) as f32;
-            seed_embedding(conn, item, setter, "clip", idx, &vec8(1.0 + offset, 2.0 + offset))
-                .await;
+            seed_embedding(
+                conn,
+                item,
+                setter,
+                "clip",
+                idx,
+                &vec8(1.0 + offset, -2.0 - offset),
+            )
+            .await;
         }
 
-        let state = desired(vec![("default", true)], Some("default"));
+        let state = desired(vec!["default"], Some("default"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let plan = plan_data(&snapshot);
@@ -2015,23 +2243,29 @@ mod tests {
         let coverage = load_coverage(conn).await.expect("coverage");
         assert_eq!(coverage[0].state, "ready");
         let artifact = coverage[0].artifact.clone().expect("artifact stored");
-        let mean_offset: f32 = (0..ARTIFACT_MIN_VECTORS)
-            .map(|idx| (idx % 10) as f32)
-            .sum::<f32>()
-            / ARTIFACT_MIN_VECTORS as f32;
-        let mean0 = f32::from_le_bytes(artifact[0..4].try_into().unwrap());
-        let mean1 = f32::from_le_bytes(artifact[4..8].try_into().unwrap());
-        assert!((mean0 - (1.0 + mean_offset)).abs() < 1e-3, "mean0 = {mean0}");
-        assert!((mean1 - (2.0 + mean_offset)).abs() < 1e-3, "mean1 = {mean1}");
+        assert_eq!(artifact.len(), 4, "the artifact is a single f32 scale");
+        let scale = artifact_scale(&artifact).expect("usable scale");
+        // absmax = 11.0 (the -2.0 - 9.0 component of the widest vector).
+        assert!((scale - 11.0 / 127.0).abs() < 1e-6, "scale = {scale}");
 
-        // Quants are not degenerate: both bit patterns occur.
-        let distinct: i64 = sqlx::query("SELECT COUNT(DISTINCT quant) AS n FROM embedding_quants")
-            .fetch_one(&mut *conn)
-            .await
-            .expect("distinct quants")
-            .try_get("n")
-            .expect("n");
-        assert!(distinct > 1, "centered quants should differ across vectors");
+        // Every stored code equals the codec's output for its vector.
+        let rows = sqlx::query(
+            "SELECT q.quant AS quant, e.embedding AS embedding \
+             FROM embedding_quants q JOIN embeddings e ON e.id = q.id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .expect("stored quants");
+        assert_eq!(rows.len() as i64, ARTIFACT_MIN_VECTORS);
+        let mut distinct = std::collections::HashSet::new();
+        for row in &rows {
+            let quant: Vec<u8> = row.try_get("quant").expect("quant");
+            let embedding: Vec<u8> = row.try_get("embedding").expect("embedding");
+            assert_eq!(quant, quantize_int8(&embedding, scale));
+            assert_eq!(quant.len(), 8, "one byte per component");
+            distinct.insert(quant);
+        }
+        assert!(distinct.len() > 1, "codes should differ across vectors");
     }
 
     // Kill/restart mid-backfill: committed chunks are the checkpoint; the
@@ -2047,34 +2281,43 @@ mod tests {
             let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
             seed_embedding(conn, item, setter, "clip", idx, &vec8(sign, -sign)).await;
         }
-        let state = desired(vec![("plain", false)], Some("plain"));
+        pad_to_threshold(conn, item, setter, "clip", 10).await;
+        let state = desired(vec!["plain"], Some("plain"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let plan = plan_data(&snapshot);
         let profile_id = profile_id_by_name(conn, "plain").await;
         let build = &plan.builds[0];
-        start_space_build(conn, profile_id, &build.setter_ids, None, build.dim)
+        let artifact = compute_int8_scale_artifact(conn, &build.setter_ids, build.dim)
             .await
-            .expect("start");
+            .expect("scale artifact");
+        start_space_build(
+            conn,
+            profile_id,
+            &build.setter_ids,
+            artifact.as_deref(),
+            build.dim,
+        )
+        .await
+        .expect("start");
         // The chunk cursor is only worth anything if the plan can seek to
         // it: `d.id > ?` must be an index range constraint on the driving
         // scan, and `ORDER BY d.id` must be satisfied by that same scan.
         // A temp b-tree here would sort the whole remaining candidate set
         // per chunk — the exact quadratic this cursor exists to remove.
-        let plan: Vec<String> =
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "EXPLAIN QUERY PLAN {BACKFILL_CHUNK_SQL}"
-            )))
-                .bind(profile_id)
-                .bind(setter)
-                .bind(0_i64)
-                .bind(4_i64)
-                .fetch_all(&mut *conn)
-                .await
-                .expect("plan")
-                .iter()
-                .map(|row| row.get::<String, _>("detail"))
-                .collect();
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {BACKFILL_CHUNK_SQL}"
+        )))
+        .bind(profile_id)
+        .bind(setter)
+        .bind(0_i64)
+        .bind(4_i64)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("plan")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
         assert!(
             !plan.iter().any(|step| step.contains("TEMP B-TREE")),
             "backfill chunk must not sort: {plan:?}"
@@ -2086,7 +2329,9 @@ mod tests {
         );
 
         // One chunk of 4, then "crash".
-        let (written, _) = backfill_chunk(conn, profile_id, setter, 4, 0).await.expect("chunk");
+        let (written, _) = backfill_chunk(conn, profile_id, setter, 4, 0)
+            .await
+            .expect("chunk");
         assert_eq!(written, 4);
         assert_eq!(quant_rows(conn).await, 4);
 
@@ -2097,8 +2342,15 @@ mod tests {
         // on every interruption).
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let plan = plan_data(&snapshot);
-        assert_eq!(plan.builds.len(), 1, "building pair must remain in the plan");
-        assert!(plan.builds[0].resume, "an in-flight build must resume, not restart");
+        assert_eq!(
+            plan.builds.len(),
+            1,
+            "building pair must remain in the plan"
+        );
+        assert!(
+            plan.builds[0].resume,
+            "an in-flight build must resume, not restart"
+        );
         let work = analyze(conn, state.clone()).await.expect("analyze");
         assert_eq!(work, ReconcileWork::DataWork);
 
@@ -2106,16 +2358,23 @@ mod tests {
         // The cursor restarts at 0 after a crash, so this also pins that
         // NOT EXISTS (not the cursor) is what makes a resumed pass skip the
         // already-committed prefix.
-        let (written, _) = backfill_chunk(conn, profile_id, setter, 100, 0)
+        let (written, _) = backfill_chunk(conn, profile_id, setter, ARTIFACT_MIN_VECTORS, 0)
             .await
             .expect("resume chunk");
-        assert_eq!(written, 6, "only the 6 uncommitted rows are written");
+        assert_eq!(
+            written as i64,
+            ARTIFACT_MIN_VECTORS - 4,
+            "only the uncommitted rows are written"
+        );
         finish_space_build(conn, profile_id, &[setter])
             .await
             .expect("finish");
-        assert_eq!(quant_rows(conn).await, 10);
+        assert_eq!(quant_rows(conn).await, ARTIFACT_MIN_VECTORS);
         let coverage = load_coverage(conn).await.expect("coverage");
-        assert_eq!(coverage[0].artifact_rev, 1, "resume must not bump the revision");
+        assert_eq!(
+            coverage[0].artifact_rev, 1,
+            "resume must not bump the revision"
+        );
         assert_eq!(coverage[0].state, "ready");
         let work = analyze(conn, state).await.expect("analyze");
         assert_eq!(work, ReconcileWork::None);
@@ -2123,8 +2382,8 @@ mod tests {
 
     // An explicit rebuild landing mid-build must not corrupt the pair: the
     // rebuild clears the artifact, so any further chunk at the frozen rev
-    // would write plain-binarized rows alongside centered ones, and the
-    // finish would flip that mixture to ready.
+    // would write rows under a different scale than the ones already
+    // committed, and the finish would flip that mixture to ready.
     #[tokio::test]
     async fn rebuild_during_build_cannot_corrupt_or_flip_ready() {
         ensure_vec_extension_loaded();
@@ -2136,17 +2395,23 @@ mod tests {
             let offset = (idx % 6) as f32;
             seed_embedding(conn, item, setter, "clip", idx, &vec8(1.0 + offset, 2.0)).await;
         }
-        let state = desired(vec![("default", true)], Some("default"));
+        let state = desired(vec!["default"], Some("default"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let profile_id = profile_id_by_name(conn, "default").await;
         let build = &plan_data(&snapshot).builds[0];
-        let artifact = compute_mean_artifact(conn, &build.setter_ids, build.dim)
+        let artifact = compute_int8_scale_artifact(conn, &build.setter_ids, build.dim)
             .await
             .expect("artifact");
-        start_space_build(conn, profile_id, &build.setter_ids, artifact.as_deref(), build.dim)
-            .await
-            .expect("start");
+        start_space_build(
+            conn,
+            profile_id,
+            &build.setter_ids,
+            artifact.as_deref(),
+            build.dim,
+        )
+        .await
+        .expect("start");
         let (written, after_id) = backfill_chunk(conn, profile_id, setter, 10, 0)
             .await
             .expect("first chunk");
@@ -2164,7 +2429,9 @@ mod tests {
             .expect("post-rebuild chunk");
         assert_eq!(written, 0, "no rows may be written to a non-building pair");
         assert!(
-            finish_space_build(conn, profile_id, &[setter]).await.is_err(),
+            finish_space_build(conn, profile_id, &[setter])
+                .await
+                .is_err(),
             "finish must refuse a pair that left 'building'"
         );
         let coverage = load_coverage(conn).await.expect("coverage");
@@ -2181,7 +2448,10 @@ mod tests {
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let plan = plan_data(&snapshot);
         assert_eq!(plan.builds.len(), 1);
-        assert!(!plan.builds[0].resume, "a cleared artifact forces a fresh build");
+        assert!(
+            !plan.builds[0].resume,
+            "a cleared artifact forces a fresh build"
+        );
         run_build(conn, &plan.builds[0], profile_id).await;
         let coverage = load_coverage(conn).await.expect("coverage");
         assert_eq!(coverage[0].state, "ready");
@@ -2308,7 +2578,7 @@ mod tests {
         // could disagree: a row of the setter with no quant at all, a quant
         // left at a stale revision, another profile's quant on every row,
         // and this profile's quant on another setter's row.
-        sync_metadata(conn, desired(vec![("plain", false)], Some("plain")))
+        sync_metadata(conn, desired(vec!["plain"], Some("plain")))
             .await
             .expect("sync");
         let profile_id = profile_id_by_name(conn, "plain").await;
@@ -2380,23 +2650,40 @@ mod tests {
             let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
             seed_embedding(conn, item, setter, "clip", idx, &vec8(sign, -sign)).await;
         }
+        pad_to_threshold(conn, item, setter, "clip", 8).await;
         // Same setter, twice the dimension: the odd one out.
-        let wide: Vec<f32> = vec8(1.0, -1.0).iter().chain(vec8(2.0, -2.0).iter()).copied().collect();
+        let wide: Vec<f32> = vec8(1.0, -1.0)
+            .iter()
+            .chain(vec8(2.0, -2.0).iter())
+            .copied()
+            .collect();
         seed_embedding(conn, item, setter, "clip", 8, &wide).await;
 
-        let state = desired(vec![("plain", false)], Some("plain"));
+        let state = desired(vec!["plain"], Some("plain"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state).await.expect("snapshot");
         let profile_id = profile_id_by_name(conn, "plain").await;
         let build = &plan_data(&snapshot).builds[0];
         assert_eq!(build.dim, 8, "the majority dimension defines the pair");
-        start_space_build(conn, profile_id, &build.setter_ids, None, build.dim)
-            .await
-            .expect("start");
-        let (written, _) = backfill_chunk(conn, profile_id, setter, 100, 0)
+        // The artifact is computed over the *matching* vectors only: the
+        // wide one would abort the scan, which is a different failure.
+        let artifact = scale_artifact(scale_from_absmax(3.0));
+        start_space_build(
+            conn,
+            profile_id,
+            &build.setter_ids,
+            Some(&artifact),
+            build.dim,
+        )
+        .await
+        .expect("start");
+        let (written, _) = backfill_chunk(conn, profile_id, setter, ARTIFACT_MIN_VECTORS * 2, 0)
             .await
             .expect("chunk");
-        assert_eq!(written, 8, "the mismatched vector must not be quantized");
+        assert_eq!(
+            written as i64, ARTIFACT_MIN_VECTORS,
+            "the mismatched vector must not be quantized"
+        );
 
         let err = finish_space_build(conn, profile_id, &[setter])
             .await
@@ -2406,7 +2693,10 @@ mod tests {
             "the mismatch must be named, not reported as a generic shortfall: {err:?}"
         );
         let coverage = load_coverage(conn).await.expect("coverage");
-        assert_eq!(coverage[0].state, "building", "a refused finish must not flip");
+        assert_eq!(
+            coverage[0].state, "building",
+            "a refused finish must not flip"
+        );
     }
 
     // The inline hook writes quants (same rev, same transform) for building
@@ -2423,27 +2713,39 @@ mod tests {
             let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
             seed_embedding(conn, item, setter, "clip", idx, &vec8(sign, -sign)).await;
         }
-        let state = desired(vec![("plain", false)], Some("plain"));
+        pad_to_threshold(conn, item, setter, "clip", 4).await;
+        let state = desired(vec!["plain"], Some("plain"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let profile_id = profile_id_by_name(conn, "plain").await;
         run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
-
-        // New vector after ready: the hook covers it at the current rev.
-        let data_id = seed_embedding(conn, item, setter, "clip", 99, &vec8(-1.0, 1.0)).await;
-        write_inline_quants(conn, data_id).await.expect("inline quants");
-        let row = sqlx::query(
-            "SELECT rev, quant = vec_quantize_binary((SELECT embedding FROM embeddings WHERE id = ?)) AS matches \
-             FROM embedding_quants WHERE id = ? AND profile_id = ?",
+        let scale = artifact_scale(
+            load_coverage(conn).await.expect("coverage")[0]
+                .artifact
+                .as_deref()
+                .expect("artifact"),
         )
-        .bind(data_id)
-        .bind(data_id)
-        .bind(profile_id)
-        .fetch_one(&mut *conn)
-        .await
-        .expect("inline quant row");
+        .expect("scale");
+
+        // New vector after ready: the hook covers it at the current rev,
+        // under the same frozen scale the backfill used.
+        let vector = vec8(-1.0, 1.0);
+        let data_id = seed_embedding(conn, item, setter, "clip", 99, &vector).await;
+        write_inline_quants(conn, data_id)
+            .await
+            .expect("inline quants");
+        let row =
+            sqlx::query("SELECT rev, quant FROM embedding_quants WHERE id = ? AND profile_id = ?")
+                .bind(data_id)
+                .bind(profile_id)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("inline quant row");
         assert_eq!(row.try_get::<i64, _>("rev").expect("rev"), 1);
-        assert_eq!(row.try_get::<i64, _>("matches").expect("matches"), 1);
+        assert_eq!(
+            row.try_get::<Vec<u8>, _>("quant").expect("quant"),
+            quantize_int8(&le_bytes(&vector), scale)
+        );
         // Coverage invariant still holds: nothing for a reconcile to do.
         let work = analyze(conn, state).await.expect("analyze");
         assert_eq!(work, ReconcileWork::None);
@@ -2457,12 +2759,16 @@ mod tests {
         let conn = &mut dbs.index_conn;
         let item = seed_item(conn, "aa").await;
         let setter = seed_setter(conn, "clip/model").await;
-        let state = desired(vec![("default", true)], Some("default"));
+        let state = desired(vec!["default"], Some("default"));
         seed_embedding(conn, item, setter, "clip", 0, &vec8(1.0, 2.0)).await;
         sync_metadata(conn, state).await.expect("sync");
         let data_id = seed_embedding(conn, item, setter, "clip", 1, &vec8(3.0, 4.0)).await;
         write_inline_quants(conn, data_id).await.expect("inline");
-        assert_eq!(quant_rows(conn).await, 0, "pending pair must get no inline quants");
+        assert_eq!(
+            quant_rows(conn).await,
+            0,
+            "pending pair must get no inline quants"
+        );
     }
 
     // Removing a profile from the TOML: chunked deletes, then the row drops
@@ -2478,23 +2784,34 @@ mod tests {
             let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
             seed_embedding(conn, item, setter, "clip", idx, &vec8(sign, -sign)).await;
         }
-        let with_profile = desired(vec![("plain", false)], Some("plain"));
-        sync_metadata(conn, with_profile.clone()).await.expect("sync");
-        let snapshot = load_snapshot(conn, with_profile.clone()).await.expect("snapshot");
+        pad_to_threshold(conn, item, setter, "clip", 6).await;
+        let with_profile = desired(vec!["plain"], Some("plain"));
+        sync_metadata(conn, with_profile.clone())
+            .await
+            .expect("sync");
+        let snapshot = load_snapshot(conn, with_profile.clone())
+            .await
+            .expect("snapshot");
         let profile_id = profile_id_by_name(conn, "plain").await;
         run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
-        assert_eq!(quant_rows(conn).await, 6);
+        assert_eq!(quant_rows(conn).await, ARTIFACT_MIN_VECTORS);
 
         // Opt out entirely.
         let empty = DesiredState {
             profiles: Vec::new(),
             default_name: None,
         };
-        sync_metadata(conn, empty.clone()).await.expect("sync removal");
+        sync_metadata(conn, empty.clone())
+            .await
+            .expect("sync removal");
         let snapshot = load_snapshot(conn, empty.clone()).await.expect("snapshot");
         let plan = plan_data(&snapshot);
         assert_eq!(plan.removals, vec![profile_id]);
-        while delete_quants_chunk(conn, profile_id, 4).await.expect("delete chunk") > 0 {}
+        while delete_quants_chunk(conn, profile_id, 4)
+            .await
+            .expect("delete chunk")
+            > 0
+        {}
         drop_profile(conn, profile_id).await.expect("drop profile");
         assert_eq!(quant_rows(conn).await, 0);
         assert!(load_profiles(conn).await.expect("profiles").is_empty());
@@ -2516,8 +2833,15 @@ mod tests {
         let text_setter = seed_setter(conn, "tclip/ViT-B-32").await;
         for idx in 0..ARTIFACT_MIN_VECTORS / 2 {
             let offset = (idx % 7) as f32;
-            seed_embedding(conn, item, image_setter, "clip", idx, &vec8(1.0 + offset, -3.0))
-                .await;
+            seed_embedding(
+                conn,
+                item,
+                image_setter,
+                "clip",
+                idx,
+                &vec8(1.0 + offset, -3.0),
+            )
+            .await;
             seed_embedding(
                 conn,
                 item,
@@ -2529,7 +2853,7 @@ mod tests {
             .await;
         }
 
-        let state = desired(vec![("default", true)], Some("default"));
+        let state = desired(vec!["default"], Some("default"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         // One space containing both setters; the union count crosses the
@@ -2545,7 +2869,10 @@ mod tests {
         let coverage = load_coverage(conn).await.expect("coverage");
         assert_eq!(coverage.len(), 2);
         assert!(coverage.iter().all(|row| row.state == "ready"));
-        assert_eq!(coverage[0].artifact, coverage[1].artifact, "shared union artifact");
+        assert_eq!(
+            coverage[0].artifact, coverage[1].artifact,
+            "shared union artifact"
+        );
 
         let pair = resolve_ready_pair(
             conn,
@@ -2556,12 +2883,14 @@ mod tests {
         .expect("resolve")
         .expect("ready");
         assert_eq!(pair.profile_id, profile_id);
-        assert!(pair.artifact.is_some());
         assert_eq!(pair.dim, 8);
+        assert!(pair.scale > 0.0);
     }
 
-    // A recipe edit (centered flag flip) resets pairs to pending — search
-    // falls back to exact until the rebuild completes at a bumped rev.
+    // A recipe edit resets every pair of the profile to pending — search
+    // falls back to exact until the rebuild completes at a bumped rev. The
+    // options JSON alone is enough to trigger it, which is what makes the
+    // binary → int8 migration free (below).
     #[tokio::test]
     async fn recipe_change_resets_pairs_and_rebuilds_at_next_rev() {
         ensure_vec_extension_loaded();
@@ -2573,16 +2902,24 @@ mod tests {
             let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
             seed_embedding(conn, item, setter, "clip", idx, &vec8(sign, -sign)).await;
         }
-        let plain = desired(vec![("p", false)], Some("p"));
-        sync_metadata(conn, plain.clone()).await.expect("sync");
-        let snapshot = load_snapshot(conn, plain.clone()).await.expect("snapshot");
+        pad_to_threshold(conn, item, setter, "clip", 5).await;
+        let state = desired(vec!["p"], Some("p"));
+        sync_metadata(conn, state.clone()).await.expect("sync");
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let profile_id = profile_id_by_name(conn, "p").await;
         run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
+        assert_eq!(
+            load_coverage(conn).await.expect("coverage")[0].artifact_rev,
+            1
+        );
 
-        // Flip to centered (still below threshold → pending, exact search,
-        // no data work).
-        let centered = desired(vec![("p", true)], Some("p"));
-        sync_metadata(conn, centered.clone()).await.expect("resync");
+        // A hand-edited recipe (here: the stored options JSON drifting from
+        // the canonical one) resets the pair.
+        sqlx::query("UPDATE vector_quant_profiles SET options = '{\"scheme\":\"other\"}'")
+            .execute(&mut *conn)
+            .await
+            .expect("edit recipe");
+        sync_metadata(conn, state.clone()).await.expect("resync");
         let coverage = load_coverage(conn).await.expect("coverage");
         assert_eq!(coverage[0].state, "pending");
         assert!(coverage[0].artifact.is_none());
@@ -2593,8 +2930,207 @@ mod tests {
                 .is_none(),
             "pending pair must not resolve for querying"
         );
-        let work = analyze(conn, centered).await.expect("analyze");
-        assert_eq!(work, ReconcileWork::None, "below threshold after reset");
+
+        // The next reconcile rebuilds it at a bumped revision.
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let plan = plan_data(&snapshot);
+        assert_eq!(plan.builds.len(), 1);
+        run_build(conn, &plan.builds[0], profile_id).await;
+        let coverage = load_coverage(conn).await.expect("coverage");
+        assert_eq!(coverage[0].state, "ready");
+        assert_eq!(coverage[0].artifact_rev, 2);
+        assert_eq!(
+            analyze(conn, state).await.expect("analyze"),
+            ReconcileWork::None
+        );
+    }
+
+    // `embedding_quants` must be a rowid table. As WITHOUT ROWID its rows
+    // lived in an index b-tree, whose in-leaf payload cap (~page_size/4)
+    // the int8 payloads blow straight through: 3.13x space and a quant
+    // search slower than exact (the 20260730150000 migration's comment has
+    // the numbers). Assert the layout itself, not a symptom of it.
+    #[tokio::test]
+    async fn embedding_quants_is_a_rowid_table() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+
+        // A WITHOUT ROWID table has no `rowid` column at all; this parses
+        // and runs only against a rowid table.
+        sqlx::query("SELECT rowid FROM embedding_quants LIMIT 0")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("embedding_quants must be a rowid table");
+
+        // ... and the old primary key survives as a unique index, which is
+        // what the search join and the upsert both key on.
+        let indexes: Vec<(String, i64)> = sqlx::query("PRAGMA index_list(embedding_quants)")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("index list")
+            .iter()
+            .map(|row| (row.get::<String, _>("name"), row.get::<i64, _>("unique")))
+            .collect();
+        let unique = indexes
+            .iter()
+            .filter(|(_, unique)| *unique != 0)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(unique.len(), 1, "exactly one unique index: {indexes:?}");
+        let columns: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA index_info({})",
+            unique[0]
+        )))
+        .fetch_all(&mut *conn)
+        .await
+        .expect("index info")
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+        assert_eq!(columns, vec!["id".to_string(), "profile_id".to_string()]);
+        assert!(
+            indexes
+                .iter()
+                .any(|(name, _)| name == "embedding_quants_profile_rev_id"),
+            "the status card's covering index must survive: {indexes:?}"
+        );
+    }
+
+    // The whole binary → int8 migration story, as an upgrading database
+    // actually meets it: the 20260730150000 migration has already dropped
+    // the binary quant rows and reset the coverage, so what remains is a
+    // binary-era *profile* row over an empty quant table. It converges to a
+    // ready int8 profile through the ordinary recipe-change path — no data
+    // migration, just a reconcile.
+    #[tokio::test]
+    async fn binary_era_profile_migrates_to_int8() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let item = seed_item(conn, "aa").await;
+        let setter = seed_setter(conn, "clip/model").await;
+        for idx in 0..8 {
+            let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
+            seed_embedding(conn, item, setter, "clip", idx, &vec8(sign, -sign)).await;
+        }
+        pad_to_threshold(conn, item, setter, "clip", 8).await;
+
+        // Actual state as v1 left it, *after* the 20260730150000 migration
+        // ran: the binary profile row and its centered recipe survive (they
+        // are metadata), the quant table is empty (dropped and recreated in
+        // the new layout) and every coverage pair was reset to pending with
+        // its artifact cleared — which is precisely what makes the orphaned
+        // 'ready' claim over vanished rows unreachable. `artifact_rev` and
+        // `dim` are not reset by the migration, so they still carry the
+        // binary era's values.
+        let profile_id: i64 = sqlx::query(
+            "INSERT INTO vector_quant_profiles (name, quantizer, options, state, is_default) \
+             VALUES ('default', 'binary', '{\"centered\":true}', 'active', 1) RETURNING id",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("binary profile")
+        .try_get("id")
+        .expect("id");
+        sqlx::query(
+            "INSERT INTO vector_quant_coverage \
+                (profile_id, setter_id, needs_artifact, artifact, artifact_rev, dim, \
+                 n_at_artifact, state) \
+             VALUES (?, ?, 1, NULL, 4, 8, NULL, 'pending')",
+        )
+        .bind(profile_id)
+        .bind(setter)
+        .execute(&mut *conn)
+        .await
+        .expect("post-migration coverage");
+        assert_eq!(quant_rows(conn).await, 0, "the migration dropped the codes");
+        assert!(
+            resolve_ready_pair(conn, "default", &["clip/model".to_string()])
+                .await
+                .expect("resolve")
+                .is_none(),
+            "a reset pair must not be served while it waits for its rebuild"
+        );
+
+        // The user's TOML still says `quantizer = "binary"`: the load path
+        // reads it as int8, which is a recipe change.
+        let state = resolve_desired(&VectorQuantsConfig {
+            default: Some("default".to_string()),
+            profiles: vec![VectorQuantProfileConfig {
+                name: "default".to_string(),
+                quantizer: "binary".to_string(),
+                centered: true,
+            }],
+        })
+        .expect("retired quantizer maps to int8");
+        assert_eq!(state.profiles[0].quantizer, "int8");
+        // The commit path rewrites the same section in place before saving,
+        // so the file converges to int8 at the first settings save.
+        let mut committed = VectorQuantsConfig {
+            default: Some("default".to_string()),
+            profiles: vec![VectorQuantProfileConfig {
+                name: "default".to_string(),
+                quantizer: "binary".to_string(),
+                centered: true,
+            }],
+        };
+        assert!(
+            normalize_retired(&mut committed),
+            "the save rewrites binary"
+        );
+        assert_eq!(committed.profiles[0].quantizer, "int8");
+        assert!(!committed.profiles[0].centered);
+
+        sync_metadata(conn, state.clone()).await.expect("sync");
+        let profile = &load_profiles(conn).await.expect("profiles")[0];
+        assert_eq!(profile.id, profile_id, "the profile keeps its identity");
+        assert_eq!(profile.quantizer, "int8");
+        assert_eq!(profile.options.as_deref(), Some("{\"scheme\":\"gsym\"}"));
+        let coverage = load_coverage(conn).await.expect("coverage");
+        assert_eq!(coverage[0].state, "pending", "the pair must rebuild");
+        assert!(
+            resolve_ready_pair(conn, "default", &["clip/model".to_string()])
+                .await
+                .expect("resolve")
+                .is_none(),
+            "binary coverage must not be served while it rebuilds"
+        );
+
+        // The rebuild writes int8 codes for the whole space, at a rev
+        // bumped past the binary era's.
+        let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
+        let plan = plan_data(&snapshot);
+        assert_eq!(plan.builds.len(), 1);
+        assert!(!plan.builds[0].resume, "a reset pair is not a resume");
+        run_build(conn, &plan.builds[0], profile_id).await;
+
+        let coverage = load_coverage(conn).await.expect("coverage");
+        assert_eq!(coverage[0].state, "ready");
+        assert_eq!(coverage[0].artifact_rev, 5, "the revision bumped once");
+        assert_eq!(
+            quant_rows(conn).await,
+            ARTIFACT_MIN_VECTORS,
+            "every vector covered"
+        );
+        let sizes: Vec<i64> =
+            sqlx::query("SELECT DISTINCT length(quant) AS n FROM embedding_quants")
+                .fetch_all(&mut *conn)
+                .await
+                .expect("quant sizes")
+                .iter()
+                .map(|row| row.get::<i64, _>("n"))
+                .collect();
+        assert_eq!(sizes, vec![8], "every row carries 8 int8 codes now");
+        let pair = resolve_ready_pair(conn, "default", &["clip/model".to_string()])
+            .await
+            .expect("resolve")
+            .expect("ready after rebuild");
+        assert_eq!(pair.dim, 8);
+        assert_eq!(
+            analyze(conn, state).await.expect("analyze"),
+            ReconcileWork::None
+        );
     }
 
     // Regression guard for the class of bug where a client models "no
@@ -2611,20 +3147,19 @@ mod tests {
             let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
             seed_embedding(conn, item, setter, "clip", idx, &vec8(sign, -sign)).await;
         }
-        let state = desired(vec![("plain", false)], Some("plain"));
+        let state = desired(vec!["plain"], Some("plain"));
         sync_metadata(conn, state.clone()).await.expect("sync");
 
         for blank in ["", "   "] {
-            let mut filter: crate::pql::model::SemanticImageSearch = serde_json::from_value(
-                serde_json::json!({
+            let mut filter: crate::pql::model::SemanticImageSearch =
+                serde_json::from_value(serde_json::json!({
                     "image_embeddings": {
                         "query": "q",
                         "model": "clip/model",
                         "variant": blank,
                     }
-                }),
-            )
-            .expect("filter json");
+                }))
+                .expect("filter json");
             filter.image_embeddings._embedding = Some(le_bytes(&vec8(1.0, 1.0)));
             filter.image_embeddings._distance_func_override =
                 Some(crate::pql::model::DistanceFunction::Cosine);
@@ -2643,16 +3178,15 @@ mod tests {
 
         // A real profile name that cannot be resolved synchronously still
         // errors — the fallback the design forbids stays forbidden.
-        let mut filter: crate::pql::model::SemanticImageSearch = serde_json::from_value(
-            serde_json::json!({
+        let mut filter: crate::pql::model::SemanticImageSearch =
+            serde_json::from_value(serde_json::json!({
                 "image_embeddings": {
                     "query": "q",
                     "model": "clip/model",
                     "variant": "plain",
                 }
-            }),
-        )
-        .expect("filter json");
+            }))
+            .expect("filter json");
         filter.image_embeddings._embedding = Some(le_bytes(&vec8(1.0, 1.0)));
         filter.image_embeddings._distance_func_override =
             Some(crate::pql::model::DistanceFunction::Cosine);
@@ -2669,17 +3203,58 @@ mod tests {
 
     #[test]
     fn resolve_desired_validates() {
-        assert!(resolve_desired(&config(vec![("a", true)], Some("a"))).is_ok());
-        assert!(resolve_desired(&config(vec![("a", true)], None)).is_err(), "default required");
-        assert!(resolve_desired(&config(vec![("a", true)], Some("b"))).is_err(), "default must exist");
+        assert!(resolve_desired(&config(vec!["a"], Some("a"))).is_ok());
         assert!(
-            resolve_desired(&config(vec![("a", true), ("a", false)], Some("a"))).is_err(),
+            resolve_desired(&config(vec!["a"], None)).is_err(),
+            "default required"
+        );
+        assert!(
+            resolve_desired(&config(vec!["a"], Some("b"))).is_err(),
+            "default must exist"
+        );
+        assert!(
+            resolve_desired(&config(vec!["a", "a"], Some("a"))).is_err(),
             "duplicate names"
         );
         assert!(resolve_desired(&config(vec![], None)).is_ok(), "opt-out");
-        let mut bad = config(vec![("a", true)], Some("a"));
-        bad.profiles[0].quantizer = "int8".to_string();
-        assert!(resolve_desired(&bad).is_err(), "int8 is reserved, not implemented");
+
+        // The retired quantizer: mapped on load, rewritten in place on
+        // commit (`normalize_retired`). A typo is an error on both paths —
+        // load_desired_state turns that into "inert", which is what keeps a
+        // slip of the finger from deleting every quant row.
+        let mut retired = config(vec!["a"], Some("a"));
+        retired.profiles[0].quantizer = "binary".to_string();
+        assert_eq!(
+            resolve_desired(&retired).expect("mapped").profiles[0].quantizer,
+            "int8"
+        );
+        assert!(normalize_retired(&mut retired), "commit rewrites binary");
+        assert_eq!(retired.profiles[0].quantizer, "int8");
+        assert!(
+            !normalize_retired(&mut retired),
+            "normalization is idempotent"
+        );
+        let mut bad = config(vec!["a"], Some("a"));
+        bad.profiles[0].quantizer = "in8".to_string();
+        assert!(resolve_desired(&bad).is_err(), "typos stay errors");
+        assert!(
+            !normalize_retired(&mut bad),
+            "unknown kinds are not rewritten; they fail validation instead"
+        );
+        assert!(resolve_desired(&bad).is_err());
+    }
+
+    // The built-in default (the day-1 desired state for every DB without a
+    // `[vector_quants]` section) is the int8 profile.
+    #[test]
+    fn builtin_default_is_int8() {
+        let state =
+            resolve_desired(&VectorQuantsConfig::builtin_default()).expect("builtin is valid");
+        assert_eq!(state.default_name.as_deref(), Some("default"));
+        assert_eq!(state.profiles.len(), 1);
+        assert_eq!(state.profiles[0].quantizer, "int8");
+        assert!(state.profiles[0].needs_artifact());
+        assert_eq!(state.profiles[0].options_json(), "{\"scheme\":\"gsym\"}");
     }
 
     async fn seed_file(conn: &mut SqliteConnection, item_id: i64, sha: &str) {
@@ -2757,32 +3332,36 @@ mod tests {
         out
     }
 
-    /// A candidate set whose Hamming (coarse) order genuinely disagrees
-    /// with cosine (exact) order — without this the head/merge machinery
-    /// is never exercised: identical quants collapse every cdist to 0 and
-    /// the coarse order degenerates into the tiebreaker, which trivially
-    /// matches exact.
+    /// A candidate set with wide, well-separated cosine margins: two
+    /// families that int8 rounding cannot reorder.
     ///
-    /// Binarization keeps only signs. "Spread" vectors are all-positive
-    /// (Hamming 0 from the all-positive query) but point far off-axis, so
-    /// their cosine distance is large; "tight" vectors flip one small
-    /// component (Hamming 1+) while staying nearly parallel to the query,
-    /// so their cosine distance is tiny. Coarse ranks spread first, exact
-    /// ranks tight first.
+    /// "Spread" vectors put nearly all their mass on one dimension, so their
+    /// cosine distance from the all-ones query is large; "tight" vectors
+    /// stay nearly parallel to the query with a few small negative
+    /// components, so their cosine distance is small. Within each family the
+    /// separation is a whole quantization step or more (the tight family
+    /// varies the *number* of negative components, the spread family the
+    /// magnitude of its off-axis mass), so the int8 ordering is required to
+    /// equal the exact one — that equality is what the test asserts, and it
+    /// is only meaningful because the fixture spans both families.
     fn disagreeing_vectors() -> Vec<[f32; 8]> {
         let mut vectors = Vec::new();
-        // Hamming 0, poor cosine: one dominant dimension.
+        // Poor cosine: one dominant dimension, with a second component whose
+        // magnitude separates the family member by member (widened for int8:
+        // a shared off-axis constant would quantize every member of this
+        // family to the same one-hot code and tie them all).
         for idx in 0..6 {
             let mut vector = [0.02f32; 8];
-            vector[idx] = 6.0 + idx as f32;
+            vector[idx] = 11.0;
+            vector[(idx + 1) % 8] = 0.6 + 0.5 * idx as f32;
             vectors.push(vector);
         }
-        // Hamming 1..3, excellent cosine: nearly parallel to the query with
-        // a few tiny negative components.
+        // Excellent cosine: nearly parallel to the query, with 1..3 negative
+        // components big enough to survive quantization.
         for idx in 0..6 {
-            let mut vector = [1.0f32; 8];
+            let mut vector = [4.0f32; 8];
             for flip in 0..=(idx % 3) {
-                vector[7 - flip] = -0.001 * (1.0 + idx as f32);
+                vector[7 - flip] = -0.5 - 0.2 * idx as f32;
             }
             vectors.push(vector);
         }
@@ -2802,31 +3381,45 @@ mod tests {
             seed_file(conn, item, &sha).await;
             seed_embedding(conn, item, setter, "clip", 0, &vector).await;
         }
-        let state = desired(vec![("plain", false)], Some("plain"));
+        // The fillers own no `files` row, so they pad the space past the
+        // artifact threshold without joining any search result.
+        let filler_item = seed_item(conn, &format!("{prefix}-pad")).await;
+        pad_to_threshold(
+            conn,
+            filler_item,
+            setter,
+            "clip",
+            disagreeing_vectors().len() as i64,
+        )
+        .await;
+        let state = desired(vec!["plain"], Some("plain"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let profile_id = profile_id_by_name(conn, "plain").await;
         run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
 
+        let scale = artifact_scale(
+            load_coverage(conn).await.expect("coverage")[0]
+                .artifact
+                .as_deref()
+                .expect("artifact"),
+        )
+        .expect("scale");
         let query_vec = le_bytes(&QUERY_VECTOR);
-        let query_quant = compute_query_quant(conn, &query_vec, None)
-            .await
-            .expect("query quant");
+        let query_quant = compute_query_quant(&query_vec, scale);
         (setter, profile_id, query_vec, query_quant)
     }
 
-    // The two-stage quant scorer is bit-identical to exact search when the
-    // candidate set fits inside k, and stays deterministic (same membership,
-    // repeatable order) when k truncates the head — on a candidate set whose
-    // coarse order genuinely disagrees with the exact order, so the head
-    // selection and the head/tail merge are actually exercised.
+    // The single-pass int8 scorer reproduces the exact ordering on a set
+    // whose cosine margins are wider than a quantization step, and is
+    // deterministic. `k` is deprecated and ignored, so passing one must not
+    // change a single row.
     #[tokio::test]
     async fn quant_query_matches_exact_and_is_deterministic() {
         ensure_vec_extension_loaded();
         let mut dbs = setup_test_databases().await;
         let conn = &mut dbs.index_conn;
-        let (_setter, profile_id, query_vec, query_quant) =
-            seed_disagreeing_space(conn, "i").await;
+        let (_setter, profile_id, query_vec, query_quant) = seed_disagreeing_space(conn, "i").await;
         let total = disagreeing_vectors().len();
 
         let make_query = |element| crate::pql::model::PqlQuery {
@@ -2847,59 +3440,47 @@ mod tests {
             profile_id,
             query_quant: Some(query_quant.clone()),
         });
-        let quant_full = run_query_order(
-            conn,
-            make_query(image_filter("clip/model", query_vec.clone(), quant.clone(), None)),
-        )
-        .await;
-        assert_eq!(
-            exact, quant_full,
-            "candidates <= k: quant must be bit-identical to exact"
-        );
-
-        // k=1 rescores only the coarse-best group; everything else keeps
-        // coarse (Hamming) order.
-        let quant_small_k = run_query_order(
-            conn,
-            make_query(image_filter("clip/model", query_vec.clone(), quant.clone(), Some(1))),
-        )
-        .await;
-        assert_eq!(quant_small_k.len(), total, "membership is never truncated");
-        assert_eq!(
-            exact.iter().collect::<std::collections::HashSet<_>>(),
-            quant_small_k.iter().collect::<std::collections::HashSet<_>>(),
-            "membership is identical to exact regardless of k"
-        );
-        // Guard against a degenerate fixture: if this ever passes, the
-        // coarse pass agrees with exact everywhere and the head/merge
-        // machinery is not being tested at all.
-        assert_ne!(
-            exact, quant_small_k,
-            "fixture must produce a coarse order that disagrees with exact"
-        );
-        let repeat = run_query_order(
-            conn,
-            make_query(image_filter("clip/model", query_vec.clone(), quant.clone(), Some(1))),
-        )
-        .await;
-        assert_eq!(quant_small_k, repeat, "ordering is deterministic");
-
-        // Growing k monotonically re-scores more of the head: at k = |set|
-        // the result must converge back to exact.
-        let quant_full_k = run_query_order(
+        let quant_order = run_query_order(
             conn,
             make_query(image_filter(
                 "clip/model",
                 query_vec.clone(),
-                quant,
-                Some(total as i64),
+                quant.clone(),
+                None,
             )),
         )
         .await;
         assert_eq!(
-            exact, quant_full_k,
-            "k covering the whole candidate set must reproduce exact"
+            exact, quant_order,
+            "int8 must reproduce the exact ordering on well-separated vectors"
         );
+        let repeat = run_query_order(
+            conn,
+            make_query(image_filter(
+                "clip/model",
+                query_vec.clone(),
+                quant.clone(),
+                None,
+            )),
+        )
+        .await;
+        assert_eq!(quant_order, repeat, "ordering is deterministic");
+
+        // k is inert: a value that would once have truncated the rescoring
+        // head must produce the identical result.
+        for k in [1, total as i64, 10_000] {
+            let with_k = run_query_order(
+                conn,
+                make_query(image_filter(
+                    "clip/model",
+                    query_vec.clone(),
+                    quant.clone(),
+                    Some(k),
+                )),
+            )
+            .await;
+            assert_eq!(quant_order, with_k, "k={k} must be ignored");
+        }
     }
 
     // Offset pagination never overlaps or skips: walking pages under a
@@ -2909,8 +3490,7 @@ mod tests {
         ensure_vec_extension_loaded();
         let mut dbs = setup_test_databases().await;
         let conn = &mut dbs.index_conn;
-        let (_setter, profile_id, query_vec, query_quant) =
-            seed_disagreeing_space(conn, "p").await;
+        let (_setter, profile_id, query_vec, query_quant) = seed_disagreeing_space(conn, "p").await;
         let quant = crate::pql::model::QuantResolved {
             profile_id,
             query_quant: Some(query_quant),
@@ -2932,7 +3512,10 @@ mod tests {
         for page in 1..=3 {
             walked.extend(run_query_order(conn, make_query(page, 4)).await);
         }
-        assert_eq!(full, walked, "page walk must equal the single-shot ordering");
+        assert_eq!(
+            full, walked,
+            "page walk must equal the single-shot ordering"
+        );
     }
 
     // New-setter flow: a setter appearing after the profile is ready gets
@@ -2949,7 +3532,8 @@ mod tests {
             let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
             seed_embedding(conn, item, first, "clip", idx, &vec8(sign, -sign)).await;
         }
-        let state = desired(vec![("plain", false)], Some("plain"));
+        pad_to_threshold(conn, item, first, "clip", 4).await;
+        let state = desired(vec!["plain"], Some("plain"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let profile_id = profile_id_by_name(conn, "plain").await;
@@ -2963,6 +3547,7 @@ mod tests {
         // not exist yet, so the check reports work.
         let second = seed_setter(conn, "textembed/b").await;
         seed_embedding(conn, item, second, "text-embedding", 0, &vec8(-1.0, 1.0)).await;
+        pad_to_threshold(conn, item, second, "text-embedding", 1).await;
         assert_ne!(
             analyze(conn, state.clone()).await.expect("analyze"),
             ReconcileWork::None
@@ -2994,10 +3579,17 @@ mod tests {
         let image_setter = seed_setter(conn, "clip/M").await;
         for idx in 0..ARTIFACT_MIN_VECTORS {
             let offset = (idx % 5) as f32;
-            seed_embedding(conn, item, image_setter, "clip", idx, &vec8(2.0 + offset, -1.0))
-                .await;
+            seed_embedding(
+                conn,
+                item,
+                image_setter,
+                "clip",
+                idx,
+                &vec8(2.0 + offset, -1.0),
+            )
+            .await;
         }
-        let state = desired(vec![("default", true)], Some("default"));
+        let state = desired(vec!["default"], Some("default"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let profile_id = profile_id_by_name(conn, "default").await;
@@ -3007,7 +3599,9 @@ mod tests {
             .clone()
             .expect("solo artifact");
 
-        // The sibling appears with a handful of vectors.
+        // The sibling appears with a handful of vectors, one of which is
+        // wider than anything the image setter holds — so the union's
+        // absmax, and with it the scale, must change.
         let text_setter = seed_setter(conn, "tclip/M").await;
         for idx in 0..3 {
             seed_embedding(
@@ -3016,7 +3610,7 @@ mod tests {
                 text_setter,
                 "text-embedding",
                 idx,
-                &vec8(-2.0, 1.0),
+                &vec8(-8.0, 1.0),
             )
             .await;
         }
@@ -3036,7 +3630,7 @@ mod tests {
         assert_eq!(coverage[0].artifact, coverage[1].artifact);
         assert_ne!(
             union_artifact, solo_artifact,
-            "the union mean must differ from the solo mean"
+            "the union scale must differ from the solo scale"
         );
         assert_eq!(
             analyze(conn, state).await.expect("analyze"),
@@ -3044,7 +3638,8 @@ mod tests {
         );
     }
 
-    // similar_to under a quant profile: same membership as exact, exact head.
+    // similar_to under a quant profile: both sides of the self-join read
+    // int8 codes, and the ordering matches exact on well-separated vectors.
     #[tokio::test]
     async fn similar_to_quant_matches_exact() {
         ensure_vec_extension_loaded();
@@ -3058,20 +3653,21 @@ mod tests {
             let spread = 0.2 + idx as f32 * 0.4;
             seed_embedding(conn, item, setter, "clip", 0, &vec8(1.0, spread)).await;
         }
-        let state = desired(vec![("plain", false)], Some("plain"));
+        let filler_item = seed_item(conn, "s-pad").await;
+        pad_to_threshold(conn, filler_item, setter, "clip", 8).await;
+        let state = desired(vec!["plain"], Some("plain"));
         sync_metadata(conn, state.clone()).await.expect("sync");
         let snapshot = load_snapshot(conn, state.clone()).await.expect("snapshot");
         let profile_id = profile_id_by_name(conn, "plain").await;
         run_build(conn, &plan_data(&snapshot).builds[0], profile_id).await;
 
         let make_filter = |quant: Option<crate::pql::model::QuantResolved>| {
-            let mut filter: crate::pql::model::SimilarTo = serde_json::from_value(
-                serde_json::json!({ "similar_to": {
+            let mut filter: crate::pql::model::SimilarTo =
+                serde_json::from_value(serde_json::json!({ "similar_to": {
                     "target": "s00", "model": "clip/model",
                     "force_distance_function": true
-                } }),
-            )
-            .expect("similar_to json");
+                } }))
+                .expect("similar_to json");
             filter.similar_to._quant = quant;
             crate::pql::model::QueryElement::SimilarTo(filter)
         };
@@ -3092,7 +3688,118 @@ mod tests {
             }))),
         )
         .await;
-        assert_eq!(exact, quant, "candidates <= k: identical to exact");
+        assert_eq!(exact, quant, "int8 similarity must reproduce exact's order");
+    }
+
+    // The codec's contract, byte for byte: round-half-to-even, clamping at
+    // both ends, one byte per component in component order, and a scale
+    // that is never zero. Everything downstream (stored codes, query codes,
+    // the recall numbers in docs/vector-int8-quant.md) rests on this.
+    #[test]
+    fn int8_codec_rounds_ties_to_even_and_clamps() {
+        // scale 1.0 makes the code equal the rounded value.
+        let values = [0.5f32, 1.5, 2.5, -0.5, -1.5, -2.5, 2.4999, -2.4999];
+        let codes = quantize_int8(&le_bytes(&values), 1.0);
+        assert_eq!(
+            codes.iter().map(|byte| *byte as i8).collect::<Vec<_>>(),
+            vec![0, 2, 2, 0, -2, -2, 2, -2],
+            "rint must be round-half-to-even, not round-half-away-from-zero"
+        );
+
+        // Clamping: the corpus absmax lands exactly on +127, and anything
+        // beyond the range (a query component, typically) saturates.
+        let scale = scale_from_absmax(11.0);
+        let codes = quantize_int8(&le_bytes(&[11.0, -11.0, 1000.0, -1000.0]), scale);
+        assert_eq!(
+            codes.iter().map(|byte| *byte as i8).collect::<Vec<_>>(),
+            vec![127, -127, 127, -128]
+        );
+
+        // Layout: one byte per component, in component order.
+        let codes = quantize_int8(&le_bytes(&[1.0, 2.0, 3.0]), 1.0);
+        assert_eq!(codes, vec![1u8, 2, 3]);
+
+        // Degenerate corpus: scale 1.0, all-zero codes, no division by zero.
+        assert_eq!(scale_from_absmax(0.0), 1.0);
+        assert_eq!(scale_from_absmax(f32::NAN), 1.0);
+        assert_eq!(quantize_int8(&le_bytes(&[0.0, 0.0]), 1.0), vec![0u8, 0]);
+
+        // Artifact round-trip, and the rejections that keep a bad artifact
+        // from ever reaching the codec.
+        let scale = scale_from_absmax(3.5);
+        assert_eq!(artifact_scale(&scale_artifact(scale)), Some(scale));
+        assert_eq!(artifact_scale(&[]), None);
+        assert_eq!(artifact_scale(&[0, 0, 0, 0, 0]), None, "wrong length");
+        assert_eq!(artifact_scale(&0f32.to_le_bytes()), None, "zero scale");
+        assert_eq!(artifact_scale(&(-1f32).to_le_bytes()), None, "negative");
+        assert_eq!(artifact_scale(&f32::NAN.to_le_bytes()), None, "not finite");
+    }
+
+    // The execution half of the codec: sqlite-vec must read our code blobs
+    // as int8 vectors and compute the distances the query builder asks for.
+    // Checked against a Rust reference, because a silent misread (float32,
+    // say) would still return numbers — just wrong ones.
+    #[tokio::test]
+    async fn sqlite_vec_int8_distances_match_a_rust_reference() {
+        ensure_vec_extension_loaded();
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+
+        let codes = |values: &[i8]| -> Vec<u8> { values.iter().map(|v| *v as u8).collect() };
+        let cases: [(Vec<i8>, Vec<i8>); 3] = [
+            (
+                vec![127, -128, 0, 3, -3, 64, -64, 1],
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            (vec![1, 1, 1, 1, 1, 1, 1, 1], vec![1, 1, 1, 1, 1, 1, 1, 1]),
+            (
+                vec![-5, 20, -33, 44, 0, 12, -7, 100],
+                vec![100, -7, 12, 0, 44, -33, 20, -5],
+            ),
+        ];
+        for (left, right) in cases {
+            let row = sqlx::query(
+                "SELECT vec_distance_L2(vec_int8(?), vec_int8(?)) AS l2, \
+                        vec_distance_cosine(vec_int8(?), vec_int8(?)) AS cosine",
+            )
+            .bind(codes(&left))
+            .bind(codes(&right))
+            .bind(codes(&left))
+            .bind(codes(&right))
+            .fetch_one(&mut *conn)
+            .await
+            .expect("sqlite-vec int8 distances");
+            let l2: f64 = row.try_get("l2").expect("l2");
+            let cosine: f64 = row.try_get("cosine").expect("cosine");
+
+            let dot: f64 = left
+                .iter()
+                .zip(&right)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum();
+            let norm = |values: &[i8]| -> f64 {
+                values
+                    .iter()
+                    .map(|v| f64::from(*v) * f64::from(*v))
+                    .sum::<f64>()
+                    .sqrt()
+            };
+            let expected_l2: f64 = left
+                .iter()
+                .zip(&right)
+                .map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let expected_cosine = 1.0 - dot / (norm(&left) * norm(&right));
+            assert!(
+                (l2 - expected_l2).abs() <= 1e-4 * expected_l2.max(1.0),
+                "L2 {l2} != {expected_l2} for {left:?} / {right:?}"
+            );
+            assert!(
+                (cosine - expected_cosine).abs() <= 1e-4,
+                "cosine {cosine} != {expected_cosine} for {left:?} / {right:?}"
+            );
+        }
     }
 
     #[test]

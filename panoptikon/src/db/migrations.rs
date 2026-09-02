@@ -25,7 +25,7 @@ static STORAGE_MIGRATOR: LazyLock<Migrator> =
 static USER_DATA_MIGRATOR: LazyLock<Migrator> =
     LazyLock::new(|| normalize_line_endings(sqlx::migrate!("migrations/user_data")));
 
-fn normalize_line_endings(raw: Migrator) -> Migrator {
+pub(crate) fn normalize_line_endings(raw: Migrator) -> Migrator {
     let migrations: Vec<Migration> = raw
         .migrations
         .iter()
@@ -312,6 +312,30 @@ async fn migrate_path(
         .await
         .with_context(|| format!("failed to enable WAL on {}", path.display()))?;
     Ok(())
+}
+
+/// Applies the index migrator to an arbitrary index database file, exactly
+/// as a gateway start would. Test/verification-harness only: the shipped
+/// paths all go through [`migrate_databases_on_disk`], which derives its
+/// paths from the runtime config.
+#[cfg(test)]
+pub(crate) async fn migrate_index_db_file(path: &Path) -> Result<()> {
+    migrate_path(path, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD, DbKind::Index).await
+}
+
+/// Applies the user_data migrator to an arbitrary user_data database file.
+/// Test-only: needed by tests that require a real on-disk user_data DB with
+/// two independent connections to it, which the shared-cache in-memory setup
+/// (`setup_test_databases`) cannot provide.
+#[cfg(test)]
+pub(crate) async fn migrate_user_data_db_file(path: &Path) -> Result<()> {
+    migrate_path(
+        path,
+        &USER_DATA_MIGRATOR,
+        USER_DATA_ALEMBIC_HEAD,
+        DbKind::Other,
+    )
+    .await
 }
 
 /// Marks a freshly created database as being at the alembic head. init.sql
@@ -702,9 +726,14 @@ mod tests {
         let path = dir.path().join("default.db");
         fake_python_db(&path, Some(USER_DATA_ALEMBIC_HEAD)).await;
 
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
-            .await
-            .expect("baseline at head should succeed");
+        migrate_path(
+            &path,
+            &USER_DATA_MIGRATOR,
+            USER_DATA_ALEMBIC_HEAD,
+            DbKind::Other,
+        )
+        .await
+        .expect("baseline at head should succeed");
 
         assert_eq!(
             sqlx_migration_count(&path).await,
@@ -721,6 +750,93 @@ mod tests {
         conn.close().await.unwrap();
     }
 
+    // The storage database's first-ever Rust migration on top of the init
+    // snapshot, against the case that only exists for upgrading users: a
+    // Python-created storage.db, baselined rather than created here.
+    //
+    // The baseline records *only* the init migration (so the existing
+    // thumbnail blobs survive untouched) and then everything after it runs
+    // normally. The mechanism is shared with the index DB, but it had never
+    // been exercised on this migrator, because storage.db had exactly one
+    // migration until `visual_attempts`.
+    #[tokio::test]
+    async fn storage_baseline_runs_migrations_added_after_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage.db");
+
+        // A Python-created storage.db at head, with a `thumbnails` table whose
+        // shape differs from the snapshot's: any accidental execution of
+        // init.sql fails loudly instead of passing silently.
+        {
+            let mut conn = connect(&path).await;
+            sqlx::query("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO alembic_version VALUES (?1)")
+                .bind(STORAGE_ALEMBIC_HEAD)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE thumbnails (fake_marker INTEGER PRIMARY KEY)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+        }
+
+        migrate_path(
+            &path,
+            &STORAGE_MIGRATOR,
+            STORAGE_ALEMBIC_HEAD,
+            DbKind::Other,
+        )
+        .await
+        .expect("an existing storage database must migrate, not be refused");
+
+        let mut conn = connect(&path).await;
+        let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("SELECT * FROM pragma_table_info('thumbnails')")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        let names: Vec<&str> = cols.iter().map(|col| col.1.as_str()).collect();
+        assert!(
+            names.contains(&"fake_marker") && !names.contains(&"item_sha256"),
+            "init.sql must not have been executed: {names:?}"
+        );
+        // ...while the post-snapshot `ALTER TABLE thumbnails` did run on it,
+        // which is the other half of the same guarantee.
+        assert!(names.contains(&"media_type"), "{names:?}");
+        // ...and the migration that came after it did run.
+        sqlx::query("SELECT COUNT(*) FROM visual_attempts")
+            .fetch_one(&mut conn)
+            .await
+            .expect("migrations after the snapshot must still apply");
+        let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied,
+            STORAGE_MIGRATOR
+                .iter()
+                .filter(|migration| !migration.migration_type.is_down_migration())
+                .count() as i64
+        );
+        conn.close().await.unwrap();
+
+        // Idempotent: a second start has nothing pending and must not fail.
+        migrate_path(
+            &path,
+            &STORAGE_MIGRATOR,
+            STORAGE_ALEMBIC_HEAD,
+            DbKind::Other,
+        )
+        .await
+        .expect("a migrated storage database must reopen cleanly");
+    }
+
     // A Python DB behind head must not be baselined — the init snapshot
     // assumes columns an older schema doesn't have.
     #[tokio::test]
@@ -729,9 +845,14 @@ mod tests {
         let path = dir.path().join("default.db");
         fake_python_db(&path, Some("31adcda83d68")).await;
 
-        let err = migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
-            .await
-            .expect_err("outdated revision must be refused");
+        let err = migrate_path(
+            &path,
+            &USER_DATA_MIGRATOR,
+            USER_DATA_ALEMBIC_HEAD,
+            DbKind::Other,
+        )
+        .await
+        .expect_err("outdated revision must be refused");
         assert!(format!("{err:#}").contains("alembic revision"), "{err:#}");
     }
 
@@ -743,9 +864,14 @@ mod tests {
         let path = dir.path().join("default.db");
         fake_python_db(&path, None).await;
 
-        let err = migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
-            .await
-            .expect_err("missing alembic_version must be refused");
+        let err = migrate_path(
+            &path,
+            &USER_DATA_MIGRATOR,
+            USER_DATA_ALEMBIC_HEAD,
+            DbKind::Other,
+        )
+        .await
+        .expect_err("missing alembic_version must be refused");
         assert!(format!("{err:#}").contains("no alembic_version"), "{err:#}");
     }
 
@@ -786,9 +912,14 @@ mod tests {
     async fn crlf_recorded_checksums_are_repaired() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("default.db");
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
-            .await
-            .unwrap();
+        migrate_path(
+            &path,
+            &USER_DATA_MIGRATOR,
+            USER_DATA_ALEMBIC_HEAD,
+            DbKind::Other,
+        )
+        .await
+        .unwrap();
 
         let mut conn = connect(&path).await;
         for migration in USER_DATA_MIGRATOR.iter() {
@@ -804,9 +935,14 @@ mod tests {
         }
         conn.close().await.unwrap();
 
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
-            .await
-            .expect("CRLF-recorded checksums must be repaired, not refused");
+        migrate_path(
+            &path,
+            &USER_DATA_MIGRATOR,
+            USER_DATA_ALEMBIC_HEAD,
+            DbKind::Other,
+        )
+        .await
+        .expect("CRLF-recorded checksums must be repaired, not refused");
 
         let mut conn = connect(&path).await;
         let rows: Vec<(i64, Vec<u8>)> =
@@ -842,9 +978,14 @@ mod tests {
     async fn unexplained_checksum_mismatch_is_rerecorded_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("default.db");
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
-            .await
-            .unwrap();
+        migrate_path(
+            &path,
+            &USER_DATA_MIGRATOR,
+            USER_DATA_ALEMBIC_HEAD,
+            DbKind::Other,
+        )
+        .await
+        .unwrap();
 
         let mut conn = connect(&path).await;
         sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = (SELECT MIN(version) FROM _sqlx_migrations)")
@@ -854,9 +995,14 @@ mod tests {
             .unwrap();
         conn.close().await.unwrap();
 
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
-            .await
-            .expect("an applied migration must never fail startup on a checksum");
+        migrate_path(
+            &path,
+            &USER_DATA_MIGRATOR,
+            USER_DATA_ALEMBIC_HEAD,
+            DbKind::Other,
+        )
+        .await
+        .expect("an applied migration must never fail startup on a checksum");
 
         let mut conn = connect(&path).await;
         let (recorded,): (Vec<u8>,) = sqlx::query_as(
@@ -909,8 +1055,8 @@ mod tests {
             "unused",
             DbKind::Other,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let mut conn = connect(&path).await;
         assert!(
@@ -957,8 +1103,8 @@ mod tests {
             "unused",
             DbKind::Other,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let mut conn = connect(&path).await;
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_stat1")
             .fetch_one(&mut conn)
@@ -975,9 +1121,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("default.db");
 
-        migrate_path(&path, &USER_DATA_MIGRATOR, USER_DATA_ALEMBIC_HEAD, DbKind::Other)
-            .await
-            .expect("fresh database creation should succeed");
+        migrate_path(
+            &path,
+            &USER_DATA_MIGRATOR,
+            USER_DATA_ALEMBIC_HEAD,
+            DbKind::Other,
+        )
+        .await
+        .expect("fresh database creation should succeed");
 
         assert_eq!(
             sqlx_migration_count(&path).await,

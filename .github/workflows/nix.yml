@@ -4,10 +4,11 @@
 # it. Automation only realigns ui-pin.json (rev + source NAR hash) to the
 # current gitlink. npm deps use importNpmLock (package-lock.json); not pinned.
 #
-# No scheduled runs and no per-push pin checks by design: only tagged releases
-# are installable, so the pin must be correct at release tags only. Run the
-# dispatch `update` job (or scripts/sync-nix-ui-pin.py) before tagging; between
-# releases the pin may go stale harmlessly.
+# No scheduled runs and no push-triggered runs by design: only tagged releases
+# are installable, so nothing on master needs to be validated between releases
+# (formatting included). Run the dispatch `update` job (or
+# scripts/sync-nix-ui-pin.py) before tagging; between releases the pin may go
+# stale harmlessly.
 #
 # Uses cache.nixos.org only (no Magic Nix Cache / GHA cache proxy).
 # Package install checks and NixOS VMs run as separate matrices so a slow VM
@@ -37,26 +38,13 @@ on:
       - "scripts/sync-nix-ui-pin.py"
       - "scripts/generate-hicolor-icons.sh"
       - ".github/workflows/nix.yml"
-  push:
-    branches: [master, main, "dev/**"]
-    paths:
-      - "**.nix"
-      - "flake.lock"
-      - "flake.nix"
-      - "contrib/package/nix/**"
-      - "contrib/package/common/**"
-      - "contrib/nixos/**"
-      - "config/server/nixos.toml"
-      - "scripts/sync-nix-ui-pin.py"
-      - "scripts/generate-hicolor-icons.sh"
-      - ".github/workflows/nix.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  # event_name in the group so a push to master cannot cancel an in-flight
-  # dispatched update run (both resolve to refs/heads/master otherwise).
+  # event_name in the group so a PR run cannot cancel an in-flight dispatched
+  # update run (or vice versa) when refs would otherwise collide.
   group: nix-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
@@ -77,8 +65,7 @@ jobs:
       - name: Flake formatter check (alejandra via nix)
         run: nix build .#checks.x86_64-linux.alejandra -L
 
-  # Package/cli smokes (no QEMU). PRs and manual dispatch only — pushes run
-  # just the light `check` job so master pushes stay off the heavy matrix.
+  # Package/cli smokes (no QEMU). PRs and manual dispatch only.
   packages:
     if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && !inputs.update)
     runs-on: ubuntu-latest

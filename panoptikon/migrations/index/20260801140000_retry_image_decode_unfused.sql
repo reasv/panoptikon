@@ -1,0 +1,12 @@
+-- Retry directive (docs/failed-media-retry-design.md, "Targeted retry
+-- directives"): the image decode was un-fused from the metadata phase, so a
+-- pixel-level decode failure no longer keeps a file out of the index — it is
+-- indexed from its header and simply gets no visuals.
+--
+-- Rows written by the fused gate say "not indexed" and, from here on, `decode`
+-- rows are audit-only and never suppress a re-attempt. Left in place they
+-- would be stale on both counts, so every file that failed the old gate gets
+-- exactly one fresh pass: it either indexes (the common case — a truncated
+-- JPEG has an intact header) or fails the header parse and earns a new
+-- `header` row.
+DELETE FROM scan_errors WHERE stage = 'decode';

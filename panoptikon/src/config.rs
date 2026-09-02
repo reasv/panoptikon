@@ -5,6 +5,8 @@ use serde::de::{self, SeqAccess, Visitor};
 use std::sync::OnceLock;
 use std::{collections::BTreeMap, env, fmt, path::PathBuf};
 
+use crate::media_tools::transcode::presets::TranscodeProfileConfig;
+
 pub const MAX_DB_NAME_LEN: usize = 64;
 pub const MAX_USERNAME_LEN: usize = 64;
 pub const CONFIG_PATH_ENV: &str = "PANOPTIKON_CONFIG_PATH";
@@ -42,6 +44,8 @@ pub struct Settings {
     pub search: SearchConfig,
     #[serde(default)]
     pub jobs: JobsConfig,
+    #[serde(default)]
+    pub transcode: TranscodeConfig,
     #[serde(default)]
     pub rulesets: BTreeMap<String, RuleSetConfig>,
     #[serde(default)]
@@ -92,9 +96,18 @@ impl Default for LoggingConfig {
 
 /// `[open]`: custom commands for the local `/api/open/*` endpoints.
 /// `{path}`, `{folder}`, and `{filename}` placeholders expand to the target
-/// file's quoted full path, parent directory, and file name. Absent: the
-/// platform default (`start`/`open`/`xdg-open`, `explorer /select` etc.).
+/// file's full path, parent directory, and file name. Absent: the
+/// platform default (`start`/`open`/`xdg-open`, `explorer /select`, the
+/// built-in native clipboard write, etc.).
 /// An explicit empty string makes the endpoint a no-op.
+///
+/// The `*_program`/`*_args` forms need no quoting at all — each value becomes
+/// one argv entry. In the shell (`*_command`) forms the executor supplies the
+/// quoting: `file_command`/`folder_command` wrap each value in `"…"` (their
+/// long-standing behaviour), and `clipboard_command` quotes each value for the
+/// host shell, which means a `clipboard_command` template must not add quotes
+/// of its own — the same rule Panoptikon Desktop's editor enforces for the
+/// clipboard action it shares with the relay.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OpenConfig {
     /// Executable for direct (non-shell) "open file" customization.
@@ -115,6 +128,17 @@ pub struct OpenConfig {
     /// Arguments passed directly to `folder_program`.
     #[serde(default)]
     pub folder_args: Vec<String>,
+    /// Executable for direct (non-shell) "copy file to clipboard"
+    /// customization.
+    #[serde(default)]
+    pub clipboard_program: Option<String>,
+    /// Arguments passed directly to `clipboard_program`.
+    #[serde(default)]
+    pub clipboard_args: Vec<String>,
+    /// Command template for "copy file to clipboard". Absent: the built-in
+    /// native clipboard write (`panoptikon-clipboard`).
+    #[serde(default)]
+    pub clipboard_command: Option<String>,
 }
 
 /// `[inference_local]`: the in-process inferio orchestrator (design doc §3).
@@ -532,6 +556,123 @@ impl Default for JobsConfig {
     }
 }
 
+/// `[transcode]`: backend video transcoding
+/// (docs/video-transcoding-design.md). Host-level like `[jobs]`: the encoders
+/// and the artifact cache are properties of the machine, not of an index
+/// database, so nothing here is per-DB.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranscodeConfig {
+    /// Concurrent ffmpeg transcodes. Bounds both CPU and the hardware
+    /// encoder's own session limit; transcodes run outside the (strictly
+    /// serial) job queue, so this is their only bound.
+    #[serde(default = "default_transcode_max_concurrent_jobs")]
+    pub max_concurrent_jobs: usize,
+    /// Artifact cache directory. Absent — or the empty string, which is what
+    /// a `${VAR:-}` template substitutes to — means
+    /// `<data_folder>/transcode-cache`.
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    /// Byte budget for the artifact cache, in megabytes. Runtime-adjustable
+    /// via `PUT /api/video/cache`; this value is what the cache starts with
+    /// (and returns to) at process startup.
+    #[serde(default = "default_transcode_cache_size_mb")]
+    pub cache_size_mb: u64,
+    /// Ceiling on the artifact cache budget, in megabytes. Bounds both
+    /// `cache_size_mb` and the runtime resize endpoint.
+    #[serde(default = "default_transcode_cache_size_max_mb")]
+    pub cache_size_max_mb: u64,
+    /// Hardware encoder policy for the fast channel: `"auto"` probes,
+    /// `"off"` always uses libx264, or name one candidate encoder (either
+    /// spelling, `nvenc` or `h264_nvenc`).
+    #[serde(default = "default_transcode_hwaccel")]
+    pub hwaccel: String,
+    /// Encoding profiles. Absent means the built-in presets; an explicit
+    /// empty table means none at all; entries are merged by name over the
+    /// built-ins (the `[vector_quants]` tri-state).
+    #[serde(default)]
+    pub profiles: Option<BTreeMap<String, TranscodeProfileConfig>>,
+    /// Maximum items in one animated-mosaic composition.
+    #[serde(default = "default_max_mosaic_inputs")]
+    pub max_mosaic_inputs: usize,
+    /// Admission-time ceiling on the memory a mosaic's loop buffers may need.
+    #[serde(default = "default_max_mosaic_loop_mb")]
+    pub max_mosaic_loop_mb: u64,
+    /// Hard cap on animated-image (WebP/AVIF) output length; those decode
+    /// entirely into memory in the browser.
+    #[serde(default = "default_max_animated_image_seconds")]
+    pub max_animated_image_seconds: u64,
+    /// Hard cap on real video output length.
+    #[serde(default = "default_max_output_seconds")]
+    pub max_output_seconds: u64,
+    /// Compositions with more inputs than this are dispatched exclusively
+    /// (nothing else runs alongside them).
+    #[serde(default = "default_compose_light_threshold")]
+    pub compose_light_threshold: usize,
+}
+
+fn default_transcode_max_concurrent_jobs() -> usize {
+    1
+}
+
+fn default_transcode_cache_size_mb() -> u64 {
+    8192
+}
+
+fn default_transcode_cache_size_max_mb() -> u64 {
+    262_144
+}
+
+fn default_transcode_hwaccel() -> String {
+    "auto".to_string()
+}
+
+fn default_max_mosaic_inputs() -> usize {
+    12
+}
+
+fn default_max_mosaic_loop_mb() -> u64 {
+    512
+}
+
+fn default_max_animated_image_seconds() -> u64 {
+    30
+}
+
+fn default_max_output_seconds() -> u64 {
+    300
+}
+
+fn default_compose_light_threshold() -> usize {
+    2
+}
+
+impl Default for TranscodeConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_jobs: default_transcode_max_concurrent_jobs(),
+            cache_dir: None,
+            cache_size_mb: default_transcode_cache_size_mb(),
+            cache_size_max_mb: default_transcode_cache_size_max_mb(),
+            hwaccel: default_transcode_hwaccel(),
+            profiles: None,
+            max_mosaic_inputs: default_max_mosaic_inputs(),
+            max_mosaic_loop_mb: default_max_mosaic_loop_mb(),
+            max_animated_image_seconds: default_max_animated_image_seconds(),
+            max_output_seconds: default_max_output_seconds(),
+            compose_light_threshold: default_compose_light_threshold(),
+        }
+    }
+}
+
+impl TranscodeConfig {
+    /// The artifact cache directory, defaulted against the data folder.
+    pub(crate) fn resolved_cache_dir(&self) -> PathBuf {
+        self.cache_dir
+            .clone()
+            .unwrap_or_else(|| runtime().data_folder.join("transcode-cache"))
+    }
+}
+
 /// Process-global copy of the config values needed deep inside code that has
 /// no `Settings` handle (DB path resolution, job helpers, the open API).
 /// Installed exactly once by `main` right after config load; the defaults
@@ -555,6 +696,9 @@ pub struct RuntimeConfig {
     /// The venv interpreter `media_tools` probes for static-ffmpeg —
     /// the same one that runs inference workers.
     pub venv_python: PathBuf,
+    /// Carried whole: the transcode worker pool and the artifact cache live
+    /// far from any `Settings` handle.
+    pub transcode: TranscodeConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -575,6 +719,7 @@ impl Default for RuntimeConfig {
             html_renderer_args: Vec::new(),
             thumbnail_font: None,
             venv_python: crate::resources::default_worker_python(crate::resources::py_source_mode()),
+            transcode: TranscodeConfig::default(),
         }
     }
 }
@@ -641,6 +786,7 @@ impl Settings {
             html_renderer_args: self.jobs.html_renderer_args.clone(),
             thumbnail_font: self.jobs.thumbnail_font.clone(),
             venv_python: self.inference_local.resolved_python(),
+            transcode: self.transcode.clone(),
         }
     }
 }
@@ -727,6 +873,25 @@ pub struct UiUpstreamConfig {
     /// When to run `next build`. Default: auto (build-staleness check).
     #[serde(default)]
     pub build: UiBuildPolicy,
+    /// Which listener the supervised UI server calls back into
+    /// (`PANOPTIKON_API_URL`), by endpoint name. Default: the primary
+    /// listener, which is what every single-listener deployment wants.
+    ///
+    /// It matters on a multi-listener deployment whose policies differ.
+    /// Server-rendered pages reach the API through this URL, and the policy
+    /// they act under is normally decided by the `x-panoptikon-policy` token
+    /// the gateway minted for the browser request that triggered the render.
+    /// A token that is absent, expired, or unverifiable is ignored and
+    /// selection falls back to the listener the SSR connected on — so this
+    /// endpoint's policy is the SSR fail-open, and it should name the most
+    /// restricted listener. Without this key the fail-open was whichever
+    /// policy the primary listener carries, and the only way to change it
+    /// was to make the restricted listener primary — which collides with the
+    /// synthesized loopback inference upstream, that requires the *primary*
+    /// listener to permit `/api/inference/*` (see
+    /// `validate_loopback_inference_policy`).
+    #[serde(default)]
+    pub api_endpoint: Option<String>,
 }
 
 /// `[upstreams.ui].build`: `next build` policy for local UI mode.
@@ -998,7 +1163,7 @@ impl Settings {
         }
 
         let mut settings: Settings = builder.build()?.try_deserialize()?;
-        settings.normalize_empty_tool_paths();
+        settings.normalize_empty_paths();
         let loopback_synthesized = settings.apply_inference_default();
         settings.validate(loopback_synthesized)?;
         Ok(settings)
@@ -1020,17 +1185,60 @@ impl Settings {
         addrs
     }
 
-    /// Empty-string tool paths mean "unset": the shipped configs template
-    /// these keys as `${VAR:-}`, which substitutes to `""` when the
-    /// variable is not set, and an empty path must behave exactly like an
-    /// absent key (fall through to the built-in search order).
-    fn normalize_empty_tool_paths(&mut self) {
+    /// The loopback URL the supervised UI server is given as
+    /// `PANOPTIKON_API_URL`. `[upstreams.ui] api_endpoint` names the
+    /// listener; absent (or naming the primary) means the primary listener,
+    /// which is the historical behaviour and what single-listener
+    /// deployments want. The name is validated at config load, so an unknown
+    /// one cannot reach here — falling back to the primary rather than
+    /// panicking keeps a future caller that skipped validation honest.
+    pub fn ui_api_base_url(&self) -> String {
+        match self.upstreams.ui.api_endpoint.as_deref() {
+            None => self.primary_loopback_url(),
+            Some(name) => self
+                .endpoint_loopback_url(name)
+                .unwrap_or_else(|| self.primary_loopback_url()),
+        }
+    }
+
+    /// Loopback base URL of the primary `[server]` listener.
+    pub fn primary_loopback_url(&self) -> String {
+        loopback_base_url(&self.server.host, self.server.port)
+    }
+
+    /// Loopback base URL of the listener named `name` (`"default"` is the
+    /// primary), or `None` when no `[[server.endpoints]]` entry carries that
+    /// name. The proxy mints this into the policy token's origin claim for
+    /// the listener a UI-bound request arrived on (policy_token.rs).
+    pub fn endpoint_loopback_url(&self, name: &str) -> Option<String> {
+        if name == PRIMARY_ENDPOINT {
+            return Some(self.primary_loopback_url());
+        }
+        self.server
+            .endpoints
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| {
+                loopback_base_url(
+                    entry.host.as_deref().unwrap_or(&self.server.host),
+                    entry.port,
+                )
+            })
+    }
+
+    /// Empty-string paths mean "unset": the shipped configs template these
+    /// keys as `${VAR:-}`, which substitutes to `""` when the variable is not
+    /// set, and an empty path must behave exactly like an absent key (fall
+    /// through to the built-in search order, or to the derived default in
+    /// `transcode.cache_dir`'s case).
+    fn normalize_empty_paths(&mut self) {
         for slot in [
             &mut self.jobs.ffmpeg,
             &mut self.jobs.ffprobe,
             &mut self.jobs.pdfium,
             &mut self.jobs.html_renderer,
             &mut self.jobs.thumbnail_font,
+            &mut self.transcode.cache_dir,
         ] {
             if slot
                 .as_ref()
@@ -1052,6 +1260,7 @@ impl Settings {
         self.validate_inference_endpoints()?;
         self.validate_inference_vram()?;
         self.validate_ui()?;
+        self.validate_transcode()?;
         if loopback_synthesized {
             self.validate_loopback_inference_policy()?;
         }
@@ -1164,13 +1373,13 @@ impl Settings {
                      fraction of other processes' VRAM usage, e.g. 0.10 for 10%"
                 );
             }
-            if let Some(cap) = cap {
-                if !cap.is_finite() || cap <= 0.0 || cap > 1.0 {
-                    anyhow::bail!(
-                        "{where_} cap_fraction must be a finite number in (0, 1] (got {cap}); \
+            if let Some(cap) = cap
+                && (!cap.is_finite() || cap <= 0.0 || cap > 1.0)
+            {
+                anyhow::bail!(
+                    "{where_} cap_fraction must be a finite number in (0, 1] (got {cap}); \
                          it is a fraction of the board's total VRAM, e.g. 0.90 for 90%"
-                    );
-                }
+                );
             }
             Ok(())
         };
@@ -1239,22 +1448,21 @@ impl Settings {
             // before identity extraction runs, so a user header inside it
             // would never be seen — every request would silently fall back
             // to the un-tenanted defaults, defeating tenant isolation.
-            if let Some(identity) = &policy.identity {
-                if identity
+            if let Some(identity) = &policy.identity
+                && identity
                     .user_header
                     .to_ascii_lowercase()
                     .starts_with("x-panoptikon-")
-                {
-                    anyhow::bail!(
-                        "policy '{}' identity.user_header '{}' is invalid: the \
+            {
+                anyhow::bail!(
+                    "policy '{}' identity.user_header '{}' is invalid: the \
                          x-panoptikon-* header namespace is gateway-reserved and is \
                          stripped from inbound requests at ingress, so this header \
                          would never reach identity extraction; use a different \
                          header name",
-                        policy.name,
-                        identity.user_header
-                    );
-                }
+                    policy.name,
+                    identity.user_header
+                );
             }
             if policy.match_rule.hosts.is_empty() && policy.match_rule.endpoints.is_empty() {
                 anyhow::bail!(
@@ -1283,14 +1491,15 @@ impl Settings {
                     );
                 }
             }
-            if let Some(ruleset_name) = policy.ruleset.as_deref() {
-                if ruleset_name != "allow_all" && !self.rulesets.contains_key(ruleset_name) {
-                    anyhow::bail!(
-                        "policy '{}' references unknown ruleset '{}'",
-                        policy.name,
-                        ruleset_name
-                    );
-                }
+            if let Some(ruleset_name) = policy.ruleset.as_deref()
+                && ruleset_name != "allow_all"
+                && !self.rulesets.contains_key(ruleset_name)
+            {
+                anyhow::bail!(
+                    "policy '{}' references unknown ruleset '{}'",
+                    policy.name,
+                    ruleset_name
+                );
             }
 
             validate_db_policy("index_db", &policy.index_db)?;
@@ -1357,6 +1566,26 @@ impl Settings {
     /// Local UI mode needs a checkout to run from and a bind address it can
     /// derive from `base_url`; both are config mistakes best caught at load.
     fn validate_ui(&self) -> Result<()> {
+        // Checked even when the UI is not local: a name that matches no
+        // listener is a typo whatever the mode, and silently pointing the
+        // SSR at the wrong policy is exactly the failure this key exists to
+        // prevent.
+        if let Some(name) = self.upstreams.ui.api_endpoint.as_deref() {
+            let known = name == PRIMARY_ENDPOINT
+                || self.server.endpoints.iter().any(|entry| entry.name == name);
+            if !known {
+                anyhow::bail!(
+                    "upstreams.ui.api_endpoint references unknown endpoint '{}' (known: '{}'{})",
+                    name,
+                    PRIMARY_ENDPOINT,
+                    self.server
+                        .endpoints
+                        .iter()
+                        .map(|entry| format!(", '{}'", entry.name))
+                        .collect::<String>()
+                );
+            }
+        }
         if !self.upstreams.ui.local {
             return Ok(());
         }
@@ -1368,6 +1597,50 @@ impl Settings {
         }
         self.upstreams.ui.local_bind_addr()?;
         Ok(())
+    }
+
+    /// `[transcode]`: the limits that would otherwise fail far from their
+    /// cause — a zero worker bound stalls every job forever, an unrecognized
+    /// `hwaccel` would silently mean "software" months after it was typed,
+    /// and an incomplete profile only surfaces at the first request for it.
+    fn validate_transcode(&self) -> Result<()> {
+        use crate::media_tools::transcode::{hw, presets};
+
+        let transcode = &self.transcode;
+        if transcode.cache_size_mb > transcode.cache_size_max_mb {
+            anyhow::bail!(
+                "transcode.cache_size_mb ({}) exceeds transcode.cache_size_max_mb ({})",
+                transcode.cache_size_mb,
+                transcode.cache_size_max_mb
+            );
+        }
+        if hw::parse_hwaccel(&transcode.hwaccel).is_none() {
+            anyhow::bail!(
+                "transcode.hwaccel '{}' is invalid: expected one of {}",
+                transcode.hwaccel,
+                hw::hwaccel_values()
+            );
+        }
+        for (key, value) in [
+            ("cache_size_mb", transcode.cache_size_mb),
+            ("max_concurrent_jobs", transcode.max_concurrent_jobs as u64),
+            ("max_mosaic_inputs", transcode.max_mosaic_inputs as u64),
+            ("max_mosaic_loop_mb", transcode.max_mosaic_loop_mb),
+            (
+                "max_animated_image_seconds",
+                transcode.max_animated_image_seconds,
+            ),
+            ("max_output_seconds", transcode.max_output_seconds),
+            (
+                "compose_light_threshold",
+                transcode.compose_light_threshold as u64,
+            ),
+        ] {
+            if value == 0 {
+                anyhow::bail!("transcode.{key} must be at least 1");
+            }
+        }
+        presets::validate_profiles(transcode.profiles.as_ref())
     }
 
     fn validate_inference_endpoints(&self) -> Result<()> {
@@ -1485,7 +1758,7 @@ fn templated_file_source(
 /// [`VramConfig::for_board`] matches case-insensitively — the stored keys are
 /// lower-case whatever the file said.) So this cannot be a `validate_*` method
 /// on `Settings`; it has to run here, before the merge.
-fn reject_case_duplicate_gpu_keys(value: &toml::Value, path: &PathBuf) -> Result<()> {
+fn reject_case_duplicate_gpu_keys(value: &toml::Value, path: &std::path::Path) -> Result<()> {
     let Some(gpu) = value
         .get("inference_local")
         .and_then(|local| local.get("vram"))
@@ -1531,14 +1804,14 @@ fn validate_db_policy(label: &str, policy: &DbPolicy) -> Result<()> {
         }
     }
 
-    if let AllowList::List(items) = &policy.allow {
-        if !items.iter().any(|entry| entry == &policy.default) {
-            anyhow::bail!(
-                "{} default '{}' must appear in allow list",
-                label,
-                policy.default
-            );
-        }
+    if let AllowList::List(items) = &policy.allow
+        && !items.iter().any(|entry| entry == &policy.default)
+    {
+        anyhow::bail!(
+            "{} default '{}' must appear in allow list",
+            label,
+            policy.default
+        );
     }
 
     if let Some(tenant_default) = &policy.tenant_default {
@@ -1574,9 +1847,11 @@ pub fn is_safe_identifier(value: &str, max_len: usize) -> bool {
     if value.is_empty() || value.len() > max_len {
         return false;
     }
-    value.bytes().all(|byte| match byte {
-        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-' => true,
-        _ => false,
+    value.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'
+        )
     })
 }
 
@@ -1713,6 +1988,101 @@ default = "default"
 allow = "*"
 "#
         )
+    }
+
+    /// `[upstreams.ui] api_endpoint` picks which listener the supervised UI
+    /// server calls back into, so the SSR fail-open (an ignored policy token
+    /// falls back to listener matching) can be aimed at the most restricted
+    /// listener without making that listener primary — which the synthesized
+    /// loopback inference upstream forbids, since it requires the *primary*
+    /// listener to permit `/api/inference/*`.
+    #[test]
+    fn ui_api_endpoint_selects_the_listener_the_ssr_calls_back_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        let base = |api_endpoint: &str| {
+            format!(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[[server.endpoints]]
+name = "public"
+port = 9156
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6340"
+{api_endpoint}
+
+[upstreams.api]
+base_url = "http://127.0.0.1:9155"
+{}"#,
+                allow_all_policy_toml(r#""localhost", "127.0.0.1""#)
+            )
+        };
+
+        // Absent -> the primary listener, the historical behaviour.
+        std::fs::write(&path, base("")).unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(settings.ui_api_base_url(), "http://127.0.0.1:9155");
+
+        // Named extra listener -> that listener's host/port.
+        std::fs::write(&path, base(r#"api_endpoint = "public""#)).unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(settings.ui_api_base_url(), "http://127.0.0.1:9156");
+
+        // The primary may be named explicitly.
+        std::fs::write(&path, base(r#"api_endpoint = "default""#)).unwrap();
+        let settings = Settings::load(Some(path.clone())).unwrap();
+        assert_eq!(settings.ui_api_base_url(), "http://127.0.0.1:9155");
+
+        // A name matching no listener is a hard config error: silently
+        // pointing the SSR at the wrong policy is the failure this prevents.
+        std::fs::write(&path, base(r#"api_endpoint = "typo""#)).unwrap();
+        let err = Settings::load(Some(path.clone())).unwrap_err().to_string();
+        assert!(
+            err.contains("upstreams.ui.api_endpoint references unknown endpoint 'typo'"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("'default'") && err.contains("'public'"),
+            "{err}"
+        );
+    }
+
+    /// A wildcard bind is mapped to a loopback address for the SSR URL, the
+    /// same as for the primary listener — the UI server dials it from inside
+    /// this process's host, and `0.0.0.0` is not a destination.
+    #[test]
+    fn ui_api_endpoint_maps_wildcard_binds_to_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+host = "0.0.0.0"
+port = 9155
+
+[[server.endpoints]]
+name = "public"
+port = 9156
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6340"
+api_endpoint = "public"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:9155"
+{}"#,
+                allow_all_policy_toml(r#""localhost", "127.0.0.1""#)
+            ),
+        )
+        .unwrap();
+        let settings = Settings::load(Some(path)).unwrap();
+        assert_eq!(settings.ui_api_base_url(), "http://127.0.0.1:9156");
     }
 
     /// Config resolution rule for local inference (documented in AGENTS.md):
@@ -1906,9 +2276,15 @@ base_url = "http://127.0.0.1:6342"
         let base = vram_base();
 
         std::fs::write(&path, base).unwrap();
-        let vram = Settings::load(Some(path.clone())).unwrap().inference_local.vram;
+        let vram = Settings::load(Some(path.clone()))
+            .unwrap()
+            .inference_local
+            .vram;
         assert_eq!(vram.margin, 0.10, "absent section tracks the code default");
-        assert_eq!(vram.cap_fraction, None, "the server lever is off by default");
+        assert_eq!(
+            vram.cap_fraction, None,
+            "the server lever is off by default"
+        );
         assert!(vram.gpu.is_empty());
         assert_eq!(vram.for_board("GPU-anything"), (0.10, None));
 
@@ -1921,8 +2297,15 @@ base_url = "http://127.0.0.1:6342"
             ),
         )
         .unwrap();
-        let vram = Settings::load(Some(path.clone())).unwrap().inference_local.vram;
-        assert_eq!(vram.for_board("GPU-cccc"), (0.25, Some(0.90)), "no override");
+        let vram = Settings::load(Some(path.clone()))
+            .unwrap()
+            .inference_local
+            .vram;
+        assert_eq!(
+            vram.for_board("GPU-cccc"),
+            (0.25, Some(0.90)),
+            "no override"
+        );
         assert_eq!(
             vram.for_board("GPU-aaaa"),
             (0.5, Some(0.90)),
@@ -1978,8 +2361,8 @@ base_url = "http://127.0.0.1:6342"
             "[inference_local.vram.gpu.\"GPU-aaaa\"]\ncap_fraction = 2.0\n",
         ] {
             std::fs::write(&path, format!("{base}\n{bad}")).unwrap();
-            let err = Settings::load(Some(path.clone()))
-                .expect_err(&format!("{bad} should be rejected"));
+            let err =
+                Settings::load(Some(path.clone())).expect_err(&format!("{bad} should be rejected"));
             let message = format!("{err:#}");
             assert!(
                 message.contains("inference_local.vram"),
@@ -2069,7 +2452,8 @@ base_url = "http://127.0.0.1:6342"
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
             assert!(
-                text.lines().any(|line| line.trim() == "[inference_local.vram]"),
+                text.lines()
+                    .any(|line| line.trim() == "[inference_local.vram]"),
                 "{name}.toml must carry the table header as a LIVE line"
             );
 
@@ -2080,7 +2464,10 @@ base_url = "http://127.0.0.1:6342"
                 "{name}.toml as shipped must track the code default"
             );
             assert_eq!(shipped.cap_fraction, None, "{name}.toml: cap is off");
-            assert!(shipped.gpu.is_empty(), "{name}.toml ships no board override");
+            assert!(
+                shipped.gpu.is_empty(),
+                "{name}.toml ships no board override"
+            );
 
             // Now uncomment exactly the example keys — what a user does — and
             // check each one lands where its comment says it does.
@@ -2604,6 +2991,9 @@ allow = "*"
         assert_eq!(settings.logging.level, "INFO");
         assert_eq!(settings.open.file_command, None);
         assert_eq!(settings.open.folder_command, None);
+        assert_eq!(settings.open.clipboard_command, None);
+        assert_eq!(settings.open.clipboard_program, None);
+        assert!(settings.open.clipboard_args.is_empty());
         assert!(!settings.jobs.atomic_extraction_jobs);
         assert_eq!(settings.jobs.image_decode_memory_limit_mb, 8192);
 
@@ -2674,6 +3064,44 @@ image_decode_memory_limit_mb = 2048
         assert!(runtime.atomic_extraction_jobs);
         assert_eq!(runtime.image_decode_memory_limit_mb, 2048);
         assert_eq!(runtime.open.file_command.as_deref(), Some("mpv {path}"));
+    }
+
+    /// The clipboard verb's keys parse like the other two `[open]` verbs —
+    /// a direct program with its own argv, or a shell template — and reach
+    /// the runtime config, which is what the endpoint reads.
+    #[test]
+    fn open_clipboard_keys_parse() {
+        let _guard = env_lock();
+        let settings = load_from(&format!(
+            r#"
+{MINIMAL}
+[open]
+clipboard_program = "my-clipboard-tool"
+clipboard_args = ["--file", "{{path}}"]
+clipboard_command = "my-clipboard-shell {{path}}"
+"#
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.open.clipboard_program.as_deref(),
+            Some("my-clipboard-tool")
+        );
+        assert_eq!(settings.open.clipboard_args, vec!["--file", "{path}"]);
+        assert_eq!(
+            settings.open.clipboard_command.as_deref(),
+            Some("my-clipboard-shell {path}")
+        );
+
+        let runtime = settings.runtime_config();
+        assert_eq!(
+            runtime.open.clipboard_program.as_deref(),
+            Some("my-clipboard-tool")
+        );
+        assert_eq!(runtime.open.clipboard_args, vec!["--file", "{path}"]);
+        assert_eq!(
+            runtime.open.clipboard_command.as_deref(),
+            Some("my-clipboard-shell {path}")
+        );
     }
 
     /// There is no env override layer: PANOPTIKON__* variables (the removed
@@ -2848,7 +3276,8 @@ file_command = "run $${{literal}} ${{GW_TEST_LEVEL}}"
             .join("config")
             .join("server");
 
-        for file in ["default.toml"] {
+        {
+            let file = "default.toml";
             unsafe { env::remove_var("LOGLEVEL") };
             let settings = Settings::load(Some(config_dir.join(file))).unwrap_or_else(|err| {
                 panic!("shipped {file} must load: {err:#}");
@@ -3015,6 +3444,136 @@ allow = "*"
                 "'{reserved}': {text}"
             );
         }
+    }
+
+    /// `[transcode]` defaults, the empty-string `cache_dir` convention, and
+    /// the profiles tri-state as it arrives from TOML (absent / explicit
+    /// empty table / entries).
+    #[test]
+    fn transcode_config_parses_and_defaults() {
+        let _guard = env_lock();
+
+        // Section absent: every key is the built-in default, and the runtime
+        // slice carries the same values.
+        let settings = load_from(MINIMAL).unwrap();
+        let transcode = &settings.transcode;
+        assert_eq!(transcode.max_concurrent_jobs, 1);
+        assert_eq!(transcode.cache_dir, None);
+        assert_eq!(transcode.cache_size_mb, 8192);
+        assert_eq!(transcode.cache_size_max_mb, 262_144);
+        assert_eq!(transcode.hwaccel, "auto");
+        assert!(transcode.profiles.is_none(), "absent means the built-ins");
+        assert_eq!(transcode.max_mosaic_inputs, 12);
+        assert_eq!(transcode.max_mosaic_loop_mb, 512);
+        assert_eq!(transcode.max_animated_image_seconds, 30);
+        assert_eq!(transcode.max_output_seconds, 300);
+        assert_eq!(transcode.compose_light_threshold, 2);
+        let runtime = settings.runtime_config();
+        assert_eq!(runtime.transcode.cache_size_mb, transcode.cache_size_mb);
+        assert_eq!(
+            RuntimeConfig::default().transcode.hwaccel,
+            transcode.hwaccel
+        );
+
+        // Explicit values, including the `${VAR:-}` empty-string cache_dir
+        // that must normalize back to "unset".
+        let settings = load_from(&format!(
+            r#"{MINIMAL}
+[transcode]
+max_concurrent_jobs = 3
+cache_dir = ""
+cache_size_mb = 512
+cache_size_max_mb = 1024
+hwaccel = "nvenc"
+max_output_seconds = 60
+"#
+        ))
+        .unwrap();
+        assert_eq!(settings.transcode.max_concurrent_jobs, 3);
+        assert_eq!(
+            settings.transcode.cache_dir, None,
+            "an empty cache_dir falls through to the data-folder default"
+        );
+        assert_eq!(settings.transcode.cache_size_mb, 512);
+        assert_eq!(settings.transcode.hwaccel, "nvenc");
+        assert_eq!(settings.transcode.max_output_seconds, 60);
+
+        let settings = load_from(&format!(
+            "{MINIMAL}\n[transcode]\ncache_dir = \"D:/cache/transcode\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.transcode.cache_dir,
+            Some(PathBuf::from("D:/cache/transcode"))
+        );
+
+        // Tri-state, as TOML expresses it.
+        let settings = load_from(&format!("{MINIMAL}\n[transcode]\nprofiles = {{}}\n")).unwrap();
+        assert_eq!(
+            settings.transcode.profiles.map(|profiles| profiles.len()),
+            Some(0),
+            "an explicit empty table is not the same as an absent one"
+        );
+        let settings = load_from(&format!(
+            r#"{MINIMAL}
+[transcode.profiles.small-share]
+container = "mp4"
+vcodec = "h264"
+crf = 28
+surfaces = ["clip"]
+"#
+        ))
+        .unwrap();
+        let profiles = settings.transcode.profiles.expect("entries parse");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles["small-share"].crf, Some(28));
+    }
+
+    /// `[transcode]` misconfigurations fail at load rather than months later
+    /// at the first transcode request.
+    #[test]
+    fn transcode_validation_errors() {
+        let expect_err = |body: String, needle: &str| {
+            let err = load_from(&body).expect_err(needle);
+            let text = format!("{err:#}");
+            assert!(text.contains(needle), "expected '{needle}' in: {text}");
+        };
+
+        expect_err(
+            format!("{MINIMAL}\n[transcode]\nmax_concurrent_jobs = 0\n"),
+            "transcode.max_concurrent_jobs must be at least 1",
+        );
+        expect_err(
+            format!("{MINIMAL}\n[transcode]\nmax_mosaic_inputs = 0\n"),
+            "transcode.max_mosaic_inputs must be at least 1",
+        );
+        expect_err(
+            format!("{MINIMAL}\n[transcode]\ncache_size_mb = 4096\ncache_size_max_mb = 1024\n"),
+            "exceeds transcode.cache_size_max_mb",
+        );
+        expect_err(
+            format!("{MINIMAL}\n[transcode]\ncache_size_mb = 0\n"),
+            "transcode.cache_size_mb must be at least 1",
+        );
+        expect_err(
+            format!("{MINIMAL}\n[transcode]\nhwaccel = \"cuda\"\n"),
+            "transcode.hwaccel 'cuda' is invalid",
+        );
+        // The profile completeness check runs through config load.
+        expect_err(
+            format!("{MINIMAL}\n[transcode.profiles.novel]\ncrf = 20\n"),
+            "container is required",
+        );
+        expect_err(
+            format!(
+                "{MINIMAL}\n[transcode.profiles.novel]\ncontainer = \"avi\"\nvcodec = \"h264\"\n"
+            ),
+            "enum Container does not have variant constructor avi",
+        );
+
+        // Patching a built-in needs nothing else.
+        load_from(&format!("{MINIMAL}\n[transcode.profiles.clip]\ncrf = 14\n"))
+            .expect("a patch of a built-in is complete by inheritance");
     }
 
     /// `${VAR}` without a default and with the variable unset fails config

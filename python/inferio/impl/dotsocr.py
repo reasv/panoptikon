@@ -3,10 +3,11 @@ from PIL import Image as PILImage
 from inferio.model import InferenceModel
 from inferio.inferio_types import PredictionInput
 from inferio.impl.utils import (
+    assemble_slots,
     clear_cache,
     cuda_capability,
+    decode_image_inputs,
     get_device,
-    load_image_from_buffer,
     run_with_oom_retry,
     select_dtype,
 )
@@ -99,25 +100,31 @@ class DotsOCRModel(InferenceModel):
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
 
-        images = [load_image_from_buffer(inp.file) for inp in inputs]
+        # Undecodable payloads are excluded before the batch is assembled and
+        # come back as error slots (docs/inferio-worker-protocol.md).
+        images, kept, slots = decode_image_inputs(
+            inputs, what="dots.ocr", logger=logger
+        )
 
         # OOM halving replaces the old broad per-chunk fallback; non-OOM
         # errors now surface to the dispatcher's per-request fallback.
         if self.enable_batching and len(images) > 1:
-            return run_with_oom_retry(
+            results = run_with_oom_retry(
                 self._predict_batch,
                 images,
                 initial_chunk_size=self.batch_size,
                 logger=logger,
             )
-        # chunk size 1 so a single-input OOM raises the classified
-        # batch-1 error here too, not a raw torch one.
-        return run_with_oom_retry(
-            lambda chunk: [self._predict_single(img) for img in chunk],
-            images,
-            initial_chunk_size=1,
-            logger=logger,
-        )
+        else:
+            # chunk size 1 so a single-input OOM raises the classified
+            # batch-1 error here too, not a raw torch one.
+            results = run_with_oom_retry(
+                lambda chunk: [self._predict_single(img) for img in chunk],
+                images,
+                initial_chunk_size=1,
+                logger=logger,
+            )
+        return assemble_slots(len(inputs), kept, results, slots)
 
     def _create_messages(self, image: PILImage.Image):
         return [

@@ -52,6 +52,10 @@ services:
       # - /path/to/your/pictures:/media/pictures:ro
     environment:
       - LOGLEVEL=DEBUG
+      # "video" makes the NVIDIA runtime inject libnvidia-encode so video
+      # transcoding can use nvenc (the runtime default compute,utility omits
+      # it). Baked into the image ENV too; harmless on CPU-only builds.
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
 volumes:
   panoptikon-data:

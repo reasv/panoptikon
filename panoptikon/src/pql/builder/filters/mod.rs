@@ -1,24 +1,27 @@
 mod embedding_types;
 mod exact;
+mod failed_for;
 mod has_unprocessed;
 mod image_embeddings;
 mod in_bookmarks;
+mod in_pinboard;
 mod item_similarity;
 mod match_filter;
 mod match_path;
 mod match_tags;
 mod match_text;
 mod processed_by;
-mod quant;
 mod text_embeddings;
 
 use super::{CteRef, QueryState};
 use crate::pql::preprocess::PqlError;
 
 pub(crate) use embedding_types::{DistanceAggregation, DistanceFunction, IndexMode, QuantResolved};
+pub(crate) use failed_for::FailedFor;
 pub(crate) use has_unprocessed::{DerivedDataArgs, HasUnprocessedData};
 pub(crate) use image_embeddings::{SemanticImageArgs, SemanticImageSearch};
 pub(crate) use in_bookmarks::{InBookmarks, InBookmarksArgs};
+pub(crate) use in_pinboard::{InPinboard, InPinboardArgs};
 pub(crate) use item_similarity::{SimilarTo, SimilarityArgs, SourceArgs};
 pub(crate) use match_filter::{
     Match, MatchAnd, MatchNot, MatchOps, MatchOr, MatchValue, MatchValues, Matches, OneOrMany,

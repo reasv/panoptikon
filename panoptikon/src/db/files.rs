@@ -13,12 +13,31 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 pub(crate) struct ItemScanMeta {
     pub md5: String,
     pub mime_type: String,
+    /// The *display* width — what a browser paints, not what the header codes
+    /// (docs/display-dimensions-design.md).
     pub width: Option<i64>,
+    /// The *display* height. See [`ItemScanMeta::width`].
     pub height: Option<i64>,
+    /// `items.rotation`: the clockwise quarter turns between this item's coded
+    /// pixels and the picture, 0/90/180/270 — see the migration
+    /// `20260824120000_item_rotation.sql`. `None` for anything with no picture
+    /// to orient (audio), which leaves the column NULL exactly as a
+    /// pre-upgrade item does; the backfill's `type` key means it never walks
+    /// them.
+    pub rotation: Option<i64>,
     pub duration: Option<f64>,
     pub audio_tracks: Option<i64>,
     pub video_tracks: Option<i64>,
     pub subtitle_tracks: Option<i64>,
+    /// `items.video_codec`, sentinels included — see the migration
+    /// `20260809120000_item_codecs.sql` and
+    /// [`crate::jobs::files::media_codecs`], which is the only thing that
+    /// builds either of these.
+    pub video_codec: Option<String>,
+    /// `items.audio_codec`: the first audio stream's codec name, or `None`
+    /// when there is no audio stream (the accepted ambiguity with "never
+    /// probed").
+    pub audio_codec: Option<String>,
 }
 
 #[derive(Clone)]
@@ -289,21 +308,439 @@ pub(crate) async fn get_item_visual_meta(
     Ok(row)
 }
 
-/// Returns the item's stored pixel dimensions, used to decide whether an
-/// image would produce a thumbnail at all without decoding it again.
-pub(crate) async fn get_item_dimensions(
+/// A video the outro detector has never examined, and everything the probe
+/// needs about it (docs/video-outro-detection-design.md §7).
+pub(crate) struct PendingOutroItem {
+    pub duration: Option<f64>,
+    pub video_tracks: Option<i64>,
+    /// The item's stored — that is, *coded* — dimensions, which the detector
+    /// consults only as a fallback for a decode whose geometry ffmpeg never
+    /// reported, and even then only when the byte count corroborates them.
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+}
+
+/// The scan dispatcher's outro question: "is this content a video that still
+/// has to be examined?" `None` means there is nothing to do — the item is not
+/// a video, has already been examined, or is not indexed at all.
+///
+/// `type >= 'video/' AND type < 'video0'` rather than `LIKE 'video/%'`, and in
+/// that order: `items.type` holds the whole mime string, and a LIKE prefix
+/// cannot be served from an index under SQLite's default case-insensitive
+/// LIKE. It is also exactly the predicate `idx_items_outro_pending` was
+/// written for, so the definition of "video" lives in one place even though
+/// this particular call is a point lookup on the `sha256` unique index.
+pub(crate) async fn get_pending_outro_item(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
-) -> ApiResult<Option<(Option<i64>, Option<i64>)>> {
-    let row: Option<(Option<i64>, Option<i64>)> =
-        sqlx::query_as("SELECT width, height FROM items WHERE sha256 = ?1")
+) -> ApiResult<Option<PendingOutroItem>> {
+    type Row = (Option<f64>, Option<i64>, Option<i64>, Option<i64>);
+    let row: Option<Row> = sqlx::query_as(
+        r#"
+SELECT duration, video_tracks, width, height
+FROM items
+WHERE sha256 = ?1
+  AND outro_kind IS NULL
+  AND type >= 'video/' AND type < 'video0'
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read an item's outro state");
+        ApiError::internal("Failed to query item")
+    })?;
+    Ok(
+        row.map(|(duration, video_tracks, width, height)| PendingOutroItem {
+            duration,
+            video_tracks,
+            width,
+            height,
+        }),
+    )
+}
+
+/// Where the item's real content ends, for the consumers that sample frames.
+/// `None` covers both "never examined" and "examined, no outro" — neither
+/// clamps anything, which is exactly the "absent behaviour, never wrong
+/// behaviour" the design asks of a consumer.
+pub(crate) async fn get_item_content_end_ms(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<Option<i64>> {
+    let row: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT content_end_ms FROM items WHERE sha256 = ?1")
             .bind(sha256)
             .fetch_optional(&mut *conn)
             .await
             .map_err(|err| {
-                tracing::error!(error = %err, "failed to read item dimensions");
+                tracing::error!(error = %err, "failed to read an item's content end");
                 ApiError::internal("Failed to query item")
             })?;
+    Ok(row.and_then(|(content_end_ms,)| content_end_ms))
+}
+
+/// Stores one genuine outro verdict and drops the probe's failure marker.
+///
+/// The delete is here, in the caller's transaction, for the same reason
+/// [`crate::db::storage::store_thumbnails`] does it: the negative cache must
+/// never outlive the positive answer. Connections carry both databases
+/// attached, so the index-side write and the `storage.` delete are one commit.
+/// Unconditional and version-agnostic — a marker from *any* detector version
+/// is answered by a stored verdict.
+///
+/// `content_end_ms` is `None` on a negative verdict, and legitimately `None`
+/// on a positive one whose duration is missing or nonsense: "has an outro" is
+/// `content_end_ms` non-null, never the kind string (design §6.3).
+pub(crate) async fn set_outro_verdict(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    outro_kind: &str,
+    content_end_ms: Option<i64>,
+) -> ApiResult<u64> {
+    let result =
+        sqlx::query("UPDATE items SET outro_kind = ?1, content_end_ms = ?2 WHERE sha256 = ?3")
+            .bind(outro_kind)
+            .bind(content_end_ms)
+            .bind(sha256)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, sha256, "failed to store an outro verdict");
+                ApiError::internal("Failed to store an outro verdict")
+            })?;
+    crate::db::visual_attempts::delete_visual_attempt(
+        &mut *conn,
+        sha256,
+        crate::db::visual_attempts::VisualKind::Outro,
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// The scan dispatcher's codec question: "is this content a video whose
+/// codecs nothing has recorded?" `false` means there is nothing to do — the
+/// item is not a video, already carries a `video_codec`, or is not indexed.
+///
+/// The whole answer, deliberately: nothing about the item's stored metadata
+/// narrows it further. A video row with no video *track* still owes its
+/// `audio_codec`, which only the probe can name (see `pending_codec_work` in
+/// `jobs::files`).
+///
+/// Scoped to the `video/` range, and phrased exactly like
+/// [`get_pending_outro_item`] — same half-open comparison rather than a LIKE
+/// prefix, and the same predicate `idx_items_codec_pending` was written for,
+/// so the definition of "video" lives in one place. Audio items are outside
+/// it on purpose: they get their `audio_codec` at scan time going forward and
+/// are never backfilled (see the migration).
+pub(crate) async fn item_codec_pending(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+SELECT 1
+FROM items
+WHERE sha256 = ?1
+  AND video_codec IS NULL
+  AND type >= 'video/' AND type < 'video0'
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read an item's codec state");
+        ApiError::internal("Failed to query item")
+    })?;
+    Ok(row.is_some())
+}
+
+/// Stores one item's stream codecs.
+///
+/// No negative-cache delete, unlike [`set_outro_verdict`]: a failed ffprobe
+/// writes no marker for codecs at all, so there is nothing here to retire (see
+/// `pending_codec_work` in `jobs::files`).
+///
+/// `video_codec` is never null — the sentinels are what terminate the backfill,
+/// so a caller with no answer must not call this at all. `audio_codec` is
+/// legitimately `None` for a container with no audio stream.
+///
+/// The column carries no version, deliberately: a `codec_name` is a fact about
+/// the file's streams, not a detector's verdict, so there is nothing for a
+/// later build to disagree with and nothing to re-examine on a bump. What
+/// *could* change is the selection policy — which stream of several counts as
+/// the file's video track (see `content_video_stream` in `jobs::files`). If it
+/// ever does, recovery is a migration that NULLs the affected rows, which puts
+/// them straight back into the backfill population the next scan walks; the
+/// manual form of the same thing is
+/// `UPDATE items SET video_codec = NULL WHERE ...`. Adding a version column
+/// instead would buy nothing that re-entering the population does not.
+pub(crate) async fn set_item_codecs(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    video_codec: &str,
+    audio_codec: Option<&str>,
+) -> ApiResult<u64> {
+    let result =
+        sqlx::query("UPDATE items SET video_codec = ?1, audio_codec = ?2 WHERE sha256 = ?3")
+            .bind(video_codec)
+            .bind(audio_codec)
+            .bind(sha256)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, sha256, "failed to store an item's codecs");
+                ApiError::internal("Failed to store item codecs")
+            })?;
+    Ok(result.rows_affected())
+}
+
+/// The scan dispatcher's animation question
+/// (docs/animated-image-spans-design.md §4): "is this a gif/webp/avif whose
+/// animation length nothing has measured?" `false` means there is nothing to
+/// do — the item is not one of the three containers, already carries a
+/// duration (0.0, the "measured: still or unparseable" verdict, terminates it
+/// exactly like a positive length), or is not indexed.
+///
+/// Scoped to the three mimes in SQL even though the dispatcher pre-filters on
+/// the walker's extension guess, so a mislabeled file (a `.gif` whose indexed
+/// type says otherwise, or vice versa) can never widen the population: the
+/// index's own `type` is what the sentinel semantics are documented against.
+pub(crate) async fn item_animation_pending(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+SELECT 1
+FROM items
+WHERE sha256 = ?1
+  AND duration IS NULL
+  AND type IN ('image/gif', 'image/webp', 'image/avif')
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read an item's animation state");
+        ApiError::internal("Failed to query item")
+    })?;
+    Ok(row.is_some())
+}
+
+/// Stores one item's measured animation length.
+///
+/// Guarded on `duration IS NULL`, which is the whole write policy
+/// (docs/animated-image-spans-design.md §4): the column holds verdicts, a
+/// verdict is written once, and neither a concurrent pass nor a re-dispatch
+/// that slipped through may overwrite one — 0.0 included. Like
+/// [`set_item_codecs`] there is no negative-cache delete: a file that could
+/// not be read records nothing at all and is simply retried.
+pub(crate) async fn set_animation_duration(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    seconds: f64,
+) -> ApiResult<u64> {
+    let result =
+        sqlx::query("UPDATE items SET duration = ?1 WHERE sha256 = ?2 AND duration IS NULL")
+            .bind(seconds)
+            .bind(sha256)
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, sha256, "failed to store an animation length");
+                ApiError::internal("Failed to store an animation length")
+            })?;
+    Ok(result.rows_affected())
+}
+
+/// The scan dispatcher's rotation question
+/// (docs/display-dimensions-design.md §4): "is this an image or a video whose
+/// orientation nothing has examined?" `false` means the item has been
+/// examined, has no picture to orient, or is not indexed.
+///
+/// Scoped to the picture mimes in SQL rather than trusting the dispatcher's
+/// extension guess, for the same reason as
+/// [`item_animation_pending`]: the index's own `type` is what the column's
+/// semantics are documented against, so a mislabeled file can never widen the
+/// population. The half-open ranges are what
+/// `idx_items_rotation_pending` can serve; `LIKE 'image/%'` is the
+/// anti-pattern this codebase has already paid for elsewhere.
+pub(crate) async fn item_rotation_pending(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+SELECT 1
+FROM items
+WHERE sha256 = ?1
+  AND rotation IS NULL
+  AND ((type >= 'image/' AND type < 'image0') OR (type >= 'video/' AND type < 'video0'))
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read an item's rotation state");
+        ApiError::internal("Failed to query item")
+    })?;
+    Ok(row.is_some())
+}
+
+/// Stores one item's measured orientation, transposing its dimensions when the
+/// turn is an odd one.
+///
+/// Guarded on `rotation IS NULL`, and that guard carries more weight here than
+/// anywhere else in the backfill (docs/display-dimensions-design.md §4): every
+/// other backfill write is idempotent, and **this one is not** — a second
+/// application of the same 90 degree answer would transpose the dimensions
+/// back to the coded ones it just corrected. The swap and the stamp are one
+/// statement so there is no window in which they can disagree.
+///
+/// `width`/`height` are swapped in SQL rather than recomputed from a value the
+/// worker carries, so an item whose dimensions were never recorded (NULL) is
+/// left NULL rather than being invented.
+pub(crate) async fn set_item_rotation(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    quarter_turns: i64,
+) -> ApiResult<u64> {
+    let transposes = quarter_turns == 90 || quarter_turns == 270;
+    let result = sqlx::query(
+        r#"
+UPDATE items
+SET rotation = ?1,
+    width = CASE WHEN ?2 THEN height ELSE width END,
+    height = CASE WHEN ?2 THEN width ELSE height END
+WHERE sha256 = ?3 AND rotation IS NULL
+        "#,
+    )
+    .bind(quarter_turns)
+    .bind(transposes)
+    .bind(sha256)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, sha256, "failed to store an item rotation");
+        ApiError::internal("Failed to store an item rotation")
+    })?;
+    Ok(result.rows_affected())
+}
+
+/// The scan dispatcher's transparency question
+/// (docs/thumbnail-format-implementation.md §2, R4): "is this an image whose
+/// pixels nothing has examined?" `false` means the item has been examined, has
+/// no pixels of its own to examine, or is not indexed.
+///
+/// Images only, and scoped in SQL rather than trusting the dispatcher's
+/// extension guess, for the same reason as [`item_rotation_pending`]: the
+/// index's own `type` is what the column's semantics are documented against.
+/// The half-open range is what `idx_items_transparency_pending` can serve;
+/// `LIKE 'image/%'` is the anti-pattern this codebase has already paid for
+/// elsewhere.
+pub(crate) async fn item_transparency_pending(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+SELECT 1
+FROM items
+WHERE sha256 = ?1
+  AND has_transparency IS NULL
+  AND type >= 'image/' AND type < 'image0'
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read an item's transparency state");
+        ApiError::internal("Failed to query item")
+    })?;
+    Ok(row.is_some())
+}
+
+/// Stores one item's measured transparency.
+///
+/// Guarded on `has_transparency IS NULL`, which is the whole write policy: the
+/// column holds a measurement, a measurement is written once, and neither a
+/// concurrent pass over identical content nor a re-dispatch that slipped
+/// through may overwrite one. Like [`set_item_codecs`] there is no
+/// negative-cache delete: a file whose pixels do not decode records nothing at
+/// all and is settled by the visuals marker instead.
+pub(crate) async fn set_item_transparency(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    has_transparency: bool,
+) -> ApiResult<u64> {
+    let result = sqlx::query(
+        "UPDATE items SET has_transparency = ?1 WHERE sha256 = ?2 AND has_transparency IS NULL",
+    )
+    .bind(has_transparency)
+    .bind(sha256)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, sha256, "failed to store an item's transparency");
+        ApiError::internal("Failed to store item transparency")
+    })?;
+    Ok(result.rows_affected())
+}
+
+/// What the scan's dimension-first questions are answered from, for one item.
+///
+/// Every field is indexed metadata, deliberately: the served-directly
+/// predicate and the rendition-ladder question both have to decide "does this
+/// item already carry what the current generator would produce?" *without*
+/// decoding the file (`jobs::files::maybe_dispatch_backfill`).
+///
+/// Read straight out of the row rather than through a tuple: four nullable
+/// columns of three types is exactly the shape a positional decode gets
+/// silently wrong.
+#[derive(sqlx::FromRow)]
+pub(crate) struct ItemVisualFacts {
+    /// Display dimensions — the header's numbers with the EXIF orientation
+    /// applied (docs/display-dimensions-design.md).
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    /// `items.duration`. For an image this is the animated-spans measurement
+    /// (docs/animated-image-spans-design.md §3): `> 0` animated, `0` measured
+    /// still, `NULL` never measured.
+    pub duration: Option<f64>,
+    /// `items.rotation`: the clockwise quarter turns between the coded pixels
+    /// and the picture the `width`/`height` above describe, `NULL` for an item
+    /// nothing has examined. See [`ItemScanMeta::rotation`].
+    pub rotation: Option<i64>,
+    /// `items.has_transparency`: whether the pixels are anywhere non-opaque,
+    /// `NULL` for an item nothing has examined. It decides the *format* of
+    /// every rendition of the item (R4), so the dispatcher needs it to predict
+    /// what the generator would write.
+    pub has_transparency: Option<bool>,
+}
+
+/// One read for all five, because the questions above are asked about the same
+/// file in the same dispatch and the deployment this runs on scans a library
+/// over SMB.
+pub(crate) async fn get_item_visual_facts(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<Option<ItemVisualFacts>> {
+    let row: Option<ItemVisualFacts> = sqlx::query_as(
+        "SELECT width, height, duration, rotation, has_transparency FROM items WHERE sha256 = ?1",
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read item visual facts");
+        ApiError::internal("Failed to query item")
+    })?;
     Ok(row)
 }
 
@@ -350,10 +787,11 @@ pub(crate) async fn update_file_data(
     let mut item_id = get_item_id(conn, &data.sha256).await?;
     let mut item_inserted = false;
 
-    if let Some(meta) = &data.item_metadata {
-        if item_id.is_none() {
-            let result = sqlx::query(
-                r#"
+    if let Some(meta) = &data.item_metadata
+        && item_id.is_none()
+    {
+        let result = sqlx::query(
+            r#"
 INSERT INTO items (
     sha256,
     md5,
@@ -362,37 +800,42 @@ INSERT INTO items (
     time_added,
     width,
     height,
+    rotation,
     duration,
     audio_tracks,
     video_tracks,
     subtitle_tracks,
-    blurhash
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+    blurhash,
+    video_codec,
+    audio_codec
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                 "#,
-            )
-            .bind(&data.sha256)
-            .bind(&meta.md5)
-            .bind(&meta.mime_type)
-            .bind(data.file_size)
-            .bind(time_added)
-            .bind(meta.width)
-            .bind(meta.height)
-            .bind(meta.duration)
-            .bind(meta.audio_tracks)
-            .bind(meta.video_tracks)
-            .bind(meta.subtitle_tracks)
-            .bind(&data.blurhash)
-            .execute(&mut *conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, sha256 = %data.sha256, "failed to insert item");
-                ApiError::internal("Failed to update file")
-            })?;
+        )
+        .bind(&data.sha256)
+        .bind(&meta.md5)
+        .bind(&meta.mime_type)
+        .bind(data.file_size)
+        .bind(time_added)
+        .bind(meta.width)
+        .bind(meta.height)
+        .bind(meta.rotation)
+        .bind(meta.duration)
+        .bind(meta.audio_tracks)
+        .bind(meta.video_tracks)
+        .bind(meta.subtitle_tracks)
+        .bind(&data.blurhash)
+        .bind(&meta.video_codec)
+        .bind(&meta.audio_codec)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, sha256 = %data.sha256, "failed to insert item");
+            ApiError::internal("Failed to update file")
+        })?;
 
-            let inserted_id = result.last_insert_rowid();
-            item_id = Some(inserted_id);
-            item_inserted = true;
-        }
+        let inserted_id = result.last_insert_rowid();
+        item_id = Some(inserted_id);
+        item_inserted = true;
     }
 
     let item_id = item_id.ok_or_else(|| {
@@ -514,7 +957,7 @@ pub(crate) async fn delete_files_not_allowed(
     job_filters: &[JobFilter],
 ) -> ApiResult<u64> {
     let user_filters = job_filters
-        .into_iter()
+        .iter()
         .filter(|filter| filter.setter_names.iter().any(|name| name == "file_scan"))
         .map(|filter| filter.pql_query.clone())
         .collect::<Vec<_>>();
@@ -554,6 +997,14 @@ pub(crate) async fn delete_files_not_allowed(
         tracing::error!(error = ?err, "failed to compile job filter PQL query");
         ApiError::internal("Failed to delete files")
     })?;
+    // Bookmark/pinboard predicates are circular as file_scan gates (a file
+    // must already be indexed before it can be bookmarked or pinned), and
+    // this connection has no user_data schema attached anyway.
+    if built.uses_user_data {
+        return Err(ApiError::bad_request(
+            "in_bookmarks/in_pinboard filters are not supported in file_scan job filters",
+        ));
+    }
     let paginated = built.paginated_query();
     let (sql, values) = match built.with_clause {
         Some(with_clause) => paginated.with(with_clause).build_sqlx(SqliteQueryBuilder),
@@ -650,6 +1101,31 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1
         assert_eq!(record.last_modified, "2024-01-01T00:00:00");
     }
 
+    // A file_scan job filter over user_data (in_bookmarks/in_pinboard) is
+    // circular — a file must already be indexed to be bookmarked — and runs
+    // on a connection without user_data attached; it must fail with a clear
+    // error, not "no such table: user_data.bookmarks".
+    #[tokio::test]
+    async fn delete_files_not_allowed_rejects_user_data_filters() {
+        let mut dbs = setup_test_databases().await;
+        let filter = JobFilter {
+            setter_names: vec!["file_scan".to_string()],
+            pql_query: serde_json::from_value(serde_json::json!({
+                "in_bookmarks": { "filter": true }
+            }))
+            .unwrap(),
+        };
+
+        let err = delete_files_not_allowed(&mut dbs.index_conn, &[filter])
+            .await
+            .expect_err("user_data job filter must be rejected");
+        assert!(
+            err.detail().contains("in_bookmarks"),
+            "unexpected error: {}",
+            err.detail()
+        );
+    }
+
     // Ensures update_file_data inserts items and files when new data arrives.
     #[tokio::test]
     async fn update_file_data_inserts_item_and_file() {
@@ -673,10 +1149,13 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1
                     mime_type: "image/png".to_string(),
                     width: Some(10),
                     height: Some(20),
+                    rotation: None,
                     duration: None,
                     audio_tracks: None,
                     video_tracks: None,
                     subtitle_tracks: None,
+                    video_codec: None,
+                    audio_codec: None,
                 }),
                 blurhash: Some("bh".to_string()),
             },
@@ -700,6 +1179,255 @@ VALUES ('sha_one', 1, 'C:\data\one.png', 'one.png', '2024-01-01T00:00:00', ?1, 1
                 .await
                 .unwrap();
         assert_eq!(file_row.0, 1);
+    }
+
+    // The rotation backfill's population and — far more important — the one
+    // write in the scan that is not idempotent
+    // (docs/display-dimensions-design.md §4).
+    #[tokio::test]
+    async fn the_rotation_question_covers_pictures_and_stamps_exactly_once() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, width, height, time_added)
+VALUES
+    (1, 'sha_photo', 'md5_1', 'image/jpeg', 4032, 3024, '2024-01-01T00:00:00'),
+    (2, 'sha_clip', 'md5_2', 'video/mp4', 1920, 1080, '2024-01-01T00:00:00'),
+    (3, 'sha_song', 'md5_3', 'audio/mpeg', NULL, NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        for sha in ["sha_photo", "sha_clip"] {
+            assert!(
+                item_rotation_pending(&mut dbs.index_conn, sha)
+                    .await
+                    .unwrap(),
+                "{sha} has a picture nothing has oriented"
+            );
+        }
+        for sha in ["sha_song", "sha_missing"] {
+            assert!(
+                !item_rotation_pending(&mut dbs.index_conn, sha)
+                    .await
+                    .unwrap(),
+                "{sha} must never be dispatched for an orientation probe"
+            );
+        }
+
+        // An odd turn transposes, and the stamp terminates the question.
+        assert_eq!(
+            set_item_rotation(&mut dbs.index_conn, "sha_photo", 90)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !item_rotation_pending(&mut dbs.index_conn, "sha_photo")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            dimensions(&mut dbs.index_conn, "sha_photo").await,
+            (Some(3024), Some(4032), Some(90))
+        );
+
+        // The point of the guard: this write is the only one in the backfill
+        // that would *undo itself* if it ran twice.
+        assert_eq!(
+            set_item_rotation(&mut dbs.index_conn, "sha_photo", 90)
+                .await
+                .unwrap(),
+            0,
+            "a second pass must not transpose the dimensions back"
+        );
+        assert_eq!(
+            dimensions(&mut dbs.index_conn, "sha_photo").await,
+            (Some(3024), Some(4032), Some(90))
+        );
+
+        // An even turn is just as much an answer, and leaves the dimensions
+        // alone.
+        assert_eq!(
+            set_item_rotation(&mut dbs.index_conn, "sha_clip", 180)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            dimensions(&mut dbs.index_conn, "sha_clip").await,
+            (Some(1920), Some(1080), Some(180))
+        );
+    }
+
+    // A picture whose dimensions were never recorded must not have any
+    // invented for it by the transposition.
+    #[tokio::test]
+    async fn a_transposing_stamp_leaves_absent_dimensions_absent() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, time_added)
+VALUES (1, 'sha_photo', 'md5_1', 'image/jpeg', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            set_item_rotation(&mut dbs.index_conn, "sha_photo", 270)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            dimensions(&mut dbs.index_conn, "sha_photo").await,
+            (None, None, Some(270))
+        );
+    }
+
+    async fn dimensions(
+        conn: &mut sqlx::SqliteConnection,
+        sha256: &str,
+    ) -> (Option<i64>, Option<i64>, Option<i64>) {
+        sqlx::query_as("SELECT width, height, rotation FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    // The codec backfill's population, which no scan test can reach: the
+    // dispatch question is scoped to the `video/` mime range, so an audio item
+    // with a NULL `video_codec` sits in the partial index forever and is never
+    // asked about. Widening it would put every audio file in an existing
+    // library through an ffprobe run for a column nothing reads.
+    #[tokio::test]
+    async fn the_codec_question_covers_videos_and_only_videos() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, video_tracks, time_added)
+VALUES
+    (1, 'sha_video', 'md5_1', 'video/mp4', 1, '2024-01-01T00:00:00'),
+    (2, 'sha_audio', 'md5_2', 'audio/mpeg', 0, '2024-01-01T00:00:00'),
+    (3, 'sha_image', 'md5_3', 'image/png', NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        assert!(
+            item_codec_pending(&mut dbs.index_conn, "sha_video")
+                .await
+                .unwrap(),
+            "an unprobed video is work"
+        );
+        for sha in ["sha_audio", "sha_image", "sha_missing"] {
+            assert!(
+                !item_codec_pending(&mut dbs.index_conn, sha).await.unwrap(),
+                "{sha} must never be dispatched for a codec probe"
+            );
+        }
+
+        // A stored answer — sentinel or codec name — is what terminates it.
+        assert_eq!(
+            set_item_codecs(&mut dbs.index_conn, "sha_video", "hevc", Some("aac"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !item_codec_pending(&mut dbs.index_conn, "sha_video")
+                .await
+                .unwrap()
+        );
+        let stored: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT video_codec, audio_codec FROM items WHERE sha256 = 'sha_video'")
+                .fetch_one(&mut dbs.index_conn)
+                .await
+                .unwrap();
+        assert_eq!(stored, (Some("hevc".to_string()), Some("aac".to_string())));
+    }
+
+    // The animation backfill's population: only the three animated-image
+    // containers, and only while the duration column is NULL. The 0.0 verdict
+    // must terminate it exactly like a real length — and must be
+    // unoverwritable, or a re-dispatch that raced a stamp would replace one
+    // measurement with another and re-key every cached mosaic built on it.
+    #[tokio::test]
+    async fn the_animation_question_covers_unmeasured_animated_images_only() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+INSERT INTO items (id, sha256, md5, type, duration, time_added)
+VALUES
+    (1, 'sha_gif', 'md5_1', 'image/gif', NULL, '2024-01-01T00:00:00'),
+    (2, 'sha_webp', 'md5_2', 'image/webp', NULL, '2024-01-01T00:00:00'),
+    (3, 'sha_avif', 'md5_3', 'image/avif', NULL, '2024-01-01T00:00:00'),
+    (4, 'sha_png', 'md5_4', 'image/png', NULL, '2024-01-01T00:00:00'),
+    (5, 'sha_still', 'md5_5', 'image/gif', 0.0, '2024-01-01T00:00:00'),
+    (6, 'sha_video', 'md5_6', 'video/mp4', NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        for sha in ["sha_gif", "sha_webp", "sha_avif"] {
+            assert!(
+                item_animation_pending(&mut dbs.index_conn, sha)
+                    .await
+                    .unwrap(),
+                "an unmeasured {sha} is work"
+            );
+        }
+        for sha in ["sha_png", "sha_still", "sha_video", "sha_missing"] {
+            assert!(
+                !item_animation_pending(&mut dbs.index_conn, sha)
+                    .await
+                    .unwrap(),
+                "{sha} must never be dispatched for a measurement"
+            );
+        }
+
+        // A stored answer terminates it, and the NULL guard keeps it stored:
+        // a second write — whatever it claims — changes nothing.
+        assert_eq!(
+            set_animation_duration(&mut dbs.index_conn, "sha_gif", 0.75)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !item_animation_pending(&mut dbs.index_conn, "sha_gif")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            set_animation_duration(&mut dbs.index_conn, "sha_gif", 99.0)
+                .await
+                .unwrap(),
+            0,
+            "a measured item is never overwritten"
+        );
+        assert_eq!(
+            set_animation_duration(&mut dbs.index_conn, "sha_still", 42.0)
+                .await
+                .unwrap(),
+            0,
+            "and neither is a 0.0 verdict"
+        );
+        let stored: Option<f64> =
+            sqlx::query_scalar("SELECT duration FROM items WHERE sha256 = 'sha_gif'")
+                .fetch_one(&mut dbs.index_conn)
+                .await
+                .unwrap();
+        assert_eq!(stored, Some(0.75));
     }
 
     // Ensures unchanged files update scan_id and last_modified without reinserting.

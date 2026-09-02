@@ -54,14 +54,15 @@ pub fn resolve_configured_executable(configured: &Path) -> Option<PathBuf> {
     if is_runnable_file(configured) {
         return Some(configured.to_path_buf());
     }
-    if configured.components().count() == 1 {
-        if let Some(name) = configured.to_str() {
-            return find_executable(&[name]);
-        }
+    if configured.components().count() == 1
+        && let Some(name) = configured.to_str()
+    {
+        return find_executable(&[name]);
     }
     None
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 fn first_existing_file(candidates: &[&str]) -> Option<PathBuf> {
     candidates
         .iter()
@@ -69,10 +70,23 @@ fn first_existing_file(candidates: &[&str]) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+#[cfg(any(target_os = "macos", windows, test))]
+fn first_runnable_under(roots: &[PathBuf], relative_paths: &[&str]) -> Option<PathBuf> {
+    for root in roots {
+        for relative in relative_paths {
+            let candidate = root.join(relative);
+            if is_runnable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 fn profile_bin_dirs() -> Vec<PathBuf> {
     #[cfg(not(unix))]
     {
-        return Vec::new();
+        Vec::new()
     }
     #[cfg(unix)]
     {
@@ -86,9 +100,7 @@ fn profile_bin_dirs() -> Vec<PathBuf> {
             dirs.push(home.join(".local/state/nix/profile/bin"));
         }
         if let Ok(user) = env::var("USER") {
-            dirs.push(PathBuf::from(format!(
-                "/etc/profiles/per-user/{user}/bin"
-            )));
+            dirs.push(PathBuf::from(format!("/etc/profiles/per-user/{user}/bin")));
         }
         dirs
     }
@@ -162,10 +174,10 @@ pub fn find_label_font() -> Option<PathBuf> {
             }
         }
         let fonts_dir = root.join("fonts");
-        if fonts_dir.is_dir() {
-            if let Some(path) = find_named_font_under(&fonts_dir, FONT_FILE_CANDIDATES) {
-                return Some(path);
-            }
+        if fonts_dir.is_dir()
+            && let Some(path) = find_named_font_under(&fonts_dir, FONT_FILE_CANDIDATES)
+        {
+            return Some(path);
         }
     }
     None
@@ -272,27 +284,69 @@ pub fn find_html_renderer() -> Option<PathBuf> {
         "chromium-browser",
         "google-chrome",
         "google-chrome-stable",
+        "google-chrome-beta",
+        "google-chrome-unstable",
+        "brave-browser",
+        "brave-browser-beta",
+        "brave-browser-nightly",
         "msedge",
         "microsoft-edge",
+        "microsoft-edge-beta",
+        "microsoft-edge-dev",
     ];
     if let Some(path) = find_executable(NAMES) {
         return Some(path);
     }
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots = vec![PathBuf::from("/Applications")];
+        if let Some(home) = env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join("Applications"));
+        }
+        return first_runnable_under(
+            &roots,
+            &[
+                "Google Chrome.app/Contents/MacOS/Google Chrome",
+                "Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+                "Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev",
+                "Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+                "Chromium.app/Contents/MacOS/Chromium",
+                "Brave Browser.app/Contents/MacOS/Brave Browser",
+                "Brave Browser Beta.app/Contents/MacOS/Brave Browser Beta",
+                "Brave Browser Nightly.app/Contents/MacOS/Brave Browser Nightly",
+                "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "Microsoft Edge Beta.app/Contents/MacOS/Microsoft Edge Beta",
+                "Microsoft Edge Dev.app/Contents/MacOS/Microsoft Edge Dev",
+                "Microsoft Edge Canary.app/Contents/MacOS/Microsoft Edge Canary",
+            ],
+        );
+    }
     #[cfg(windows)]
     {
-        return first_existing_file(&[
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ]);
+        let roots = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+            .into_iter()
+            .filter_map(env::var_os)
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        first_runnable_under(
+            &roots,
+            &[
+                r"Microsoft\Edge\Application\msedge.exe",
+                r"Google\Chrome\Application\chrome.exe",
+                r"BraveSoftware\Brave-Browser\Application\brave.exe",
+                r"Chromium\Application\chrome.exe",
+            ],
+        )
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         first_existing_file(&[
             "/usr/bin/chromium",
             "/usr/bin/chromium-browser",
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
+            "/usr/bin/brave-browser",
+            "/usr/bin/microsoft-edge",
         ])
     }
     #[cfg(not(any(unix, windows)))]
@@ -331,7 +385,10 @@ pub fn find_pdfium_in_venvs() -> Option<PathBuf> {
     for site in site_packages {
         let candidate = site.join("pypdfium2_raw").join(lib_name);
         if candidate.is_file() {
-            return Some(candidate);
+            // Hardened macOS processes reject relative dlopen() paths even
+            // when the file exists. All platforms benefit from handing the
+            // dynamic loader an unambiguous absolute path.
+            return fs::canonicalize(&candidate).ok().or(Some(candidate));
         }
     }
     None
@@ -355,7 +412,10 @@ mod tests {
 
     #[test]
     fn can_spawn_rejects_missing() {
-        assert!(!can_spawn(Path::new("/nonexistent/binary-xyz"), &["-version"]));
+        assert!(!can_spawn(
+            Path::new("/nonexistent/binary-xyz"),
+            &["-version"]
+        ));
     }
 
     #[test]
@@ -371,6 +431,34 @@ mod tests {
             assert!(resolve_configured_executable(Path::new("cmd")).is_some());
         }
         assert!(resolve_configured_executable(Path::new("no-such-panoptikon-tool-xyz")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_runnable_under_respects_root_and_preference_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Applications");
+        let chrome = root.join("Chrome.app/Contents/MacOS/Chrome");
+        let brave = root.join("Brave.app/Contents/MacOS/Brave");
+        fs::create_dir_all(chrome.parent().unwrap()).unwrap();
+        fs::create_dir_all(brave.parent().unwrap()).unwrap();
+        fs::write(&chrome, b"browser").unwrap();
+        fs::write(&brave, b"browser").unwrap();
+        fs::set_permissions(&chrome, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&brave, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            first_runnable_under(
+                std::slice::from_ref(&root),
+                &[
+                    "Brave.app/Contents/MacOS/Brave",
+                    "Chrome.app/Contents/MacOS/Chrome",
+                ],
+            ),
+            Some(brave),
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
       "name": "AGPL-3.0-or-later",
       "identifier": "AGPL-3.0-or-later"
     },
-    "version": "0.1.7"
+    "version": "0.1.8"
   },
   "paths": {
     "/api/bookmarks/item/{sha256}": {
@@ -762,6 +762,16 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Server is in read-only mode",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         }
       }
@@ -1513,7 +1523,7 @@
           "inference"
         ],
         "summary": "Run a batch prediction on a model",
-        "description": "Runs a batch of inputs through a model, auto-loading it into the given cache slot first if needed. The response encoding depends on the outputs: exactly one binary output is returned raw as `application/octet-stream`; all-binary outputs use `multipart/mixed`; anything else is the JSON `{\"outputs\": [...]}` envelope.",
+        "description": "Runs a batch of inputs through a model, auto-loading it into the given cache slot first if needed. The response encoding depends on the outputs: exactly one binary output is returned raw as `application/octet-stream`; all-binary outputs use `multipart/mixed`; anything else is the JSON `{\"outputs\": [...]}` envelope. An input the model rejected on its own occupies its output slot as `{\"__error__\": {\"class\": \"input\"|\"transient\", \"message\": ...}}`, which always selects the JSON envelope.",
         "operationId": "predict",
         "parameters": [
           {
@@ -1993,7 +2003,7 @@
           "items"
         ],
         "summary": "Get thumbnail for an item",
-        "description": "Returns a thumbnail for a given item.\nThe thumbnail may be a thumbnail,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nGIFs are always returned as the original file.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).",
+        "description": "Returns a thumbnail for a given item.\nThe thumbnail may be a stored rendition,\nthe unmodified original image (only for images),\nor a placeholder image generated on the fly.\nOn the default (`display`) path an animated item is returned as the original file unless it is over the display loop trigger reported by `/api/client-config`, in which case it is answered with an H.264 loop as `video/mp4`.\nFor video thumbnails, the `big` parameter can be used to\nselect between the 2x2 frame grid (big=True) or the first frame from the grid (big=False).\nThe `size` parameter selects a rendition tier: `display` (default),\n`grid-m` (short side 1024), `grid-s` (short side 512) or `grid-xs` (short side 256).\nA tier with no stored rendition falls through to the next larger one.\nStill renditions are `image/jpeg` or `image/webp`; the response's Content-Type and filename extension come from the stored row.\nAt a grid tier an **animated** item above the raw floor answers with its H.264 loop as\n`video/mp4` (one rendition serves every grid tier), and `still=true` answers with the\nstatic poster for that tier instead. Animated items at or below the floor - at most\n1 MiB with both sides at most 512 px, reported by `/api/client-config` - are answered\nwith their original file at every tier.\nSupports HTTP Range requests (single byte ranges), which matter for the H.264 loops:\na `<video>` that cannot ask for a range downloads the whole stream before playing.\nConditional GET is supported on every answer; a validated `If-None-Match` returns 304.",
         "operationId": "item_thumbnail",
         "parameters": [
           {
@@ -2046,11 +2056,44 @@
               "type": "boolean",
               "default": true
             }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "description": "Which rendition to serve. `display` (the default, and what omitting\nthe parameter has always meant) is gallery quality; `grid-m` and\n`grid-s` cap the **short** side at 1024 and 512 for grid-sized boxes.\nA tier an item has no stored rendition for falls through to the next\nlarger one, so a request is always answerable.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ThumbnailTier"
+                }
+              ],
+              "default": "display"
+            }
+          },
+          {
+            "name": "still",
+            "in": "query",
+            "description": "Animated items: serve the static tier image (the loop's poster)\ninstead of the loop. A no-op for static items, whose renditions are\nalways images, and for animated items at or below the raw floor,\nwhich are served as their original file either way.",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         ],
         "responses": {
           "200": {
             "description": "Item thumbnail image"
+          },
+          "206": {
+            "description": "Partial thumbnail contents (Range request)"
+          },
+          "304": {
+            "description": "Not modified (validated If-None-Match)"
+          },
+          "416": {
+            "description": "Requested range not satisfiable"
           }
         }
       }
@@ -2566,6 +2609,128 @@
                   "items": {
                     "$ref": "#/components/schemas/JobModel"
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/jobs/data/failures": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "List recorded data extraction failures",
+        "description": "The extraction failure ledger: media a setter has already rejected, which the work query therefore skips. Read-only by design — a row is cleared when the file's content changes, when a missing dependency appears, or by a shipped retry directive, never by an API call. Newest first, paginated with limit/offset against `total`.",
+        "operationId": "get_extraction_failures",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "setter",
+            "in": "query",
+            "description": "Only failures recorded for this setter. Deliberately *not* validated\nagainst the known setters: the vocabulary is free-form and depends on\nwhich models the user has ever run, so there is no closed list to check\nagainst. A typo therefore answers \"no failures\", which is acceptable\nhere — unlike `error_class`, whose vocabulary is closed and enforced,\nbecause a mistyped class silently reading as \"nothing is wrong\" is\nexactly what an audit surface must not do.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "error_class",
+            "in": "query",
+            "description": "`input`, `blocked` or `resource`. Anything else is a 400.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "stage",
+            "in": "query",
+            "description": "`prepare` (the gateway could not produce the model's input) or\n`inference` (the worker rejected it).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "mime_prefix",
+            "in": "query",
+            "description": "Prefix of the recorded mime type, e.g. `image/`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size. Defaults to 100; values outside 1..=1000 are clamped into\nthat range rather than rejected. Deliberately unconstrained in the\nschema: a generated validating client must not refuse a request the\nserver accepts.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip. Values below 0 are clamped to 0 (start at the beginning),\nnot rejected — same reason as `limit`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recorded extraction failures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractionFailuresResponse"
                 }
               }
             }
@@ -3089,7 +3254,7 @@
           "jobs"
         ],
         "summary": "Rebuild a quant profile's artifact for an embedding space",
-        "description": "Marks the embedding space containing the given setter for rebuild under the given profile (artifact recomputed at a bumped revision) and enqueues a reconcile job. The affected setters search exact until the rebuild completes. Explicit user action by design — artifact recomputation reshuffles coarse order and is never background-silent.",
+        "description": "Marks the embedding space containing the given setter for rebuild under the given profile (the int8 scale is recomputed and every code rewritten at a bumped revision) and enqueues a reconcile job. The affected setters search exact until the rebuild completes. Explicit user action by design — a recomputed scale invalidates every code already stored for the space, so search results move; that is never background-silent.",
         "operationId": "rebuild_vector_quant_pair",
         "parameters": [
           {
@@ -3258,6 +3423,232 @@
         }
       }
     },
+    "/api/jobs/scan/failures": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "List recorded file scan failures",
+        "description": "The filescan failure ledger: paths the scan could not get as far as an item for. A confirmed row (`active`) is skipped only while the file still has the mtime and size the failure was recorded against, so a repaired or modified file is re-attempted on the next scan regardless. Read-only by design — a row is cleared when the file's mtime or size changes, when the path stops being walked, when a missing dependency appears, or by a shipped retry directive. Newest first, paginated with limit/offset against `total`.",
+        "operationId": "get_scan_failures",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "error_class",
+            "in": "query",
+            "description": "`input`, `blocked` or `resource`. Anything else is a 400.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "stage",
+            "in": "query",
+            "description": "`mime`, `metadata`, `header` or `decode`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "mime_prefix",
+            "in": "query",
+            "description": "Prefix of the recorded mime type, e.g. `image/`. Rows whose mime guess\nis what failed have no mime type and match no prefix.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size. Defaults to 100; values outside 1..=1000 are clamped into\nthat range rather than rejected. Deliberately unconstrained in the\nschema: a generated validating client must not refuse a request the\nserver accepts.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rows to skip. Values below 0 are clamped to 0 (start at the beginning),\nnot rejected — same reason as `limit`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recorded scan failures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanFailuresResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/open/clipboard/artifact": {
+      "post": {
+        "tags": [
+          "open"
+        ],
+        "summary": "Copy a cached transcode artifact to the host system's clipboard",
+        "description": "Place an OS-native reference to a finished rendition (a clip, a converted video, a mosaic) on the clipboard of the machine running the server, so that pasting it into a file manager, a chat client or an upload form attaches that file.\nThe artifact is stored under its content-addressed `<key>.<ext>` name, which is useless to paste, so the path handed to the clipboard is a hardlinked view of the same bytes under a human file name; it is created on demand and removed with the artifact.\nThe write targets the *server's* clipboard, so this is only useful when the server and the browser share a machine (or when a custom open.clipboard_command forwards it elsewhere).\nThis is a potentially dangerous operation, as a custom command can execute arbitrary code.",
+        "operationId": "copy_artifact_to_clipboard_on_host",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "query",
+            "description": "The artifact cache key, exactly as `ArtifactRef.key` carries it.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "The download name the client was handed on `ArtifactRef.filename`.\n\nOptional: without it the artifact's stored name is used. It is\nre-sanitized inside `materialize_share` (single path component,\nlength-capped), so a hostile value degrades to a safe name rather\nthan escaping the share directory.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Artifact copied to the host clipboard",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No cached artifact for this key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/open/clipboard/{sha256}": {
+      "post": {
+        "tags": [
+          "open"
+        ],
+        "summary": "Copy a file to the host system's clipboard",
+        "description": "Place an OS-native reference to the file on the clipboard of the machine running the server, so that pasting it into a file manager, a chat client or an upload form attaches the original file.\nOnly the path travels; the file's contents are never read.\nThe write targets the *server's* clipboard, so this is only useful when the server and the browser share a machine (or when a custom open.clipboard_command forwards it elsewhere).\nThis is a potentially dangerous operation, as a custom command can execute arbitrary code.",
+        "operationId": "copy_file_to_clipboard_on_host",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "sha256",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File copied to the host clipboard",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/open/file/{sha256}": {
       "post": {
         "tags": [
@@ -3392,7 +3783,7 @@
           "pinboards"
         ],
         "summary": "List saved pinboards",
-        "description": "Lists the user's saved pinboards, most recently updated first, with head-version metadata (preview dimensions, item and version counts) but without layouts or preview blobs.\nThe `q` parameter matches pinboard names via FTS prefix search.",
+        "description": "Lists the user's saved pinboards with head-version metadata (preview dimensions, item and version counts) but without layouts or preview blobs.\nOrdered by `order`: `activity` (default) ranks by a recency strip followed by a decaying visit score — opening a board counts as activity, not just saving it — while `updated` is plain last-saved-first. The order applies identically under the `q` name search (FTS prefix match).\nEach board carries its association with the selected index database: `associated` (stamped for this database, or fully present in it), the stamped `databases`, and `present_count` — which is reported whether or not `associated_only` filters the list.",
         "operationId": "list_pinboards",
         "parameters": [
           {
@@ -3436,6 +3827,24 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "description": "List ordering: `activity` (recency + decaying visit frequency, the\ndefault) or `updated` (last saved first).",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PinboardOrder"
+            }
+          },
+          {
+            "name": "associated_only",
+            "in": "query",
+            "description": "Return only the boards associated with the selected index database.\nThe verdict is server-computed (see `associated`); the client sends\nits stored preference.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -3512,6 +3921,90 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SavePinboardResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pinboards/search": {
+      "post": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Find the pinboards whose images match a search",
+        "description": "Runs the same PQL query `/api/search/pql` would run, intersects its full result set with every pinboard's pinned items, and returns the boards that intersect — not files. Membership is the board's head version only, by sha256, so a pin whose item is no longer indexed never matches.\n\nThe result is unpaginated: the response carries every matching board, ordered by the position of its best-ranked matching image (the direction-adjusted extreme of the search's first order key), then by match fraction, then by match count, then by the library's activity score. Multi-key orders are approximated by their primary key. `page`, `page_size`, `partition_by`, `count`, `results` and `check_path` in the body are ignored: there is one result shape.",
+        "operationId": "search_pql_pinboards",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user",
+            "in": "query",
+            "description": "The user whose pinboards to search.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "user"
+            }
+          },
+          {
+            "name": "associated_only",
+            "in": "query",
+            "description": "Return only the boards associated with the selected index database —\nthe same server-computed rule and the same client preference as the\nlibrary list.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The PQL Search query whose results the boards are intersected with",
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PqlQuery"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Matching pinboards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PinboardSearchResponse"
                 }
               }
             }
@@ -3729,6 +4222,90 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Pinboard not found"
+          }
+        }
+      }
+    },
+    "/api/pinboards/{pinboard_id}/databases": {
+      "put": {
+        "tags": [
+          "pinboards"
+        ],
+        "summary": "Replace the databases a pinboard is associated with",
+        "description": "Sets the board's database associations to exactly the names given, replacing whatever was there (an empty list clears them). This is the manual fix path every automatic verdict has: associations are hints, so renames, accidental stamps and instance-identity resets all need somewhere to go.\nA name the board is already stamped for is kept exactly as stored — including one whose database no longer exists locally, which the server has no way to mint again. Every other name must resolve to a local index database; one that resolves to nothing is a 400 and nothing is written. Removing a name is expressed by omitting it.\nThe board's `time_updated` is deliberately not bumped: an association is not a content change and must not reorder the library.",
+        "operationId": "set_pinboard_databases",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "pinboard_id",
+            "in": "path",
+            "description": "The pinboard id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "user",
+            "in": "query",
+            "description": "The user the pinboard belongs to.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "user"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPinboardDatabasesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The board's associations after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PinboardDatabasesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A name that is neither already stamped nor a local index database"
           },
           "404": {
             "description": "Pinboard not found"
@@ -3973,7 +4550,7 @@
           "pinboards"
         ],
         "summary": "Get the stored preview image for a pinboard version",
-        "description": "Serves the client-composited preview for one version. Versions are immutable, so responses carry immutable cache headers.\nWith `maxw`, the image is downscaled on the fly (JPEG) to at most that width; without it, the stored image is served as uploaded.",
+        "description": "Serves the client-composited preview for one version. Responses carry immutable cache headers.\nWith `maxw`, the image is downscaled on the fly (JPEG) to at most that width — unless the stored image is already no wider than `maxw`, in which case it is served as uploaded, exactly as it is without `maxw`. Asking for the full master therefore costs no second lossy pass.",
         "operationId": "pinboard_version_preview",
         "parameters": [
           {
@@ -4048,6 +4625,95 @@
           },
           "404": {
             "description": "No preview stored for this version"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "pinboards"
+        ],
+        "summary": "Replace the stored preview image of a pinboard version",
+        "description": "Overwrites one version's preview image and its recorded dimensions, leaving the layout, items and name-at-save untouched. The compositor is client-side, so this is how a board saved at an older preview resolution gets a better picture without minting a version: recomposite the head version's layout and PUT the result.\nThe board's `time_updated` is deliberately not bumped — re-rendering the picture of a version is not a content change, so it must not reorder the library.\nCaveat: version previews are served with immutable cache headers (versions were immutable until this endpoint existed), so after a refresh, already-cached sizes persist in browsers and proxies until a hard refresh. Accepted as-is: this is a one-time local operation, not a cache-busting mechanism.",
+        "operationId": "update_pinboard_version_preview",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "pinboard_id",
+            "in": "path",
+            "description": "The pinboard id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "version_id",
+            "in": "path",
+            "description": "The version id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "user",
+            "in": "query",
+            "description": "The user the pinboard belongs to.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "user"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Preview replaced",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PinboardDeleteResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Version not found"
           }
         }
       }
@@ -4715,6 +5381,475 @@
           }
         }
       }
+    },
+    "/api/video/artifact": {
+      "get": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Serve a cached transcode artifact",
+        "description": "Serves a finished rendition by `key` (primary form) or by the `(id, id_type, preset, start_cs, end_cs)` that produced it. Supports Range requests. **Never starts a job**: a miss is a 404 whose body names the live job when one exists. The `key=` form is `immutable` — that URL is content-addressed on both the source hash and the resolved settings — while the resolvable form is `no-cache`, so its ETag revalidates: the same parameters name different bytes after a profile edit.",
+        "operationId": "video_artifact",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "description": "The cache key, as carried by every `ArtifactRef`. Primary form.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "query",
+            "description": "Resolvable form: the same `(id, id_type, preset, start_cs, end_cs)`\nthat produced the artifact.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ItemIdentifierType"
+            }
+          },
+          {
+            "name": "preset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start_cs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "end_cs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Artifact contents"
+          },
+          "206": {
+            "description": "Partial artifact contents (Range request)"
+          },
+          "404": {
+            "description": "Not cached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactMissResponse"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "Requested range not satisfiable"
+          },
+          "422": {
+            "description": "Unknown preset, or trim bounds that name a freeze frame rather than a clip (the resolvable form validates exactly as the POST does)"
+          }
+        }
+      }
+    },
+    "/api/video/cache": {
+      "get": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Get transcode artifact cache stats",
+        "operationId": "get_transcode_cache",
+        "responses": {
+          "200": {
+            "description": "Artifact cache stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeCacheStats"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Resize the transcode artifact cache",
+        "description": "Sets the live byte budget and evicts down to it. Sizes above the `[transcode] cache_size_max_mb` ceiling are rejected. Not persisted — the TOML value applies again at the next startup.",
+        "operationId": "resize_transcode_cache",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscodeCacheResize"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Artifact cache stats after resizing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeCacheStats"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Above the configured ceiling"
+          },
+          "500": {
+            "description": "The eviction pass behind the resize failed"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Clear the transcode artifact cache",
+        "description": "Removes every unpinned artifact (pinned rows are the share-link guarantee and survive). `include_failures` also forgets the recorded encode verdicts.",
+        "operationId": "clear_transcode_cache",
+        "parameters": [
+          {
+            "name": "include_failures",
+            "in": "query",
+            "description": "Also forget the recorded encode verdicts, so files that failed twice\nare attempted again.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Artifact cache stats after clearing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeCacheStats"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/video/compose": {
+      "post": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Create or join a composition job",
+        "description": "Renders a composition document — a canvas, a frame rate, an output length policy and a list of placed items — into one animated artifact. A sibling of `/api/video/transcode` rather than a variant of it: a composition is addressed by the hash of its document, not by an item, and is strictly heavier work, so a policy can allow one and deny the other. The response envelope, the jobs/SSE routes and the artifact route are identical to the single-file path; a single-item save is simply a composition with one item.",
+        "operationId": "video_compose",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComposeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The composition was already cached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeSubmitResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A job was created or joined",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeSubmitResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "An item is not in this database, or has no readable file"
+          },
+          "422": {
+            "description": "Unknown preset, or a document the composition limits refuse: too many items, a canvas that is odd/too large/taller than the preset renders, a destination rectangle outside the canvas or at an odd position, a span whose end is not after its start, a still frozen at or past its item's recorded length, a thumbnail-source item whose time is not `image` or whose item has no stored thumbnail, an unusable frame rate or length cap, or loop buffers over `max_mosaic_loop_mb` (the message carries the estimate)"
+          }
+        }
+      }
+    },
+    "/api/video/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Get a transcode job snapshot",
+        "description": "The same envelope the SSE stream carries. Exists for late joiners and as the fallback when `text/event-stream` cannot get through.",
+        "operationId": "video_job",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeJobSnapshot"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Cancel a transcode job",
+        "description": "A queued job settles immediately; a running one is flagged and its ffmpeg child killed. Cancellation is never recorded as a verdict on the file.",
+        "operationId": "video_job_cancel",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job snapshot after the cancel",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeJobSnapshot"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job"
+          }
+        }
+      }
+    },
+    "/api/video/jobs/{job_id}/events": {
+      "get": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Follow a transcode job (SSE)",
+        "description": "A `text/event-stream` of job snapshots. The first event is always the current snapshot, keep-alive comments are sent every 10 seconds, and the stream ends after the terminal event — clients must close their EventSource then, or it will reconnect forever.",
+        "operationId": "video_job_events",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stream of TranscodeJobSnapshot events (text/event-stream)"
+          },
+          "404": {
+            "description": "No such job"
+          }
+        }
+      }
+    },
+    "/api/video/presets": {
+      "get": {
+        "tags": [
+          "video"
+        ],
+        "summary": "List the available transcode presets",
+        "description": "The resolved preset table (built-ins merged with `[transcode.profiles]`), filtered by the matched policy's `[policies.client] transcode_presets` when it is set. The envelope also carries the composition limits, so clients clamp against live config.",
+        "operationId": "video_presets",
+        "responses": {
+          "200": {
+            "description": "Presets and limits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodePresetsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/video/transcode": {
+      "post": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Create or join a transcode job",
+        "description": "Resolves the item, validates the preset and trim bounds, and either answers from the artifact cache (200, `outcome: \"hit\"`) or creates/joins a job (202). `cut: \"outro\"` ends the clip at the item's detected outro boundary: it excludes `end_cs`, composes with `start_cs`, and is resolved to explicit centiseconds here, so it shares its cache entry with the identical explicit trim. An item with no detected outro — including one whose index database has `detect_outros` off — is a 404.",
+        "operationId": "video_transcode",
+        "parameters": [
+          {
+            "name": "index_db",
+            "in": "query",
+            "description": "The name of the `index` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_data_db",
+            "in": "query",
+            "description": "The name of the `user_data` database to open and use for this API call. Find available databases with `/api/db`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscodeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The rendition was already cached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeSubmitResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A job was created or joined",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscodeSubmitResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such item, no readable file for it, or no detected outro"
+          },
+          "422": {
+            "description": "Unknown preset, an unusable trim window (bounds that name a freeze frame rather than a clip, a start bound past the end of the item, or a start bound at or past the resolved outro cut), an unknown/conflicting `cut`, or an animated-image preset asked for more than `max_animated_image_seconds` of output (including an unbounded one on an item with no recorded duration)"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -4730,6 +5865,94 @@
             "items": {
               "$ref": "#/components/schemas/QueryElement"
             }
+          }
+        }
+      },
+      "AnimatedThumbnailFloor": {
+        "type": "object",
+        "description": "The animated raw floor, verbatim from\n[`crate::visual_tiers`] (docs/grid-scroll-performance-implementation.md\n§2, step B2).\n\nA grid cell decides `<img>` vs `<video>` from four fields of its search\nresult — `type` and `duration` say whether the picture moves, `size` and\n`width`/`height` say whether it clears the floor — against these two\nnumbers, which is the same rule and the same arithmetic the scan used to\ndecide what to store. Surfaced rather than duplicated in the UI so the two\nsides cannot drift.\n\nClearing the floor is necessary but not sufficient: an item above it is\nserved a loop *once the backfill has written one*, and an item whose H.264\nencode came out no smaller than its source keeps serving the source\npermanently (the settled keep-the-original edge). A cell that mounts a\n`<video>` must therefore fall back to its poster when playback errors —\nthe F6 contract in the plan document.\n\nServer-derived constants, not policy-scoped configuration: every policy\nsees the same floor, because it is a property of what the scan wrote.",
+        "required": [
+          "max_file_size",
+          "max_side"
+        ],
+        "properties": {
+          "max_file_size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "An animated item at or below **both** of these is served as its\noriginal file at every grid tier: no loop is stored for it, so a cell\nrenders it as an image.",
+            "minimum": 0
+          },
+          "max_side": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The longer side, in pixels. Both sides must be within it.",
+            "minimum": 0
+          }
+        }
+      },
+      "ArtifactMissResponse": {
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "job": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TranscodeJobSnapshot",
+                "description": "The job already producing this artifact, when there is one. A miss is\nnever a reason to start one — `POST` is the sole job creator."
+              }
+            ]
+          }
+        }
+      },
+      "ArtifactRef": {
+        "type": "object",
+        "description": "A finished artifact, as every client-facing shape refers to it.",
+        "required": [
+          "key",
+          "mime_type",
+          "size_bytes",
+          "url",
+          "filename",
+          "path"
+        ],
+        "properties": {
+          "filename": {
+            "type": "string",
+            "description": "The name a download should be saved under, computed server-side from\nthe request that produced the artifact (implementation plan §3 S3).\n\nIt rides here because [`Self::url`] is the `key=` form, and that form\ncannot name a download: a key knows the source hash and the settings,\nnever the file's path or whether the request was trimmed. The client\nhangs this on its `<a download>` (the §0.4 precedent — naming inputs\nbelong to the server, so clients keep no lookup tables).\n\nA *joined* job answers with the first submitter's name. The bytes are\nidentical by construction (the key covers the source hash), so the most\nthis can cost is the stem of one of several files with the same\ncontent."
+          },
+          "key": {
+            "type": "string",
+            "description": "Cache key; also the artifact's ETag and its `?key=` query value."
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "The absolute path of this artifact's *share view* on the machine\nrunning this server — `share/<key>/<human name>`, the same path\n`POST /api/open/clipboard/artifact` resolves to for this\n[`Self::filename`].\n\nThe relay's mapping hint: when server and relay share a filesystem it\ncan take the file directly instead of streaming it back over HTTP.\n\n**It names the share view, not the raw artifact, and it may not exist\nyet.** The raw file is `<key>.<ext>`, a hash — a relay whose mapping\nresolved *that* would paste a content-addressed name while the toast\nand the server-copy route both promise the human one. Naming the share\nview instead makes both outcomes agree: a path the relay cannot resolve\n(or that has not been materialized) simply degrades to its\nbytes-required branch and the upload carries the same name, while a\nresolvable one lands on the human-named hardlink. The prediction is\nexact — `TranscodeCache::share_target` is deterministic for a given\n(artifact row, name), so a later `materialize_share` with this same\nname creates precisely this path.\n\nA deliberate, gated exposure of a server-side path. `ArtifactRef` only\nrides the `POST /api/video/transcode` and `POST /api/video/compose`\nresponses and the job snapshot/SSE shapes those two produce, all of\nwhich sit behind the `video_transcode`/`video_compose` capabilities —\na policy that grants either is already trusted with starting ffmpeg on\nthis host. The one artifact shape a *read-only* profile can reach is\n`GET /api/video/artifact`'s 404 body, whose `job` can never be `Done`:\nthe pool frees a key's `by_key` entry in the same actor message that\npublishes the terminal event, so a snapshot found by key is always\nstill queued or running."
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Lowercase hex sha256 of the artifact's **own** bytes (not the source\nhash the key carries), as computed at publish time.\n\nA receiver that was handed the bytes out-of-band — the Desktop relay,\nwhich uploads an artifact on the browser's behalf — verifies them\nagainst this. `None` for a row committed before the column existed;\nevery consumer must read that as \"no integrity claim\", never as a\nmismatch."
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "url": {
+            "type": "string",
+            "description": "Ready-to-use URL for `GET /api/video/artifact`."
           }
         }
       },
@@ -4924,6 +6147,35 @@
           }
         }
       },
+      "Canvas": {
+        "type": "object",
+        "required": [
+          "w",
+          "h"
+        ],
+        "properties": {
+          "background": {
+            "type": "string",
+            "description": "`#RRGGBB`, `#RRGGBBAA` or the `0x` spelling of either. Normalized\nbefore it reaches a filtergraph, which is not decoration: the value is\ninterpolated into a filter argument, where an unvalidated string could\nspell further filters."
+          },
+          "h": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "w": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "Channel": {
+        "type": "string",
+        "description": "Which encoder family a preset draws from: `Quality` is software x264 at a\ndecent CRF, `Fast` is the validated hardware encoder when there is one\n(design §5 — hardware encoders are meaningfully worse per bit, so export\nquality never rides on them).",
+        "enum": [
+          "quality",
+          "fast"
+        ]
+      },
       "ClientCapabilities": {
         "type": "object",
         "description": "Coarse feature switches derived from the matched policy's ruleset. Each\ncapability is one representative probe from the real route list in\nmain.rs, evaluated with the exact rule-matching code enforcement uses\n(`policy::ruleset_allows`) — true means the probe request would pass the\nruleset gate.",
@@ -4935,7 +6187,10 @@
           "open_files",
           "db_create",
           "inference",
-          "pinboards"
+          "pinboards",
+          "pinboard_search",
+          "video_transcode",
+          "video_compose"
         ],
         "properties": {
           "bookmarks": {
@@ -4958,6 +6213,10 @@
             "type": "boolean",
             "description": "POST /api/open/file/{sha256}"
           },
+          "pinboard_search": {
+            "type": "boolean",
+            "description": "POST /api/pinboards/search\n\nSeparate from `pinboards` because that probe is a *write*: a policy\ngranting read-only board access would report `pinboards: false` while\nthe library search still works."
+          },
           "pinboards": {
             "type": "boolean",
             "description": "POST /api/pinboards"
@@ -4969,6 +6228,14 @@
           "search": {
             "type": "boolean",
             "description": "POST /api/search/pql"
+          },
+          "video_compose": {
+            "type": "boolean",
+            "description": "POST /api/video/compose\n\nSeparate from `video_transcode` because the two are separately\nrule-able and mean different work: a composition is strictly heavier\n(N decoders and their loop buffers at once, holding the pool), so a\npolicy may allow single-file clips while denying mosaics. The client's\nanimated-mosaic controls gate on this one."
+          },
+          "video_transcode": {
+            "type": "boolean",
+            "description": "POST /api/video/transcode\n\nThe write probe of the video surface: a policy may serve already\nencoded artifacts (`GET /api/video/artifact`) while denying new\nconversions, so this is deliberately not probed off the GET."
           }
         }
       },
@@ -4979,9 +6246,14 @@
           "capabilities",
           "client",
           "desktop_managed",
-          "desktop_shell_available"
+          "desktop_shell_available",
+          "animated_floor"
         ],
         "properties": {
+          "animated_floor": {
+            "$ref": "#/components/schemas/AnimatedThumbnailFloor",
+            "description": "The animated raw floor the thumbnail endpoint serves by (see\n[`AnimatedThumbnailFloor`])."
+          },
           "capabilities": {
             "$ref": "#/components/schemas/ClientCapabilities",
             "description": "Ruleset-derived feature switches (see ClientCapabilities)."
@@ -4996,6 +6268,17 @@
           "desktop_shell_available": {
             "type": "boolean",
             "description": "True only for a policy explicitly marked as the local Desktop client\nwhile the private parent-shell bridge is configured."
+          },
+          "display_loop_trigger": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DisplayLoopTrigger",
+                "description": "The display-tier loop trigger (see [`DisplayLoopTrigger`]).\n\nAlways `Some` today: the loop ladder is unconditional. The `Option` is\nreserved for a build that stores no loops at all, which would publish\n`null` here rather than a bound it does not serve by — with nothing to\nevaluate, every animated item is an `<img>` on its original file and\nno client mounts a `<video>`."
+              }
+            ]
           },
           "policy": {
             "type": "string",
@@ -5023,6 +6306,10 @@
           "video_tracks",
           "subtitle_tracks",
           "blurhash",
+          "outro_kind",
+          "content_end_ms",
+          "video_codec",
+          "audio_codec",
           "data_id",
           "language",
           "language_confidence",
@@ -5051,6 +6338,137 @@
             "type": "string"
           }
         }
+      },
+      "ComposeItem": {
+        "type": "object",
+        "required": [
+          "sha256",
+          "src",
+          "dest",
+          "time"
+        ],
+        "properties": {
+          "audio": {
+            "type": "boolean",
+            "description": "Whether this item's audio is mixed in. The client sets it to\n`playing && !muted`; it is forced off for a still, an image, or a\ncontainer that carries no audio at all."
+          },
+          "dest": {
+            "$ref": "#/components/schemas/Rect"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Item content hash; resolved against the request's index database."
+          },
+          "source": {
+            "$ref": "#/components/schemas/ItemSource",
+            "description": "Where this item's pixels come from; defaults to the item's file."
+          },
+          "src": {
+            "$ref": "#/components/schemas/Rect"
+          },
+          "time": {
+            "$ref": "#/components/schemas/ItemTime"
+          },
+          "transform": {
+            "$ref": "#/components/schemas/Transform"
+          }
+        }
+      },
+      "ComposeLength": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The longest span plays exactly once; everything shorter loops to fill.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "longest_loop_once"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A fixed length, whatever the items are.",
+            "required": [
+              "seconds",
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "cap"
+                ]
+              },
+              "seconds": {
+                "type": "number",
+                "format": "double"
+              }
+            }
+          }
+        ],
+        "description": "How long the output runs."
+      },
+      "ComposeOutput": {
+        "type": "object",
+        "required": [
+          "preset",
+          "length"
+        ],
+        "properties": {
+          "length": {
+            "$ref": "#/components/schemas/ComposeLength"
+          },
+          "preset": {
+            "type": "string",
+            "description": "Preset id from `GET /api/video/presets`."
+          }
+        }
+      },
+      "ComposeRequest": {
+        "type": "object",
+        "description": "The composition document as it arrives.",
+        "required": [
+          "canvas",
+          "fps",
+          "output",
+          "items"
+        ],
+        "properties": {
+          "canvas": {
+            "$ref": "#/components/schemas/Canvas"
+          },
+          "fps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Output frame rate, 1-60, then capped by the preset.",
+            "minimum": 0
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ComposeItem"
+            }
+          },
+          "output": {
+            "$ref": "#/components/schemas/ComposeOutput"
+          }
+        }
+      },
+      "Container": {
+        "type": "string",
+        "description": "Output container. Fixes the file extension, the MIME type the artifact is\nserved with, and whether an audio stream is possible at all.",
+        "enum": [
+          "mp4",
+          "webm",
+          "webp",
+          "avif"
+        ]
       },
       "ContinuousFilescanConfig": {
         "type": "object",
@@ -5466,6 +6884,9 @@
           "cron_schedule": {
             "type": "string"
           },
+          "detect_outros": {
+            "type": "boolean"
+          },
           "enable_cron_job": {
             "type": "boolean"
           },
@@ -5560,6 +6981,35 @@
         "properties": {
           "version": {
             "type": "string"
+          }
+        }
+      },
+      "DisplayLoopTrigger": {
+        "type": "object",
+        "description": "The display-tier loop trigger, verbatim from [`crate::visual_tiers`]\n(docs/thumbnail-format-implementation.md §2, R3).\n\nThe gallery's large view decides `<video>` vs `<img>` from four fields of\nthe item it is showing — `type` and `duration` say whether the picture\nmoves, `size` and `width`/`height` say whether it clears the trigger —\nagainst these three numbers, which is the same arithmetic the scan used to\ndecide whether to store a loop at all. Surfaced rather than duplicated in\nthe UI so the two sides cannot drift, and so the client needs no request to\nfind out (a wasted round trip per animated item, and an error latch on the\nones that answer with an image).\n\nAny **one** of the three firing is enough; they are not a conjunction.",
+        "required": [
+          "max_bytes",
+          "max_short_side",
+          "max_pixels"
+        ],
+        "properties": {
+          "max_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes. An animated original larger than this is answered with a loop.",
+            "minimum": 0
+          },
+          "max_pixels": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total pixels.",
+            "minimum": 0
+          },
+          "max_short_side": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The shorter side, in pixels.",
+            "minimum": 0
           }
         }
       },
@@ -5759,6 +7209,126 @@
               "null"
             ],
             "format": "double"
+          }
+        }
+      },
+      "ExtractionFailure": {
+        "type": "object",
+        "description": "One recorded extraction failure, as served to the audit surface.",
+        "required": [
+          "id",
+          "sha256",
+          "mime_type",
+          "setter_name",
+          "stage",
+          "error_class",
+          "error",
+          "skip_after",
+          "attempts",
+          "active",
+          "first_seen",
+          "last_seen"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "`attempts >= skip_after`: the verdict is confirmed and the work query\nis skipping this item. False means the verdict is recorded but\nunconfirmed and will be retried."
+          },
+          "attempts": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "blocker": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The missing dependency for a `blocked` row (`pdfium`, `html-renderer`\nor `ffmpeg`), null otherwise."
+          },
+          "error": {
+            "type": "string",
+            "description": "Human-readable message, clamped when it was recorded."
+          },
+          "error_class": {
+            "type": "string",
+            "description": "`input`, `blocked` or `resource`."
+          },
+          "first_seen": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ledger row id. Stable for as long as the row lives, which is what the\nUI keys rows on."
+          },
+          "last_job_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The last job that saw this failure. Null only when it was recorded\noutside a job. This is *not* a foreign key and nothing nulls it when\njob rows are cleaned up, so the id may name a job that no longer\nexists — the ledger has to outlive the job history it refers to."
+          },
+          "last_seen": {
+            "type": "string"
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "The item's mime type as recorded when the failure happened."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One of the paths this item is stored under, chosen deterministically\n(an available file first, then the lexicographically smallest path).\nAn item can have several files and the ledger keys on the item, so\nthis is a representative, not the whole story. Null when every file of\nthe item has gone away."
+          },
+          "setter_name": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "skip_after": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Attempts needed before the verdict suppresses the item."
+          },
+          "stage": {
+            "type": "string",
+            "description": "`prepare` or `inference`."
+          }
+        }
+      },
+      "ExtractionFailuresResponse": {
+        "type": "object",
+        "required": [
+          "total",
+          "failures"
+        ],
+        "properties": {
+          "failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExtractionFailure"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many failures match the filters, ignoring the page window — the\ndenominator for `limit`/`offset` paging."
+          }
+        }
+      },
+      "FailedFor": {
+        "type": "object",
+        "required": [
+          "failed_for"
+        ],
+        "properties": {
+          "failed_for": {
+            "type": "string",
+            "description": "This Item has an active extraction-failure record for this setter name\n(the pipeline rejected its media, or a dependency it needs is missing)"
           }
         }
       },
@@ -6355,6 +7925,40 @@
           }
         }
       },
+      "InPinboard": {
+        "type": "object",
+        "description": "Restrict search to items pinned on a pinboard.\n\nNot sortable: pinboard membership has no natural per-item rank, so this\nfollows the `ProcessedBy`/`FailedFor` shape (no `SortableOptions`, no\n`order_rank` column, never an order source) rather than the `InBookmarks`\none.",
+        "required": [
+          "in_pinboard"
+        ],
+        "properties": {
+          "in_pinboard": {
+            "$ref": "#/components/schemas/InPinboardArgs",
+            "description": "Restrict search to items pinned on a pinboard\n\nOnly include items that are members of the head version of a pinboard."
+          }
+        }
+      },
+      "InPinboardArgs": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "boolean",
+            "description": "Enable the filter\n\nMust be set to True, this option only exists to make sure the filter is not empty,\ngiven that that all fields are optional."
+          },
+          "pinboard_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "description": "Pinboard IDs\n\nList of pinboard IDs to filter by. An item matches if it is pinned in the\nhead (current) version of at least one of them.\nIf empty, membership in *any* of the user's pinboards matches."
+          },
+          "user": {
+            "type": "string",
+            "description": "The user whose pinboards are searched."
+          }
+        }
+      },
       "IndexMode": {
         "type": "string",
         "description": "Index mode for vector filters (docs/vector-index-design.md).\n\n`auto` resolves to the default quant profile where its coverage is ready\nfor the queried setter(s), else exact. `exact` always brute-forces\nfull-precision vectors. `quant` demands a quant profile (the `variant`\nor the default) and errors when it isn't ready. `ann` is reserved.",
@@ -6446,9 +8050,20 @@
           "video_tracks",
           "subtitle_tracks",
           "blurhash",
+          "outro_kind",
+          "content_end_ms",
+          "video_codec",
+          "audio_codec",
           "time_added"
         ],
         "properties": {
+          "audio_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The *first* audio stream's codec name (`aac`, `opus`, `ac3`, ...), or\n`unknown` when a stream exists that ffprobe named no codec for. `null`\nconflates \"no audio stream\" with \"not probed yet\" — deliberately, since\nneither is a reason to veto playback. Never gated, as above."
+          },
           "audio_tracks": {
             "type": [
               "integer",
@@ -6461,6 +8076,14 @@
               "string",
               "null"
             ]
+          },
+          "content_end_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Where the item's real content ends, when an outro was found.\n\nServed as `null` for every item when the index database has\n`detect_outros` off, on the same terms (and with the same PQL\nasymmetry) as `outro_kind` — an `order_by` on this column still\norders the rows by the stored boundaries even though every served\nvalue is null."
           },
           "duration": {
             "type": [
@@ -6482,6 +8105,13 @@
           },
           "md5": {
             "type": "string"
+          },
+          "outro_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The raw stored outro verdict, detector version included\n(`tiktok_card/1`, `none/1`); `null` when the item was never examined.\nKind-specific checks must prefix-match (`tiktok_card/`) rather than\ncompare the whole value — see\n`docs/video-outro-detection-design.md` §6.2. \"Has an outro\" is\n`content_end_ms` being non-null.\n\nServed as `null` for every item when the index database has\n`detect_outros` off, including items whose outro was detected while it\nwas on: the toggle turns the whole feature off for its database.\nNote the deliberate asymmetry — PQL predicates (`match` filters,\n`order_by`) on this column keep working with the toggle off, because\nquerying your own data is a query capability, not playback\n(`docs/video-outro-skip-design.md` §6). The visible edge of that\nasymmetry: an `order_by` on `content_end_ms` still orders the rows by\nthe stored boundaries even though every served value is null."
           },
           "sha256": {
             "type": "string"
@@ -6506,6 +8136,13 @@
           "type": {
             "type": "string"
           },
+          "video_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The video stream's codec name as ffprobe reports it (`h264`, `hevc`,\n`av1`, ...), with two in-band sentinels: `none` means the container was\nprobed and has no video stream, `unknown` means a video stream exists\nbut ffprobe named no codec. `null` means the item has not been probed\nyet — an existing library fills in over its next few scans, so a client\nmust keep whatever it did before these columns existed as the `null`\nbehaviour.\n\nUnlike the outro fields this is never gated: a codec name is an\nobjective property of the file, like `duration` or `width`."
+          },
           "video_tracks": {
             "type": [
               "integer",
@@ -6521,6 +8158,79 @@
             "format": "int64"
           }
         }
+      },
+      "ItemSource": {
+        "type": "string",
+        "description": "Which of an item's stored pictures the composition reads\n(docs/compose-still-video-parity-design.md §2).\n\n`File` is the item's own file on disk — everything before this field\nexisted. `Thumbnail` is the stored thumbnail blob the board renders for a\nvideo no `<video>` element is mounted for: it has no file path and no\nrecorded source timestamp, so it can be neither referenced as a file nor\nrecreated by a seek — the API layer materializes the blob to a per-job\ntemp file instead. A thumbnail is a still image in every way, so admission\nrequires `time.kind = image` for it.",
+        "enum": [
+          "file",
+          "thumbnail"
+        ]
+      },
+      "ItemTime": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A playing range. `end_cs` is **required**: the client always knows the\nduration, and with both bounds the target length is arithmetic rather\nthan a probe of every input before the job can even be keyed.",
+            "required": [
+              "start_cs",
+              "end_cs",
+              "kind"
+            ],
+            "properties": {
+              "end_cs": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "span"
+                ]
+              },
+              "start_cs": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "One frame of a video, held for the whole output.",
+            "required": [
+              "at_cs",
+              "kind"
+            ],
+            "properties": {
+              "at_cs": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "still"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A still image file, held for the whole output.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "image"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What an item is showing. Replaces the design's separate \"playing\" and\n\"muted\" flags (§0.5): a span *is* playing, a still and an image are\nstopped, so no combination of fields can contradict another."
       },
       "Items": {
         "type": "object",
@@ -6868,6 +8578,7 @@
           "other_files",
           "total_segments",
           "errors",
+          "input_errors",
           "total_remaining",
           "data_load_time",
           "inference_time",
@@ -6909,6 +8620,11 @@
           "inference_time": {
             "type": "number",
             "format": "double"
+          },
+          "input_errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of `errors` were verdicts about the media itself (the\n`input`/`blocked`/`resource` ledger classes) rather than systemic\nfailures. The remainder is what decides whether a job where everything\nfailed completes with a warning or hard-fails."
           },
           "items_in_db": {
             "type": "integer",
@@ -7324,6 +9040,13 @@
       "MatchValue": {
         "type": "object",
         "properties": {
+          "audio_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See [`MatchValues::audio_codec`]."
+          },
           "audio_tracks": {
             "type": [
               "integer",
@@ -7343,6 +9066,13 @@
               "null"
             ],
             "format": "double"
+          },
+          "content_end_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           },
           "data_id": {
             "type": [
@@ -7424,6 +9154,13 @@
               "null"
             ]
           },
+          "outro_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See [`MatchValues::outro_kind`]."
+          },
           "path": {
             "type": [
               "string",
@@ -7494,6 +9231,13 @@
               "string",
               "null"
             ]
+          },
+          "video_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See [`MatchValues::video_codec`]."
           },
           "video_tracks": {
             "type": [
@@ -7514,6 +9258,17 @@
       "MatchValues": {
         "type": "object",
         "properties": {
+          "audio_codec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OneOrMany_String",
+                "description": "The first audio stream's codec name, on the same terms as\n[`MatchValues::video_codec`]."
+              }
+            ]
+          },
           "audio_tracks": {
             "oneOf": [
               {
@@ -7541,6 +9296,16 @@
               },
               {
                 "$ref": "#/components/schemas/OneOrMany_f64"
+              }
+            ]
+          },
+          "content_end_ms": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OneOrMany_i64"
               }
             ]
           },
@@ -7664,6 +9429,17 @@
               }
             ]
           },
+          "outro_kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OneOrMany_String",
+                "description": "The raw stored outro verdict, detector version included\n(`tiktok_card/1`, `none/1`). Kind-specific queries must prefix-match\n(`startswith: \"tiktok_card/\"`) rather than compare the whole value; see\n`docs/video-outro-detection-design.md` §6.2."
+              }
+            ]
+          },
           "path": {
             "oneOf": [
               {
@@ -7771,6 +9547,17 @@
               },
               {
                 "$ref": "#/components/schemas/OneOrMany_String"
+              }
+            ]
+          },
+          "video_codec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OneOrMany_String",
+                "description": "The video stream's codec name as ffprobe reports it, with the in-band\nsentinels `none` (probed, no video stream) and `unknown` (a stream\nffprobe named no codec for). NULL — never probed — matches nothing, so\n\"find every HEVC file\" is `eq: { \"video_codec\": \"hevc\" }` and stays\ncorrect while a library is still filling in."
               }
             ]
           },
@@ -8039,6 +9826,10 @@
           "video_tracks",
           "subtitle_tracks",
           "blurhash",
+          "outro_kind",
+          "content_end_ms",
+          "video_codec",
+          "audio_codec",
           "data_id",
           "language",
           "language_confidence",
@@ -8059,6 +9850,51 @@
           "asc",
           "desc"
         ]
+      },
+      "PinboardDatabaseResponse": {
+        "type": "object",
+        "description": "One stamped database of a board. Databases are named, never identified by\nUUID, on the wire: the UUIDs are server-side matching keys.",
+        "required": [
+          "name",
+          "last_stamped",
+          "associated"
+        ],
+        "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether this row is the database currently selected."
+          },
+          "last_stamped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds of the last stamp for this database."
+          },
+          "name": {
+            "type": "string",
+            "description": "The index database's name as of the stamp. It may no longer resolve\nto a local database, in which case it is a residual label only."
+          }
+        }
+      },
+      "PinboardDatabasesResponse": {
+        "type": "object",
+        "description": "A board's associations after the manual editor changed them — the same\ntwo fields the list and detail responses carry, so the client can update\nthe card in place without re-listing.",
+        "required": [
+          "associated",
+          "databases"
+        ],
+        "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether the board now belongs to the selected index database, by the\nfull rule (so it can still be true through 100% item overlap with no\nstamp at all)."
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardDatabaseResponse"
+            },
+            "description": "The databases the board is stamped for, newest stamp first."
+          }
+        }
       },
       "PinboardDeleteResponse": {
         "type": "object",
@@ -8090,9 +9926,23 @@
           "id",
           "time_added",
           "time_updated",
-          "version_count"
+          "version_count",
+          "present_count",
+          "associated",
+          "databases"
         ],
         "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether the board belongs to the selected index database."
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardDatabaseResponse"
+            },
+            "description": "The databases this board is stamped for, newest stamp first."
+          },
           "flags": {
             "description": "The board's stored editing-behavior flags, verbatim as last saved.\nNull for boards saved before flags existed; the UI treats that as\nits codec defaults."
           },
@@ -8115,6 +9965,11 @@
               "string",
               "null"
             ]
+          },
+          "present_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The head version's items that exist in the selected index database\n(`head.item_count` is the total). Same field as on the list summary."
           },
           "time_added": {
             "type": "string"
@@ -8142,16 +9997,40 @@
           }
         }
       },
-      "PinboardSummaryResponse": {
+      "PinboardOrder": {
+        "type": "string",
+        "description": "Library list ordering. `Activity` is the recency+frequency hybrid;\n`Updated` is the historical `time_updated DESC` order.",
+        "enum": [
+          "activity",
+          "updated"
+        ]
+      },
+      "PinboardSearchMatch": {
         "type": "object",
+        "description": "One matching board: the `PinboardSummaryResponse` fields the library card\nrenders, plus how much of the board the search matched.",
         "required": [
           "id",
           "time_added",
           "time_updated",
           "item_count",
-          "version_count"
+          "present_count",
+          "version_count",
+          "match_count",
+          "associated",
+          "databases"
         ],
         "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether the board belongs to the selected index database, by the same\nrule the library list applies."
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardDatabaseResponse"
+            },
+            "description": "The databases this board is stamped for, newest stamp first."
+          },
           "head_version_id": {
             "type": [
               "integer",
@@ -8167,11 +10046,139 @@
             "type": "integer",
             "format": "int64"
           },
+          "last_seen": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the board's last activity — opening it counts, not\njust saving. Null only for rows predating the activity columns."
+          },
+          "match_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Distinct items on the board's head version that the search matched."
+          },
           "name": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "present_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of the board's items exist in the selected index database\n(`match_count` is how many the *search* matched). Same field as on the\nlibrary list summary."
+          },
+          "preview_h": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "preview_w": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "screenful_h": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "time_added": {
+            "type": "string"
+          },
+          "time_updated": {
+            "type": "string"
+          },
+          "version_count": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "PinboardSearchResponse": {
+        "type": "object",
+        "required": [
+          "pinboards",
+          "metrics"
+        ],
+        "properties": {
+          "metrics": {
+            "$ref": "#/components/schemas/SearchMetrics"
+          },
+          "pinboards": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardSearchMatch"
+            },
+            "description": "Every board with at least one matching image, unpaginated, in the\nserver's default order (see the endpoint description)."
+          }
+        }
+      },
+      "PinboardSummaryResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "time_added",
+          "time_updated",
+          "item_count",
+          "version_count",
+          "present_count",
+          "associated",
+          "databases"
+        ],
+        "properties": {
+          "associated": {
+            "type": "boolean",
+            "description": "Whether the board belongs to the selected index database, by the full\nrule: a stamp for this database (by identity, or by name for a\ndatabase this instance rebuilt), or 100% of its items present here."
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PinboardDatabaseResponse"
+            },
+            "description": "The databases this board is stamped for, newest stamp first."
+          },
+          "head_version_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "item_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_seen": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the board's last activity — opening it counts, not\njust saving. Null only for rows predating the activity columns."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "present_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of the board's items exist in the selected index database.\nBelow `item_count` this is rot (\"38/40 here\"), and is reported\nwhatever `associated_only` says — it is what tells rot apart from a\nboard that belongs somewhere else."
           },
           "preview_h": {
             "type": [
@@ -8455,7 +10462,7 @@
             "items": {
               "$ref": "#/components/schemas/Value"
             },
-            "description": "One output per input; binary outputs are wrapped as\n`{\"__type__\": \"base64\", \"content\": \"<base64>\"}`."
+            "description": "One output per input; binary outputs are wrapped as\n`{\"__type__\": \"base64\", \"content\": \"<base64>\"}`, and an input the\nmodel rejected on its own is\n`{\"__error__\": {\"class\": \"input\" | \"transient\", \"message\": \"...\"}}`."
           }
         }
       },
@@ -8551,6 +10558,12 @@
           },
           {
             "$ref": "#/components/schemas/HasUnprocessedData"
+          },
+          {
+            "$ref": "#/components/schemas/FailedFor"
+          },
+          {
+            "$ref": "#/components/schemas/InPinboard"
           }
         ]
       },
@@ -8588,6 +10601,34 @@
             "items": {
               "$ref": "#/components/schemas/JobModel"
             }
+          }
+        }
+      },
+      "Rect": {
+        "type": "object",
+        "description": "A rectangle. Source rectangles are in the source's own pixels *before* its\ndisplay orientation is applied; destination rectangles are in output pixels\non the canvas.",
+        "required": [
+          "x",
+          "y",
+          "w",
+          "h"
+        ],
+        "properties": {
+          "h": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "w": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "x": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "y": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -8885,6 +10926,102 @@
           }
         ]
       },
+      "ScanFailure": {
+        "type": "object",
+        "description": "One recorded filescan failure, as served to the audit surface.",
+        "required": [
+          "id",
+          "path",
+          "stage",
+          "error_class",
+          "error",
+          "skip_after",
+          "attempts",
+          "active",
+          "first_seen",
+          "last_seen"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "`attempts >= skip_after`: the verdict is confirmed. Not the same as\n\"this path will be skipped\": the walker also requires the file to still\nhave the `last_modified`/`file_size` the failure was recorded against,\nso a file that has been repaired or otherwise modified since is\nre-attempted on the next scan even though this reads true.\n\nA `decode`-stage row never suppresses anything at any `attempts`: its\nfile *is* indexed (only the visuals failed), so the row is audit-only\nand retry scheduling is the visuals cache's, not this ledger's."
+          },
+          "attempts": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "blocker": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": "string"
+          },
+          "error_class": {
+            "type": "string",
+            "description": "`input`, `blocked` or `resource`."
+          },
+          "first_seen": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_scan_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The last scan that saw this failure. Null only when it was recorded\noutside a scan. This is *not* a foreign key and nothing nulls it when\n`file_scans` rows are cleaned up, so the id may name a scan that no\nlonger exists."
+          },
+          "last_seen": {
+            "type": "string"
+          },
+          "mime_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The extension-based guess, or null when the guess is what failed."
+          },
+          "path": {
+            "type": "string",
+            "description": "The path is the key of this ledger: these failures happen before an\nitem — or even a hash — exists."
+          },
+          "skip_after": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "stage": {
+            "type": "string",
+            "description": "`mime`, `metadata`, `header` or `decode`."
+          }
+        }
+      },
+      "ScanFailuresResponse": {
+        "type": "object",
+        "required": [
+          "total",
+          "failures"
+        ],
+        "properties": {
+          "failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScanFailure"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many failures match the filters, ignoring the page window."
+          }
+        }
+      },
       "SearchCacheDbGroup": {
         "type": "object",
         "required": [
@@ -9131,6 +11268,13 @@
           "item_id"
         ],
         "properties": {
+          "audio_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Audio Codec\n\nThe *first* audio stream's codec name (`aac`, `opus`, `ac3`, ...), or\n`unknown` when a stream exists that ffprobe named no codec for. Absent\nfor a file with no audio stream as well as for one not yet probed —\nthe column does not distinguish them. Never withheld, as above."
+          },
           "audio_tracks": {
             "type": [
               "integer",
@@ -9157,6 +11301,14 @@
               "null"
             ],
             "format": "double"
+          },
+          "content_end_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Content End (ms)\n\nWhere the item's real content ends, when an outro was found. Absent\nwhen no outro is recorded or the column was not selected.\n\nAlso absent on every row when the index database has `detect_outros`\noff, on the same terms (and with the same PQL asymmetry) as\n`outro_kind` — an `order_by` on this column still orders the rows by\nthe stored boundaries even though every served value is absent."
           },
           "data_id": {
             "type": [
@@ -9243,6 +11395,13 @@
               "null"
             ]
           },
+          "outro_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Outro Kind\n\nThe raw stored outro verdict, detector version included (`tiktok_card/1`,\n`none/1`); absent when the item was never examined or the column was\nnot selected. Kind-specific\nqueries must prefix-match, not compare the whole value — see\n`docs/video-outro-detection-design.md` §6.2. \"Has an outro\" is\n`content_end_ms` being present.\n\nAbsent on every row when the index database has `detect_outros` off,\neven for items whose outro was detected while it was on: the toggle\nturns the whole feature off for its database. Note the deliberate\nasymmetry — PQL predicates (`match` filters, `order_by`) on this\ncolumn keep working with the toggle off, because querying your own\ndata is a query capability, not playback\n(`docs/video-outro-skip-design.md` §6). The visible edge of that\nasymmetry: an `order_by` on `content_end_ms` still orders the rows by\nthe stored boundaries even though every served value is absent."
+          },
           "path": {
             "type": [
               "string",
@@ -9313,6 +11472,13 @@
               "string",
               "null"
             ]
+          },
+          "video_codec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Video Codec\n\nThe video stream's codec name as ffprobe reports it (`h264`, `hevc`,\n`av1`, ...), with two in-band sentinels: `none` means the container was\nprobed and has no video stream, `unknown` means a video stream exists\nbut ffprobe named no codec. Absent when the item has not been probed\nyet or the column was not selected.\n\nUnlike the outro fields this is never withheld: a codec name is an\nobjective property of the file, like `duration` or `width`."
           },
           "video_tracks": {
             "type": [
@@ -9407,12 +11573,12 @@
           },
           "index": {
             "$ref": "#/components/schemas/IndexMode",
-            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile the displayed head order is always re-scored\nagainst full-precision vectors (see `k`), and `order_rank` is a rank,\nnot a raw distance."
+            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nA quant profile scores int8 codes in a single pass; `order_rank` has\nexactly the same semantics as under `exact`."
           },
           "k": {
             "type": "integer",
             "format": "int64",
-            "description": "The exactness horizon: the coarse-top-k candidates re-scored with\nfull-precision distances. Ignored by `exact`. Keep it fixed across a\npagination session."
+            "description": "Deprecated: ignored. Reserved for a future ANN index mode (top-k\nretrieval depth)."
           },
           "model": {
             "type": "string",
@@ -9485,12 +11651,12 @@
           },
           "index": {
             "$ref": "#/components/schemas/IndexMode",
-            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile the displayed head order is always re-scored\nagainst full-precision vectors (see `k`), and `order_rank` is a rank,\nnot a raw distance."
+            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nA quant profile scores int8 codes in a single pass; `order_rank` has\nexactly the same semantics as under `exact`."
           },
           "k": {
             "type": "integer",
             "format": "int64",
-            "description": "The exactness horizon: the coarse-top-k candidates re-scored with\nfull-precision distances. Ignored by `exact`. Keep it fixed across a\npagination session."
+            "description": "Deprecated: ignored. Reserved for a future ANN index mode (top-k\nretrieval depth)."
           },
           "model": {
             "type": "string",
@@ -9538,6 +11704,22 @@
             }
           }
         ]
+      },
+      "SetPinboardDatabasesRequest": {
+        "type": "object",
+        "description": "The manual editor's payload: exactly the databases the board should be\nassociated with afterwards. An empty list clears every association.",
+        "required": [
+          "databases"
+        ],
+        "properties": {
+          "databases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Index database names. Each keeps every stamp already stored under it\n(including one whose database no longer exists, which the server could\nnot mint again) *and* associates the board with the live database that\nname refers to here. A name that is neither stamped nor local is a\n400. Omitting a name removes it."
+          }
+        }
       },
       "SetterDataStats": {
         "type": "object",
@@ -9610,12 +11792,12 @@
           },
           "index": {
             "$ref": "#/components/schemas/IndexMode",
-            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile both sides of the similarity self-join use\nbinary quants for the coarse pass, and `order_rank` is a rank, not a\nraw distance."
+            "description": "Index mode: `auto` (default) uses the default quant profile where its\ncoverage is ready for this model, else exact; `exact` always\nbrute-forces full-precision vectors; `quant` demands a quant profile\nand errors when it isn't ready. `ann` is reserved.\n\nUnder a quant profile both sides of the similarity self-join read\nint8 codes; `order_rank` has exactly the same semantics as under\n`exact`."
           },
           "k": {
             "type": "integer",
             "format": "int64",
-            "description": "The exactness horizon: the coarse-top-k candidates re-scored with\nfull-precision distances. Ignored by `exact`. Keep it fixed across a\npagination session."
+            "description": "Deprecated: ignored. Reserved for a future ANN index mode (top-k\nretrieval depth)."
           },
           "model": {
             "type": "string",
@@ -9814,6 +11996,15 @@
           }
         }
       },
+      "Surface": {
+        "type": "string",
+        "description": "Where the UI may offer a preset. Presets carry their own surfaces so a\nuser-declared profile appears in the right dropdowns with no client change.",
+        "enum": [
+          "playback",
+          "clip",
+          "mosaic"
+        ]
+      },
       "SystemConfig": {
         "type": "object",
         "properties": {
@@ -9828,6 +12019,10 @@
           },
           "cron_schedule": {
             "type": "string"
+          },
+          "detect_outros": {
+            "type": "boolean",
+            "description": "Probe videos for an appended platform outro (TikTok end cards) at scan\ntime, so thumbnails and frames stop sampling the card\n(docs/video-outro-detection-design.md §8). Subordinate to `scan_video`:\noff when video scanning is off, regardless of this. Turning it off does\nnot revert visuals already regenerated against a trimmed range (§8.1)."
           },
           "enable_cron_job": {
             "type": "boolean"
@@ -9892,6 +12087,17 @@
           },
           "scan_video": {
             "type": "boolean"
+          },
+          "thumbnail_formats": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Accepted names: `jpeg`, `webp`; unknown names are ignored\n(docs/thumbnail-format-implementation.md §2, R5).\n\nWhich container formats stored thumbnails may use.\n\nIt *constrains* the format rules rather than deciding anything: with\n`webp` absent every WebP verdict becomes JPEG (alpha flattened), with\n`jpeg` absent every JPEG verdict becomes WebP — the\nstorage-constrained deployment, which knowingly pays WebP's measured\n2.2-2.7x decode cost in the grid. A list naming neither is treated as\nthe default with a warning and never rejected at commit: the settings\nUI round-trips the whole config, so a reject would break every\nunrelated save.\n\nChanging it regenerates the affected renditions on the next scan; the\ndatabase file only shrinks after the maintenance VACUUM.",
+            "example": [
+              "jpeg",
+              "webp"
+            ]
           },
           "vector_quants": {
             "oneOf": [
@@ -10070,6 +12276,417 @@
           }
         }
       },
+      "ThumbnailTier": {
+        "type": "string",
+        "description": "One rendition of an item's picture.\n\nThe wire values are the frozen `size=` parameter of\n`GET /api/items/item/thumbnail`; do not rename them.",
+        "enum": [
+          "display",
+          "grid-m",
+          "grid-s",
+          "grid-xs"
+        ]
+      },
+      "TranscodeCacheResize": {
+        "type": "object",
+        "required": [
+          "size_mb"
+        ],
+        "properties": {
+          "size_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "New byte budget in megabytes. `0` empties the cache; values above the\n`[transcode] cache_size_max_mb` ceiling are rejected. Not persisted.",
+            "minimum": 0
+          }
+        }
+      },
+      "TranscodeCacheStats": {
+        "type": "object",
+        "required": [
+          "entries",
+          "pinned_entries",
+          "used_bytes",
+          "capacity_bytes",
+          "limit_bytes"
+        ],
+        "properties": {
+          "capacity_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "entries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "limit_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The `[transcode] cache_size_max_mb` ceiling, in bytes.",
+            "minimum": 0
+          },
+          "pinned_entries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "used_bytes": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TranscodeJobEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "1-based position in the queue.",
+            "required": [
+              "position",
+              "state"
+            ],
+            "properties": {
+              "position": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "queued"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`None` while the output length is unknown (a source with no recorded\nduration): the job is running, the percentage is not knowable.",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "progress": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "format": "float"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "artifact",
+              "state"
+            ],
+            "properties": {
+              "artifact": {
+                "$ref": "#/components/schemas/ArtifactRef"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "done"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "error",
+              "cancelled",
+              "state"
+            ],
+            "properties": {
+              "cancelled": {
+                "type": "boolean"
+              },
+              "error": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "failed"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Job state, as both the SSE payload and the snapshot body. Deliberately\ngeneric (no transcode-specific fields): `jobs/queue.rs`'s polled status is\nexpected to migrate onto the same envelope."
+      },
+      "TranscodeJobSnapshot": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TranscodeJobEvent"
+          },
+          {
+            "type": "object",
+            "required": [
+              "id"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "TranscodeLimits": {
+        "type": "object",
+        "description": "Composition limits, carried alongside the presets so a client builder\nclamps against what this server enforces instead of mirrored constants.\n\nDeliberately *not* only the config values: the canvas and frame-rate bounds\nare code constants (`compose.rs`), and a client that has to guess them is in\nexactly the position this envelope exists to prevent. Where a limit comes\nfrom is the server's business; that the client has the number is the point.",
+        "required": [
+          "max_mosaic_inputs",
+          "max_mosaic_loop_mb",
+          "max_animated_image_seconds",
+          "max_output_seconds",
+          "min_canvas_side",
+          "max_canvas_side",
+          "max_canvas_area",
+          "max_compose_fps",
+          "span_capable_image_mimes"
+        ],
+        "properties": {
+          "max_animated_image_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_canvas_area": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max_canvas_side": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max_compose_fps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "max_mosaic_inputs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_mosaic_loop_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_output_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "min_canvas_side": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "span_capable_image_mimes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The image mimes this server can play *animation* from in a\ncomposition, so a client may classify such an item as a compose span\ninstead of a frozen frame (docs/animated-image-spans-design.md §5).\nAlways `image/gif`, and always `image/webp` — which no ffmpeg\ndecodes, so the server bridges it through its own decoder\n(docs/animated-webp-bridge-design.md); `image/avif` rides the decode\nprobe.\n\nA capability, not a validation: the server does not reject a span on\nan unlisted container at admission (admission is probe-free and knows\nno mimes) — this list exists so a correct client never builds one."
+          }
+        }
+      },
+      "TranscodePresetInfo": {
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "container",
+          "ext",
+          "channel",
+          "surfaces"
+        ],
+        "properties": {
+          "channel": {
+            "$ref": "#/components/schemas/Channel"
+          },
+          "container": {
+            "$ref": "#/components/schemas/Container"
+          },
+          "ext": {
+            "type": "string",
+            "description": "File extension for the container, so clients keep no lookup table."
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "max_height": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Cap on output height in pixels; `null` keeps the source height.\n\nCarried because it is a *rejection*: a composition whose canvas is\ntaller than this is refused outright (`canvas_over_preset_height`)\nrather than rescaled, so a client that cannot see the number can only\ndiscover it by having a document turned away. Its `fps_max` twin is\ndeliberately **not** here, for the same reason inverted: an over-cap\nframe rate is silently capped, never refused, so there is nothing a\nclient could do with it but mirror a value that changes nothing."
+          },
+          "surfaces": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Surface"
+            }
+          }
+        }
+      },
+      "TranscodePresetsResponse": {
+        "type": "object",
+        "required": [
+          "presets",
+          "limits"
+        ],
+        "properties": {
+          "limits": {
+            "$ref": "#/components/schemas/TranscodeLimits"
+          },
+          "presets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TranscodePresetInfo"
+            }
+          }
+        }
+      },
+      "TranscodeRequest": {
+        "type": "object",
+        "required": [
+          "id",
+          "id_type",
+          "preset"
+        ],
+        "properties": {
+          "cut": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`\"outro\"` to end the clip at this item's detected outro boundary,\nresolved server-side. Excludes `end_cs` (the two are the same bound\nasked for two ways), composes with `start_cs`, and is a 404 when the\nitem has no detected outro or the index database has detection off.\nAny other value is rejected rather than ignored: a client that sent one\nand got a full-length file would have no way to notice."
+          },
+          "end_cs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Trim end, in centiseconds from the start of the file."
+          },
+          "id": {
+            "type": "string",
+            "description": "An item identifier (sha256 hash, file ID, path, item ID, ...)."
+          },
+          "id_type": {
+            "$ref": "#/components/schemas/ItemIdentifierType"
+          },
+          "preset": {
+            "type": "string",
+            "description": "Preset id from `GET /api/video/presets`."
+          },
+          "start_cs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Trim start, in centiseconds from the start of the file."
+          }
+        }
+      },
+      "TranscodeSubmitResponse": {
+        "type": "object",
+        "required": [
+          "outcome"
+        ],
+        "properties": {
+          "artifact": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArtifactRef"
+              }
+            ]
+          },
+          "job": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TranscodeJobSnapshot"
+              }
+            ]
+          },
+          "outcome": {
+            "type": "string",
+            "description": "`hit` | `created` | `joined` | `known_failure`."
+          }
+        }
+      },
+      "Transform": {
+        "type": "object",
+        "description": "The display transform of the dihedral group of order 8: `flip_h` applied\nafter `quarter_turns` clockwise rotations. The same decomposition the\npinboard stores per pin, passed through verbatim.",
+        "properties": {
+          "flip_h": {
+            "type": "boolean"
+          },
+          "quarter_turns": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0-3 clockwise quarter turns.",
+            "minimum": 0
+          }
+        }
+      },
+      "UpdatePreviewRequest": {
+        "type": "object",
+        "description": "A replacement preview image for an existing version. Same field semantics\nas the preview half of [`SaveVersionRequest`]; nothing else about the\nversion can be changed.",
+        "required": [
+          "preview_b64"
+        ],
+        "properties": {
+          "preview_b64": {
+            "type": "string",
+            "description": "Base64-encoded preview image (WebP or PNG), composited client-side."
+          },
+          "preview_h": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "preview_w": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "screenful_h": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Height in preview-image pixels of one save-time viewport screenful."
+          }
+        }
+      },
       "Value": {},
       "VectorQuantActionResponse": {
         "type": "object",
@@ -10091,14 +12708,14 @@
         "properties": {
           "centered": {
             "type": "boolean",
-            "description": "Mean-center vectors before binarization (per embedding space)."
+            "description": "Deprecated: ignored since the int8 remap. Kept deserializable so\nexisting `[vector_quants]` sections still parse."
           },
           "name": {
             "type": "string"
           },
           "quantizer": {
             "type": "string",
-            "description": "'binary' in v1; 'int8' is a reserved future recipe slot."
+            "description": "`int8` (global-symmetric absmax, docs/vector-int8-quant.md). `binary`\nis retired: the load path maps it to `int8` (which triggers a\nrecipe-change rebuild), the config-commit path rejects it."
           }
         }
       },
@@ -10107,16 +12724,12 @@
         "required": [
           "name",
           "quantizer",
-          "centered",
           "state",
           "is_default",
           "size_bytes",
           "setters"
         ],
         "properties": {
-          "centered": {
-            "type": "boolean"
-          },
           "is_default": {
             "type": "boolean"
           },
@@ -10270,6 +12883,10 @@
     {
       "name": "client",
       "description": "Per-policy client configuration and derived capabilities"
+    },
+    {
+      "name": "video",
+      "description": "Backend video transcoding: jobs, artifacts, presets, and the artifact cache"
     },
     {
       "name": "inference",

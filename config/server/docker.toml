@@ -22,8 +22,13 @@ file = ""
 level = "${LOGLEVEL:-INFO}"
 
 # "Open file / show in folder" cannot reach a file manager from inside a
-# container; make the endpoints no-ops. Use Panoptikon Relay on the client
-# machine instead (see the README).
+# container, so both are disabled here as no-ops. Use Panoptikon Relay on the
+# client machine instead (see the README).
+#
+# The clipboard verb (POST /api/open/clipboard/{sha256}) is deliberately NOT
+# disabled: in a container it fails with a clear "no graphical session" error,
+# which is more honest than a silent no-op. Client-side copy goes through the
+# Relay anyway, never through this endpoint.
 [open]
 file_command = ""
 folder_command = ""
@@ -46,6 +51,14 @@ port = 6339
 # never mapped out of the container.
 base_url = "http://127.0.0.1:6340"
 local = true
+# Server-rendered pages call the API back through this listener. Normally the
+# x-panoptikon-policy token decides which policy an SSR call acts under, but a
+# token that ever stops verifying is ignored and selection falls back to the
+# listener the call arrived on — so this names the PUBLIC listener, making the
+# fail-open the restricted policy rather than allow_all. It is deliberately not
+# the primary listener: the synthesized loopback inference upstream dials the
+# primary, and requires it to permit /api/inference/*.
+api_endpoint = "public"
 # No UI checkout exists in the image: a nonexistent dir makes the gateway
 # fall back to the UI bundle embedded in the binary.
 dir = "no-checkout-use-embedded-bundle"
@@ -108,6 +121,37 @@ enabled = true
 # (leaving it commented tracks the built-in default across image upgrades).
 # embedding_cache_size = 1024
 
+# Backend video transcoding (docs/video-transcoding-design.md). Every key is a
+# tunable default -- leaving it commented tracks the built-in default across
+# image upgrades. Note for nvenc in a container: the NVIDIA container toolkit
+# must be present AND NVIDIA_DRIVER_CAPABILITIES must include "video" (the
+# common "compute,utility" does not inject libnvidia-encode.so). VAAPI needs
+# /dev/dri passed through. Without either, "auto" simply falls back to libx264.
+# [transcode]
+# max_concurrent_jobs = 1
+# cache_dir = ""                       # empty = <data_folder>/transcode-cache
+# cache_size_mb = 8192
+# cache_size_max_mb = 262144           # ceiling for PUT /api/video/cache
+# hwaccel = "auto"                     # "auto" | "off" | h264_nvenc | h264_amf | h264_qsv | h264_videotoolbox | h264_mf
+# max_mosaic_inputs = 12
+# max_mosaic_loop_mb = 512
+# max_animated_image_seconds = 30
+# max_output_seconds = 300
+# compose_light_threshold = 2
+
+# Custom encoding profiles merge by name over the built-ins; a name matching
+# no built-in must give at least container, vcodec and a rate control. Absent
+# = the built-in presets, an explicit empty table = none at all.
+# [transcode.profiles.small-share]
+# label = "Small (share)"
+# container = "mp4"                    # mp4 | webm | webp
+# vcodec = "h264"                      # codec family, not the encoder
+# acodec = "aac"                       # or audio = false for no audio track
+# crf = 28                             # or bitrate_kbps = 2500
+# max_height = 720                     # 0 = uncapped
+# channel = "fast"                     # quality | fast
+# surfaces = ["clip"]                  # playback | clip | mosaic
+
 # --------- Rulesets ---------
 # Rulesets define which methods + paths are allowed for a policy.
 # If a policy references a ruleset, anything not matched is denied.
@@ -134,6 +178,16 @@ allow = [
     { methods = [
         "GET",
     ], path_prefix = "/api/items/" },
+
+    # Serving an already-encoded rendition (and listing the presets) is safe
+    # for a public profile; POST /api/video/transcode, which spawns ffmpeg, is
+    # deliberately not granted.
+    { methods = [
+        "GET",
+    ], path = "/api/video/artifact" },
+    { methods = [
+        "GET",
+    ], path = "/api/video/presets" },
 
     { methods = [
         "GET",

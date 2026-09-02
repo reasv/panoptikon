@@ -603,6 +603,12 @@ def build_corpus(d: dict, page_size: int) -> list[dict]:
         "order_no_tiebreak",
         base(order_by=[{"order_by": "last_modified", "order": "desc", "priority": 0}]),
     )
+    # Not quite all of them any more: `outro_kind` and `content_end_ms`
+    # (docs/video-outro-detection-design.md §6.3) are Rust-only columns, and
+    # the deprecated Python implementation this suite diffs against has no
+    # notion of them — selecting one would fail on the Python side for a
+    # reason that has nothing to do with equivalence. Deliberately excluded;
+    # the case keeps its name so its recorded reports stay comparable.
     case(
         "select_all_file_columns",
         base(

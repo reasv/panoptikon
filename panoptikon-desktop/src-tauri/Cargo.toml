@@ -1,6 +1,6 @@
 [package]
 name = "panoptikon-desktop"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Panoptikon Desktop tray, supervisor, updater, and Relay"
@@ -18,11 +18,13 @@ tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 anyhow = "1"
+panoptikon-clipboard = { path = "../../panoptikon-clipboard" }
 panoptikon-config = { path = "../../panoptikon-config" }
 argon2 = "0.5"
 axum = "0.8"
 base64 = "0.22"
 http = "1"
+http-body-util = "0.1"
 notify-rust = "4.11"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

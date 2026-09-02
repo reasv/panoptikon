@@ -49,16 +49,40 @@ use tokio::time::timeout;
 
 use super::ledger::{FitSnapshot, Grant};
 use super::registry::SpawnSpec;
+use super::slot_error::{ERROR_SLOT_KEY, SlotError, slot_error_from_parts};
 use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_process_group};
 
 /// Protocol version this orchestrator speaks; workers answering anything
 /// else in the handshake are killed.
 const PROTOCOL_VERSION: u64 = 2;
 
-/// Max frame size (512 MiB). Either side treats a larger declared length as
-/// a fatal protocol error. `pub(super)` because the dispatcher's window
-/// payload bound is derived from it.
-pub(super) const MAX_FRAME_BYTES: usize = 0x2000_0000;
+/// Max frame size (2 GiB; must stay below the u32 length-prefix ceiling).
+/// Either side treats a larger declared length as a fatal protocol error.
+/// Sized for whole-track audio payloads (a raw f32 mono track at 16 kHz is
+/// ~230 MiB/hour); both sides buffer a full frame, so the limit is a memory
+/// bound, not a correctness one.
+pub(crate) const MAX_FRAME_BYTES: usize = 0x8000_0000;
+
+/// Payload budget for the *inputs* of one predict frame: the frame limit
+/// minus headroom for the envelope (type/id/keys) and the msgpack encoding
+/// overhead of the inputs themselves, so admission arithmetic done on
+/// estimated input sizes can never build a frame `encode_frame` refuses.
+pub(crate) const FRAME_INPUT_BYTES_BUDGET: usize = MAX_FRAME_BYTES - 8 * 1024 * 1024;
+
+/// Estimated wire size of one predict input: file bytes dominate; JSON data
+/// is bounded by its serialized length (msgpack strings/maps are never
+/// larger than the JSON text), plus a small per-input framing allowance.
+/// Used for byte-aware batch admission — an estimate, which is why
+/// [`FRAME_INPUT_BYTES_BUDGET`] keeps a margin under the hard limit.
+pub(crate) fn estimate_input_bytes(input: &WorkerInput) -> usize {
+    let data = input
+        .data
+        .as_ref()
+        .map(|value| value.to_string().len())
+        .unwrap_or(0);
+    let file = input.file.as_ref().map(Vec::len).unwrap_or(0);
+    data + file + 64
+}
 
 /// Bounds for the per-worker stderr tail ring buffer kept for error reports.
 const STDERR_TAIL_MAX_LINES: usize = 50;
@@ -191,11 +215,15 @@ pub struct WorkerInput {
 }
 
 /// One entry of a `predict` response: msgpack bin stays bytes (serialized
-/// numpy etc.), anything else is converted to JSON.
+/// numpy etc.), anything else is converted to JSON — except a map carrying
+/// the reserved [`ERROR_SLOT_KEY`], which is a typed per-input failure
+/// ([`WorkerOutput::Error`]) rather than a payload.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkerOutput {
     Bytes(Vec<u8>),
     Json(JsonValue),
+    /// This input failed on its own; the rest of the batch is unaffected.
+    Error(SlotError),
 }
 
 /// One instant's view of the worker's GPU memory, as reported on `load` and
@@ -651,11 +679,7 @@ fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Comma
 /// [`colliding_device_variables`]. A pooled worker
 /// ([`Worker::spawn`], `prewarm.rs`) is spawned by impl class with no model
 /// env at all, so there is nothing there for this to report.
-fn warn_on_visibility_overrides(
-    cfg: &WorkerSpawnConfig,
-    spec: &SpawnSpec,
-    device: Option<&str>,
-) {
+fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, spec: &SpawnSpec, device: Option<&str>) {
     let overrides = colliding_device_variables(cfg, spec);
     if overrides.is_empty() {
         return;
@@ -974,6 +998,12 @@ impl Worker {
     /// boards of their own and do get grants —
     /// docs/unified-memory-admission.md). `fit` rides along only when the
     /// fitted cost model moved since the last frame to this worker.
+    ///
+    /// A slot may come back as [`WorkerOutput::Error`] — the worker's typed
+    /// verdict on *that input alone* (protocol doc, "Per-item error slots").
+    /// It is a normal, successful roundtrip: the count still has to match, so
+    /// slot alignment downstream is unchanged, and only a malformed error
+    /// object (or a wrong count) is fatal.
     pub async fn predict(
         &mut self,
         inputs: &[WorkerInput],
@@ -1037,28 +1067,47 @@ impl Worker {
                 )
                 .await);
         }
-        outputs
-            .into_iter()
-            .enumerate()
-            .map(|(index, output)| match output {
-                Value::Binary(bytes) => Ok(WorkerOutput::Bytes(bytes)),
-                other => rmpv_to_json(&other).map(WorkerOutput::Json).map_err(|err| {
-                    // The exchange completed and the stream is in sync — an
-                    // unconvertible output (non-finite float, nested bin/ext)
-                    // is a per-request failure, not a supervision failure.
-                    // Surface it as a WorkerError so the dispatcher applies
-                    // its per-request fallback instead of killing a healthy
-                    // worker and failing the whole queue.
-                    anyhow::Error::new(WorkerError {
-                        message: format!(
-                            "predict output {index} is not representable as JSON: {err:#}"
-                        ),
-                        traceback: String::new(),
-                        stderr_tail: self.stderr_tail_snapshot(),
-                    })
-                }),
-            })
-            .collect()
+        let mut converted = Vec::with_capacity(outputs.len());
+        for (index, output) in outputs.into_iter().enumerate() {
+            match error_slot_from_rmpv(&output) {
+                Some(Ok(error)) => converted.push(WorkerOutput::Error(error)),
+                // The reserved key with a body the protocol does not define is
+                // a violation, exactly like a count mismatch: guessing a class
+                // would let a broken worker fabricate an "undecodable media"
+                // verdict, which the ledger would then persist.
+                Some(Err(reason)) => {
+                    return Err(self
+                        .fatal(
+                            format!("predict output {index} is a malformed error slot: {reason}"),
+                            FatalCause::Desync,
+                        )
+                        .await);
+                }
+                None => match output {
+                    Value::Binary(bytes) => converted.push(WorkerOutput::Bytes(bytes)),
+                    other => match rmpv_to_json(&other) {
+                        Ok(value) => converted.push(WorkerOutput::Json(value)),
+                        Err(err) => {
+                            // The exchange completed and the stream is in sync
+                            // — an unconvertible output (non-finite float,
+                            // nested bin/ext) is a per-request failure, not a
+                            // supervision failure. Surface it as a WorkerError
+                            // so the dispatcher applies its per-request
+                            // fallback instead of killing a healthy worker and
+                            // failing the whole queue.
+                            return Err(anyhow::Error::new(WorkerError {
+                                message: format!(
+                                    "predict output {index} is not representable as JSON: {err:#}"
+                                ),
+                                traceback: String::new(),
+                                stderr_tail: self.stderr_tail_snapshot(),
+                            }));
+                        }
+                    },
+                },
+            }
+        }
+        Ok(converted)
     }
 
     /// Send `trim` — release the caching allocator's unused pool
@@ -1239,9 +1288,19 @@ impl Worker {
         ];
         frame.append(&mut fields);
         // Serialize fully before sending: an over-limit or unencodable frame
-        // fails here without a byte hitting the stream, so it is a plain
-        // error, not a protocol desync.
-        let bytes = encode_frame(&Value::Map(frame))?;
+        // fails here without a byte hitting the stream — no protocol desync,
+        // the worker is still serviceable. Surfaced as a WorkerError so the
+        // dispatcher fails this request alone instead of killing the model.
+        let bytes = match encode_frame(&Value::Map(frame)) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Err(anyhow::Error::new(WorkerError {
+                    message: format!("request refused before send: {err:#}"),
+                    traceback: String::new(),
+                    stderr_tail: String::new(),
+                }));
+            }
+        };
 
         self.in_flight = true;
         let stdin = &mut self.stdin;
@@ -1496,8 +1555,8 @@ async fn forward_stderr(stderr: ChildStderr, inference_id: String, tail: Arc<Mut
     }
 }
 
-/// Serialize one frame payload, enforcing the 512 MiB limit before any byte
-/// is written (a failure here never corrupts the stream).
+/// Serialize one frame payload, enforcing [`MAX_FRAME_BYTES`] before any
+/// byte is written (a failure here never corrupts the stream).
 fn encode_frame(value: &Value) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     rmpv::encode::write_value(&mut payload, value).context("failed to encode frame payload")?;
@@ -1689,10 +1748,7 @@ fn encode_fit(fit: &FitSnapshot) -> Value {
         ),
         (Value::from("intercept_mb"), Value::F64(fit.intercept_mb)),
         (Value::from("residual_mb"), Value::F64(fit.residual_mb)),
-        (
-            Value::from("samples"),
-            Value::from(fit.samples as u64),
-        ),
+        (Value::from("samples"), Value::from(fit.samples as u64)),
     ])
 }
 
@@ -1700,6 +1756,24 @@ fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     map.iter()
         .find(|(k, _)| k.as_str() == Some(key))
         .map(|(_, v)| v)
+}
+
+/// Reads one msgpack output slot as a typed error (protocol doc, "Per-item
+/// error slots"). `None` means an ordinary payload; `Some(Err(..))` means the
+/// reserved key was there but the body is not a valid error object, which the
+/// caller treats as a fatal protocol violation.
+fn error_slot_from_rmpv(value: &Value) -> Option<Result<SlotError, String>> {
+    let Value::Map(entries) = value else {
+        return None;
+    };
+    let body = map_get(entries, ERROR_SLOT_KEY)?;
+    let Value::Map(body) = body else {
+        return Some(Err(format!("`{ERROR_SLOT_KEY}` is not a map: {body}")));
+    };
+    Some(slot_error_from_parts(
+        map_get(body, "class").and_then(Value::as_str),
+        map_get(body, "message").and_then(Value::as_str),
+    ))
 }
 
 fn take_field(map: &mut Vec<(Value, Value)>, key: &str) -> Option<Value> {
@@ -1855,8 +1929,8 @@ pub(super) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::testing::*;
+    use super::*;
     use serde_json::json;
 
     /// D2's spawn half: a resolved pin goes into the visibility variable the
@@ -2049,7 +2123,9 @@ mod tests {
         );
         // Matched case-insensitively, like every other env comparison here.
         let mut lower = spec("echo_test");
-        lower.env.push(("inferio_device".to_owned(), "cuda".to_owned()));
+        lower
+            .env
+            .push(("inferio_device".to_owned(), "cuda".to_owned()));
         assert_eq!(
             colliding_device_variables(&merged(cpu_host(), &lower), &lower),
             vec![DEVICE_ENV_VAR]
@@ -2111,7 +2187,10 @@ mod tests {
                 file: Some(vec![0x00, 0x01, 0xfe, 0xff]),
             },
         ];
-        let outputs = worker.predict(&inputs, None, None).await.expect("predict ok");
+        let outputs = worker
+            .predict(&inputs, None, None)
+            .await
+            .expect("predict ok");
         assert_eq!(outputs.len(), 2, "one output per input, in order");
         assert_eq!(outputs[0], WorkerOutput::Json(json!({"echo": data})));
         assert_eq!(
@@ -2151,7 +2230,10 @@ mod tests {
             .predict(&inputs, None, None)
             .await
             .expect("the worker still serves predicts after a trim");
-        assert_eq!(outputs[0], WorkerOutput::Json(json!({"echo": "still here"})));
+        assert_eq!(
+            outputs[0],
+            WorkerOutput::Json(json!({"echo": "still here"}))
+        );
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0));
     }
@@ -2264,14 +2346,10 @@ mod tests {
     #[tokio::test]
     async fn a_granted_window_reports_its_oom_batch_on_the_error_frame() {
         let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(
-            &cfg,
-            "test/oomsecond",
-            &spec("oom_second_batch_test"),
-            None,
-        )
-        .await
-        .expect("spawn + handshake");
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/oomsecond", &spec("oom_second_batch_test"), None)
+                .await
+                .expect("spawn + handshake");
         worker.load().await.expect("load ok");
         let telemetry = worker.telemetry();
 
@@ -2328,7 +2406,10 @@ mod tests {
         // The worker survived: a smaller window still succeeds... except this
         // fixture is now permanently past its first batch, so assert only
         // liveness, which is the contract that matters.
-        worker.ping().await.expect("the worker is still serviceable");
+        worker
+            .ping()
+            .await
+            .expect("the worker is still serviceable");
         worker.shutdown().await.expect("graceful shutdown");
     }
 
@@ -2374,10 +2455,14 @@ mod tests {
             .expect("spawn + handshake");
 
         let err = worker
-            .predict(&[WorkerInput {
-                data: Some(json!("x")),
-                file: None,
-            }], None, None)
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!("x")),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect_err("predict before load must fail");
         let worker_err = err
@@ -2411,10 +2496,14 @@ mod tests {
         worker.kill_child_externally_for_test().await;
 
         let err = worker
-            .predict(&[WorkerInput {
-                data: Some(json!(1)),
-                file: None,
-            }], None, None)
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!(1)),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect_err("predict against a dead worker must fail");
         assert!(
@@ -2457,7 +2546,10 @@ mod tests {
                 file: None,
             },
         ];
-        let outputs = worker.predict(&inputs, None, None).await.expect("predict ok");
+        let outputs = worker
+            .predict(&inputs, None, None)
+            .await
+            .expect("predict ok");
         assert_eq!(
             outputs,
             vec![
@@ -2512,7 +2604,10 @@ mod tests {
 
         // A follow-up predict proves the worker (and its stderr pipe) is
         // still fully serviceable.
-        let outputs = worker.predict(&input, None, None).await.expect("second predict");
+        let outputs = worker
+            .predict(&input, None, None)
+            .await
+            .expect("second predict");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"bad": true}))]);
 
         // The forwarder drains asynchronously; poll for the marker line
@@ -2532,6 +2627,163 @@ mod tests {
 
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0));
+    }
+
+    /// The msgpack half of the error-slot decoder, in isolation: only a map
+    /// carrying the reserved key is a slot error, a malformed body is
+    /// reported as a violation rather than guessed at, and ordinary payloads
+    /// (including maps with other keys) are left alone.
+    #[test]
+    fn error_slot_from_rmpv_accepts_only_the_documented_shape() {
+        let slot = Value::Map(vec![(
+            Value::from(ERROR_SLOT_KEY),
+            Value::Map(vec![
+                (Value::from("class"), Value::from("input")),
+                (Value::from("message"), Value::from("Unreadable image")),
+            ]),
+        )]);
+        assert_eq!(
+            error_slot_from_rmpv(&slot),
+            Some(Ok(SlotError {
+                class: super::super::slot_error::SlotErrorClass::Input,
+                message: "Unreadable image".to_owned(),
+            }))
+        );
+
+        for payload in [
+            Value::Binary(vec![1, 2]),
+            Value::from("text"),
+            Value::Map(vec![(Value::from("tags"), Value::from("a"))]),
+        ] {
+            assert_eq!(error_slot_from_rmpv(&payload), None, "{payload}");
+        }
+
+        for malformed in [
+            Value::Map(vec![(Value::from(ERROR_SLOT_KEY), Value::from("boom"))]),
+            Value::Map(vec![(
+                Value::from(ERROR_SLOT_KEY),
+                Value::Map(vec![(Value::from("class"), Value::from("blocked"))]),
+            )]),
+            Value::Map(vec![(
+                Value::from(ERROR_SLOT_KEY),
+                Value::Map(vec![(Value::from("class"), Value::from("input"))]),
+            )]),
+        ] {
+            assert!(
+                matches!(error_slot_from_rmpv(&malformed), Some(Err(_))),
+                "{malformed} must be rejected"
+            );
+        }
+    }
+
+    /// Per-item error slots end to end against a real worker: a batch mixing
+    /// two typed failures with healthy JSON and binary outputs comes back
+    /// with every slot in its input's position (alignment is the whole point
+    /// — a shifted slot would blame the wrong file), and the worker is still
+    /// serviceable afterwards, because an error slot is a *successful*
+    /// roundtrip, not a failure.
+    #[tokio::test]
+    async fn error_slots_decode_and_stay_aligned_with_healthy_outputs() {
+        let cfg = test_spawn_config();
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/errorslot", &spec("errorslot_test"), None)
+                .await
+                .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+
+        let inputs = [
+            WorkerInput {
+                data: Some(json!("first")),
+                file: None,
+            },
+            WorkerInput {
+                data: Some(json!("bad")),
+                file: None,
+            },
+            WorkerInput {
+                data: None,
+                file: Some(b"payload".to_vec()),
+            },
+            WorkerInput {
+                data: Some(json!("flaky")),
+                file: None,
+            },
+        ];
+        let outputs = worker
+            .predict(&inputs, None, None)
+            .await
+            .expect("predict ok");
+        assert_eq!(outputs.len(), inputs.len(), "one slot per input");
+        assert_eq!(outputs[0], WorkerOutput::Json(json!({"ok": "first"})));
+        assert_eq!(
+            outputs[1],
+            WorkerOutput::Error(SlotError {
+                class: super::super::slot_error::SlotErrorClass::Input,
+                message: "Unreadable image: truncated".to_owned(),
+            })
+        );
+        assert_eq!(outputs[2], WorkerOutput::Bytes(b"bytes:payload".to_vec()));
+        assert_eq!(
+            outputs[3],
+            WorkerOutput::Error(SlotError {
+                class: super::super::slot_error::SlotErrorClass::Transient,
+                message: "try again".to_owned(),
+            })
+        );
+
+        // Nothing about the worker changed: it keeps serving.
+        let outputs = worker
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!("again")),
+                    file: None,
+                }],
+                None,
+                None,
+            )
+            .await
+            .expect("worker is still serviceable");
+        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": "again"}))]);
+        let status = worker.shutdown().await.expect("graceful shutdown");
+        assert_eq!(status.code(), Some(0));
+    }
+
+    /// A slot carrying the reserved key with a body the protocol does not
+    /// define is a protocol violation, exactly like a count mismatch: the
+    /// worker is killed and poisoned rather than the class being guessed —
+    /// guessing would let a broken worker fabricate an "undecodable media"
+    /// verdict that the ledger then persists.
+    #[tokio::test]
+    async fn a_malformed_error_slot_kills_the_worker() {
+        let cfg = test_spawn_config();
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/errorslot", &spec("errorslot_test"), None)
+                .await
+                .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+
+        let err = worker
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!("malformed")),
+                    file: None,
+                }],
+                None,
+                None,
+            )
+            .await
+            .expect_err("a malformed error slot must fail the predict");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("malformed error slot"),
+            "the error names the violation: {text}"
+        );
+        assert!(
+            err.downcast_ref::<WorkerError>().is_none(),
+            "a protocol violation is fatal, not a per-request worker error"
+        );
+        let err = worker.ping().await.expect_err("the worker is poisoned");
+        assert!(format!("{err:#}").contains("dead"));
     }
 
     /// Non-finite floats and binary/ext nested inside a JSON-like output
@@ -2573,10 +2825,14 @@ mod tests {
             "map": {"inner": {"deep": ["リスト", 2.0, -1]}}
         });
         let outputs = worker
-            .predict(&[WorkerInput {
-                data: Some(data.clone()),
-                file: None,
-            }], None, None)
+            .predict(
+                &[WorkerInput {
+                    data: Some(data.clone()),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect("predict ok");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": data}))]);
@@ -2609,10 +2865,14 @@ mod tests {
             .expect("configure instantiates after the park");
         worker.load().await.expect("load ok");
         let outputs = worker
-            .predict(&[WorkerInput {
-                data: Some(json!(1)),
-                file: None,
-            }], None, None)
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!(1)),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect("predict ok");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"prepared": true}))]);
@@ -2671,10 +2931,14 @@ mod tests {
 
         // predict before configure is the state-machine sanity error.
         let err = worker
-            .predict(&[WorkerInput {
-                data: Some(json!(1)),
-                file: None,
-            }], None, None)
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!(1)),
+                    file: None,
+                }],
+                None,
+                None,
+            )
             .await
             .expect_err("predict before configure must fail");
         let worker_err = err
@@ -2763,10 +3027,7 @@ mod tests {
         // harness) contributes one sample each.
         telemetry.record_measurements(vec![measurement(10), measurement(11)]);
         assert_eq!(telemetry.recorded_measurements(), 5);
-        assert_eq!(
-            telemetry.measurements().next_back().map(|s| s.seq),
-            Some(5)
-        );
+        assert_eq!(telemetry.measurements().next_back().map(|s| s.seq), Some(5));
 
         // Overflow: the ring is bounded, the counter is not.
         for items in 0..WorkerTelemetry::RING as u64 {

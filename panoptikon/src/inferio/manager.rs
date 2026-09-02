@@ -64,15 +64,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use super::calibration::CalibrationProfiles;
 use super::cost::CostDimension;
 use super::dispatch::{
     DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, Replica, run_dispatcher,
 };
 use super::gpu::{GpuInfo, GpuInventory};
-use super::calibration::CalibrationProfiles;
-use super::ledger::{
-    Admission, GpuBudgetHealth, LoadReservation, VramBudgets, VramLedger,
-};
+use super::ledger::{Admission, GpuBudgetHealth, LoadReservation, VramBudgets, VramLedger};
 use super::prewarm::{PrewarmConfig, PrewarmHealth, PrewarmPool};
 use super::registry::{Registry, RegistryCache, SpawnSpec};
 use super::worker::{
@@ -290,9 +288,8 @@ impl ReplicaTelemetryHealth {
             Err(poisoned) => poisoned.into_inner().clone(),
         };
         let now = Instant::now();
-        let age_ms = |captured_at: Instant| {
-            now.saturating_duration_since(captured_at).as_millis() as u64
-        };
+        let age_ms =
+            |captured_at: Instant| now.saturating_duration_since(captured_at).as_millis() as u64;
         // The load report's own timestamp is kept in the telemetry for 1b
         // (a base measured long ago on a busy board is a weaker prior);
         // health only needs the values.
@@ -521,10 +518,10 @@ impl CacheState {
                 if self.pins.get(inference_id).copied().unwrap_or(0) > 0 {
                     continue;
                 }
-                if let Expiration::At(at) = expiration {
-                    if now > *at {
-                        expired.push((cache_key.clone(), inference_id.clone()));
-                    }
+                if let Expiration::At(at) = expiration
+                    && now > *at
+                {
+                    expired.push((cache_key.clone(), inference_id.clone()));
                 }
             }
         }
@@ -565,10 +562,10 @@ impl CacheState {
         now: DateTime<Local>,
     ) {
         self.unpin(inference_id);
-        if let Some(lru) = self.lru_caches.get_mut(cache_key) {
-            if let Some(expiration) = lru.get_mut(inference_id) {
-                *expiration = Expiration::new(ttl_seconds, now);
-            }
+        if let Some(lru) = self.lru_caches.get_mut(cache_key)
+            && let Some(expiration) = lru.get_mut(inference_id)
+        {
+            *expiration = Expiration::new(ttl_seconds, now);
         }
     }
 
@@ -839,6 +836,7 @@ impl ModelManager {
     /// TTL afterwards whether the predict succeeded or not (Python's
     /// `finally`). `prewarm_hint` as on [`ModelManager::load_model`]; it
     /// only matters when this predict is the one that auto-loads the model.
+    #[allow(clippy::too_many_arguments)]
     pub async fn predict(
         &self,
         inference_id: &str,
@@ -1047,10 +1045,10 @@ impl ModelManager {
         // the caller's existing shutdown envelope).
         let drain = async {
             for handle in handles {
-                if let Err(err) = handle.await {
-                    if err.is_panic() {
-                        tracing::error!("inferio dispatcher task panicked during shutdown: {err}");
-                    }
+                if let Err(err) = handle.await
+                    && err.is_panic()
+                {
+                    tracing::error!("inferio dispatcher task panicked during shutdown: {err}");
                 }
             }
         };
@@ -1269,8 +1267,7 @@ impl ModelManager {
             // The registry's `default_batch_size` keeps exactly one job: the
             // fixed window size of the unpriced path. Priced models are sized
             // by the ledger.
-            unpriced_window_items: registry_default_batch
-                .unwrap_or(self.cfg.default_max_batch),
+            unpriced_window_items: registry_default_batch.unwrap_or(self.cfg.default_max_batch),
             manager: self.weak.get().cloned().expect("weak self is set in new()"),
             stats: Arc::clone(&stats),
             unload_grace: self.cfg.spawn.deadlines.unload_grace,
@@ -1471,7 +1468,9 @@ impl ModelManager {
                                 Err(err) => return Err(err),
                             }
                         }
-                        None => Worker::spawn_configured(&spawn, inference_id, spec, device).await?,
+                        None => {
+                            Worker::spawn_configured(&spawn, inference_id, spec, device).await?
+                        }
                     };
                     if let Err(err) = worker.load().await {
                         // A load `error` frame leaves the worker alive; kill it
@@ -2612,7 +2611,8 @@ config.replicas = 2
             },
             Duration::from_secs(3600),
         );
-        let setup = test_manager_with_calibration(Arc::clone(&store) as Arc<dyn CalibrationProfiles>);
+        let setup =
+            test_manager_with_calibration(Arc::clone(&store) as Arc<dyn CalibrationProfiles>);
         let update = |slope: f64| ProfileUpdate {
             inference_id: "echo/test".to_owned(),
             epoch: 1,
@@ -3149,7 +3149,11 @@ config.replicas = 2
 
         let health = manager.health();
         assert_eq!(
-            health.gpus.iter().map(|gpu| gpu.uuid.as_str()).collect::<Vec<_>>(),
+            health
+                .gpus
+                .iter()
+                .map(|gpu| gpu.uuid.as_str())
+                .collect::<Vec<_>>(),
             vec!["GPU-0000", "GPU-3333"],
             "the inventory is reported by board UUID"
         );
@@ -3226,7 +3230,15 @@ config.replicas = 2
             .await
             .expect("predict");
         manager
-            .predict("echo/test", "k", 10, -1, None, None, vec![data_input(json!(3))])
+            .predict(
+                "echo/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(3))],
+            )
             .await
             .expect("second predict");
 

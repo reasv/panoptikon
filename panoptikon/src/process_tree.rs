@@ -9,6 +9,70 @@
 //! child to gateway death via the kernel, and `kill_process_group` reaps
 //! the child's descendants on the explicit kill paths.
 
+/// The spawn-configuration surface both `std::process::Command` and
+/// `tokio::process::Command` expose under different names. It exists so the
+/// two policies below (console detachment, parent-death) have exactly one
+/// implementation each: the blocking transcode runner spawns std children
+/// while every other supervised child is a tokio one, and a second copy of
+/// either policy would be a platform-specific divergence waiting to happen.
+pub(crate) trait SpawnCommand {
+    #[cfg(windows)]
+    fn set_creation_flags(&mut self, flags: u32);
+    #[cfg(unix)]
+    fn set_process_group(&mut self, pgid: i32);
+    /// # Safety
+    /// The hook runs between fork and exec in the child, so it may only call
+    /// async-signal-safe functions.
+    #[cfg(target_os = "linux")]
+    unsafe fn set_pre_exec(
+        &mut self,
+        hook: Box<dyn FnMut() -> std::io::Result<()> + Send + Sync + 'static>,
+    );
+}
+
+impl SpawnCommand for std::process::Command {
+    #[cfg(windows)]
+    fn set_creation_flags(&mut self, flags: u32) {
+        use std::os::windows::process::CommandExt;
+        self.creation_flags(flags);
+    }
+    #[cfg(unix)]
+    fn set_process_group(&mut self, pgid: i32) {
+        use std::os::unix::process::CommandExt;
+        self.process_group(pgid);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe fn set_pre_exec(
+        &mut self,
+        hook: Box<dyn FnMut() -> std::io::Result<()> + Send + Sync + 'static>,
+    ) {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            self.pre_exec(hook);
+        }
+    }
+}
+
+impl SpawnCommand for tokio::process::Command {
+    #[cfg(windows)]
+    fn set_creation_flags(&mut self, flags: u32) {
+        self.creation_flags(flags);
+    }
+    #[cfg(unix)]
+    fn set_process_group(&mut self, pgid: i32) {
+        self.process_group(pgid);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe fn set_pre_exec(
+        &mut self,
+        hook: Box<dyn FnMut() -> std::io::Result<()> + Send + Sync + 'static>,
+    ) {
+        unsafe {
+            self.pre_exec(hook);
+        }
+    }
+}
+
 /// Keep console signals for the gateway alone: a Ctrl-C that reached the
 /// children directly would kill them before the supervisor is told to stop,
 /// logging spurious "exited unexpectedly" noise mid-shutdown and skipping
@@ -16,15 +80,19 @@
 /// (CREATE_NEW_PROCESS_GROUP on Windows, setsid on Unix); shutdown delivery
 /// is unaffected — supervisors stop children via their own ladders
 /// (TerminateProcess/SIGKILL and the job object), never console signals.
-pub(crate) fn detach_from_console(command: &mut tokio::process::Command) {
+pub(crate) fn detach_from_console<C: SpawnCommand>(command: &mut C) {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        command.set_creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     #[cfg(unix)]
     {
-        command.process_group(0);
+        command.set_process_group(0);
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = command;
     }
 }
 
@@ -43,14 +111,14 @@ pub(crate) fn detach_from_console(command: &mut tokio::process::Command) {
 /// this is a no-op: `kill_process_group` still covers every orderly shutdown
 /// path, and only a gateway death where no gateway code runs can leave the
 /// child behind.
-pub(crate) fn die_with_parent(command: &mut tokio::process::Command) {
+pub(crate) fn die_with_parent<C: SpawnCommand>(command: &mut C) {
     #[cfg(target_os = "linux")]
     {
         let gateway = std::process::id() as libc::pid_t;
         // SAFETY: runs between fork and exec in the child; prctl, getppid,
         // and _exit are async-signal-safe.
         unsafe {
-            command.pre_exec(move || {
+            command.set_pre_exec(Box::new(move || {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -58,7 +126,7 @@ pub(crate) fn die_with_parent(command: &mut tokio::process::Command) {
                     libc::_exit(127);
                 }
                 Ok(())
-            });
+            }));
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -76,8 +144,15 @@ pub(crate) fn die_with_parent(command: &mut tokio::process::Command) {
 /// and group id — cannot be recycled out from under us). Windows: no-op,
 /// the job object covers the tree.
 pub(crate) fn kill_process_group(child: &tokio::process::Child) {
+    kill_process_group_pid(child.id());
+}
+
+/// [`kill_process_group`] by pid, for callers holding a `std` child (whose
+/// `id()` is not invalidated by reaping — only call this while the child is
+/// still unreaped, or the pid may have been handed to someone else).
+pub(crate) fn kill_process_group_pid(pid: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    if let Some(pid) = pid {
         // Errors (ESRCH: group already gone) are irrelevant by design.
         unsafe {
             libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
@@ -85,7 +160,7 @@ pub(crate) fn kill_process_group(child: &tokio::process::Child) {
     }
     #[cfg(not(unix))]
     {
-        let _ = child;
+        let _ = pid;
     }
 }
 
@@ -95,6 +170,11 @@ pub(crate) struct JobGuard {
 }
 
 impl JobGuard {
+    /// Closes the job object, reaping any grandchildren still inside it.
+    /// Spelled as a method rather than `drop(guard)` because on non-Windows
+    /// targets the guard carries nothing and has no `Drop` impl.
+    pub(crate) fn release(self) {}
+
     pub(crate) fn assign(child: &std::process::Child) -> JobGuard {
         #[cfg(windows)]
         {

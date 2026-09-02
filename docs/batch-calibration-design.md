@@ -310,7 +310,8 @@ Under auto:
 - **Window size comes from the orchestrator's fitted model**, like the
   grant: a few GPU batches' worth of units (≈2–4× the current admitted
   batch estimate; seed-derived before calibration), additionally bounded
-  by payload bytes (the 512 MiB frame limit is the hard wall). Windows
+  by payload bytes (the transport frame limit — `MAX_FRAME_BYTES`, 2 GiB —
+  is the hard wall). Windows
   deep enough to hold several batches are what give bucketing material
   and amortize the request/response round trip; the *bound* is what keeps
   work divisible across replicas (an unbounded drain would hand the whole

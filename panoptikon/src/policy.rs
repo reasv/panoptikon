@@ -290,13 +290,15 @@ fn apply_policy(
         && (path.starts_with("/api/relay/pairings/")
             || path.starts_with("/api/relay/pairing-operations/"));
 
-    if is_api && !is_client_config && !is_relay_bootstrap {
-        if !ruleset_allows(settings, &policy, &method, &path) {
-            return Err(EnforcementError {
-                status: StatusCode::FORBIDDEN,
-                reason: "ruleset_denied",
-            });
-        }
+    if is_api
+        && !is_client_config
+        && !is_relay_bootstrap
+        && !ruleset_allows(settings, &policy, &method, &path)
+    {
+        return Err(EnforcementError {
+            status: StatusCode::FORBIDDEN,
+            reason: "ruleset_denied",
+        });
     }
 
     let username = extract_username(&policy, req)?;
@@ -309,9 +311,7 @@ fn apply_policy(
     }
 
     let mut db_action = DbAction::Skipped;
-    let apply_db_params = if is_inference {
-        false
-    } else if is_db_info || is_db_create {
+    let apply_db_params = if is_inference || is_db_info || is_db_create {
         false
     } else if is_client_config || is_relay_bootstrap {
         // Local-mode client-config takes no DB params (same gate as its
@@ -321,7 +321,16 @@ fn apply_policy(
     } else if is_api {
         needs_db_params(&path)
     } else {
-        true
+        // UI-bound requests (pages, assets, HMR) are forwarded with their
+        // query string untouched. Injecting the policy's DB defaults here
+        // makes the Next.js server SSR against a URL the browser never had:
+        // every nuqs-serialized link href then carries index_db/user_data_db
+        // that the client-side render omits, and React fails hydration
+        // (error #418) on every page load. DB scoping for SSR does not need
+        // the page URL — the UI's SSR API calls come back through the
+        // gateway with the echoed policy token, and this same enforcement
+        // resolves the DB params on that API hop.
+        false
     };
 
     if apply_db_params {
@@ -372,8 +381,13 @@ fn consume_policy_token<'a>(
             return None;
         }
     };
+    // Only the policy claim matters here. The origin claim is routing
+    // advice for the UI server (policy_token.rs); a legitimate SSR call may
+    // well arrive on a different listener than the one the claim names
+    // (`[upstreams.ui] api_endpoint`, or a PANOPTIKON_API_URL naming any
+    // listener), so it is neither compared nor acted on.
     let name = match token_key.verify(token) {
-        Ok(name) => name,
+        Ok(claims) => claims.policy,
         Err(err) => {
             tracing::debug!(reason = err.as_str(), "policy token ignored");
             return None;
@@ -457,10 +471,10 @@ fn needs_db_params(path: &str) -> bool {
 
 fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<String> {
     if trust_forwarded {
-        if let Some(value) = header_to_str(req.headers().get("forwarded")) {
-            if let Some(host) = parse_forwarded_host(value) {
-                return Some(normalize_host(&host));
-            }
+        if let Some(value) = header_to_str(req.headers().get("forwarded"))
+            && let Some(host) = parse_forwarded_host(value)
+        {
+            return Some(normalize_host(&host));
         }
         if let Some(value) = header_to_str(req.headers().get("x-forwarded-host")) {
             let host = value.split(',').next().unwrap_or(value).trim();
@@ -495,10 +509,10 @@ fn parse_forwarded_host(value: &str) -> Option<String> {
 
 pub(crate) fn normalize_host(value: &str) -> String {
     let value = value.trim();
-    if value.starts_with('[') {
-        if let Some(end) = value.find(']') {
-            return value[1..end].to_ascii_lowercase();
-        }
+    if value.starts_with('[')
+        && let Some(end) = value.find(']')
+    {
+        return value[1..end].to_ascii_lowercase();
     }
     value
         .split(':')
@@ -896,10 +910,10 @@ fn filter_db_list(names: Vec<String>, policy: &DbPolicy, username: Option<&str>)
         })
         .collect();
 
-    if let (Some(_username), Some(tenant_default)) = (username, policy.tenant_default.as_deref()) {
-        if !filtered.iter().any(|entry| entry == tenant_default) {
-            filtered.push(tenant_default.to_string());
-        }
+    if let (Some(_username), Some(tenant_default)) = (username, policy.tenant_default.as_deref())
+        && !filtered.iter().any(|entry| entry == tenant_default)
+    {
+        filtered.push(tenant_default.to_string());
     }
 
     let mut deduped = Vec::with_capacity(filtered.len());
@@ -1299,7 +1313,7 @@ allow = "*"
 
         // Valid token naming a policy this request would never match by
         // host/endpoint ("both" needs host special.local AND endpoint test).
-        let mut req = request_with_token(&key.mint("both"));
+        let mut req = request_with_token(&key.mint("both", "http://127.0.0.1:9155"));
         let decision = apply_policy(&mut req, &settings, &key).unwrap();
         assert_eq!(decision.policy.name, "both");
         assert_eq!(decision.selected_by, PolicySelection::Token);
@@ -1311,10 +1325,11 @@ allow = "*"
         // Fallback cases: all select "localhost" via listener/host.
         let other_key = TokenKey::random();
         for bad in [
-            other_key.mint("both"),      // forged: wrong key
-            key.sign("both", 42),        // expired long ago
-            key.mint("no-such-policy"),  // unknown policy name
-            "total.garbage".to_string(), // malformed
+            other_key.mint("both", "http://127.0.0.1:9155"), // forged: wrong key
+            key.sign("both", "http://127.0.0.1:9155", 42),   // expired long ago
+            key.mint("no-such-policy", "http://127.0.0.1:9155"), // unknown policy name
+            "total.garbage".to_string(),                     // malformed
+            format!("both.{}.{}", u64::MAX, "ab".repeat(32)), // pre-origin format
         ] {
             let mut req = request_with_token(&bad);
             let decision = apply_policy(&mut req, &settings, &key).unwrap();
@@ -1322,6 +1337,53 @@ allow = "*"
             assert_eq!(decision.selected_by, PolicySelection::ListenerHost);
             assert!(req.headers().get(POLICY_TOKEN_HEADER).is_none());
         }
+    }
+
+    /// The origin claim is routing advice for the UI, never a selection
+    /// input: a valid token whose origin names a different listener than
+    /// the one the SSR call arrived on (the `api_endpoint` / explicit
+    /// PANOPTIKON_API_URL case) still selects the named policy, and one
+    /// naming an origin no listener has is not an error either.
+    #[test]
+    fn token_origin_claim_does_not_affect_selection() {
+        let settings = endpoint_settings();
+        let key = TokenKey::random();
+        for origin in [
+            "http://127.0.0.1:9155",
+            "http://127.0.0.1:9156",
+            "http://[::1]:1",
+            "http://nowhere.invalid:80",
+        ] {
+            let mut req = Request::builder()
+                .uri("http://localhost/api/items")
+                .header("host", "localhost")
+                .header(POLICY_TOKEN_HEADER, key.mint("both", origin))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ListenerEndpoint(Arc::from("default")));
+            let decision = apply_policy(&mut req, &settings, &key).unwrap();
+            assert_eq!(decision.policy.name, "both", "origin: {origin}");
+            assert_eq!(decision.selected_by, PolicySelection::Token);
+        }
+    }
+
+    /// The loopback URL the proxy mints into a token's origin claim, per
+    /// listener name: the primary from `[server]`, extra listeners from
+    /// `[[server.endpoints]]`, and nothing for an unknown name.
+    #[test]
+    fn endpoint_loopback_urls_follow_the_listeners() {
+        let settings = endpoint_settings();
+        assert_eq!(
+            settings.endpoint_loopback_url("default").as_deref(),
+            Some("http://127.0.0.1:9155")
+        );
+        assert_eq!(
+            settings.endpoint_loopback_url("test").as_deref(),
+            Some("http://127.0.0.1:9156")
+        );
+        assert_eq!(settings.endpoint_loopback_url("nope"), None);
+        assert_eq!(settings.primary_loopback_url(), "http://127.0.0.1:9155");
     }
 
     /// Ingress hygiene: client-supplied `x-panoptikon-*` headers are
@@ -1631,8 +1693,8 @@ allow = ["default"]
             query.get("new_user_data_db").unwrap(),
             &vec!["user_alice_bookmarks".to_string()]
         );
-        assert!(query.get("index_db").is_none());
-        assert!(query.get("user_data_db").is_none());
+        assert!(!query.contains_key("index_db"));
+        assert!(!query.contains_key("user_data_db"));
     }
 
     #[test]

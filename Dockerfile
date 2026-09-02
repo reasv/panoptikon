@@ -27,6 +27,9 @@ RUN npm ci \
 # Built on the same Ubuntu release as the runtime stage so the binary never
 # links glibc symbols newer than what the runtime provides.
 FROM ubuntu:24.04 AS rust-build
+# `build-essential` is load-bearing beyond the -sys crates' headers: the WebP
+# encoder (libwebp-sys) vendors its C sources and builds them with `cc` alone
+# -- no cmake, no nasm -- so a C compiler is all the thumbnail encoders need.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config libssl-dev curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -41,6 +44,7 @@ COPY panoptikon/ panoptikon/
 # All workspace members must be present for cargo to load the workspace,
 # even though only -p panoptikon is built.
 COPY panoptikon-config/ panoptikon-config/
+COPY panoptikon-clipboard/ panoptikon-clipboard/
 COPY panoptikon-desktop/src-tauri/ panoptikon-desktop/src-tauri/
 COPY python/ python/
 COPY config/ config/
@@ -93,6 +97,11 @@ COPY config/inference/example.toml config/inference/example.toml
 RUN mkdir -p data && chown -R ubuntu:ubuntu /app
 USER ubuntu
 ENV PANOPTIKON_CONFIG_PATH=/app/config/server/docker.toml
+# The NVIDIA container runtime injects driver libraries per this list; its
+# default when unset is compute,utility, which OMITS libnvidia-encode — video
+# transcoding's nvenc would silently fall back to software. Inert without the
+# NVIDIA runtime, so safe for the CPU image too.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
 # Provision the Python inference environment at build time so first boot is
 # fast: extracts the embedded Python source set to /app/runtime and creates

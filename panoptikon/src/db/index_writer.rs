@@ -11,9 +11,13 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use sqlx::SqliteConnection;
 use tokio::sync::{Mutex, oneshot};
 
-use crate::api_error::ApiError;
+use crate::api_error::{ApiError, Blocker};
 use crate::db::connection::index_storage_paths_unchecked;
 use crate::db::{
+    extraction_errors::{
+        ExtractionErrorRecord, delete_blocked_errors, delete_extraction_error,
+        upsert_extraction_error,
+    },
     extraction_log::delete_data_job_by_log_id,
     extraction_write::{
         DataLogUpdate, EmbeddingEntry, TagEntry, TagTextEntry, TextEntry, add_data_log,
@@ -27,17 +31,26 @@ use crate::db::{
     },
     files::{
         FileScanData, FileUpsertResult, delete_file_by_path, delete_files_not_allowed,
-        delete_item_if_orphan, delete_items_without_files, rename_file_path, set_blurhash,
-        update_file_data,
+        delete_item_if_orphan, delete_items_without_files, rename_file_path,
+        set_animation_duration, set_blurhash, set_item_codecs, set_item_rotation,
+        set_item_transparency, set_outro_verdict, update_file_data,
     },
     folders::{
         add_folder_to_database, delete_files_not_under_included_folders,
         delete_files_under_excluded_folders, delete_folders_not_in_list,
     },
     open_index_db_read_no_user_data, open_index_db_write_no_user_data,
+    scan_errors::{
+        ScanErrorRecord, delete_blocked_scan_errors, delete_scan_error, delete_scan_errors,
+        rekey_scan_error, upsert_scan_error,
+    },
     storage::{
-        StoredImage, delete_orphaned_frames, delete_orphaned_thumbnails, store_frames,
+        StoredImage, StoredTier, delete_orphaned_frames, delete_orphaned_thumbnails,
+        delete_orphaned_visual_attempts, delete_thumbnails, store_frames, store_thumbnail_tiers,
         store_thumbnails,
+    },
+    visual_attempts::{
+        VisualAttemptRecord, delete_blocked_visual_attempts, upsert_visual_attempts,
     },
 };
 
@@ -128,6 +141,82 @@ pub(crate) enum IndexDbWriterMessage {
         frames: Vec<StoredImage>,
         reply: Reply<()>,
     },
+    /// One item's **whole** grid tier set
+    /// (docs/grid-scroll-performance-implementation.md §2). An empty `tiers`
+    /// is a legitimate instruction — "this item wants no stored tier" — so
+    /// the caller must not short-circuit on it the way the two above do.
+    /// The generator version rides on each [`StoredTier`] rather than on the
+    /// message: one set can hold posters at `TIER_PROCESS_VERSION` beside
+    /// loops at `LOOP_PROCESS_VERSION`.
+    StoreThumbnailTiers {
+        sha256: String,
+        mime_type: String,
+        tiers: Vec<StoredTier>,
+        reply: Reply<()>,
+    },
+    /// Drops an item's stored display renditions, for the one case that needs
+    /// it: the display rule is short-side based now, so an item the rule
+    /// serves from its original can still be carrying a rendition the old
+    /// long-side rule stored. See [`crate::db::storage::delete_thumbnails`].
+    DeleteThumbnails {
+        sha256: String,
+        reply: Reply<u64>,
+    },
+    /// One genuine outro verdict (docs/video-outro-detection-design.md §7.2).
+    /// The `items` write and the probe marker's delete share this one
+    /// transaction, mirroring [`Self::StoreThumbnails`] — connections have
+    /// both databases attached, so the negative cache can never outlive the
+    /// answer that retired it. Probe *failures* never come through here: they
+    /// are `UpsertVisualAttempts` records, because `outro_kind` only ever
+    /// holds verdicts.
+    SetOutroVerdict {
+        sha256: String,
+        outro_kind: String,
+        content_end_ms: Option<i64>,
+        reply: Reply<u64>,
+    },
+    /// One item's stream codecs (docs/video-transcoding-design.md §6). Unlike
+    /// [`Self::SetOutroVerdict`] this carries no marker delete: the codec pass
+    /// writes nothing to the negative cache, so there is nothing to retire.
+    SetItemCodecs {
+        sha256: String,
+        video_codec: String,
+        audio_codec: Option<String>,
+        reply: Reply<u64>,
+    },
+    /// One item's measured animation length
+    /// (docs/animated-image-spans-design.md §4). Like [`Self::SetItemCodecs`]
+    /// it carries no marker delete — the measurement writes nothing to the
+    /// negative cache — and the write itself is guarded on `duration IS
+    /// NULL`, so it can only ever fill a gap, never replace a verdict.
+    SetAnimationDuration {
+        sha256: String,
+        seconds: f64,
+        reply: Reply<u64>,
+    },
+    /// One item's measured orientation, which also transposes its stored
+    /// dimensions on an odd quarter turn
+    /// (docs/display-dimensions-design.md §4).
+    ///
+    /// Guarded on `rotation IS NULL` like the two above, but the guard is
+    /// load-bearing in a way theirs are not: this is the only write in the
+    /// scan that is **not idempotent**, since re-applying a 90 degree answer
+    /// would transpose the dimensions back. The swap and the stamp are one
+    /// statement so they cannot come apart.
+    SetItemRotation {
+        sha256: String,
+        quarter_turns: i64,
+        reply: Reply<u64>,
+    },
+    /// One item's measured transparency
+    /// (docs/thumbnail-format-implementation.md §2, R4). Like
+    /// [`Self::SetAnimationDuration`] it carries no marker delete and is
+    /// guarded on `has_transparency IS NULL`, so it can only ever fill a gap.
+    SetItemTransparency {
+        sha256: String,
+        has_transparency: bool,
+        reply: Reply<u64>,
+    },
     RenameFilePath {
         old_path: String,
         new_path: String,
@@ -165,6 +254,28 @@ pub(crate) enum IndexDbWriterMessage {
     DeleteOrphanedThumbnails {
         reply: Reply<u64>,
     },
+    /// The negative cache's half of the orphan sweep. Its count is kept out of
+    /// the caller's deletion flag — see `delete_orphaned_visual_attempts`.
+    DeleteOrphanedVisualAttempts {
+        reply: Reply<u64>,
+    },
+    /// Records what a visuals generation pass concluded
+    /// (docs/failed-media-retry-design.md). One message per file: a single
+    /// pass can owe both a thumbnail and a frame marker, and they are one
+    /// conclusion, so they commit together and cost one search-cache epoch
+    /// bump instead of two. Advisory — a failed write costs one wasted
+    /// regeneration next scan, which is exactly today's behavior.
+    UpsertVisualAttempts {
+        records: Vec<VisualAttemptRecord>,
+        scan_id: Option<i64>,
+        reply: Reply<()>,
+    },
+    /// Auto-heal for the visuals cache, the twin of
+    /// [`Self::ClearBlockedScanErrors`] one database over.
+    ClearBlockedVisualAttempts {
+        blockers: Vec<Blocker>,
+        reply: Reply<u64>,
+    },
     DeleteJobData {
         log_id: i64,
         reply: Reply<u64>,
@@ -188,6 +299,61 @@ pub(crate) enum IndexDbWriterMessage {
     UpsertSetter {
         setter_name: String,
         reply: Reply<i64>,
+    },
+    /// Records one non-transient extraction failure
+    /// (docs/failed-media-retry-design.md). The reply is what makes a failed
+    /// ledger write systemic rather than input-side: the item task returns
+    /// `Err`, so a DB outage can never soft-complete a job as "all corrupt
+    /// media".
+    UpsertExtractionError {
+        record: ExtractionErrorRecord,
+        reply: Reply<()>,
+    },
+    /// Success path: the setter can process this item after all.
+    DeleteExtractionError {
+        item_sha256: String,
+        setter_name: String,
+        reply: Reply<u64>,
+    },
+    /// Auto-heal: clears the `blocked` rows of every dependency that now
+    /// binds, so those items become selectable in the same run.
+    ClearBlockedErrors {
+        blockers: Vec<Blocker>,
+        reply: Reply<u64>,
+    },
+    /// Records one non-transient filescan failure
+    /// (docs/failed-media-retry-design.md). The scan already routes every
+    /// write through this actor, so the ledger rides the same serialized path
+    /// rather than opening a second writer. `scan_id` is the run that saw the
+    /// failure, which is what dedups `attempts`.
+    UpsertScanError {
+        record: ScanErrorRecord,
+        scan_id: Option<i64>,
+        reply: Reply<()>,
+    },
+    /// Success path: the scan can process this path after all.
+    DeleteScanError {
+        path: String,
+        reply: Reply<u64>,
+    },
+    /// False-change path: the bytes provably did not move (same sha256 under
+    /// a new mtime), so an audit-only row follows the stat instead of being
+    /// cleared by it. Verdict and counters stay put.
+    RekeyScanError {
+        path: String,
+        last_modified: String,
+        file_size: i64,
+        reply: Reply<u64>,
+    },
+    /// End-of-root sweep: rows the walk never reached, in one statement.
+    DeleteScanErrors {
+        paths: Vec<String>,
+        reply: Reply<u64>,
+    },
+    /// Auto-heal for the scan ledger, the twin of [`Self::ClearBlockedErrors`].
+    ClearBlockedScanErrors {
+        blockers: Vec<Blocker>,
+        reply: Reply<u64>,
     },
     WriteTagsOutput {
         job_id: i64,
@@ -443,10 +609,10 @@ impl Actor for IndexDbWriter {
         myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let _ = myself.send_interval(
+        drop(myself.send_interval(
             RactorDuration::from_secs(args.idle_timeout.as_secs()),
             || IndexDbWriterMessage::IdleCheck,
-        );
+        ));
         Ok(IndexDbWriterState {
             index_db: args.index_db,
             idle_timeout: args.idle_timeout,
@@ -464,15 +630,15 @@ impl Actor for IndexDbWriter {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             IndexDbWriterMessage::IdleCheck => {
-                if let (Some(last_used), Some(_)) = (state.last_used, state.conn.as_ref()) {
-                    if last_used.elapsed() >= state.idle_timeout {
-                        state.conn = None;
-                        state.last_used = None;
-                        tracing::info!(
-                            index_db = %state.index_db,
-                            "index db writer connection closed after idle timeout"
-                        );
-                    }
+                if let (Some(last_used), Some(_)) = (state.last_used, state.conn.as_ref())
+                    && last_used.elapsed() >= state.idle_timeout
+                {
+                    state.conn = None;
+                    state.last_used = None;
+                    tracing::info!(
+                        index_db = %state.index_db,
+                        "index db writer connection closed after idle timeout"
+                    );
                 }
             }
             IndexDbWriterMessage::AddFileScan {
@@ -575,6 +741,102 @@ impl Actor for IndexDbWriter {
                     .with_transaction(move |conn| {
                         Box::pin(async move {
                             store_frames(conn, &sha256, &mime_type, process_version, &frames).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::StoreThumbnailTiers {
+                sha256,
+                mime_type,
+                tiers,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            store_thumbnail_tiers(conn, &sha256, &mime_type, &tiers).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteThumbnails { sha256, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_thumbnails(conn, &sha256).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::SetOutroVerdict {
+                sha256,
+                outro_kind,
+                content_end_ms,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            set_outro_verdict(conn, &sha256, &outro_kind, content_end_ms).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::SetItemCodecs {
+                sha256,
+                video_codec,
+                audio_codec,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            set_item_codecs(conn, &sha256, &video_codec, audio_codec.as_deref())
+                                .await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::SetAnimationDuration {
+                sha256,
+                seconds,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(
+                            async move { set_animation_duration(conn, &sha256, seconds).await },
+                        )
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::SetItemRotation {
+                sha256,
+                quarter_turns,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(
+                            async move { set_item_rotation(conn, &sha256, quarter_turns).await },
+                        )
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::SetItemTransparency {
+                sha256,
+                has_transparency,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            set_item_transparency(conn, &sha256, has_transparency).await
                         })
                     })
                     .await;
@@ -692,6 +954,38 @@ impl Actor for IndexDbWriter {
                     .await;
                 let _ = reply.send(result);
             }
+            IndexDbWriterMessage::DeleteOrphanedVisualAttempts { reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_orphaned_visual_attempts(conn).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::UpsertVisualAttempts {
+                records,
+                scan_id,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(
+                            async move { upsert_visual_attempts(conn, &records, scan_id).await },
+                        )
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::ClearBlockedVisualAttempts { blockers, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(
+                            async move { delete_blocked_visual_attempts(conn, &blockers).await },
+                        )
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
             IndexDbWriterMessage::DeleteJobData { log_id, reply } => {
                 // Deleting the `data_jobs` row cascades through `item_data`
                 // into `tags_items`.
@@ -770,6 +1064,87 @@ impl Actor for IndexDbWriter {
                     .await;
                 let _ = reply.send(result);
             }
+            IndexDbWriterMessage::UpsertExtractionError { record, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { upsert_extraction_error(conn, &record).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteExtractionError {
+                item_sha256,
+                setter_name,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            delete_extraction_error(conn, &item_sha256, &setter_name).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::ClearBlockedErrors { blockers, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_blocked_errors(conn, &blockers).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::UpsertScanError {
+                record,
+                scan_id,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { upsert_scan_error(conn, &record, scan_id).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteScanError { path, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_scan_error(conn, &path).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::RekeyScanError {
+                path,
+                last_modified,
+                file_size,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            rekey_scan_error(conn, &path, &last_modified, file_size).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::DeleteScanErrors { paths, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_scan_errors(conn, &paths).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::ClearBlockedScanErrors { blockers, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move { delete_blocked_scan_errors(conn, &blockers).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
             IndexDbWriterMessage::WriteTagsOutput {
                 job_id,
                 setter_name,
@@ -789,7 +1164,7 @@ impl Actor for IndexDbWriter {
                 // failed, and a job whose every item failed writes nothing a
                 // recount could see.
                 let mark_dirty =
-                    !state.tags_dirty_marked && !(tags.is_empty() && text_entries.is_empty());
+                    !state.tags_dirty_marked && (!tags.is_empty() || !text_entries.is_empty());
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move {
@@ -1159,10 +1534,10 @@ impl Actor for IndexDbSupervisor {
         myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let _ = myself.send_interval(
+        drop(myself.send_interval(
             RactorDuration::from_secs(args.health_interval.as_secs()),
             || IndexDbSupervisorMessage::HealthCheck,
-        );
+        ));
         Ok(IndexDbSupervisorState {
             writers: HashMap::new(),
             idle_timeout: args.idle_timeout,
@@ -1240,13 +1615,12 @@ impl Actor for IndexDbSupervisor {
                         }
                     }
 
-                    if !to_remove.contains(key) {
-                        if writer
+                    if !to_remove.contains(key)
+                        && writer
                             .send_message(IndexDbWriterMessage::IdleCheck)
                             .is_err()
-                        {
-                            to_remove.push(key.clone());
-                        }
+                    {
+                        to_remove.push(key.clone());
                     }
                 }
 
@@ -1557,9 +1931,11 @@ mod tests {
     }
 
     async fn recount(index_db: &str) {
-        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::RecountTagItems { reply })
-            .await
-            .unwrap();
+        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::RecountTagItems {
+            reply,
+        })
+        .await
+        .unwrap();
     }
 
     async fn marker_is_set(index_db: &str) -> bool {
@@ -1819,10 +2195,97 @@ mod tests {
         let (index_db, _job_id) = marker_test_db(0).await;
         clear_marker_behind_the_writer(&index_db).await;
 
-        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::MarkTagsDirty { reply })
-            .await
-            .unwrap();
+        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::MarkTagsDirty {
+            reply,
+        })
+        .await
+        .unwrap();
         assert!(marker_is_set(&index_db).await);
+    }
+
+    // The extraction ledger's three writer messages, end to end: the
+    // pipelines that will send them reach the database only through here, so
+    // a mis-wired handler would surface as failures that are never recorded
+    // (and items retried forever) rather than as an error.
+    #[tokio::test]
+    async fn extraction_ledger_messages_round_trip_through_the_writer() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = marker_test_db(1).await;
+
+        let record = crate::db::extraction_errors::ExtractionErrorRecord {
+            item_sha256: "sha0".to_string(),
+            setter_name: "test/tagger".to_string(),
+            stage: crate::db::extraction_errors::STAGE_PREPARE.to_string(),
+            kind: crate::api_error::ApiErrorKind::Blocked {
+                blocker: Blocker::Pdfium,
+            },
+            error: "pdfium unavailable".to_string(),
+            skip_after: 1,
+            job_id: Some(job_id),
+        };
+        call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::UpsertExtractionError {
+                record: record.clone(),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+
+        let recorded = {
+            let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+                .await
+                .unwrap();
+            crate::db::extraction_errors::list_error_sha256s_for_setter(&mut conn, "test/tagger")
+                .await
+                .unwrap()
+                .len()
+        };
+        assert_eq!(recorded, 1, "the writer's upsert reached the ledger");
+
+        // A blocker that is still missing must not clear anything.
+        let cleared = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::ClearBlockedErrors {
+                blockers: vec![Blocker::Ffmpeg],
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(cleared, 0);
+
+        let cleared = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::ClearBlockedErrors {
+                blockers: vec![Blocker::Pdfium],
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cleared, 1,
+            "the dependency appeared; the item is selectable"
+        );
+
+        // And the success path removes what is left.
+        call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::UpsertExtractionError {
+                record: record.clone(),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        let deleted = call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::DeleteExtractionError {
+                item_sha256: "sha0".to_string(),
+                setter_name: "test/tagger".to_string(),
+                reply,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(deleted, 1);
     }
 
     // Guards the property the constant's comment argues for: post-job
@@ -1855,11 +2318,12 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{statement} failed: {err}"));
         }
 
-        let analyzed: i64 = sqlx::query("SELECT COUNT(*) AS n FROM sqlite_stat1 WHERE tbl = 'items'")
-            .fetch_one(&mut *conn)
-            .await
-            .expect("read sqlite_stat1")
-            .get("n");
+        let analyzed: i64 =
+            sqlx::query("SELECT COUNT(*) AS n FROM sqlite_stat1 WHERE tbl = 'items'")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("read sqlite_stat1")
+                .get("n");
         assert!(
             analyzed > 0,
             "post-job maintenance left `items` unanalyzed: {ANALYZE_STATEMENTS:?}"

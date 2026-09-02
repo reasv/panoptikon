@@ -36,6 +36,57 @@ pub(crate) struct PqlBuilderResult {
     pub(crate) uses_user_data: bool,
 }
 
+/// What the built statement is for. `Results` and `Count` are the two shapes
+/// `build_query` has always produced; `ItemSet` is results-like minus the
+/// final sort and pagination (docs/pinboard-content-search-design.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildMode {
+    Results,
+    Count,
+    ItemSet,
+}
+
+/// The alias the composite (coalesced / RRF) primary order key is projected
+/// under. Single-key orders reuse the order machinery's own label instead.
+const ITEM_SET_COMPOSITE_ORDER_ALIAS: &str = "primary_order_key";
+
+/// The highest-priority order entry of an `ItemSet` build, as a plain
+/// selectable column on the returned statement plus the direction the results
+/// query would have sorted it by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrimaryOrderKey {
+    /// Alias of the key column in the returned statement's projection.
+    pub(crate) alias: String,
+    pub(crate) direction: OrderDirection,
+    /// Always true today: every order term this builder emits sorts
+    /// `NULLS LAST`. Reported so callers replicating the sort don't have to
+    /// know that.
+    pub(crate) nulls_last: bool,
+}
+
+/// The full, unsorted, unpaginated result set of a query, for callers that
+/// aggregate over it (the pinboard content search intersects it with board
+/// membership). Projection is `file_id`, `item_id` (plus `data_id` for
+/// `entity: text`) and the order-key columns — no user-selected columns.
+pub(crate) struct ItemSetBuild {
+    /// No final ORDER BY and no LIMIT/OFFSET; the caller wraps it.
+    pub(crate) query: SelectStatement,
+    pub(crate) with_clause: Option<WithClause>,
+    /// `None` only when the query orders by nothing at all. The
+    /// `last_modified DESC` default every request carries lives in
+    /// `PqlQuery`'s serde defaults, not in this builder — a query that
+    /// explicitly clears `order_by` gets no ORDER BY in `Results` mode
+    /// either, so there is no key to project and the caller picks its own
+    /// fallback.
+    pub(crate) primary_order: Option<PrimaryOrderKey>,
+    /// True when any filter joins the attached user_data database. Unread
+    /// today: its only consumer is result-cache keying, and the pinboard
+    /// content search deliberately does not cache in v1 — the board join
+    /// touches user_data unconditionally anyway.
+    #[allow(dead_code)]
+    pub(crate) uses_user_data: bool,
+}
+
 impl PqlBuilderResult {
     /// The built statement with pagination applied, for callers that execute
     /// it directly and don't care about the pagination/statement split.
@@ -175,7 +226,8 @@ pub(crate) fn build_query(
         Some(query_root) => preprocess_query(query_root)?,
         None => None,
     };
-    build_query_with_root(input_query, count_query, query_root)
+    let (built, _) = build_query_with_root(input_query, build_mode(count_query), query_root)?;
+    Ok(built)
 }
 
 pub(crate) fn build_query_preprocessed(
@@ -183,14 +235,45 @@ pub(crate) fn build_query_preprocessed(
     count_query: bool,
 ) -> Result<PqlBuilderResult, PqlError> {
     let query_root = input_query.query.take();
-    build_query_with_root(input_query, count_query, query_root)
+    let (built, _) = build_query_with_root(input_query, build_mode(count_query), query_root)?;
+    Ok(built)
+}
+
+/// The `ItemSet` counterpart of `build_query_preprocessed`: the root must
+/// already be preprocessed (semantic filters need their embeddings resolved),
+/// and the caller must have resolved the random-order seed, exactly as for a
+/// results build.
+pub(crate) fn build_item_set_preprocessed(
+    mut input_query: PqlQuery,
+) -> Result<ItemSetBuild, PqlError> {
+    // Item-set semantics are partition-free: partitioning is display dedup,
+    // while intersection is by sha256. Enforced at the seam so no caller can
+    // half-apply it.
+    input_query.partition_by = None;
+    let query_root = input_query.query.take();
+    let (built, primary_order) =
+        build_query_with_root(input_query, BuildMode::ItemSet, query_root)?;
+    Ok(ItemSetBuild {
+        query: built.query,
+        with_clause: built.with_clause,
+        primary_order,
+        uses_user_data: built.uses_user_data,
+    })
+}
+
+fn build_mode(count_query: bool) -> BuildMode {
+    if count_query {
+        BuildMode::Count
+    } else {
+        BuildMode::Results
+    }
 }
 
 fn build_query_with_root(
     mut input_query: PqlQuery,
-    count_query: bool,
+    mode: BuildMode,
     query_root: Option<QueryElement>,
-) -> Result<PqlBuilderResult, PqlError> {
+) -> Result<(PqlBuilderResult, Option<PrimaryOrderKey>), PqlError> {
     raise_if_invalid(&input_query)?;
 
     // An empty partition list means no partitioning.
@@ -208,7 +291,7 @@ fn build_query_with_root(
         selects: HashMap::new(),
         ctes: Vec::new(),
         cte_counter: 0,
-        is_count_query: count_query,
+        is_count_query: matches!(mode, BuildMode::Count),
         item_data_query: matches!(input_query.entity, EntityType::Text),
         entity: input_query.entity,
         uses_user_data: false,
@@ -290,7 +373,7 @@ fn build_query_with_root(
         &mut joined_tables,
     );
 
-    if count_query {
+    if matches!(mode, BuildMode::Count) {
         let (count_query, extra_columns) = if input_query.partition_by.is_none() {
             let mut count_query = Query::select();
             count_query
@@ -323,13 +406,108 @@ fn build_query_with_root(
         let with_clause =
             build_with_clause(&state, root_cte_name.as_deref(), last_cte_name.as_deref());
 
-        return Ok(PqlBuilderResult {
-            query: count_query,
-            with_clause,
-            extra_columns,
-            pagination: None,
-            uses_user_data: state.uses_user_data,
-        });
+        return Ok((
+            PqlBuilderResult {
+                query: count_query,
+                with_clause,
+                extra_columns,
+                pagination: None,
+                uses_user_data: state.uses_user_data,
+            },
+            None,
+        ));
+    }
+
+    if matches!(mode, BuildMode::ItemSet) {
+        // Only the order CTEs are joined: nothing in this mode projects the
+        // `select_as` extra columns, and an unused LEFT JOIN is not free.
+        // Membership is unaffected — every rank CTE is grouped by the std
+        // columns, so those joins are at most 1:1.
+        let join_targets: Vec<CteRef> = state.order_list.iter().map(|c| c.cte.clone()).collect();
+
+        full_query = add_joins(
+            &join_targets,
+            full_query,
+            file_id_ref,
+            data_id_ref,
+            root_cte_name.as_deref(),
+            last_cte_name.as_deref(),
+        );
+
+        let seed = input_query.seed.unwrap_or(0);
+        // `select_conds = true` makes the order machinery *project* its keys
+        // instead of only sorting by them; the returned ORDER BY specs are
+        // then simply never applied. `partition_by` cannot be set here:
+        // `build_item_set_preprocessed` clears it at the seam.
+        let (full_query, _order_specs, order_columns) = build_order_by(
+            full_query,
+            root_cte_name.as_deref(),
+            true,
+            &state.order_list,
+            &input_query.order_by,
+            seed,
+        );
+
+        let (full_query, primary_order) = match order_columns.first() {
+            None => (full_query, None),
+            Some(OrderByColumn::Label { label, order }) => (
+                full_query,
+                Some(PrimaryOrderKey {
+                    alias: label.clone(),
+                    direction: order_to_direction(order),
+                    nulls_last: true,
+                }),
+            ),
+            Some(OrderByColumn::Coalesce {
+                labels,
+                order,
+                rrfs,
+            }) => {
+                // A coalesced/RRF key is an expression over several projected
+                // rank columns, and SQLite does not resolve an output alias
+                // from a sibling result column — so it is computed one level
+                // out, where those labels are real columns.
+                let source = Alias::new("item_set");
+                let mut wrapper = Query::select();
+                wrapper
+                    .from_subquery(full_query, source.clone())
+                    .column((source.clone(), Alias::new("file_id")))
+                    .column((source.clone(), Alias::new("item_id")));
+                if state.item_data_query {
+                    wrapper.column((source.clone(), Alias::new("data_id")));
+                }
+                let columns = labels
+                    .iter()
+                    .map(|label| Expr::col((source.clone(), Alias::new(label.as_str()))))
+                    .collect::<Vec<_>>();
+                wrapper.expr_as(
+                    build_coalesced_expr(&columns, order.clone(), rrfs.clone()),
+                    Alias::new(ITEM_SET_COMPOSITE_ORDER_ALIAS),
+                );
+                (
+                    wrapper,
+                    Some(PrimaryOrderKey {
+                        alias: ITEM_SET_COMPOSITE_ORDER_ALIAS.to_string(),
+                        direction: order_to_direction(order),
+                        nulls_last: true,
+                    }),
+                )
+            }
+        };
+
+        let with_clause =
+            build_with_clause(&state, root_cte_name.as_deref(), last_cte_name.as_deref());
+
+        return Ok((
+            PqlBuilderResult {
+                query: full_query,
+                with_clause,
+                extra_columns: HashMap::new(),
+                pagination: None,
+                uses_user_data: state.uses_user_data,
+            },
+            primary_order,
+        ));
     }
 
     let mut selected_columns = SelectedColumns::default();
@@ -405,13 +583,16 @@ fn build_query_with_root(
 
     let with_clause = build_with_clause(&state, root_cte_name.as_deref(), last_cte_name.as_deref());
 
-    Ok(PqlBuilderResult {
-        query: full_query,
-        with_clause,
-        extra_columns,
-        pagination,
-        uses_user_data: state.uses_user_data,
-    })
+    Ok((
+        PqlBuilderResult {
+            query: full_query,
+            with_clause,
+            extra_columns,
+            pagination,
+            uses_user_data: state.uses_user_data,
+        },
+        None,
+    ))
 }
 
 fn raise_if_invalid(input_query: &PqlQuery) -> Result<(), PqlError> {
@@ -430,12 +611,12 @@ fn raise_if_invalid(input_query: &PqlQuery) -> Result<(), PqlError> {
                 "Tried to order by text columns in a non-text query",
             ));
         }
-        if let Some(partition_by) = &input_query.partition_by {
-            if partition_by.iter().copied().any(is_text_column) {
-                return Err(PqlError::invalid(
-                    "Tried to partition by text columns in a non-text query",
-                ));
-            }
+        if let Some(partition_by) = &input_query.partition_by
+            && partition_by.iter().copied().any(is_text_column)
+        {
+            return Err(PqlError::invalid(
+                "Tried to partition by text columns in a non-text query",
+            ));
         }
     }
     Ok(())
@@ -519,7 +700,9 @@ fn process_query_element(
         QueryElement::MatchTags(filter) => filter.build(context, state),
         QueryElement::InBookmarks(filter) => filter.build(context, state),
         QueryElement::ProcessedBy(filter) => filter.build(context, state),
+        QueryElement::FailedFor(filter) => filter.build(context, state),
         QueryElement::HasUnprocessedData(filter) => filter.build(context, state),
+        QueryElement::InPinboard(filter) => filter.build(context, state),
     }
 }
 
@@ -935,12 +1118,12 @@ fn combine_order_lists(order_list: &[OrderByFilter], order_args: &[OrderArgs]) -
                 let mut group = vec![filter];
                 let mut j = i + 1;
                 while j < combined.len() {
-                    if let OrderItem::Filter(next_filter) = &combined[j].0 {
-                        if combined[j].1 == priority {
-                            group.push(next_filter.clone());
-                            j += 1;
-                            continue;
-                        }
+                    if let OrderItem::Filter(next_filter) = &combined[j].0
+                        && combined[j].1 == priority
+                    {
+                        group.push(next_filter.clone());
+                        j += 1;
+                        continue;
                     }
                     break;
                 }
@@ -1253,6 +1436,21 @@ fn direction_to_order(direction: OrderDirection) -> Order {
     }
 }
 
+/// Inverse of `direction_to_order` for reporting an `ItemSet` build's primary
+/// order key. Only `Asc`/`Desc` are ever produced by this builder.
+fn order_to_direction(order: &Order) -> OrderDirection {
+    match order {
+        Order::Asc => OrderDirection::Asc,
+        Order::Desc => OrderDirection::Desc,
+        // `Order::Field` sorts by an explicit value list. Every order this
+        // builder emits comes from `direction_to_order`, so neither it nor a
+        // future variant (`Order` is `#[non_exhaustive]`, hence the required
+        // wildcard) is reachable; ascending is the closest honest report.
+        Order::Field(_) => OrderDirection::Asc,
+        _ => OrderDirection::Asc,
+    }
+}
+
 fn column_name(col: Column) -> &'static str {
     match col {
         Column::FileId => "file_id",
@@ -1272,6 +1470,10 @@ fn column_name(col: Column) -> &'static str {
         Column::VideoTracks => "video_tracks",
         Column::SubtitleTracks => "subtitle_tracks",
         Column::Blurhash => "blurhash",
+        Column::OutroKind => "outro_kind",
+        Column::ContentEndMs => "content_end_ms",
+        Column::VideoCodec => "video_codec",
+        Column::AudioCodec => "audio_codec",
         Column::DataId => "data_id",
         Column::Language => "language",
         Column::LanguageConfidence => "language_confidence",
@@ -1305,6 +1507,10 @@ fn order_by_name(field: OrderByField) -> &'static str {
         OrderByField::VideoTracks => "video_tracks",
         OrderByField::SubtitleTracks => "subtitle_tracks",
         OrderByField::Blurhash => "blurhash",
+        OrderByField::OutroKind => "outro_kind",
+        OrderByField::ContentEndMs => "content_end_ms",
+        OrderByField::VideoCodec => "video_codec",
+        OrderByField::AudioCodec => "audio_codec",
         OrderByField::DataId => "data_id",
         OrderByField::Language => "language",
         OrderByField::LanguageConfidence => "language_confidence",
@@ -1339,6 +1545,10 @@ fn get_column_expr(column: Column) -> Expr {
         Column::VideoTracks => Expr::col((Items::Table, Items::VideoTracks)),
         Column::SubtitleTracks => Expr::col((Items::Table, Items::SubtitleTracks)),
         Column::Blurhash => Expr::col((Items::Table, Items::Blurhash)),
+        Column::OutroKind => Expr::col((Items::Table, Items::OutroKind)),
+        Column::ContentEndMs => Expr::col((Items::Table, Items::ContentEndMs)),
+        Column::VideoCodec => Expr::col((Items::Table, Items::VideoCodec)),
+        Column::AudioCodec => Expr::col((Items::Table, Items::AudioCodec)),
         Column::DataId => Expr::col((ItemData::Table, ItemData::Id)),
         Column::Language => Expr::col((ExtractedText::Table, ExtractedText::Language)),
         Column::LanguageConfidence => {
@@ -1387,6 +1597,10 @@ fn get_order_by_expr(field: OrderByField, seed: i64) -> Expr {
         OrderByField::VideoTracks => Expr::col((Items::Table, Items::VideoTracks)),
         OrderByField::SubtitleTracks => Expr::col((Items::Table, Items::SubtitleTracks)),
         OrderByField::Blurhash => Expr::col((Items::Table, Items::Blurhash)),
+        OrderByField::OutroKind => Expr::col((Items::Table, Items::OutroKind)),
+        OrderByField::ContentEndMs => Expr::col((Items::Table, Items::ContentEndMs)),
+        OrderByField::VideoCodec => Expr::col((Items::Table, Items::VideoCodec)),
+        OrderByField::AudioCodec => Expr::col((Items::Table, Items::AudioCodec)),
         OrderByField::DataId => Expr::col((ItemData::Table, ItemData::Id)),
         OrderByField::Language => Expr::col((ExtractedText::Table, ExtractedText::Language)),
         OrderByField::LanguageConfidence => {
@@ -1403,6 +1617,11 @@ fn get_order_by_expr(field: OrderByField, seed: i64) -> Expr {
     }
 }
 
+/// Whether a column belongs to the *text entity* (`item_data` /
+/// `extracted_text` / `setters`), and so is only available once those tables
+/// are joined. This is not a SQL type test: `confidence` and `text_length` are
+/// numeric and listed, while string-valued `items`/`files` columns such as
+/// `blurhash`, `path` or `outro_kind` are not.
 fn is_text_column(column: Column) -> bool {
     matches!(
         column,
@@ -1459,12 +1678,146 @@ enum Files {
 mod tests {
     use super::*;
     use sea_query::SqliteQueryBuilder;
+    use sea_query_sqlx::SqlxBinder;
+    use serde_json::json;
 
     fn base_query(partition_by: Option<Vec<Column>>) -> PqlQuery {
         PqlQuery {
             partition_by,
             ..Default::default()
         }
+    }
+
+    fn render(query: SelectStatement, with_clause: Option<WithClause>) -> String {
+        match with_clause {
+            Some(with_clause) => query.with(with_clause).to_string(SqliteQueryBuilder),
+            None => query.to_string(SqliteQueryBuilder),
+        }
+    }
+
+    fn render_built(built: PqlBuilderResult) -> String {
+        render(built.paginated_query(), built.with_clause)
+    }
+
+    fn render_item_set(built: &ItemSetBuild) -> String {
+        render(built.query.clone(), built.with_clause.clone())
+    }
+
+    /// A bookmarks-filtered query that also carries a rank-producing order
+    /// filter — the shape that exercises rank columns, the order CTE join and
+    /// the top-level order args at once.
+    fn bookmarks_query(extra: serde_json::Value) -> PqlQuery {
+        let mut value = json!({
+            "query": {
+                "in_bookmarks": { "filter": true, "user": "alice" },
+                "order_by": true
+            },
+            "select": ["sha256", "path"],
+            "page": 2,
+            "page_size": 5
+        });
+        let object = value.as_object_mut().expect("object");
+        for (key, item) in extra.as_object().expect("object").clone() {
+            object.insert(key, item);
+        }
+        serde_json::from_value(value).expect("deserialize PqlQuery")
+    }
+
+    /// Two order filters at the same priority collapse into one coalesced
+    /// key; the second one is the root CTE, whose rank is projected as the
+    /// bare `order_rank` alias.
+    fn coalesced_order_query() -> PqlQuery {
+        serde_json::from_value(json!({
+            "query": {
+                "and_": [
+                    {
+                        "order_by": true,
+                        "priority": 100,
+                        "match_text": {
+                            "match": "hello",
+                            "raw_fts5_match": false,
+                            "setters": [],
+                            "languages": [],
+                            "min_language_confidence": 0,
+                            "min_confidence": 0,
+                            "min_length": 0,
+                            "max_length": 0
+                        }
+                    },
+                    {
+                        "order_by": true,
+                        "priority": 100,
+                        "in_bookmarks": { "filter": true }
+                    }
+                ]
+            },
+            "select": [],
+            "page": 1,
+            "page_size": 10
+        }))
+        .expect("deserialize PqlQuery")
+    }
+
+    /// The production "anytext" shape: two sortable filters OR'ed together at
+    /// one priority, fused with RRF instead of coalesced.
+    fn rrf_order_query() -> PqlQuery {
+        serde_json::from_value(json!({
+            "query": {
+                "or_": [
+                    {
+                        "order_by": true,
+                        "direction": "desc",
+                        "priority": 100,
+                        "row_n": true,
+                        "row_n_direction": "asc",
+                        "rrf": { "k": 10, "weight": 0.5 },
+                        "match_text": {
+                            "match": "hello",
+                            "raw_fts5_match": false,
+                            "setters": [],
+                            "languages": [],
+                            "min_language_confidence": 0,
+                            "min_confidence": 0,
+                            "min_length": 0,
+                            "max_length": 0
+                        }
+                    },
+                    {
+                        "order_by": true,
+                        "direction": "desc",
+                        "priority": 100,
+                        "row_n": true,
+                        "row_n_direction": "asc",
+                        "rrf": { "k": 60, "weight": 0.6 },
+                        "in_bookmarks": { "filter": true }
+                    }
+                ]
+            },
+            "select": [],
+            "page": 1,
+            "page_size": 10
+        }))
+        .expect("deserialize PqlQuery")
+    }
+
+    fn as_text_entity(mut query: PqlQuery) -> PqlQuery {
+        query.entity = EntityType::Text;
+        query
+    }
+
+    async fn run_item_set(query: PqlQuery) -> Result<(), sqlx::Error> {
+        crate::db::sql_functions::ensure_sqlite_extensions().expect("register SQLite extensions");
+        let built = build_item_set_preprocessed(query).expect("item set build");
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+
+        let (sql, values) = match built.with_clause {
+            Some(with_clause) => built.query.with(with_clause).build_sqlx(SqliteQueryBuilder),
+            None => built.query.build_sqlx(SqliteQueryBuilder),
+        };
+        let _rows = sqlx::query_with(sqlx::AssertSqlSafe(sql.as_str()), values)
+            .fetch_all(&mut dbs.index_conn)
+            .await?;
+        Ok(())
     }
 
     // Regression: the UI's combined "anytext" query ORs multiple sortable
@@ -1554,6 +1907,250 @@ mod tests {
         );
     }
 
+    // Belt and braces for the BuildMode refactor: the results and count
+    // renderings of a filtered, ordered, paginated query are frozen verbatim.
+    #[test]
+    fn filtered_ordered_results_and_count_sql_are_pinned() {
+        let results =
+            render_built(build_query(bookmarks_query(json!({})), false).expect("results"));
+        assert_eq!(
+            results,
+            r#"WITH "begin_cte" AS (SELECT "files"."id" AS "file_id", "files"."item_id" AS "item_id" FROM "files") SELECT "begin_cte"."item_id", "begin_cte"."file_id", MAX("user_data"."bookmarks"."time_added") AS "order_rank", "files"."sha256" AS "sha256", "files"."path" AS "path" FROM "begin_cte" INNER JOIN "files" ON "files"."id" = "begin_cte"."file_id" INNER JOIN "user_data"."bookmarks" ON "user_data"."bookmarks"."sha256" = "files"."sha256" INNER JOIN "items" ON "items"."id" = "begin_cte"."item_id" WHERE "user_data"."bookmarks"."user" IN ('alice', '*') GROUP BY "begin_cte"."file_id" ORDER BY "order_rank" DESC NULLS LAST, "files"."last_modified" DESC NULLS LAST LIMIT 5 OFFSET 5"#
+        );
+
+        let count = render_built(build_query(bookmarks_query(json!({})), true).expect("count"));
+        assert_eq!(
+            count,
+            r#"WITH "begin_cte" AS (SELECT "files"."id" AS "file_id", "files"."item_id" AS "item_id" FROM "files") SELECT COUNT(*) AS "total" FROM (SELECT "begin_cte"."item_id", "begin_cte"."file_id" FROM "begin_cte" INNER JOIN "files" ON "files"."id" = "begin_cte"."file_id" INNER JOIN "user_data"."bookmarks" ON "user_data"."bookmarks"."sha256" = "files"."sha256" INNER JOIN "items" ON "items"."id" = "begin_cte"."item_id" WHERE "user_data"."bookmarks"."user" IN ('alice', '*') GROUP BY "begin_cte"."file_id") AS "wrapped_query""#
+        );
+    }
+
+    #[test]
+    fn item_set_drops_the_sort_the_pagination_and_the_user_selects() {
+        let built = build_item_set_preprocessed(bookmarks_query(json!({}))).expect("item set");
+        let sql = render_item_set(&built);
+
+        assert!(sql.starts_with(r#"WITH "begin_cte" AS ("#), "{sql}");
+        assert!(!sql.contains("ORDER BY"), "{sql}");
+        assert!(!sql.contains("LIMIT"), "{sql}");
+        assert!(!sql.contains("OFFSET"), "{sql}");
+        // Membership-shaping work is kept: the filter's rank column and the
+        // bookmarks join are still there.
+        assert!(sql.contains(r#"MAX("user_data"."bookmarks"."time_added") AS "order_rank""#));
+        assert!(sql.contains(r#""begin_cte"."file_id""#));
+        assert!(sql.contains(r#""begin_cte"."item_id""#));
+        // ...but the payload columns the caller never reads are not.
+        assert!(!sql.contains(r#"AS "sha256""#), "{sql}");
+        assert!(!sql.contains(r#"AS "path""#), "{sql}");
+
+        let primary = built.primary_order.expect("rank filter is the primary key");
+        assert_eq!(primary.alias, "order_rank");
+        assert_eq!(primary.direction, OrderDirection::Desc);
+        assert!(primary.nulls_last);
+    }
+
+    #[test]
+    fn item_set_projects_the_default_last_modified_order() {
+        let built = build_item_set_preprocessed(PqlQuery::default()).expect("item set");
+        let sql = render_item_set(&built);
+
+        assert!(
+            sql.contains(r#""files"."last_modified" AS "o0_last_modified""#),
+            "{sql}"
+        );
+        assert!(!sql.contains("ORDER BY"), "{sql}");
+
+        let primary = built.primary_order.expect("default order is a key");
+        assert_eq!(primary.alias, "o0_last_modified");
+        assert_eq!(primary.direction, OrderDirection::Desc);
+    }
+
+    #[test]
+    fn item_set_follows_an_explicit_column_order() {
+        let query = PqlQuery {
+            order_by: vec![OrderArgs {
+                order_by: OrderByField::LastModified,
+                order: Some(OrderDirection::Asc),
+                priority: 0,
+            }],
+            ..PqlQuery::default()
+        };
+        let built = build_item_set_preprocessed(query).expect("item set");
+
+        let primary = built
+            .primary_order
+            .clone()
+            .expect("explicit order is a key");
+        assert_eq!(primary.alias, "o0_last_modified");
+        assert_eq!(primary.direction, OrderDirection::Asc);
+        assert!(
+            render_item_set(&built).contains(r#"AS "o0_last_modified""#),
+            "the key must be a plain selectable alias"
+        );
+    }
+
+    // A query that orders by nothing renders without ORDER BY in results mode
+    // too, so there is no key to report and the caller falls back.
+    #[test]
+    fn item_set_without_any_order_reports_no_primary_key() {
+        let query = PqlQuery {
+            order_by: Vec::new(),
+            ..PqlQuery::default()
+        };
+        let built = build_item_set_preprocessed(query).expect("item set");
+        assert!(built.primary_order.is_none());
+        assert!(!render_item_set(&built).contains(r#"AS "o0_"#));
+    }
+
+    #[tokio::test]
+    async fn item_set_seeded_random_order_yields_a_usable_key() {
+        let query = PqlQuery {
+            order_by: vec![OrderArgs {
+                order_by: OrderByField::Random,
+                ..OrderArgs::default()
+            }],
+            seed: Some(987_654),
+            ..PqlQuery::default()
+        };
+        let built = build_item_set_preprocessed(query.clone()).expect("item set");
+        let sql = render_item_set(&built);
+
+        assert!(sql.contains(r#"AS "o0_random""#), "{sql}");
+        assert!(sql.contains("pk_mix"), "{sql}");
+        let primary = built.primary_order.expect("random order is a key");
+        assert_eq!(primary.alias, "o0_random");
+        // `Random` carries no explicit direction, and only `last_modified`
+        // defaults to descending.
+        assert_eq!(primary.direction, OrderDirection::Asc);
+        assert!(primary.nulls_last);
+
+        // `pk_mix` is a runtime function: the key is only usable if the
+        // statement actually executes.
+        run_item_set(query).await.expect("random item set query");
+    }
+
+    // Sort bounds are results-mode semantics (the count build drops them), and
+    // membership has to match what the results query returns.
+    #[test]
+    fn item_set_keeps_sort_bound_wrappers() {
+        let query = bookmarks_query(json!({
+            "query": {
+                "in_bookmarks": { "filter": true, "user": "alice" },
+                "order_by": true,
+                "gt": 5
+            }
+        }));
+        let sql = render_item_set(&build_item_set_preprocessed(query).expect("item set"));
+        assert!(sql.contains(r#""wrapped_n0_InBookmarks""#), "{sql}");
+        assert!(sql.contains(r#""order_rank" > 5"#), "{sql}");
+    }
+
+    #[test]
+    fn item_set_coalesced_order_projects_a_single_key() {
+        let built = build_item_set_preprocessed(coalesced_order_query()).expect("item set");
+        let sql = render_item_set(&built);
+
+        let primary = built.primary_order.expect("coalesced order is a key");
+        assert_eq!(primary.alias, ITEM_SET_COMPOSITE_ORDER_ALIAS);
+        assert_eq!(primary.direction, OrderDirection::Asc);
+        assert!(sql.contains(r#"AS "primary_order_key""#), "{sql}");
+        // The composite is computed one level out, where the per-filter rank
+        // labels are real columns rather than sibling output aliases.
+        assert!(sql.contains(r#"AS "item_set""#), "{sql}");
+        assert!(!sql.contains("ORDER BY"), "{sql}");
+    }
+
+    #[test]
+    fn item_set_propagates_uses_user_data() {
+        let built = build_item_set_preprocessed(bookmarks_query(json!({}))).expect("item set");
+        assert!(built.uses_user_data);
+
+        let plain = build_item_set_preprocessed(PqlQuery::default()).expect("item set");
+        assert!(!plain.uses_user_data);
+    }
+
+    #[tokio::test]
+    async fn item_set_runs_against_the_database() {
+        run_item_set(bookmarks_query(json!({})))
+            .await
+            .expect("filtered item set query");
+        run_item_set(PqlQuery::default())
+            .await
+            .expect("default item set query");
+    }
+
+    // The coalesced key references the root filter's rank, which the results
+    // build only ever names as the bare `order_rank` output alias — SQLite
+    // cannot resolve that from a sibling result column, hence the wrapper.
+    #[tokio::test]
+    async fn item_set_coalesced_order_runs_against_the_database() {
+        run_item_set(coalesced_order_query())
+            .await
+            .expect("coalesced item set query");
+    }
+
+    // The RRF branch of the composite key: same wrapper, but the expression is
+    // a weighted sum of reciprocal ranks rather than a COALESCE.
+    #[tokio::test]
+    async fn item_set_rrf_composite_order_projects_a_single_key() {
+        let built = build_item_set_preprocessed(rrf_order_query()).expect("item set");
+        let sql = render_item_set(&built);
+
+        let primary = built.primary_order.expect("rrf order is a key");
+        assert_eq!(primary.alias, ITEM_SET_COMPOSITE_ORDER_ALIAS);
+        assert_eq!(primary.direction, OrderDirection::Desc);
+        assert!(primary.nulls_last);
+        assert!(sql.contains(r#"AS "primary_order_key""#), "{sql}");
+        assert!(sql.contains(r#"AS "item_set""#), "{sql}");
+        // RRF terms, not a COALESCE fallback chain.
+        assert!(sql.contains("(1.0) / ((10)"), "{sql}");
+        assert!(sql.contains("(1.0) / ((60)"), "{sql}");
+
+        run_item_set(rrf_order_query())
+            .await
+            .expect("rrf item set query");
+    }
+
+    // `entity: "text"` makes every row a text/file pair, so `data_id` has to
+    // survive into the item set — including through the composite wrapper,
+    // which re-projects the passthrough columns by hand.
+    #[tokio::test]
+    async fn item_set_text_entity_projects_data_id() {
+        let plain = build_item_set_preprocessed(as_text_entity(bookmarks_query(json!({}))))
+            .expect("item set");
+        let plain_sql = render_item_set(&plain);
+        assert!(plain_sql.contains(r#""data_id""#), "{plain_sql}");
+
+        let composite =
+            build_item_set_preprocessed(as_text_entity(coalesced_order_query())).expect("item set");
+        let composite_sql = render_item_set(&composite);
+        assert!(
+            composite_sql.contains(r#""item_set"."data_id""#),
+            "{composite_sql}"
+        );
+
+        run_item_set(as_text_entity(bookmarks_query(json!({}))))
+            .await
+            .expect("text entity item set query");
+        run_item_set(as_text_entity(coalesced_order_query()))
+            .await
+            .expect("text entity composite item set query");
+    }
+
+    // Item-set semantics are partition-free; the seam clears `partition_by` so
+    // a caller that leaves it set gets the same statement either way.
+    #[test]
+    fn item_set_ignores_partition_by() {
+        let mut partitioned = bookmarks_query(json!({}));
+        partitioned.partition_by = Some(vec![Column::ItemId]);
+        let partitioned =
+            build_item_set_preprocessed(partitioned).expect("partitioned item set builds");
+        let plain = build_item_set_preprocessed(bookmarks_query(json!({}))).expect("item set");
+
+        assert_eq!(render_item_set(&partitioned), render_item_set(&plain));
+        assert_eq!(partitioned.primary_order, plain.primary_order);
+    }
+
     #[test]
     fn empty_partition_by_count_query_matches_no_partitioning() {
         let with_empty =
@@ -1599,6 +2196,10 @@ enum Items {
     VideoTracks,
     SubtitleTracks,
     Blurhash,
+    OutroKind,
+    ContentEndMs,
+    VideoCodec,
+    AudioCodec,
 }
 
 #[derive(sea_query::Iden)]
@@ -1660,6 +2261,17 @@ enum Setters {
     Name,
 }
 
+/// The extraction failure ledger (docs/failed-media-retry-design.md). Only
+/// the columns the work-query anti-join needs.
+#[derive(sea_query::Iden)]
+enum ItemExtractionErrors {
+    Table,
+    ItemId,
+    SetterId,
+    Attempts,
+    SkipAfter,
+}
+
 #[derive(sea_query::Iden)]
 enum Tags {
     Table,
@@ -1683,4 +2295,23 @@ enum Bookmarks {
     Namespace,
     Sha256,
     TimeAdded,
+}
+
+/// Board identity. Membership is head-version-only, which is why
+/// `HeadVersionId` is the join key rather than a version list.
+#[derive(sea_query::Iden)]
+enum Pinboards {
+    Table,
+    Id,
+    User,
+    HeadVersionId,
+}
+
+/// The reverse membership index; `idx_pinboard_version_items_sha256`
+/// (sha256, version_id) drives the probe from a file's hash.
+#[derive(sea_query::Iden)]
+enum PinboardVersionItems {
+    Table,
+    VersionId,
+    Sha256,
 }

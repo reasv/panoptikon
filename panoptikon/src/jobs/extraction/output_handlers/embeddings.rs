@@ -209,9 +209,9 @@ mod tests {
         assert!(f16_to_f32(0x8000) == 0.0 && f16_to_f32(0x8000).is_sign_negative());
         assert_eq!(f16_to_f32(0x3c00), 1.0);
         assert_eq!(f16_to_f32(0xc000), -2.0);
-        assert_eq!(f16_to_f32(0x3555), 0.333251953125); // 1/3 rounded to f16
+        assert_eq!(f16_to_f32(0x3555), 0.333_251_95); // 1/3 rounded to f16
         assert_eq!(f16_to_f32(0x7bff), 65504.0); // max finite
-        assert_eq!(f16_to_f32(0x0400), 6.103515625e-5); // min normal
+        assert_eq!(f16_to_f32(0x0400), 6.103_515_6e-5); // min normal
         assert_eq!(f16_to_f32(0x0200), 2.0f32.powi(-15)); // subnormal
         assert_eq!(f16_to_f32(0x0001), 2.0f32.powi(-24)); // min subnormal
         assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);

@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use crate::api_error::ApiError;
 use crate::inferio_client::{InferenceFile, InferenceInput};
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
+use crate::media_tools::stderr_tail;
 
 pub(super) async fn build_audio_tracks_inputs(
     item: &JobInputData,
@@ -17,8 +18,9 @@ pub(super) async fn build_audio_tracks_inputs(
         .and_then(Value::as_i64)
         .unwrap_or(16000) as u32;
     let max_tracks = opts.get("max_tracks").and_then(Value::as_i64).unwrap_or(4) as usize;
+    let max_duration = opts.get("max_duration").and_then(Value::as_f64);
 
-    let audio = load_audio_single(&item.path, sample_rate)?;
+    let audio = load_audio_single(&item.path, sample_rate, max_duration)?;
     let mut outputs = Vec::new();
     for track in audio.into_iter().take(max_tracks) {
         let bytes = serialize_npy_f32(&track);
@@ -43,8 +45,9 @@ pub(super) async fn build_audio_files_inputs(
         .and_then(Value::as_i64)
         .unwrap_or(48000) as u32;
     let max_tracks = opts.get("max_tracks").and_then(Value::as_i64).unwrap_or(4) as usize;
+    let max_duration = opts.get("max_duration").and_then(Value::as_f64);
 
-    let audio = load_audio_single(&item.path, sample_rate)?;
+    let audio = load_audio_single(&item.path, sample_rate, max_duration)?;
     let mut outputs = Vec::new();
     for track in audio.into_iter().take(max_tracks) {
         let wav_bytes = audio_to_wav_bytes(&track, sample_rate);
@@ -75,8 +78,19 @@ fn serialize_npy_f32(values: &[f32]) -> Vec<u8> {
     out
 }
 
-fn load_audio_single(path: &str, sample_rate: u32) -> ApiResult<Vec<Vec<f32>>> {
-    let output = std::process::Command::new(crate::media_tools::ffmpeg())
+/// Decode the audio track to mono PCM at `sample_rate`, optionally capped
+/// to the first `max_duration` seconds (`-t` as an ffmpeg output option, so
+/// decoding stops at the cap instead of decoding everything and trimming).
+/// The cap is a per-model registry opt: embedding models whose receptive
+/// field is seconds long gain nothing past it, while transcription models
+/// must keep the whole track and simply do not set it.
+fn load_audio_single(
+    path: &str,
+    sample_rate: u32,
+    max_duration: Option<f64>,
+) -> ApiResult<Vec<Vec<f32>>> {
+    let mut command = std::process::Command::new(crate::media_tools::ffmpeg());
+    command
         .arg("-nostdin")
         .arg("-threads")
         .arg("0")
@@ -89,9 +103,11 @@ fn load_audio_single(path: &str, sample_rate: u32) -> ApiResult<Vec<Vec<f32>>> {
         .arg("-acodec")
         .arg("pcm_s16le")
         .arg("-ar")
-        .arg(sample_rate.to_string())
-        .arg("-")
-        .output();
+        .arg(sample_rate.to_string());
+    if let Some(seconds) = max_duration.filter(|seconds| *seconds > 0.0) {
+        command.arg("-t").arg(seconds.to_string());
+    }
+    let output = command.arg("-").output();
 
     match output {
         Ok(output) => {
@@ -102,10 +118,16 @@ fn load_audio_single(path: &str, sample_rate: u32) -> ApiResult<Vec<Vec<f32>>> {
             if !has_audio_stream(path)? {
                 return Ok(Vec::new());
             }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(ApiError::internal(format!("ffmpeg failed: {stderr}")))
+            // ffmpeg opened the file itself, so a corrupt track and a
+            // transient mount hiccup are indistinguishable: an unconfirmed
+            // payload verdict, which needs a second failing run to settle.
+            let stderr = stderr_tail(&output.stderr);
+            Err(ApiError::input_unconfirmed(format!(
+                "ffmpeg failed to decode audio from {path}: {stderr}"
+            )))
         }
-        Err(err) => Err(ApiError::internal(format!("ffmpeg failed: {err}"))),
+        // A spawn failure is never a verdict on the media.
+        Err(err) => Err(crate::media_tools::spawn_error("ffmpeg", &err)),
     }
 }
 
@@ -119,16 +141,26 @@ fn has_audio_stream(path: &str) -> ApiResult<bool> {
         .arg("json")
         .arg(path)
         .output()
-        .map_err(|err| ApiError::internal(format!("ffprobe failed: {err}")))?;
+        .map_err(|err| crate::media_tools::spawn_error("ffprobe", &err))?;
     // ffprobe failing is not the same as "no audio stream": a corrupt file or
     // a transient read error (e.g. an SMB hiccup) must fail the item so it is
-    // retried, not permanently marked processed with a placeholder.
+    // retried, not permanently marked processed with a placeholder. Which of
+    // the two it was cannot be told apart here, hence the unconfirmed
+    // threshold rather than a class.
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ApiError::internal(format!("ffprobe failed: {stderr}")));
+        let stderr = stderr_tail(&output.stderr);
+        return Err(ApiError::input_unconfirmed(format!(
+            "ffprobe failed on {path}: {stderr}"
+        )));
     }
-    let value: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|err| ApiError::internal(format!("ffprobe output unparseable: {err}")))?;
+    // Exit 0 with stdout we cannot parse is not a verdict about the file:
+    // ffprobe read it fine and something on *our* side of the pipe went wrong
+    // (a truncated read, a version whose `-of json` shape we do not
+    // understand). Transient, so the item is retried rather than suppressed.
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|err| {
+        tracing::error!(error = %err, path, "ffprobe output is unparseable");
+        ApiError::internal(format!("ffprobe output for {path} is unparseable: {err}"))
+    })?;
     let streams = value
         .get("streams")
         .and_then(Value::as_array)

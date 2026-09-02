@@ -19,14 +19,15 @@
 //! - **Priced path** (the replica has an [`Admission`] handle, i.e. a known
 //!   board and a cost dimension that scales): window size comes from the
 //!   ledger — a few admitted GPU batches' worth of units — additionally
-//!   bounded by payload bytes ([`MAX_WINDOW_BYTES`], well under the 512 MiB
-//!   frame limit). Before dispatch the window takes a **grant** out of the
+//!   bounded by payload bytes ([`MAX_WINDOW_BYTES`], well under the frame
+//!   limit [`MAX_FRAME_BYTES`]). Before dispatch the window takes a **grant** out of the
 //!   board's headroom and forwards it on the request frame; the worker's
 //!   packing harness splits the window into GPU batches within that budget
 //!   and enforces the user cap as an item count at pack time. Payload bytes are
 //!   still the dispatcher's job here: window formation always takes the first
-//!   request whether or not it fits, and an oversized frame is a fatal error, so
-//!   a lone over-budget request is split across frames ([`frame_chunks`]). When
+//!   request whether or not it fits, and a frame over the limit is refused by
+//!   the transport, so a lone over-budget request is split across frames
+//!   ([`frame_chunks`]). When
 //!   the requests carry a user cap the window is additionally bounded in items,
 //!   to the same batch depth the unit budget uses ([`priced_item_bound`]).
 //! - **Unpriced path** (`none`-class models, any host with no inventory, a
@@ -68,6 +69,12 @@
 //!   in the window and everything still queued, then report the death to the
 //!   manager so the model is dropped from all LRUs.
 //!
+//! A typed per-item error slot (`WorkerOutput::Error`, protocol doc) is an
+//! ordinary output as far as this layer is concerned: the worker still
+//! returns one slot per input, so the count-based split below keeps every
+//! slot with its own request ([`split_window_outputs`]). This layer never
+//! inspects or acts on them — only the caller that owns the item does.
+//!
 //! Every exit path settles the window's grant: a response (success or a
 //! per-request error) counts as a real window and feeds the ledger's ramp,
 //! deflation and cost fit; a fatal error or an aborted task settles as
@@ -90,7 +97,7 @@
 //! future work): ANY replica failing fatally kills the whole model. Queued
 //! requests are failed, windows in flight on other replicas are aborted
 //! (their callers see errors; the dropped workers are reaped by kill_on_drop
-//! + the Job Object), idle replicas get the ladder-less `kill()`, and
+//! plus the Job Object), idle replicas get the ladder-less `kill()`, and
 //! `handle_worker_death` runs once under the generation guard. Graceful
 //! shutdown is the opposite: in-flight windows finish, then every replica
 //! gets the graceful unload ladder, concurrently.
@@ -120,20 +127,21 @@ use super::ledger::{
 };
 use super::manager::ModelManager;
 use super::worker::{
-    MAX_FRAME_BYTES, Worker, WorkerError, WorkerInput, WorkerOutput,
+    MAX_FRAME_BYTES, Worker, WorkerError, WorkerInput, WorkerOutput, estimate_input_bytes,
 };
 
-/// Payload-byte ceiling for one window. The 512 MiB frame limit is the hard
+/// Payload-byte ceiling for one window. [`MAX_FRAME_BYTES`] is the hard
 /// wall; half of it leaves ample room for the msgpack map overhead around the
 /// inputs and for the grant/fit maps, and a window that big is already far
-/// past the point where deeper batching buys anything.
+/// past the point where deeper batching buys anything. Per-input sizes come
+/// from the worker's own [`estimate_input_bytes`], the same estimator
+/// extraction's frame-budget check uses, so the two never disagree about
+/// what fits.
 pub(crate) const MAX_WINDOW_BYTES: usize = MAX_FRAME_BYTES / 2;
-
-/// Per-input overhead charged against [`MAX_WINDOW_BYTES`] on top of the raw
-/// file bytes: the msgpack map keys plus a small allowance for JSON-like
-/// `data`. Deliberately crude — this bound exists to stay clear of the frame
-/// limit, not to predict the encoded size.
-const INPUT_BYTE_OVERHEAD: usize = 256;
+const _: () = assert!(
+    MAX_WINDOW_BYTES < MAX_FRAME_BYTES,
+    "the window bound must stay under the hard frame limit"
+);
 
 /// Estimated units for a `pixel`-priced input whose image header could not be
 /// read at dispatch (missing bytes, an encoding `image` cannot sniff). ~2 MP,
@@ -350,21 +358,12 @@ fn request_units(inputs: &[WorkerInput], cost: &CostDimension) -> u64 {
     }
 }
 
-/// Estimated wire bytes for one input: its payload plus a crude fixed
-/// allowance for the msgpack map around it.
-fn input_bytes(input: &WorkerInput) -> usize {
-    input
-        .file
-        .as_ref()
-        .map_or(0, Vec::len)
-        .saturating_add(text_bytes(input))
-        .saturating_add(INPUT_BYTE_OVERHEAD)
-}
-
+/// Estimated wire bytes for a request: the worker's per-input estimate,
+/// summed.
 fn request_bytes(inputs: &[WorkerInput]) -> usize {
     inputs
         .iter()
-        .map(input_bytes)
+        .map(estimate_input_bytes)
         .fold(0usize, usize::saturating_add)
 }
 
@@ -561,8 +560,7 @@ pub(crate) async fn run_dispatcher(
             ctx.stats.total_batches.fetch_add(1, Relaxed);
             ctx.stats.in_flight_windows.fetch_add(1, Relaxed);
             let inference_id = ctx.inference_id.clone();
-            in_flight
-                .spawn(async move { run_batch(&inference_id, replica, window, plan).await });
+            in_flight.spawn(async move { run_batch(&inference_id, replica, window, plan).await });
         }
         // Demand signal for the ledger's contention split: an idle model must
         // stop counting as hungry, or its neighbours keep splitting headroom
@@ -693,8 +691,7 @@ pub(crate) async fn run_dispatcher(
             // set as one unit, so the set shuts down as one unit). Moving
             // `worker` out of each Replica drops its admission handle, which
             // is how the ledger stops charging a model that has unloaded.
-            let results =
-                join_all(free.into_iter().map(|replica| replica.worker.shutdown())).await;
+            let results = join_all(free.into_iter().map(|replica| replica.worker.shutdown())).await;
             for result in results {
                 if let Err(err) = result {
                     tracing::warn!(
@@ -886,12 +883,13 @@ async fn run_batch_inner(
         window.into_iter().map(|queued| queued.request).collect();
 
     match predict_chunked(inference_id, worker, &combined, grant, fit, item_bound).await {
-        Ok(mut outputs) => {
+        Ok(outputs) => {
             // Split outputs back per request, preserving request order.
-            for (request, count) in window.into_iter().zip(counts) {
-                let rest = outputs.split_off(count);
-                let _ = request.reply.send(Ok(outputs));
-                outputs = rest;
+            for (request, slice) in window
+                .into_iter()
+                .zip(split_window_outputs(outputs, &counts))
+            {
+                let _ = request.reply.send(Ok(slice));
             }
             (
                 BatchOutcome::Continue,
@@ -985,11 +983,10 @@ fn error_reports_oom(err: &anyhow::Error) -> bool {
 /// How a fatal dispatch failure settles with the ledger.
 ///
 /// "Not a [`WorkerError`]" means the model is going down; it does **not**
-/// mean the replica died. The frame can have been rejected by `encode_frame`
-/// before a byte hit the wire, or the stream can have been torn down for a
-/// desync the dispatcher itself caused by dropping a request future — the
-/// path a user cancel produces — and in both cases the process was alive and
-/// answering. [`WindowOutcome::WorkerDied`] is read as evidence about memory
+/// mean the replica died. The stream can have been torn down for a desync
+/// the dispatcher itself caused by dropping a request future — the path a
+/// user cancel produces — and the process was alive and answering.
+/// [`WindowOutcome::WorkerDied`] is read as evidence about memory
 /// on unified boards (DP-2's synthetic negative sample), so it is reserved
 /// for a worker that actually stopped answering; everything else is an
 /// abort, which teaches the ledger nothing.
@@ -1014,7 +1011,7 @@ fn fatal_settlement(worker: &mut Worker) -> WindowOutcome {
 /// goes in one frame and the worker's harness does the splitting inside the
 /// grant — but it is still split on **payload bytes**, because window formation
 /// always takes the first request whether or not it fits and an oversized frame
-/// is a fatal error that kills the model (see [`frame_chunks`]).
+/// is refused by the transport (see [`frame_chunks`]).
 ///
 /// A [`WorkerError`] on any sub-batch fails the whole request (no fallback:
 /// there is nothing smaller than one request's sub-batch to fall back to,
@@ -1028,7 +1025,16 @@ async fn run_single(
     fit: Option<&FitSnapshot>,
     item_bound: Option<usize>,
 ) -> (BatchOutcome, WindowOutcome) {
-    match predict_chunked(inference_id, worker, &request.inputs, grant, fit, item_bound).await {
+    match predict_chunked(
+        inference_id,
+        worker,
+        &request.inputs,
+        grant,
+        fit,
+        item_bound,
+    )
+    .await
+    {
         Ok(outputs) => {
             let _ = request.reply.send(Ok(outputs));
             (
@@ -1059,23 +1065,28 @@ async fn run_single(
 ///   size and the user cap it enforces itself, and it applies to *every* frame
 ///   the dispatcher sends — including the merged window, which used to ignore it
 ///   entirely and hand an unbounded batch to a worker with no packer.
-/// - **payload bytes**, always. A window is byte-bounded at formation, but the
-///   at-least-one rule means a *single* request can exceed the bound on its own,
-///   and `encode_frame` answers an oversized frame with a plain `anyhow` error —
-///   which the dispatcher classifies as fatal and kills the model for. Chunking
-///   here turns "one huge request kills the model" into "one huge request is
+/// - **payload bytes**, always (`byte_bound`, [`MAX_WINDOW_BYTES`] in
+///   production). A window is byte-bounded at formation, but the at-least-one
+///   rule means a *single* request can exceed the bound on its own, and
+///   `encode_frame` refuses a frame over [`MAX_FRAME_BYTES`] outright — a
+///   per-request [`WorkerError`], so the model survives but the request fails.
+///   Chunking here turns "one huge request fails" into "one huge request is
 ///   sent in pieces". A single input larger than the bound still goes alone and
 ///   may still fail: that is the frame limit doing its job, and there is nothing
 ///   smaller to split into.
-fn frame_chunks(inputs: &[WorkerInput], item_bound: Option<usize>) -> Vec<usize> {
+fn frame_chunks(
+    inputs: &[WorkerInput],
+    item_bound: Option<usize>,
+    byte_bound: usize,
+) -> Vec<usize> {
     let items = item_bound.unwrap_or(usize::MAX).max(1);
     let mut chunks: Vec<usize> = Vec::new();
     let mut current = 0usize;
     let mut bytes = 0usize;
     for input in inputs {
-        let cost = input_bytes(input);
-        let would_overflow = current > 0
-            && (current >= items || bytes.saturating_add(cost) > MAX_WINDOW_BYTES);
+        let cost = estimate_input_bytes(input);
+        let would_overflow =
+            current > 0 && (current >= items || bytes.saturating_add(cost) > byte_bound);
         if would_overflow {
             chunks.push(current);
             current = 0;
@@ -1104,7 +1115,7 @@ async fn predict_chunked(
     fit: Option<&FitSnapshot>,
     item_bound: Option<usize>,
 ) -> Result<Vec<WorkerOutput>> {
-    let chunks = frame_chunks(inputs, item_bound);
+    let chunks = frame_chunks(inputs, item_bound, MAX_WINDOW_BYTES);
     if chunks.len() <= 1 {
         return worker.predict(inputs, grant, fit).await;
     }
@@ -1139,6 +1150,30 @@ fn halved_for_retry(grant: Option<&Grant>) -> Option<Grant> {
         unit_budget: (grant.unit_budget / 2).max(1),
         ..*grant
     })
+}
+
+/// Cut a merged window's outputs back into one slice per request, in the
+/// order the requests were merged.
+///
+/// Purely positional, and that is the point: the worker returns exactly one
+/// slot per input whether that slot is a payload or a typed per-item error
+/// (protocol doc), so the same count-based cut keeps every error slot with
+/// the request whose input produced it. Sending someone else's error slot to
+/// a request would attach an "undecodable media" verdict to the wrong item.
+///
+/// The worker's count check (`Worker::predict`) guarantees
+/// `outputs.len() == counts.iter().sum()`, which this relies on.
+fn split_window_outputs(
+    mut outputs: Vec<WorkerOutput>,
+    counts: &[usize],
+) -> Vec<Vec<WorkerOutput>> {
+    let mut slices = Vec::with_capacity(counts.len());
+    for &count in counts {
+        let rest = outputs.split_off(count);
+        slices.push(outputs);
+        outputs = rest;
+    }
+    slices
 }
 
 /// Fail every request with a copy of the same error message (anyhow errors
@@ -1184,7 +1219,10 @@ mod tests {
         ];
         // Budget 8: 3 + 4 fit (7), the next 2 would exceed -> take 2, even
         // though the trailing 1-unit request would still fit.
-        assert_eq!(window_take_count(&queued, bounds(8, usize::MAX, usize::MAX)), 2);
+        assert_eq!(
+            window_take_count(&queued, bounds(8, usize::MAX, usize::MAX)),
+            2
+        );
         assert_eq!(
             window_take_count(
                 &[shape(2, 1, None), shape(3, 1, None), shape(3, 1, None)],
@@ -1200,10 +1238,7 @@ mod tests {
     #[test]
     fn oversized_first_request_is_taken_alone() {
         assert_eq!(
-            window_take_count(
-                &[shape(100, 100, None), shape(1, 1, None)],
-                bounds(8, 8, 8)
-            ),
+            window_take_count(&[shape(100, 100, None), shape(1, 1, None)], bounds(8, 8, 8)),
             1
         );
         assert_eq!(
@@ -1246,6 +1281,20 @@ mod tests {
             window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
             2
         );
+        // Extraction's isolation retry (`ISOLATION_MAX_BATCH`): a request
+        // advertising 1 is never merged into a job chunk's window, whichever
+        // side of the chunk it is queued on, so it gets a GPU batch of its own
+        // on every path — the cap bounds items at pack time too.
+        let queued = [shape(7, 7, Some(8)), shape(1, 1, Some(1))];
+        assert_eq!(
+            window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
+            1
+        );
+        let queued = [shape(1, 1, Some(1)), shape(7, 7, Some(8))];
+        assert_eq!(
+            window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
+            1
+        );
     }
 
     /// The payload-byte bound is what keeps a window clear of the 512 MiB
@@ -1276,10 +1325,6 @@ mod tests {
             window_take_count(&queued, bounds(u64::MAX, usize::MAX, 700)),
             2
         );
-        assert!(
-            MAX_WINDOW_BYTES < MAX_FRAME_BYTES,
-            "the window bound must stay well under the hard frame limit"
-        );
     }
 
     /// The unpriced path bounds windows in items: the user cap when present,
@@ -1308,13 +1353,20 @@ mod tests {
     #[test]
     fn a_capped_priced_window_is_bounded_in_items() {
         assert_eq!(priced_item_bound(None), usize::MAX, "no cap, no item bound");
-        assert_eq!(priced_item_bound(Some(0)), usize::MAX, "0 is not an opinion");
+        assert_eq!(
+            priced_item_bound(Some(0)),
+            usize::MAX,
+            "0 is not an opinion"
+        );
         assert_eq!(
             priced_item_bound(Some(1)),
             WINDOW_DEPTH_MULTIPLIER as usize,
             "a cap of 1 still allows a few batches' worth of items"
         );
-        assert_eq!(priced_item_bound(Some(8)), 8 * WINDOW_DEPTH_MULTIPLIER as usize);
+        assert_eq!(
+            priced_item_bound(Some(8)),
+            8 * WINDOW_DEPTH_MULTIPLIER as usize
+        );
         assert_eq!(
             priced_item_bound(Some(u32::MAX)),
             u64::from(u32::MAX) as usize * WINDOW_DEPTH_MULTIPLIER as usize,
@@ -1418,10 +1470,11 @@ mod tests {
         );
     }
 
-    /// Byte accounting charges file bytes plus text plus a fixed per-input
-    /// overhead, so the window bound stays conservative.
+    /// Byte accounting is the worker's own estimator, summed: file bytes plus
+    /// serialized `data` plus a fixed per-input allowance, so the window bound
+    /// stays conservative and agrees with extraction's frame-budget check.
     #[test]
-    fn request_bytes_counts_files_text_and_overhead() {
+    fn request_bytes_sums_the_workers_estimate() {
         let inputs = vec![
             WorkerInput {
                 data: None,
@@ -1432,10 +1485,71 @@ mod tests {
                 file: None,
             },
         ];
-        assert_eq!(
-            request_bytes(&inputs),
-            1000 + 4 + 2 * INPUT_BYTE_OVERHEAD
+        let expected: usize = inputs.iter().map(estimate_input_bytes).sum();
+        assert_eq!(request_bytes(&inputs), expected);
+        assert!(
+            expected > 1000 + 4,
+            "the allowance is charged on top of the payload"
         );
+    }
+
+    /// Splitting a merged window's outputs stays aligned when some slots are
+    /// typed per-item errors: the worker returns one slot per input either
+    /// way, so an error slot must land in the request whose input produced
+    /// it. Misalignment here would hand one item's "undecodable media"
+    /// verdict to a different item, which the extraction job persists.
+    #[test]
+    fn split_keeps_error_slots_with_their_own_request() {
+        use super::super::slot_error::{SlotError, SlotErrorClass};
+
+        let error = |message: &str| {
+            WorkerOutput::Error(SlotError {
+                class: SlotErrorClass::Input,
+                message: message.to_owned(),
+            })
+        };
+        let payload = |tag: u8| WorkerOutput::Bytes(vec![tag]);
+
+        // Window of three requests sized 1, 3, 2 — six inputs, with the
+        // global positions 0 and 4 coming back as error slots.
+        let outputs = vec![
+            error("zero"),
+            payload(1),
+            payload(2),
+            payload(3),
+            error("four"),
+            payload(5),
+        ];
+        let split = split_window_outputs(outputs, &[1, 3, 2]);
+
+        assert_eq!(split.len(), 3);
+        assert_eq!(split[0], vec![error("zero")]);
+        assert_eq!(split[1], vec![payload(1), payload(2), payload(3)]);
+        assert_eq!(split[2], vec![error("four"), payload(5)]);
+    }
+
+    /// The legacy shape (no error slots) and the degenerate ones are the
+    /// same positional cut, which is what makes the rule above additive.
+    #[test]
+    fn split_covers_the_plain_and_degenerate_shapes() {
+        let outputs = vec![
+            WorkerOutput::Json(json!(0)),
+            WorkerOutput::Json(json!(1)),
+            WorkerOutput::Json(json!(2)),
+        ];
+        assert_eq!(
+            split_window_outputs(outputs, &[2, 1]),
+            vec![
+                vec![WorkerOutput::Json(json!(0)), WorkerOutput::Json(json!(1))],
+                vec![WorkerOutput::Json(json!(2))],
+            ]
+        );
+        // A zero-unit request gets an empty slice and shifts nothing.
+        assert_eq!(
+            split_window_outputs(vec![WorkerOutput::Json(json!(0))], &[0, 1]),
+            vec![vec![], vec![WorkerOutput::Json(json!(0))]]
+        );
+        assert!(split_window_outputs(Vec::new(), &[]).is_empty());
     }
 
     fn sized(bytes: usize) -> WorkerInput {
@@ -1448,31 +1562,46 @@ mod tests {
     /// Frames are bounded in items *and* in payload bytes, on every path. The
     /// item bound is the unpriced path's batch size; the byte bound exists
     /// because window formation always takes the first request whether or not it
-    /// fits, and an oversized frame is a plain `anyhow` error the dispatcher
-    /// classifies as fatal — i.e. one huge request would kill the model.
+    /// fits, and the transport refuses an oversized frame — i.e. one huge
+    /// request would fail whole instead of being sent in pieces.
     #[test]
     fn frames_are_chunked_by_items_and_by_bytes() {
         let small: Vec<WorkerInput> = (0..7).map(|_| sized(10)).collect();
-        assert_eq!(frame_chunks(&small, Some(3)), vec![3, 3, 1]);
-        assert_eq!(frame_chunks(&small, None), vec![7], "one frame, no bounds hit");
-        assert_eq!(frame_chunks(&[], Some(3)), Vec::<usize>::new());
-        assert_eq!(frame_chunks(&small, Some(0)), vec![1; 7], "0 is at least 1");
-
-        // Three inputs of a bit over half the window bound each: they cannot
-        // share a frame, even with no item bound at all.
-        let huge: Vec<WorkerInput> = (0..3)
-            .map(|_| sized(MAX_WINDOW_BYTES / 2 + 1024))
-            .collect();
         assert_eq!(
-            frame_chunks(&huge, None),
+            frame_chunks(&small, Some(3), MAX_WINDOW_BYTES),
+            vec![3, 3, 1]
+        );
+        assert_eq!(
+            frame_chunks(&small, None, MAX_WINDOW_BYTES),
+            vec![7],
+            "one frame, no bounds hit"
+        );
+        assert_eq!(
+            frame_chunks(&[], Some(3), MAX_WINDOW_BYTES),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            frame_chunks(&small, Some(0), MAX_WINDOW_BYTES),
+            vec![1; 7],
+            "0 is at least 1"
+        );
+
+        // A small stand-in for the production bound: the arithmetic is the
+        // same at 4 KiB as at half a frame, without gigabytes of fixture.
+        let bound = 4096;
+        // Three inputs of a bit over half the bound each: they cannot share a
+        // frame, even with no item bound at all.
+        let huge: Vec<WorkerInput> = (0..3).map(|_| sized(bound / 2 + 64)).collect();
+        assert_eq!(
+            frame_chunks(&huge, None, bound),
             vec![1, 1, 1],
             "byte-chunked with no item bound: this is the priced path, where a \
-             lone oversized request used to reach encode_frame and be fatal"
+             lone oversized request used to reach encode_frame whole"
         );
         // A single input past the bound goes alone and may still fail: that is
         // the frame limit doing its job, and there is nothing smaller to split.
-        let colossal = vec![sized(MAX_WINDOW_BYTES + 1)];
-        assert_eq!(frame_chunks(&colossal, None), vec![1]);
+        let colossal = vec![sized(bound + 1)];
+        assert_eq!(frame_chunks(&colossal, None, bound), vec![1]);
     }
 
     /// OOM retries do not re-offer the budget that just failed.
@@ -1789,11 +1918,7 @@ mod tests {
             },
         );
         let replica = priced_replica(&ledger, "echo_test", cost).await;
-        let worker_id = replica
-            .admission
-            .as_ref()
-            .expect("priced")
-            .worker_id();
+        let worker_id = replica.admission.as_ref().expect("priced").worker_id();
         let stats = Arc::new(ModelStats::default());
         let (tx, rx) = mpsc::unbounded_channel();
         let dispatcher = tokio::spawn(run_dispatcher(
@@ -1863,11 +1988,7 @@ mod tests {
             },
         );
         let replica = priced_replica(&ledger, "slow_test", cost).await;
-        let worker_id = replica
-            .admission
-            .as_ref()
-            .expect("priced")
-            .worker_id();
+        let worker_id = replica.admission.as_ref().expect("priced").worker_id();
         let stats = Arc::new(ModelStats::default());
         let (tx, rx) = mpsc::unbounded_channel();
         let dispatcher = tokio::spawn(run_dispatcher(
@@ -1971,7 +2092,10 @@ mod tests {
         worker
     }
 
-    fn lone_request() -> (DispatchRequest, oneshot::Receiver<Result<Vec<WorkerOutput>>>) {
+    fn lone_request() -> (
+        DispatchRequest,
+        oneshot::Receiver<Result<Vec<WorkerOutput>>>,
+    ) {
         let (reply, answer) = oneshot::channel();
         (
             DispatchRequest {

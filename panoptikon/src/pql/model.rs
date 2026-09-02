@@ -2,11 +2,12 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 pub(crate) use crate::pql::builder::filters::{
-    DerivedDataArgs, DistanceAggregation, DistanceFunction, EmbedArgs, HasUnprocessedData,
-    InBookmarks, InBookmarksArgs, IndexMode, Match, MatchAnd, MatchNot, MatchOps, MatchOr,
-    MatchPath, MatchPathArgs, MatchTags, MatchText, MatchTextArgs, MatchValue, MatchValues,
-    Matches, ProcessedBy, QuantResolved, SemanticImageArgs, SemanticImageSearch, SemanticTextArgs,
-    SemanticTextSearch, SimilarTo, SimilarityArgs, SourceArgs, TagsArgs,
+    DerivedDataArgs, DistanceAggregation, DistanceFunction, EmbedArgs, FailedFor,
+    HasUnprocessedData, InBookmarks, InBookmarksArgs, InPinboard, InPinboardArgs, IndexMode, Match,
+    MatchAnd, MatchNot, MatchOps, MatchOr, MatchPath, MatchPathArgs, MatchTags, MatchText,
+    MatchTextArgs, MatchValue, MatchValues, Matches, ProcessedBy, QuantResolved, SemanticImageArgs,
+    SemanticImageSearch, SemanticTextArgs, SemanticTextSearch, SimilarTo, SimilarityArgs,
+    SourceArgs, TagsArgs,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
@@ -36,6 +37,10 @@ pub(crate) enum Column {
     VideoTracks,
     SubtitleTracks,
     Blurhash,
+    OutroKind,
+    ContentEndMs,
+    VideoCodec,
+    AudioCodec,
     DataId,
     Language,
     LanguageConfidence,
@@ -69,6 +74,10 @@ pub(crate) enum OrderByField {
     VideoTracks,
     SubtitleTracks,
     Blurhash,
+    OutroKind,
+    ContentEndMs,
+    VideoCodec,
+    AudioCodec,
     DataId,
     Language,
     LanguageConfidence,
@@ -83,7 +92,7 @@ pub(crate) enum OrderByField {
     Random,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum OrderDirection {
     Asc,
@@ -502,7 +511,7 @@ pub(crate) enum QueryElement {
     Or(OrOperator),
     #[schema(no_recursion)]
     Not(NotOperator),
-    Match(Match),
+    Match(Box<Match>),
     MatchPath(MatchPath),
     MatchText(MatchText),
     SemanticTextSearch(SemanticTextSearch),
@@ -512,6 +521,11 @@ pub(crate) enum QueryElement {
     InBookmarks(InBookmarks),
     ProcessedBy(ProcessedBy),
     HasUnprocessedData(HasUnprocessedData),
+    // Appended, never inserted: the enum is `untagged`, so serde tries the
+    // variants in declaration order, and a new variant placed ahead of an
+    // existing one could change how an already-stored query parses.
+    FailedFor(FailedFor),
+    InPinboard(InPinboard),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

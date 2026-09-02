@@ -74,10 +74,11 @@ impl<'de> serde::Deserialize<'de> for MatchTags {
 }
 
 fn default_sort_desc() -> SortableOptions {
-    let mut options = SortableOptions::default();
-    options.direction = OrderDirection::Desc;
-    options.row_n_direction = OrderDirection::Desc;
-    options
+    SortableOptions {
+        direction: OrderDirection::Desc,
+        row_n_direction: OrderDirection::Desc,
+        ..Default::default()
+    }
 }
 
 impl FilterCompiler for MatchTags {

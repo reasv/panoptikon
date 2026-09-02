@@ -61,9 +61,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::capability::{
-    HostComputeCaps, find_nvidia_smi, output_with_timeout, parse_compute_cap,
-};
+use super::capability::{HostComputeCaps, find_nvidia_smi, output_with_timeout, parse_compute_cap};
 use super::cpu;
 use super::mps;
 use super::rocm;
@@ -811,7 +809,11 @@ fn parse_memory(stdout: &str) -> Option<Vec<GpuMemory>> {
             free_mb,
         });
     }
-    if boards.is_empty() { None } else { Some(boards) }
+    if boards.is_empty() {
+        None
+    } else {
+        Some(boards)
+    }
 }
 
 /// Turn probe output plus the ambient `CUDA_VISIBLE_DEVICES` into both
@@ -1168,10 +1170,7 @@ impl GpuInventory {
     /// visibility variable could only *hide* something), while board keys
     /// keep resolving as everywhere else.
     fn pins_are_absent(&self) -> bool {
-        matches!(
-            self.backend,
-            MemoryBackend::Mps | MemoryBackend::Cpu { .. }
-        )
+        matches!(self.backend, MemoryBackend::Mps | MemoryBackend::Cpu { .. })
     }
 
     /// Whether this host's boards are priced against system RAM because it
@@ -1405,20 +1404,20 @@ impl GpuInventory {
             let mut matches = gpus
                 .iter()
                 .filter(|gpu| gpu.uuid.to_ascii_uppercase().starts_with(&wanted));
-            if let Some(first) = matches.next() {
-                if matches.next().is_none() {
-                    return Some(first.uuid.clone());
-                }
+            if let Some(first) = matches.next()
+                && matches.next().is_none()
+            {
+                return Some(first.uuid.clone());
             }
             // Ambiguous, or a board this host cannot see (a `MIG-…`
             // instance, a UUID from another machine): verbatim, as before —
             // resolving it is CUDA's business, not ours.
             return Some(trimmed.to_owned());
         }
-        if let Ok(index) = trimmed.parse::<u32>() {
-            if let Some(gpu) = gpus.iter().find(|gpu| gpu.index == index) {
-                return Some(gpu.uuid.clone());
-            }
+        if let Ok(index) = trimmed.parse::<u32>()
+            && let Some(gpu) = gpus.iter().find(|gpu| gpu.index == index)
+        {
+            return Some(gpu.uuid.clone());
         }
         tracing::warn!(
             pin = %requested,
@@ -1843,10 +1842,7 @@ mod tests {
     /// some board's external usage as zero.
     #[test]
     fn parses_a_memory_snapshot() {
-        let boards = parse_memory(
-            "GPU-1a2b, 32607, 21000\nGPU-3c4d, 6138, 512\n",
-        )
-        .expect("parses");
+        let boards = parse_memory("GPU-1a2b, 32607, 21000\nGPU-3c4d, 6138, 512\n").expect("parses");
         assert_eq!(
             boards,
             vec![
@@ -1868,7 +1864,10 @@ mod tests {
             parse_memory("GPU-1a2b, 32607, 21000\nGPU-3c4d, [N/A], 512\n").is_none(),
             "one bad row makes the whole snapshot unknown"
         );
-        assert!(parse_memory("GPU-1a2b, 32607\n").is_none(), "missing column");
+        assert!(
+            parse_memory("GPU-1a2b, 32607\n").is_none(),
+            "missing column"
+        );
         assert!(
             parse_memory("0, 32607, 21000\n").is_none(),
             "a non-UUID identity cannot key a ledger"
@@ -1917,7 +1916,9 @@ mod tests {
             "driver error text must not become a GPU"
         );
         // One good line plus one bad line: the whole probe is unknown.
-        assert!(parse_inventory("0, GPU-1a2b, RTX, 32607, 8.6\nN/A, N/A, N/A, N/A, N/A\n").is_none());
+        assert!(
+            parse_inventory("0, GPU-1a2b, RTX, 32607, 8.6\nN/A, N/A, N/A, N/A, N/A\n").is_none()
+        );
         // A non-UUID identity column is not something we can key a ledger
         // by, so it is unknown rather than half-trusted.
         assert!(parse_inventory("0, 0, RTX, 32607, 8.6\n").is_none());
@@ -1974,7 +1975,10 @@ mod tests {
         );
         assert_eq!(capless.inventory.gpus().map(<[GpuInfo]>::len), Some(2));
         assert_eq!(capless.caps.meets_floor(8.0), None);
-        assert_eq!(capless.inventory.default_pin(), Some("GPU-1a2b".to_string()));
+        assert_eq!(
+            capless.inventory.default_pin(),
+            Some("GPU-1a2b".to_string())
+        );
     }
 
     /// nvidia-smi ignores `CUDA_VISIBLE_DEVICES`, so an operator's ambient
@@ -2007,8 +2011,20 @@ mod tests {
         );
 
         // Unset and empty both mean "no restriction".
-        assert_eq!(build(Some(TWO_BOARDS), Some("")).inventory.gpus().map(<[GpuInfo]>::len), Some(2));
-        assert_eq!(build(Some(TWO_BOARDS), Some(" , ")).inventory.gpus().map(<[GpuInfo]>::len), Some(2));
+        assert_eq!(
+            build(Some(TWO_BOARDS), Some(""))
+                .inventory
+                .gpus()
+                .map(<[GpuInfo]>::len),
+            Some(2)
+        );
+        assert_eq!(
+            build(Some(TWO_BOARDS), Some(" , "))
+                .inventory
+                .gpus()
+                .map(<[GpuInfo]>::len),
+            Some(2)
+        );
     }
 
     /// An unmappable ambient restriction blanks the **inventory only**. The
@@ -2047,7 +2063,8 @@ mod tests {
     /// lowest index.
     #[test]
     fn default_pin_is_the_fastest_board() {
-        let mixed = GpuInventory::known(vec![gpu(0, "GPU-slow", "8.6"), gpu(1, "GPU-fast", "12.0")]);
+        let mixed =
+            GpuInventory::known(vec![gpu(0, "GPU-slow", "8.6"), gpu(1, "GPU-fast", "12.0")]);
         assert_eq!(mixed.default_pin(), Some("GPU-fast".to_string()));
         // 10.x is above 9.x, not lexicographically below it.
         let blackwell = GpuInventory::known(vec![gpu(0, "GPU-9", "9.0"), gpu(1, "GPU-12", "12.0")]);
@@ -2070,7 +2087,10 @@ mod tests {
             sized_gpu(0, "GPU-slow-big", "8.6", 49152),
             sized_gpu(1, "GPU-fast-small", "12.0", 8192),
         ]);
-        assert_eq!(slow_and_big.default_pin(), Some("GPU-fast-small".to_string()));
+        assert_eq!(
+            slow_and_big.default_pin(),
+            Some("GPU-fast-small".to_string())
+        );
         // The all-capless (ROCm-shaped) host, where this is load-bearing.
         let rocm_shaped = GpuInventory::known(vec![
             sized_gpu(0, "GPU-igpu", "", 2048),
@@ -2937,7 +2957,10 @@ mod tests {
             let values = VISIBILITY_VARS.map(|var| (var == set).then_some("0"));
             ambient_hip_restriction(values)
         };
-        assert!(!ambient("ROCR_VISIBLE_DEVICES"), "composes with a HIP index");
+        assert!(
+            !ambient("ROCR_VISIBLE_DEVICES"),
+            "composes with a HIP index"
+        );
         assert!(ambient("HIP_VISIBLE_DEVICES"), "the variable we write");
         assert!(ambient("CUDA_VISIBLE_DEVICES"), "the alias we outrank");
         assert!(ambient("GPU_DEVICE_ORDINAL"), "the same layer");
@@ -3004,8 +3027,14 @@ mod tests {
     #[test]
     fn index_pins_map_to_uuids() {
         let inventory = inventory();
-        assert_eq!(inventory.resolve_pin(Some("3")), Some("GPU-3333".to_string()));
-        assert_eq!(inventory.resolve_pin(Some(" 0 ")), Some("GPU-1111".to_string()));
+        assert_eq!(
+            inventory.resolve_pin(Some("3")),
+            Some("GPU-3333".to_string())
+        );
+        assert_eq!(
+            inventory.resolve_pin(Some(" 0 ")),
+            Some("GPU-1111".to_string())
+        );
     }
 
     #[test]

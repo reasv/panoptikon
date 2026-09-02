@@ -88,6 +88,24 @@ pub struct DbConnection<M: DbMode> {
     _mode: PhantomData<M>,
 }
 
+#[cfg(test)]
+impl<M: DbMode> DbConnection<M> {
+    /// Wraps an already-open connection in the request-scoped shape the
+    /// extractor would have produced, so handler bodies can be called
+    /// directly in tests. `_mode` is private, so this is the only way to
+    /// build one outside this module — and without it every handler-level
+    /// invariant (which of the two database names a handler reads, for one)
+    /// would only ever be tested through stand-ins.
+    pub(crate) fn for_tests(conn: SqliteConnection, index_db: &str, user_data_db: &str) -> Self {
+        Self {
+            conn: DbConn::Direct(conn),
+            index_db: index_db.to_string(),
+            user_data_db: user_data_db.to_string(),
+            _mode: PhantomData,
+        }
+    }
+}
+
 impl<M: DbMode> Drop for DbConnection<M> {
     fn drop(&mut self) {
         // Unconditional bump on release of a user-data write connection:
@@ -129,6 +147,20 @@ pub(crate) async fn open_index_db_read_at_path(
         user_db_file: PathBuf::new(),
     };
     connect_db(&paths, false, false, false).await
+}
+
+/// A short-lived user-data write connection for background best-effort
+/// writes, configured exactly like the request-scoped `UserDataWrite`
+/// connections (same pragmas, same sqlx busy timeout) but WITHOUT
+/// `DbConnection`'s drop-time epoch bump: the pinboard activity columns can
+/// never affect a search result, so counting an open must not invalidate the
+/// search cache.
+pub(crate) async fn open_user_data_write(
+    index_db: &str,
+    user_data_db: &str,
+) -> Result<SqliteConnection, ApiError> {
+    let paths = db_paths(index_db, user_data_db)?;
+    connect_db(&paths, false, true, true).await
 }
 
 pub(crate) async fn open_index_db_write_no_user_data(
@@ -418,10 +450,11 @@ fn db_lists() -> Result<(Vec<String>, Vec<String>), ApiError> {
             ApiError::internal("Failed to read database list")
         })?;
         let path = entry.path();
-        if path.is_dir() && path.join("index.db").exists() {
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                index_dbs.push(name.to_string());
-            }
+        if path.is_dir()
+            && path.join("index.db").exists()
+            && let Some(name) = path.file_name().and_then(|name| name.to_str())
+        {
+            index_dbs.push(name.to_string());
         }
     }
 
@@ -436,10 +469,10 @@ fn db_lists() -> Result<(Vec<String>, Vec<String>), ApiError> {
             ApiError::internal("Failed to read database list")
         })?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("db") {
-            if let Some(stem) = path.file_stem().and_then(|name| name.to_str()) {
-                user_data_dbs.push(stem.to_string());
-            }
+        if path.extension().and_then(|ext| ext.to_str()) == Some("db")
+            && let Some(stem) = path.file_stem().and_then(|name| name.to_str())
+        {
+            user_data_dbs.push(stem.to_string());
         }
     }
 
@@ -452,23 +485,23 @@ fn check_dbs(index_db: Option<&str>, user_data_db: Option<&str>) -> Result<(), A
     }
 
     let (index_dbs, user_data_dbs) = db_lists()?;
-    if let Some(index_db) = index_db {
-        if !index_dbs.iter().any(|entry| entry == index_db) {
-            return Err(ApiError::not_found(format!(
-                "Index database {index_db} not found"
-            )));
-        }
+    if let Some(index_db) = index_db
+        && !index_dbs.iter().any(|entry| entry == index_db)
+    {
+        return Err(ApiError::not_found(format!(
+            "Index database {index_db} not found"
+        )));
     }
 
     // Python reports this as "Index database ... not found" (copy-paste bug
     // in api/routers/utils.py); deliberately diverge — the wrong label sends
     // people hunting for a missing index DB when it is the user-data DB.
-    if let Some(user_data_db) = user_data_db {
-        if !user_data_dbs.iter().any(|entry| entry == user_data_db) {
-            return Err(ApiError::not_found(format!(
-                "User data database {user_data_db} not found"
-            )));
-        }
+    if let Some(user_data_db) = user_data_db
+        && !user_data_dbs.iter().any(|entry| entry == user_data_db)
+    {
+        return Err(ApiError::not_found(format!(
+            "User data database {user_data_db} not found"
+        )));
     }
 
     Ok(())
@@ -479,6 +512,54 @@ fn check_dbs(index_db: Option<&str>, user_data_db: Option<&str>) -> Result<(), A
 /// migrations.
 pub(crate) fn readonly_mode() -> bool {
     crate::config::runtime().readonly
+}
+
+/// Rejects runtime migration entry points (POST /api/db/create, the Desktop
+/// setup new-database path) in readonly mode. Startup guards its own
+/// migrations in `main`, but these handlers run the same DDL on demand;
+/// without this check a readonly server would still create database files
+/// and alter schemas on request.
+pub(crate) fn ensure_migrations_allowed() -> Result<(), ApiError> {
+    #[cfg(test)]
+    let readonly = readonly_mode() || readonly_test_override::forced();
+    #[cfg(not(test))]
+    let readonly = readonly_mode();
+    if readonly {
+        return Err(ApiError::forbidden(
+            "Server is in read-only mode; creating or migrating databases is disabled",
+        ));
+    }
+    Ok(())
+}
+
+/// The process-global `RuntimeConfig` is a `OnceLock` shared by every unit
+/// test, so `readonly = true` can never be installed per-test. This override
+/// is consulted only by [`ensure_migrations_allowed`] (not by
+/// [`readonly_mode`] itself) so a test holding it can never flip concurrent
+/// tests' connections to read-only. Callers must hold the
+/// `test_utils::test_data_dir` lock to serialize against other handler tests.
+#[cfg(test)]
+pub(crate) mod readonly_test_override {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FORCED: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn forced() -> bool {
+        FORCED.load(Ordering::SeqCst)
+    }
+
+    pub(crate) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Forces the readonly guard on for the returned guard's lifetime.
+    pub(crate) fn force() -> Guard {
+        FORCED.store(true, Ordering::SeqCst);
+        Guard
+    }
 }
 
 /// `journal_size_limit` for writable schemas (64 MiB). A checkpoint that
@@ -521,10 +602,38 @@ async fn connect_db(
                 ApiError::internal("Failed to open database")
             })?;
         conn
+    } else if !write_lock {
+        // A user_data-only writer (request-scoped `UserDataWrite` and the
+        // background activity writer). `BEGIN IMMEDIATE` takes a write
+        // transaction on every *writable* attached schema, so the index
+        // (`main`) and `storage` are opened read-only here to confine the
+        // immediate lock to user_data — otherwise every pinboard/bookmark
+        // save contends with the index writer's own immediate transactions.
+        // A read-only *connection* cannot attach user_data read-write
+        // (`mode` may only be more restrictive than the open flags), so the
+        // connection stays read-write and the read-only-ness comes from
+        // `mode=ro` URI filenames on the two index schemas instead.
+        let options = SqliteConnectOptions::new().filename(read_only_db_uri(&paths.index_db_file));
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to open index database");
+                ApiError::internal("Failed to open database")
+            })?;
+
+        sqlx::query("ATTACH DATABASE ? AS storage")
+            .bind(read_only_db_uri(&paths.storage_db_file))
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to attach storage database");
+                ApiError::internal("Failed to open database")
+            })?;
+        conn
     } else {
         let options = SqliteConnectOptions::new()
             .filename(&paths.index_db_file)
-            .create_if_missing(write_lock);
+            .create_if_missing(true);
         let mut conn = SqliteConnection::connect_with(&options)
             .await
             .map_err(|err| {
@@ -540,65 +649,61 @@ async fn connect_db(
                 tracing::error!(error = %err, "failed to attach storage database");
                 ApiError::internal("Failed to open database")
             })?;
-        if write_lock {
-            sqlx::query("PRAGMA journal_mode=WAL")
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to enable WAL mode");
+                ApiError::internal("Failed to open database")
+            })?;
+        // Bound the WAL high-water mark: with a limit set, any checkpoint
+        // that resets the log truncates the file back to the limit instead
+        // of leaving it at peak size until every connection closes. The
+        // pragma is per-connection and per-schema: autocheckpoints run on
+        // the committing connection, which is opened through this path,
+        // and each writable schema needs its own line.
+        for pragma in [
+            format!("PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"),
+            format!("PRAGMA storage.journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(pragma))
                 .execute(&mut conn)
                 .await
                 .map_err(|err| {
-                    tracing::error!(error = %err, "failed to enable WAL mode");
+                    tracing::error!(error = %err, "failed to set WAL size limit");
                     ApiError::internal("Failed to open database")
                 })?;
-            // Bound the WAL high-water mark: with a limit set, any checkpoint
-            // that resets the log truncates the file back to the limit instead
-            // of leaving it at peak size until every connection closes. The
-            // pragma is per-connection and per-schema: autocheckpoints run on
-            // the committing connection, which is opened through this path,
-            // and each writable schema needs its own line.
-            for pragma in [
-                format!("PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"),
-                format!("PRAGMA storage.journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"),
-            ] {
-                sqlx::query(sqlx::AssertSqlSafe(pragma))
-                    .execute(&mut conn)
-                    .await
-                    .map_err(|err| {
-                        tracing::error!(error = %err, "failed to set WAL size limit");
-                        ApiError::internal("Failed to open database")
-                    })?;
-            }
         }
         conn
     };
 
-    if attach_user_data {
-        if !write_lock || user_data_wl {
-            let user_data_path = user_data_attach_path(&paths.user_db_file, !user_data_wl);
-            sqlx::query("ATTACH DATABASE ? AS user_data")
-                .bind(user_data_path)
+    if attach_user_data && (!write_lock || user_data_wl) {
+        let user_data_path = user_data_attach_path(&paths.user_db_file, !user_data_wl);
+        sqlx::query("ATTACH DATABASE ? AS user_data")
+            .bind(user_data_path)
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to attach user data database");
+                ApiError::internal("Failed to open database")
+            })?;
+        if user_data_wl {
+            sqlx::query("PRAGMA user_data.journal_mode=WAL")
                 .execute(&mut conn)
                 .await
                 .map_err(|err| {
-                    tracing::error!(error = %err, "failed to attach user data database");
+                    tracing::error!(error = %err, "failed to enable WAL for user data");
                     ApiError::internal("Failed to open database")
                 })?;
-            if user_data_wl {
-                sqlx::query("PRAGMA user_data.journal_mode=WAL")
-                    .execute(&mut conn)
-                    .await
-                    .map_err(|err| {
-                        tracing::error!(error = %err, "failed to enable WAL for user data");
-                        ApiError::internal("Failed to open database")
-                    })?;
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "PRAGMA user_data.journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"
-                )))
-                .execute(&mut conn)
-                .await
-                .map_err(|err| {
-                    tracing::error!(error = %err, "failed to set WAL size limit for user data");
-                    ApiError::internal("Failed to open database")
-                })?;
-            }
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA user_data.journal_size_limit = {WAL_SIZE_LIMIT_BYTES}"
+            )))
+            .execute(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to set WAL size limit for user data");
+                ApiError::internal("Failed to open database")
+            })?;
         }
     }
 
@@ -624,10 +729,140 @@ fn user_data_attach_path(path: &Path, read_only: bool) -> String {
     if !read_only {
         return path.to_string_lossy().to_string();
     }
+    read_only_db_uri(path)
+}
+
+/// `file:` URI that opens `path` read-only regardless of the connection's
+/// open flags (sqlx always passes `SQLITE_OPEN_URI`). `mode=ro` may be more
+/// restrictive than the connection flags but never less, which is exactly
+/// what mixed-mode connections need: a read-write connection with individual
+/// schemas held read-only.
+fn read_only_db_uri(path: &Path) -> String {
     if let Ok(mut url) = Url::from_file_path(path) {
         url.set_query(Some("mode=ro"));
         return url.to_string();
     }
     let path = path.to_string_lossy().replace('\\', "/");
     format!("file:{path}?mode=ro")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the `UserDataWrite` connection shape: index (`main`) and
+    /// `storage` are attached read-only, so its `BEGIN IMMEDIATE` write lock
+    /// is confined to user_data and never contends with the index writer's
+    /// own immediate transactions (and vice versa). A regression back to
+    /// read-write index schemas fails this test twice over: the readonly
+    /// INSERT probes succeed, and the overlapping BEGIN IMMEDIATE pairs
+    /// deadlock into sqlx's busy timeout.
+    #[tokio::test]
+    async fn user_data_write_conn_does_not_lock_index_or_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DbPaths {
+            index_db_file: dir.path().join("index.db"),
+            storage_db_file: dir.path().join("storage.db"),
+            user_db_file: dir.path().join("user.db"),
+        };
+
+        // Seed index + storage through the index-writer path and user_data
+        // via a direct open; the user-data write path creates nothing.
+        {
+            let mut writer = connect_db(&paths, true, false, false).await.unwrap();
+            sqlx::query("CREATE TABLE t (v INTEGER)")
+                .execute(&mut writer)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE storage.s (v INTEGER)")
+                .execute(&mut writer)
+                .await
+                .unwrap();
+            writer.close().await.unwrap();
+        }
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(&paths.user_db_file)
+                .create_if_missing(true);
+            let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+            sqlx::query("CREATE TABLE u (v INTEGER)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+        }
+
+        let mut index_writer = connect_db(&paths, true, false, false).await.unwrap();
+        let mut user_data_writer = connect_db(&paths, false, true, true).await.unwrap();
+
+        // The index schemas must be read-only on the user-data connection —
+        // this is what keeps BEGIN IMMEDIATE from write-locking them.
+        assert!(
+            sqlx::query("INSERT INTO t (v) VALUES (1)")
+                .execute(&mut user_data_writer)
+                .await
+                .is_err(),
+            "index (main) must be read-only on a UserDataWrite connection"
+        );
+        assert!(
+            sqlx::query("INSERT INTO storage.s (v) VALUES (1)")
+                .execute(&mut user_data_writer)
+                .await
+                .is_err(),
+            "storage must be read-only on a UserDataWrite connection"
+        );
+
+        // User-data transaction first, index writer second: the index
+        // writer's BEGIN IMMEDIATE and COMMIT proceed while the user-data
+        // transaction is still open.
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_data.u (v) VALUES (1)")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut index_writer)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t (v) VALUES (2)")
+            .execute(&mut index_writer)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut index_writer)
+            .await
+            .unwrap();
+
+        sqlx::query("COMMIT")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+
+        // And the reverse order: with the index write transaction open, the
+        // user-data save begins, writes, and commits without waiting.
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut index_writer)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_data.u (v) VALUES (2)")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut user_data_writer)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut index_writer)
+            .await
+            .unwrap();
+    }
 }

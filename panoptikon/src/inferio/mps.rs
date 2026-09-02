@@ -365,7 +365,10 @@ mod tests {
     /// chip and different RAM do not price alike).
     #[test]
     fn the_name_carries_the_chip_and_the_capacity() {
-        assert_eq!(board_name("Apple M3 Max", 128 * GIB), "Apple M3 Max (128 GB)");
+        assert_eq!(
+            board_name("Apple M3 Max", 128 * GIB),
+            "Apple M3 Max (128 GB)"
+        );
         assert_eq!(board_name("Apple M1", 16 * GIB), "Apple M1 (16 GB)");
         // Rounds to nearest, and never to zero.
         assert_eq!(board_name("Apple M4", 36 * GIB - 1), "Apple M4 (36 GB)");

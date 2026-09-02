@@ -3,18 +3,19 @@
 // own suggestion is to raise the limit.
 #![recursion_limit = "256"]
 
+mod accelerator_env;
+mod accelerator_report;
 mod api;
 mod api_error;
 mod config;
 mod db;
 mod desktop;
 mod env_template;
+mod host_paths;
 mod inferio;
 mod inferio_client;
 mod jobs;
 mod logging;
-mod host_paths;
-mod accelerator_env;
 mod media_tools;
 mod openapi;
 mod policy;
@@ -29,12 +30,16 @@ mod shutdown;
 mod test_utils;
 mod ui;
 mod update;
+/// The stored-rendition ladder (`display`/`grid-m`/`grid-s`) shared by the
+/// scan's generator, its backfill dispatcher and the thumbnail endpoint —
+/// one place, because the three must agree exactly.
+mod visual_tiers;
 
 use crate::jobs::inference_pool::{InferencePool, JobInferenceContext, set_job_inference_context};
 use anyhow::Context as _;
 use axum::{
     Router,
-    routing::{any, delete, get, post},
+    routing::{any, delete, get, post, put},
 };
 use clap::Parser;
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -97,6 +102,10 @@ enum Command {
         #[arg(long)]
         if_needed: bool,
     },
+    /// Print the resolved inference accelerator (cpu/cuda/rocm/…) and any
+    /// GPU names. CPU is reported without warning; GPU backends warn only
+    /// when no device name can be detected.
+    Accelerator,
     /// Download and install the latest release, replacing this executable.
     /// Checks GitHub every time (ignoring the startup-check throttle).
     Update {
@@ -105,6 +114,21 @@ enum Command {
         yes: bool,
     },
 }
+
+/// Request-body ceiling for the pinboard routes.
+///
+/// Pinboard writes carry the board's composited preview image inline in the
+/// JSON body as base64 (`POST /api/pinboards`, `POST …/versions`, and
+/// `PUT …/versions/{id}/preview`), so axum's 2 MiB `DefaultBodyLimit` cuts
+/// them off long before the handler's own caps apply: a dense board at the
+/// 2048px preview master is a multi-megabyte payload, and a 413 at the
+/// extractor makes the board permanently unsaveable. The worst case the
+/// handlers actually accept is `MAX_PREVIEW_BYTES` (8 MiB) inflated ~4/3 by
+/// base64 (~10.7 MiB) plus `MAX_LAYOUT_BYTES` (1 MiB) and JSON overhead, so
+/// 16 MiB puts the limit just above what `api::pinboards` will accept and
+/// keeps the handler the thing that rejects oversized uploads. Every other
+/// route keeps the 2 MiB default.
+const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
     // Build a custom tokio runtime with a larger worker thread stack size.
@@ -197,11 +221,17 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .await;
         }
+        Some(Command::Accelerator) => {
+            accelerator_report::print_report(&settings);
+            return Ok(());
+        }
         Some(Command::Update { yes }) => {
             return update::run_update_command(crate::resources::VERSION, yes).await;
         }
         None => {}
     }
+
+    accelerator_report::log_report(&settings);
 
     // Server path only (Setup/Inferio/Update returned above). Fire-and-forget a
     // best-effort, throttled check for a newer release; it prints a banner if
@@ -306,12 +336,12 @@ async fn async_main() -> anyhow::Result<()> {
     // usable embedding impl class (plus always_warm, which the manager
     // already warmed at construction). The `inferio` subcommand never scans
     // DBs; it gets always_warm only.
-    if let Some(state) = &inferio_state {
-        if settings.inference_local.prewarm.enabled {
-            tokio::spawn(inferio::prewarm::run_eager_prewarm_loop(Arc::downgrade(
-                &state.manager,
-            )));
-        }
+    if let Some(state) = &inferio_state
+        && settings.inference_local.prewarm.enabled
+    {
+        tokio::spawn(inferio::prewarm::run_eager_prewarm_loop(Arc::downgrade(
+            &state.manager,
+        )));
     }
 
     // Production UI ([upstreams.ui] local = true): npm install / next build
@@ -451,28 +481,50 @@ async fn async_main() -> anyhow::Result<()> {
                     .put(api::bookmarks::add_bookmark_by_sha256)
                     .delete(api::bookmarks::delete_bookmark_by_sha256),
             )
-            .route(
-                "/api/pinboards",
-                get(api::pinboards::list_pinboards).post(api::pinboards::create_pinboard),
-            )
-            .route(
-                "/api/pinboards/{pinboard_id}",
-                get(api::pinboards::get_pinboard)
-                    .patch(api::pinboards::update_pinboard)
-                    .delete(api::pinboards::delete_pinboard),
-            )
-            .route(
-                "/api/pinboards/{pinboard_id}/versions",
-                get(api::pinboards::list_pinboard_versions)
-                    .post(api::pinboards::save_pinboard_version),
-            )
-            .route(
-                "/api/pinboards/{pinboard_id}/versions/{version_id}",
-                delete(api::pinboards::delete_pinboard_version),
-            )
-            .route(
-                "/api/pinboards/{pinboard_id}/versions/{version_id}/preview",
-                get(api::pinboards::pinboard_version_preview),
+            // The pinboard surface is merged as its own router purely so the
+            // raised body limit lands on these paths and nowhere else; the
+            // routes are otherwise ordinary members of the app.
+            .merge(
+                Router::new()
+                    .route(
+                        "/api/pinboards",
+                        get(api::pinboards::list_pinboards).post(api::pinboards::create_pinboard),
+                    )
+                    // Content search lives in the pinboard authz domain, not
+                    // the search one: under /api/search/ it would inherit
+                    // search-only ruleset grants (`path_prefix =
+                    // "/api/search/"`) and leak board names, ids and
+                    // timestamps to policies that deny pinboards. The handler
+                    // still lives in api/search.rs.
+                    .route(
+                        "/api/pinboards/search",
+                        post(api::search::search_pql_pinboards),
+                    )
+                    .route(
+                        "/api/pinboards/{pinboard_id}",
+                        get(api::pinboards::get_pinboard)
+                            .patch(api::pinboards::update_pinboard)
+                            .delete(api::pinboards::delete_pinboard),
+                    )
+                    .route(
+                        "/api/pinboards/{pinboard_id}/databases",
+                        put(api::pinboards::set_pinboard_databases),
+                    )
+                    .route(
+                        "/api/pinboards/{pinboard_id}/versions",
+                        get(api::pinboards::list_pinboard_versions)
+                            .post(api::pinboards::save_pinboard_version),
+                    )
+                    .route(
+                        "/api/pinboards/{pinboard_id}/versions/{version_id}",
+                        delete(api::pinboards::delete_pinboard_version),
+                    )
+                    .route(
+                        "/api/pinboards/{pinboard_id}/versions/{version_id}/preview",
+                        get(api::pinboards::pinboard_version_preview)
+                            .put(api::pinboards::update_pinboard_version_preview),
+                    )
+                    .layer(axum::extract::DefaultBodyLimit::max(PINBOARD_BODY_LIMIT)),
             )
             .route("/api/items/item/file", get(api::items::item_file))
             .route("/api/items/item/thumbnail", get(api::items::item_thumbnail))
@@ -488,6 +540,18 @@ async fn async_main() -> anyhow::Result<()> {
                 "/api/open/folder/{sha256}",
                 post(api::open::show_in_file_manager),
             )
+            // Ahead of the `{sha256}` capture below only for readability:
+            // matchit prefers a literal segment over a parameter regardless
+            // of registration order, so `.../clipboard/artifact` can never be
+            // read as a file hash named "artifact".
+            .route(
+                "/api/open/clipboard/artifact",
+                post(api::open::copy_artifact_to_clipboard_on_host),
+            )
+            .route(
+                "/api/open/clipboard/{sha256}",
+                post(api::open::copy_file_to_clipboard_on_host),
+            )
             .route("/api/search/pql", post(api::search::search_pql))
             .route("/api/search/pql/build", post(api::search::search_pql_build))
             .route(
@@ -499,6 +563,24 @@ async fn async_main() -> anyhow::Result<()> {
                 get(api::search_cache::get_result_cache)
                     .delete(api::search_cache::clear_result_cache)
                     .put(api::search_cache::resize_result_cache),
+            )
+            .route("/api/video/transcode", post(api::video::video_transcode))
+            .route("/api/video/compose", post(api::video::video_compose))
+            .route("/api/video/artifact", get(api::video::video_artifact))
+            .route(
+                "/api/video/jobs/{job_id}",
+                get(api::video::video_job).delete(api::video::video_job_cancel),
+            )
+            .route(
+                "/api/video/jobs/{job_id}/events",
+                get(api::video::video_job_events),
+            )
+            .route("/api/video/presets", get(api::video::video_presets))
+            .route(
+                "/api/video/cache",
+                get(api::video::get_transcode_cache)
+                    .delete(api::video::clear_transcode_cache)
+                    .put(api::video::resize_transcode_cache),
             )
             .route("/api/search/tags", get(api::search::get_tags))
             .route("/api/search/tags/top", get(api::search::get_top_tags))
@@ -540,6 +622,11 @@ async fn async_main() -> anyhow::Result<()> {
                 "/api/jobs/data/history",
                 get(api::jobs::get_extraction_history).delete(api::jobs::delete_scan_data),
             )
+            .route(
+                "/api/jobs/data/failures",
+                get(api::jobs::get_extraction_failures),
+            )
+            .route("/api/jobs/scan/failures", get(api::jobs::get_scan_failures))
             .route(
                 "/api/jobs/config",
                 get(api::jobs::get_config).put(api::jobs::update_config),
@@ -637,32 +724,6 @@ async fn api_not_found(uri: axum::http::Uri) -> api_error::ApiError {
     api_error::ApiError::not_found(format!("Unknown API endpoint: {}", uri.path()))
 }
 
-#[cfg(test)]
-mod route_tests {
-    use super::*;
-
-    #[test]
-    fn relay_pairing_route_shapes_do_not_conflict() {
-        let _: Router<Arc<proxy::ProxyState>> = Router::new()
-            .route(
-                "/api/relay/pairings/{relay_id}",
-                get(api::relay::get_pairing).delete(api::relay::delete_pairing),
-            )
-            .route(
-                "/api/relay/pairing-operations/{relay_id}",
-                get(api::relay::get_pairing_operation).post(api::relay::begin_pairing_operation),
-            )
-            .route(
-                "/api/relay/pairing-operations/{operation_id}/commit",
-                axum::routing::put(api::relay::commit_pairing_operation),
-            )
-            .route(
-                "/api/relay/pairing-operations/{operation_id}/cancel",
-                axum::routing::delete(api::relay::cancel_pairing_operation),
-            );
-    }
-}
-
 /// `panoptikon inferio`: the standalone inference service (design
 /// doc §3 "GPU lender" mode). Same config file, same policy layer (host
 /// policies + rulesets apply; inference paths get DB params stripped), but
@@ -694,6 +755,7 @@ async fn inferio_main(
         .unwrap_or(settings.server.port);
     let listen_addr = format!("{}:{}", settings.server.host, port);
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    accelerator_report::log_report(&settings);
     tracing::info!(address = %listen_addr, "inference service listening (inferio mode)");
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -714,4 +776,176 @@ async fn inferio_main(
     let _ = cleanup.await;
     tracing::info!("inference service stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn relay_pairing_route_shapes_do_not_conflict() {
+        let _: Router<Arc<proxy::ProxyState>> = Router::new()
+            .route(
+                "/api/relay/pairings/{relay_id}",
+                get(api::relay::get_pairing).delete(api::relay::delete_pairing),
+            )
+            .route(
+                "/api/relay/pairing-operations/{relay_id}",
+                get(api::relay::get_pairing_operation).post(api::relay::begin_pairing_operation),
+            )
+            .route(
+                "/api/relay/pairing-operations/{operation_id}/commit",
+                axum::routing::put(api::relay::commit_pairing_operation),
+            )
+            .route(
+                "/api/relay/pairing-operations/{operation_id}/cancel",
+                axum::routing::delete(api::relay::cancel_pairing_operation),
+            );
+    }
+
+    /// `/api/video/jobs/{job_id}` and its `/events` child are the one place
+    /// in the video surface where a path parameter is followed by a literal
+    /// segment. Both shapes must reach their own handler, and the job id must
+    /// not swallow `events`.
+    #[tokio::test]
+    async fn video_job_routes_do_not_shadow_the_events_route() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app: Router = Router::new()
+            .route("/api/video/transcode", post(|| async { "submit" }))
+            .route("/api/video/artifact", get(|| async { "artifact" }))
+            .route(
+                "/api/video/jobs/{job_id}",
+                get(
+                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        format!("job {id}")
+                    },
+                )
+                .delete(|| async { "cancel" }),
+            )
+            .route(
+                "/api/video/jobs/{job_id}/events",
+                get(
+                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        format!("events {id}")
+                    },
+                ),
+            )
+            .route("/api/video/presets", get(|| async { "presets" }));
+
+        async fn call(app: &Router, method: &str, path: &str) -> (StatusCode, String) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("route");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            (status, String::from_utf8(body.to_vec()).expect("utf8"))
+        }
+
+        assert_eq!(
+            call(&app, "GET", "/api/video/jobs/abc").await,
+            (StatusCode::OK, "job abc".to_string())
+        );
+        assert_eq!(
+            call(&app, "GET", "/api/video/jobs/abc/events").await,
+            (StatusCode::OK, "events abc".to_string())
+        );
+        assert_eq!(
+            call(&app, "DELETE", "/api/video/jobs/abc").await,
+            (StatusCode::OK, "cancel".to_string())
+        );
+        assert_eq!(
+            call(&app, "GET", "/api/video/presets").await,
+            (StatusCode::OK, "presets".to_string())
+        );
+        // The artifact route is a sibling, not a job id.
+        assert_eq!(
+            call(&app, "GET", "/api/video/artifact").await,
+            (StatusCode::OK, "artifact".to_string())
+        );
+    }
+
+    /// The pinboard content search is a literal segment sitting where every
+    /// other pinboard route has a `{pinboard_id}` path param. axum 0.8 gives
+    /// the literal priority and still matches ids, but that is a routing
+    /// subtlety worth pinning: this replicates the registered path set with
+    /// stand-in handlers and asserts both shapes reach the right one.
+    #[tokio::test]
+    async fn pinboard_search_route_does_not_shadow_the_id_route() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app: Router = Router::new()
+            .route(
+                "/api/pinboards",
+                get(|| async { "list" }).post(|| async { "create" }),
+            )
+            .route("/api/pinboards/search", post(|| async { "search" }))
+            .route(
+                "/api/pinboards/{pinboard_id}",
+                get(
+                    |axum::extract::Path(id): axum::extract::Path<i64>| async move {
+                        format!("board {id}")
+                    },
+                ),
+            )
+            .route(
+                "/api/pinboards/{pinboard_id}/versions",
+                get(|| async { "versions" }),
+            );
+
+        async fn call(app: &Router, method: &str, path: &str) -> (StatusCode, String) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("route");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            (status, String::from_utf8(body.to_vec()).expect("utf8"))
+        }
+
+        assert_eq!(
+            call(&app, "POST", "/api/pinboards/search").await,
+            (StatusCode::OK, "search".to_string())
+        );
+        assert_eq!(
+            call(&app, "GET", "/api/pinboards/123").await,
+            (StatusCode::OK, "board 123".to_string())
+        );
+        // The literal wins outright: axum does *not* fall back to the param
+        // route for a method the literal route does not serve. Harmless,
+        // because `{pinboard_id}` is an i64 — `/api/pinboards/search` was
+        // never a reachable board URL — but worth pinning, since it is the
+        // one behavior that would bite if ids ever became names.
+        assert_eq!(
+            call(&app, "GET", "/api/pinboards/search").await.0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            call(&app, "GET", "/api/pinboards/123/versions").await,
+            (StatusCode::OK, "versions".to_string())
+        );
+    }
 }

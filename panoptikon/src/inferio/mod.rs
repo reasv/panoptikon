@@ -5,7 +5,8 @@
 //! in the spawn handshake; workers never read TOML themselves.
 //!
 //! Layers: the registry (`registry`), worker supervision (`worker`), the
-//! model manager with dispatch-time batching (`manager` + `dispatch`), and
+//! model manager with dispatch-time batching (`manager` + `dispatch`), the
+//! wire vocabulary of typed per-item error slots (`slot_error`), and
 //! the wire-compatible HTTP surface (`http`) mounted under
 //! `/api/inference` when `[inference_local].enabled` (or via the `inferio`
 //! subcommand). Hardware awareness sits alongside: `capability` (compute
@@ -38,4 +39,5 @@ pub mod registry;
 /// The ROCm half of `gpu`: KFD/amdgpu sysfs instead of nvidia-smi. Private
 /// because `gpu` is the only entry point either backend is reached through.
 mod rocm;
+pub mod slot_error;
 pub mod worker;

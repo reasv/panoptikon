@@ -414,10 +414,7 @@ impl From<VramBudget> for VramBudgets {
 /// they are the same statement anyway, since the CPU board is the only board.
 /// Absence tracking the constant is what makes this a serde-defaults-layer
 /// change rather than a line frozen into every user's shipped TOML.
-fn with_shipped_board_defaults(
-    inventory: &GpuInventory,
-    mut budgets: VramBudgets,
-) -> VramBudgets {
+fn with_shipped_board_defaults(inventory: &GpuInventory, mut budgets: VramBudgets) -> VramBudgets {
     if !inventory.prices_host_ram() {
         return budgets;
     }
@@ -1645,10 +1642,10 @@ impl VramLedger {
         report: &LoadReport,
         expected_board: Option<&str>,
     ) -> BoardResolution {
-        if let Some(uuid) = report.gpu_uuid.as_deref() {
-            if let Some(board) = state.gpus.get(uuid) {
-                return Self::admit_board(state, uuid, board, report, expected_board);
-            }
+        if let Some(uuid) = report.gpu_uuid.as_deref()
+            && let Some(board) = state.gpus.get(uuid)
+        {
+            return Self::admit_board(state, uuid, board, report, expected_board);
         }
         let inventory_has_bdfs = state.gpus.values().any(|board| board.bdf.is_some());
         if let Some(bdf) = report.gpu_bdf.as_deref() {
@@ -1869,7 +1866,10 @@ impl VramLedger {
     /// Adoption is for the board whose real total *nothing else can read*;
     /// the APU is instead cross-checked against either figure (see
     /// [`Self::cross_check_total`]), and the CPU board against the one.
-    fn adopt_unified_total_locked(state: &mut LedgerState, report: &LoadReport) -> Option<BoardLog> {
+    fn adopt_unified_total_locked(
+        state: &mut LedgerState,
+        report: &LoadReport,
+    ) -> Option<BoardLog> {
         if !state.adopts_worker_total {
             return None;
         }
@@ -2005,18 +2005,18 @@ impl VramLedger {
         // predict responses, so without this the first window after a load
         // prices `external` as 0 — i.e. hands out the whole card as if nothing
         // else were on it — until the staleness refresh happens to land.
-        if let Some(sample) = report.memory.as_ref() {
-            if let (Some(free), Some(source)) = (sample.free_mb, sample.free_source.clone()) {
-                Self::record_free_locked(
-                    &mut state,
-                    &gpu,
-                    free,
-                    source,
-                    loaded_at,
-                    sample.total_mb,
-                    Some(inference_id),
-                );
-            }
+        if let Some(sample) = report.memory.as_ref()
+            && let (Some(free), Some(source)) = (sample.free_mb, sample.free_source.clone())
+        {
+            Self::record_free_locked(
+                &mut state,
+                &gpu,
+                free,
+                source,
+                loaded_at,
+                sample.total_mb,
+                Some(inference_id),
+            );
         }
         Self::seed_calibration_locked(
             &mut state,
@@ -2441,10 +2441,7 @@ impl VramLedger {
             // reading, or `external` swings by gigabytes on source alone.
             return;
         }
-        let fresher = board
-            .free
-            .as_ref()
-            .is_none_or(|existing| existing.at <= at);
+        let fresher = board.free.as_ref().is_none_or(|existing| existing.at <= at);
         if !fresher {
             return;
         }
@@ -2513,9 +2510,8 @@ impl VramLedger {
             .get(gpu)
             .map(|board| board.load_reservations.values().copied().sum::<u64>())
             .unwrap_or(0);
-        self.limit_with_margin_locked(state, gpu, margin).saturating_sub(
-            Self::charges_locked(state, gpu).saturating_add(reservations),
-        )
+        self.limit_with_margin_locked(state, gpu, margin)
+            .saturating_sub(Self::charges_locked(state, gpu).saturating_add(reservations))
     }
 
     /// The margin one model's windows are priced under: the board's
@@ -2561,10 +2557,11 @@ impl VramLedger {
         } else {
             0.0
         };
-        if let (Some(fit), Some(base_mb)) = (cal.and_then(|cal| cal.fit), entry.base_mb) {
-            if base_mb > 0 && fit.residual_mb.is_finite() {
-                increment += (fit.residual_mb / base_mb as f64).clamp(0.0, MAX_RESIDUAL_MARGIN);
-            }
+        if let (Some(fit), Some(base_mb)) = (cal.and_then(|cal| cal.fit), entry.base_mb)
+            && base_mb > 0
+            && fit.residual_mb.is_finite()
+        {
+            increment += (fit.residual_mb / base_mb as f64).clamp(0.0, MAX_RESIDUAL_MARGIN);
         }
         base + increment.clamp(0.0, MAX_MARGIN_INCREMENT)
     }
@@ -2639,8 +2636,7 @@ impl VramLedger {
             .iter()
             .filter(|(id, entry)| {
                 entry.gpu == requesting.gpu
-                    && (**id == worker
-                        || (entry.pending_requests > 0 && entry.grants.is_empty()))
+                    && (**id == worker || (entry.pending_requests > 0 && entry.grants.is_empty()))
             })
             .map(|(_, entry)| entry)
             .collect();
@@ -2850,9 +2846,8 @@ impl VramLedger {
                 // slope; pre-fit there is no slope, so the ramp value *is* the
                 // unit budget and `share` is simply the contention share held
                 // while that step is measured.
-                let affordable = ((share.mb as f64) / fit.slope_mb_per_unit)
-                    .floor()
-                    .max(1.0) as u64;
+                let affordable =
+                    ((share.mb as f64) / fit.slope_mb_per_unit).floor().max(1.0) as u64;
                 let squeezed = affordable < wanted;
                 units = units.min(affordable).max(1);
                 mb = ((units as f64) * fit.slope_mb_per_unit).ceil() as u64;
@@ -3151,14 +3146,12 @@ impl VramLedger {
 
         // A base that only arrived after registration (a late load response,
         // a claimed prewarmed worker) is recorded once and never moved.
-        if !base_recorded {
-            if let Some(base) = load.as_ref().and_then(|report| report.base_mb) {
-                if let Some(entry) = state.workers.get_mut(&worker) {
-                    entry.base_mb = Some(base);
-                    entry.base_recorded = true;
-                }
-                state.remembered_bases.insert(key.clone(), Some(base));
+        if !base_recorded && let Some(base) = load.as_ref().and_then(|report| report.base_mb) {
+            if let Some(entry) = state.workers.get_mut(&worker) {
+                entry.base_mb = Some(base);
+                entry.base_recorded = true;
             }
+            state.remembered_bases.insert(key.clone(), Some(base));
         }
         if reserved_at_load.is_none() {
             reserved_at_load = load.as_ref().and_then(|report| report.reserved_at_load_mb);
@@ -3170,11 +3163,11 @@ impl VramLedger {
         // The freshest device sample updates both our own pool size and the
         // board's free reading, which the external term is derived from.
         if let Some(stamped) = memory {
-            if let Some(reserved) = stamped.value.reserved_mb {
-                if let Some(entry) = state.workers.get_mut(&worker) {
-                    entry.reserved_mb = Some(reserved);
-                    entry.reserved_seen_at = Some(stamped.captured_at);
-                }
+            if let Some(reserved) = stamped.value.reserved_mb
+                && let Some(entry) = state.workers.get_mut(&worker)
+            {
+                entry.reserved_mb = Some(reserved);
+                entry.reserved_seen_at = Some(stamped.captured_at);
             }
             if let (Some(free), Some(source)) =
                 (stamped.value.free_mb, stamped.value.free_source.clone())
@@ -3204,9 +3197,8 @@ impl VramLedger {
         // The smallest batch this window counts as having spent its budget.
         // `None` when there is no window to measure against, which admits
         // nothing.
-        let full_batch = granted_units.map(|budget| {
-            ((budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1)
-        });
+        let full_batch =
+            granted_units.map(|budget| ((budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -3547,11 +3539,11 @@ impl VramLedger {
             return;
         };
         let fresher = seen_at.is_none_or(|at| stamped.captured_at > at);
-        if let Some(reserved) = stamped.value.reserved_mb.filter(|_| fresher) {
-            if let Some(entry) = state.workers.get_mut(&worker) {
-                entry.reserved_mb = Some(reserved);
-                entry.reserved_seen_at = Some(stamped.captured_at);
-            }
+        if let Some(reserved) = stamped.value.reserved_mb.filter(|_| fresher)
+            && let Some(entry) = state.workers.get_mut(&worker)
+        {
+            entry.reserved_mb = Some(reserved);
+            entry.reserved_seen_at = Some(stamped.captured_at);
         }
         if let (Some(free), Some(source)) =
             (stamped.value.free_mb, stamped.value.free_source.clone())
@@ -3694,9 +3686,7 @@ impl VramLedger {
                             max_units_measured: anchor,
                             knee_units: knee,
                             knee_is_local: cal.is_some_and(|cal| cal.knee_is_local),
-                            throughput_samples: cal
-                                .map(|cal| cal.throughput.len())
-                                .unwrap_or(0),
+                            throughput_samples: cal.map(|cal| cal.throughput.len()).unwrap_or(0),
                             local_samples: cal.map(|cal| cal.local_samples).unwrap_or(0),
                             effective_margin: self.effective_margin_locked(&state, entry),
                             fit: cal.and_then(|cal| cal.fit).map(|fit| FitHealth {
@@ -3704,9 +3694,7 @@ impl VramLedger {
                                 intercept_mb: fit.intercept_mb,
                                 residual_mb: fit.residual_mb,
                                 samples: fit.samples,
-                                transient_samples: cal
-                                    .map(|cal| cal.transients.len())
-                                    .unwrap_or(0),
+                                transient_samples: cal.map(|cal| cal.transients.len()).unwrap_or(0),
                             }),
                         }
                     })
@@ -4472,7 +4460,11 @@ mod tests {
     }
 
     /// [`loaded`] for a named board, so a test can put replicas on two cards.
-    fn loaded_on(board: &str, base_mb: Option<u64>, reserved_at_load: Option<u64>) -> TelemetryHandle {
+    fn loaded_on(
+        board: &str,
+        base_mb: Option<u64>,
+        reserved_at_load: Option<u64>,
+    ) -> TelemetryHandle {
         let mut telemetry = WorkerTelemetry::default();
         telemetry.load = Some(Timestamped::now(LoadReport {
             base_mb,
@@ -4510,9 +4502,12 @@ mod tests {
         /// `(inference_id, epoch, gpu_name, torch, dtype)` per
         /// `expected_base_mb` call — the load-reservation tier, where the key
         /// is deliberately incomplete.
-        queries: StdMutex<Vec<(String, u32, String, Option<String>, Option<String>)>>,
+        queries: StdMutex<Vec<RecordedQuery>>,
         updates: StdMutex<Vec<ProfileUpdate>>,
     }
+
+    /// `(inference_id, epoch, gpu_name, torch, dtype)` as `expected_base_mb` saw it.
+    type RecordedQuery = (String, u32, String, Option<String>, Option<String>);
 
     impl CalibrationProfiles for FakeProfiles {
         fn expected_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
@@ -4812,7 +4807,9 @@ mod tests {
         let ledger = ledger(20_000, no_margin());
         let busy = loaded(Some(1000), Some(0));
         let asking = loaded(Some(1000), Some(0));
-        let a = ledger.register_worker("g/busy", item_cost(4), &busy, None).unwrap();
+        let a = ledger
+            .register_worker("g/busy", item_cost(4), &busy, None)
+            .unwrap();
         let b = ledger
             .register_worker("g/asking", item_cost(4), &asking, None)
             .unwrap();
@@ -4826,7 +4823,8 @@ mod tests {
         assert_eq!(held.grant().mb, 9000);
         let asked = b.request_grant(u64::MAX, None, 3, 0).unwrap();
         assert_eq!(
-            asked.grant().mb, 9000,
+            asked.grant().mb,
+            9000,
             "the remaining headroom, not half of it again"
         );
     }
@@ -4996,7 +4994,11 @@ mod tests {
         drop(token);
         assert_eq!(measured_window(&handle, &admission, 128), 128);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        assert_eq!(token.grant().unit_budget, 256, "and again from the new anchor");
+        assert_eq!(
+            token.grant().unit_budget,
+            256,
+            "and again from the new anchor"
+        );
     }
 
     /// The exponent the anchor implies, in isolation.
@@ -5035,7 +5037,11 @@ mod tests {
         assert_eq!(anchor_before, 32);
         assert_eq!(samples_before, 4);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        assert_eq!(token.grant().unit_budget, 64, "seed 4 << 4 measured windows");
+        assert_eq!(
+            token.grant().unit_budget,
+            64,
+            "seed 4 << 4 measured windows"
+        );
         // An OOM-classified window deflates by one halving.
         token.finish(WindowOutcome::Responded { oom: true });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
@@ -5241,8 +5247,9 @@ mod tests {
             .unwrap();
         push_memory(&handle, 90_000, 0);
         // A clean linear series of high-water batches: 10 MB per unit.
-        let series: Vec<BatchMeasurement> =
-            (1..=6u64).map(|k| measurement(k * 8, 0, 10 * k * 8)).collect();
+        let series: Vec<BatchMeasurement> = (1..=6u64)
+            .map(|k| measurement(k * 8, 0, 10 * k * 8))
+            .collect();
         handle.lock().unwrap().record_measurements(series);
         clean_window(&admission);
         let fit = ledger.health()[0].workers[0]
@@ -5273,8 +5280,9 @@ mod tests {
             .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
-        let series: Vec<BatchMeasurement> =
-            (1..=6u64).map(|k| measurement(k * 8, 0, 10 * k * 8)).collect();
+        let series: Vec<BatchMeasurement> = (1..=6u64)
+            .map(|k| measurement(k * 8, 0, 10 * k * 8))
+            .collect();
         handle.lock().unwrap().record_measurements(series);
         clean_window(&admission);
 
@@ -5347,14 +5355,19 @@ mod tests {
             10_000 - CONSERVATIVE_BASE_MB,
             "an unmeasured first load reserves the conservative constant"
         );
-        assert_eq!(ledger.health()[0].load_reservations_mb, CONSERVATIVE_BASE_MB);
+        assert_eq!(
+            ledger.health()[0].load_reservations_mb,
+            CONSERVATIVE_BASE_MB
+        );
         drop(reservation);
         assert_eq!(ledger.headroom_mb(BOARD), 10_000, "released on drop");
 
         // A measured load teaches the ledger the real base for next time.
         let handle = loaded(Some(1234), Some(0));
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
-        let reservation = ledger.reserve_load("g/a", item_cost(4), BOARD, None).unwrap();
+        let reservation = ledger
+            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .unwrap();
         assert_eq!(
             ledger.headroom_mb(BOARD),
             10_000 - 1234 - 1234,
@@ -5362,7 +5375,11 @@ mod tests {
         );
         drop(reservation);
         // An unknown board has nothing to charge against.
-        assert!(ledger.reserve_load("g/a", item_cost(4), "GPU-nope", None).is_none());
+        assert!(
+            ledger
+                .reserve_load("g/a", item_cost(4), "GPU-nope", None)
+                .is_none()
+        );
     }
 
     /// The calibration store supplies the expected base of a load nothing
@@ -5376,15 +5393,26 @@ mod tests {
             ..FakeProfiles::default()
         });
         let ledger = ledger_with(10_000, no_margin(), &profiles);
-        let _reservation = ledger.reserve_load("g/a", item_cost(4), BOARD, None).unwrap();
+        let _reservation = ledger
+            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .unwrap();
         assert_eq!(ledger.headroom_mb(BOARD), 10_000 - 777);
         let queries = profiles.queries.lock().unwrap();
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].0, "g/a");
         assert_eq!(queries[0].1, 1, "the model's epoch is part of the key");
-        assert_eq!(queries[0].2, "TEST 9000", "the board's model name, not its UUID");
-        assert_eq!(queries[0].3, None, "no torch build before the load response");
-        assert_eq!(queries[0].4, None, "and no negotiated dtype on a first load");
+        assert_eq!(
+            queries[0].2, "TEST 9000",
+            "the board's model name, not its UUID"
+        );
+        assert_eq!(
+            queries[0].3, None,
+            "no torch build before the load response"
+        );
+        assert_eq!(
+            queries[0].4, None,
+            "and no negotiated dtype on a first load"
+        );
     }
 
     /// Two sources describe the same quantity — this run's measured base and
@@ -5400,7 +5428,9 @@ mod tests {
         let ledger = ledger_with(20_000, no_margin(), &profiles);
         let handle = loaded(Some(1234), Some(0));
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
-        let reservation = ledger.reserve_load("g/a", item_cost(4), BOARD, None).unwrap();
+        let reservation = ledger
+            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .unwrap();
         assert_eq!(
             ledger.health()[0].load_reservations_mb,
             5000,
@@ -5415,7 +5445,9 @@ mod tests {
         let ledger = ledger_with(20_000, no_margin(), &profiles);
         let handle = loaded(Some(1234), Some(0));
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
-        let _reservation = ledger.reserve_load("g/a", item_cost(4), BOARD, None).unwrap();
+        let _reservation = ledger
+            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .unwrap();
         assert_eq!(
             ledger.health()[0].load_reservations_mb,
             1234,
@@ -5470,13 +5502,25 @@ mod tests {
             "but its fit prices the very first window"
         );
         assert_eq!(
-            ledger.calibration_state("g/a", BOARD).unwrap().samples.len(),
+            ledger
+                .calibration_state("g/a", BOARD)
+                .unwrap()
+                .samples
+                .len(),
             0,
             "and its samples are not this machine's evidence"
         );
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        assert_eq!(token.grant().unit_budget, 4, "the seed, not the foreign anchor");
-        assert_eq!(token.grant().mb, 40, "4 units priced at the profile's slope");
+        assert_eq!(
+            token.grant().unit_budget,
+            4,
+            "the seed, not the foreign anchor"
+        );
+        assert_eq!(
+            token.grant().mb,
+            40,
+            "4 units priced at the profile's slope"
+        );
     }
 
     /// A **local** profile is this machine's own evidence, so it resumes the
@@ -5516,7 +5560,10 @@ mod tests {
         ledger.ingest_all_for_test();
 
         let state = ledger.calibration_state("g/a", BOARD).expect("seeded");
-        assert_eq!(state.max_units_measured, 64, "the anchor survived the restart");
+        assert_eq!(
+            state.max_units_measured, 64,
+            "the anchor survived the restart"
+        );
         assert_eq!(state.samples, ring, "and so did the ring the fit runs on");
         assert_eq!(ledger.health()[0].workers[0].local_samples, 6);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
@@ -5552,11 +5599,19 @@ mod tests {
         });
         let ledger = ledger_with(100_000, no_margin(), &profiles);
         let first = loaded(Some(1000), Some(0));
-        let _a = ledger.register_worker("g/a", item_cost(4), &first, None).unwrap();
+        let _a = ledger
+            .register_worker("g/a", item_cost(4), &first, None)
+            .unwrap();
         let second = loaded(Some(1000), Some(0));
-        let _b = ledger.register_worker("g/a", item_cost(4), &second, None).unwrap();
+        let _b = ledger
+            .register_worker("g/a", item_cost(4), &second, None)
+            .unwrap();
         assert_eq!(
-            ledger.calibration_state("g/a", BOARD).unwrap().samples.len(),
+            ledger
+                .calibration_state("g/a", BOARD)
+                .unwrap()
+                .samples
+                .len(),
             1,
             "the ring was restored once, not once per replica"
         );
@@ -5694,7 +5749,10 @@ mod tests {
         clean_window(&admission);
         let worker = &ledger.health()[0].workers[0];
         let residual = worker.fit.as_ref().unwrap().residual_mb;
-        assert!(residual > 50.0, "the series really is scattered: {residual}");
+        assert!(
+            residual > 50.0,
+            "the series really is scattered: {residual}"
+        );
         assert!(
             worker.effective_margin > DEFAULT_MARGIN,
             "and that scatter reaches the margin: {}",
@@ -5798,7 +5856,11 @@ mod tests {
         assert_eq!(last.base_method.as_deref(), Some("nvml"));
         assert_eq!(last.max_units_measured, 16);
         assert_eq!(last.local_samples, 3);
-        assert_eq!(last.ring.len(), 3, "the ring rides along so a restart refits");
+        assert_eq!(
+            last.ring.len(),
+            3,
+            "the ring rides along so a restart refits"
+        );
 
         // More clean windows that measure nothing again change nothing.
         for _ in 0..5 {
@@ -5916,9 +5978,7 @@ mod tests {
         assert_eq!(before.max_units_measured, 16);
         // The store really would answer now — that is the whole hazard.
         assert!(
-            store
-                .lookup(&item_query("g/a"))
-                .is_some(),
+            store.lookup(&item_query("g/a")).is_some(),
             "this run's own profile is on disk"
         );
 
@@ -5975,7 +6035,10 @@ mod tests {
         let first = profiles.updates.lock().unwrap().last().cloned().unwrap();
         assert_eq!(first.max_units_measured, 4);
         assert_eq!(first.local_samples, 1);
-        assert!(!first.ring.is_empty(), "the ring is local evidence and travels");
+        assert!(
+            !first.ring.is_empty(),
+            "the ring is local evidence and travels"
+        );
         assert_eq!(
             (first.slope_mb_per_unit, first.residual_mb, first.samples),
             (0.0, 0.0, 0),
@@ -6700,12 +6763,7 @@ mod tests {
     /// the host's RAM recorded as the DP-4 bound and the DP-2 flag.
     fn mps_ledger() -> Arc<VramLedger> {
         let ledger = VramLedger::for_test_boards(
-            &[(
-                MPS_BOARD,
-                "Apple M3 Max (128 GB)",
-                MAC_RAM_MB / 4 * 3,
-                None,
-            )],
+            &[(MPS_BOARD, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
             no_margin(),
             None,
         );
@@ -6761,7 +6819,10 @@ mod tests {
             raised,
             "the figure allocations are actually judged against wins"
         );
-        assert_eq!(admitted_board(&ledger, 0), (MPS_BOARD.to_owned(), "g/a".to_owned()));
+        assert_eq!(
+            admitted_board(&ledger, 0),
+            (MPS_BOARD.to_owned(), "g/a".to_owned())
+        );
     }
 
     /// The adoption's only test is a sanity bound, `0 < reported ≤ host RAM`.
@@ -7260,7 +7321,13 @@ mod tests {
             measured_window(&handle, &admission, units);
         }
         assert_eq!(
-            profiles.updates.lock().unwrap().last().unwrap().max_units_measured,
+            profiles
+                .updates
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .max_units_measured,
             16,
             "the measured anchor is what was written"
         );
@@ -7454,17 +7521,19 @@ mod tests {
     /// host are the same statement because the CPU board is the only board.
     #[test]
     fn a_configured_ceiling_overrides_the_cpu_default() {
-        let per_board = cpu_ledger(VramBudgets::uniform(VramBudget {
-            margin: 0.0,
-            cap_fraction: None,
-        })
-        .with_board(
-            "CPU",
-            VramBudget {
+        let per_board = cpu_ledger(
+            VramBudgets::uniform(VramBudget {
                 margin: 0.0,
-                cap_fraction: Some(0.5),
-            },
-        ));
+                cap_fraction: None,
+            })
+            .with_board(
+                "CPU",
+                VramBudget {
+                    margin: 0.0,
+                    cap_fraction: Some(0.5),
+                },
+            ),
+        );
         assert_eq!(per_board.health()[0].cap_fraction, Some(0.5));
 
         let section_wide = cpu_ledger(VramBudget {
@@ -7493,7 +7562,10 @@ mod tests {
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted under the only board there is");
-        assert_eq!(admitted_board(&ledger, 0), ("CPU".to_owned(), "g/a".to_owned()));
+        assert_eq!(
+            admitted_board(&ledger, 0),
+            ("CPU".to_owned(), "g/a".to_owned())
+        );
 
         // A report describing some *other* machine's memory is refused, as on
         // every other backend.
@@ -7805,8 +7877,8 @@ mod tests {
     /// subprocess on every single grant request, forever.
     #[test]
     fn a_failed_external_refresh_backs_off() {
-        let fresh = |free: Option<FreeSample>, failed: Option<Instant>, refreshing: bool| {
-            GpuLedger {
+        let fresh =
+            |free: Option<FreeSample>, failed: Option<Instant>, refreshing: bool| GpuLedger {
                 name: "TEST 9000".to_owned(),
                 total_mb: 10_000,
                 unified_ram_mb: None,
@@ -7818,8 +7890,7 @@ mod tests {
                 load_reservations: HashMap::new(),
                 refreshing,
                 last_refresh_failed_at: failed,
-            }
-        };
+            };
         let stale = || {
             Some(FreeSample {
                 free_mb: 1000,
@@ -7931,7 +8002,10 @@ mod tests {
             worker.deflation, 0,
             "the aborted window's OOM was watermarked away, not inherited"
         );
-        assert_eq!(worker.ramp_step, 1, "the clean measured window earned a step");
+        assert_eq!(
+            worker.ramp_step, 1,
+            "the clean measured window earned a step"
+        );
     }
 
     /// A `none`-class load reserves nothing, so it cannot squeeze the windows
@@ -7961,13 +8035,16 @@ mod tests {
         drop(undisturbed);
 
         assert!(
-            ledger.reserve_load("g/api", none_class, BOARD, None).is_none(),
+            ledger
+                .reserve_load("g/api", none_class, BOARD, None)
+                .is_none(),
             "the none class is never reserved for"
         );
         assert_eq!(ledger.health()[0].load_reservations_mb, 0);
         let during = neighbour.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(
-            during.grant().mb, baseline,
+            during.grant().mb,
+            baseline,
             "the neighbour's window is untouched by the concurrent load"
         );
         drop(during);
@@ -7976,7 +8053,10 @@ mod tests {
         let charged = ledger
             .reserve_load("g/b", item_cost(4), BOARD, None)
             .expect("charged");
-        assert_eq!(ledger.health()[0].load_reservations_mb, CONSERVATIVE_BASE_MB);
+        assert_eq!(
+            ledger.health()[0].load_reservations_mb,
+            CONSERVATIVE_BASE_MB
+        );
         let squeezed = neighbour.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert!(
             squeezed.grant().mb < baseline,
@@ -7995,8 +8075,13 @@ mod tests {
     fn a_footprintless_model_reserves_nothing_on_reload() {
         let ledger = ledger(10_000, no_margin());
         // First load: nothing is known, so the conservative constant is held.
-        let first = ledger.reserve_load("g/a", item_cost(4), BOARD, None).expect("charged");
-        assert_eq!(ledger.health()[0].load_reservations_mb, CONSERVATIVE_BASE_MB);
+        let first = ledger
+            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .expect("charged");
+        assert_eq!(
+            ledger.health()[0].load_reservations_mb,
+            CONSERVATIVE_BASE_MB
+        );
         drop(first);
         // The load lands and reports no base at all.
         let handle = loaded(None, Some(0));
@@ -8004,13 +8089,20 @@ mod tests {
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("registers");
         assert!(
-            ledger.reserve_load("g/a", item_cost(4), BOARD, None).is_none(),
+            ledger
+                .reserve_load("g/a", item_cost(4), BOARD, None)
+                .is_none(),
             "a model with no footprint is not reserved for again"
         );
         assert_eq!(ledger.health()[0].load_reservations_mb, 0);
         // A different model on the same board is unaffected.
-        let other = ledger.reserve_load("g/b", item_cost(4), BOARD, None).expect("charged");
-        assert_eq!(ledger.health()[0].load_reservations_mb, CONSERVATIVE_BASE_MB);
+        let other = ledger
+            .reserve_load("g/b", item_cost(4), BOARD, None)
+            .expect("charged");
+        assert_eq!(
+            ledger.health()[0].load_reservations_mb,
+            CONSERVATIVE_BASE_MB
+        );
         drop(other);
     }
 
@@ -8028,8 +8120,9 @@ mod tests {
             ledger.calibration_state("g/a", BOARD).is_none(),
             "nothing measured yet"
         );
-        let series: Vec<BatchMeasurement> =
-            (1..=6u64).map(|k| measurement(k * 8, 0, 10 * k * 8)).collect();
+        let series: Vec<BatchMeasurement> = (1..=6u64)
+            .map(|k| measurement(k * 8, 0, 10 * k * 8))
+            .collect();
         handle.lock().unwrap().record_measurements(series);
         clean_window(&admission);
 
@@ -8038,7 +8131,13 @@ mod tests {
         assert_eq!(state.gpu, BOARD);
         assert_eq!(state.max_units_measured, 48, "the ratchet anchor");
         assert_eq!(state.samples.len(), 6);
-        assert_eq!(state.samples[0], FitSample { units: 8, delta_mb: 80 });
+        assert_eq!(
+            state.samples[0],
+            FitSample {
+                units: 8,
+                delta_mb: 80
+            }
+        );
         let fit = state.fit.expect("fitted");
         assert!((fit.slope_mb_per_unit - 10.0).abs() < 1e-6);
 
@@ -8068,7 +8167,8 @@ mod tests {
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().mb, 0, "nothing was reserved, and it says so");
         assert_eq!(
-            token.grant().unit_budget, 4,
+            token.grant().unit_budget,
+            4,
             "the worker still makes progress; its clamp shrinks the batch"
         );
     }
@@ -8212,7 +8312,9 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         // The idle resident: 4000 base plus 1000 MiB of retained pool.
         let idle = loaded(Some(4000), Some(0));
-        let _idle = ledger.register_worker("g/idle", item_cost(4), &idle, None).unwrap();
+        let _idle = ledger
+            .register_worker("g/idle", item_cost(4), &idle, None)
+            .unwrap();
         // The hungry one: 4800 base, no pool of its own yet.
         let hungry = loaded(Some(4800), Some(0));
         let asking = ledger
@@ -8258,7 +8360,9 @@ mod tests {
         //    costing anybody anything.
         let roomy = ledger(10_000, no_margin());
         let idle = loaded(Some(1000), Some(0));
-        let _idle = roomy.register_worker("g/idle", item_cost(4), &idle, None).unwrap();
+        let _idle = roomy
+            .register_worker("g/idle", item_cost(4), &idle, None)
+            .unwrap();
         let hungry = loaded(Some(1000), Some(0));
         let asking = roomy
             .register_worker("g/hungry", item_cost(4), &hungry, None)
@@ -8278,7 +8382,9 @@ mod tests {
         //    worth: it would pay a full pool teardown to hand over crumbs.
         let tight = ledger(10_000, no_margin());
         let idle = loaded(Some(4900), Some(0));
-        let _idle = tight.register_worker("g/idle", item_cost(4), &idle, None).unwrap();
+        let _idle = tight
+            .register_worker("g/idle", item_cost(4), &idle, None)
+            .unwrap();
         let hungry = loaded(Some(4900), Some(0));
         let asking = tight
             .register_worker("g/hungry", item_cost(4), &hungry, None)
@@ -8418,9 +8524,13 @@ mod tests {
         // model, and a budget bounded by what it has measured.
         let roomy = ledger(200_000, no_margin());
         let idle = loaded(Some(1000), Some(0));
-        let _idle = roomy.register_worker("g/idle", item_cost(4), &idle, None).unwrap();
+        let _idle = roomy
+            .register_worker("g/idle", item_cost(4), &idle, None)
+            .unwrap();
         let handle = loaded(Some(1000), Some(0));
-        let admission = roomy.register_worker("g/a", item_cost(4), &handle, None).unwrap();
+        let admission = roomy
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
         push_memory(&idle, 190_000, 1000);
         push_memory(&handle, 190_000, 0);
         roomy.ingest_all_for_test();
@@ -8436,7 +8546,9 @@ mod tests {
             .slope_mb_per_unit;
         assert!(slope > 0.0);
         roomy.take_pending_trims();
-        let token = admission.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
         assert!(
             (token.grant().unit_budget as f64) * slope < roomy.headroom_mb(BOARD) as f64,
             "the premise: memory was nowhere near the binding constraint"
@@ -8452,9 +8564,13 @@ mod tests {
         // nothing left, where the slice genuinely cannot pay for the window.
         let tight = ledger(10_000, no_margin());
         let idle = loaded(Some(4000), Some(0));
-        let _idle = tight.register_worker("g/idle", item_cost(4), &idle, None).unwrap();
+        let _idle = tight
+            .register_worker("g/idle", item_cost(4), &idle, None)
+            .unwrap();
         let handle = loaded(Some(4980), Some(0));
-        let admission = tight.register_worker("g/a", item_cost(4), &handle, None).unwrap();
+        let admission = tight
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
         // footprints = (4000 + 1000) + 4980 = 9980; external = 0; headroom = 20.
         push_memory(&idle, 20, 1000);
         push_memory(&handle, 20, 0);
@@ -8594,10 +8710,8 @@ mod tests {
         );
         drop(token);
 
-        ledger.age_trim_clocks_for_test(
-            resident.worker_id(),
-            TRIM_DEBOUNCE + Duration::from_secs(1),
-        );
+        ledger
+            .age_trim_clocks_for_test(resident.worker_id(), TRIM_DEBOUNCE + Duration::from_secs(1));
         let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
         assert_eq!(
             ledger.take_pending_trims().len(),
@@ -8617,9 +8731,8 @@ mod tests {
         // Cheap residents: 1 MiB of base each, 300 MiB of pool slack.
         let footprints = (RESIDENTS as u64) * 301 + 1;
         let ledger = ledger(footprints + 159, no_margin());
-        let handles: Vec<TelemetryHandle> = (0..RESIDENTS)
-            .map(|_| loaded(Some(1), Some(0)))
-            .collect();
+        let handles: Vec<TelemetryHandle> =
+            (0..RESIDENTS).map(|_| loaded(Some(1), Some(0))).collect();
         let _residents: Vec<Admission> = handles
             .iter()
             .enumerate()
@@ -8894,7 +9007,12 @@ mod tests {
             warm_window(
                 &handle,
                 &admission,
-                &[(units, 100.0), (units, 100.0), (units, 100.0), (units, 100.0)],
+                &[
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                ],
             );
         }
 
@@ -8918,7 +9036,11 @@ mod tests {
         );
 
         let last = profiles.updates.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(last.knee_units, Some(15), "a locally fitted knee is written");
+        assert_eq!(
+            last.knee_units,
+            Some(15),
+            "a locally fitted knee is written"
+        );
 
         // A settle that changes nothing writes nothing more: the knee is one
         // more evidence trigger, not a per-window write.
@@ -8967,7 +9089,11 @@ mod tests {
         token.finish(WindowOutcome::Responded { oom: true });
 
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        assert_eq!(token.grant().unit_budget, 8, "deflation halves under the knee");
+        assert_eq!(
+            token.grant().unit_budget,
+            8,
+            "deflation halves under the knee"
+        );
         token.finish(WindowOutcome::Responded { oom: true });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 4);
@@ -8978,7 +9104,11 @@ mod tests {
             clean_window(&admission);
         }
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        assert_eq!(token.grant().unit_budget, 16, "back to the knee, never past it");
+        assert_eq!(
+            token.grant().unit_budget,
+            16,
+            "back to the knee, never past it"
+        );
     }
 
     /// A seeded knee caps, but is never written back out under our own
@@ -9056,7 +9186,12 @@ mod tests {
             warm_window(
                 &handle,
                 &admission,
-                &[(units, 100.0), (units, 100.0), (units, 100.0), (units, 100.0)],
+                &[
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                ],
             );
         }
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
@@ -9064,7 +9199,11 @@ mod tests {
         let seed = store
             .lookup(&item_query("g/a"))
             .expect("this run's own profile is on disk");
-        assert_eq!(seed.knee_units, Some(15), "the knee round-trips through TOML");
+        assert_eq!(
+            seed.knee_units,
+            Some(15),
+            "the knee round-trips through TOML"
+        );
 
         // A fresh ledger over the same store: the next run.
         let next = VramLedger::for_test_with(
@@ -9190,7 +9329,12 @@ mod tests {
             warm_window(
                 &handle,
                 &admission,
-                &[(units, rate_), (units, rate_), (units, rate_), (units, rate_)],
+                &[
+                    (units, rate_),
+                    (units, rate_),
+                    (units, rate_),
+                    (units, rate_),
+                ],
             );
         }
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
@@ -9218,8 +9362,7 @@ mod tests {
 
         let worker = &ledger.health()[0].workers[0];
         assert_eq!(
-            worker.throughput_samples,
-            KNEE_RING,
+            worker.throughput_samples, KNEE_RING,
             "one admitted sample per window, and the ring is full"
         );
         assert_eq!(
@@ -9303,7 +9446,12 @@ mod tests {
             warm_window(
                 &handle,
                 &admission,
-                &[(units, 100.0), (units, 100.0), (units, 100.0), (units, 100.0)],
+                &[
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                ],
             );
         }
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
@@ -9386,7 +9534,10 @@ mod tests {
             .find(|worker| worker.inference_id == "g/b")
             .expect("registered");
         assert_eq!(seeded.knee_units, Some(16), "adopted where there was none");
-        assert!(!seeded.knee_is_local, "and never laundered into local provenance");
+        assert!(
+            !seeded.knee_is_local,
+            "and never laundered into local provenance"
+        );
     }
 
     /// A knee-capped model must not claim a share of the board sized for a
@@ -9412,10 +9563,11 @@ mod tests {
         for units in [4u64, 8, 16] {
             let window = |handle: &TelemetryHandle, admission: &Admission| {
                 let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-                handle
-                    .lock()
-                    .unwrap()
-                    .record_measurements(vec![measurement(units, 0, 1000 * units)]);
+                handle.lock().unwrap().record_measurements(vec![measurement(
+                    units,
+                    0,
+                    1000 * units,
+                )]);
                 token.finish(WindowOutcome::Responded { oom: false });
             };
             window(&a_handle, &a);
@@ -9431,7 +9583,10 @@ mod tests {
             drop(token);
             mb
         };
-        assert_eq!(even, 4000, "half the headroom, and 4 units of the 1000 slope");
+        assert_eq!(
+            even, 4000,
+            "half the headroom, and 4 units of the 1000 slope"
+        );
 
         // A knee at 7 units: `a` can only use 7 of the 16 it has measured.
         ledger.set_knee_for_test("g/a", BOARD, 7);
@@ -9467,7 +9622,12 @@ mod tests {
             warm_window(
                 &handle,
                 &admission,
-                &[(units, 100.0), (units, 100.0), (units, 100.0), (units, 100.0)],
+                &[
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                ],
             );
         }
         let worker = &ledger.health()[0].workers[0];
@@ -9475,7 +9635,11 @@ mod tests {
         assert_eq!(worker.unit_budget, 1);
 
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        assert_eq!(token.grant().unit_budget, 1, "never zero: a batch is at least one item");
+        assert_eq!(
+            token.grant().unit_budget,
+            1,
+            "never zero: a batch is at least one item"
+        );
         drop(token);
         assert_eq!(
             admission.window_target_units(),

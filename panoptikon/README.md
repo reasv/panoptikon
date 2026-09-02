@@ -111,10 +111,12 @@ Special handling:
 
 ### Policy-scoped SSR tokens (`x-panoptikon-policy`)
 
-The gateway injects `x-panoptikon-policy: <policy>.<expiry_unix>.<hmac_hex>`
+The gateway injects
+`x-panoptikon-policy: <policy>.<expiry_unix>.<origin_b64url>.<hmac_hex>`
 into every request it proxies to the UI upstream, naming the policy the
-policy layer matched for that request (HMAC-SHA256 over `<policy>.<expiry>`,
-5-minute expiry). When the Next.js server renders a page it echoes the token
+policy layer matched for that request and the loopback base URL of the
+listener it arrived on (HMAC-SHA256 over
+`<policy>.<expiry>.<origin_b64url>`, 5-minute expiry). When the Next.js server renders a page it echoes the token
 on its own API calls back into the gateway; at policy ingress a token that
 parses, verifies (constant-time), is unexpired, and names a configured
 policy selects that policy instead of listener/host matching — so SSR acts
@@ -125,10 +127,34 @@ Threat model, in short: the UI process holds no authority of its own — the
 token is minted per request and expires quickly. A forged, tampered,
 expired, or absent token is silently ignored (reason logged at debug:
 `malformed`/`bad-hmac`/`expired`/`unknown-policy`) and selection falls back
-to listener/host matching, so point the SSR's API base URL at the listener
-whose policy is the most restricted one. Every request log line records the
-selection mechanism (`selected_by = token` or `listener/host`) and the
-policy name.
+to listener/host matching. Falling back is required, not a concession: the
+token is minted only on UI-bound proxied requests, so an ordinary API client
+never carries one and "absent" has to mean "select normally" — and once
+absent falls back, so must invalid, since the caller chooses which of the
+two it sends. Every request log line records the selection mechanism
+(`selected_by = token` or `listener/host`) and the policy name.
+
+For SSR that fallback is the one case where it is *wrong* rather than merely
+conservative: a server-rendered API call is a fresh connection from the UI
+server to a loopback listener, so listener matching answers "what may the UI
+process do" instead of "what may this visitor do". Point it at the most
+restricted listener with `[upstreams.ui] api_endpoint` (below), so a token
+that ever stops verifying degrades the render instead of escalating it.
+
+The origin claim is for the UI server, not for the gateway. A UI server the
+gateway launched is told where to send its SSR API calls through
+`PANOPTIKON_API_URL`; one it did not launch (`[upstreams.ui] local = false`
+with a hand-run `next start`) used to have only a compiled-in default port,
+which is right for exactly one gateway on the machine and silently wrong for
+every other — a scratch gateway's pages once rendered another instance's
+library that way. With the claim, such a server routes each SSR call to the
+listener that is actually serving the page. Precedence on the UI side is env
+first (`PANOPTIKON_API_URL` always wins when set), and the UI honors only a
+plain-http loopback origin. The gateway never selects or routes on the claim
+— a legitimate SSR call may arrive on a different listener than the one it
+names (`api_endpoint`, or an explicit `PANOPTIKON_API_URL`) — it is inside
+the signed message only so a token cannot be re-pointed without breaking its
+HMAC.
 
 The HMAC key is a random 256 bits generated at gateway boot. `[server]
 policy_token_key` (64 hex chars, env-templatable) pins it — a niche option
@@ -207,11 +233,37 @@ file_program = "mpv"
 file_args = ["{path}"]
 folder_program = "my-file-manager"
 folder_args = ["--select", "{path}"]
+clipboard_program = "my-clipboard-tool"
+clipboard_args = ["--file", "{path}"]
 ```
 
-The existing `file_command` and `folder_command` keys remain available as
-explicit shell-command templates. All forms support `{path}`, `{folder}`, and
-`{filename}`. Panoptikon Desktop exposes one shared **File opening on this
+`clipboard_program`/`clipboard_args` (and the shell form `clipboard_command`)
+are used by `POST /api/open/clipboard/{sha256}` to copy a file reference to the
+host's clipboard, overriding the built-in native clipboard write; they take the
+same placeholders, and an empty string is a no-op like the other verbs.
+
+The existing `file_command`, `folder_command` and `clipboard_command` keys
+remain available as explicit shell-command templates. All forms support
+`{path}`, `{folder}`, and `{filename}`.
+
+**Quoting is the executor's job in every form.** The `*_program`/`*_args`
+forms pass each value to the operating system as its own argument, so quoting
+does not arise. In the shell forms the placeholders are substituted already
+quoted, so a template writes `mpv {path}`, never `mpv "{path}"`:
+
+| key | substituted as |
+| --- | --- |
+| `file_command`, `folder_command` | wrapped in `"…"` (unchanged behaviour; on Linux/macOS a `"` or `\` inside the value is escaped so it cannot break out) |
+| `clipboard_command` | quoted for the host shell — `'…'` on Linux/macOS, `"…"` on Windows |
+
+`clipboard_command` follows the same convention as Panoptikon Desktop's
+clipboard action, so one template behaves identically in both. Adding your own
+quotes around a placeholder produces a broken command; the server config is
+hand-edited and nothing validates it at save time, so this is the one rule to
+remember. Placeholder text appearing inside a *filename* is never re-expanded,
+whatever the form.
+
+Panoptikon Desktop exposes one shared **File opening on this
 computer** editor for its local Server and Relay actions, including native
 application and test-file pickers, command-line-style argument entry backed by
 structured direct arguments, a copyable placeholder reference, expanded
@@ -802,7 +854,9 @@ Setup completion revalidates them, optionally creates a named index database,
 saves file-type, folder, continuous-scan, model-plan, and schedule settings,
 then atomically queues an initial folder update followed by every selected
 model. `POST /api/desktop/setup-schedule/preview` validates a staged cron string
-and returns its next local-time occurrence without saving it.
+and returns its next local-time occurrence without saving it. Setup completion
+always requires a valid stored routine schedule, including when automatic runs
+are disabled.
 `GET /api/desktop/setup-status` evaluates the
 policy-resolved default index database and reports it ready once at least one
 currently included folder has a matching `file_scans` row, meaning a scan for
@@ -947,6 +1001,11 @@ level = "${LOGLEVEL:-INFO}"  # RUST_LOG takes precedence when set
 # [open]                     # custom /api/open commands; {path} {folder}
 # file_command = "mpv {path}"          #   {filename} placeholders; "" = no-op
 # folder_command = "explorer {folder}" # (was: show in file manager)
+# clipboard_program = "my-clipboard-tool"   # copy a file reference to the
+# clipboard_args = ["--file", "{path}"]     #   host clipboard; overrides the
+# clipboard_command = "my-clipboard-shell {path}"  # built-in native write
+                             # placeholders are quoted automatically in the
+                             #   shell forms: do not add your own quotes
 
 [server]
 host = "127.0.0.1"
@@ -966,6 +1025,12 @@ local = true
 dir = "ui"                    # the ui/ git submodule is the standard spot
 # node = "C:/path/to/node.exe"  # default: repo venv's node, then PATH
 # build = "auto"                # "auto" | "always" | "never"
+# Which listener the UI server calls back into (PANOPTIKON_API_URL), by
+# endpoint name. Default: the primary listener. Only matters when listeners
+# carry different policies: it is the policy an SSR call falls back to when
+# its policy token is absent or does not verify, so name the most restricted
+# listener. An unknown name fails config load.
+# api_endpoint = "public"
 
 [upstreams.api]
 base_url = "http://127.0.0.1:6342"
@@ -1018,6 +1083,15 @@ default = "default"
 allow = "*"
 ```
 
+HTML scanning is opt-in and requires a Chromium-family browser. Panoptikon
+discovers Chrome, Chromium, Brave, and Edge from PATH and their conventional
+platform install locations, or uses `jobs.html_renderer` when set. A new HTML
+file is indexed only after its first screenshot renders successfully; missing
+or failing renderers create an auditable scan failure instead of a metadata-only
+item. Installing a browser makes dependency-blocked files eligible on the next
+scan without restarting Panoptikon. Existing HTML items are not removed if the
+browser later becomes unavailable.
+
 Registry/impl directory resolution for local inference is configured only by
 `[inference_local].config_dirs` / `impl_dirs` (defaults:
 `["python/inferio/config", "config/inference"]` and
@@ -1054,6 +1128,14 @@ they became the `[jobs]` keys `pdfium`, `html_renderer` and
 `thumbnail_font`, which the shipped configs template as `${PDFIUM_PATH:-}`
 etc., so setting the variables in `.env` still works — through the
 templating layer, not a direct read.
+
+Panoptikon Desktop sets `PDFIUM_PATH` to the absolute path of its bundled,
+version-pinned PDFium library before it starts the Server. On macOS that path
+is the Tauri-signed copy under `Contents/Frameworks`, as required by hardened
+runtime library validation. Standalone Server
+installs retain the normal discovery order; managed-venv PDFium libraries are
+canonicalized before loading so hardened macOS processes never receive a
+relative `dlopen` path.
 
 The config file path itself can be overridden on the CLI:
 

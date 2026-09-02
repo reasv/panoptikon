@@ -399,10 +399,7 @@ metadata.cost.seed_units = 4000000
         );
         let deviating = CostDimension::resolve(&registry, "doctr/easyocr");
         assert_eq!(deviating.unit, CostUnit::Pixel);
-        assert_eq!(
-            deviating.aggregation,
-            Some(CostAggregation::MaxTimesCount)
-        );
+        assert_eq!(deviating.aggregation, Some(CostAggregation::MaxTimesCount));
         assert_eq!(deviating.seed_units, Some(4_000_000));
         assert_eq!(deviating.epoch, 3, "epoch still inherited from the group");
         assert!(!deviating.degraded);
@@ -562,7 +559,10 @@ metadata.cost.aggregation = "max-times-count"
             Some(2_000_000),
             "the pixel-class default, not the group's 8 items"
         );
-        assert!(!pixels.degraded, "this is a valid declaration, not a fallback");
+        assert!(
+            !pixels.degraded,
+            "this is a valid declaration, not a fallback"
+        );
 
         assert_eq!(
             CostDimension::resolve(&registry, "g/own_seed").seed_units,
@@ -677,8 +677,8 @@ metadata.cost.aggregation = "sum"
                 if CostDimension::resolve(&registry, &full).unit != CostUnit::Pixel {
                     continue;
                 }
-                let handler = input_handler(&entry.metadata)
-                    .or_else(|| input_handler(&group.group_metadata));
+                let handler =
+                    input_handler(&entry.metadata).or_else(|| input_handler(&group.group_metadata));
                 assert_eq!(
                     handler,
                     Some("image_frames"),

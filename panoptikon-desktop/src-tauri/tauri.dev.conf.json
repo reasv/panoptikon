@@ -2,7 +2,10 @@
   "productName": "Panoptikon Desktop Dev",
   "identifier": "app.panoptikon.desktop.dev",
   "bundle": {
-    "createUpdaterArtifacts": false
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "entitlements": "Entitlements.dev.plist"
+    }
   },
   "plugins": {
     "updater": {
@@ -10,4 +13,3 @@
     }
   }
 }
-

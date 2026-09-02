@@ -1,0 +1,97 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>scroll-perf synthetic grid</title>
+<!--
+  Minimal virtualized grid that reproduces ResultGrid's remount behaviour: a
+  fixed-height absolutely-positioned row window with a small overscan, rows
+  created on entry and removed on exit (no recycling), object-fit: cover /
+  object-position: top cells, lazy+async images. Deliberately zero framework
+  work, so a run measures image cost alone.
+
+  Query params:
+    mode=full|t4096|t1024|t512   image set (see SETS below)
+    cols=<n>                     columns per row (default 5)
+    ch=<px>                      cell height (default 608, ~4K/5-col cell)
+    rows=<n>                     row count (default: enough for ~120000px)
+    overscan=<n>                 rows kept above/below the window (default 3)
+    nocache=1                    append a unique token to every src (defeats
+                                 the HTTP cache; use for cold-transfer runs)
+-->
+<style>
+  body { margin: 0; background: #0a0a12; }
+  #scroller { height: 100vh; overflow-y: auto; }
+  #inner { position: relative; width: 100%; }
+  .row { position: absolute; left: 0; width: 100%; display: grid; gap: 16px; padding: 0 16px; box-sizing: border-box; }
+  .cell { border: 1px solid #333; border-radius: 4px; overflow: hidden; position: relative; }
+  .cell img { width: 100%; height: 100%; object-fit: cover; object-position: top; display: block; }
+</style>
+<div id="scroller"><div id="inner"></div></div>
+<script>
+const Q = new URLSearchParams(location.search);
+const MODE = Q.get('mode') || 'full';
+const COLS = Number(Q.get('cols') || 5);
+const CELL_H = Number(Q.get('ch') || 608);
+const OVERSCAN = Number(Q.get('overscan') || 3);
+const ROW_H = CELL_H + 16;
+const ROWS = Number(Q.get('rows') || Math.max(400, Math.ceil(120000 / ROW_H)));
+const NOCACHE = Q.get('nocache') ? '&n=' + Math.random().toString(36).slice(2) : '';
+
+// full   = the four originals. The three JPEGs are the worst case today's
+//          serve-directly policy allows through (<= 5 MB at any dimensions);
+//          png-16mp.png (7.6 MB, 4600x3500) is NOT -- it is over the byte cap
+//          and over 4096 wide, so today it would be thumbnailed. It is kept as
+//          an upper bound on decode cost (and for comparability with the
+//          recorded baselines), so read this mode as "originals + one
+//          over-the-rule upper bound", not as four of today's served files.
+// t4096  = today's stored thumbs (LONG side capped at 4096)
+// t1024  = proposed grid-m tier (SHORT side 1024)
+// t512   = proposed grid-s tier (SHORT side 512)
+const SETS = {
+  full:  ['jpeg-12mp.jpg','jpeg-33mp.jpg','jpeg-100mp.jpg','png-16mp.png'],
+  t4096: ['t4096-jpeg-12mp.jpg','t4096-jpeg-33mp.jpg','t4096-jpeg-100mp.jpg','t4096-png-16mp.jpg'],
+  t1024: ['t1024-jpeg-12mp.jpg','t1024-jpeg-33mp.jpg','t1024-jpeg-100mp.jpg','t1024-png-16mp.jpg'],
+  t512:  ['t512-jpeg-12mp.jpg','t512-jpeg-33mp.jpg','t512-jpeg-100mp.jpg','t512-png-16mp.jpg'],
+};
+const SET = SETS[MODE];
+if (!SET) throw new Error('unknown mode: ' + MODE + ' (want ' + Object.keys(SETS).join('|') + ')');
+// Distinct query token per index: each cell gets its own cache entry, so the
+// browser cannot share one decoded bitmap across the whole grid.
+const srcFor = (i) => '/img/' + SET[i % SET.length] + '?i=' + i + NOCACHE;
+
+const scroller = document.getElementById('scroller');
+const inner = document.getElementById('inner');
+inner.style.height = (ROWS * ROW_H) + 'px';
+
+const mounted = new Map();
+function renderWindow() {
+  const top = scroller.scrollTop;
+  const first = Math.max(0, Math.floor(top / ROW_H) - OVERSCAN);
+  const last = Math.min(ROWS - 1, Math.ceil((top + scroller.clientHeight) / ROW_H) + OVERSCAN);
+  for (const [idx, el] of mounted) {
+    if (idx < first || idx > last) { el.remove(); mounted.delete(idx); }
+  }
+  for (let r = first; r <= last; r++) {
+    if (mounted.has(r)) continue;
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.gridTemplateColumns = `repeat(${COLS}, 1fr)`;
+    row.style.transform = 'translateY(' + (r * ROW_H) + 'px)';
+    for (let c = 0; c < COLS; c++) {
+      const i = r * COLS + c;
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      cell.style.height = CELL_H + 'px';
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.src = srcFor(i);
+      cell.appendChild(img);
+      row.appendChild(cell);
+    }
+    inner.appendChild(row);
+    mounted.set(r, row);
+  }
+}
+scroller.addEventListener('scroll', renderWindow, { passive: true });
+renderWindow();
+</script>

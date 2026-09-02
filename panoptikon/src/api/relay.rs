@@ -503,10 +503,12 @@ mod tests {
             created_unix: 1,
         };
 
-        let mut store = PairingStore::default();
-        store.operations = (0..MAX_PENDING_OPERATIONS_PER_POLICY)
-            .map(|_| operation("public"))
-            .collect();
+        let mut store = PairingStore {
+            operations: (0..MAX_PENDING_OPERATIONS_PER_POLICY)
+                .map(|_| operation("public"))
+                .collect(),
+            ..Default::default()
+        };
         assert!(!operation_capacity_available(&store, "public"));
         assert!(operation_capacity_available(&store, "private"));
         store.operations = (0..MAX_PENDING_OPERATIONS)

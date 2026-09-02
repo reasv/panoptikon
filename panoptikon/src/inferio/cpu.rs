@@ -180,7 +180,7 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "windows")]
     {
         let _ = roots;
-        return sys::total_mb();
+        sys::total_mb()
     }
     #[cfg(target_os = "macos")]
     {
@@ -215,7 +215,7 @@ fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "windows")]
     {
         let _ = roots;
-        return sys::available_mb();
+        sys::available_mb()
     }
     #[cfg(target_os = "macos")]
     {

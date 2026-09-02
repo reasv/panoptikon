@@ -89,16 +89,12 @@ pub(crate) struct DeleteNamespaceQuery {
 
 #[derive(Deserialize, Copy, Clone, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub(crate) enum BookmarkOrderBy {
     LastModified,
     Path,
+    #[default]
     TimeAdded,
-}
-
-impl Default for BookmarkOrderBy {
-    fn default() -> Self {
-        BookmarkOrderBy::TimeAdded
-    }
 }
 
 #[derive(Deserialize, Copy, Clone, ToSchema)]
@@ -427,6 +423,7 @@ async fn load_bookmark_users(conn: &mut sqlx::SqliteConnection) -> ApiResult<Boo
     Ok(BookmarkUsers { users })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_bookmarks_by_namespace(
     conn: &mut sqlx::SqliteConnection,
     namespace: &str,
@@ -639,12 +636,11 @@ fn resolve_metadata(metadata: Option<&Value>, sha256: &str) -> Option<Value> {
     if !is_truthy(metadata) {
         return None;
     }
-    if let Value::Object(map) = metadata {
-        if let Some(entry) = map.get(sha256) {
-            if is_truthy(entry) {
-                return Some(entry.clone());
-            }
-        }
+    if let Value::Object(map) = metadata
+        && let Some(entry) = map.get(sha256)
+        && is_truthy(entry)
+    {
+        return Some(entry.clone());
     }
     Some(metadata.clone())
 }
@@ -681,8 +677,16 @@ fn default_true() -> bool {
     true
 }
 
+/// IMMEDIATE, not deferred, is a correctness requirement: these transactions
+/// read user_data before their first write, and the background pinboard
+/// activity writer commits to the same database at any time. Under a deferred
+/// BEGIN the read pins a WAL snapshot, and the first write after a concurrent
+/// commit fails `SQLITE_BUSY_SNAPSHOT` — which does NOT invoke the busy
+/// handler, so `busy_timeout` never applies and the user's write 500s. Taking
+/// the write lock up front routes the contention through the busy handler
+/// instead, with the telemetry write as the loser.
 async fn begin_transaction(conn: &mut sqlx::SqliteConnection) -> ApiResult<()> {
-    sqlx::query("BEGIN TRANSACTION")
+    sqlx::query("BEGIN IMMEDIATE")
         .execute(conn)
         .await
         .map_err(|err| {

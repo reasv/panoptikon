@@ -101,11 +101,9 @@ fn inject_vectors(root: &mut QueryElement, fixture: &Fixture, index: &str) {
             args._embedding = Some(fixture.embedding.clone());
             args._distance_func_override =
                 Some(crate::pql::builder::filters::DistanceFunction::Cosine);
-            args._quant = (index == "quant").then(|| {
-                crate::pql::builder::filters::QuantResolved {
-                    profile_id: fixture.profile_id,
-                    query_quant: Some(fixture.query_quant.clone()),
-                }
+            args._quant = (index == "quant").then(|| crate::pql::builder::filters::QuantResolved {
+                profile_id: fixture.profile_id,
+                query_quant: Some(fixture.query_quant.clone()),
             });
         }
     }
@@ -224,13 +222,11 @@ async fn load_fixture(conn: &mut SqliteConnection) -> Fixture {
     .get("n");
     println!("chosen model={model} profile_id={profile_id} vectors={vectors}");
 
-    let query_quant = crate::db::vector_quants::compute_query_quant(
-        &mut *conn,
-        &embedding,
-        artifact.as_deref(),
-    )
-    .await
-    .expect("query quant");
+    let scale = artifact
+        .as_deref()
+        .and_then(crate::db::vector_quants::artifact_scale)
+        .expect("a ready pair carries an int8 scale artifact");
+    let query_quant = crate::db::vector_quants::compute_query_quant(&embedding, scale);
 
     Fixture {
         model,
@@ -286,8 +282,14 @@ async fn find_target(conn: &mut SqliteConnection, setters: &[String]) -> Option<
 #[ignore = "needs a populated index database (PANOPTIKON_EXPLAIN_DB)"]
 async fn explain_plan_similar_to() {
     let (dir, mut conn) = open_target_db().await;
-    let clip = env_or("PANOPTIKON_EXPLAIN_CLIP", "clip/ViT-H-14-378-quickgelu_dfn5b");
-    let text = env_or("PANOPTIKON_EXPLAIN_TEXTMODEL", "textembed/all-mpnet-base-v2");
+    let clip = env_or(
+        "PANOPTIKON_EXPLAIN_CLIP",
+        "clip/ViT-H-14-378-quickgelu_dfn5b",
+    );
+    let text = env_or(
+        "PANOPTIKON_EXPLAIN_TEXTMODEL",
+        "textembed/all-mpnet-base-v2",
+    );
     let k: i64 = env_or("PANOPTIKON_EXPLAIN_K", "10000").parse().expect("k");
     let limit: i64 = env_or("PANOPTIKON_EXPLAIN_LIMIT", "320")
         .parse()
@@ -323,7 +325,10 @@ async fn explain_plan_similar_to() {
             ));
         }
         let Some(target) = find_target(&mut conn, &setters).await else {
-            println!("\n##### {} — SKIPPED (no item covers {setters:?})", case.label);
+            println!(
+                "\n##### {} — SKIPPED (no item covers {setters:?})",
+                case.label
+            );
             continue;
         };
         // The production resolution path: `auto` engages only when every
@@ -369,13 +374,12 @@ async fn explain_plan_similar_to() {
                     let QueryElement::SimilarTo(filter) = &mut root else {
                         unreachable!()
                     };
-                    filter.similar_to._quant =
-                        Some(crate::pql::builder::filters::QuantResolved {
-                            profile_id: pair.as_ref().expect("pair").profile_id,
-                            // Similarity reads both sides from stored quants;
-                            // there is no query vector to binarize.
-                            query_quant: None,
-                        });
+                    filter.similar_to._quant = Some(crate::pql::builder::filters::QuantResolved {
+                        profile_id: pair.as_ref().expect("pair").profile_id,
+                        // Similarity reads both sides from stored quants;
+                        // there is no query vector to binarize.
+                        query_quant: None,
+                    });
                 }
                 PqlQuery {
                     query: Some(root),
@@ -719,10 +723,7 @@ async fn explain_plan_or_decomposition() {
     run_variant(
         &mut conn,
         "probe: setter-driven, SUM without GROUP BY",
-        &with(
-            &[BEGIN, N2_NOGROUP],
-            r#"SELECT "n" FROM "n2_scalar""#,
-        ),
+        &with(&[BEGIN, N2_NOGROUP], r#"SELECT "n" FROM "n2_scalar""#),
         &semantic_binds(),
         runs,
     )
@@ -778,6 +779,13 @@ async fn explain_plan_or_decomposition() {
 
 /// Re-races exact vs quant on the composed RRF `or` shape after giving
 /// *both* paths the sorter fix (docs/or-composition-penalty.md §5 fix B).
+///
+/// **Historical.** Its quant SQL is hand-inlined *binary two-stage* output,
+/// captured before the int8 remap (docs/vector-int8-quant.md) deleted that
+/// scorer. It still runs — the strings are self-contained and binary quant
+/// rows may still exist in an un-reconciled DB — but it no longer describes
+/// what the compiler emits. `explain_plan_exact_vs_quant` (which renders
+/// through the real compiler) is the one to use for current numbers.
 ///
 /// The question this answers: quantization's one measured win was the
 /// composed shape, and that win turned out to be the exact path's
@@ -857,7 +865,16 @@ async fn explain_plan_quant_sorter_fix() {
         &mut conn,
         "quant composed baseline (literals inlined)",
         &with(
-            &[BEGIN, N0_PATH, N1_TEXT, &coarse_baseline, RANKED, &head_baseline, MERGE, OR3],
+            &[
+                BEGIN,
+                N0_PATH,
+                N1_TEXT,
+                &coarse_baseline,
+                RANKED,
+                &head_baseline,
+                MERGE,
+                OR3,
+            ],
             FINAL,
         ),
         &quant_binds(),
@@ -868,7 +885,16 @@ async fn explain_plan_quant_sorter_fix() {
         &mut conn,
         "quant composed, fix B on coarse",
         &with(
-            &[BEGIN, N0_PATH, N1_TEXT, &coarse_fixb, RANKED, &head_baseline, MERGE, OR3],
+            &[
+                BEGIN,
+                N0_PATH,
+                N1_TEXT,
+                &coarse_fixb,
+                RANKED,
+                &head_baseline,
+                MERGE,
+                OR3,
+            ],
             FINAL,
         ),
         &quant_binds(),
@@ -879,7 +905,16 @@ async fn explain_plan_quant_sorter_fix() {
         &mut conn,
         "quant composed, fix B on coarse + head",
         &with(
-            &[BEGIN, N0_PATH, N1_TEXT, &coarse_fixb, RANKED, &head_fixb, MERGE, OR3],
+            &[
+                BEGIN,
+                N0_PATH,
+                N1_TEXT,
+                &coarse_fixb,
+                RANKED,
+                &head_fixb,
+                MERGE,
+                OR3,
+            ],
             FINAL,
         ),
         &quant_binds(),
@@ -956,7 +991,10 @@ async fn explain_plan_quant_sorter_fix() {
     run_variant(
         &mut conn,
         "full composed: pure-quant no-rerank branch",
-        &with(&[BEGIN, N0_PATH, N1_TEXT, &pure_quant_as_branch, OR3], FINAL),
+        &with(
+            &[BEGIN, N0_PATH, N1_TEXT, &pure_quant_as_branch, OR3],
+            FINAL,
+        ),
         &[
             BindVal::Text(text.clone()),
             BindVal::Text(text.clone()),
@@ -981,7 +1019,16 @@ async fn explain_plan_quant_sorter_fix() {
         &mut conn,
         "quant composed, fix B coarse + ranked-driven head",
         &with(
-            &[BEGIN, N0_PATH, N1_TEXT, &coarse_fixb, RANKED, &head_ranked_driven, MERGE, OR3],
+            &[
+                BEGIN,
+                N0_PATH,
+                N1_TEXT,
+                &coarse_fixb,
+                RANKED,
+                &head_ranked_driven,
+                MERGE,
+                OR3,
+            ],
             FINAL,
         ),
         &quant_binds(),
@@ -1030,9 +1077,8 @@ async fn explain_plan_exact_vs_quant() {
                     let QueryElement::Or(or) = query.query.as_mut().expect("root") else {
                         unreachable!()
                     };
-                    or.or_.retain(|element| {
-                        matches!(element, QueryElement::SemanticImageSearch(_))
-                    });
+                    or.or_
+                        .retain(|element| matches!(element, QueryElement::SemanticImageSearch(_)));
                 }
                 query
             };

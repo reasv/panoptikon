@@ -148,8 +148,7 @@ fn clear_config_batch_sizes(store: &SystemConfigStore, index_db: &str) -> Result
         // Nothing to null, and nothing to seed.
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read {}", config_path.display()));
+            return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
         }
     };
     let mut config: SystemConfig = toml::from_str(&raw)
@@ -408,7 +407,10 @@ mod tests {
         // Restore write access (and drop any read-only temp file the failed
         // atomic write could not clean up) so the TempDir can be removed.
         fs::set_permissions(&config_path, writable.clone()).unwrap();
-        for entry in fs::read_dir(config_path.parent().unwrap()).unwrap().flatten() {
+        for entry in fs::read_dir(config_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+        {
             let _ = fs::set_permissions(entry.path(), writable.clone());
         }
     }
@@ -457,10 +459,7 @@ mod tests {
             use std::os::unix::ffi::OsStringExt;
             std::ffi::OsString::from_vec(vec![0x64, 0x80])
         };
-        let path = Path::new("data")
-            .join("index")
-            .join(name)
-            .join("index.db");
+        let path = Path::new("data").join("index").join(name).join("index.db");
         assert!(store_for_index_db(&path).is_none());
         // The skip path: no panic, no error, nothing written.
         clear_stored_batch_sizes(&path);

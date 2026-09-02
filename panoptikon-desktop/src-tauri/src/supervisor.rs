@@ -57,6 +57,30 @@ pub struct StatusSnapshot {
     pub default_database_ready: Option<bool>,
 }
 
+fn pdfium_library_name() -> &'static str {
+    if cfg!(windows) {
+        "pdfium.dll"
+    } else if cfg!(target_os = "macos") {
+        "libpdfium.dylib"
+    } else {
+        "libpdfium.so"
+    }
+}
+
+fn bundled_pdfium_path(resource_dir: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        // Tauri signs custom dylibs only when it installs them in Frameworks.
+        // resource_dir is Contents/Resources in a macOS application bundle.
+        resource_dir
+            .parent()
+            .unwrap_or(resource_dir)
+            .join("Frameworks")
+            .join(pdfium_library_name())
+    } else {
+        resource_dir.join("pdfium").join(pdfium_library_name())
+    }
+}
+
 impl Supervisor {
     pub fn server_config_path(&self) -> std::path::PathBuf {
         self.paths.server_root.join(self.server_config)
@@ -172,6 +196,23 @@ impl Supervisor {
             .args(args);
         if let Some(environment) = crate::host_env::child_environment() {
             command = command.env_clear().envs(environment);
+        }
+        match app.path().resource_dir() {
+            Ok(resource_dir) => {
+                let pdfium = bundled_pdfium_path(&resource_dir);
+                if pdfium.is_file() {
+                    command = command.env("PDFIUM_PATH", pdfium);
+                } else {
+                    tracing::warn!(
+                        path = %pdfium.display(),
+                        "bundled PDFium library is missing; the Server will use fallback discovery"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "could not resolve Desktop resources; the Server will use PDFium fallback discovery"
+            ),
         }
         if let Some((bridge_url, bridge_token)) = crate::updates::bridge_environment(&app) {
             command = command
@@ -469,26 +510,25 @@ async fn wait_for_readiness(app: &AppHandle, generation: u64, port: u16) -> anyh
                     supervisor.set_state(app, LifecycleState::SettingUp).await;
                 }
             }
-            if let Ok(response) = client.get(&ui).send().await {
-                if response.status().is_success()
-                    && response
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|value| value.contains("text/html"))
-                {
-                    let child_is_still_running = app
-                        .state::<Arc<Supervisor>>()
-                        .child
-                        .lock()
-                        .await
-                        .as_ref()
-                        .is_some_and(|running| running.generation == generation);
-                    if child_is_still_running {
-                        return Ok(());
-                    }
-                    bail!("Server sidecar exited during readiness checks");
+            if let Ok(response) = client.get(&ui).send().await
+                && response.status().is_success()
+                && response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|value| value.contains("text/html"))
+            {
+                let child_is_still_running = app
+                    .state::<Arc<Supervisor>>()
+                    .child
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|running| running.generation == generation);
+                if child_is_still_running {
+                    return Ok(());
                 }
+                bail!("Server sidecar exited during readiness checks");
             }
         }
         tokio::time::sleep(delay).await;
@@ -585,6 +625,19 @@ mod tests {
         assert_eq!(args[1], paths.server_root.as_os_str());
         assert_eq!(args[3], OsString::from("config/server/desktop-dev.toml"));
         assert_eq!(args[5], OsString::from("--desktop-managed"));
+    }
+
+    /// PDFium uses Tauri's signed Frameworks location on macOS and its
+    /// platform-specific resource directory everywhere else.
+    #[test]
+    fn bundled_pdfium_uses_the_tauri_resource_directory() {
+        let resource_dir = std::path::Path::new("/opt/panoptikon/resources");
+        let expected = if cfg!(target_os = "macos") {
+            std::path::Path::new("/opt/panoptikon/Frameworks").join(pdfium_library_name())
+        } else {
+            resource_dir.join("pdfium").join(pdfium_library_name())
+        };
+        assert_eq!(bundled_pdfium_path(resource_dir), expected);
     }
 
     /// Diagnostics redact complete lines containing known secret markers.

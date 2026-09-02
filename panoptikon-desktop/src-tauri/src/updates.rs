@@ -931,9 +931,14 @@ impl UpdateCoordinator {
             return Err(format!("Update installation failed: {error}"));
         }
         emit_progress(app, "restarting", 0, None, true);
+        #[cfg(windows)]
+        {
+            Ok(())
+        }
         #[cfg(not(windows))]
-        app.restart();
-        Ok(())
+        {
+            app.restart()
+        }
     }
 
     async fn validate_exact_install_target(
@@ -1363,21 +1368,18 @@ pub fn show_update_window(app: &AppHandle, focus: bool) -> tauri::Result<()> {
                 .title("Update Panoptikon")
                 .inner_size(900.0, 760.0)
                 .min_inner_size(620.0, 520.0)
+                .visible(false)
                 .build()?;
         let close_window = window.clone();
         window.on_window_event(move |event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = close_window.hide();
+                let _ = crate::hide_desktop_window(&close_window);
             }
         });
         window
     };
-    window.show()?;
-    if focus {
-        window.unminimize()?;
-        window.set_focus()?;
-    }
+    crate::show_desktop_window(&window, focus)?;
     Ok(())
 }
 
@@ -1414,7 +1416,7 @@ pub async fn open_update_window(window: WebviewWindow, app: AppHandle) -> Result
 #[tauri::command]
 pub fn close_update_window(window: WebviewWindow) -> Result<(), String> {
     validate_update_window(&window)?;
-    window.hide().map_err(|error| error.to_string())
+    crate::hide_desktop_window(&window).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

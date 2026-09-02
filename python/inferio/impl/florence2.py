@@ -5,11 +5,12 @@ from typing import Dict, List, Sequence
 from PIL import Image as PILImage
 
 from inferio.impl.utils import (
+    assemble_slots,
     clean_whitespace,
     clear_cache,
     cuda_capability,
+    decode_image_inputs,
     get_device,
-    load_image_from_buffer,
     print_resource_usage,
     run_with_oom_retry,
     select_dtype,
@@ -115,14 +116,11 @@ class Florence2(InferenceModel):
         assert self.processor is not None
         assert self.model is not None
 
-        image_inputs: List[PILImage.Image] = []
-        configs: List[dict] = [inp.data for inp in inputs]  # type: ignore
-
-        for input_item in inputs:
-            if input_item.file:
-                image_inputs.append(load_image_from_buffer(input_item.file))
-            else:
-                raise ValueError("Florence2 requires image inputs.")
+        # Undecodable payloads are excluded before the batch is assembled and
+        # come back as error slots (docs/inferio-worker-protocol.md).
+        image_inputs, kept, slots = decode_image_inputs(
+            inputs, what="Florence2", logger=logger
+        )
 
         prompt = self.task_prompt if self.text_input is None else (self.task_prompt + self.text_input)
 
@@ -143,7 +141,7 @@ class Florence2(InferenceModel):
         assert len(results) == len(image_inputs), "Mismatch in input and output."
 
         outputs: List[dict] = []
-        for file_text, _config in zip(results, configs):
+        for file_text in results:
             file_text = clean_whitespace(file_text.strip())
             outputs.append(
                 {
@@ -154,8 +152,7 @@ class Florence2(InferenceModel):
                 }
             )
 
-        assert len(outputs) == len(inputs), f"Expected {len(inputs)} outputs but got {len(outputs)}"
-        return outputs
+        return assemble_slots(len(inputs), kept, outputs, slots)
 
     def _to_device_dtype(self, batch: Dict[str, "torch.Tensor"]) -> Dict[str, "torch.Tensor"]: # type: ignore
         """

@@ -98,13 +98,37 @@ function placeholderReference() {
   }
   section.append(heading, help, list); return section;
 }
+// Mirrors the Rust `quote_cmd` / `quote_posix`: inside a cmd double-quoted
+// region `& | < > ^ ( )` are inert and `"` cannot be escaped (so it is
+// dropped); inside POSIX single quotes everything is literal except `'`.
+function quoteShellValue(value) {
+  return navigator.userAgent.includes('Windows') ? `"${value.replaceAll('"', '')}"` : `'${value.replaceAll("'", "'\\''")}'`;
+}
+// Single pass, mirroring the Rust `substitute_placeholders`: chained
+// replaceAll calls run over text an earlier call already emitted, so a value
+// containing the literal text {filename} would be substituted a second time.
+function expandPlaceholders(template, values, quote) {
+  let output = ''; let rest = template;
+  for (;;) {
+    const open = rest.indexOf('{');
+    if (open < 0) { output += rest; return output; }
+    output += rest.slice(0, open); rest = rest.slice(open);
+    const token = Object.keys(values).find(name => rest.startsWith(name));
+    if (token) { output += quote ? quoteShellValue(values[token]) : values[token]; rest = rest.slice(token.length); }
+    else { output += '{'; rest = rest.slice(1); }
+  }
+}
 function commandPreview(box) {
   const mode = box.querySelector('[data-field=mode]').value;
   if (mode === 'system_default') return 'System default';
   const path = box.querySelector('[data-field=test_path]').value || samplePath;
   const folder = path.replace(/[\\/][^\\/]*$/, '') || path; const filename = path.split(/[\\/]/).pop() || '';
-  const expand = value => value.replaceAll('{path}', path).replaceAll('{folder}', folder).replaceAll('{filename}', filename);
-  if (mode === 'custom_shell') return expand(box.querySelector('[data-field=shell_command]').value);
+  const values = { '{path}': path, '{folder}': folder, '{filename}': filename };
+  // The relay quotes the clipboard verb's shell values because its {filename}
+  // is remote-supplied; direct modes hand every value to the OS as its own
+  // argv entry, so they are raw for every verb.
+  const expand = value => expandPlaceholders(value, values, false);
+  if (mode === 'custom_shell') return expandPlaceholders(box.querySelector('[data-field=shell_command]').value, values, box.dataset.command === 'copy_to_clipboard');
   const program = expand(box.querySelector('[data-field=program]').value);
   let args;
   try { args = parseArguments(box.querySelector('[data-field=args]').value).map(value => `"${expand(value)}"`); }
@@ -137,15 +161,30 @@ function updateCommandCard(box) {
 }
 function commandEditor(container, commands) {
   container.replaceChildren();
-  for (const [key, label] of [['open_file', 'Open File'], ['reveal_in_folder', 'Show in Folder']]) {
+  for (const [key, label] of [['open_file', 'Open File'], ['reveal_in_folder', 'Show in Folder'], ['copy_to_clipboard', 'Copy to Clipboard']]) {
     const spec = commands[key] || { mode: 'system_default', program: '', args: [], shell_command: '' };
     const box = document.createElement('fieldset'); box.dataset.command = key; box.className = 'command-card';
     const legend = document.createElement('legend'); legend.textContent = label;
     const methodLabel = document.createElement('label'); methodLabel.className = 'method-field'; methodLabel.textContent = 'Method';
     const mode = document.createElement('select'); mode.dataset.field = 'mode';
-    for (const [value, text] of [['system_default','System default'], ['specific_application','Choose an application'], ['custom_direct','Executable from PATH'], ['custom_shell','Shell command (advanced)']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; mode.append(option); }
-    mode.value = spec.mode || (spec.shell_command ? 'custom_shell' : spec.program ? 'custom_direct' : 'system_default'); methodLabel.append(mode);
+    // "Choose an application" is meaningless for a clipboard write, so the
+    // clipboard verb offers only System default / Custom (direct) / Custom
+    // (shell). Custom modes still require a path placeholder (readCommand).
+    const modeOptions = [['system_default','System default'], ['specific_application','Choose an application'], ['custom_direct','Executable from PATH'], ['custom_shell','Shell command (advanced)']].filter(([value]) => key !== 'copy_to_clipboard' || value !== 'specific_application');
+    for (const [value, text] of modeOptions) { const option = document.createElement('option'); option.value = value; option.textContent = text; mode.append(option); }
+    let modeValue = spec.mode || (spec.shell_command ? 'custom_shell' : spec.program ? 'custom_direct' : 'system_default');
+    // A hand-edited `mode = "specific_application"` has no option on this row.
+    // Show it as the equivalent direct mode — same program, same arguments,
+    // same execution — and say so, rather than silently falling back to
+    // System default and discarding the command on the next Save.
+    let modeNotice = '';
+    if (key === 'copy_to_clipboard' && modeValue === 'specific_application') {
+      modeValue = 'custom_direct';
+      modeNotice = 'This action was configured to use a chosen application, which Copy to Clipboard does not offer. It is shown as “Executable from PATH”; the program and arguments are unchanged and saving keeps them.';
+    }
+    mode.value = modeValue; methodLabel.append(mode);
     const methodHelp = document.createElement('p'); methodHelp.dataset.role = 'method-help'; methodHelp.className = 'method-help muted';
+    const modeNoticeElement = document.createElement('p'); modeNoticeElement.className = 'warning'; modeNoticeElement.textContent = modeNotice; modeNoticeElement.hidden = !modeNotice;
 
     const direct = document.createElement('div'); direct.dataset.panel = 'direct'; direct.className = 'command-panel';
     const programLabel = document.createElement('label'); programLabel.dataset.role = 'program-label'; programLabel.append('Application or executable');
@@ -169,12 +208,15 @@ function commandEditor(container, commands) {
     const testRow = document.createElement('div'); testRow.className = 'test-row';
     const testPath = document.createElement('input'); testPath.dataset.field = 'test_path'; testPath.placeholder = 'Choose a local test file';
     const chooseTest = document.createElement('button'); chooseTest.type = 'button'; chooseTest.textContent = 'Choose test file…'; chooseTest.onclick = async () => { const value = await invoke('choose_file_action_test_file'); if (value) { testPath.value = value; updateCommandCard(box); } };
-    const runTest = document.createElement('button'); runTest.type = 'button'; runTest.textContent = 'Test action'; runTest.onclick = async () => { try { if (!testPath.value) throw new Error('Choose a test file first.'); const result = await invoke('test_file_action', { command: readCommand(box), path: testPath.value }); status.textContent = `${result.message}. Preview: ${result.preview}`; status.className = result.exit_code && result.exit_code !== 0 ? 'inline-error' : 'success'; } catch (error) { status.textContent = String(error); status.className = 'inline-error'; } };
+    // `action` decides the substitution the backend uses (the clipboard verb's
+    // values are shell-quoted), so the test must run the row's own verb. The
+    // dataset value is already the wire value RelayAction deserializes.
+    const runTest = document.createElement('button'); runTest.type = 'button'; runTest.textContent = 'Test action'; runTest.onclick = async () => { try { if (!testPath.value) throw new Error('Choose a test file first.'); const result = await invoke('test_file_action', { command: readCommand(box), path: testPath.value, action: box.dataset.command }); status.textContent = `${result.message}. Preview: ${result.preview}`; status.className = result.exit_code && result.exit_code !== 0 ? 'inline-error' : 'success'; } catch (error) { status.textContent = String(error); status.className = 'inline-error'; } };
     testRow.append(testPath, chooseTest, runTest);
     const status = document.createElement('p'); status.setAttribute('aria-live', 'polite'); status.className = 'command-status muted';
     const reset = document.createElement('button'); reset.type = 'button'; reset.className = 'reset-action'; reset.textContent = 'Reset to Default'; reset.onclick = () => { mode.value = 'system_default'; program.value = ''; args.value = ''; shell.value = ''; updateCommandCard(box); };
     const methodRow = document.createElement('div'); methodRow.className = 'method-row'; methodRow.append(methodLabel, reset);
-    box.append(legend, methodRow, methodHelp, direct, shellPanel, placeholders, previewLabel, preview, testRow, status);
+    box.append(legend, methodRow, modeNoticeElement, methodHelp, direct, shellPanel, placeholders, previewLabel, preview, testRow, status);
     box.addEventListener('input', () => updateCommandCard(box));
     mode.addEventListener('change', () => { if (mode.value === 'specific_application' && !args.value.trim()) args.value = '{path}'; updateCommandCard(box); });
     updateCommandCard(box); container.append(box);
@@ -187,6 +229,11 @@ function readCommand(box) {
   const args = ['specific_application', 'custom_direct'].includes(mode) ? parseArguments(box.querySelector('[data-field=args]').value) : [];
   if (mode !== 'system_default' && !program && !shell_command) throw new Error('Choose an application or enter a command.');
   if (mode !== 'system_default' && ![program, shell_command, ...args].some(value => /\{(?:path|folder|filename)\}/.test(value))) throw new Error('Each custom action must use at least one path placeholder.');
+  // The relay quotes the clipboard command's placeholders automatically (its
+  // {filename} is remote-supplied), so a quote in the template would be
+  // rejected on save. Surface a friendly message before the round-trip; the
+  // backend remains the enforcer.
+  if (box.dataset.command === 'copy_to_clipboard' && mode === 'custom_shell' && /["']/.test(shell_command)) throw new Error("The clipboard command's placeholders are quoted automatically; remove the quotes from your shell command.");
   return { mode, program, shell_command, args };
 }
 function readCommands(container) { const result = {}; for (const box of container.querySelectorAll('[data-command]')) result[box.dataset.command] = readCommand(box); return result; }
@@ -325,7 +372,10 @@ async function loadServerConfiguration(force = false) {
   renderServerConfiguration(await invoke('get_server_configuration'));
 }
 function positiveInteger(id, label, minimum, maximum) {
-  const value = Number(byId(id).value);
+  // Number('') is 0, so an empty or blank field would otherwise be saved as
+  // zero — silently disabling a cache while reporting success.
+  const raw = byId(id).value.trim();
+  const value = raw === '' ? Number.NaN : Number(raw);
   if (!Number.isInteger(value) || value < minimum || value > maximum) throw new Error(`${label} must be between ${minimum} and ${maximum}.`);
   return value;
 }
@@ -403,6 +453,9 @@ async function refresh() {
     await refreshSearchCacheStats();
     const relayStatus = await invoke('relay_status');
     byId('relay-enabled').checked = relayStatus.enabled;
+    // Don't clobber the field while the user is editing it. share_cache_max_bytes
+    // is bytes; the field is MB.
+    if (document.activeElement !== byId('share-cache-size')) byId('share-cache-size').value = Math.round(relayStatus.share_cache_max_bytes / 1048576);
     if (!byId('file-commands').children.length) commandEditor(byId('file-commands'), await invoke('file_action_commands'));
     if (!byId('relay-instances').contains(document.activeElement)) byId('relay-instances').replaceChildren(...relayStatus.instances.map(mappingEditor));
   } catch (error) { fail(error); }
@@ -525,6 +578,32 @@ byId('clear-search-cache').addEventListener('click', async () => {
     renderSearchCacheStats(await invoke('clear_search_result_cache'));
     searchCacheStatus('Search result cache cleared.', true);
   } catch (error) { searchCacheStatus(String(error), false); }
+});
+function shareCacheStatus(message, ok) {
+  const status = byId('share-cache-status');
+  status.textContent = message;
+  status.className = ok ? 'command-status success' : 'command-status inline-error';
+}
+byId('apply-share-cache-size').addEventListener('click', async () => {
+  const button = byId('apply-share-cache-size');
+  try {
+    const size = positiveInteger('share-cache-size', 'Share cache limit', 0, 1048576);
+    // Matches the backend's clamp: 0 disables caching, anything else must be
+    // large enough to hold a file long enough to paste it.
+    if (size !== 0 && size < 64) throw new Error('Share cache limit must be 0 (disabled) or at least 64 MB.');
+    button.disabled = true; button.textContent = 'Applying…';
+    await invoke('set_share_cache_max_bytes', { sizeMb: size });
+    shareCacheStatus(size === 0 ? 'Share caching disabled; unmapped copies fall back to a download.' : 'Share cache limit saved. Files beyond the new limit were removed.', true);
+  } catch (error) { shareCacheStatus(String(error), false); }
+  finally { button.disabled = false; button.textContent = 'Apply now'; }
+});
+byId('clear-share-cache').addEventListener('click', async () => {
+  const button = byId('clear-share-cache');
+  try {
+    button.disabled = true;
+    shareCacheStatus(await invoke('clear_share_cache'), true);
+  } catch (error) { shareCacheStatus(String(error), false); }
+  finally { button.disabled = false; }
 });
 byId('save-file-commands').addEventListener('click', async () => { try { await invoke('set_file_action_commands', { commands: readCommands(byId('file-commands')) }); byId('file-command-status').textContent = 'File-opening settings saved.'; } catch (error) { fail(error); } });
 window.__TAURI__?.event?.listen('desktop-state', refresh);

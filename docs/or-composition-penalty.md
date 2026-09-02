@@ -270,10 +270,58 @@ only 1–2 rows fit per page. Corrected conclusions:
    `tools/quant-recall` and reconsider the `auto` policy — plausibly
    N-gated (quant wins 2× at 690k, ties at 90k, and small setters like clap
    would pay pure overhead).
+   **IMPLEMENTED 2026-07-30 (e8584a3).** Per-row distances materialize in
+   `qdist_{cte}`/`hdist_{cte}` CTEs and the head is CROSS JOIN-pinned off
+   `ranked` (shared core: `exact::grouped_over_materialized_distance`;
+   `similar_to`'s quant arm deliberately untouched per §7). Verified
+   byte-identical on stdtest and production (917k rows, baseline-worktree
+   binary vs new; permanent harness `pql/quant_ab.rs`), 79/79
+   pql-equivalence, production bench mpnet quant 3.47→1.56s (>2.2× — more
+   after subtracting the harness's fetch-all floor), clip composed
+   0.91→0.70s, k=100 flat (the win scales with head size, not candidate
+   count).
+   **`auto` policy decision (recall re-run, same day): bare `auto` stays
+   exact — the gate turned out to be modality/recall, not N.** The
+   tools/quant-recall re-run on the production DB: CLIP-family recall is
+   clean (clip/clap/similar_to overlap@100 ≥ 0.978, mostly 1.000; sub-1.0
+   is page-boundary ties), but **binary quant on mpnet text is
+   recall-broken at the default k=10,000** — overlap@50 down to 0.245,
+   overlap@10 to 0.700: the exact top-10 falls outside the coarse top-10k
+   (≈ top 12% of that setter's 85k file groups), so no practical k fixes
+   it. The N-gate hypothesis is dead: the one big latency win (mpnet
+   composed, 2×) is recall-disqualified, clip at 90k is a latency tie,
+   clap's win is ~50ms absolute, and `similar_to` quant remains a loss.
+   `quant_requested` in preprocess.rs carries the updated rationale.
+   Consequence for step 4: int8's acceptance bar is overlap@100 ≥ 0.99 on
+   *mpnet* specifically — that is the path by which `auto` can claim the
+   2× composed win.
 4. **Evaluate no-rerank quant methods** (int8 first) with
    `tools/quant-recall` before building anything: the latency ceiling
    (3× at 690k) is now known; whether raw quant ordering is good enough is
    the only open question.
+   **IMPLEMENTED 2026-07-30 — see `docs/vector-int8-quant.md`.** The
+   evaluation answered yes: int8 global-symmetric absmax ("gsym") is
+   effectively at parity with exact (overlap@100 0.989/0.960 mpnet,
+   0.969/0.920 clip; candidate recall@10k 1.000; true-distance ratio
+   1.00001) at 2.14× on mpnet (2.94 → 1.374s) and 1.57× on clip
+   (0.577 → 0.367s). Consequences, all shipped:
+   - the `quant` index mode is **remapped** to single-pass int8 — the quant
+     arm of every vector filter is now literally the exact arm with
+     `embedding_quants` + `vec_int8` swapped in for the vector payload, so
+     `order_rank` means the same thing in both modes;
+   - the **two-stage machinery is deleted** (`filters/quant.rs`, the pinned
+     head skeletons, the text filter's `Drive` chain). Rerank has no
+     surviving niche: 4bit+rerank measured 1.327s against int8-alone's
+     1.374s, fixed-k candidate recall decays with N, and the per-row SQL
+     floor makes narrow-payload speedups inaccessible. Resurrection points
+     are d155328 and e8584a3;
+   - **bare `auto` now resolves to the default quant profile**, non-strictly
+     (falls back to exact when coverage isn't ready). No size gate — the
+     quant payload is strictly smaller, so it cannot lose. This reverses the
+     step-3 decision above, on the evidence that replaced its premise;
+   - `k` is deprecated and ignored, reserved for a future ANN mode;
+   - binary is retired as a quantizer kind; existing coverage migrates
+     through the ordinary recipe-change rebuild.
 
 ---
 

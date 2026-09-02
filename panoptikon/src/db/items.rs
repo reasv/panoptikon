@@ -32,6 +32,19 @@ pub(crate) struct ItemRecord {
     pub video_tracks: Option<i64>,
     pub subtitle_tracks: Option<i64>,
     pub blurhash: Option<String>,
+    /// The raw stored outro verdict, detector version included
+    /// (`tiktok_card/1`, `none/1`); `None` when never examined. Served raw:
+    /// the version suffix is never stripped (design §6.3).
+    pub outro_kind: Option<String>,
+    /// Where the item's real content ends, when an outro was found.
+    pub content_end_ms: Option<i64>,
+    /// `items.video_codec`, sentinels included (`none`, `unknown`); `None` when
+    /// the item was never probed. See
+    /// `migrations/index/20260809120000_item_codecs.sql`.
+    pub video_codec: Option<String>,
+    /// `items.audio_codec`; `None` covers both "no audio stream" and "never
+    /// probed" (the column's accepted ambiguity).
+    pub audio_codec: Option<String>,
     pub time_added: String,
 }
 
@@ -157,6 +170,10 @@ fn item_metadata_query(
         items.video_tracks AS video_tracks,
         items.subtitle_tracks AS subtitle_tracks,
         items.blurhash AS blurhash,
+        items.outro_kind AS outro_kind,
+        items.content_end_ms AS content_end_ms,
+        items.video_codec AS video_codec,
+        items.audio_codec AS audio_codec,
         items.time_added AS time_added,
         files.id AS file_id,
         files.path AS path,
@@ -286,6 +303,22 @@ pub(crate) async fn get_item_metadata_unchecked(
             tracing::error!(error = %err, "failed to read blurhash");
             ApiError::internal("Failed to get item")
         })?;
+        let outro_kind: Option<String> = row.try_get("outro_kind").map_err(|err| {
+            tracing::error!(error = %err, "failed to read outro kind");
+            ApiError::internal("Failed to get item")
+        })?;
+        let content_end_ms: Option<i64> = row.try_get("content_end_ms").map_err(|err| {
+            tracing::error!(error = %err, "failed to read content end");
+            ApiError::internal("Failed to get item")
+        })?;
+        let video_codec: Option<String> = row.try_get("video_codec").map_err(|err| {
+            tracing::error!(error = %err, "failed to read video codec");
+            ApiError::internal("Failed to get item")
+        })?;
+        let audio_codec: Option<String> = row.try_get("audio_codec").map_err(|err| {
+            tracing::error!(error = %err, "failed to read audio codec");
+            ApiError::internal("Failed to get item")
+        })?;
         let time_added: String = row.try_get("time_added").map_err(|err| {
             tracing::error!(error = %err, "failed to read time_added");
             ApiError::internal("Failed to get item")
@@ -321,6 +354,10 @@ pub(crate) async fn get_item_metadata_unchecked(
                 video_tracks,
                 subtitle_tracks,
                 blurhash,
+                outro_kind,
+                content_end_ms,
+                video_codec,
+                audio_codec,
                 time_added,
             });
         }
@@ -557,8 +594,7 @@ pub(crate) async fn get_text_by_ids(
         return Ok(Vec::new());
     }
 
-    let placeholders = std::iter::repeat("?")
-        .take(text_ids.len())
+    let placeholders = std::iter::repeat_n("?", text_ids.len())
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
@@ -710,8 +746,7 @@ pub(crate) async fn get_all_tags_for_item(
     );
 
     if !setters.is_empty() {
-        let placeholders = std::iter::repeat("?")
-            .take(setters.len())
+        let placeholders = std::iter::repeat_n("?", setters.len())
             .collect::<Vec<_>>()
             .join(", ");
         sql.push_str(&format!(" AND setters.name IN ({placeholders})"));
@@ -858,7 +893,7 @@ pub(crate) async fn get_all_mime_types(
         mime_types.push(mime_type);
     }
 
-    mime_types.extend(general_types.into_iter());
+    mime_types.extend(general_types);
     mime_types.sort();
     Ok(mime_types)
 }
@@ -899,37 +934,6 @@ pub(crate) async fn get_file_stats(conn: &mut sqlx::SqliteConnection) -> ApiResu
     })?;
 
     Ok((total_files, total_items))
-}
-
-pub(crate) async fn get_thumbnail_bytes(
-    conn: &mut sqlx::SqliteConnection,
-    sha256: &str,
-    idx: i64,
-) -> ApiResult<Option<Vec<u8>>> {
-    let row = sqlx::query(
-        r#"
-        SELECT thumbnail
-        FROM thumbnails
-        WHERE item_sha256 = ? AND idx = ?
-        "#,
-    )
-    .bind(sha256)
-    .bind(idx)
-    .fetch_optional(conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to read thumbnail bytes");
-        ApiError::internal("Failed to load thumbnail")
-    })?;
-
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let bytes: Vec<u8> = row.try_get("thumbnail").map_err(|err| {
-        tracing::error!(error = %err, "failed to parse thumbnail bytes");
-        ApiError::internal("Failed to load thumbnail")
-    })?;
-    Ok(Some(bytes))
 }
 
 #[cfg(test)]

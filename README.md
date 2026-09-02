@@ -63,7 +63,7 @@ The self-contained console binary preserves the existing foreground and
 Per-release changelogs and the separate Server/Desktop update manifests are on
 the [releases page](https://github.com/reasv/panoptikon/releases).
 
-## This is the Rust implementation
+## Rust rewrite
 
 Panoptikon is implemented in Rust: a single native binary owns the HTTP
 server, the full API, PQL search, the job system and cron scheduler, file

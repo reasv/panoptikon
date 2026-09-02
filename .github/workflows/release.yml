@@ -265,6 +265,9 @@ jobs:
           ext=""; if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
           cp "${{ matrix.bin }}" "panoptikon-desktop/src-tauri/binaries/panoptikon-${{ matrix.triple }}${ext}"
 
+      - name: Stage pinned PDFium runtime and notices
+        run: python scripts/stage-pdfium.py --target "${{ matrix.triple }}"
+
       - name: Install pinned Tauri CLI
         run: npm install --global @tauri-apps/cli@2.11.4
 

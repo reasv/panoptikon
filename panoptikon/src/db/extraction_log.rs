@@ -89,6 +89,11 @@ pub(crate) struct LogRecord {
     pub other_files: i64,
     pub total_segments: i64,
     pub errors: i64,
+    /// How many of `errors` were verdicts about the media itself (the
+    /// `input`/`blocked`/`resource` ledger classes) rather than systemic
+    /// failures. The remainder is what decides whether a job where everything
+    /// failed completes with a warning or hard-fails.
+    pub input_errors: i64,
     pub total_remaining: i64,
     pub data_load_time: f64,
     pub inference_time: f64,
@@ -124,6 +129,7 @@ pub(crate) async fn get_all_data_logs(
             other_files,
             total_segments,
             errors,
+            input_errors,
             total_remaining,
             data_load_time,
             inference_time,
@@ -220,6 +226,10 @@ pub(crate) async fn get_all_data_logs(
                 tracing::error!(error = %err, "failed to read data log errors");
                 ApiError::internal("Failed to get data logs")
             })?,
+            input_errors: row.try_get("input_errors").map_err(|err| {
+                tracing::error!(error = %err, "failed to read data log input errors");
+                ApiError::internal("Failed to get data logs")
+            })?,
             total_remaining: row.try_get("total_remaining").map_err(|err| {
                 tracing::error!(error = %err, "failed to read data log remaining");
                 ApiError::internal("Failed to get data logs")
@@ -301,12 +311,12 @@ pub(crate) async fn get_setters_total_data(
     conn: &mut sqlx::SqliteConnection,
 ) -> ApiResult<Vec<(String, i64)>> {
     let rows = sqlx::query(SETTER_TOTALS_SQL)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| {
-        tracing::error!(error = %err, "failed to read setter totals");
-        ApiError::internal("Failed to get setters")
-    })?;
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "failed to read setter totals");
+            ApiError::internal("Failed to get setters")
+        })?;
 
     let mut results = Vec::with_capacity(rows.len());
     for row in rows {
@@ -443,11 +453,11 @@ mod tests {
             r#"
             INSERT INTO data_log
                 (id, job_id, start_time, end_time, type, setter, threshold, batch_size,
-                 image_files, video_files, other_files, total_segments, errors, total_remaining,
-                 data_load_time, inference_time, completed)
+                 image_files, video_files, other_files, total_segments, errors, input_errors,
+                 total_remaining, data_load_time, inference_time, completed)
             VALUES
                 (10, 1, '2024-01-01T00:00:00', '2024-01-01T00:10:00', 'tags', 'alpha', 0.5, 32,
-                 1, 2, 3, 4, 5, 6, 1.5, 2.5, 1)
+                 1, 2, 3, 4, 5, 4, 6, 1.5, 2.5, 1)
             "#,
         )
         .execute(&mut dbs.index_conn)
@@ -462,6 +472,9 @@ mod tests {
         assert_eq!(logs[0].failed, 0);
         assert_eq!(logs[0].completed, 1);
         assert_eq!(logs[0].status, Some(1));
+        // The input split rides along with the error total: the job history
+        // reads "errors: 5 (4 input)" off exactly these two.
+        assert_eq!((logs[0].errors, logs[0].input_errors), (5, 4));
     }
 
     // Ensures setter totals return counts per setter.
@@ -499,16 +512,15 @@ mod tests {
         // item_data heap: the index has to answer it outright. Column order
         // drifting out of sync with the query would not fail anything —
         // SQLite would just quietly go back to scanning every row.
-        let plan: Vec<String> =
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "EXPLAIN QUERY PLAN {SETTER_TOTALS_SQL}"
-            )))
-            .fetch_all(&mut dbs.index_conn)
-            .await
-            .unwrap()
-            .iter()
-            .map(|row| row.get::<String, _>("detail"))
-            .collect();
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {SETTER_TOTALS_SQL}"
+        )))
+        .fetch_all(&mut dbs.index_conn)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
         assert!(
             plan.iter()
                 .any(|step| step.contains("idx_item_data_placeholder_setter")),

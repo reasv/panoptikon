@@ -128,8 +128,7 @@ pub(crate) async fn get_most_common_tags_frequency(
         "#,
     );
     if !setters.is_empty() {
-        let placeholders = std::iter::repeat("?")
-            .take(setters.len())
+        let placeholders = std::iter::repeat_n("?", setters.len())
             .collect::<Vec<_>>()
             .join(", ");
         sql.push_str(&format!(
@@ -202,7 +201,7 @@ pub(crate) async fn get_all_tag_namespaces(
             prefixes.insert(prefix.to_string());
         }
     }
-    namespaces.extend(prefixes.into_iter());
+    namespaces.extend(prefixes);
     namespaces.sort();
     Ok(namespaces)
 }
@@ -282,8 +281,7 @@ async fn get_most_common_tags(
         conditions.push("tags_items.confidence >= ?".to_string());
     }
     if !setters.is_empty() {
-        let placeholders = std::iter::repeat("?")
-            .take(setters.len())
+        let placeholders = std::iter::repeat_n("?", setters.len())
             .collect::<Vec<_>>()
             .join(", ");
         conditions.push(format!("setters.name IN ({placeholders})"));
@@ -309,10 +307,10 @@ async fn get_most_common_tags(
             query = query.bind(upper);
         }
     }
-    if let Some(confidence_threshold) = confidence_threshold {
-        if confidence_threshold > 0.0 {
-            query = query.bind(confidence_threshold);
-        }
+    if let Some(confidence_threshold) = confidence_threshold
+        && confidence_threshold > 0.0
+    {
+        query = query.bind(confidence_threshold);
     }
     for setter in setters {
         query = query.bind(setter);
@@ -447,9 +445,8 @@ mod tests {
     // normalizes them, so normalize here too.)
     #[test]
     fn recount_sql_matches_the_migration() {
-        let migration =
-            include_str!("../../migrations/index/20260727130000_tags_item_count.sql")
-                .replace("\r\n", "\n");
+        let migration = include_str!("../../migrations/index/20260727130000_tags_item_count.sql")
+            .replace("\r\n", "\n");
         assert!(
             migration.contains(RECOUNT_TAG_ITEMS_SQL),
             "migration 20260727130000 no longer runs RECOUNT_TAG_ITEMS_SQL verbatim"
@@ -513,13 +510,15 @@ mod tests {
     #[tokio::test]
     async fn tags_items_insert_without_item_id_is_rejected() {
         let mut dbs = setup_tag_db().await;
-        let result =
-            sqlx::query("INSERT INTO tags_items (item_data_id, tag_id, confidence) VALUES (12, 3, 1.0)")
-                .execute(&mut dbs.index_conn)
-                .await;
+        let result = sqlx::query(
+            "INSERT INTO tags_items (item_data_id, tag_id, confidence) VALUES (12, 3, 1.0)",
+        )
+        .execute(&mut dbs.index_conn)
+        .await;
         let err = result.expect_err("insert omitting item_id must be rejected");
         assert!(
-            err.to_string().contains("item_id must be the owning item id"),
+            err.to_string()
+                .contains("item_id must be the owning item id"),
             "unexpected error: {err}"
         );
     }

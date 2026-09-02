@@ -1,3 +1,4 @@
+use crate::visual_tiers::FormatPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{
@@ -40,9 +41,12 @@ pub(crate) struct JobSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub(crate) struct VectorQuantProfileConfig {
     pub name: String,
-    /// 'binary' in v1; 'int8' is a reserved future recipe slot.
+    /// `int8` (global-symmetric absmax, docs/vector-int8-quant.md). `binary`
+    /// is retired: the load path maps it to `int8` (which triggers a
+    /// recipe-change rebuild), the config-commit path rejects it.
     pub quantizer: String,
-    /// Mean-center vectors before binarization (per embedding space).
+    /// Deprecated: ignored since the int8 remap. Kept deserializable so
+    /// existing `[vector_quants]` sections still parse.
     #[serde(default)]
     pub centered: bool,
 }
@@ -65,8 +69,8 @@ impl VectorQuantsConfig {
             default: Some("default".to_string()),
             profiles: vec![VectorQuantProfileConfig {
                 name: "default".to_string(),
-                quantizer: "binary".to_string(),
-                centered: true,
+                quantizer: "int8".to_string(),
+                centered: false,
             }],
         }
     }
@@ -94,6 +98,32 @@ pub(crate) struct SystemConfig {
     pub scan_html: bool,
     #[serde(default)]
     pub scan_pdf: bool,
+    /// Probe videos for an appended platform outro (TikTok end cards) at scan
+    /// time, so thumbnails and frames stop sampling the card
+    /// (docs/video-outro-detection-design.md §8). Subordinate to `scan_video`:
+    /// off when video scanning is off, regardless of this. Turning it off does
+    /// not revert visuals already regenerated against a trimmed range (§8.1).
+    #[serde(default = "default_true")]
+    pub detect_outros: bool,
+    /// Accepted names: `jpeg`, `webp`; unknown names are ignored
+    /// (docs/thumbnail-format-implementation.md §2, R5).
+    ///
+    /// Which container formats stored thumbnails may use.
+    ///
+    /// It *constrains* the format rules rather than deciding anything: with
+    /// `webp` absent every WebP verdict becomes JPEG (alpha flattened), with
+    /// `jpeg` absent every JPEG verdict becomes WebP — the
+    /// storage-constrained deployment, which knowingly pays WebP's measured
+    /// 2.2-2.7x decode cost in the grid. A list naming neither is treated as
+    /// the default with a warning and never rejected at commit: the settings
+    /// UI round-trips the whole config, so a reject would break every
+    /// unrelated save.
+    ///
+    /// Changing it regenerates the affected renditions on the next scan; the
+    /// database file only shrinks after the maintenance VACUUM.
+    #[serde(default = "default_thumbnail_formats")]
+    #[schema(example = json!(["jpeg", "webp"]))]
+    pub thumbnail_formats: Vec<String>,
     #[serde(default)]
     pub enable_cron_job: bool,
     #[serde(default = "default_cron_schedule")]
@@ -155,6 +185,22 @@ fn default_cron_schedule() -> String {
     "0 3 * * *".to_string()
 }
 
+impl SystemConfig {
+    /// [`FormatPolicy`] for this database, folded from `thumbnail_formats`.
+    ///
+    /// Fold it **once** per scan — at job start, and on every config reload —
+    /// and thread the result. It is a parse of a `Vec<String>`, and a list
+    /// naming no usable format warns; doing it per dispatched file put that
+    /// warning in the log once per file in the library.
+    pub(crate) fn format_policy(&self) -> FormatPolicy {
+        FormatPolicy::from_names(&self.thumbnail_formats)
+    }
+}
+
+fn default_thumbnail_formats() -> Vec<String> {
+    vec!["jpeg".to_string(), "webp".to_string()]
+}
+
 impl Default for SystemConfig {
     fn default() -> Self {
         Self {
@@ -164,6 +210,8 @@ impl Default for SystemConfig {
             scan_audio: false,
             scan_html: false,
             scan_pdf: false,
+            detect_outros: true,
+            thumbnail_formats: default_thumbnail_formats(),
             enable_cron_job: false,
             cron_schedule: default_cron_schedule(),
             cron_jobs: Vec::new(),
@@ -208,6 +256,9 @@ impl SystemConfigStore {
             .join("config.toml")
     }
 
+    /// Reads the stored configuration, creating it from defaults when the
+    /// file does not exist yet. For the jobs/config surfaces, which are
+    /// entitled to materialize the file they are about to edit.
     pub(crate) fn load(&self, index_db: &str) -> ApiResult<SystemConfig> {
         let config_path = self.config_path(index_db);
         if !config_path.exists() {
@@ -216,17 +267,26 @@ impl SystemConfigStore {
             return Ok(config);
         }
 
-        let raw = fs::read_to_string(&config_path).map_err(|err| {
-            tracing::error!(error = %err, path = %config_path.display(), "failed to read system config");
-            ApiError::internal("Failed to read system configuration")
-        })?;
-        let mut config: SystemConfig = toml::from_str(&raw).map_err(|err| {
-            tracing::error!(error = %err, path = %config_path.display(), "failed to parse system config");
-            ApiError::internal("Failed to parse system configuration")
-        })?;
+        read_config_file(&config_path)
+    }
 
-        normalize_folder_lists(&mut config);
-        Ok(config)
+    /// The same read as [`load`](Self::load) with the create-on-missing side
+    /// effect removed: a missing file simply reads as
+    /// `SystemConfig::default()`, and nothing is written.
+    ///
+    /// This is what read paths must use. A plain GET has no business creating
+    /// files in the data folder: a read-only server refuses exactly that kind
+    /// of on-demand write (see `db::connection::ensure_migrations_allowed`),
+    /// a search-only capability client has no config-write entitlement, and a
+    /// GET racing a `PUT /api/jobs/config` could otherwise drop a defaults
+    /// file on top of the save.
+    pub(crate) fn load_readonly(&self, index_db: &str) -> ApiResult<SystemConfig> {
+        let config_path = self.config_path(index_db);
+        if !config_path.exists() {
+            return Ok(SystemConfig::default());
+        }
+
+        read_config_file(&config_path)
     }
 
     pub(crate) fn save(&self, index_db: &str, config: &SystemConfig) -> ApiResult<()> {
@@ -274,6 +334,23 @@ impl SystemConfigStore {
     }
 }
 
+/// Reads and parses an existing `config.toml`. Shared by both load paths so
+/// they can never drift in how a stored file is interpreted; they differ
+/// only in what they do when there is no file.
+fn read_config_file(config_path: &Path) -> ApiResult<SystemConfig> {
+    let raw = fs::read_to_string(config_path).map_err(|err| {
+        tracing::error!(error = %err, path = %config_path.display(), "failed to read system config");
+        ApiError::internal("Failed to read system configuration")
+    })?;
+    let mut config: SystemConfig = toml::from_str(&raw).map_err(|err| {
+        tracing::error!(error = %err, path = %config_path.display(), "failed to parse system config");
+        ApiError::internal("Failed to parse system configuration")
+    })?;
+
+    normalize_folder_lists(&mut config);
+    Ok(config)
+}
+
 fn normalize_folder_lists(config: &mut SystemConfig) {
     if !config.included_folders.is_empty() {
         config.included_folders = normalize_folder_list(&config.included_folders);
@@ -304,10 +381,10 @@ pub(crate) fn normalize_folder_list(folder_list: &[String]) -> Vec<String> {
 fn normalize_path(path: &str) -> String {
     let trimmed = path.trim();
     let mut buf = PathBuf::from(trimmed);
-    if !buf.is_absolute() {
-        if let Ok(cwd) = env::current_dir() {
-            buf = cwd.join(buf);
-        }
+    if !buf.is_absolute()
+        && let Ok(cwd) = env::current_dir()
+    {
+        buf = cwd.join(buf);
     }
 
     let mut normalized = PathBuf::new();
@@ -352,6 +429,8 @@ mod tests {
         );
         assert_eq!(config.scan_images, default.scan_images);
         assert_eq!(config.scan_video, default.scan_video);
+        assert_eq!(config.detect_outros, default.detect_outros);
+        assert!(config.detect_outros, "outro detection is opt-out");
         assert!(config.job_filters.is_empty());
         assert!(config.filescan_filter.is_none());
         assert!(store.config_path("default").exists());
@@ -366,6 +445,7 @@ mod tests {
         let raw = r#"
 scan_images = true
 scan_video = false
+detect_outros = false
 
 job_filters = [
   { setter_names = ["file_scan"], pql_query = { match = { gt = { size = 10 } } } }
@@ -387,6 +467,7 @@ some_future_key = { a = 1, b = [1, 2, 3] }
         assert_eq!(loaded.job_filters.len(), 1);
         assert!(loaded.filescan_filter.is_some());
         assert!(loaded.extra.contains_key("some_future_key"));
+        assert!(!loaded.detect_outros);
 
         store.save("default", &loaded).unwrap();
 
@@ -394,6 +475,7 @@ some_future_key = { a = 1, b = [1, 2, 3] }
         assert_eq!(reloaded.job_filters.len(), loaded.job_filters.len());
         assert!(reloaded.filescan_filter.is_some());
         assert!(reloaded.extra.contains_key("some_future_key"));
+        assert!(!reloaded.detect_outros);
     }
 
     #[test]
@@ -411,6 +493,10 @@ some_future_key = { a = 1, b = [1, 2, 3] }
         );
         fs::write(&path, raw).unwrap();
         let mut config = store.load("default").unwrap();
+        // A key the file has never carried keeps its serde default and is not
+        // written back: a new setting reaches existing databases without a
+        // migration and without rewriting hand-edited config (design §8).
+        assert!(config.detect_outros);
         config.scan_video = false;
         store.save("default", &config).unwrap();
         assert_eq!(

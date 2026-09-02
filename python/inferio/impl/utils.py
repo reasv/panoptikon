@@ -4,7 +4,8 @@ import os
 import logging
 import json
 import re
-from typing import List, Optional
+import struct
+from typing import List, Optional, Sequence
 import numpy as np
 from PIL import Image
 import PIL.Image
@@ -716,6 +717,110 @@ def print_resource_usage(logger: logging.Logger | None = None):
     except ImportError:
         log("  [psutil] psutil not installed. Install with `pip install psutil` for more details.")
 
+# --------------------------------------------------------------------------
+# Per-item error slots (docs/inferio-worker-protocol.md).
+#
+# An output slot may carry a typed failure instead of a payload, so one
+# undecodable input no longer takes its healthy batch-mates down with it. Only
+# a decode failure of *this input's own bytes* may become a slot: everything
+# else (OOM, a broken model, a missing dependency) keeps failing the whole
+# batch, which is what the orchestrator retries.
+# --------------------------------------------------------------------------
+
+ERROR_SLOT_KEY = "__error__"
+ERROR_CLASS_INPUT = "input"
+
+
+class ImageDecodeError(ValueError):
+    """The image payload itself is undecodable by every enabled backend.
+
+    A ValueError subclass, so callers that never caught it see no change; the
+    distinct type is what lets the per-item seam tell a bad payload apart from
+    a broken environment ("Pillow is not installed"), which must never be
+    blamed on the item.
+    """
+
+
+def input_error_slot(message: str) -> dict:
+    """One output slot reporting that this input's own payload was rejected."""
+    return {
+        ERROR_SLOT_KEY: {"class": ERROR_CLASS_INPUT, "message": str(message)}
+    }
+
+
+def load_image_or_slot(
+    buf: bytes, *, logger: logging.Logger | None = None, **kwargs
+) -> "tuple[PIL.Image.Image | None, dict | None]":
+    """Decode one image payload, per item, before the batch is assembled.
+
+    Returns `(image, None)` on success and `(None, slot)` when these bytes are
+    undecodable. Only `ImageDecodeError` becomes a slot, and
+    `load_image_from_buffer` raises it only for a genuine decode failure of
+    this payload; everything else (MemoryError, a decompression-bomb ceiling,
+    a broken cv2, a RecursionError) propagates and fails the whole batch,
+    which the orchestrator retries.
+    """
+    try:
+        return load_image_from_buffer(buf, **kwargs), None
+    except ImageDecodeError as err:
+        (logger or logging.getLogger(__name__)).warning(
+            "Excluding an undecodable image input from the batch: %s", err
+        )
+        return None, input_error_slot(str(err))
+
+
+def decode_image_inputs(
+    inputs, *, what: str, logger: logging.Logger | None = None
+) -> "tuple[list, list[int], list[tuple[int, dict]]]":
+    """Decode the image payload of every input of an image-only model.
+
+    Returns `(images, kept, slots)`: `images` are the decoded payloads of the
+    inputs whose positions are listed in `kept` (both in input order), and
+    `slots` pairs each excluded position with its error slot. An input with no
+    file at all is a caller error, not an input error, and still raises —
+    `what` names the model in that message, as before.
+    """
+    images: list = []
+    kept: List[int] = []
+    slots: List[tuple] = []
+    for idx, input_item in enumerate(inputs):
+        if not input_item.file:
+            raise ValueError(f"{what} requires image inputs.")
+        image, slot = load_image_or_slot(input_item.file, logger=logger)
+        if slot is not None:
+            slots.append((idx, slot))
+            continue
+        images.append(image)
+        kept.append(idx)
+    return images, kept, slots
+
+
+def assemble_slots(
+    total: int, kept: List[int], results: Sequence, slots: List[tuple]
+) -> list:
+    """Rebuild the full, input-ordered output list around the error slots.
+
+    `kept` are the input positions the batch actually ran and `results` their
+    outputs (same order and length); `slots` are the excluded positions. Every
+    position must end up filled — a hole means the impl lost an output, which
+    the protocol treats as a fatal count mismatch anyway, so it is raised here
+    where the cause is still visible.
+    """
+    outputs: list = [None] * total
+    if len(kept) != len(results):
+        raise RuntimeError(
+            f"predict produced {len(results)} results for {len(kept)} inputs"
+        )
+    for index, result in zip(kept, results):
+        outputs[index] = result
+    for index, slot in slots:
+        outputs[index] = slot
+    missing = [i for i, out in enumerate(outputs) if out is None]
+    if missing:
+        raise RuntimeError(f"predict produced no output for inputs {missing}")
+    return outputs
+
+
 def load_image_from_buffer(
     buf: bytes,
     *,
@@ -724,7 +829,8 @@ def load_image_from_buffer(
     fallback_opencv: bool = True,
 ) -> "PIL.Image.Image":
     """
-    Load an image from a raw byte buffer and return a Pillow Image in RGB mode.
+    Load an image from a raw byte buffer and return a Pillow Image in RGB
+    mode, display-oriented (the EXIF orientation applied, as a browser would).
 
     Parameters
     ----------
@@ -737,17 +843,38 @@ def load_image_from_buffer(
         If True, appends the JPEG end‑of‑image marker 0xFF 0xD9 if it is missing.
     fallback_opencv : bool, default True
         If Pillow still cannot decode, fall back to OpenCV and convert the
-        result back to Pillow.
+        result back to Pillow. OpenCV is optional: when it is not installed
+        the Pillow verdict simply stands.
 
     Raises
     ------
-    ValueError
-        If the image is unreadable by all enabled back‑ends.
+    ImageDecodeError
+        If the image is unreadable by all enabled back‑ends (a ValueError
+        subclass, so existing callers are unaffected; the per-item seam
+        `load_image_or_slot` catches exactly this one). This is the only
+        exception this function ever mints, and the only one that can become
+        a persisted `input` verdict.
+    Exception
+        Anything that is *not* a decode failure of these bytes propagates
+        untouched — a missing Pillow, a cv2 that is installed but fails to
+        import, a MemoryError, a DecompressionBombError, a RecursionError.
+        Those are facts about the machine or its configuration, never about
+        the item, so they must fail the whole predict (which the orchestrator
+        retries) instead of being recorded against the file forever.
     """
+    # Only decoder-shaped failures may fall through to the next backend and
+    # end as an `input` verdict. Pillow raises UnidentifiedImageError (an
+    # OSError) for "not an image", OSError for a broken/truncated stream,
+    # ValueError/SyntaxError/EOFError/struct.error from the individual format
+    # plugins. Catching bare Exception here (as this did) quietly turned
+    # MemoryError, DecompressionBombError and a failed `import cv2` into
+    # "undecodable file", which the ledger then persists.
+    decode_errors = (OSError, ValueError, SyntaxError, EOFError, struct.error)
+
     # ––––– 1.  Pillow first –––––
     try:
         from PIL import Image as PILImage
-        from PIL import ImageFile
+        from PIL import ImageFile, ImageOps
 
         if accept_truncated:
             ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -758,20 +885,66 @@ def load_image_from_buffer(
 
         with PILImage.open(BytesIO(raw)) as im:
             im.load()                   # force decoding now
+            # The picture, not the pixels as stored: browsers, ffmpeg's
+            # video decoder and the indexed dimensions all apply the file's
+            # EXIF orientation (docs/display-dimensions-design.md §5), so
+            # the models must see the same frame. This is the one decode
+            # every image payload passes through — indexed files sent whole,
+            # and query uploads for search-by-image, which keeps a query
+            # embedding comparable with the index it searches. Re-encoded
+            # payloads (video frames, slices, PDF pages) carry no EXIF, so
+            # this is a no-op for them.
+            #
+            # A broken EXIF chunk is never a verdict on pixels that decoded
+            # fine: a decoder-shaped failure here degrades to the
+            # un-oriented image (what every consumer saw before orientation
+            # was read at all) instead of falling through to the ledger as
+            # "undecodable". Anything else propagates, per this function's
+            # taxonomy.
+            try:
+                im = ImageOps.exif_transpose(im)
+            except decode_errors:
+                pass
             return im.convert("RGB")
 
     except (ModuleNotFoundError, ImportError):
         raise ValueError("Pillow is not installed") from None
-    except Exception as err:
-        # Any other OSError & friends fall through to optional fallback
+    except PIL.Image.DecompressionBombError:
+        # Deliberately NOT a decode failure: the image decoded fine, it is
+        # merely larger than the configurable PIL.Image.MAX_IMAGE_PIXELS
+        # ceiling. That is a machine/config limit, so raising the limit
+        # changes the answer — exactly the kind of verdict that must never be
+        # persisted against the file. (The softer DecompressionBombWarning is
+        # a warning, not an exception, unless the deployment turns warnings
+        # into errors; if it does, it arrives here as a Warning subclass and
+        # likewise propagates.)
+        raise
+    except decode_errors as err:
+        # A decode failure of these bytes: fall through to the optional
+        # fallback backend, and to ImageDecodeError if that fails too.
         last_err: Optional[Exception] = err
 
     # ––––– 2.  OpenCV fallback –––––
     if fallback_opencv:
+        # The import is outside the decode try/except on purpose. cv2 is an
+        # optional dependency, so "not installed" only means the fallback is
+        # unavailable and the Pillow verdict stands — but a cv2 that *is*
+        # installed and fails to import (broken build, missing shared
+        # library) is an environment problem and must propagate rather than
+        # be folded into `last_err` and blamed on the payload.
         try:
             import cv2
-            import numpy as np
+        except ModuleNotFoundError:
+            cv2 = None  # type: ignore[assignment]
+    else:
+        cv2 = None  # type: ignore[assignment]
 
+    if cv2 is not None:
+        try:
+            # `imdecode` ignores EXIF orientation (only `imread` applies it),
+            # so this fallback yields the un-oriented pixels. Deliberately
+            # left that way: it only runs for a file Pillow could not decode
+            # at all, where sideways pixels beat none.
             arr = np.frombuffer(buf, dtype=np.uint8)
             img_cv = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
             if img_cv is None:
@@ -780,8 +953,8 @@ def load_image_from_buffer(
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
             from PIL import Image as PILImage
             return PILImage.fromarray(img_cv)
-        except Exception as err:
+        except decode_errors as err:
             last_err = err
 
     # ––––– 3.  Give up –––––
-    raise ValueError(f"Unreadable image: {last_err}") from last_err
+    raise ImageDecodeError(f"Unreadable image: {last_err}") from last_err

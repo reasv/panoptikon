@@ -117,6 +117,13 @@ Inferio rejects an attempted load of an inference ID when one of its required
 inputs is absent or empty. The error names the inference ID, the user-facing
 input label, and its environment binding, but never any supplied value.
 
+The gateway consults this endpoint when a data extraction job is enqueued and
+when `PUT /api/jobs/config` adds a cron-job model that the stored config did
+not already schedule. A save that adds no cron-job model (scan toggles,
+folders, thumbnail settings, or a re-save of the same schedule) never contacts
+the inference upstream, so it succeeds even when that upstream is down or
+unreachable; only saves that introduce a model surface an upstream failure.
+
 ## Desktop management API
 
 Desktop-managed Panoptikon additionally exposes:

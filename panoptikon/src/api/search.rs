@@ -1,5 +1,7 @@
 use crate::api::db_params::DbQueryParams;
+use crate::api::pinboards::{PinboardDatabaseResponse, map_databases};
 use crate::api::search_cache::{self, CacheLookup, EpochSnapshot, QueryKey};
+use crate::api::utils::serve_outro_metadata;
 use crate::api_error::ApiError;
 use crate::db::bookmarks::get_all_bookmark_namespaces;
 use crate::db::extraction_log::get_existing_setters;
@@ -7,22 +9,26 @@ use crate::db::folders::get_folders_from_database;
 use crate::db::items::{
     TextStats, get_all_mime_types, get_existing_file_for_item_id, get_file_stats, get_text_stats,
 };
+use crate::db::pinboard_dbs::{self, AssociationContext, BoardOverlap};
 use crate::db::pql::{run_compiled_count, run_compiled_query};
 use crate::db::tags::{
     find_tags, get_all_tag_namespaces, get_min_tag_confidence, get_most_common_tags_frequency,
 };
 use crate::db::{DbConnection, ReadOnly};
 use crate::policy::PolicyContext;
-use crate::pql::model::{EntityType, PqlQuery};
+use crate::pql::model::{EntityType, OrderDirection, PqlQuery};
 use crate::pql::{
-    EmbeddingCacheStats, PqlError, build_query_preprocessed, clear_embedding_cache,
-    embedding_cache_stats, preprocess_query_async,
+    EmbeddingCacheStats, ItemSetBuild, PqlError, PrimaryOrderKey, build_item_set_preprocessed,
+    build_query_preprocessed, clear_embedding_cache, embedding_cache_stats, preprocess_query_async,
 };
 use crate::proxy::ProxyState;
 use axum::{Extension, Json, extract::State};
 use axum_extra::extract::Query;
 use base64::{Engine as _, engine::general_purpose};
-use sea_query::{SqliteQueryBuilder, Value as SeaValue, Values};
+use sea_query::{
+    Alias, Asterisk, Expr, Func, JoinType, Query as SeaQuery, SelectStatement, SqliteQueryBuilder,
+    Value as SeaValue, Values, WithClause,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Column;
@@ -194,6 +200,57 @@ pub(crate) struct SearchResult {
     subtitle_tracks: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     blurhash: Option<String>,
+    /// Outro Kind
+    ///
+    /// The raw stored outro verdict, detector version included (`tiktok_card/1`,
+    /// `none/1`); absent when the item was never examined or the column was
+    /// not selected. Kind-specific
+    /// queries must prefix-match, not compare the whole value — see
+    /// `docs/video-outro-detection-design.md` §6.2. "Has an outro" is
+    /// `content_end_ms` being present.
+    ///
+    /// Absent on every row when the index database has `detect_outros` off,
+    /// even for items whose outro was detected while it was on: the toggle
+    /// turns the whole feature off for its database. Note the deliberate
+    /// asymmetry — PQL predicates (`match` filters, `order_by`) on this
+    /// column keep working with the toggle off, because querying your own
+    /// data is a query capability, not playback
+    /// (`docs/video-outro-skip-design.md` §6). The visible edge of that
+    /// asymmetry: an `order_by` on `content_end_ms` still orders the rows by
+    /// the stored boundaries even though every served value is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outro_kind: Option<String>,
+    /// Content End (ms)
+    ///
+    /// Where the item's real content ends, when an outro was found. Absent
+    /// when no outro is recorded or the column was not selected.
+    ///
+    /// Also absent on every row when the index database has `detect_outros`
+    /// off, on the same terms (and with the same PQL asymmetry) as
+    /// `outro_kind` — an `order_by` on this column still orders the rows by
+    /// the stored boundaries even though every served value is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_end_ms: Option<i64>,
+    /// Video Codec
+    ///
+    /// The video stream's codec name as ffprobe reports it (`h264`, `hevc`,
+    /// `av1`, ...), with two in-band sentinels: `none` means the container was
+    /// probed and has no video stream, `unknown` means a video stream exists
+    /// but ffprobe named no codec. Absent when the item has not been probed
+    /// yet or the column was not selected.
+    ///
+    /// Unlike the outro fields this is never withheld: a codec name is an
+    /// objective property of the file, like `duration` or `width`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video_codec: Option<String>,
+    /// Audio Codec
+    ///
+    /// The *first* audio stream's codec name (`aac`, `opus`, `ac3`, ...), or
+    /// `unknown` when a stream exists that ffprobe named no codec for. Absent
+    /// for a file with no audio stream as well as for one not yet probed —
+    /// the column does not distinguish them. Never withheld, as above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_codec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -409,12 +466,12 @@ pub async fn get_top_tags(
     mut db: DbConnection<ReadOnly>,
     Query(query): Query<TopTagsQuery>,
 ) -> ApiResult<Json<TagFrequency>> {
-    if let Some(confidence) = query.confidence_threshold {
-        if !(0.0..=1.0).contains(&confidence) {
-            return Err(ApiError::bad_request(
-                "confidence_threshold must be between 0 and 1",
-            ));
-        }
+    if let Some(confidence) = query.confidence_threshold
+        && !(0.0..=1.0).contains(&confidence)
+    {
+        return Err(ApiError::bad_request(
+            "confidence_threshold must be between 0 and 1",
+        ));
     }
 
     let tags = load_top_tags(
@@ -486,12 +543,7 @@ pub async fn search_pql(
     let mut count_metrics = builder.count_metrics.clone();
     let mut result_metrics = builder.result_metrics.clone();
 
-    // Requests outside the policy layer (no PolicyContext extension, e.g.
-    // local mode) default to cache-enabled, same as the policy default.
-    let policy_allows = policy
-        .as_ref()
-        .is_none_or(|Extension(context)| context.search_cache);
-    let cache_available = search_cache::is_enabled() && policy_allows;
+    let cache_available = cache_available(policy.as_ref());
     let use_cache = cache_available && cache_requested;
     // A synthesized seed differs on every request, so its rows are keyed
     // where nothing will ever look again: storing them would fill the byte
@@ -501,11 +553,7 @@ pub async fn search_pql(
     let use_results_cache = use_cache && !seed.synthesized;
     // Bypass skips the read AND the write: a benchmark request must not
     // pollute the cache.
-    let inactive_outcome = if cache_available {
-        CacheOutcome::Bypass
-    } else {
-        CacheOutcome::Disabled
-    };
+    let inactive_outcome = inactive_cache_outcome(cache_available);
 
     let count = if let Some(compiled) = builder.compiled_count_query.as_ref() {
         let start = Instant::now();
@@ -624,6 +672,18 @@ pub async fn search_pql(
     }
     result_metrics.enrich = elapsed_seconds(enrich_start);
 
+    // Response-mapping time, deliberately after the cache read: rows served
+    // from the cache were stored under whatever policy was in force when
+    // they were executed, so gating any earlier would let a stale policy
+    // survive in the cache and a config change take effect late.
+    //
+    // All SQL is done by here, and the gate does filesystem work that can
+    // block on a network mount, so the pooled connection is handed back
+    // first: a slow config stat must not hold one of the read pool's slots.
+    let index_db = db.index_db.clone();
+    drop(db);
+    apply_outro_gate(&index_db, &mut results).await;
+
     Ok(Json(FileSearchResponse {
         count,
         results,
@@ -631,6 +691,47 @@ pub async fn search_pql(
         result_metrics,
         seed: seed.effective,
     }))
+}
+
+/// Blanks the outro playback metadata on a page of results when the index
+/// database has `detect_outros` off (`docs/video-outro-skip-design.md` §6).
+///
+/// Must be called at response-mapping time — never on the rows handed to the
+/// result cache, which are stored raw so that a config change is reflected by
+/// the very next request, hit or miss. The PQL builder is untouched by
+/// design: filters and orders on these columns keep working with the toggle
+/// off, only the served values are withheld.
+async fn apply_outro_gate(index_db: &str, results: &mut [SearchResult]) {
+    let carries_metadata = results
+        .iter()
+        .any(|result| result.outro_kind.is_some() || result.content_end_ms.is_some());
+    if serve_outro_metadata(index_db, carries_metadata).await {
+        return;
+    }
+    for result in results {
+        result.outro_kind = None;
+        result.content_end_ms = None;
+    }
+}
+
+/// Whether the result cache may serve this request at all: enabled globally
+/// and permitted by the request's policy. Requests outside the policy layer
+/// (no PolicyContext extension, e.g. local mode) default to cache-enabled,
+/// same as the policy default. The single place any search endpoint reads
+/// the policy.
+fn cache_available(policy: Option<&Extension<PolicyContext>>) -> bool {
+    let policy_allows = policy.is_none_or(|Extension(context)| context.search_cache);
+    search_cache::is_enabled() && policy_allows
+}
+
+/// The outcome reported when a request does not consult the cache: it opted
+/// out, or there was no cache to consult.
+fn inactive_cache_outcome(cache_available: bool) -> CacheOutcome {
+    if cache_available {
+        CacheOutcome::Bypass
+    } else {
+        CacheOutcome::Disabled
+    }
 }
 
 /// Serialize bound params into the canonical cache-key string.
@@ -745,6 +846,504 @@ pub async fn search_pql_build(
     Ok(Json(builder))
 }
 
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct PinboardSearchQuery {
+    /// The user whose pinboards to search.
+    #[serde(default = "default_user")]
+    #[param(default = "user")]
+    user: String,
+    /// Return only the boards associated with the selected index database —
+    /// the same server-computed rule and the same client preference as the
+    /// library list.
+    #[serde(default)]
+    associated_only: bool,
+}
+
+/// One matching board: the `PinboardSummaryResponse` fields the library card
+/// renders, plus how much of the board the search matched.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PinboardSearchMatch {
+    id: i64,
+    name: Option<String>,
+    head_version_id: Option<i64>,
+    time_added: String,
+    time_updated: String,
+    /// Unix seconds of the board's last activity — opening it counts, not
+    /// just saving. Null only for rows predating the activity columns.
+    last_seen: Option<i64>,
+    preview_w: Option<i64>,
+    preview_h: Option<i64>,
+    screenful_h: Option<i64>,
+    item_count: i64,
+    /// How many of the board's items exist in the selected index database
+    /// (`match_count` is how many the *search* matched). Same field as on the
+    /// library list summary.
+    present_count: i64,
+    version_count: i64,
+    /// Distinct items on the board's head version that the search matched.
+    match_count: i64,
+    /// Whether the board belongs to the selected index database, by the same
+    /// rule the library list applies.
+    associated: bool,
+    /// The databases this board is stamped for, newest stamp first.
+    databases: Vec<PinboardDatabaseResponse>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PinboardSearchResponse {
+    /// Every board with at least one matching image, unpaginated, in the
+    /// server's default order (see the endpoint description).
+    pinboards: Vec<PinboardSearchMatch>,
+    metrics: SearchMetrics,
+}
+
+/// A board plus the ranking keys that never leave the server: the extreme of
+/// the search's primary order key over the board's matches, and its activity
+/// score.
+struct RankedPinboard {
+    board: PinboardSearchMatch,
+    best_key: OrderKeyValue,
+    activity: f64,
+}
+
+impl RankedPinboard {
+    /// The share of the board that matched — the user-chosen match-strength
+    /// signal. A board with no head items can still appear if a match came
+    /// from a version that has since lost its items; it scores 0.
+    fn match_fraction(&self) -> f64 {
+        if self.board.item_count > 0 {
+            self.board.match_count as f64 / self.board.item_count as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// A `best_key` value in whatever storage class the search's primary order
+/// key has. Integers and reals unify as `f64`, which is lossy above 2^53 —
+/// `pk_mix` spans the whole i64 range and the composite key's coalesce
+/// sentinels (±9223372036854775805) are past it. That is safe here because
+/// `i64 as f64` rounds to nearest, which is monotone: it can never swap two
+/// keys' order, only collapse near-equal ones (within ~2048 at that
+/// magnitude) into a tie, which then falls through to the next sort key.
+#[derive(Debug, Clone, PartialEq)]
+enum OrderKeyValue {
+    Null,
+    Number(f64),
+    Text(String),
+}
+
+impl OrderKeyValue {
+    /// Ascending comparison of two non-NULL keys. Mixed storage classes only
+    /// arise from a genuinely mixed-type key column; SQLite sorts numbers
+    /// before text, so mirror that rather than inventing an order.
+    fn cmp_ascending(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (OrderKeyValue::Number(a), OrderKeyValue::Number(b)) => a.total_cmp(b),
+            (OrderKeyValue::Text(a), OrderKeyValue::Text(b)) => a.cmp(b),
+            (OrderKeyValue::Number(_), OrderKeyValue::Text(_)) => Ordering::Less,
+            (OrderKeyValue::Text(_), OrderKeyValue::Number(_)) => Ordering::Greater,
+            _ => Ordering::Equal,
+        }
+    }
+}
+
+const BEST_KEY_COLUMN: &str = "best_key";
+
+#[utoipa::path(
+    post,
+    operation_id = "search_pql_pinboards",
+    // Deliberately under /api/pinboards: this reads pinboard data, so it
+    // belongs to the pinboard authorization domain (a policy that denies
+    // pinboards must deny this too), even though the handler lives here.
+    path = "/api/pinboards/search",
+    tag = "search",
+    summary = "Find the pinboards whose images match a search",
+    description = "Runs the same PQL query `/api/search/pql` would run, intersects its \
+full result set with every pinboard's pinned items, and returns the boards \
+that intersect — not files. Membership is the board's head version only, by \
+sha256, so a pin whose item is no longer indexed never matches.\n\nThe result \
+is unpaginated: the response carries every matching board, ordered by the \
+position of its best-ranked matching image (the direction-adjusted extreme of \
+the search's first order key), then by match fraction, then by match count, \
+then by the library's activity score. Multi-key orders are approximated by \
+their primary key. `page`, `page_size`, `partition_by`, `count`, `results` \
+and `check_path` in the body are ignored: there is one result shape.",
+    params(DbQueryParams, PinboardSearchQuery),
+    request_body(
+        content = Option<PqlQuery>,
+        description = "The PQL Search query whose results the boards are intersected with"
+    ),
+    responses(
+        (status = 200, description = "Matching pinboards", body = PinboardSearchResponse)
+    )
+)]
+pub async fn search_pql_pinboards(
+    State(state): State<Arc<ProxyState>>,
+    mut db: DbConnection<ReadOnly>,
+    Query(params): Query<PinboardSearchQuery>,
+    policy: Option<Extension<PolicyContext>>,
+    body: Option<Json<Value>>,
+) -> ApiResult<Json<PinboardSearchResponse>> {
+    let payload = body
+        .map(|Json(value)| value)
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let mut query = decode_pql_payload(&payload)?;
+    // Same policy step as `search_pql`. v1 deliberately does not cache (the
+    // stored value shape is rows and counts, not boards), so the outcome is
+    // always the inactive one — reported so a client can tell "not cached
+    // here" from "caching is off".
+    let mut metrics = SearchMetrics {
+        cache: Some(inactive_cache_outcome(cache_available(policy.as_ref()))),
+        ..SearchMetrics::default()
+    };
+    // Random order carries a live key here too, so the seed has to be
+    // resolved before the build binds it.
+    query.resolve_seed();
+    if let Some(preprocess) = preprocess_pql(&state, &mut query, &db.index_db).await? {
+        metrics.preprocess = preprocess;
+    }
+
+    let ctx = AssociationContext::load(&mut db.conn, &db.index_db).await;
+    let pinboards = run_pinboard_search(
+        &mut db.conn,
+        query,
+        &params.user,
+        crate::db::pinboards::unix_now(),
+        &mut metrics,
+        &ctx,
+        params.associated_only,
+    )
+    .await?;
+
+    Ok(Json(PinboardSearchResponse { pinboards, metrics }))
+}
+
+/// Builds, executes and ranks the board intersection for an already
+/// preprocessed query. Stamps build/compile/execute into `metrics`.
+///
+/// The association fields are computed over the matched boards and
+/// `associated_only` applied as a post-filter — after the ranking, so the
+/// filter only ever removes rows from an order it never influenced.
+#[allow(clippy::too_many_arguments)]
+async fn run_pinboard_search(
+    conn: &mut sqlx::SqliteConnection,
+    query: PqlQuery,
+    user: &str,
+    now: i64,
+    metrics: &mut SearchMetrics,
+    ctx: &AssociationContext,
+    associated_only: bool,
+) -> ApiResult<Vec<PinboardSearchMatch>> {
+    let start = Instant::now();
+    let built = build_item_set_preprocessed(query).map_err(map_pql_error)?;
+    let primary_order = built.primary_order.clone();
+    let (statement, with_clause) = compose_pinboard_search(built, user);
+    metrics.build = elapsed_seconds(start);
+
+    let start = Instant::now();
+    let compiled = compile_statement(statement, with_clause)?;
+    metrics.compile = elapsed_seconds(start);
+
+    let start = Instant::now();
+    let rows = run_compiled_query(conn, &compiled.sql, &compiled.params).await?;
+    metrics.execute = elapsed_seconds(start);
+
+    let mut ranked = Vec::with_capacity(rows.len());
+    for row in &rows {
+        ranked.push(map_pinboard_match(row, primary_order.is_some(), now)?);
+    }
+    sort_pinboard_matches(&mut ranked, primary_order.as_ref());
+
+    let mut boards: Vec<PinboardSearchMatch> =
+        ranked.into_iter().map(|entry| entry.board).collect();
+    let overlaps: Vec<BoardOverlap> = boards
+        .iter()
+        .map(|board| BoardOverlap {
+            pinboard_id: board.id,
+            present_count: board.present_count,
+            item_count: board.item_count,
+        })
+        .collect();
+    let mut associations = pinboard_dbs::load_associations(conn, ctx, &overlaps).await?;
+    for board in &mut boards {
+        let association = associations.remove(&board.id).unwrap_or_default();
+        board.associated = association.associated;
+        board.databases = map_databases(association.databases);
+    }
+    if associated_only {
+        boards.retain(|board| board.associated);
+    }
+    Ok(boards)
+}
+
+/// Wraps the unsorted item set in the board intersection: one row per board
+/// whose head version pins at least one matching item. The `WITH` clause goes
+/// on the outermost statement — CTEs stay in scope inside the subquery — as
+/// the count build does when it wraps the same statement.
+fn compose_pinboard_search(
+    built: ItemSetBuild,
+    user: &str,
+) -> (SelectStatement, Option<WithClause>) {
+    // Scoped: `ExprTrait` blankets `min`/`max`/`eq` onto every type, which
+    // would shadow `Ord::min`/`Ord::max` elsewhere in this module.
+    use sea_query::ExprTrait;
+
+    let sr = Alias::new("sr");
+    let it = Alias::new("it");
+    let pvi = Alias::new("pvi");
+    let p = Alias::new("p");
+    let hv = Alias::new("hv");
+    let user_data = Alias::new("user_data");
+    let board_column = |name: &str| Expr::col((p.clone(), Alias::new(name)));
+
+    let mut query = SeaQuery::select();
+    query
+        .from_subquery(built.query, sr.clone())
+        // items.sha256 is UNIQUE, so this is the item's hash: multi-file
+        // items and multi-row entities collapse in the COUNT(DISTINCT) below.
+        .join_as(
+            JoinType::InnerJoin,
+            Alias::new("items"),
+            it.clone(),
+            Expr::col((it.clone(), Alias::new("id"))).equals((sr.clone(), Alias::new("item_id"))),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            (user_data.clone(), Alias::new("pinboard_version_items")),
+            pvi.clone(),
+            Expr::col((pvi.clone(), Alias::new("sha256")))
+                .equals((it.clone(), Alias::new("sha256"))),
+        )
+        // Joining pins to boards through head_version_id is what makes only
+        // the head version searchable; older versions self-heal.
+        .join_as(
+            JoinType::InnerJoin,
+            (user_data.clone(), Alias::new("pinboards")),
+            p.clone(),
+            board_column("head_version_id").equals((pvi.clone(), Alias::new("version_id"))),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            (user_data.clone(), Alias::new("pinboard_versions")),
+            hv.clone(),
+            Expr::col((hv.clone(), Alias::new("id"))).eq(board_column("head_version_id")),
+        )
+        .and_where(board_column("user").eq(user))
+        .add_group_by([board_column("id")]);
+
+    for column in [
+        "id",
+        "name",
+        "head_version_id",
+        "time_added",
+        "time_updated",
+        "last_seen",
+        // Ranking-only, never serialized.
+        "frecency",
+        "frecency_at",
+    ] {
+        query.column((p.clone(), Alias::new(column)));
+    }
+    for column in ["preview_w", "preview_h", "screenful_h"] {
+        query.column((hv.clone(), Alias::new(column)));
+    }
+    query.expr_as(
+        Func::count_distinct(Expr::col((pvi.clone(), Alias::new("sha256")))),
+        Alias::new("match_count"),
+    );
+
+    // "The board's best rank" is monotone with the extreme of the order key
+    // in the sort direction, so per-group MIN/MAX replaces numbering the
+    // whole result set.
+    if let Some(key) = built.primary_order.as_ref() {
+        let key_column = Expr::col((sr.clone(), Alias::new(key.alias.as_str())));
+        let best = match key.direction {
+            OrderDirection::Asc => Func::min(key_column),
+            OrderDirection::Desc => Func::max(key_column),
+        };
+        query.expr_as(best, Alias::new(BEST_KEY_COLUMN));
+    }
+
+    let mut item_count = SeaQuery::select();
+    let counted = Alias::new("c");
+    item_count
+        .expr(Func::count(Expr::col(Asterisk)))
+        .from_as(
+            (user_data.clone(), Alias::new("pinboard_version_items")),
+            counted.clone(),
+        )
+        .and_where(
+            Expr::col((counted, Alias::new("version_id")))
+                .equals((p.clone(), Alias::new("head_version_id"))),
+        );
+    query.expr_as(item_count, Alias::new("item_count"));
+
+    // The overlap with the current index database, next to the item count:
+    // the display signal, and clause (c) of the association rule when the two
+    // are equal. `items.sha256` is UNIQUE, so this is one indexed probe per
+    // pin. Deliberately expression-only (no bound value) — the composed
+    // statement's single parameter is the user scope.
+    let mut present_count = SeaQuery::select();
+    let present = Alias::new("pc");
+    let present_item = Alias::new("pi");
+    let mut indexed_here = SeaQuery::select();
+    indexed_here
+        .column((present_item.clone(), Alias::new("sha256")))
+        .from_as(Alias::new("items"), present_item.clone())
+        .and_where(
+            Expr::col((present_item, Alias::new("sha256")))
+                .equals((present.clone(), Alias::new("sha256"))),
+        );
+    present_count
+        .expr(Func::count(Expr::col(Asterisk)))
+        .from_as(
+            (user_data.clone(), Alias::new("pinboard_version_items")),
+            present.clone(),
+        )
+        .and_where(
+            Expr::col((present.clone(), Alias::new("version_id")))
+                .equals((p.clone(), Alias::new("head_version_id"))),
+        )
+        .and_where(Expr::exists(indexed_here));
+    query.expr_as(present_count, Alias::new("present_count"));
+
+    let mut version_count = SeaQuery::select();
+    let versions = Alias::new("v");
+    version_count
+        .expr(Func::count(Expr::col(Asterisk)))
+        .from_as(
+            (user_data.clone(), Alias::new("pinboard_versions")),
+            versions.clone(),
+        )
+        .and_where(Expr::col((versions, Alias::new("pinboard_id"))).equals((p, Alias::new("id"))));
+    query.expr_as(version_count, Alias::new("version_count"));
+
+    (query, built.with_clause)
+}
+
+fn map_pinboard_match(
+    row: &sqlx::sqlite::SqliteRow,
+    has_best_key: bool,
+    now: i64,
+) -> ApiResult<RankedPinboard> {
+    let last_seen: Option<i64> = read_pinboard_column(row, "last_seen")?;
+    let frecency: f64 = read_pinboard_column(row, "frecency")?;
+    let frecency_at: Option<i64> = read_pinboard_column(row, "frecency_at")?;
+    let board = PinboardSearchMatch {
+        id: read_pinboard_column(row, "id")?,
+        name: read_pinboard_column(row, "name")?,
+        head_version_id: read_pinboard_column(row, "head_version_id")?,
+        time_added: read_pinboard_column(row, "time_added")?,
+        time_updated: read_pinboard_column(row, "time_updated")?,
+        last_seen,
+        preview_w: read_pinboard_column(row, "preview_w")?,
+        preview_h: read_pinboard_column(row, "preview_h")?,
+        screenful_h: read_pinboard_column(row, "screenful_h")?,
+        item_count: read_pinboard_column(row, "item_count")?,
+        present_count: read_pinboard_column(row, "present_count")?,
+        version_count: read_pinboard_column(row, "version_count")?,
+        match_count: read_pinboard_column(row, "match_count")?,
+        // Filled in once the whole result set is known: the stamp rows are
+        // read in one query for every matched board, not one per row.
+        associated: false,
+        databases: Vec::new(),
+    };
+    Ok(RankedPinboard {
+        board,
+        best_key: if has_best_key {
+            read_order_key(row)
+        } else {
+            OrderKeyValue::Null
+        },
+        activity: crate::db::pinboards::activity_score_columns(
+            last_seen,
+            frecency,
+            frecency_at,
+            now,
+        ),
+    })
+}
+
+fn read_pinboard_column<T>(row: &sqlx::sqlite::SqliteRow, field: &str) -> ApiResult<T>
+where
+    for<'r> T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
+{
+    row.try_get(field).map_err(|err| {
+        tracing::error!(error = %err, field = %field, "failed to read pinboard search result");
+        ApiError::internal("Failed to read search results")
+    })
+}
+
+/// The order key's storage class depends on which filter produced it (an
+/// INTEGER rank, a REAL distance, a TEXT path), so it is decoded by trying
+/// the classes rather than by a declared type — same approach as
+/// `read_extra_value`.
+fn read_order_key(row: &sqlx::sqlite::SqliteRow) -> OrderKeyValue {
+    if let Ok(value) = row.try_get::<Option<f64>, _>(BEST_KEY_COLUMN) {
+        // A NULL decodes here whatever the column's class would have been,
+        // which is the only reason this branch can return Null.
+        return value.map_or(OrderKeyValue::Null, OrderKeyValue::Number);
+    }
+    if let Ok(Some(value)) = row.try_get::<Option<i64>, _>(BEST_KEY_COLUMN) {
+        return OrderKeyValue::Number(value as f64);
+    }
+    if let Ok(Some(value)) = row.try_get::<Option<String>, _>(BEST_KEY_COLUMN) {
+        return OrderKeyValue::Text(value);
+    }
+    tracing::error!("failed to decode the pinboard search order key");
+    OrderKeyValue::Null
+}
+
+/// The server's default board order: best rank, then match fraction, then
+/// match count, then the library's activity score. `primary` is `None` for
+/// a query that orders by nothing, which skips the rank key entirely.
+///
+/// Deliberately not `order_by_activity`: its recency strip is a
+/// library-browsing device that would pull just-opened boards above their
+/// search rank. Only the score is reused.
+fn sort_pinboard_matches(boards: &mut [RankedPinboard], primary: Option<&PrimaryOrderKey>) {
+    boards.sort_by(|a, b| {
+        let by_rank = match primary {
+            None => std::cmp::Ordering::Equal,
+            Some(primary) => compare_best_key(&a.best_key, &b.best_key, primary),
+        };
+        by_rank
+            .then_with(|| b.match_fraction().total_cmp(&a.match_fraction()))
+            .then_with(|| b.board.match_count.cmp(&a.board.match_count))
+            .then_with(|| b.activity.total_cmp(&a.activity))
+            .then_with(|| b.board.last_seen.cmp(&a.board.last_seen))
+            .then_with(|| b.board.id.cmp(&a.board.id))
+    });
+}
+
+fn compare_best_key(
+    a: &OrderKeyValue,
+    b: &OrderKeyValue,
+    primary: &PrimaryOrderKey,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // The builder reports where its ORDER BY puts NULLs rather than making
+    // callers assume it; today that is always last, but the sort follows the
+    // reported flag so a builder change cannot silently desynchronize it.
+    let (null_is_a, null_is_b) = if primary.nulls_last {
+        (Ordering::Greater, Ordering::Less)
+    } else {
+        (Ordering::Less, Ordering::Greater)
+    };
+    match (a, b) {
+        (OrderKeyValue::Null, OrderKeyValue::Null) => Ordering::Equal,
+        (OrderKeyValue::Null, _) => null_is_a,
+        (_, OrderKeyValue::Null) => null_is_b,
+        _ => match primary.direction {
+            OrderDirection::Asc => a.cmp_ascending(b),
+            OrderDirection::Desc => a.cmp_ascending(b).reverse(),
+        },
+    }
+}
+
 async fn load_tags(
     conn: &mut sqlx::SqliteConnection,
     name: &str,
@@ -804,6 +1403,30 @@ fn map_text_stats(stats: TextStats) -> ExtractedTextStats {
     }
 }
 
+/// Resolves the query's semantic filters into embeddings in place. Returns
+/// how long it took, or None when the query carries no filter tree at all
+/// (nothing to preprocess, and nothing to report).
+async fn preprocess_pql(
+    state: &ProxyState,
+    query: &mut PqlQuery,
+    index_db: &str,
+) -> ApiResult<Option<f64>> {
+    let Some(root) = query.query.take() else {
+        return Ok(None);
+    };
+    let start = Instant::now();
+    let preprocessed = preprocess_query_async(
+        root,
+        &state.inference_client,
+        state.search_embedding_cache_size,
+        Some(index_db),
+    )
+    .await
+    .map_err(map_pql_error)?;
+    query.query = preprocessed;
+    Ok(Some(elapsed_seconds(start)))
+}
+
 async fn compile_pql(
     state: &ProxyState,
     mut query: PqlQuery,
@@ -813,24 +1436,7 @@ async fn compile_pql(
     let mut result_metrics = SearchMetrics::default();
     let check_path = query.check_path;
 
-    let mut used_preprocess = false;
-    let mut preprocess_time = 0.0;
-    if let Some(root) = query.query.take() {
-        used_preprocess = true;
-        let start = Instant::now();
-        let preprocessed = preprocess_query_async(
-            root,
-            &state.inference_client,
-            state.search_embedding_cache_size,
-            Some(index_db),
-        )
-        .await
-        .map_err(map_pql_error)?;
-        preprocess_time = elapsed_seconds(start);
-        query.query = preprocessed;
-    }
-
-    if used_preprocess {
+    if let Some(preprocess_time) = preprocess_pql(state, &mut query, index_db).await? {
         count_metrics.preprocess = preprocess_time;
         result_metrics.preprocess = preprocess_time;
     }
@@ -975,13 +1581,20 @@ fn is_empty_partition(query: &PqlQuery) -> bool {
     query
         .partition_by
         .as_ref()
-        .map_or(true, |partition| partition.is_empty())
+        .is_none_or(|partition| partition.is_empty())
 }
 
 fn compile_select(built: crate::pql::PqlBuilderResult) -> ApiResult<CompiledQuery> {
-    let (sql, values) = match built.with_clause {
-        Some(with_clause) => built.query.with(with_clause).build(SqliteQueryBuilder),
-        None => built.query.build(SqliteQueryBuilder),
+    compile_statement(built.query, built.with_clause)
+}
+
+fn compile_statement(
+    query: SelectStatement,
+    with_clause: Option<WithClause>,
+) -> ApiResult<CompiledQuery> {
+    let (sql, values) = match with_clause {
+        Some(with_clause) => query.with(with_clause).build(SqliteQueryBuilder),
+        None => query.build(SqliteQueryBuilder),
     };
     let params = encode_values(values)?;
     Ok(CompiledQuery { sql, params })
@@ -1191,6 +1804,10 @@ fn map_search_result(
     result.video_tracks = read_optional(row, &columns, "video_tracks")?;
     result.subtitle_tracks = read_optional(row, &columns, "subtitle_tracks")?;
     result.blurhash = read_optional(row, &columns, "blurhash")?;
+    result.outro_kind = read_optional(row, &columns, "outro_kind")?;
+    result.content_end_ms = read_optional(row, &columns, "content_end_ms")?;
+    result.video_codec = read_optional(row, &columns, "video_codec")?;
+    result.audio_codec = read_optional(row, &columns, "audio_codec")?;
     result.data_id = read_optional(row, &columns, "data_id")?;
     result.language = read_optional(row, &columns, "language")?;
     result.language_confidence = read_optional(row, &columns, "language_confidence")?;
@@ -1287,6 +1904,10 @@ fn is_known_column(name: &str) -> bool {
             | "video_tracks"
             | "subtitle_tracks"
             | "blurhash"
+            | "outro_kind"
+            | "content_end_ms"
+            | "video_codec"
+            | "audio_codec"
             | "data_id"
             | "language"
             | "language_confidence"
@@ -1912,6 +2533,7 @@ mod tests {
     // prefix, which then serves later pages *and* page sizes the execution
     // never ran at. An epoch bump invalidates the lot.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes against the sync cache tests
     async fn prefetch_stores_rows_servable_at_any_page_size() {
         let _guard = search_cache::test_lock();
         search_cache::set_budget_mb(16);
@@ -1967,6 +2589,7 @@ mod tests {
     // it ends, so windows straddling or past the end are served rather than
     // re-executed.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes against the sync cache tests
     async fn short_read_is_cached_with_its_end() {
         let _guard = search_cache::test_lock();
         search_cache::set_budget_mb(16);
@@ -2009,9 +2632,693 @@ mod tests {
         );
     }
 
+    /// Fixed clock for the pinboard fixtures: only the activity tiebreak
+    /// reads it, and no assertion here depends on that tiebreak.
+    const PINBOARD_NOW: i64 = 1_000_000;
+
+    /// Five items, one of them (`sha_a`) with two file rows and one
+    /// (`sha_d`) with no width, so the fixture covers the multi-file and
+    /// NULL-order-key cases. `last_modified` and `width` order the items
+    /// differently on purpose.
+    async fn setup_pinboard_search_db() -> crate::db::migrations::InMemoryDatabases {
+        // `pk_mix` (seeded random order) is a registered runtime function;
+        // registration is global and idempotent, but it only happens if some
+        // earlier test did it, so the random-order case would pass or fail by
+        // test order without this.
+        crate::db::sql_functions::ensure_sqlite_extensions().expect("register SQLite extensions");
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, width, time_added)
+            VALUES
+                (1, 'sha_a', 'md5_a', 'image/png', 10, '2024-01-01T00:00:00'),
+                (2, 'sha_b', 'md5_b', 'image/png', 20, '2024-01-01T00:00:00'),
+                (3, 'sha_c', 'md5_c', 'image/png', 30, '2024-01-01T00:00:00'),
+                (4, 'sha_d', 'md5_d', 'image/png', NULL, '2024-01-01T00:00:00'),
+                (5, 'sha_e', 'md5_e', 'image/png', 40, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\boards").await;
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_a', 1, 'C:\boards\a.png', 'a.png', '2024-01-05T00:00:00', 1, 1),
+                -- Same item, second path: it must not double-count.
+                (11, 'sha_a', 1, 'C:\boards\a-copy.png', 'a-copy.png', '2023-12-01T00:00:00', 1, 1),
+                (12, 'sha_b', 2, 'C:\boards\b.png', 'b.png', '2024-01-04T00:00:00', 1, 1),
+                (13, 'sha_c', 3, 'C:\boards\c.png', 'c.png', '2024-01-03T00:00:00', 1, 1),
+                (14, 'sha_d', 4, 'C:\boards\d.png', 'd.png', '2024-01-02T00:00:00', 1, 1),
+                (15, 'sha_e', 5, 'C:\boards\e.png', 'e.png', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added)
+            VALUES ('user', 'default', 'sha_c', '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        // The boards the ordering tests rank. `sha_gone` is pinned but not
+        // indexed; `board_e`'s only item has no width.
+        make_board(&mut dbs.index_conn, "user", "a", &[&["sha_a", "sha_b"]]).await;
+        make_board(&mut dbs.index_conn, "user", "b", &[&["sha_c"]]).await;
+        make_board(&mut dbs.index_conn, "user", "c", &[&["sha_e", "sha_gone"]]).await;
+        make_board(&mut dbs.index_conn, "user", "e", &[&["sha_d"]]).await;
+        // Another user's board over the same items.
+        make_board(&mut dbs.index_conn, "other", "theirs", &[&["sha_a"]]).await;
+        dbs
+    }
+
+    async fn make_board(
+        conn: &mut sqlx::SqliteConnection,
+        user: &str,
+        name: &str,
+        versions: &[&[&str]],
+    ) -> i64 {
+        let id = crate::db::pinboards::create_pinboard(conn, user, Some(name), None, PINBOARD_NOW)
+            .await
+            .expect("create pinboard");
+        for items in versions {
+            let items: Vec<String> = items.iter().map(|item| (*item).to_string()).collect();
+            crate::db::pinboards::append_version(
+                conn,
+                id,
+                &["v2".to_string()],
+                &items,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("append version");
+        }
+        id
+    }
+
+    fn order_query(field: OrderByField, direction: Option<OrderDirection>) -> PqlQuery {
+        PqlQuery {
+            order_by: vec![OrderArgs {
+                order_by: field,
+                order: direction,
+                priority: 0,
+            }],
+            ..PqlQuery::default()
+        }
+    }
+
+    async fn search_boards(
+        conn: &mut sqlx::SqliteConnection,
+        query: PqlQuery,
+        user: &str,
+    ) -> Vec<PinboardSearchMatch> {
+        search_boards_with(conn, query, user, &no_associations(), false).await
+    }
+
+    /// A context nothing is stamped for and no database claims: only clause
+    /// (c) can associate a board, which is what the ranking tests want.
+    fn no_associations() -> AssociationContext {
+        AssociationContext::for_tests(
+            None,
+            None,
+            "",
+            crate::db::local_dbs::LocalDbIdentities::for_tests(&[], false),
+        )
+    }
+
+    async fn search_boards_with(
+        conn: &mut sqlx::SqliteConnection,
+        query: PqlQuery,
+        user: &str,
+        ctx: &AssociationContext,
+        associated_only: bool,
+    ) -> Vec<PinboardSearchMatch> {
+        let mut metrics = SearchMetrics::default();
+        run_pinboard_search(
+            conn,
+            query,
+            user,
+            PINBOARD_NOW,
+            &mut metrics,
+            ctx,
+            associated_only,
+        )
+        .await
+        .expect("pinboard search")
+    }
+
+    fn board_names(boards: &[PinboardSearchMatch]) -> Vec<String> {
+        boards
+            .iter()
+            .map(|board| board.name.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// The full, ordered result set the search itself would return — the
+    /// input to the ROW_NUMBER reference ranking.
+    async fn ordered_item_ids(conn: &mut sqlx::SqliteConnection, query: PqlQuery) -> Vec<i64> {
+        let query = PqlQuery {
+            page_size: 0,
+            count: false,
+            check_path: false,
+            ..query
+        };
+        let built = build_query_preprocessed(query, false).expect("build");
+        let extra_columns = built.extra_columns.clone();
+        let compiled = compile_select(built).expect("compile");
+        let rows = run_compiled_query(conn, &compiled.sql, &compiled.params)
+            .await
+            .expect("run results query");
+        rows.iter()
+            .map(|row| {
+                map_search_result(row, &extra_columns)
+                    .expect("map result")
+                    .item_id
+            })
+            .collect()
+    }
+
+    /// Reference implementation of the ordering: number the ordered result
+    /// set, take each board's lowest-numbered matching item.
+    fn expected_order(ordered: &[i64], boards: &[(&str, &[i64])]) -> Vec<String> {
+        let mut ranked: Vec<(usize, &str)> = boards
+            .iter()
+            .filter_map(|(name, items)| {
+                ordered
+                    .iter()
+                    .position(|item| items.contains(item))
+                    .map(|rank| (rank, *name))
+            })
+            .collect();
+        ranked.sort_unstable();
+        ranked
+            .into_iter()
+            .map(|(_, name)| name.to_string())
+            .collect()
+    }
+
+    const USER_BOARDS: &[(&str, &[i64])] = &[("a", &[1, 2]), ("b", &[3]), ("c", &[5]), ("e", &[4])];
+
+    // Boards must land where their best-ranked image lands. The reference is
+    // the ordered result set itself, ranked in Rust — both for the default
+    // `last_modified DESC` and for the explicit ascending order, which the
+    // fixture makes produce a different board order.
+    #[tokio::test]
+    async fn pinboard_search_matches_a_row_number_reference() {
+        let mut dbs = setup_pinboard_search_db().await;
+
+        for query in [
+            PqlQuery::default(),
+            order_query(OrderByField::LastModified, Some(OrderDirection::Asc)),
+        ] {
+            let ordered = ordered_item_ids(&mut dbs.index_conn, query.clone()).await;
+            let expected = expected_order(&ordered, USER_BOARDS);
+            let boards = search_boards(&mut dbs.index_conn, query, "user").await;
+            assert_eq!(board_names(&boards), expected, "ordered items: {ordered:?}");
+        }
+
+        // The two orders really do disagree, or the assertion above is
+        // trivially satisfied twice.
+        let descending = ordered_item_ids(&mut dbs.index_conn, PqlQuery::default()).await;
+        let ascending = ordered_item_ids(
+            &mut dbs.index_conn,
+            order_query(OrderByField::LastModified, Some(OrderDirection::Asc)),
+        )
+        .await;
+        assert_ne!(
+            expected_order(&descending, USER_BOARDS),
+            expected_order(&ascending, USER_BOARDS)
+        );
+    }
+
+    // A multi-file item counts once, a pin whose item is not indexed counts
+    // never, and both count signals are reported.
+    #[tokio::test]
+    async fn pinboard_search_reports_match_and_item_counts() {
+        let mut dbs = setup_pinboard_search_db().await;
+        let boards = search_boards(&mut dbs.index_conn, PqlQuery::default(), "user").await;
+
+        let board_a = boards
+            .iter()
+            .find(|b| b.name.as_deref() == Some("a"))
+            .unwrap();
+        // sha_a has two file rows; the board still matched two items.
+        assert_eq!(board_a.match_count, 2);
+        assert_eq!(board_a.item_count, 2);
+
+        let board_c = boards
+            .iter()
+            .find(|b| b.name.as_deref() == Some("c"))
+            .unwrap();
+        assert_eq!(board_c.match_count, 1, "the unindexed pin must not match");
+        assert_eq!(board_c.item_count, 2, "but it is still on the board");
+        assert_eq!(board_c.version_count, 1);
+    }
+
+    // The grid Library tab obeys the same association rule and the same
+    // stored preference as the library list: a board fully present here is
+    // admitted by 100% overlap, a rotted one needs a stamp, and
+    // `associated_only` post-filters the ranked list without disturbing the
+    // order of what survives.
+    #[tokio::test]
+    async fn pinboard_search_reports_and_filters_associations() {
+        let mut dbs = setup_pinboard_search_db().await;
+        let boards = search_boards(&mut dbs.index_conn, PqlQuery::default(), "user").await;
+
+        let intact = boards
+            .iter()
+            .find(|board| board.name.as_deref() == Some("a"))
+            .unwrap();
+        assert_eq!((intact.present_count, intact.item_count), (2, 2));
+        assert!(intact.associated, "a fully present board is associated");
+
+        let rotted = boards
+            .iter()
+            .find(|board| board.name.as_deref() == Some("c"))
+            .unwrap();
+        assert_eq!((rotted.present_count, rotted.item_count), (1, 2));
+        assert!(!rotted.associated, "partial overlap is never membership");
+        assert!(rotted.databases.is_empty());
+        let rotted_id = rotted.id;
+
+        let unstamped = board_names(&boards);
+        let filtered = search_boards_with(
+            &mut dbs.index_conn,
+            PqlQuery::default(),
+            "user",
+            &no_associations(),
+            true,
+        )
+        .await;
+        let expected: Vec<String> = unstamped
+            .iter()
+            .filter(|name| name.as_str() != "c")
+            .cloned()
+            .collect();
+        assert_eq!(board_names(&filtered), expected);
+
+        // Stamped for the database being searched, it comes back — in the
+        // same place the unfiltered order put it.
+        crate::db::pinboard_dbs::stamp_for_tests(
+            &mut dbs.index_conn,
+            rotted_id,
+            "uuid_here",
+            "photos",
+            "inst",
+            PINBOARD_NOW,
+        )
+        .await;
+        let ctx = AssociationContext::for_tests(
+            Some("uuid_here"),
+            Some("inst"),
+            "photos",
+            crate::db::local_dbs::LocalDbIdentities::for_tests(&[("photos", "uuid_here")], false),
+        );
+        let filtered =
+            search_boards_with(&mut dbs.index_conn, PqlQuery::default(), "user", &ctx, true).await;
+        assert_eq!(board_names(&filtered), unstamped);
+        let stamped = filtered.iter().find(|board| board.id == rotted_id).unwrap();
+        assert!(stamped.associated);
+        assert_eq!(stamped.databases.len(), 1);
+    }
+
+    // Membership is the head version only: an item dropped from the board in
+    // a later save stops matching, and stops counting.
+    #[tokio::test]
+    async fn pinboard_search_uses_the_head_version_only() {
+        let mut dbs = setup_pinboard_search_db().await;
+        make_board(
+            &mut dbs.index_conn,
+            "head",
+            "h",
+            &[&["sha_a", "sha_b"], &["sha_b"]],
+        )
+        .await;
+
+        let boards = search_boards(&mut dbs.index_conn, PqlQuery::default(), "head").await;
+        assert_eq!(board_names(&boards), vec!["h".to_string()]);
+        assert_eq!(boards[0].match_count, 1);
+        assert_eq!(boards[0].item_count, 1);
+        assert_eq!(boards[0].version_count, 2);
+    }
+
+    // A query that explicitly orders by nothing has no rank key, so the
+    // ordering falls through to fraction, then absolute count.
+    #[tokio::test]
+    async fn pinboard_search_without_an_order_ranks_by_fraction_then_count() {
+        let mut dbs = setup_pinboard_search_db().await;
+        // p: 3/3, q: 1/2 (count 1), r: 2/4 (count 2).
+        make_board(
+            &mut dbs.index_conn,
+            "unordered",
+            "p",
+            &[&["sha_a", "sha_b", "sha_c"]],
+        )
+        .await;
+        make_board(
+            &mut dbs.index_conn,
+            "unordered",
+            "q",
+            &[&["sha_a", "sha_gone"]],
+        )
+        .await;
+        make_board(
+            &mut dbs.index_conn,
+            "unordered",
+            "r",
+            &[&["sha_a", "sha_b", "sha_gone", "sha_gone_2"]],
+        )
+        .await;
+
+        let query = PqlQuery {
+            order_by: Vec::new(),
+            ..PqlQuery::default()
+        };
+        let built = build_item_set_preprocessed(query.clone()).expect("item set");
+        assert!(built.primary_order.is_none(), "no key to rank by");
+
+        let boards = search_boards(&mut dbs.index_conn, query, "unordered").await;
+        assert_eq!(
+            board_names(&boards),
+            vec!["p".to_string(), "r".to_string(), "q".to_string()]
+        );
+    }
+
+    // Equal best key: the board that matched a larger share of itself wins,
+    // even though it matched fewer items in absolute terms.
+    #[tokio::test]
+    async fn pinboard_search_breaks_best_key_ties_by_fraction() {
+        let mut dbs = setup_pinboard_search_db().await;
+        // Both boards' best match is sha_a, the first result of the default
+        // order; only the fractions differ.
+        make_board(&mut dbs.index_conn, "frac", "whole", &[&["sha_a"]]).await;
+        make_board(
+            &mut dbs.index_conn,
+            "frac",
+            "diluted",
+            &[&["sha_a", "sha_b", "sha_gone"]],
+        )
+        .await;
+
+        let boards = search_boards(&mut dbs.index_conn, PqlQuery::default(), "frac").await;
+        assert_eq!(
+            board_names(&boards),
+            vec!["whole".to_string(), "diluted".to_string()]
+        );
+        assert_eq!(boards[0].match_count, 1);
+        assert_eq!(boards[1].match_count, 2, "and it did match more items");
+    }
+
+    // Rank joins are LEFT joins: a board whose every match has a NULL order
+    // key aggregates to NULL and sorts last, in either direction.
+    #[tokio::test]
+    async fn pinboard_search_sorts_null_key_boards_last() {
+        let mut dbs = setup_pinboard_search_db().await;
+        for direction in [OrderDirection::Asc, OrderDirection::Desc] {
+            let query = order_query(OrderByField::Width, Some(direction));
+            let boards = search_boards(&mut dbs.index_conn, query, "user").await;
+            // Board `e`'s only item is the one with no width.
+            assert_eq!(
+                board_names(&boards).last().map(String::as_str),
+                Some("e"),
+                "{direction:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pinboard_search_is_scoped_to_the_user() {
+        let mut dbs = setup_pinboard_search_db().await;
+        let boards = search_boards(&mut dbs.index_conn, PqlQuery::default(), "user").await;
+        assert!(!board_names(&boards).contains(&"theirs".to_string()));
+
+        let boards = search_boards(&mut dbs.index_conn, PqlQuery::default(), "other").await;
+        assert_eq!(board_names(&boards), vec!["theirs".to_string()]);
+    }
+
+    // A filtered search intersects: only boards holding a matching image come
+    // back, and only their matching items count.
+    #[tokio::test]
+    async fn pinboard_search_intersects_a_filtered_query() {
+        let mut dbs = setup_pinboard_search_db().await;
+        let query: PqlQuery = serde_json::from_value(serde_json::json!({
+            "query": { "in_bookmarks": { "filter": true, "user": "user" } }
+        }))
+        .expect("bookmarks query");
+
+        let boards = search_boards(&mut dbs.index_conn, query, "user").await;
+        // Only sha_c is bookmarked, and only board `b` pins it.
+        assert_eq!(board_names(&boards), vec!["b".to_string()]);
+        assert_eq!(boards[0].match_count, 1);
+    }
+
+    // A rank-filter order: the primary key is the bare `order_rank` alias
+    // (bookmark time here), a TEXT key, aggregated per board and executed
+    // through the composed endpoint SQL. Boards rank by their most recently
+    // bookmarked matching image.
+    #[tokio::test]
+    async fn pinboard_search_ranks_by_a_rank_filter_order() {
+        let mut dbs = setup_pinboard_search_db().await;
+        // The fixture already bookmarks sha_c at 2024-01-01.
+        sqlx::query(
+            r#"
+            INSERT INTO user_data.bookmarks (user, namespace, sha256, time_added)
+            VALUES
+                ('user', 'default', 'sha_a', '2024-03-01T00:00:00'),
+                ('user', 'default', 'sha_e', '2024-04-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let query: PqlQuery = serde_json::from_value(serde_json::json!({
+            "query": { "in_bookmarks": { "filter": true, "user": "user" }, "order_by": true }
+        }))
+        .expect("bookmarks order query");
+
+        let primary = build_item_set_preprocessed(query.clone())
+            .expect("item set")
+            .primary_order
+            .expect("the rank filter is the primary key");
+        assert_eq!(primary.alias, "order_rank");
+        assert_eq!(primary.direction, OrderDirection::Desc);
+
+        let boards = search_boards(&mut dbs.index_conn, query, "user").await;
+        // `e` pins nothing bookmarked, so it is not in the item set at all;
+        // the rest rank by their newest bookmark (c 04-01, a 03-01, b 01-01),
+        // which is the opposite of their match fractions (b 1/1, a 1/2, c 1/2).
+        assert_eq!(
+            board_names(&boards),
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+    }
+
+    // The RRF composite order: the key is the synthesized `primary_order_key`
+    // column, a REAL fused from two branches. The board holding the image both
+    // branches matched must win even though it matched a smaller share of
+    // itself — i.e. the composite key, not the fraction tiebreak, decides.
+    #[tokio::test]
+    async fn pinboard_search_ranks_by_an_rrf_composite_order() {
+        let mut dbs = setup_pinboard_search_db().await;
+        sqlx::query("INSERT INTO setters (id, name) VALUES (1, 'ocr')")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO item_data (id, item_id, setter_id, data_type, idx, is_origin)
+            VALUES (100, 1, 1, 'text', 0, 1), (101, 3, 1, 'text', 0, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        // sha_a and sha_c carry the text; only sha_c is also bookmarked, so
+        // it is the row both RRF branches contribute to.
+        sqlx::query(
+            r#"
+            INSERT INTO extracted_text (
+                id, language, language_confidence, confidence, text, text_length
+            )
+            VALUES
+                (100, 'en', 0.9, 0.9, 'hello', 5),
+                (101, 'en', 0.9, 0.9, 'hello', 5)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        // Fraction would order these the other way round: 1/3 vs 1/1.
+        make_board(
+            &mut dbs.index_conn,
+            "rrf",
+            "both_branches",
+            &[&["sha_c", "sha_gone", "sha_gone_2"]],
+        )
+        .await;
+        make_board(&mut dbs.index_conn, "rrf", "text_only", &[&["sha_a"]]).await;
+
+        let query: PqlQuery = serde_json::from_value(serde_json::json!({
+            "query": {
+                "or_": [
+                    {
+                        "order_by": true,
+                        "direction": "desc",
+                        "priority": 100,
+                        "row_n": true,
+                        "row_n_direction": "asc",
+                        "rrf": { "k": 10, "weight": 0.5 },
+                        "match_text": {
+                            "match": "hello",
+                            "raw_fts5_match": false,
+                            "setters": [],
+                            "languages": [],
+                            "min_language_confidence": 0,
+                            "min_confidence": 0,
+                            "min_length": 0,
+                            "max_length": 0
+                        }
+                    },
+                    {
+                        "order_by": true,
+                        "direction": "desc",
+                        "priority": 100,
+                        "row_n": true,
+                        "row_n_direction": "asc",
+                        "rrf": { "k": 60, "weight": 0.6 },
+                        "in_bookmarks": { "filter": true, "user": "user" }
+                    }
+                ]
+            }
+        }))
+        .expect("rrf query");
+
+        let primary = build_item_set_preprocessed(query.clone())
+            .expect("item set")
+            .primary_order
+            .expect("the composite is the primary key");
+        assert_eq!(primary.alias, "primary_order_key");
+        assert_eq!(primary.direction, OrderDirection::Desc);
+
+        let boards = search_boards(&mut dbs.index_conn, query, "rrf").await;
+        assert_eq!(
+            board_names(&boards),
+            vec!["both_branches".to_string(), "text_only".to_string()]
+        );
+        assert_eq!(boards[0].match_count, 1);
+        assert_eq!(boards[0].item_count, 3, "and it is the diluted board");
+    }
+
+    // Seeded random order end to end. `pk_mix` is a registered runtime
+    // function and the key is a full-range i64, so this exercises both the
+    // extension registration and the integer key path; the board order has to
+    // follow the shuffled item order the results query would have produced.
+    #[tokio::test]
+    async fn pinboard_search_ranks_by_a_seeded_random_order() {
+        let mut dbs = setup_pinboard_search_db().await;
+        let random_query = |seed: i64| PqlQuery {
+            order_by: vec![OrderArgs {
+                order_by: OrderByField::Random,
+                order: None,
+                priority: 0,
+            }],
+            seed: Some(seed),
+            ..PqlQuery::default()
+        };
+
+        let primary = build_item_set_preprocessed(random_query(1))
+            .expect("item set")
+            .primary_order
+            .expect("random order is a key");
+        assert_eq!(primary.alias, "o0_random");
+        assert_eq!(primary.direction, OrderDirection::Asc);
+
+        let default_order = {
+            let ordered = ordered_item_ids(&mut dbs.index_conn, PqlQuery::default()).await;
+            expected_order(&ordered, USER_BOARDS)
+        };
+        let mut any_shuffled = false;
+        for seed in [1_i64, 987_654, 42] {
+            let ordered = ordered_item_ids(&mut dbs.index_conn, random_query(seed)).await;
+            let expected = expected_order(&ordered, USER_BOARDS);
+            let boards = search_boards(&mut dbs.index_conn, random_query(seed), "user").await;
+            assert_eq!(
+                board_names(&boards),
+                expected,
+                "seed {seed}, shuffled items: {ordered:?}"
+            );
+            assert_eq!(boards.len(), 4, "every board still matches");
+            any_shuffled |= expected != default_order;
+        }
+        assert!(
+            any_shuffled,
+            "no seed reordered the boards — the key is not being applied"
+        );
+    }
+
+    fn composed_pinboard_sql(query: PqlQuery) -> CompiledQuery {
+        let built = build_item_set_preprocessed(query).expect("item set");
+        let (statement, with_clause) = compose_pinboard_search(built, "user");
+        compile_statement(statement, with_clause).expect("compile")
+    }
+
+    // The aggregate has to follow the sort direction — MAX for a descending
+    // key, MIN for an ascending one — or "best rank" inverts. The user scope
+    // is a bound parameter, and the search's CTEs stay on the outermost
+    // statement, where they are in scope for the wrapped subquery.
+    #[test]
+    fn pinboard_search_sql_aggregates_in_the_sort_direction() {
+        let descending = composed_pinboard_sql(PqlQuery::default());
+        assert!(
+            descending
+                .sql
+                .contains(r#"MAX("sr"."o0_last_modified") AS "best_key""#),
+            "{}",
+            descending.sql
+        );
+        assert_eq!(descending.params, vec![Value::from("user")]);
+
+        let ascending = composed_pinboard_sql(order_query(
+            OrderByField::LastModified,
+            Some(OrderDirection::Asc),
+        ));
+        assert!(
+            ascending
+                .sql
+                .contains(r#"MIN("sr"."o0_last_modified") AS "best_key""#),
+            "{}",
+            ascending.sql
+        );
+
+        let filtered: PqlQuery = serde_json::from_value(serde_json::json!({
+            "query": { "in_bookmarks": { "filter": true, "user": "user" } }
+        }))
+        .expect("bookmarks query");
+        let filtered = composed_pinboard_sql(filtered);
+        assert!(
+            filtered.sql.starts_with(r#"WITH "begin_cte""#),
+            "{}",
+            filtered.sql
+        );
+    }
+
     // Without a cache target (bypass/disabled) nothing is stored and no
     // prefetch happens even when requested.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes against the sync cache tests
     async fn bypass_executes_without_storing() {
         let _guard = search_cache::test_lock();
         search_cache::set_budget_mb(16);
@@ -2037,5 +3344,534 @@ mod tests {
             search_cache::lookup_rows(&key, 0, Some(1)),
             CacheLookup::Miss
         ));
+    }
+
+    /// Both outro columns travel the whole select → SQL → row-reader path,
+    /// and the kind arrives with its detector-version suffix intact: the
+    /// stored value is the only served form (design §6.3). The negative row
+    /// proves `content_end_ms` — not the kind string — is what "has an outro"
+    /// reads, and the never-examined row proves absent stays absent.
+    ///
+    /// This is the mapping up to but not including the serving gate, i.e.
+    /// what the response carries whenever `detect_outros` is on (the
+    /// default). The toggle-off contract is
+    /// [`outro_columns_gated_by_detect_outros`].
+    #[tokio::test]
+    async fn outro_columns_served_raw_when_detection_enabled() {
+        use crate::pql::model::Column as PqlColumn;
+
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, duration, outro_kind, content_end_ms, time_added)
+            VALUES
+                (1, 'sha_card', 'md5_1', 'video/mp4', 12.0, 'tiktok_card/1', 8000, '2024-01-01T00:00:00'),
+                (2, 'sha_none', 'md5_2', 'video/mp4', 12.0, 'none/1', NULL, '2024-01-01T00:00:00'),
+                (3, 'sha_new', 'md5_3', 'video/mp4', 12.0, NULL, NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\outro").await;
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_card', 1, 'C:\outro\a.mp4', 'a.mp4', '2024-01-03T00:00:00', 1, 1),
+                (11, 'sha_none', 2, 'C:\outro\b.mp4', 'b.mp4', '2024-01-02T00:00:00', 1, 1),
+                (12, 'sha_new', 3, 'C:\outro\c.mp4', 'c.mp4', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let query = PqlQuery {
+            select: vec![
+                PqlColumn::Sha256,
+                PqlColumn::OutroKind,
+                PqlColumn::ContentEndMs,
+            ],
+            page_size: 0,
+            count: false,
+            check_path: false,
+            ..PqlQuery::default()
+        };
+        let built = build_query_preprocessed(query, false).expect("build");
+        let extra_columns = built.extra_columns.clone();
+        let compiled = compile_select(built).expect("compile");
+        let rows = run_compiled_query(&mut dbs.index_conn, &compiled.sql, &compiled.params)
+            .await
+            .expect("run results query");
+        let results: Vec<SearchResult> = rows
+            .iter()
+            .map(|row| map_search_result(row, &extra_columns).expect("map result"))
+            .collect();
+
+        let by_sha = |sha: &str| {
+            results
+                .iter()
+                .find(|result| result.sha256.as_deref() == Some(sha))
+                .unwrap_or_else(|| panic!("{sha} in results"))
+        };
+
+        let card = by_sha("sha_card");
+        assert_eq!(
+            card.outro_kind.as_deref(),
+            Some("tiktok_card/1"),
+            "the version suffix is never stripped at the API boundary"
+        );
+        assert_eq!(card.content_end_ms, Some(8000));
+
+        let negative = by_sha("sha_none");
+        assert_eq!(negative.outro_kind.as_deref(), Some("none/1"));
+        assert_eq!(
+            negative.content_end_ms, None,
+            "examined and negative carries no boundary"
+        );
+
+        let unexamined = by_sha("sha_new");
+        assert_eq!(unexamined.outro_kind, None);
+        assert_eq!(unexamined.content_end_ms, None);
+    }
+
+    /// Both codec columns travel the whole select → SQL → row-reader path,
+    /// sentinels and all, and a `match` filter on either one reaches the right
+    /// SQLite column. There is no serving gate to pin here — that absence is
+    /// the point, and it is what the trailing assertion on a `detect_outros`
+    /// off database checks.
+    #[tokio::test]
+    async fn codec_columns_select_and_filter() {
+        use crate::pql::model::Column as PqlColumn;
+
+        let _env = crate::test_utils::test_data_dir();
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (
+                id, sha256, md5, type, video_codec, audio_codec, time_added
+            )
+            VALUES
+                (1, 'sha_hevc', 'md5_1', 'video/mp4', 'hevc', 'aac', '2024-01-01T00:00:00'),
+                (2, 'sha_h264', 'md5_2', 'video/mp4', 'h264', NULL, '2024-01-01T00:00:00'),
+                (3, 'sha_bare', 'md5_3', 'video/mp4', 'none', NULL, '2024-01-01T00:00:00'),
+                (4, 'sha_new', 'md5_4', 'video/mp4', NULL, NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\codecs").await;
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_hevc', 1, 'C:\codecs\a.mp4', 'a.mp4', '2024-01-01T00:00:00', 1, 1),
+                (11, 'sha_h264', 2, 'C:\codecs\b.mp4', 'b.mp4', '2024-01-01T00:00:00', 1, 1),
+                (12, 'sha_bare', 3, 'C:\codecs\c.mp4', 'c.mp4', '2024-01-01T00:00:00', 1, 1),
+                (13, 'sha_new', 4, 'C:\codecs\d.mp4', 'd.mp4', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        let query = PqlQuery {
+            select: vec![
+                PqlColumn::Sha256,
+                PqlColumn::VideoCodec,
+                PqlColumn::AudioCodec,
+            ],
+            page_size: 0,
+            count: false,
+            check_path: false,
+            ..PqlQuery::default()
+        };
+        let built = build_query_preprocessed(query, false).expect("build");
+        let extra_columns = built.extra_columns.clone();
+        let compiled = compile_select(built).expect("compile");
+        let rows = run_compiled_query(&mut dbs.index_conn, &compiled.sql, &compiled.params)
+            .await
+            .expect("run results query");
+        let results: Vec<SearchResult> = rows
+            .iter()
+            .map(|row| map_search_result(row, &extra_columns).expect("map result"))
+            .collect();
+        let by_sha = |sha: &str| {
+            results
+                .iter()
+                .find(|result| result.sha256.as_deref() == Some(sha))
+                .unwrap_or_else(|| panic!("{sha} in results"))
+        };
+
+        let hevc = by_sha("sha_hevc");
+        assert_eq!(hevc.video_codec.as_deref(), Some("hevc"));
+        assert_eq!(hevc.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(
+            by_sha("sha_bare").video_codec.as_deref(),
+            Some("none"),
+            "the sentinel is served as stored: probed, and there is no video"
+        );
+        let unprobed = by_sha("sha_new");
+        assert_eq!(
+            unprobed.video_codec, None,
+            "never probed stays absent, which is what a client falls back on"
+        );
+        assert_eq!(unprobed.audio_codec, None);
+
+        // "Find all HEVC", the query this exists for. The audio filter proves
+        // the second column is wired to its own SQLite column and not to the
+        // first one's.
+        let mut hevc_shas = codec_query_shas(
+            &mut dbs.index_conn,
+            serde_json::json!({
+                "query": { "match": { "eq": { "video_codec": "hevc" } } }
+            }),
+        )
+        .await;
+        hevc_shas.sort();
+        assert_eq!(hevc_shas, vec!["sha_hevc".to_string()]);
+
+        let aac_shas = codec_query_shas(
+            &mut dbs.index_conn,
+            serde_json::json!({
+                "query": { "match": { "eq": { "audio_codec": "aac" } } }
+            }),
+        )
+        .await;
+        assert_eq!(aac_shas, vec!["sha_hevc".to_string()]);
+
+        // And with the outro toggle off, which withholds `outro_kind` from
+        // every row, the codec columns still arrive: they are not part of that
+        // feature.
+        crate::test_utils::write_detect_outros_config("codecs-outro-off", false);
+        let mut served = results.clone();
+        apply_outro_gate("codecs-outro-off", &mut served).await;
+        assert_eq!(
+            served
+                .iter()
+                .find(|result| result.sha256.as_deref() == Some("sha_hevc"))
+                .and_then(|result| result.video_codec.as_deref()),
+            Some("hevc")
+        );
+    }
+
+    /// [`outro_query_shas`] for the codec columns: compiles and runs `filter`
+    /// as a whole PQL query, returning the matched sha256s in result order.
+    async fn codec_query_shas(
+        conn: &mut sqlx::SqliteConnection,
+        filter: serde_json::Value,
+    ) -> Vec<String> {
+        let mut query: PqlQuery = serde_json::from_value(filter).expect("pql query");
+        query.select = vec![
+            crate::pql::model::Column::Sha256,
+            crate::pql::model::Column::VideoCodec,
+            crate::pql::model::Column::AudioCodec,
+        ];
+        query.page_size = 0;
+        query.count = false;
+        query.check_path = false;
+        let built = build_query_preprocessed(query, false).expect("build");
+        let extra_columns = built.extra_columns.clone();
+        let compiled = compile_select(built).expect("compile");
+        let rows = run_compiled_query(conn, &compiled.sql, &compiled.params)
+            .await
+            .expect("run results query");
+        rows.iter()
+            .map(|row| {
+                map_search_result(row, &extra_columns)
+                    .expect("map result")
+                    .sha256
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Compiles and runs `filter` as a whole PQL query, returning the matched
+    /// sha256s in result order.
+    async fn outro_query_shas(
+        conn: &mut sqlx::SqliteConnection,
+        filter: serde_json::Value,
+    ) -> Vec<String> {
+        let mut query: PqlQuery = serde_json::from_value(filter).expect("pql query");
+        query.select = vec![
+            crate::pql::model::Column::Sha256,
+            crate::pql::model::Column::ContentEndMs,
+        ];
+        query.page_size = 0;
+        query.count = false;
+        query.check_path = false;
+        let built = build_query_preprocessed(query, false).expect("build");
+        let extra_columns = built.extra_columns.clone();
+        let compiled = compile_select(built).expect("compile");
+        let rows = run_compiled_query(conn, &compiled.sql, &compiled.params)
+            .await
+            .expect("run results query");
+        rows.iter()
+            .map(|row| {
+                map_search_result(row, &extra_columns)
+                    .expect("map result")
+                    .sha256
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// A kind-specific query prefix-matches, and the boundary column filters
+    /// and orders numerically. Both run against real SQLite so the column
+    /// mapping, not just the enum, is exercised.
+    #[tokio::test]
+    async fn outro_columns_filter_and_order() {
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, outro_kind, content_end_ms, time_added)
+            VALUES
+                (1, 'sha_1', 'md5_1', 'video/mp4', 'tiktok_card/1', 9000, '2024-01-01T00:00:00'),
+                (2, 'sha_2', 'md5_2', 'video/mp4', 'tiktok_card/1', 3000, '2024-01-01T00:00:00'),
+                (3, 'sha_3', 'md5_3', 'video/mp4', 'none/1', NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\outro").await;
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_1', 1, 'C:\outro\1.mp4', '1.mp4', '2024-01-01T00:00:00', 1, 1),
+                (11, 'sha_2', 2, 'C:\outro\2.mp4', '2.mp4', '2024-01-01T00:00:00', 1, 1),
+                (12, 'sha_3', 3, 'C:\outro\3.mp4', '3.mp4', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        // Prefix, not equality: the stored value carries a version suffix.
+        let mut prefixed = outro_query_shas(
+            &mut dbs.index_conn,
+            serde_json::json!({
+                "query": { "match": { "startswith": { "outro_kind": "tiktok_card/" } } }
+            }),
+        )
+        .await;
+        prefixed.sort();
+        assert_eq!(prefixed, vec!["sha_1".to_string(), "sha_2".to_string()]);
+
+        // Numeric comparison on the boundary, ordered ascending by it.
+        let bounded = outro_query_shas(
+            &mut dbs.index_conn,
+            serde_json::json!({
+                "query": { "match": { "gte": { "content_end_ms": 1000 } } },
+                "order_by": [{ "order_by": "content_end_ms", "order": "asc", "priority": 0 }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            bounded,
+            vec!["sha_2".to_string(), "sha_1".to_string()],
+            "NULL content_end_ms is excluded and the rest sort numerically"
+        );
+    }
+
+    /// The per-database serving gate (`docs/video-outro-skip-design.md` §6):
+    /// with `detect_outros` off, both outro fields are blanked on the mapped
+    /// rows — even for an item whose outro was detected while it was on —
+    /// while a PQL predicate on the same column keeps filtering. The
+    /// asymmetry is deliberate: playback metadata is withheld, query
+    /// capability is not.
+    #[tokio::test]
+    async fn outro_columns_gated_by_detect_outros() {
+        let _env = crate::test_utils::test_data_dir();
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, duration, outro_kind, content_end_ms, time_added)
+            VALUES
+                (1, 'sha_card', 'md5_1', 'video/mp4', 12.0, 'tiktok_card/1', 8000, '2024-01-01T00:00:00'),
+                (2, 'sha_none', 'md5_2', 'video/mp4', 12.0, 'none/1', NULL, '2024-01-01T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        insert_scan(&mut dbs.index_conn, 1, r"C:\outro").await;
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES
+                (10, 'sha_card', 1, 'C:\outro\a.mp4', 'a.mp4', '2024-01-02T00:00:00', 1, 1),
+                (11, 'sha_none', 2, 'C:\outro\b.mp4', 'b.mp4', '2024-01-01T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+
+        /// Selects both outro columns and maps the rows exactly as the
+        /// handler does, up to (but not including) the gate.
+        async fn mapped_results(conn: &mut sqlx::SqliteConnection) -> Vec<SearchResult> {
+            let query = PqlQuery {
+                select: vec![
+                    crate::pql::model::Column::Sha256,
+                    crate::pql::model::Column::OutroKind,
+                    crate::pql::model::Column::ContentEndMs,
+                ],
+                page_size: 0,
+                count: false,
+                check_path: false,
+                ..PqlQuery::default()
+            };
+            let built = build_query_preprocessed(query, false).expect("build");
+            let extra_columns = built.extra_columns.clone();
+            let compiled = compile_select(built).expect("compile");
+            let rows = run_compiled_query(conn, &compiled.sql, &compiled.params)
+                .await
+                .expect("run results query");
+            rows.iter()
+                .map(|row| map_search_result(row, &extra_columns).expect("map result"))
+                .collect()
+        }
+
+        // Positive control: the gate is a no-op with the toggle on, so the
+        // stored values reach the response unchanged.
+        crate::test_utils::write_detect_outros_config("search-outro-on", true);
+        let mut served = mapped_results(&mut dbs.index_conn).await;
+        apply_outro_gate("search-outro-on", &mut served).await;
+        let card = served
+            .iter()
+            .find(|result| result.sha256.as_deref() == Some("sha_card"))
+            .expect("sha_card in results");
+        assert_eq!(card.outro_kind.as_deref(), Some("tiktok_card/1"));
+        assert_eq!(card.content_end_ms, Some(8000));
+
+        crate::test_utils::write_detect_outros_config("search-outro-off", false);
+        let mut gated = mapped_results(&mut dbs.index_conn).await;
+        apply_outro_gate("search-outro-off", &mut gated).await;
+        assert_eq!(gated.len(), 2);
+        for result in &gated {
+            assert_eq!(
+                result.outro_kind, None,
+                "outro_kind is withheld for every row, verdict or not"
+            );
+            assert_eq!(result.content_end_ms, None);
+            assert!(
+                result.sha256.is_some(),
+                "the gate touches nothing but the two outro fields"
+            );
+        }
+
+        // Same database, same toggle-off config: PQL predicates on the
+        // gated columns still select rows by their stored values.
+        let filtered = outro_query_shas(
+            &mut dbs.index_conn,
+            serde_json::json!({
+                "query": { "match": { "gte": { "content_end_ms": 1000 } } }
+            }),
+        )
+        .await;
+        assert_eq!(
+            filtered,
+            vec!["sha_card".to_string()],
+            "filtering on content_end_ms survives detect_outros being off"
+        );
+    }
+
+    /// The wiring, not the helper: `search_pql` must gate on the request's
+    /// **index** database config, not its user-data one. Both names are
+    /// stamped with opposite toggles and the handler is run twice with them
+    /// swapped, so reading the wrong name fails whichever way it is wrong.
+    #[tokio::test]
+    async fn search_pql_gates_on_the_index_db_config() {
+        let _env = crate::test_utils::test_data_dir();
+        crate::test_utils::write_detect_outros_config("search-handler-index-off", false);
+        crate::test_utils::write_detect_outros_config("search-handler-user-on", true);
+        crate::test_utils::write_detect_outros_config("search-handler-index-on", true);
+        crate::test_utils::write_detect_outros_config("search-handler-user-off", false);
+
+        /// Runs the real handler over a throwaway database holding one file
+        /// whose item carries a detected outro. `cache: false` keeps the
+        /// process-global result cache out of it; the gate sits after the
+        /// cache read either way.
+        async fn serve(index_db: &str, user_data_db: &str) -> Vec<SearchResult> {
+            let mut dbs = setup_test_databases().await;
+            sqlx::query(
+                r#"
+                INSERT INTO items (
+                    id, sha256, md5, type, duration, outro_kind, content_end_ms, time_added
+                )
+                VALUES (1, 'sha_card', 'md5_1', 'video/mp4', 12.0, 'tiktok_card/1', 8000,
+                        '2024-01-01T00:00:00')
+                "#,
+            )
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+            insert_scan(&mut dbs.index_conn, 1, r"C:\outro").await;
+            sqlx::query(
+                r#"
+                INSERT INTO files (
+                    id, sha256, item_id, path, filename, last_modified, scan_id, available
+                )
+                VALUES (10, 'sha_card', 1, 'C:\outro\a.mp4', 'a.mp4', '2024-01-02T00:00:00', 1, 1)
+                "#,
+            )
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+
+            let crate::db::migrations::InMemoryDatabases {
+                index_conn,
+                storage_conn,
+                user_data_conn,
+            } = dbs;
+            // Held so the shared-cache in-memory databases outlive the call.
+            let _attached = (storage_conn, user_data_conn);
+            let db = DbConnection::<ReadOnly>::for_tests(index_conn, index_db, user_data_db);
+
+            search_pql(
+                State(crate::proxy::test_proxy_state()),
+                db,
+                Query(
+                    serde_json::from_value(serde_json::json!({})).expect("default bookmark params"),
+                ),
+                None,
+                Some(Json(serde_json::json!({
+                    "select": ["sha256", "outro_kind", "content_end_ms"],
+                    "page_size": 0,
+                    "count": false,
+                    "check_path": false,
+                    "cache": false,
+                }))),
+            )
+            .await
+            .expect("search")
+            .0
+            .results
+        }
+
+        let gated = serve("search-handler-index-off", "search-handler-user-on").await;
+        assert_eq!(gated.len(), 1);
+        assert_eq!(
+            gated[0].outro_kind, None,
+            "the index database's toggle is off, so nothing is served"
+        );
+        assert_eq!(gated[0].content_end_ms, None);
+
+        let served = serve("search-handler-index-on", "search-handler-user-off").await;
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].outro_kind.as_deref(), Some("tiktok_card/1"));
+        assert_eq!(served[0].content_end_ms, Some(8000));
     }
 }
