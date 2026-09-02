@@ -271,7 +271,11 @@ browser doesn't expose the Performance domain.
 **`domAdded` / `domRemoved`** — mutation counts, i.e. remount churn.
 
 **`netReqs` / `netKB`** — *all* resource-timing entries created during the run
-and their transfer size (images included). Zero KB with unchanged frame times is
+and their transfer size (images included). The driver raises the
+resource-timing buffer to 50 000 entries before measuring: the browser default
+is 250, which a dense grid exhausts during the settle alone, and past that the
+window's own entries are silently dropped and a transfer-heavy run reports zero
+bytes. Zero KB with unchanged frame times is
 the crucial fact about warm scrolling: the cache kills the transfer, not the
 decode.
 

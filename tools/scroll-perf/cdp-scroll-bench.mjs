@@ -280,6 +280,11 @@ window.__viewport = (() => {
       || scrollables.sort((a,b) => b.scrollHeight - a.scrollHeight)[0]
       || document.scrollingElement;
 })();
+// The resource-timing buffer holds 250 entries by DEFAULT, and a dense grid
+// blows through that during the settle alone -- after which netReqs/netKB read
+// ZERO for the measured window and a transfer-heavy run looks like a cached
+// one. Raise it before the run so the window's own entries are recorded.
+try { performance.setResourceTimingBufferSize(50000); } catch { /* older engines */ }
 window.__measure = async function(velocity, ms){
   const el = window.__viewport;
   const frames=[]; const longtasks=[]; let added=0, removed=0;
