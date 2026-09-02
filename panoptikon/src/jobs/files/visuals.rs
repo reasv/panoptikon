@@ -2086,8 +2086,8 @@ pub(super) fn encode_tiers(
 
 /// The grid tiers of a picture the generator itself produced — a video's
 /// frame grid, an audio cover, a rendered PDF page, an HTML screenshot.
-/// Their source is a q85 JPEG, never a user file, so the byte half of the
-/// serve-directly rule does not apply.
+/// Their source is one of this generator's own stills, never a user file, so
+/// the byte half of the serve-directly rule does not apply.
 pub(super) fn encode_stored_thumbnail_tiers(
     idx: i64,
     image: &DynamicImage,
@@ -2097,7 +2097,7 @@ pub(super) fn encode_stored_thumbnail_tiers(
         idx,
         image,
         &grid_plans_for_stored_thumbnail(width, height),
-        RenditionFormat::Jpeg,
+        GENERATED_STILL_FORMAT,
         Some(false),
     )
 }
@@ -2132,10 +2132,7 @@ pub(super) fn encode_image(
 /// The display rendition of a picture this **generator** produced — a video's
 /// frame grid, an audio cover, a rendered PDF page, an HTML screenshot.
 ///
-/// Always JPEG, deliberately outside the format policy: those pictures are
-/// opaque by construction and the format rules are written about a *user's*
-/// file, so making them follow the policy would regenerate every video
-/// rendition in a library for a setting that is about photographs (§4).
+/// [`GENERATED_STILL_FORMAT`], which is where the reasoning lives.
 pub(super) fn encode_generated_still(
     idx: i64,
     image: &DynamicImage,
@@ -2143,7 +2140,7 @@ pub(super) fn encode_generated_still(
     encode_image(
         idx,
         image,
-        RenditionFormat::Jpeg,
+        GENERATED_STILL_FORMAT,
         RenditionRung::Display,
         Some(false),
     )

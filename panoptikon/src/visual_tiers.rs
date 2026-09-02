@@ -338,6 +338,18 @@ pub(crate) enum RenditionRung {
     Display,
 }
 
+/// The container every picture this **generator** produced is stored in — a
+/// video's frame grid, an audio cover, a rendered PDF page, an HTML
+/// screenshot, and every grid tier derived from one of them.
+///
+/// Deliberately outside the format policy (R5) and outside R4. Those pictures
+/// are opaque by construction, and the format rules are written about a
+/// *user's* file: making a video's stills follow a `thumbnail_formats` edit
+/// would regenerate every video rendition in the library for a setting that
+/// is about photographs (§4). Its own constant so the four sites that write
+/// or predict one cannot drift.
+pub(crate) const GENERATED_STILL_FORMAT: RenditionFormat = RenditionFormat::Jpeg;
+
 /// The per-database format policy (R5), folded from
 /// `SystemConfig::thumbnail_formats` once per scan.
 ///
@@ -1167,12 +1179,12 @@ pub(crate) fn static_rendition_set(
 }
 
 /// [`static_rendition_set`] for a source that is itself a stored thumbnail —
-/// a video's frame grid, an audio cover, a rendered page. Always JPEG: those
-/// generators are out of the format policy's scope (§4).
+/// a video's frame grid, an audio cover, a rendered page. Always
+/// [`GENERATED_STILL_FORMAT`].
 pub(crate) fn stored_thumbnail_rendition_set(width: u32, height: u32) -> Vec<WantedRendition> {
     named(
         grid_plans_for_stored_thumbnail(width, height),
-        RenditionFormat::Jpeg,
+        GENERATED_STILL_FORMAT,
     )
 }
 
