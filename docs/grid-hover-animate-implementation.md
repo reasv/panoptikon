@@ -21,7 +21,7 @@ zero, the playback director owns every global listener) all remain in force.
 | D6 | Hover arming | `pointerenter` arms only if a real `pointermove` (coords changed) happened within the last 150 ms AND the director is not scroll-suspended; then a **200 ms dwell**; cancelled by `pointerleave`, scroll start, or suspend |
 | D7 | Concurrency | at most ONE hover-playing cell; entering another stops the previous. On leave: pause + unmount the `<video>` (the poster `<img>` never left; the loop URL is immutable-cached, so re-hover is cheap) |
 | D8 | Badge rule | badge = "this item moves, but is not moving right now". Shown on: video stills; an animated image's static poster (hover mode, not playing). Hidden on: a playing loop; a below-floor GIF animating natively in an `<img>`. The hover fade stays. |
-| D9 | Videos | below the threshold request the single frame (`big=false`), above the 2x2 (today). Armed hover at small sizes swaps to the 2x2, latch-until-loaded (same pattern as the aspect>2 display swap). Choice latches at mount. |
+| D9 | Videos | below the threshold request the single frame (`big=false`), above the 2x2 (today). **Plain `:hover`** at small sizes swaps to the 2x2 — with the card's cover→contain zoom-out, never as a second step after a dwell (user QA 2026-09-02) — latch-until-loaded (same pattern as the aspect>2 display swap). Choice latches at mount. |
 | D10 | Gallery | **filmstrip thumbnails** hover-play the loop through the same director (they are grid-s posters today). The **large view is unchanged** (it already serves the original animated file). |
 | D11 | Overlay scaling | grid host writes `--cell-px` on its container; overlay chrome geometry is `clamp()`/`calc()` of it: linear ramp from 240 px cells (scale 1.0, corner insets 8 px) down to 140 px (scale ≈0.72, insets 2 px). Acceptance: fanout fully open at the minimum size with no overlap with corner buttons; hit targets never under 18 px. `PlayableBadge` already self-scales (`cqmin`) — untouched. |
 
@@ -156,6 +156,10 @@ geometry table listed both values, and nobody (coordinator included) read
 alignment as a criterion because D11 never named it. Every corner anchor is
 now the one `--cell-chrome-inset`. (2) The grid's file-action fanout moves to
 bottom-right to match the filmstrip; the details button takes bottom-left.
+(3) The small-cell video swap followed the loop's arming rule and dwell, so
+the 2x2 arrived as a second change after the hover zoom-out; it now follows
+`:hover` directly (mouseenter/leave on the group root, like the extreme-aspect
+swap), so both changes are one moment.
 
 ## 7. Traps carried over
 
