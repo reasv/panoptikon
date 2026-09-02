@@ -203,6 +203,9 @@ pub(super) async fn load_base_frames(
                     idx: idx as i64,
                     width: img.width() as i64,
                     height: img.height() as i64,
+                    // `storage.frames` has no media type column of its own;
+                    // these are the JPEGs `encode_jpeg` just wrote.
+                    media_type: "image/jpeg".to_string(),
                     bytes: encode_jpeg(img)?,
                 });
             }

@@ -1139,8 +1139,13 @@ async fn resolve_item_thumbnail(
 
 /// Writes one thumbnail blob into the job's scratch dir (created on the first
 /// call) and returns it as a compose input whose `StreamInfo` is synthesized
-/// from the stored geometry — thumbnails are JPEGs, so no probe could learn
-/// more than the row already says.
+/// from the stored geometry — the row already says everything a probe of what
+/// was just written could learn.
+///
+/// The extension comes from the row's own media type: a display rendition is
+/// no longer always a JPEG (a lossless source's is a WebP), and ffmpeg picks
+/// its demuxer by content but the compose pipeline's own logs and the
+/// still-format normalisation read the name.
 async fn materialize_thumbnail(
     scratch: &mut Option<Arc<tempfile::TempDir>>,
     index: usize,
@@ -1157,7 +1162,11 @@ async fn materialize_thumbnail(
     // The index disambiguates duplicates of one item; the sha prefix only
     // makes a leftover dir attributable by eye.
     let prefix: String = item.sha256.chars().take(10).collect();
-    let path = dir.path().join(format!("{index}-{prefix}.jpg"));
+    let extension = match thumb.media_type.as_str() {
+        "image/webp" => "webp",
+        _ => "jpg",
+    };
+    let path = dir.path().join(format!("{index}-{prefix}.{extension}"));
     tokio::fs::write(&path, &thumb.bytes).await.map_err(|err| {
         tracing::error!(error = %err, "failed to write a materialized thumbnail");
         ApiError::internal("Failed to materialize a thumbnail")
