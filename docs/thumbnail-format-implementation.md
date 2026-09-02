@@ -41,8 +41,7 @@ rendition is stored, and *what shape* it has once it is.
 
 - **Trigger — dimensions shared, bytes per source class:** store a rendition
   iff `short > 4096` OR `pixels > 24 MP` OR `bytes > B(class)`, where
-  `B(lossless PNG/BMP/TIFF) = 2 MiB`, `B(jpeg) = TBD (Phase E, working number
-  8 MiB)`, `B(webp) = none` (bytes never trigger), and `B(animated) = 5 MiB`
+  `B(lossless PNG/BMP/TIFF) = 2 MiB`, `B(jpeg) = 4 MiB`, `B(webp) = none` (bytes never trigger), and `B(animated) = 5 MiB`
   (R3). Otherwise serve the original. Bytes mean different things per
   format — a 5 MiB PNG is a modest picture, a 5 MiB JPEG a large efficient
   one — so one number cannot serve all of them; a 600 KiB 2400×3600 JPEG is
@@ -53,9 +52,16 @@ rendition is stored, and *what shape* it has once it is.
   rendition saves 80–90% of bytes from the 1–2 MiB bucket up, sentinel hits
   only below 1 MiB). WebP sources measured "never by bytes" (under 50% saved,
   half tripping the sentinel). Animated 5 MiB is the user's judgement call
-  for GIFs. JPEG is pending Phase E — the study encoded only WebP renditions
-  of JPEG originals, never a JPEG downscale, so no measured number exists
-  yet. The 4096 short-side bound is today's constant, unchanged. The pixel
+  for GIFs. JPEG 4 MiB is from Phase E (JPEG→JPEG renditions via the actual
+  `jpeg-encoder` settings): a rendition of a JPEG original **decodes faster
+  than the original** (0.56–0.68×) and saves 57–62% of bytes from the 2–4 MiB
+  bucket up with ≤ 7.5% sentinel hits; below 2 MiB it stops paying (20%
+  sentinel hits, 49% saved). 4 MiB was chosen over the data-supported 2 MiB
+  to halve the regeneration and storage footprint on photo libraries (at
+  2 MiB, 75% of the camera corpus's raw-served JPEGs would gain a rendition);
+  it is one constant if that trade is ever revisited. Phase C's "never by
+  bytes for JPEG" verdict was about *WebP* renditions of JPEGs, which decode
+  2.33× slower; it does not apply to JPEG renditions. The 4096 short-side bound is today's constant, unchanged. The pixel
   bound drops from 32 MP — which was 4096² doubled for a 2:1 aspect, not a
   chosen number — to 24 MP; decimal MP with `>`, so a 6000×4000 camera JPEG
   is exactly 24,000,000 and serves raw unless its class byte bound fires.
