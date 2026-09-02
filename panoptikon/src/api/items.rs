@@ -2528,6 +2528,124 @@ VALUES (?1, 0, 'image/jpeg', 'image/jpeg', 2560, 284, 1, X'')
         );
     }
 
+    /// `Range` on a **stored rendition**, over the three answers the header
+    /// has: a satisfiable range, an unsatisfiable one, and a conditional one.
+    ///
+    /// The bytes live in the database, so this path cannot reuse the file
+    /// server's machinery and has its own copy of the rule — which is exactly
+    /// why it needs its own test. The stored `display` rendition is the case
+    /// that matters least for seeking and most for correctness: whatever a
+    /// client sends, the ETag it gets back has to be the validator the next
+    /// `If-Range` is judged against, or a resumed transfer splices two
+    /// different pictures together.
+    #[tokio::test]
+    async fn a_rendition_answers_ranges_and_conditional_ranges() {
+        let file_path = temp_path("rendition_range.png");
+        std::fs::write(&file_path, b"the original, which is not the answer").unwrap();
+        let (mut item, mut file) = test_records(&file_path);
+        item.mime_type = "image/png".to_string();
+        item.width = Some(9000);
+        item.height = Some(1000);
+        item.size = Some(27 * 1024 * 1024);
+        file.last_modified =
+            format_system_time(std::fs::metadata(&file_path).unwrap().modified().unwrap()).unwrap();
+
+        let crate::db::migrations::InMemoryDatabases {
+            mut index_conn,
+            storage_conn,
+            user_data_conn,
+        } = crate::db::migrations::setup_test_databases().await;
+        let _attached = (storage_conn, user_data_conn);
+
+        sqlx::query(
+            r#"
+INSERT INTO storage.thumbnails (
+    item_sha256, idx, item_mime_type, media_type, width, height, version, thumbnail
+)
+VALUES (?1, 0, 'image/png', 'image/webp', 2560, 284, 1, ?2)
+            "#,
+        )
+        .bind(&item.sha256)
+        .bind(b"0123456789".to_vec())
+        .execute(&mut index_conn)
+        .await
+        .unwrap();
+
+        let serve = async |conn: &mut sqlx::SqliteConnection, headers: HeaderMap| {
+            thumbnail_response(
+                conn,
+                &item,
+                std::slice::from_ref(&file),
+                true,
+                ThumbnailTier::Display,
+                false,
+                &headers,
+                true,
+            )
+            .await
+            .expect("thumbnail response")
+        };
+
+        let response = serve(&mut index_conn, HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(etag, format!("\"{}-thumb0-2560x284-webp\"", item.sha256));
+
+        let mut ranged = HeaderMap::new();
+        ranged.insert(header::RANGE, "bytes=2-5".parse().unwrap());
+        let response = serve(&mut index_conn, ranged.clone()).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(body_bytes(response).await, b"2345".to_vec());
+
+        // Past the end of the blob: 416 with the length, never a 200 carrying
+        // bytes the client did not ask for.
+        let mut past_the_end = HeaderMap::new();
+        past_the_end.insert(header::RANGE, "bytes=100-".parse().unwrap());
+        let response = serve(&mut index_conn, past_the_end).await;
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes */10"
+        );
+        assert!(body_bytes(response).await.is_empty());
+
+        // `If-Range` naming these bytes: the partial state is still usable.
+        let mut matching = ranged.clone();
+        matching.insert(header::IF_RANGE, etag.parse().unwrap());
+        let response = serve(&mut index_conn, matching).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(response).await, b"2345".to_vec());
+
+        // Naming anything else — a validator from before a format or geometry
+        // change, which under this rendition's ETag is exactly what a stale
+        // client holds — and the range is refused in the only safe way: the
+        // whole current body.
+        let mut stale = ranged;
+        stale.insert(
+            header::IF_RANGE,
+            format!("\"{}-thumb0-4096x455-jpeg\"", item.sha256)
+                .parse()
+                .unwrap(),
+        );
+        let response = serve(&mut index_conn, stale).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"0123456789".to_vec());
+    }
+
     /// A **grid** request that falls up onto a display sentinel is still a
     /// fall-up, and pays the fall-up's cache rule.
     ///

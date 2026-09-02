@@ -375,6 +375,62 @@ disable_backend_open = true
         );
     }
 
+    /// The display-tier loop trigger on the wire (§5): three keys, always all
+    /// three, carrying the same numbers the scan decided with.
+    ///
+    /// The gallery large view mounts a `<video>` on the bare thumbnail URL for
+    /// an animated item over this trigger and an `<img>` under it, with no
+    /// request to find out which — so a client and a server that disagree here
+    /// produce an error latch on one class of item and a still frame where a
+    /// loop was stored on the other. Server-derived, like the floor beside it:
+    /// a restricted policy sees the same numbers, because they are a property
+    /// of what the scan wrote.
+    #[test]
+    fn the_display_loop_trigger_is_published_verbatim() {
+        let settings = two_policy_settings();
+        let response = build_client_config(&settings, &settings.policies[1]);
+        let trigger = response
+            .display_loop_trigger
+            .as_ref()
+            .expect("the loop ladder is unconditional today");
+        assert_eq!(
+            (
+                trigger.max_bytes,
+                trigger.max_short_side,
+                trigger.max_pixels
+            ),
+            (
+                crate::visual_tiers::DISPLAY_MAX_FILE_SIZE_ANIMATED,
+                crate::visual_tiers::DISPLAY_MAX_SHORT_SIDE,
+                crate::visual_tiers::DISPLAY_MAX_PIXELS
+            )
+        );
+        // Written out, because these are the numbers the UI hard-codes nothing
+        // against and every one of them is a frozen client contract.
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["display_loop_trigger"],
+            serde_json::json!({
+                "max_bytes": 5_242_880u64,
+                "max_short_side": 4096u32,
+                "max_pixels": 24_000_000u64,
+            }),
+            "all three keys, always, and never the 2560 rendition cap"
+        );
+
+        // And the absent case is a JSON `null`, not a missing key: a build
+        // that serves no loops has to *say* so, or a client reading the field
+        // as optional would read "no answer" as "no trigger" and mount a
+        // `<video>` on every animation there is.
+        let json = serde_json::to_value(ClientConfigResponse {
+            display_loop_trigger: None,
+            ..response
+        })
+        .unwrap();
+        assert_eq!(json["display_loop_trigger"], serde_json::Value::Null);
+        assert!(json.as_object().unwrap().contains_key("display_loop_trigger"));
+    }
+
     /// allow_all: everything true, client table passed through.
     #[test]
     fn allow_all_capabilities() {
