@@ -103,8 +103,12 @@ in
     };
 
     postPatch = ''
-      substituteInPlace Cargo.toml \
-        --replace-fail ', "panoptikon-desktop/src-tauri"' ""
+      # Drop the Tauri desktop crate from the workspace: it needs GTK/WebKit
+      # and is packaged separately. Match the member by line so the patch
+      # survives one-line or one-member-per-line `members = [...]`
+      # formatting; fail loudly if the member is not there at all.
+      grep -q '"panoptikon-desktop/src-tauri"' Cargo.toml
+      sed -i '/"panoptikon-desktop\/src-tauri"/d' Cargo.toml
     '';
 
     postInstall = ''
