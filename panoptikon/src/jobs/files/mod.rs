@@ -2536,7 +2536,7 @@ impl ScanContext {
         // image that owes nothing else must still be examined once — or the
         // partial index's population never drains and the item is reconsidered
         // on every scan forever.
-        let transparency_work = self
+        let mut transparency_work = self
             .pending_transparency_work(&sha256, &mime_type, &path)
             .await;
         // An image with nothing else owing rides the ordinary image pass to
@@ -2584,6 +2584,21 @@ impl ScanContext {
                 Some(TierWork::Image { .. } | TierWork::Animated { .. })
             ) {
                 tier_work = None;
+            }
+            // The transparency question goes with it, and it goes *answered*.
+            // Its only answer is a decode of the original, which is precisely
+            // what the marker has a verdict about — so leaving the column NULL
+            // would dispatch a visuals task with nothing to do on every scan
+            // for the rest of this file's life, and never drain the pending
+            // index. `0` is the same terminal verdict `rotation_pass_for`
+            // writes for a header this build deterministically cannot read: a
+            // picture nobody can decode has no renditions for anything to be
+            // transparent in. Through the same write-once setter, so a pass
+            // over identical content that *can* decode still wins the race by
+            // construction.
+            if transparency_work {
+                transparency_work = false;
+                self.record_item_transparency(&sha256, Some(false)).await;
             }
         }
         // The animated ladder's own marker, and deliberately a separate
@@ -8030,6 +8045,70 @@ LIMIT 1
         }
         let (_, totals) = env.scan().await;
         assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+    }
+
+    /// An image nothing can decode still **answers** the transparency
+    /// question, rather than asking it forever.
+    ///
+    /// Its header reads, so it is indexed and `has_transparency` starts NULL;
+    /// its pixels do not, so the one pass that could measure them is exactly
+    /// the pass the negative cache exists to stop running. Without a terminal
+    /// verdict the column stays NULL, the partial index never drains, and
+    /// every scan for the rest of this file's life dispatches a visuals task
+    /// with nothing in it — the Wave-5 rotation bug, one column over.
+    #[tokio::test]
+    async fn an_undecodable_image_settles_the_transparency_question() {
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-undecodable"]).await;
+        // A real PNG header over pixel data that stops mid-stream: the
+        // metadata phase reads the dimensions out of IHDR and indexes the
+        // file, and every decode after that fails. (The indexing gate is a
+        // header read on purpose — docs/failed-media-retry-design.md, "Scan
+        // policy for undecodable images".)
+        let mut encoded = Vec::new();
+        image::RgbImage::from_fn(1400, 1400, |x, y| {
+            image::Rgb([(x / 8) as u8, (y / 8) as u8, 40])
+        })
+        .write_to(
+            &mut std::io::Cursor::new(&mut encoded),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        encoded.truncate(200);
+        fs::write(env.media_dirs[0].join("truncated.png"), &encoded).unwrap();
+
+        // The ledger takes as many attempts to settle as the failure's class
+        // is worth — what matters is that the verdict lands at all, and that
+        // it is the marker's arrival that lands it.
+        let mut settled = None;
+        for scan in 1..=6 {
+            env.scan().await;
+            let mut conn = env.read().await;
+            let flags = transparency_flags(&mut conn).await;
+            drop(conn);
+            if flags == vec![Some(0)] {
+                settled = Some(scan);
+                break;
+            }
+            assert_eq!(
+                flags,
+                vec![None],
+                "the column holds verdicts: nothing measured these pixels"
+            );
+        }
+        assert!(
+            settled.is_some(),
+            "a picture nobody can decode has no rendition for anything to be \
+             transparent in — without that verdict the partial index never \
+             drains and every scan dispatches a pass that cannot answer"
+        );
+
+        // Written once and never revisited: the item owes nothing more, and
+        // the marker keeps the decode from being attempted again.
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0);
+        let mut conn = env.read().await;
+        assert_eq!(transparency_flags(&mut conn).await, vec![Some(0)]);
     }
 
     /// Whether every stored display rendition carries bytes — the difference
