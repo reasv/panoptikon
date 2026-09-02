@@ -27,7 +27,10 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::api::db_params::DbQueryParams;
-use crate::api::http_file::{FILE_IO_TIMEOUT, FileServeSpec, open_file_with_timeout, serve_file};
+use crate::api::http_file::{
+    FILE_IO_TIMEOUT, ServeBody, ServeSpec, open_file_with_timeout, serve,
+};
+use crate::visual_tiers::{GENERATED_STILL_FORMAT, RenditionFormat};
 use crate::api::utils::serve_outro_metadata;
 use crate::api_error::ApiError;
 use crate::config::{PolicyConfig, Settings};
@@ -599,10 +602,8 @@ pub async fn video_artifact(
             ext,
         )
     };
-    serve_file(
-        FileServeSpec {
-            file,
-            size,
+    serve(
+        ServeSpec {
             mime_type: artifact.mime_type.clone(),
             etag: format!("\"{}\"", artifact.key),
             cache_control: target.cache_control,
@@ -610,6 +611,7 @@ pub async fn video_artifact(
             content_disposition_type: "inline",
             filename,
         },
+        ServeBody::File { file, size },
         &request_headers,
     )
     .await
@@ -1162,10 +1164,9 @@ async fn materialize_thumbnail(
     // The index disambiguates duplicates of one item; the sha prefix only
     // makes a leftover dir attributable by eye.
     let prefix: String = item.sha256.chars().take(10).collect();
-    let extension = match thumb.media_type.as_str() {
-        "image/webp" => "webp",
-        _ => "jpg",
-    };
+    let extension = RenditionFormat::from_media_type(&thumb.media_type)
+        .unwrap_or(GENERATED_STILL_FORMAT)
+        .extension();
     let path = dir.path().join(format!("{index}-{prefix}.{extension}"));
     tokio::fs::write(&path, &thumb.bytes).await.map_err(|err| {
         tracing::error!(error = %err, "failed to write a materialized thumbnail");

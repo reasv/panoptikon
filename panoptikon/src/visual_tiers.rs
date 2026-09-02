@@ -347,6 +347,23 @@ impl RenditionFormat {
         }
     }
 
+    /// The format a stored `media_type` names, or `None` for a type that is
+    /// not a still rendition at all — the loop rows' [`LOOP_MEDIA_TYPE`], and
+    /// anything a future version writes.
+    pub(crate) fn from_media_type(media_type: &str) -> Option<Self> {
+        [Self::Jpeg, Self::Webp]
+            .into_iter()
+            .find(|format| format.media_type() == media_type)
+    }
+
+    /// The filename extension a rendition in this format is offered under.
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Webp => "webp",
+        }
+    }
+
     /// Whether alpha survives into this container for a picture whose pixels
     /// carry it (R4's other half).
     ///
