@@ -57,20 +57,14 @@ Workflow [`.github/workflows/nix.yml`](../../../.github/workflows/nix.yml):
 
 | Trigger | Action |
 | --- | --- |
-| Push (nix/packaging paths) | flake alejandra format check only (fast) |
-| PR (same paths) / plain `workflow_dispatch` | the above plus the full package/desktop/NixOS VM smoke matrix |
+| plain `workflow_dispatch` | flake alejandra format check plus the full package/desktop/NixOS VM smoke matrix |
 | `workflow_dispatch` with `update` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
 
-There are **no scheduled runs and no per-push pin checks**: only tagged
-releases are installable, so the UI pin and flake.lock must be correct **at
-release tags only** (see the release checklist below). Between releases they
-may go stale harmlessly — master is not an installable source.
-
-Path filters cover packaging inputs only: `contrib/package/{nix,common}/**`,
-`contrib/nixos/**`, the flake, `config/server/nixos.toml`, UI pin scripts,
-and `scripts/generate-hicolor-icons.sh`. **Rust/Cargo/desktop/ui sources
-deliberately do not trigger this workflow** — core development stays off the
-nix matrix; packaging breakage from core changes surfaces via a manual
+The workflow is **manual dispatch only**: no push, pull-request, or scheduled
+runs, by policy. Only tagged releases are installable, so the UI pin and
+flake.lock must be correct **at release tags only** (see the release checklist
+below). Between releases they may go stale harmlessly — master is not an
+installable source. Packaging breakage from core changes surfaces via a manual
 dispatch (run one before cutting a release).
 
 CI uses **`cache.nixos.org` only** (no Magic Nix Cache / GHA cache proxy — those
@@ -79,11 +73,10 @@ per job (no shared GHA binary cache); first-run wall time can be long. Installer
 is pinned (`nix-installer-action@v22`). Package/VM checks run as a **parallel
 matrix**.
 
-**Update PR and `GITHUB_TOKEN`:** PRs opened with the default `GITHUB_TOKEN` do
-**not** re-trigger `pull_request`/`push` workflows (GitHub recursion guard). The
-update job therefore runs pin + light package smokes **before** opening the PR.
-Full package/VM matrix is not auto-run on that PR; re-run the workflow after
-merge or push with a human token if you need the full matrix on the PR tip.
+**Update PR:** nothing runs automatically on the opened PR (no `pull_request`
+trigger). The update job therefore runs pin + light package smokes **before**
+opening the PR. Dispatch the workflow manually on the PR branch if you need the
+full package/VM matrix on the PR tip.
 
 **Never auto-updates the `ui` git submodule** — only maintainers change that
 pointer. Automation only rewrites `ui-pin.json` / `flake.lock` to match what is
