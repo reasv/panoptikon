@@ -402,14 +402,7 @@ pub(super) fn wanted_tier_geometry(
 ) -> Vec<TierGeometry> {
     let mut wanted: Vec<TierGeometry> = renditions
         .iter()
-        .map(|rendition| TierGeometry {
-            idx,
-            tier: rendition.tier.to_string(),
-            width: i64::from(rendition.plan.width),
-            height: i64::from(rendition.plan.height),
-            version: rendition_process_version(rendition.tier),
-            media_type: rendition.media_type.to_string(),
-        })
+        .map(|rendition| rendition.geometry(idx))
         .collect();
     wanted.sort_by(|left, right| (left.idx, &left.tier).cmp(&(right.idx, &right.tier)));
     wanted
@@ -432,6 +425,25 @@ pub(super) fn tier_geometry_matches(stored: &[TierGeometry], wanted: &[TierGeome
             .iter()
             .zip(wanted)
             .all(|(stored, wanted)| rendition_row_matches(stored, wanted))
+}
+
+impl WantedRendition {
+    /// The `thumbnail_tiers` row this rendition would be, as the dispatcher
+    /// reads one back.
+    ///
+    /// One conversion, used by both sides of every comparison — the whole
+    /// wanted set and the per-row loop-reuse check — because a row that is
+    /// built one way and compared another is a backfill that never settles.
+    pub(super) fn geometry(&self, idx: i64) -> TierGeometry {
+        TierGeometry {
+            idx,
+            tier: self.kind.as_str().to_string(),
+            width: i64::from(self.plan.width),
+            height: i64::from(self.plan.height),
+            version: self.kind.process_version(),
+            media_type: self.media_type.to_string(),
+        }
+    }
 }
 
 /// Whether one stored row is the row the current ladder wants: same
@@ -469,19 +481,12 @@ pub(super) fn reusable_loop_rows(
     set: &[WantedRendition],
 ) -> Vec<TierGeometry> {
     set.iter()
-        .filter(|rendition| is_loop_tier(rendition.tier))
+        .filter(|rendition| rendition.kind.is_loop())
         .filter_map(|rendition| {
-            let wanted = TierGeometry {
-                idx: 0,
-                tier: rendition.tier.to_string(),
-                width: i64::from(rendition.plan.width),
-                height: i64::from(rendition.plan.height),
-                version: rendition_process_version(rendition.tier),
-                media_type: rendition.media_type.to_string(),
-            };
+            let wanted = rendition.geometry(0);
             stored
                 .iter()
-                .find(|row| row.idx == 0 && row.tier == rendition.tier)
+                .find(|row| (row.idx, row.tier.as_str()) == (0, wanted.tier.as_str()))
                 .filter(|row| rendition_row_matches(row, &wanted))
                 .cloned()
         })
@@ -734,9 +739,9 @@ pub(super) fn build_animated_tiers(
     // `loop-display` where the display answer is a loop the grid one cannot
     // stand in for (R3). Read from the same function the dispatcher predicts
     // with, so the two cannot disagree.
-    for (tier, plan) in animated_plans(file_size, width, height)
+    for (kind, plan) in animated_plans(file_size, width, height)
         .into_iter()
-        .filter(|(tier, _)| is_loop_tier(tier))
+        .filter(|(kind, _)| kind.is_loop())
     {
         // The reuse the version split exists for: a poster-only staleness —
         // a still-encoder change, a new grid tier, a transparency measurement
@@ -746,11 +751,11 @@ pub(super) fn build_animated_tiers(
         // in the authoritative set without moving a byte.
         if let Some(stored) = reusable_loops
             .iter()
-            .find(|stored| stored.idx == 0 && stored.tier == tier)
+            .find(|stored| (stored.idx, stored.tier.as_str()) == (0, kind.as_str()))
         {
             tiers.push(StoredTier {
                 idx: 0,
-                tier,
+                tier: kind,
                 media_type: stored.media_type.clone(),
                 width: stored.width,
                 height: stored.height,
@@ -759,7 +764,7 @@ pub(super) fn build_animated_tiers(
             });
             continue;
         }
-        let rung = if tier == LOOP_DISPLAY_TIER {
+        let rung = if kind == RenditionKind::LoopDisplay {
             RenditionRung::Display
         } else {
             RenditionRung::Grid
@@ -775,7 +780,7 @@ pub(super) fn build_animated_tiers(
             Err(error) => {
                 tracing::debug!(
                     path = %path.display(),
-                    tier,
+                    tier = kind.as_str(),
                     error = %error,
                     "failed to encode an animated loop"
                 );
@@ -794,7 +799,7 @@ pub(super) fn build_animated_tiers(
         if keeps_original {
             tracing::debug!(
                 path = %path.display(),
-                tier,
+                tier = kind.as_str(),
                 encoded = bytes.len(),
                 source = file_size,
                 "the animated loop was not smaller than its source; keeping the original"
@@ -802,7 +807,7 @@ pub(super) fn build_animated_tiers(
         }
         tiers.push(StoredTier {
             idx: 0,
-            tier,
+            tier: kind,
             // The format the encode was **attempted** with, sentinel or not
             // (`crate::visual_tiers`, "The keep-the-original sentinel").
             media_type: LOOP_MEDIA_TYPE.to_string(),
@@ -2073,7 +2078,7 @@ pub(super) fn encode_tiers(
             let encoded = encode_image(idx, &rendition, format, RenditionRung::Grid, transparency)?;
             Ok(StoredTier {
                 idx,
-                tier: tier.as_str(),
+                tier: RenditionKind::Still(tier),
                 media_type: encoded.media_type,
                 width: encoded.width,
                 height: encoded.height,
@@ -2149,7 +2154,6 @@ pub(super) fn encode_generated_still(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::visual_tiers::LOOP_TIER;
     // The one fixture the two test modules share; it stays with the scan's
     // own tests, which also plant animated GIFs.
     use super::super::tests::write_animated_gif;
@@ -2263,7 +2267,7 @@ mod tests {
 
         let animated = tiers
             .iter()
-            .find(|tier| tier.tier == LOOP_TIER)
+            .find(|tier| tier.tier == RenditionKind::Loop)
             .expect("the loop row is written whatever the comparison says");
         assert!(
             animated.encoded().is_some_and(<[u8]>::is_empty),
@@ -2282,7 +2286,7 @@ mod tests {
         // to answer with something.
         let posters: Vec<&StoredTier> = tiers
             .iter()
-            .filter(|tier| tier.tier != LOOP_TIER)
+            .filter(|tier| tier.tier != RenditionKind::Loop)
             .collect();
         assert!(!posters.is_empty());
         assert!(
@@ -2829,7 +2833,7 @@ mod tests {
                     .iter()
                     .map(|tier| TierGeometry {
                         idx: tier.idx,
-                        tier: tier.tier.to_string(),
+                        tier: tier.tier.as_str().to_string(),
                         width: tier.width,
                         height: tier.height,
                         version: tier.version,

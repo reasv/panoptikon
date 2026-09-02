@@ -110,12 +110,13 @@ use crate::{
     media_tools::animated_loop::LoopError,
     media_tools::transcode::compose::Transform,
     visual_tiers::{
-        DisplayPlan, FormatPolicy, LOOP_DISPLAY_TIER, LOOP_MEDIA_TYPE, RenditionFormat, RenditionRung, ThumbnailTier, TierPlan, WantedRendition,
-        GENERATED_STILL_FORMAT, UNDECODABLE_HAS_TRANSPARENCY, animated_plans, animated_rendition_set,
-        animated_serves_original, display_bytes_trigger, display_plan, encode_rendition, grid_plans,
+        DisplayPlan, FormatPolicy, GENERATED_STILL_FORMAT, LOOP_MEDIA_TYPE, RenditionFormat,
+        RenditionKind, RenditionRung, ThumbnailTier, TierPlan, UNDECODABLE_HAS_TRANSPARENCY,
+        WantedRendition, animated_plans, animated_rendition_set, animated_serves_original,
+        display_bytes_trigger, display_plan, encode_rendition, grid_plans,
         grid_plans_for_stored_thumbnail, grid_renditions, has_alpha_pixels, is_animated_image,
-        is_loop_tier, loop_keeps_original, poster_plans, render, static_rendition_set,
-        still_keeps_original, stored_thumbnail_rendition_set, tier_format,
+        loop_keeps_original, poster_plans, render, static_rendition_set, still_keeps_original,
+        stored_thumbnail_rendition_set, tier_format,
     },
 };
 
@@ -850,9 +851,23 @@ async fn sweep_orphaned_visual_attempts(index_db: &str) {
     }
 }
 
+/// The generator versions, and what a bump to each one regenerates.
+///
+/// | constant | stamped on | a bump regenerates |
+/// |---|---|---|
+/// | `THUMBNAIL_PROCESS_VERSION` | `storage.thumbnails` | every display rendition, and for a video every frame extraction that feeds one |
+/// | `FRAME_PROCESS_VERSION` | `storage.frames` | every stored video frame |
+/// | `TIER_PROCESS_VERSION` | the **still** rows of `storage.thumbnail_tiers` | every grid tier and every animated poster — a re-encode of pictures the pass already holds |
+/// | `LOOP_PROCESS_VERSION` | the `loop`/`loop-display` rows | every H.264 loop — an ffmpeg run per animated item |
+///
+/// [`RenditionKind::process_version`] reads the bottom two, and
+/// [`visual_process_version`] reads the version a *marker* of each kind is
+/// stamped with and consulted at. Kept in one block because the whole point
+/// of splitting them is the cost difference in the right-hand column, and a
+/// reader deciding which to bump has to see all four.
 pub(crate) const THUMBNAIL_PROCESS_VERSION: i64 = 1;
 pub(crate) const FRAME_PROCESS_VERSION: i64 = 1;
-/// The grid tier generator's version, stamped on every
+/// The grid tier generator's version, stamped on every **still**
 /// `storage.thumbnail_tiers` row.
 ///
 /// Its own constant, independent of [`THUMBNAIL_PROCESS_VERSION`], because
@@ -868,6 +883,7 @@ pub(crate) const FRAME_PROCESS_VERSION: i64 = 1;
 /// ([`tier_geometry_matches`]).
 pub(crate) const TIER_PROCESS_VERSION: i64 = 2;
 
+
 /// The H.264 loop generator's version, stamped on the `loop`/`loop-display`
 /// rows and on nothing else.
 ///
@@ -881,15 +897,6 @@ pub(crate) const TIER_PROCESS_VERSION: i64 = 2;
 /// Starts at 1 rather than inheriting the tier version's number: the loops
 /// stored today were produced by exactly this encoder, so they are current.
 pub(crate) const LOOP_PROCESS_VERSION: i64 = 1;
-
-/// The generator version one stored rendition carries, by its discriminator.
-pub(crate) fn rendition_process_version(tier: &str) -> i64 {
-    if is_loop_tier(tier) {
-        LOOP_PROCESS_VERSION
-    } else {
-        TIER_PROCESS_VERSION
-    }
-}
 /// Minimum interval between mid-scan writes of the running counters to the
 /// file_scans row (progress display only; the final update is unconditional).
 pub(crate) const SCAN_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
@@ -4114,9 +4121,10 @@ fn visuals_blocked(blocker: Blocker, message: impl Into<String>) -> FileProcessE
 }
 
 /// The generator version a marker of this kind is stamped with, and compared
-/// against when it is consulted. Exhaustive on purpose: a new kind must fail to
-/// compile here rather than silently inherit the thumbnail generator's version,
-/// which would make every one of its markers expire on the wrong bump.
+/// against when it is consulted (see the version table above). Exhaustive on
+/// purpose: a new kind must fail to compile here rather than silently inherit
+/// the thumbnail generator's version, which would make every one of its
+/// markers expire on the wrong bump.
 fn visual_process_version(kind: VisualKind) -> i64 {
     match kind {
         VisualKind::Thumbnail => THUMBNAIL_PROCESS_VERSION,
@@ -4126,17 +4134,16 @@ fn visual_process_version(kind: VisualKind) -> i64 {
         // `version >= ?` consult while the unrecognised suffix recovers the
         // negatives (docs/video-outro-detection-design.md §7.2).
         VisualKind::Outro => OUTRO_DETECTOR_VERSION,
-        // The *tier* generator's version, never the thumbnail's: a loop is a
+        // The *loop* row's own version, never the thumbnail's: a loop is a
         // `thumbnail_tiers` rendition, and §2 forbids bumping
         // `THUMBNAIL_PROCESS_VERSION` for tier work (that would regenerate
         // every video thumbnail in the library to fix an encoder setting).
         // This is also the only thing that gives a loop failure a heal path:
-        // bump the *loop* version and the ledger's `version >= ?` consult
-        // retires every one of these markers for free. Keyed to
-        // `LOOP_PROCESS_VERSION` rather than the still tiers' version, so a
-        // still-encoder bump neither retires a loop marker nor re-runs the
-        // ffmpeg the marker exists to stop.
-        VisualKind::Loop => LOOP_PROCESS_VERSION,
+        // bump the loop version and the ledger's `version >= ?` consult
+        // retires every one of these markers for free. Read from the row's
+        // own kind, so a still-encoder bump neither retires a loop marker nor
+        // re-runs the ffmpeg the marker exists to stop.
+        VisualKind::Loop => RenditionKind::Loop.process_version(),
     }
 }
 
@@ -8156,8 +8163,13 @@ LIMIT 1
             .fetch_all(&mut conn)
             .await
             .unwrap();
+            let is_loop = |tier: &str| {
+                [RenditionKind::Loop, RenditionKind::LoopDisplay]
+                    .iter()
+                    .any(|kind| kind.as_str() == tier)
+            };
             for (tier, version, bytes) in &rows {
-                if is_loop_tier(tier) {
+                if is_loop(tier) {
                     assert_eq!(
                         bytes.as_slice(),
                         PLANTED,
@@ -11607,7 +11619,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         assert_eq!(
             tiers
                 .iter()
-                .map(|tier| (tier.tier, tier.width, tier.height))
+                .map(|tier| (tier.tier.as_str(), tier.width, tier.height))
                 .collect::<Vec<_>>(),
             vec![
                 ("grid-m", 2048, 1000),

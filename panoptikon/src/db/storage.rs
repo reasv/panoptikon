@@ -1,5 +1,6 @@
 use crate::api_error::ApiError;
 use crate::db::visual_attempts::{VisualKind, delete_visual_attempt};
+use crate::visual_tiers::RenditionKind;
 use sqlx::Row;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -39,9 +40,9 @@ pub(crate) struct StoredTier {
     /// Mirrors [`StoredImage::idx`]: which of the item's pictures this is a
     /// tier of.
     pub idx: i64,
-    /// `ThumbnailTier::as_str`, or `visual_tiers::LOOP_TIER` for an animated
-    /// item's video loop — never a free-form string.
-    pub tier: &'static str,
+    /// Which of the five renditions this row is. The stored `tier` column is
+    /// its [`RenditionKind::as_str`], never a free-form string.
+    pub tier: RenditionKind,
     /// What the endpoint serves these bytes as: `image/jpeg` or `image/webp`
     /// for a still rendition, `video/mp4` for a loop.
     ///
@@ -441,7 +442,7 @@ pub(crate) async fn store_thumbnail_tiers(
     }
     let mut prune = sqlx::query(sqlx::AssertSqlSafe(delete.as_str())).bind(sha256);
     for tier in &retained {
-        prune = prune.bind(tier.idx).bind(tier.tier);
+        prune = prune.bind(tier.idx).bind(tier.tier.as_str());
     }
     prune.execute(&mut *conn).await.map_err(|err| {
         tracing::error!(error = %err, "failed to prune thumbnail tiers");
@@ -462,7 +463,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         )
         .bind(sha256)
         .bind(tier.idx)
-        .bind(tier.tier)
+        .bind(tier.tier.as_str())
         .bind(mime_type)
         .bind(&tier.media_type)
         .bind(tier.width)
@@ -825,6 +826,7 @@ WHERE item_sha256 IN (
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::visual_tiers::ThumbnailTier;
     use crate::db::migrations::setup_test_databases;
 
     // Ensures storage cleanup removes thumbnails that no longer have corresponding items.
@@ -888,9 +890,9 @@ VALUES
     async fn storing_tiers_replaces_the_whole_set() {
         let mut dbs = setup_test_databases().await;
         let conn = &mut dbs.index_conn;
-        let tier = |name: &'static str, width: i64| StoredTier {
+        let tier = |kind: RenditionKind, width: i64| StoredTier {
             idx: 0,
-            tier: name,
+            tier: kind,
             media_type: "image/jpeg".to_string(),
             width,
             height: width,
@@ -902,7 +904,7 @@ VALUES
             conn,
             "sha_one",
             "image/png",
-            &[tier("grid-m", 1024), tier("grid-s", 512)],
+            &[tier(RenditionKind::Still(ThumbnailTier::GridM), 1024), tier(RenditionKind::Still(ThumbnailTier::GridS), 512)],
         )
         .await
         .unwrap();
@@ -911,7 +913,7 @@ VALUES
             conn,
             "sha_two",
             "image/png",
-            &[tier("grid-s", 512)])
+            &[tier(RenditionKind::Still(ThumbnailTier::GridS), 512)])
             .await
             .unwrap();
 
@@ -920,7 +922,7 @@ VALUES
             conn,
             "sha_one",
             "image/png",
-            &[tier("grid-m", 900)])
+            &[tier(RenditionKind::Still(ThumbnailTier::GridM), 900)])
             .await
             .unwrap();
         assert_eq!(
@@ -980,7 +982,7 @@ VALUES
             &[
                 StoredTier {
                     idx: 0,
-                    tier: "grid-m",
+                    tier: RenditionKind::Still(ThumbnailTier::GridM),
                     media_type: "image/jpeg".to_string(),
                     width: 1024,
                     height: 1024,
@@ -989,7 +991,7 @@ VALUES
                 },
                 StoredTier {
                     idx: 0,
-                    tier: "loop",
+                    tier: RenditionKind::Loop,
                     media_type: "video/mp4".to_string(),
                     width: 1024,
                     height: 1024,
@@ -1020,7 +1022,7 @@ VALUES
             "image/gif",
             &[StoredTier {
                 idx: 0,
-                tier: "loop",
+                tier: RenditionKind::Loop,
                 media_type: "image/gif".to_string(),
                 width: 512,
                 height: 512,

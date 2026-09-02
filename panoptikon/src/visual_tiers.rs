@@ -226,11 +226,60 @@ pub(crate) const LOOP_DISPLAY_TIER: &str = "loop-display";
 /// The loop's stored media type, and what the endpoint serves it as.
 pub(crate) const LOOP_MEDIA_TYPE: &str = "video/mp4";
 
-/// Whether a stored discriminator names one of the two H.264 loop rows, which
-/// carry [`crate::jobs::files::LOOP_PROCESS_VERSION`] rather than the still
-/// tiers' version and may stand in the keep-the-original sentinel state.
-pub(crate) fn is_loop_tier(tier: &str) -> bool {
-    tier == LOOP_TIER || tier == LOOP_DISPLAY_TIER
+/// What one row of `storage.thumbnail_tiers` *is*.
+///
+/// The `tier` column holds one of five strings, and three separate facts hang
+/// off which one: the media type the row carries, the generator version it is
+/// stamped with, and whether it can stand in the keep-the-original sentinel
+/// state. Reading those off the string at each site is how a fourth kind gets
+/// added and one of the three is missed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenditionKind {
+    /// A still: a grid tier of a picture, or an animated item's poster.
+    Still(ThumbnailTier),
+    /// The H.264 loop that answers **every** grid tier of an animated item.
+    Loop,
+    /// The second loop, for an animated item whose display answer is a loop
+    /// the grid one cannot stand in for (R3).
+    LoopDisplay,
+}
+
+impl RenditionKind {
+    /// The stored discriminator. The strings are frozen: they are the `tier`
+    /// column and, through it, part of every rendition ETag.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Still(tier) => tier.as_str(),
+            Self::Loop => LOOP_TIER,
+            Self::LoopDisplay => LOOP_DISPLAY_TIER,
+        }
+    }
+
+    /// The media type a row of this kind carries. `format` is the still
+    /// ladder's verdict (R1/R4/R5) and has no say over a loop, which is
+    /// always H.264 in an mp4.
+    pub(crate) fn media_type(self, format: RenditionFormat) -> &'static str {
+        match self {
+            Self::Still(_) => format.media_type(),
+            Self::Loop | Self::LoopDisplay => LOOP_MEDIA_TYPE,
+        }
+    }
+
+    /// Whether this is one of the two H.264 rows — the ones an ffmpeg run
+    /// produces, and the ones a still-encoder bump must not touch.
+    pub(crate) fn is_loop(self) -> bool {
+        matches!(self, Self::Loop | Self::LoopDisplay)
+    }
+
+    /// The generator version a row of this kind is stamped with. See the
+    /// version table in `crate::jobs::files`.
+    pub(crate) fn process_version(self) -> i64 {
+        if self.is_loop() {
+            crate::jobs::files::LOOP_PROCESS_VERSION
+        } else {
+            crate::jobs::files::TIER_PROCESS_VERSION
+        }
+    }
 }
 
 /// One rendition of an item's picture.
@@ -1139,17 +1188,17 @@ pub(crate) fn animated_plans(
     file_size: u64,
     width: u32,
     height: u32,
-) -> Vec<(&'static str, TierPlan)> {
-    let mut out: Vec<(&'static str, TierPlan)> = poster_plans(width, height)
+) -> Vec<(RenditionKind, TierPlan)> {
+    let mut out: Vec<(RenditionKind, TierPlan)> = poster_plans(width, height)
         .into_iter()
-        .map(|(tier, plan)| (tier.as_str(), plan))
+        .map(|(tier, plan)| (RenditionKind::Still(tier), plan))
         .collect();
-    out.push((LOOP_TIER, loop_plan(width, height)));
+    out.push((RenditionKind::Loop, loop_plan(width, height)));
     // The second loop row exists only where the display answer is a loop the
-    // grid one cannot stand in for (R3) - which is exactly the row
+    // grid one cannot stand in for (R3) — which is exactly the row
     // [`animated_display_loop`] names.
     if animated_display_loop(file_size, width, height) == Some(LOOP_DISPLAY_TIER) {
-        out.push((LOOP_DISPLAY_TIER, loop_display_plan(width, height)));
+        out.push((RenditionKind::LoopDisplay, loop_display_plan(width, height)));
     }
     out
 }
@@ -1163,7 +1212,7 @@ pub(crate) fn animated_plans(
 /// a stored JPEG of identical dimensions would look like a match forever.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WantedRendition {
-    pub tier: &'static str,
+    pub kind: RenditionKind,
     pub plan: TierPlan,
     pub media_type: &'static str,
 }
@@ -1198,14 +1247,10 @@ pub(crate) fn animated_rendition_set(
 ) -> Vec<WantedRendition> {
     animated_plans(file_size, width, height)
         .into_iter()
-        .map(|(tier, plan)| WantedRendition {
-            tier,
+        .map(|(kind, plan)| WantedRendition {
+            kind,
             plan,
-            media_type: if is_loop_tier(tier) {
-                LOOP_MEDIA_TYPE
-            } else {
-                format.media_type()
-            },
+            media_type: kind.media_type(format),
         })
         .collect()
 }
@@ -1217,7 +1262,7 @@ fn named(
     plans
         .into_iter()
         .map(|(tier, plan)| WantedRendition {
-            tier: tier.as_str(),
+            kind: RenditionKind::Still(tier),
             plan,
             media_type: format.media_type(),
         })
@@ -2165,12 +2210,12 @@ mod tests {
         assert!(
             animated_plans(6 * MB, 1500, 2000)
                 .iter()
-                .any(|(tier, _)| *tier == LOOP_DISPLAY_TIER)
+                .any(|(kind, _)| *kind == RenditionKind::LoopDisplay)
         );
         assert!(
             !animated_plans(DISPLAY_MAX_FILE_SIZE_ANIMATED + 1, 900, 900)
                 .iter()
-                .any(|(tier, _)| *tier == LOOP_DISPLAY_TIER)
+                .any(|(kind, _)| *kind == RenditionKind::LoopDisplay)
         );
     }
 
@@ -2248,7 +2293,7 @@ mod tests {
     fn the_animated_set_is_its_posters_plus_its_loops() {
         let plans = animated_plans(MB, 2000, 2000);
         assert_eq!(
-            plans.iter().map(|(tier, _)| *tier).collect::<Vec<_>>(),
+            plans.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>(),
             vec!["grid-m", "grid-s", "grid-xs", LOOP_TIER],
             "under the display trigger there is exactly one loop"
         );
@@ -2258,7 +2303,7 @@ mod tests {
         // The smallest possible set: one poster and one loop.
         let plans = animated_plans(MB, 120, 120);
         assert_eq!(
-            plans.iter().map(|(tier, _)| *tier).collect::<Vec<_>>(),
+            plans.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>(),
             vec!["grid-m", LOOP_TIER]
         );
 
@@ -2266,7 +2311,7 @@ mod tests {
         // in: the second loop row joins the set.
         let plans = animated_plans(6 * MB, 2000, 2000);
         assert_eq!(
-            plans.iter().map(|(tier, _)| *tier).collect::<Vec<_>>(),
+            plans.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>(),
             vec!["grid-m", "grid-s", "grid-xs", LOOP_TIER, LOOP_DISPLAY_TIER]
         );
 
@@ -2274,7 +2319,7 @@ mod tests {
         // display loop: still one row.
         let plans = animated_plans(6 * MB, 900, 900);
         assert!(
-            !plans.iter().any(|(tier, _)| *tier == LOOP_DISPLAY_TIER),
+            !plans.iter().any(|(kind, _)| *kind == RenditionKind::LoopDisplay),
             "no second encode where the grid loop is already native"
         );
     }
@@ -2290,15 +2335,31 @@ mod tests {
 
         let set = animated_rendition_set(6 * MB, 2000, 2000, RenditionFormat::Jpeg);
         for row in &set {
-            let expected = if is_loop_tier(row.tier) {
+            let expected = if row.kind.is_loop() {
                 LOOP_MEDIA_TYPE
             } else {
                 "image/jpeg"
             };
-            assert_eq!(row.media_type, expected, "{}", row.tier);
+            assert_eq!(row.media_type, expected, "{}", row.kind.as_str());
         }
-        assert!(is_loop_tier(LOOP_TIER) && is_loop_tier(LOOP_DISPLAY_TIER));
-        assert!(!is_loop_tier("grid-m"));
+        // The five discriminators, and which of them an ffmpeg run produces.
+        for kind in [
+            RenditionKind::Still(ThumbnailTier::GridM),
+            RenditionKind::Still(ThumbnailTier::GridS),
+            RenditionKind::Still(ThumbnailTier::GridXs),
+            RenditionKind::Loop,
+            RenditionKind::LoopDisplay,
+        ] {
+            assert_eq!(kind.is_loop(), kind.as_str().starts_with("loop"));
+            assert_eq!(
+                kind.media_type(RenditionFormat::Webp),
+                if kind.is_loop() {
+                    LOOP_MEDIA_TYPE
+                } else {
+                    "image/webp"
+                }
+            );
+        }
 
         // A picture derived from a stored thumbnail is JPEG whatever the
         // policy says: those generators are out of the policy's scope.
