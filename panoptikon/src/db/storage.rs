@@ -37,7 +37,7 @@ pub(crate) struct StoredTier {
     pub tier: &'static str,
     /// What the endpoint serves these bytes as: `image/jpeg` or `image/webp`
     /// for a still rendition, `video/mp4` for a loop, and the *item's own*
-    /// mime type for a row that carries no bytes (see `bytes`).
+    /// mime type for a row that carries no bytes (see [`TierPayload`]).
     pub media_type: String,
     pub width: i64,
     pub height: i64,
@@ -47,12 +47,42 @@ pub(crate) struct StoredTier {
     /// regenerate every poster in the library without re-running ffmpeg over
     /// every animation (docs/thumbnail-format-implementation.md §3).
     pub version: i64,
-    /// **Empty means the original file is the rendition.** Only the loop row
-    /// is ever written that way, and only for the settled
-    /// encoded-larger-than-the-source verdict: the geometry still has to be
-    /// stored, or the backfill dispatcher would ask for the loop again on
-    /// every scan forever, but the bytes would be a pessimization to serve.
-    pub bytes: Vec<u8>,
+    /// The bytes to write, or the instruction to leave the row where it is.
+    pub payload: TierPayload,
+}
+
+impl StoredTier {
+    /// The bytes this row would write, or `None` for a retained one.
+    pub(crate) fn encoded(&self) -> Option<&[u8]> {
+        match &self.payload {
+            TierPayload::Encoded(bytes) => Some(bytes),
+            TierPayload::Retained => None,
+        }
+    }
+}
+
+/// What one member of a wanted tier set carries.
+///
+/// The set is always authoritative — it names *every* row the item should
+/// have — but naming a row and rewriting it are two different things, and the
+/// expensive rows are exactly the ones a pass usually has no reason to touch:
+/// a `TIER_PROCESS_VERSION` bump or a transparency measurement moves the
+/// posters and leaves an animated item's H.264 loops alone, and re-encoding
+/// those would be an ffmpeg run per animation in the library.
+#[derive(Clone)]
+pub(crate) enum TierPayload {
+    /// Bytes this pass produced, to be written.
+    ///
+    /// **Empty means the original file is the rendition** — the
+    /// keep-the-original sentinel, whose geometry still has to be stored or
+    /// the backfill dispatcher would ask for the rendition again on every
+    /// scan forever.
+    Encoded(Vec<u8>),
+    /// A row already in the table that the current ladder still wants,
+    /// verified against the same plan the set was built from. Named so the
+    /// set stays authoritative; never rewritten, so its bytes never cross the
+    /// worker boundary.
+    Retained,
 }
 
 /// The stored geometry of one rendition, which is all the scan's backfill
@@ -368,6 +398,12 @@ LIMIT 1
 /// item on every scan. An empty `tiers` is a legitimate call: it says this
 /// item wants no stored tier at all, and the delete is the whole write.
 ///
+/// A [`TierPayload::Retained`] member is *named* by the set and left on disk:
+/// the delete spares exactly those `(idx, tier)` pairs and the insert skips
+/// them. That keeps the whole-set invariant while an unchanged H.264 loop
+/// stays where it is, rather than being read out of the database, carried
+/// through the worker and written straight back.
+///
 /// No `visual_attempts` delete: the negative cache shadows `thumbnails` and
 /// `frames`, and a tier is neither — a tier is derived from a rendition the
 /// positive cache already holds, or from a decode that cache already settled.
@@ -381,21 +417,31 @@ pub(crate) async fn store_thumbnail_tiers(
     mime_type: &str,
     tiers: &[StoredTier],
 ) -> ApiResult<()> {
-    sqlx::query(
-        r#"
-DELETE FROM storage.thumbnail_tiers
-WHERE item_sha256 = ?1
-        "#,
-    )
-    .bind(sha256)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
+    let retained: Vec<&StoredTier> = tiers
+        .iter()
+        .filter(|tier| tier.encoded().is_none())
+        .collect();
+    // Spelled out per pair rather than as a row-value `NOT IN`: the list is
+    // the two loop rows at most, and a plain conjunction needs nothing from
+    // the SQLite version.
+    let mut delete = String::from("DELETE FROM storage.thumbnail_tiers WHERE item_sha256 = ?1");
+    for index in 0..retained.len() {
+        let (idx, tier) = (index * 2 + 2, index * 2 + 3);
+        delete.push_str(&format!(" AND NOT (idx = ?{idx} AND tier = ?{tier})"));
+    }
+    let mut prune = sqlx::query(sqlx::AssertSqlSafe(delete.as_str())).bind(sha256);
+    for tier in &retained {
+        prune = prune.bind(tier.idx).bind(tier.tier);
+    }
+    prune.execute(&mut *conn).await.map_err(|err| {
         tracing::error!(error = %err, "failed to prune thumbnail tiers");
         ApiError::internal("Failed to store thumbnail tiers")
     })?;
 
     for tier in tiers {
+        let Some(bytes) = tier.encoded() else {
+            continue;
+        };
         sqlx::query(
             r#"
 INSERT INTO storage.thumbnail_tiers (
@@ -412,7 +458,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         .bind(tier.width)
         .bind(tier.height)
         .bind(tier.version)
-        .bind(&tier.bytes)
+        .bind(bytes)
         .execute(&mut *conn)
         .await
         .map_err(|err| {
@@ -835,7 +881,7 @@ VALUES
             width,
             height: width,
             version: 1,
-            bytes: vec![0_u8],
+            payload: TierPayload::Encoded(vec![0_u8]),
         };
 
         store_thumbnail_tiers(
@@ -925,7 +971,7 @@ VALUES
                     width: 1024,
                     height: 1024,
                     version: 2,
-                    bytes: vec![1_u8],
+                    payload: TierPayload::Encoded(vec![1_u8]),
                 },
                 StoredTier {
                     idx: 0,
@@ -934,7 +980,7 @@ VALUES
                     width: 1024,
                     height: 1024,
                     version: 1,
-                    bytes: vec![2_u8],
+                    payload: TierPayload::Encoded(vec![2_u8]),
                 },
             ],
         )
@@ -965,7 +1011,7 @@ VALUES
                 width: 512,
                 height: 512,
                 version: 1,
-                bytes: Vec::new(),
+                payload: TierPayload::Encoded(Vec::new()),
             }],
         )
         .await

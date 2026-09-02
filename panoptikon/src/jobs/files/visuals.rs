@@ -365,7 +365,7 @@ pub(super) fn build_new_item_renditions(
             transparency: None,
             // A first generation has nothing stored to reuse, and no loop
             // encode to spare.
-            loops: Vec::new(),
+            reusable_loops: Vec::new(),
         };
         build_image_renditions(&mut out, path, mime_type, file_size, image, work)
             .map_err(VisualsError::thumbnail)?;
@@ -452,6 +452,44 @@ pub(super) fn rendition_row_matches(
         && rendition_media_type_matches(stored, wanted, item_mime_type)
 }
 
+/// The stored H.264 loop rows the current ladder still wants, named by their
+/// geometry so nothing has to read a blob.
+///
+/// This is what `LOOP_PROCESS_VERSION` being separate actually buys: a
+/// poster-only staleness — a new grid tier, a still-encoder bump, a
+/// transparency measurement — must not re-run ffmpeg over every animation in
+/// the library to reproduce loops that are already correct. The generator
+/// *names* these rows in the set it writes, and `store_thumbnail_tiers`
+/// leaves them exactly where they are.
+///
+/// Per row, deliberately. All-or-nothing would re-encode a correct grid loop
+/// for an item that has newly started owing a `loop-display` — which is every
+/// large animation the moment R3 shipped.
+pub(super) fn reusable_loop_rows(
+    stored: &[TierGeometry],
+    set: &[WantedRendition],
+    mime_type: &str,
+) -> Vec<TierGeometry> {
+    set.iter()
+        .filter(|rendition| is_loop_tier(rendition.tier))
+        .filter_map(|rendition| {
+            let wanted = TierGeometry {
+                idx: 0,
+                tier: rendition.tier.to_string(),
+                width: i64::from(rendition.plan.width),
+                height: i64::from(rendition.plan.height),
+                version: rendition_process_version(rendition.tier),
+                media_type: rendition.media_type.to_string(),
+            };
+            stored
+                .iter()
+                .find(|row| row.idx == 0 && row.tier == rendition.tier)
+                .filter(|row| rendition_row_matches(row, &wanted, mime_type))
+                .cloned()
+        })
+        .collect()
+}
+
 /// Whether a stored row's media type is one the current rule would have
 /// written.
 ///
@@ -489,8 +527,8 @@ pub(super) fn image_file_size(path: &Path) -> Result<u64, VisualsError> {
 /// grid tiers come from the original pixels — it simply does not re-derive a
 /// picture that is already stored and already correct.
 ///
-/// Not `Copy` any more: it carries the loop rows a `TIER_PROCESS_VERSION` bump
-/// must **not** re-encode.
+/// Not `Copy`: it carries the loop rows a `TIER_PROCESS_VERSION` bump must
+/// **not** re-encode.
 #[derive(Clone)]
 pub(super) struct ImageLadderWork {
     /// Produce the display rendition, or the verdict that retires a stale
@@ -520,16 +558,9 @@ pub(super) struct ImageLadderWork {
     /// forever. Deferring to the column is what makes that impossible by
     /// construction.
     pub(super) transparency: Option<bool>,
-    /// The stored H.264 loop rows that are already exactly what the ladder
-    /// wants, for re-emission beside freshly encoded posters.
-    ///
-    /// The whole tier set is replaced wholesale, so an animated item whose
-    /// *posters* went stale — every one of them, on the release that bumps
-    /// `TIER_PROCESS_VERSION` and adds `grid-xs` — would otherwise re-run
-    /// ffmpeg over every animation in the library to reproduce loops that are
-    /// already correct. Empty means "encode them", which is the only case that
-    /// spawns anything.
-    pub(super) loops: Vec<StoredTier>,
+    /// See [`PendingBackfillWork::reusable_loops`]: the stored H.264 rows the
+    /// dispatcher verified against this same plan, named rather than encoded.
+    pub(super) reusable_loops: Vec<TierGeometry>,
 }
 
 /// The display rendition and the grid tiers of one already-decoded image, in
@@ -584,7 +615,7 @@ pub(super) fn build_image_renditions(
                 work.rotation,
                 grid_format,
                 keep_alpha,
-                &work.loops,
+                &work.reusable_loops,
             );
             out.tiers = tiers;
             out.tier_verdicts = verdicts;
@@ -724,7 +755,7 @@ pub(super) fn build_animated_tiers(
     rotation: Option<i64>,
     format: RenditionFormat,
     keep_alpha: bool,
-    reusable_loops: &[StoredTier],
+    reusable_loops: &[TierGeometry],
 ) -> (Option<Vec<StoredTier>>, Vec<VisualVerdict>) {
     let (width, height) = first_frame.dimensions();
     let mut tiers = match encode_tiers(
@@ -752,14 +783,22 @@ pub(super) fn build_animated_tiers(
         // The reuse the version split exists for: a poster-only staleness —
         // a still-encoder change, a new grid tier, a transparency measurement
         // — must not re-run ffmpeg over every animation in the library. The
-        // dispatcher hands back the rows it already verified against this same
-        // plan, sentinel rows included.
+        // dispatcher hands back the geometry of the rows it already verified
+        // against this same plan, sentinel rows included; naming one keeps it
+        // in the authoritative set without moving a byte.
         if let Some(stored) = reusable_loops
             .iter()
-            .find(|stored| stored.tier == tier)
-            .cloned()
+            .find(|stored| stored.idx == 0 && stored.tier == tier)
         {
-            tiers.push(stored);
+            tiers.push(StoredTier {
+                idx: 0,
+                tier,
+                media_type: stored.media_type.clone(),
+                width: stored.width,
+                height: stored.height,
+                version: stored.version,
+                payload: TierPayload::Retained,
+            });
             continue;
         }
         let crf = if tier == LOOP_DISPLAY_TIER {
@@ -814,7 +853,7 @@ pub(super) fn build_animated_tiers(
             width: i64::from(plan.width),
             height: i64::from(plan.height),
             version: LOOP_PROCESS_VERSION,
-            bytes: if keeps_original { Vec::new() } else { bytes },
+            payload: TierPayload::Encoded(if keeps_original { Vec::new() } else { bytes }),
         });
     }
     (Some(tiers), Vec::new())
@@ -1079,12 +1118,11 @@ pub(super) enum TierWork {
     /// posters, both produced from the item's own file — the loop by ffmpeg,
     /// the posters from the first frame the same decode yields.
     ///
-    /// `loops` carries the stored H.264 rows the dispatcher already verified
-    /// against the current plan, for re-emission beside fresh posters — the
-    /// whole point of `LOOP_PROCESS_VERSION` being separate, and what keeps a
-    /// still-encoder change from re-running ffmpeg over every animation in the
-    /// library. Empty means "encode them".
-    Animated { loops: Vec<StoredTier> },
+    /// Which loop rows are already correct is *not* part of this verdict:
+    /// every animated-ladder path can reach the generator, this one included,
+    /// so the reuse travels beside the ladder itself
+    /// ([`PendingBackfillWork::reusable_loops`]).
+    Animated,
     /// This item wants **no** stored tier at all and carries some: delete the
     /// set. Produced by [`GridLadder::Nothing`], which in practice means one
     /// thing: an animated item at or below the raw floor, served from its own
@@ -1096,6 +1134,36 @@ pub(super) enum TierWork {
     /// Needs no decode and no source — the write is the whole work — so it
     /// deliberately survives the negative cache's suppression.
     Retire,
+}
+
+/// The ladder question's whole answer: the work an item owes, and — for an
+/// animated one — the stored loop rows the current plan still wants.
+///
+/// The two are separate because they answer to different things. The work is
+/// about *this* dispatch; the reuse is a property of the item's stored set
+/// that every path into the generator needs, including the ones that carry no
+/// [`TierWork`] at all (see [`PendingBackfillWork::reusable_loops`]).
+pub(super) struct TierQuestion {
+    pub(super) work: Option<TierWork>,
+    pub(super) reusable_loops: Vec<TierGeometry>,
+}
+
+impl TierQuestion {
+    /// Nothing owed and nothing to reuse — every answer but the animated
+    /// ladder's, which is the only one that has loops to speak of.
+    pub(super) fn none() -> Self {
+        Self {
+            work: None,
+            reusable_loops: Vec::new(),
+        }
+    }
+
+    pub(super) fn work(work: TierWork) -> Self {
+        Self {
+            work: Some(work),
+            reusable_loops: Vec::new(),
+        }
+    }
 }
 
 /// One image's measurements, gathered once per dispatch and shared by every
@@ -1333,6 +1401,20 @@ pub(super) struct PendingBackfillWork {
     /// rendition runs the image pass, and that pass must produce the animated
     /// set rather than static tiers.
     pub(super) ladder: GridLadder,
+    /// The stored H.264 loop rows the current plan still wants, verified
+    /// row by row against the very set the generator will build.
+    ///
+    /// Beside `ladder` rather than inside `tier` for the same reason `ladder`
+    /// is: **every** animated-ladder path ends in `build_animated_tiers`, and
+    /// most of them are not [`TierWork::Animated`] at all — a transparency
+    /// fold, a stale still to retire, an orientation that invalidated the
+    /// visuals. A pass that arrived without this list re-ran ffmpeg over an
+    /// animation whose loop was already correct, which on the library-wide
+    /// upgrade pass is every animated item there is.
+    ///
+    /// Per row, not all-or-nothing: an item newly owing `loop-display` must
+    /// encode that one and keep the grid loop it already has.
+    pub(super) reusable_loops: Vec<TierGeometry>,
     /// Frames already in `storage.frames`, where the thumbnail half fetched
     /// them: a video's thumbnail can be rebuilt from these without ffmpeg.
     pub(super) existing_frames: Vec<Vec<u8>>,
@@ -1392,6 +1474,7 @@ pub(super) fn generate_backfill_visuals(
         tier: tier_work,
         formats,
         ladder,
+        reusable_loops,
         existing_frames,
         existing_thumb,
         frames_stored,
@@ -1495,13 +1578,6 @@ pub(super) fn generate_backfill_visuals(
     let replace_visuals = (pass_content_end_ms.is_some() && replaces_visuals)
         || stale_thumbnail(rotation.as_ref())
         || ladder_replaces_display;
-    // The loop rows the ladder question already verified against the current
-    // plan. Re-emitted verbatim beside fresh posters, so a still-encoder
-    // change costs no ffmpeg run (see [`ImageLadderWork::loops`]).
-    let reusable_loops = match &tier_work {
-        Some(TierWork::Animated { loops }) => loops.clone(),
-        _ => Vec::new(),
-    };
     // Which halves of the image ladder this pass is for.
     let image_work = ImageLadderWork {
         display: match &tier_work {
@@ -1524,7 +1600,7 @@ pub(super) fn generate_backfill_visuals(
         rotation: display_rotation,
         formats,
         transparency: indexed_transparency,
-        loops: reusable_loops,
+        reusable_loops: reusable_loops.clone(),
     };
     // An image owing renditions runs the ordinary image pass: display tier
     // and grid tiers come out of the one decode together, so there is no
@@ -1621,9 +1697,7 @@ pub(super) fn generate_backfill_visuals(
     // anywhere. The negative cache was consulted for exactly this decode
     // before the work was dispatched.
     let image_pass_attempted = needs_thumb && mime_type.starts_with("image");
-    if let Some(TierWork::Animated { loops }) = &tier_work
-        && !image_pass_attempted
-    {
+    if matches!(tier_work, Some(TierWork::Animated)) && !image_pass_attempted {
         match image_file_size(path).map_err(|err| err.error).and_then(|file_size| {
             open_image_oriented(path)
                 .map(|image| (file_size, image))
@@ -1649,7 +1723,7 @@ pub(super) fn generate_backfill_visuals(
                     display_rotation,
                     format,
                     keep_alpha,
-                    loops,
+                    &reusable_loops,
                 );
                 tiers = produced;
                 verdicts.extend(tier_verdicts);
@@ -2017,7 +2091,7 @@ pub(super) fn encode_tiers(
                 width: encoded.width,
                 height: encoded.height,
                 version: TIER_PROCESS_VERSION,
-                bytes: encoded.bytes,
+                payload: TierPayload::Encoded(encoded.bytes),
             })
         })
         .collect()
@@ -2138,7 +2212,7 @@ mod tests {
                 rotation: None,
                 formats: FormatPolicy::default(),
                 transparency: Some(false),
-                loops: Vec::new(),
+                reusable_loops: Vec::new(),
             },
         )
         .expect("the pass runs on decoded pixels");
@@ -2205,7 +2279,7 @@ mod tests {
             .find(|tier| tier.tier == LOOP_TIER)
             .expect("the loop row is written whatever the comparison says");
         assert!(
-            animated.bytes.is_empty(),
+            animated.encoded().is_some_and(<[u8]>::is_empty),
             "an encode no smaller than its source must not be stored"
         );
         assert_eq!(
@@ -2224,7 +2298,11 @@ mod tests {
             .filter(|tier| tier.tier != LOOP_TIER)
             .collect();
         assert!(!posters.is_empty());
-        assert!(posters.iter().all(|tier| !tier.bytes.is_empty()));
+        assert!(
+            posters
+                .iter()
+                .all(|tier| tier.encoded().is_some_and(|bytes| !bytes.is_empty()))
+        );
     }
 
     /// The animated ladder's failure ledger. Without it the dispatcher's
@@ -2411,7 +2489,7 @@ mod tests {
                 rotation: None,
                 formats: FormatPolicy::default(),
                 transparency: None,
-                loops: Vec::new(),
+                reusable_loops: Vec::new(),
             },
         )
         else {
@@ -2441,7 +2519,7 @@ mod tests {
                 rotation: None,
                 formats: FormatPolicy::default(),
                 transparency: None,
-                loops: Vec::new(),
+                reusable_loops: Vec::new(),
             },
         ) else {
             panic!("unreadable bytes cannot yield frames");

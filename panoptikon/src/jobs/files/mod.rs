@@ -88,9 +88,9 @@ use crate::{
             stage_blocks_indexing,
         },
         storage::{
-            StoredImage, StoredTier, ThumbnailGeometry, TierGeometry, get_frames_bytes,
-            get_thumbnail_bytes, get_thumbnail_geometry, get_thumbnail_tier_geometry,
-            get_thumbnail_tier_rendition, has_any_frame, has_frame, has_thumbnail,
+            StoredImage, StoredTier, ThumbnailGeometry, TierGeometry, TierPayload,
+            get_frames_bytes, get_thumbnail_bytes, get_thumbnail_geometry,
+            get_thumbnail_tier_geometry, has_any_frame, has_frame, has_thumbnail,
             has_thumbnail_tiers,
         },
         system_config::{SystemConfig, SystemConfigStore},
@@ -2526,9 +2526,10 @@ impl ScanContext {
         // [`GridLadder::Nothing`] is not "no question": it is the answer "the
         // set this item wants is empty", and an item carrying a stale set has
         // to be told so (see [`TierWork::Retire`]).
-        let mut tier_work = self
+        let question = self
             .pending_tier_work(&sha256, &mime_type, &path, image_facts.as_ref(), ladder)
             .await;
+        let mut tier_work = question.work;
         // The transparency question
         // (docs/thumbnail-format-implementation.md §2, R4): "is this an image
         // whose pixels nothing has examined?" Asked here because its answer is
@@ -2566,7 +2567,7 @@ impl ScanContext {
         // which is exactly what a marker has a verdict about, and an animated
         // item is usually served directly at the display tier (so
         // `needs_thumb` is false for it and the gate would never be reached).
-        let animated_ladder = matches!(tier_work, Some(TierWork::Animated { .. }));
+        let animated_ladder = matches!(tier_work, Some(TierWork::Animated));
         if (generate_thumbnail || animated_ladder)
             && self.thumbnail_marker_suppresses(&sha256, &path).await
         {
@@ -2581,7 +2582,7 @@ impl ScanContext {
             // source at all.
             if matches!(
                 tier_work,
-                Some(TierWork::Image { .. } | TierWork::Animated { .. })
+                Some(TierWork::Image { .. } | TierWork::Animated)
             ) {
                 tier_work = None;
             }
@@ -2609,7 +2610,7 @@ impl ScanContext {
         // perfectly capable of producing (and may start owing the moment the
         // display rule flips for it).
         let mut ladder = ladder;
-        if matches!(tier_work, Some(TierWork::Animated { .. }))
+        if matches!(tier_work, Some(TierWork::Animated))
             && self.loop_marker_suppresses(&sha256, &path).await
         {
             tier_work = None;
@@ -2708,6 +2709,7 @@ impl ScanContext {
             tier: tier_work,
             formats: self.formats,
             ladder,
+            reusable_loops: question.reusable_loops,
             existing_frames: Vec::new(),
             existing_thumb: None,
             frames_stored: false,
@@ -3159,7 +3161,7 @@ impl ScanContext {
         path: &Path,
         image_facts: Option<&ImageFacts>,
         ladder: GridLadder,
-    ) -> Option<TierWork> {
+    ) -> TierQuestion {
         // Before any storage read at all. This question is asked once per
         // file per scan, forever, and most of the files in a general-purpose
         // library are types no generator has ever produced a picture for — a
@@ -3176,7 +3178,7 @@ impl ScanContext {
         // reclassification that also has to survive re-hashing to reach this
         // point at all.
         if !mime_can_have_renditions(mime_type) {
-            return None;
+            return TierQuestion::none();
         }
         let stored_tiers = match get_thumbnail_tier_geometry(&mut self.conn, sha256).await {
             Ok(tiers) => tiers,
@@ -3188,7 +3190,7 @@ impl ScanContext {
                     path = %path.display(),
                     "failed to read the stored tiers; skipping the ladder question"
                 );
-                return None;
+                return TierQuestion::none();
             }
         };
         match ladder {
@@ -3206,54 +3208,105 @@ impl ScanContext {
                 // has no use for it, and raw-floor animated items should not
                 // pay a second query to be told nothing.
                 if stored_tiers.is_empty() {
-                    return None;
+                    return TierQuestion::none();
                 }
-                return Some(TierWork::Retire);
+                return TierQuestion::work(TierWork::Retire);
             }
             // Not enough indexed metadata to say what this item wants. Left
             // exactly as it is: guessing "empty" would retire a correct set,
             // and guessing "animated" would need geometry nobody measured.
-            GridLadder::Unknown => return None,
+            GridLadder::Unknown => return TierQuestion::none(),
             GridLadder::Animated => {
-                let facts = image_facts?;
-                let (width, height) = facts.dimensions?;
-                let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
-                    return None;
-                };
-                let set = animated_rendition_set(
-                    facts.file_size,
-                    width,
-                    height,
-                    tier_format(facts.has_transparency, self.formats),
-                );
-                let wanted = wanted_tier_geometry(0, &set);
-                let tiers_match = tier_geometry_matches(&stored_tiers, &wanted, mime_type);
-                // A moving picture never carries a still display rendition:
-                // its `display` answer is its own file or a stored loop (R3).
-                // The one thing that can leave one behind is an older rule —
-                // an animated WebP big enough that the pre-format display rule
-                // froze it into a static JPEG, which the serving path would go
-                // on preferring to the animation forever.
-                let stored_thumbnails = self.stored_geometry(sha256, path).await?;
-                if tiers_match && stored_thumbnails.is_empty() {
-                    return None;
-                }
-                if !stored_thumbnails.is_empty() {
-                    // The image pass, whose ladder is `Animated`: it produces
-                    // the animated set out of the decode it performs *and*
-                    // retires the stale still in the same pass.
-                    return Some(TierWork::Image {
-                        replace_display: true,
-                    });
-                }
-                return Some(TierWork::Animated {
-                    loops: self
-                        .reusable_loop_rows(sha256, path, &stored_tiers, &set, mime_type)
-                        .await,
-                });
+                return self
+                    .animated_tier_question(sha256, mime_type, path, image_facts, &stored_tiers)
+                    .await;
             }
             GridLadder::Static => {}
         }
+        match self
+            .static_tier_work(sha256, mime_type, path, image_facts, &stored_tiers)
+            .await
+        {
+            Some(work) => TierQuestion::work(work),
+            None => TierQuestion::none(),
+        }
+    }
+
+    /// The ladder question for an animated item above the raw floor.
+    ///
+    /// Split out because it is the one branch that answers two things: what
+    /// this dispatch owes, and which stored loop rows the current plan still
+    /// wants. The reuse is computed on **every** path out of here, the ones
+    /// that owe no [`TierWork::Animated`] included — a stale still to retire,
+    /// or nothing at all while some *other* question drags the item through
+    /// the image pass — because all of them end in `build_animated_tiers`,
+    /// and one that arrived without the list re-ran ffmpeg over a loop that
+    /// was already correct.
+    async fn animated_tier_question(
+        &mut self,
+        sha256: &str,
+        mime_type: &str,
+        path: &Path,
+        image_facts: Option<&ImageFacts>,
+        stored_tiers: &[TierGeometry],
+    ) -> TierQuestion {
+        let Some(facts) = image_facts else {
+            return TierQuestion::none();
+        };
+        let Some((width, height)) = facts.dimensions else {
+            return TierQuestion::none();
+        };
+        let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+            return TierQuestion::none();
+        };
+        let set = animated_rendition_set(
+            facts.file_size,
+            width,
+            height,
+            tier_format(facts.has_transparency, self.formats),
+        );
+        let reusable_loops = reusable_loop_rows(stored_tiers, &set, mime_type);
+        let wanted = wanted_tier_geometry(0, &set);
+        let tiers_match = tier_geometry_matches(stored_tiers, &wanted, mime_type);
+        // A moving picture never carries a still display rendition: its
+        // `display` answer is its own file or a stored loop (R3). The one
+        // thing that can leave one behind is an older rule — an animated WebP
+        // big enough that the pre-format display rule froze it into a static
+        // JPEG, which the serving path would go on preferring to the
+        // animation forever.
+        let Some(stored_thumbnails) = self.stored_geometry(sha256, path).await else {
+            return TierQuestion::none();
+        };
+        let work = if !stored_thumbnails.is_empty() {
+            // The image pass, whose ladder is `Animated`: it produces the
+            // animated set out of the decode it performs *and* retires the
+            // stale still in the same pass.
+            Some(TierWork::Image {
+                replace_display: true,
+            })
+        } else if tiers_match {
+            None
+        } else {
+            Some(TierWork::Animated)
+        };
+        TierQuestion {
+            work,
+            reusable_loops,
+        }
+    }
+
+    /// The ladder question for everything on the static ladder: an image,
+    /// whose whole ladder comes from one decode of the original, and every
+    /// other kind, whose tiers are derived from the display renditions
+    /// already stored.
+    async fn static_tier_work(
+        &mut self,
+        sha256: &str,
+        mime_type: &str,
+        path: &Path,
+        image_facts: Option<&ImageFacts>,
+        stored_tiers: &[TierGeometry],
+    ) -> Option<TierWork> {
         let stored_thumbnails = self.stored_geometry(sha256, path).await?;
 
         if mime_type.starts_with("image") {
@@ -3328,7 +3381,7 @@ impl ScanContext {
                     tier_format(facts.has_transparency, self.formats),
                 ),
             );
-            if display_matches && tier_geometry_matches(&stored_tiers, &wanted, mime_type) {
+            if display_matches && tier_geometry_matches(stored_tiers, &wanted, mime_type) {
                 return None;
             }
             return Some(TierWork::Image {
@@ -3361,7 +3414,7 @@ impl ScanContext {
                 &stored_thumbnail_rendition_set(width, height),
             ));
         }
-        if tier_geometry_matches(&stored_tiers, &wanted, mime_type) {
+        if tier_geometry_matches(stored_tiers, &wanted, mime_type) {
             return None;
         }
         // Only now, with work established, are the blobs worth reading.
@@ -3382,68 +3435,6 @@ impl ScanContext {
             }
         }
         Some(TierWork::Derived(sources))
-    }
-
-    /// The stored H.264 loop rows that are already exactly what the ladder
-    /// wants, read whole so the generator can re-emit them beside fresh
-    /// posters.
-    ///
-    /// This is what `LOOP_PROCESS_VERSION` being separate actually buys: the
-    /// tier set is replaced wholesale, so a poster-only staleness — a new
-    /// grid tier, a still-encoder bump, a transparency measurement — would
-    /// otherwise re-run ffmpeg over every animation in the library to
-    /// reproduce loops that are already correct.
-    ///
-    /// All or nothing: a row that does not match, or a blob that will not
-    /// read, empties the list and the generator encodes every loop. A partial
-    /// list would be a set the dispatcher never predicted.
-    async fn reusable_loop_rows(
-        &mut self,
-        sha256: &str,
-        path: &Path,
-        stored: &[TierGeometry],
-        set: &[WantedRendition],
-        mime_type: &str,
-    ) -> Vec<StoredTier> {
-        let mut out = Vec::new();
-        for rendition in set.iter().filter(|rendition| is_loop_tier(rendition.tier)) {
-            let wanted = TierGeometry {
-                idx: 0,
-                tier: rendition.tier.to_string(),
-                width: i64::from(rendition.plan.width),
-                height: i64::from(rendition.plan.height),
-                version: rendition_process_version(rendition.tier),
-                media_type: rendition.media_type.to_string(),
-            };
-            let matched = stored
-                .iter()
-                .find(|row| row.idx == 0 && row.tier == rendition.tier)
-                .is_some_and(|row| rendition_row_matches(row, &wanted, mime_type));
-            if !matched {
-                return Vec::new();
-            }
-            match get_thumbnail_tier_rendition(&mut self.conn, sha256, 0, rendition.tier).await {
-                Ok(Some(row)) => out.push(StoredTier {
-                    idx: 0,
-                    tier: rendition.tier,
-                    media_type: row.media_type,
-                    width: wanted.width,
-                    height: wanted.height,
-                    version: row.version,
-                    bytes: row.bytes,
-                }),
-                Ok(None) => return Vec::new(),
-                Err(err) => {
-                    tracing::warn!(
-                        error = ?err,
-                        path = %path.display(),
-                        "failed to read a stored loop; re-encoding it"
-                    );
-                    return Vec::new();
-                }
-            }
-        }
-        out
     }
 
     /// Everything the dimension-first questions need about one image, from a
@@ -8131,12 +8122,29 @@ LIMIT 1
         !lengths.is_empty() && lengths.iter().all(|length| *length > 0)
     }
 
+    /// The rowids of the stored H.264 loop rows.
+    ///
+    /// A rewritten set deletes and re-inserts, so a *new* rowid is a
+    /// re-encode however the bytes compare — which is the property the
+    /// retained payload exists for, and the one a byte comparison alone would
+    /// miss for a deterministic encoder.
+    async fn loop_tier_ids(conn: &mut sqlx::SqliteConnection) -> Vec<i64> {
+        sqlx::query_scalar(
+            "SELECT id FROM storage.thumbnail_tiers WHERE tier LIKE 'loop%' ORDER BY id",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
+    }
+
     /// The whole point of `LOOP_PROCESS_VERSION` being separate: a
     /// still-encoder bump regenerates every poster in the library and re-runs
     /// ffmpeg over none of it.
     ///
-    /// Proven by planting bytes no encoder would produce in the loop row: if
-    /// the pass re-encoded, they would be replaced by a real mp4.
+    /// Proven twice over: bytes no encoder would produce are planted in the
+    /// loop row, and the row's identity is watched. Both matter — the bytes
+    /// catch an encode, the rowid catches a rewrite that would have produced
+    /// the same bytes.
     #[tokio::test]
     async fn a_tier_version_bump_regenerates_posters_and_never_the_loop() {
         if !crate::media_tools::ffmpeg_available() {
@@ -8157,6 +8165,12 @@ LIMIT 1
         env.scan().await;
 
         const PLANTED: &[u8] = b"not an mp4, planted";
+        let loop_ids = {
+            let mut conn = env.read().await;
+            let ids = loop_tier_ids(&mut conn).await;
+            assert!(!ids.is_empty(), "the premise: this item is on the animated ladder");
+            ids
+        };
         {
             let mut conn = env.write().await;
             // Every still row rewound to the superseded generator; the loop
@@ -8196,14 +8210,42 @@ LIMIT 1
                     assert!(!bytes.is_empty(), "{tier} carries a real picture");
                 }
             }
-            assert!(
-                rows.iter().any(|(tier, _, _)| is_loop_tier(tier)),
-                "the premise: this item is on the animated ladder"
+            assert_eq!(
+                loop_tier_ids(&mut conn).await,
+                loop_ids,
+                "the loop rows were rewritten, not retained"
             );
         }
 
         let (_, totals) = env.scan().await;
         assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+
+        // The other pass that reaches `build_animated_tiers` without ever
+        // being `TierWork::Animated`: the transparency question, which decodes
+        // for one column and used to arrive with no loops to reuse at all.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE items SET has_transparency = NULL")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        env.scan().await;
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                loop_tier_ids(&mut conn).await,
+                loop_ids,
+                "a transparency pass re-ran ffmpeg over an already correct loop"
+            );
+            let planted: Vec<Vec<u8>> = sqlx::query_scalar(
+                "SELECT thumbnail FROM storage.thumbnail_tiers WHERE tier LIKE 'loop%'",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            assert!(planted.iter().all(|bytes| bytes.as_slice() == PLANTED));
+        }
     }
 
     /// `items.has_transparency`, in `items` order.
