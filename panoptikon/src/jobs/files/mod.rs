@@ -2537,18 +2537,17 @@ impl ScanContext {
         // image that owes nothing else must still be examined once — or the
         // partial index's population never drains and the item is reconsidered
         // on every scan forever.
+        //
+        // It travels as itself, never disguised as a ladder verdict: an image
+        // with nothing else owing rides the ordinary image pass to have its
+        // pixels looked at, and that pass owes no rendition at all — not the
+        // display one, not the tier set the geometry comparison already found
+        // correct. Answering it with a `TierWork` said the opposite, and a
+        // whole-set delete-and-insert per already-correct image is the
+        // library-wide cost of saying it.
         let mut transparency_work = self
             .pending_transparency_work(&sha256, &mime_type, &path)
             .await;
-        // An image with nothing else owing rides the ordinary image pass to
-        // have its pixels looked at: `replace_display: false`, so the stored
-        // display rendition and the blurhash are left exactly as they are and
-        // the only write is the tier set the (possibly changed) verdict wants.
-        if transparency_work && tier_work.is_none() && mime_type.starts_with("image") {
-            tier_work = Some(TierWork::Image {
-                replace_display: false,
-            });
-        }
         if matches!(tier_work, Some(TierWork::Image { .. })) {
             generate_thumbnail = true;
         }
@@ -2567,8 +2566,13 @@ impl ScanContext {
         // which is exactly what a marker has a verdict about, and an animated
         // item is usually served directly at the display tier (so
         // `needs_thumb` is false for it and the gate would never be reached).
+        //
+        // The transparency question joins them for the same reason: its only
+        // answer is that decode, so an item whose decode a marker has already
+        // settled must be turned away here or the question is asked on every
+        // scan for the rest of the file's life.
         let animated_ladder = matches!(tier_work, Some(TierWork::Animated));
-        if (generate_thumbnail || animated_ladder)
+        if (generate_thumbnail || animated_ladder || transparency_work)
             && self.thumbnail_marker_suppresses(&sha256, &path).await
         {
             if generate_thumbnail {
@@ -7726,8 +7730,11 @@ LIMIT 1
         }
 
         // Unexamined again: the measurement is re-taken, reaches the same
-        // answer, and the verdict it feeds is unchanged — so the formats
-        // stay put.
+        // answer, and the verdict it feeds is unchanged — so nothing is
+        // rewritten. The rowids are the assertion that matters: the tier
+        // write is a whole-set delete and insert, so a set re-emitted for an
+        // unchanged verdict would show up here even though every byte in it
+        // is identical.
         {
             let mut conn = env.write().await;
             sqlx::query("UPDATE items SET has_transparency = NULL")
@@ -7744,6 +7751,11 @@ LIMIT 1
                     .await
                     .iter()
                     .all(|(_, media)| media == "image/webp")
+            );
+            assert_eq!(
+                tier_ids(&mut conn).await,
+                ids,
+                "a re-measurement that changed no verdict rewrote the set"
             );
         }
         let (_, totals) = env.scan().await;
@@ -8104,11 +8116,21 @@ LIMIT 1
         );
 
         // Written once and never revisited: the item owes nothing more, and
-        // the marker keeps the decode from being attempted again.
+        // the marker keeps the decode from being attempted again. The marker
+        // is half the claim — without one there is nothing for the next
+        // scan's consult to find, and the verdict above would be re-derived
+        // by a fresh decode every time.
         let (_, totals) = env.scan().await;
         assert_eq!(totals.backfilled_visuals, 0);
         let mut conn = env.read().await;
         assert_eq!(flag(&mut conn).await, Some(0));
+        assert!(
+            visual_attempt_rows(&mut conn)
+                .await
+                .iter()
+                .any(|(kind, _, _, _, _)| kind == "thumbnail"),
+            "the settle rides a marker; without one the decode is retried forever"
+        );
     }
 
     /// Whether every stored display rendition carries bytes — the difference
@@ -8216,6 +8238,10 @@ LIMIT 1
                 "the loop rows were rewritten, not retained"
             );
         }
+        let bumped_ids = {
+            let mut conn = env.read().await;
+            tier_ids(&mut conn).await
+        };
 
         let (_, totals) = env.scan().await;
         assert_eq!(totals.backfilled_visuals, 0, "and it settles");
@@ -8237,6 +8263,11 @@ LIMIT 1
                 loop_tier_ids(&mut conn).await,
                 loop_ids,
                 "a transparency pass re-ran ffmpeg over an already correct loop"
+            );
+            assert_eq!(
+                tier_ids(&mut conn).await,
+                bumped_ids,
+                "a re-measurement that changed no verdict rewrote the set"
             );
             let planted: Vec<Vec<u8>> = sqlx::query_scalar(
                 "SELECT thumbnail FROM storage.thumbnail_tiers WHERE tier LIKE 'loop%'",

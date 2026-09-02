@@ -354,6 +354,7 @@ pub(super) fn build_new_item_renditions(
         let (width, height) = image.dimensions();
         let work = ImageLadderWork {
             display: true,
+            replace_tiers: true,
             tiers: first_pass_ladder(mime_type, metadata.duration, file_size, width, height),
             // Measured by this very pass's metadata phase, so the loop is
             // oriented by exactly the turn the item is about to be indexed
@@ -537,6 +538,13 @@ pub(super) struct ImageLadderWork {
     /// and re-storing an identical picture (and its blurhash) for every
     /// already-correct item is the bulk of the work and buys nothing.
     pub(super) display: bool,
+    /// Produce the grid tier set, or leave the stored one where it is. False
+    /// exactly when the ladder question found the stored set already correct
+    /// and some *other* question — the transparency measurement — is what
+    /// dragged this image through a decode. The set is written whole, so
+    /// re-emitting an identical one deletes and re-inserts every rendition
+    /// the item has for nothing.
+    pub(super) replace_tiers: bool,
     /// Which grid renditions this pass owes — see [`grid_ladder`].
     pub(super) tiers: GridLadder,
     /// The item's orientation in clockwise quarter turns, as the scan measured
@@ -597,6 +605,7 @@ pub(super) fn build_image_renditions(
     // the documented fallback when the policy or the size limit refuses one.
     let keep_alpha = grid_format == RenditionFormat::Webp && transparency == Some(true);
     match work.tiers {
+        _ if !work.replace_tiers => {}
         GridLadder::Static => {
             out.tiers = Some(encode_tiers(
                 0,
@@ -1468,7 +1477,7 @@ pub(super) fn generate_backfill_visuals(
         codec: needs_codecs,
         animation: needs_animation,
         rotation: rotation_work,
-        transparency: _,
+        transparency: transparency_work,
         indexed_rotation,
         indexed_transparency,
         tier: tier_work,
@@ -1572,7 +1581,8 @@ pub(super) fn generate_backfill_visuals(
     // an image whose stored display rendition is not the one the current rule
     // wants is a *replacement*, so it lifts the same store guard. An image
     // with nothing stored is an ordinary first generation.
-    let image_ladder = matches!(&tier_work, Some(TierWork::Image { .. }));
+    let image_ladder =
+        matches!(&tier_work, Some(TierWork::Image { .. })) || transparency_work;
     let ladder_replaces_display =
         matches!(&tier_work, Some(TierWork::Image { replace_display: true }));
     let replace_visuals = (pass_content_end_ms.is_some() && replaces_visuals)
@@ -1580,22 +1590,21 @@ pub(super) fn generate_backfill_visuals(
         || ladder_replaces_display;
     // Which halves of the image ladder this pass is for.
     let image_work = ImageLadderWork {
-        display: match &tier_work {
-            // The ladder question examined this image, so it is the
-            // authority: `replace_display` says the stored display rendition
-            // is not the one the current plan wants, and that is the same
-            // fact as "a display rendition is owed" — a *missing* one does
-            // not match the plan either. An image dispatched purely for its
-            // grid tiers therefore gets `false`, and its already-correct
-            // display rendition and blurhash are left exactly as they are.
-            // Across a library-wide ladder backfill that is the difference
-            // between re-encoding and re-storing every stored rendition in
-            // the library and touching none of them.
-            Some(TierWork::Image { replace_display }) => *replace_display || replace_visuals,
-            // No ladder verdict for this file — an ordinary display-side
-            // backfill, which is exactly what the pass is for.
-            _ => true,
-        },
+        // The display rendition is owed when the thumbnail question wants one,
+        // when a verdict invalidated what is stored, or when the ladder
+        // question found the stored rendition disagreeing with the plan. A
+        // pass dispatched purely for the grid tiers or for the transparency
+        // question does none of that, and leaves the stored rendition and its
+        // blurhash exactly as they are — across a library-wide backfill that
+        // is the difference between re-encoding every stored rendition in the
+        // library and touching none of them.
+        display: needs_thumb || replace_visuals || ladder_replaces_display,
+        // The tier set is owed when the ladder question said so, and when a
+        // verdict invalidated the pixels the stored set was made from. A pass
+        // that decoded only to answer the transparency question would
+        // otherwise re-emit the set the geometry comparison had just called
+        // correct — and the write is a whole-set delete and insert.
+        replace_tiers: tier_work.is_some() || replace_visuals,
         tiers: ladder,
         rotation: display_rotation,
         formats,
@@ -1604,7 +1613,8 @@ pub(super) fn generate_backfill_visuals(
     };
     // An image owing renditions runs the ordinary image pass: display tier
     // and grid tiers come out of the one decode together, so there is no
-    // separate stage for them and no second decode.
+    // separate stage for them and no second decode. The transparency question
+    // rides the same pass for the same reason — its answer is that decode.
     let needs_thumb = needs_thumb || replace_visuals || image_ladder;
     // A replaced thumbnail leaves the blurhash describing the old one, which
     // is the same class of visual and the only one derived from it. The
@@ -2206,6 +2216,7 @@ mod tests {
             image,
             ImageLadderWork {
                 display: true,
+                replace_tiers: true,
                 // The display half alone: the grid tiers are a different
                 // rule and would only cost three more encodes here.
                 tiers: GridLadder::Nothing,
@@ -2485,6 +2496,7 @@ mod tests {
             Some(5000),
             ImageLadderWork {
                 display: true,
+                replace_tiers: true,
                 tiers: GridLadder::Static,
                 rotation: None,
                 formats: FormatPolicy::default(),
@@ -2515,6 +2527,7 @@ mod tests {
             None,
             ImageLadderWork {
                 display: true,
+                replace_tiers: true,
                 tiers: GridLadder::Static,
                 rotation: None,
                 formats: FormatPolicy::default(),
