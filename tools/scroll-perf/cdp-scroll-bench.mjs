@@ -49,9 +49,9 @@ if (args.help || args.h) {
   --pulse              scroll 600ms of every 1100ms instead of continuously
   --blockImages        block image requests via CDP (isolates JS cost)
   --blockPattern <g>   override the blocked URL patterns (comma-separated globs)
-  --rewrite <a>=<b>    rewrite substring <a> to <b> in every request URL
-                       (repeatable as a comma-separated list; e.g.
-                       --rewrite size=grid-xs=size=grid-s serves the OLD tier)
+  --rewrite <a>::<b>   rewrite substring <a> to <b> in every request URL
+                       (comma-separated for several; e.g.
+                       --rewrite size=grid-xs::size=grid-s serves the OLD tier)
   --dpr <n>            emulate devicePixelRatio <n> over the SAME physical pixel
                        area (CSS viewport is rescaled by the dpr ratio)
   --allowHidden        measure even if the window is hidden (results are junk)
@@ -79,15 +79,27 @@ function fail(msg) { console.error(msg); process.exit(1); }
 // it is answered with swapped, which is a URL substring rewrite at the network
 // layer -- not a page edit and not a server change.
 //
-// The value is `<from>=<to>`, split at the LAST '=' that leaves a non-empty
-// tail, so `size=grid-xs=size=grid-s` parses the obvious way. Comma-separates
-// several rewrites. Each is applied in order to every intercepted URL.
+// The value is `<from>::<to>`. The separator is '::' and NOT '=' because the
+// substrings this flag exists to swap are themselves query parameters:
+// `size=grid-xs=size=grid-s` has four '=' and no rule over them recovers the
+// intended split. ('=' is still accepted for a spec containing exactly one, so
+// `/img/::/thumb/`-shaped and `a=b`-shaped both work.) Comma-separates several
+// rewrites; each is applied in order to every intercepted URL.
 const rewrites = (typeof args.rewrite === 'string' ? args.rewrite.split(',') : [])
   .map(s => s.trim()).filter(Boolean)
   .map(spec => {
-    const i = spec.lastIndexOf('=');
-    if (i <= 0 || i === spec.length - 1) fail(`--rewrite wants <from>=<to>, got "${spec}"`);
-    return { from: spec.slice(0, i), to: spec.slice(i + 1) };
+    let i = spec.indexOf('::'), width = 2;
+    if (i < 0) {
+      if ((spec.match(/=/g) || []).length !== 1) {
+        fail(`--rewrite wants <from>::<to>, got "${spec}"\n` +
+          "'=' only works when the spec contains exactly one '='; a swap between two\n" +
+          'query parameters must use "::" ' +
+          '(e.g. --rewrite size=grid-xs::size=grid-s).');
+      }
+      i = spec.indexOf('='); width = 1;
+    }
+    if (i <= 0 || i + width >= spec.length) fail(`--rewrite wants <from>::<to>, got "${spec}"`);
+    return { from: spec.slice(0, i), to: spec.slice(i + width) };
   });
 const dprOverride = args.dpr != null && args.dpr !== true ? Number(args.dpr) : null;
 if (dprOverride != null && !(dprOverride > 0)) fail(`--dpr wants a positive number, got "${args.dpr}"`);
@@ -467,6 +479,22 @@ if (args.trace) {
     fs.writeFileSync(args.trace, data);
   }
 }
+
+// A rewrite that matched NOTHING is the failure mode this flag invites -- a
+// mistyped substring produces a run that looks perfectly normal and silently
+// measures the unmodified page. Say so rather than letting it pass as a result.
+if (rewrites.length && rewriteCount === 0) {
+  console.error(`WARNING: --rewrite matched 0 requests. This run measured the page UNCHANGED.\n` +
+    `Rules: ${rewrites.map(r => `"${r.from}" -> "${r.to}"`).join(', ')}\n` +
+    'Check the substring against a real request URL (DevTools Network, or the page\'s\n' +
+    'resource timings). Remember the separator is "::", not "=".');
+}
+
+// Emulation overrides SURVIVE this connection closing, so a --dpr run would
+// leave every later run on the same browser at the emulated viewport -- and
+// those runs report the native dpr, so nothing in their output says the
+// viewport is wrong. Clear it explicitly.
+if (dprOverride != null) await send('Emulation.clearDeviceMetricsOverride').catch(() => {});
 
 console.log(JSON.stringify({
   scenario: { url: typeof args.url === 'string' ? args.url : page.url, dir, velocity, ms, blockImages: !!args.blockImages, warm: !!args.warm, pulse: !!args.pulse },

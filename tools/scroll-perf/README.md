@@ -186,12 +186,21 @@ node cdp-scroll-bench.mjs --port 9231 \
 --pulse            scroll 600ms of every 1100ms (start/stop, not continuous)
 --blockImages      block image requests via CDP -- isolates JS cost
 --blockPattern <g> override the blocked globs (default: gateway thumbnails + /img/)
---rewrite <a>=<b>  rewrite substring <a> to <b> in every request URL (comma-separated
-                   for several); --rewrite size=grid-xs=size=grid-s measures the
-                   page unchanged but served the PREVIOUS thumbnail tier
+--rewrite <a>::<b> rewrite substring <a> to <b> in every request URL (comma-separated
+                   for several); --rewrite size=grid-xs::size=grid-s measures the
+                   page unchanged but served the PREVIOUS thumbnail tier.
+                   The separator is "::" -- both halves are usually query
+                   parameters containing their own "=", so "=" cannot split them.
+                   A rewrite matching ZERO requests warns loudly: a mistyped
+                   substring otherwise yields a normal-looking run of the
+                   unmodified page.
 --dpr <n>          emulate devicePixelRatio <n> over the same PHYSICAL pixel area
                    (the CSS viewport is rescaled by the dpr ratio, so the run
-                   paints the same device pixels and stays comparable)
+                   paints the same device pixels and stays comparable).
+                   TRAP: the override OUTLIVES the connection, so the driver
+                   clears it at the end -- a killed --dpr run leaves the browser
+                   at the emulated viewport and later runs report the NATIVE dpr
+                   while measuring the wrong one. Check info.vp when in doubt.
 --allowHidden      measure even if the window is hidden (results are junk)
 --trace [file]     record a DevTools trace; with a filename, also save it
                    (e.g. --trace trace-out.json -- gitignored)
