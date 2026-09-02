@@ -115,7 +115,7 @@ use crate::{
         WantedRendition, animated_plans, animated_rendition_set, animated_serves_original,
         display_bytes_trigger, display_plan, encode_rendition, grid_plans,
         grid_plans_for_stored_thumbnail, grid_renditions, has_alpha_pixels, is_animated_image,
-        loop_keeps_original, poster_plans, render, static_rendition_set, still_keeps_original,
+        poster_plans, render, static_rendition_set, still_keeps_original,
         stored_thumbnail_rendition_set, tier_format,
     },
 };
@@ -8497,6 +8497,154 @@ LIMIT 1
         );
         let mut conn = env.read().await;
         assert_eq!(tier_rows(&mut conn).await.len(), 5);
+    }
+
+    /// The legacy loop sentinel, and the scan that repairs it without a
+    /// generator bump.
+    ///
+    /// Until 2026-09-02 an H.264 encode that came out no smaller than its
+    /// source was written as an **empty** row, and the endpoint answered such
+    /// a row with the original file — so a heavy GIF was embedded raw at
+    /// every grid tier down to a 140 px cell, which is exactly what the
+    /// display trigger and the ladder exist to prevent. The rule is gone, and
+    /// the rows it left behind have to come back: every other column of one
+    /// is precisely what the current ladder wants, so only the missing bytes
+    /// distinguish it from a correct rendition.
+    ///
+    /// Repaired **per row and without bumping `LOOP_PROCESS_VERSION`**, which
+    /// would re-encode every already-correct loop in the library to reach the
+    /// few that are empty. Both halves are asserted: the emptied row gains
+    /// bytes, and the loop row beside it keeps its rowid — a rewritten set
+    /// deletes and re-inserts, so an unchanged rowid is proof no ffmpeg ran
+    /// for it.
+    #[tokio::test]
+    async fn a_legacy_empty_loop_row_is_refilled_without_a_version_bump() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let test_env = test_data_dir();
+        let env = visuals_env(test_env.path(), &["media-loop-sentinel"]).await;
+        // 5.88 MB uncompressed at 1400x1400, exactly as the stale-set test
+        // above: past the raw floor on both clauses and past the animated
+        // class's 5 MiB display bound, so this item wants both loop rows.
+        // A planted `duration` is what puts it on the animated ladder, with
+        // no dependence on an encoder's idea of a GIF.
+        image::RgbImage::new(1400, 1400)
+            .save(env.media_dirs[0].join("loop.bmp"))
+            .unwrap();
+        env.scan().await;
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE items SET duration = 3.5")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        env.scan().await;
+
+        let (grid_loop_id, display_loop_id) = {
+            let mut conn = env.read().await;
+            let rows = tier_snapshot(&mut conn).await;
+            let id_of = |name: &str| {
+                rows.iter()
+                    .find(|row| row.tier == name)
+                    .unwrap_or_else(|| panic!("the premise: a {name} row is stored"))
+                    .id
+            };
+            assert!(
+                rows.iter()
+                    .filter(|row| row.tier.starts_with("loop"))
+                    .all(|row| !row.thumbnail.is_empty()),
+                "the premise: both loops are stored with their bytes"
+            );
+            (
+                id_of(LOOP_TIER),
+                id_of(crate::visual_tiers::LOOP_DISPLAY_TIER),
+            )
+        };
+
+        // What an older build wrote for an encode no smaller than its source.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE storage.thumbnail_tiers SET thumbnail = X'' WHERE tier = ?1")
+                .bind(crate::visual_tiers::LOOP_DISPLAY_TIER)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 1,
+            "an empty loop row is work, not a row the ladder can leave alone"
+        );
+        {
+            let mut conn = env.read().await;
+            let rows = tier_snapshot(&mut conn).await;
+            let display_row = rows
+                .iter()
+                .find(|row| row.tier == crate::visual_tiers::LOOP_DISPLAY_TIER)
+                .expect("the display loop is still stored");
+            assert!(
+                !display_row.thumbnail.is_empty(),
+                "the emptied row is refilled by the ordinary animated ladder"
+            );
+            assert_ne!(display_row.id, display_loop_id, "it was really rewritten");
+            assert_eq!(
+                display_row.version, LOOP_PROCESS_VERSION,
+                "at today's generator, which nothing had to bump"
+            );
+            let grid_row = rows
+                .iter()
+                .find(|row| row.tier == LOOP_TIER)
+                .expect("the grid loop is untouched");
+            assert_eq!(
+                grid_row.id, grid_loop_id,
+                "the loop that had its bytes was re-encoded instead of reused"
+            );
+        }
+
+        let settled = {
+            let mut conn = env.read().await;
+            tier_ids(&mut conn).await
+        };
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "and it settles: a refilled row is the row the ladder wants"
+        );
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                tier_ids(&mut conn).await,
+                settled,
+                "a settled scan rewrote the set"
+            );
+        }
+
+        // And the same for the grid loop, the row that answers every tier.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE storage.thumbnail_tiers SET thumbnail = X'' WHERE tier = ?1")
+                .bind(LOOP_TIER)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        {
+            let mut conn = env.read().await;
+            assert!(
+                tier_snapshot(&mut conn)
+                    .await
+                    .iter()
+                    .all(|row| !row.thumbnail.is_empty()),
+                "every row of the set carries bytes again"
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles again");
     }
 
     // The raw floor's other side: an animated item small enough to serve as

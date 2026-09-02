@@ -488,9 +488,9 @@ fn rendition_extension(media_type: &str) -> &'static str {
     match media_type {
         "image/webp" => "webp",
         "video/mp4" => "mp4",
-        // Every other stored rendition is a JPEG. A sentinel row names the
-        // format its encode was attempted with and never reaches here anyway,
-        // because a sentinel is answered with the file itself.
+        // Every other stored rendition is a JPEG. A display sentinel row
+        // names the format its encode was attempted with and never reaches
+        // here anyway, because a sentinel is answered with the file itself.
         _ => "jpg",
     }
 }
@@ -694,10 +694,10 @@ enum Answer {
 /// |---|-------|------|--------------|------|--------------------|
 /// | 1 | empty mime | the file | the file's | `sha256-size-mtime` + variant | `fall_up_is_final` ? immutable/drifted : no-cache |
 /// | 2 | animated grid, loop stored | `thumbnail_tiers.loop` | stored (`video/mp4`) | `sha-thumb0-loop-v{ver}` | immutable |
-/// | 3 | animated grid, loop row empty | the file | the file's | + variant | immutable / drifted |
+/// | 3 | animated grid, loop row empty (legacy) | the file | the file's | + variant | `fall_up_is_final` ? immutable/drifted : no-cache |
 /// | 4 | animated grid, no loop row | the file | the file's | + variant | `fall_up_is_final` ? immutable/drifted : no-cache |
 /// | 5 | animated `display`, over the trigger | `thumbnail_tiers.loop`/`loop-display` | stored (`video/mp4`) | `sha-thumb0-{tier}-v{ver}` | immutable |
-/// | 5b | animated `display`, loop row empty or under the trigger | the file | the file's | (no variant) | row 3 / row 4 |
+/// | 5b | animated `display`, loop row empty (legacy) or under the trigger | the file | the file's | (no variant) | row 3 / row 4 |
 /// | 6 | animated, `still=true`, poster stored | `thumbnail_tiers.grid-*` | stored | `…-{tier}-v{ver}-still` | exact hit ? immutable : no-cache |
 /// | 6b | animated `display`, `still=true` | the largest poster (`grid-m`), else row 7 | | | |
 /// | 7 | animated, `still=true`, no poster | the file | the file's | + `-still` | as row 4 |
@@ -794,12 +794,18 @@ async fn decide(
                         // carries the version its bytes were made at.
                         final_: true,
                     },
-                    // Geometry written, bytes deliberately not: the settled
-                    // verdict that no encode of this source came out smaller.
-                    // As final as a hit.
+                    // Geometry written, no bytes. A **legacy** row: an older
+                    // build stored an empty loop where the encode came out no
+                    // smaller than its source, and that rule is gone
+                    // (`crate::visual_tiers`, "A loop is never the
+                    // sentinel"). Defensive only — it covers the window
+                    // before the scan that repairs the row, which is why it
+                    // answers exactly like the no-row branch below rather
+                    // than immutably: this is a state that changes, not a
+                    // verdict that settles.
                     Some(_) => Answer::File {
                         etag_suffix: "",
-                        final_: true,
+                        final_: fall_up_is_final,
                     },
                     // No row at all: the backfill has not reached this item,
                     // so the file stands in until the loop lands and must
@@ -2308,8 +2314,11 @@ VALUES (?1, 0, 'grid-m', 'image/gif', 'image/webp', 1024, 1024, 2, ?2)
         );
         assert_eq!(header(&response, header::CACHE_CONTROL), CACHE_IMMUTABLE);
 
-        // The keep-the-original sentinel: geometry stored, bytes deliberately
-        // not. A verdict about the content, so the file is as final as a hit.
+        // A legacy empty loop row, which no current generator writes
+        // (`crate::visual_tiers`, "A loop is never the sentinel"): the file
+        // still answers, so nothing breaks in the window before the scan
+        // repairs the row — but revalidating, because that row is about to
+        // gain its bytes.
         sqlx::query(
             "UPDATE storage.thumbnail_tiers SET thumbnail = X'', media_type = 'image/gif' \
              WHERE tier = 'loop-display'",
@@ -2319,7 +2328,11 @@ VALUES (?1, 0, 'grid-m', 'image/gif', 'image/webp', 1024, 1024, 2, ?2)
         .unwrap();
         let response = display(&mut index_conn, &item, false, HeaderMap::new()).await;
         assert_eq!(header(&response, header::CONTENT_TYPE), "image/gif");
-        assert_eq!(header(&response, header::CACHE_CONTROL), CACHE_IMMUTABLE);
+        assert_eq!(
+            header(&response, header::CACHE_CONTROL),
+            CACHE_REVALIDATE,
+            "a repairable state is never cached immutably"
+        );
     }
 
     /// The keep-the-original sentinel on `thumbnails`: a still whose
@@ -2806,10 +2819,11 @@ VALUES (?1, 0, ?2, 'image/gif', ?3, ?4, ?5, 1, ?6)
         assert_eq!(kind, "image/jpeg");
         assert_eq!(etag, format!("\"{}-thumb0-grid-m-v1-still\"", item.sha256));
 
-        // The settled encoded-larger-than-the-source edge: the loop row is
-        // stored for its geometry but carries no bytes, and the endpoint
-        // reads that as "the original file is the rendition" — a verdict, so
-        // immutable, unlike the pending case at the top of this test.
+        // A legacy empty loop row: an older build stored one for an encode
+        // no smaller than its source, and the endpoint still reads it as "the
+        // original file is the rendition" so nothing breaks before the scan
+        // refills it. Repairable, not settled, so it revalidates
+        // (`crate::visual_tiers`, "A loop is never the sentinel").
         sqlx::query("UPDATE storage.thumbnail_tiers SET thumbnail = X'', media_type = 'image/gif' WHERE tier = 'loop'")
             .execute(&mut index_conn)
             .await
@@ -2818,8 +2832,8 @@ VALUES (?1, 0, ?2, 'image/gif', ?3, ?4, ?5, 1, ?6)
             serve(&mut index_conn, &item, &file, ThumbnailTier::GridM, false).await;
         assert_eq!(kind, "image/gif");
         assert_eq!(
-            cache, CACHE_IMMUTABLE,
-            "a settled keep-the-original verdict is as permanent as a hit"
+            cache, CACHE_REVALIDATE,
+            "a row the next scan repairs must never be pinned for a year"
         );
     }
 

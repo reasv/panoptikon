@@ -444,25 +444,37 @@ impl WantedRendition {
             height: i64::from(self.plan.height),
             version: self.kind.process_version(),
             media_type: self.media_type.to_string(),
+            // Every rendition the ladder wants carries bytes; nothing this
+            // table stores is ever the keep-the-original sentinel
+            // (`crate::visual_tiers`, "A loop is never the sentinel").
+            has_bytes: true,
         }
     }
 }
 
 /// Whether one stored row is the row the current ladder wants: same
-/// discriminator, same geometry, a generator version at least as new, and the
-/// media type the current rule would have written.
+/// discriminator, same geometry, a generator version at least as new, the
+/// media type the current rule would have written, and bytes.
 ///
 /// Plain equality on the media type, with no exception for either kind of
-/// row. Every row names the format its generator *tried*, sentinels included
-/// (`crate::visual_tiers`, "The keep-the-original sentinel"), so one
-/// comparison settles both: a sentinel counts as the final answer it is
-/// exactly while the format it was attempted with is still the verdict, and a
-/// real rendition matches only its own.
+/// row: every row names the format its generator *tried*, so a rendition
+/// matches only its own.
+///
+/// **And bytes.** Nothing this table stores is a keep-the-original sentinel
+/// any more (`crate::visual_tiers`, "A loop is never the sentinel"), so an
+/// empty blob is a legacy row an older build wrote for a loop whose encode
+/// came out no smaller than its source. Every other column of such a row is
+/// exactly what the current ladder wants, so without this clause it matches
+/// forever: the item is never re-dispatched, the grid goes on answering the
+/// raw animation at every tier, and only a `LOOP_PROCESS_VERSION` bump --
+/// which re-encodes every already-correct loop in the library -- could reach
+/// it.
 pub(super) fn rendition_row_matches(stored: &TierGeometry, wanted: &TierGeometry) -> bool {
     (stored.idx, &stored.tier, stored.width, stored.height)
         == (wanted.idx, &wanted.tier, wanted.width, wanted.height)
         && stored.version >= wanted.version
         && stored.media_type == wanted.media_type
+        && stored.has_bytes
 }
 
 /// The stored H.264 loop rows the current ladder still wants, named by their
@@ -478,6 +490,10 @@ pub(super) fn rendition_row_matches(stored: &TierGeometry, wanted: &TierGeometry
 /// Per row, deliberately. All-or-nothing would re-encode a correct grid loop
 /// for an item that has newly started owing a `loop-display` — which is every
 /// large animation the moment R3 shipped.
+///
+/// Reuse runs through [`rendition_row_matches`], so a **legacy empty loop
+/// row** is never named here: it is re-encoded once, and reused like any
+/// other from then on.
 pub(super) fn reusable_loop_rows(
     stored: &[TierGeometry],
     set: &[WantedRendition],
@@ -510,6 +526,12 @@ pub(super) fn reusable_loop_rows(
 /// and stops counting the moment a policy edit or a transparency measurement
 /// moves it. Nothing distinguishes the two kinds of row here, and nothing
 /// should: the verdict and the rendition are equally final.
+///
+/// This table is the one place an empty blob is still an answer, which is why
+/// this function does not ask about bytes the way [`rendition_row_matches`]
+/// does: a display **still** verdict is about storage — a second copy of a
+/// picture that saves nothing — while a loop is about decode cost and is
+/// stored whatever its size.
 pub(super) fn display_row_matches(stored: &ThumbnailGeometry, plan: &DisplayPlan) -> bool {
     let DisplayPlan::Thumbnail { plan, format } = plan else {
         return false;
@@ -772,8 +794,8 @@ pub(super) fn build_animated_tiers(
         // a still-encoder change, a new grid tier, a transparency measurement
         // — must not re-run ffmpeg over every animation in the library. The
         // dispatcher hands back the geometry of the rows it already verified
-        // against this same plan, sentinel rows included; naming one keeps it
-        // in the authoritative set without moving a byte.
+        // against this same plan; naming one keeps it in the authoritative set
+        // without moving a byte.
         if let Some(stored) = reusable_loops
             .iter()
             .find(|stored| (stored.idx, stored.tier.as_str()) == (0, kind.as_str()))
@@ -812,34 +834,30 @@ pub(super) fn build_animated_tiers(
                 return (None, failure_verdicts(&loop_failure(error)));
             }
         };
-        // The settled encoded-larger-than-the-source edge (§2): keep the
-        // original. The row is still written — with the geometry the
-        // dispatcher predicted, or the backfill would ask for this loop again
-        // on every scan forever — but carries no bytes, which is how the
-        // endpoint learns to serve the file itself. A verdict about the
-        // *content*, unlike the failure above, so freezing it is correct: the
-        // same file encodes the same way until `LOOP_PROCESS_VERSION` says
-        // otherwise.
-        let keeps_original = loop_keeps_original(bytes.len() as u64, file_size);
-        if keeps_original {
+        // Stored whatever it weighs (`crate::visual_tiers`, "A loop is never
+        // the sentinel"). A loop is bought for *decode cost* and playback
+        // smoothness, not for bytes: a hardware-decoded H.264 stream with
+        // `faststart` and range requests beats a software GIF decode at any
+        // byte ratio, and the rule that used to drop these bytes made the
+        // gallery embed the very multi-megabyte animation the display trigger
+        // exists to avoid — at every grid tier down to a 140 px cell.
+        if bytes.len() as u64 >= file_size {
             tracing::debug!(
                 path = %path.display(),
                 tier = kind.as_str(),
                 encoded = bytes.len(),
                 source = file_size,
-                "the animated loop was not smaller than its source; keeping the original"
+                "the animated loop is no smaller than its source; storing it anyway"
             );
         }
         tiers.push(StoredTier {
             idx: 0,
             tier: kind,
-            // The format the encode was **attempted** with, sentinel or not
-            // (`crate::visual_tiers`, "The keep-the-original sentinel").
             media_type: LOOP_MEDIA_TYPE.to_string(),
             width: i64::from(plan.width),
             height: i64::from(plan.height),
             version: LOOP_PROCESS_VERSION,
-            payload: TierPayload::Encoded(if keeps_original { Vec::new() } else { bytes }),
+            payload: TierPayload::Encoded(bytes),
         });
     }
     (Some(tiers), Vec::new())
@@ -2253,18 +2271,18 @@ mod tests {
         assert_eq!((row.width, row.height), (2560, 2560));
     }
 
-    /// The settled encoded-larger-than-the-source edge (§2), reached the way
-    /// a library reaches it rather than by planting a row: a dithered
-    /// two-colour pattern is what GIF's palette coding is best at and what
-    /// H.264's transform is worst at, so the encode really does come out
-    /// larger — by two orders of magnitude here.
+    /// The encoded-larger-than-the-source edge, reached the way a library
+    /// reaches it rather than by planting a row: a dithered two-colour
+    /// pattern is what GIF's palette coding is best at and what H.264's
+    /// transform is worst at, so the encode really does come out larger — by
+    /// two orders of magnitude here.
     ///
-    /// The row is still written, with the geometry the dispatcher predicted,
-    /// because the alternative is asking for this loop again on every scan
-    /// forever. It carries no bytes, which is how the endpoint learns to
-    /// serve the file itself.
+    /// The bytes are stored all the same (`crate::visual_tiers`, "A loop is
+    /// never the sentinel"). A loop is bought for decode cost, not for bytes:
+    /// dropping it left the cell decoding the whole animation in software at
+    /// every grid tier, which is the opposite of what the ladder is for.
     #[test]
-    fn a_loop_no_smaller_than_its_source_keeps_the_original() {
+    fn a_loop_larger_than_its_source_is_stored_anyway() {
         if !crate::media_tools::ffmpeg_available() {
             return;
         }
@@ -2293,20 +2311,25 @@ mod tests {
         let tiers = tiers.expect("the ladder is produced");
         assert!(
             verdicts.is_empty(),
-            "keeping the original is a verdict about the content, not a failure"
+            "an oversized encode is not a failure of any kind"
         );
 
         let animated = tiers
             .iter()
             .find(|tier| tier.tier == RenditionKind::Loop)
             .expect("the loop row is written whatever the comparison says");
+        let stored = animated
+            .encoded()
+            .expect("the loop carries its bytes, never a sentinel");
         assert!(
-            animated.encoded().is_some_and(<[u8]>::is_empty),
-            "an encode no smaller than its source must not be stored"
+            stored.len() as u64 >= file_size,
+            "the premise: this encode really is no smaller than its source \
+             ({} vs {file_size})",
+            stored.len()
         );
         assert_eq!(
             animated.media_type, LOOP_MEDIA_TYPE,
-            "a sentinel names the format the encode was attempted with"
+            "the loop's own media type, whatever its size"
         );
         assert_eq!(
             (animated.width, animated.height),
@@ -2871,6 +2894,7 @@ mod tests {
                         height: tier.height,
                         version: tier.version,
                         media_type: tier.media_type.clone(),
+                        has_bytes: tier.encoded().is_some_and(|bytes| !bytes.is_empty()),
                     })
                     .collect();
                 let wanted =

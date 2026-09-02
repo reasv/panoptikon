@@ -83,8 +83,9 @@ impl StoredTier {
 /// those would be an ffmpeg run per animation in the library.
 #[derive(Clone)]
 pub(crate) enum TierPayload {
-    /// Bytes this pass produced, to be written. **Empty is the
-    /// keep-the-original sentinel** (`crate::visual_tiers`).
+    /// Bytes this pass produced, to be written. Never empty: the
+    /// keep-the-original sentinel is the display stills' convention alone,
+    /// one table over (`crate::visual_tiers`).
     Encoded(Vec<u8>),
     /// A row already in the table that the current ladder still wants,
     /// verified against the same plan the set was built from. Named so the
@@ -115,6 +116,17 @@ pub(crate) struct TierGeometry {
     /// R5's policy edit and the display switch all leave the dimensions where
     /// they were (docs/thumbnail-format-implementation.md §4).
     pub media_type: String,
+    /// Whether the row's blob is non-empty, read as `length(thumbnail) > 0`
+    /// so no rendition ever crosses this query.
+    ///
+    /// Every row this table's generator writes carries bytes. An empty one is
+    /// a **legacy loop sentinel** an older build wrote for an encode that came
+    /// out no smaller than its source (`crate::visual_tiers`, "A loop is never
+    /// the sentinel"), and the dispatcher has to be able to see it: geometry,
+    /// media type and version are all exactly what the current ladder wants,
+    /// so without this the row matches forever and the item never gets the
+    /// loop it is owed.
+    pub has_bytes: bool,
 }
 
 pub(crate) async fn has_thumbnail(
@@ -569,9 +581,9 @@ pub(crate) async fn get_thumbnail_tier_geometry(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
 ) -> ApiResult<Vec<TierGeometry>> {
-    let rows: Vec<(i64, String, i64, i64, i64, String)> = sqlx::query_as(
+    let rows: Vec<(i64, String, i64, i64, i64, String, bool)> = sqlx::query_as(
         r#"
-SELECT idx, tier, width, height, version, media_type
+SELECT idx, tier, width, height, version, media_type, length(thumbnail) > 0
 FROM storage.thumbnail_tiers
 WHERE item_sha256 = ?1
 ORDER BY idx, tier
@@ -587,13 +599,14 @@ ORDER BY idx, tier
     Ok(rows
         .into_iter()
         .map(
-            |(idx, tier, width, height, version, media_type)| TierGeometry {
+            |(idx, tier, width, height, version, media_type, has_bytes)| TierGeometry {
                 idx,
                 tier,
                 width,
                 height,
                 version,
                 media_type,
+                has_bytes,
             },
         )
         .collect())
@@ -944,6 +957,7 @@ VALUES
                 height: 900,
                 version: 1,
                 media_type: "image/jpeg".to_string(),
+                has_bytes: true,
             }]
         );
         assert_eq!(
@@ -974,9 +988,13 @@ VALUES
     }
 
     /// The media type travels with the bytes: an animated item's `loop` row
-    /// is an mp4 sitting beside JPEG posters in the same table, and the one
-    /// that carries no bytes at all means "the original file is the
-    /// rendition" (the settled encoded-larger-than-the-source edge).
+    /// is an mp4 sitting beside JPEG posters in the same table.
+    ///
+    /// And the row that carries no bytes at all — a **legacy loop sentinel**
+    /// no current generator writes (`crate::visual_tiers`, "A loop is never
+    /// the sentinel") — reads back with `has_bytes: false`, which is the one
+    /// fact that lets the dispatcher tell it from a real rendition whose
+    /// geometry, media type and version are identical.
     #[tokio::test]
     async fn a_tier_row_carries_its_own_media_type() {
         let mut dbs = setup_test_databases().await;
@@ -1021,7 +1039,7 @@ VALUES
         assert_eq!(animated.media_type, "video/mp4");
         assert_eq!(animated.bytes, vec![2_u8]);
 
-        // The keep-the-original row: geometry, no bytes.
+        // The legacy sentinel row an older build wrote: geometry, no bytes.
         store_thumbnail_tiers(
             conn,
             "sha_loop",
@@ -1053,8 +1071,9 @@ VALUES
                 height: 512,
                 version: 1,
                 media_type: "image/gif".to_string(),
+                has_bytes: false,
             }],
-            "the dispatcher still sees a loop it does not have to re-encode"
+            "an empty blob is visible to the dispatcher as work, not as a row              it can leave alone"
         );
     }
 
