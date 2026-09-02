@@ -132,6 +132,34 @@ impl DisplayLoopTrigger {
     }
 }
 
+/// `[policies.client]` key turning hover previews off for a policy. `false`
+/// denies **both** rungs; any other value (including absence) allows them,
+/// which is what makes the default "allowed" and keeps every seeded config
+/// free of a new live line (docs/video-hover-preview-implementation.md, V5).
+const HOVER_PREVIEW_KEY: &str = "hover_preview";
+
+/// The server's resolved answer to "may this client preview a video on
+/// hover?", for the two rungs the UI has
+/// (docs/video-hover-preview-implementation.md, V8).
+///
+/// Resolved here rather than derived client-side: the transcode rung is a
+/// conjunction of four independent facts (the policy's own switch, the
+/// `[transcode] hover_preview` server default, whether this policy may POST a
+/// transcode at all, and whether the `preview` preset survives its
+/// `transcode_presets` limit), three of which the client cannot see.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct HoverPreview {
+    /// Rung 0: mount a muted `<video>` on the item's own file when the
+    /// browser can already decode it. Costs the server nothing but Range
+    /// reads, so only the policy switch can withhold it.
+    pub direct: bool,
+    /// Rung 1: request the `preview` rendition for an item the browser
+    /// cannot play. Implies `direct`: a policy that denies previews denies
+    /// both, and there is no arrangement in which the expensive rung is
+    /// allowed while the free one is not.
+    pub transcode: bool,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ClientConfigResponse {
     /// Name of the policy that matched this request.
@@ -140,8 +168,10 @@ pub(crate) struct ClientConfigResponse {
     pub capabilities: ClientCapabilities,
     /// The policy's `[policies.client]` table, verbatim (empty object when
     /// unset). Free-form; recognized-by-convention keys include
-    /// `search_throttle_ms`, `disable_backend_open`, and `relay_enabled`
-    /// (Relay is enabled when the key is absent).
+    /// `search_throttle_ms`, `disable_backend_open`, `relay_enabled`
+    /// (Relay is enabled when the key is absent), `transcode_presets`, and
+    /// `hover_preview` (see the resolved `hover_preview` field below, which
+    /// is what a client should read).
     pub client: serde_json::Value,
     /// True only when this Server process is the bundled sidecar owned by
     /// Panoptikon Desktop and the matched policy opts into Desktop authority.
@@ -160,6 +190,11 @@ pub(crate) struct ClientConfigResponse {
     /// evaluate, every animated item is an `<img>` on its original file and
     /// no client mounts a `<video>`.
     pub display_loop_trigger: Option<DisplayLoopTrigger>,
+    /// What the hover preview may do under this policy (see
+    /// [`HoverPreview`]). `null` means the feature does not exist on this
+    /// server at all — a client reading `null` arms nothing and never
+    /// re-derives the answer from the capabilities beside it.
+    pub hover_preview: Option<HoverPreview>,
 }
 
 /// The probe table: (capability, method, representative real route). Paths
@@ -196,13 +231,44 @@ fn desktop_managed_for_policy(policy: &PolicyConfig, managed: bool) -> bool {
             == Some(true)
 }
 
+/// The hover-preview answer for one policy, with the server default injected
+/// — resolving it here would mean probing the hardware encoder (two ffmpeg
+/// spawns on a cold process) from inside a synchronous builder the handler
+/// calls on the async runtime.
+fn hover_preview_for(
+    policy: &PolicyConfig,
+    capabilities: &ClientCapabilities,
+    transcode_default: bool,
+) -> HoverPreview {
+    // Only an explicit `false` denies: an absent key, and anything that is
+    // not a boolean, leave the feature on.
+    let direct = policy
+        .client
+        .get(HOVER_PREVIEW_KEY)
+        .and_then(serde_json::Value::as_bool)
+        != Some(false);
+    HoverPreview {
+        direct,
+        transcode: direct
+            && transcode_default
+            && capabilities.video_transcode
+            && crate::api::video::policy_exposes_preset(
+                policy,
+                crate::api::video::PREVIEW_PRESET_ID,
+            ),
+    }
+}
+
 pub(crate) fn build_client_config(
     settings: &Settings,
     policy: &PolicyConfig,
+    hover_preview_default: bool,
 ) -> ClientConfigResponse {
+    let capabilities = derive_capabilities(settings, policy);
+    let hover_preview = hover_preview_for(policy, &capabilities, hover_preview_default);
     ClientConfigResponse {
         policy: policy.name.clone(),
-        capabilities: derive_capabilities(settings, policy),
+        capabilities,
         client: policy.client.clone(),
         desktop_managed: desktop_managed_for_policy(policy, crate::desktop::is_managed()),
         desktop_shell_available: desktop_shell_available(
@@ -214,6 +280,9 @@ pub(crate) fn build_client_config(
         // One condition, one place: the trigger is published exactly while
         // the floor is.
         display_loop_trigger: Some(DisplayLoopTrigger::current()),
+        // Always answered by this build: the field is `Option` so an older
+        // server's *absence* of it reads as `null` rather than as a denial.
+        hover_preview: Some(hover_preview),
     }
 }
 
@@ -245,12 +314,23 @@ pub async fn client_config(
             tracing::error!(policy = %context.policy_name, "matched policy missing from config");
             ApiError::internal("matched policy missing from configuration")
         })?;
+    // `"auto"` resolves through the hardware-encoder probe, which on a cold
+    // process spawns ffmpeg twice and can take seconds: never on the runtime's
+    // worker. A probe that could not be run at all leaves the transcode rung
+    // off, which is the safe direction — the client simply never asks.
+    let hover_preview_default =
+        tokio::task::spawn_blocking(crate::media_tools::transcode::hw::hover_preview_enabled)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "hover-preview probe failed; reporting it off");
+                false
+            });
     Ok((
         // The response is policy-scoped: a shared/intermediary cache keyed
         // on the path alone could serve one audience's capabilities to
         // another, so it must never be stored.
         [(header::CACHE_CONTROL, "no-store")],
-        Json(build_client_config(settings, policy)),
+        Json(build_client_config(settings, policy, hover_preview_default)),
     ))
 }
 
@@ -343,7 +423,7 @@ disable_backend_open = true
         let settings = two_policy_settings();
         let policy = &settings.policies[1];
         assert_eq!(policy.name, "demo");
-        let response = build_client_config(&settings, policy);
+        let response = build_client_config(&settings, policy, true);
 
         assert_eq!(response.policy, "demo");
         let caps = &response.capabilities;
@@ -375,6 +455,87 @@ disable_backend_open = true
         );
     }
 
+    /// The hover-preview field's shape and its four-way conjunction
+    /// (docs/video-hover-preview-implementation.md, V8): the free rung is
+    /// allowed unless the policy says otherwise, and the transcode rung
+    /// additionally needs the server default, the POST capability, and the
+    /// `preview` preset surviving the policy's `transcode_presets` limit.
+    ///
+    /// Every one of those is a fact the client cannot observe, which is why
+    /// the server publishes the answer instead of the inputs.
+    #[test]
+    fn hover_preview_is_a_conjunction_the_client_never_re_derives() {
+        let settings = two_policy_settings();
+        let desktop = &settings.policies[0];
+        let demo = &settings.policies[1];
+
+        let rungs = |policy: &PolicyConfig, server: bool| {
+            let hover = build_client_config(&settings, policy, server)
+                .hover_preview
+                .expect("this build always answers");
+            (hover.direct, hover.transcode)
+        };
+
+        // Nothing withheld: an unrestricted policy on a server whose default
+        // resolved true gets both rungs.
+        assert_eq!(rungs(desktop, true), (true, true));
+        // `[transcode] hover_preview = "off"` (or an "auto" that found no
+        // hardware encoder) withholds only the expensive rung: playing an
+        // already-playable original costs the server nothing to permit.
+        assert_eq!(rungs(desktop, false), (true, false));
+        // The restricted_demo ruleset denies POST /api/video/transcode, so
+        // the transcode rung is impossible however the server is configured.
+        assert_eq!(rungs(demo, true), (true, false));
+
+        // The policy key is a negative override that wins over everything.
+        let mut denied = desktop.clone();
+        denied.client["hover_preview"] = serde_json::Value::Bool(false);
+        assert_eq!(rungs(&denied, true), (false, false));
+        // Only an explicit `false`: absent, `true`, and a non-boolean all
+        // leave the feature on, so no seeded config needs a new line.
+        for value in [
+            serde_json::Value::Bool(true),
+            serde_json::Value::String("false".to_string()),
+            serde_json::Value::Null,
+        ] {
+            let mut policy = desktop.clone();
+            policy.client["hover_preview"] = value.clone();
+            assert_eq!(rungs(&policy, true), (true, true), "{value}");
+        }
+
+        // A preset whitelist that omits `preview` denies the transcode rung
+        // by itself: the POST would refuse the preset by name, so promising
+        // it here would send every hovered cell into a 422.
+        let mut limited = desktop.clone();
+        limited.client["transcode_presets"] = serde_json::json!(["playback"]);
+        assert_eq!(rungs(&limited, true), (true, false));
+        limited.client["transcode_presets"] = serde_json::json!(["playback", "preview"]);
+        assert_eq!(rungs(&limited, true), (true, true));
+    }
+
+    /// The field on the wire: two keys, always both, and `null` — never a
+    /// missing key — for a build with no hover preview at all. A client
+    /// reading an absent key as "no answer" would have to guess, and the one
+    /// guess it must never make is "allowed".
+    #[test]
+    fn the_hover_preview_field_is_two_keys_or_an_explicit_null() {
+        let settings = two_policy_settings();
+        let response = build_client_config(&settings, &settings.policies[0], true);
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["hover_preview"],
+            serde_json::json!({ "direct": true, "transcode": true })
+        );
+
+        let json = serde_json::to_value(ClientConfigResponse {
+            hover_preview: None,
+            ..response
+        })
+        .unwrap();
+        assert_eq!(json["hover_preview"], serde_json::Value::Null);
+        assert!(json.as_object().unwrap().contains_key("hover_preview"));
+    }
+
     /// The display-tier loop trigger on the wire (§5): three keys, always all
     /// three, carrying the same numbers the scan decided with.
     ///
@@ -388,7 +549,7 @@ disable_backend_open = true
     #[test]
     fn the_display_loop_trigger_is_published_verbatim() {
         let settings = two_policy_settings();
-        let response = build_client_config(&settings, &settings.policies[1]);
+        let response = build_client_config(&settings, &settings.policies[1], true);
         let trigger = response
             .display_loop_trigger
             .as_ref()
@@ -441,7 +602,7 @@ disable_backend_open = true
         let settings = two_policy_settings();
         let policy = &settings.policies[0];
         assert_eq!(policy.name, "desktop");
-        let response = build_client_config(&settings, policy);
+        let response = build_client_config(&settings, policy, true);
 
         assert_eq!(response.policy, "desktop");
         let caps = &response.capabilities;

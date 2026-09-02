@@ -6190,7 +6190,7 @@
             "description": "Ruleset-derived feature switches (see ClientCapabilities)."
           },
           "client": {
-            "description": "The policy's `[policies.client]` table, verbatim (empty object when\nunset). Free-form; recognized-by-convention keys include\n`search_throttle_ms`, `disable_backend_open`, and `relay_enabled`\n(Relay is enabled when the key is absent)."
+            "description": "The policy's `[policies.client]` table, verbatim (empty object when\nunset). Free-form; recognized-by-convention keys include\n`search_throttle_ms`, `disable_backend_open`, `relay_enabled`\n(Relay is enabled when the key is absent), `transcode_presets`, and\n`hover_preview` (see the resolved `hover_preview` field below, which\nis what a client should read)."
           },
           "desktop_managed": {
             "type": "boolean",
@@ -6208,6 +6208,17 @@
               {
                 "$ref": "#/components/schemas/DisplayLoopTrigger",
                 "description": "The display-tier loop trigger (see [`DisplayLoopTrigger`]).\n\nAlways `Some` today: the loop ladder is unconditional. The `Option` is\nreserved for a build that stores no loops at all, which would publish\n`null` here rather than a bound it does not serve by — with nothing to\nevaluate, every animated item is an `<img>` on its original file and\nno client mounts a `<video>`."
+              }
+            ]
+          },
+          "hover_preview": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HoverPreview",
+                "description": "What the hover preview may do under this policy (see\n[`HoverPreview`]). `null` means the feature does not exist on this\nserver at all — a client reading `null` arms nothing and never\nre-derives the answer from the capabilities beside it."
               }
             ]
           },
@@ -7533,6 +7544,24 @@
           "status": {
             "type": "string",
             "description": "`\"ok\"` normally, `\"shutting_down\"` once shutdown has begun."
+          }
+        }
+      },
+      "HoverPreview": {
+        "type": "object",
+        "description": "The server's resolved answer to \"may this client preview a video on\nhover?\", for the two rungs the UI has\n(docs/video-hover-preview-implementation.md, V8).\n\nResolved here rather than derived client-side: the transcode rung is a\nconjunction of four independent facts (the policy's own switch, the\n`[transcode] hover_preview` server default, whether this policy may POST a\ntranscode at all, and whether the `preview` preset survives its\n`transcode_presets` limit), three of which the client cannot see.",
+        "required": [
+          "direct",
+          "transcode"
+        ],
+        "properties": {
+          "direct": {
+            "type": "boolean",
+            "description": "Rung 0: mount a muted `<video>` on the item's own file when the\nbrowser can already decode it. Costs the server nothing but Range\nreads, so only the policy switch can withhold it."
+          },
+          "transcode": {
+            "type": "boolean",
+            "description": "Rung 1: request the `preview` rendition for an item the browser\ncannot play. Implies `direct`: a policy that denies previews denies\nboth, and there is no arrangement in which the expensive rung is\nallowed while the free one is not."
           }
         }
       },
@@ -11357,7 +11386,8 @@
         "enum": [
           "playback",
           "clip",
-          "mosaic"
+          "mosaic",
+          "preview"
         ]
       },
       "SystemConfig": {

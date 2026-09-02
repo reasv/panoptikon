@@ -74,6 +74,13 @@ const SSE_KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// `[policies.client]` key restricting which presets a policy exposes.
 const CLIENT_PRESETS_KEY: &str = "transcode_presets";
 
+/// The preset a grid or filmstrip cell asks for on hover
+/// (docs/video-hover-preview-implementation.md §3). Named here because
+/// `/api/client-config` has to answer "may this client transcode a preview?"
+/// before any cell asks, and the answer is partly this preset's presence on
+/// the policy's table.
+pub(crate) const PREVIEW_PRESET_ID: &str = "preview";
+
 /// The only value `cut` accepts: the server-side outro cut.
 const CUT_OUTRO: &str = "outro";
 
@@ -1295,6 +1302,14 @@ fn allowed_presets(policy: &PolicyConfig) -> Vec<ResolvedPreset> {
     filter_presets(presets, policy.client.get(CLIENT_PRESETS_KEY))
 }
 
+/// Whether this policy's `transcode_presets` limit leaves `id` on its table.
+///
+/// The same resolution the POST enforces, so `/api/client-config` cannot
+/// promise a rendition the transcode route would then refuse by name.
+pub(crate) fn policy_exposes_preset(policy: &PolicyConfig, id: &str) -> bool {
+    find_preset(&allowed_presets(policy), id).is_some()
+}
+
 /// Pure half of [`allowed_presets`]: an absent (or non-array) setting means
 /// no restriction; an explicit list — empty included — means exactly it.
 fn filter_presets(
@@ -1396,8 +1411,19 @@ mod tests {
             ["playback", "clip-fast"]
         );
         assert!(
-            filter_presets(all, Some(&serde_json::json!([]))).is_empty(),
+            filter_presets(all.clone(), Some(&serde_json::json!([]))).is_empty(),
             "an explicit empty list offers nothing"
+        );
+        // The hover preview is an ordinary preset on this table: it is offered
+        // by default and withheld by a list that omits it, which is how a
+        // policy denies rung 1 alone (V5).
+        assert!(ids(&filter_presets(all.clone(), None)).contains(&PREVIEW_PRESET_ID));
+        assert_eq!(
+            ids(&filter_presets(
+                all,
+                Some(&serde_json::json!(["playback", "preview"]))
+            )),
+            ["playback", "preview"]
         );
     }
 
@@ -1779,6 +1805,7 @@ transcode_presets = ["playback"]
             ids,
             [
                 "playback",
+                "preview",
                 "clip",
                 "clip-fast",
                 "webp-anim",
@@ -1788,25 +1815,40 @@ transcode_presets = ["playback"]
                 "mosaic-webm",
             ]
         );
-        assert_eq!(json["presets"][0]["ext"], "mp4");
-        assert_eq!(json["presets"][0]["channel"], "fast");
-        assert_eq!(json["presets"][0]["surfaces"][0], "playback");
-        assert_eq!(json["presets"][3]["ext"], "webp");
+        let row = |id: &str| {
+            json["presets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|preset| preset["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is on the table"))
+                .clone()
+        };
+        assert_eq!(row("playback")["ext"], "mp4");
+        assert_eq!(row("playback")["channel"], "fast");
+        assert_eq!(row("playback")["surfaces"][0], "playback");
+        assert_eq!(row("webp-anim")["ext"], "webp");
+        // The hover preview is listed like any other preset — the surface tag
+        // is what keeps it out of the clip and mosaic dropdowns, not absence
+        // from this response.
+        assert_eq!(row("preview")["surfaces"][0], "preview");
+        assert_eq!(row("preview")["channel"], "fast");
         // The preset's height cap rides along because it is a *rejection*: a
         // canvas taller than it is refused rather than rescaled, so a client
         // that cannot see it discovers it only by being turned away. Presets
         // with no cap carry no key rather than a null.
-        assert_eq!(json["presets"][0]["max_height"], 1080);
-        assert_eq!(json["presets"][3]["max_height"], 720);
+        assert_eq!(row("playback")["max_height"], 1080);
+        assert_eq!(row("webp-anim")["max_height"], 720);
+        assert_eq!(row("preview")["max_height"], 480);
         assert!(
-            json["presets"][1].get("max_height").is_none(),
+            row("clip").get("max_height").is_none(),
             "`clip` is uncapped: {}",
-            json["presets"][1]
+            row("clip")
         );
         // `fps_max` is deliberately absent from the DTO: an over-cap frame
         // rate is silently capped, never refused, so there is nothing a client
         // could do with the number.
-        assert!(json["presets"][0].get("fps_max").is_none());
+        assert!(row("preview").get("fps_max").is_none());
 
         // The compose limits ride along, so a client builder clamps against
         // what this server enforces rather than mirrored constants — the
@@ -3130,5 +3172,196 @@ transcode_presets = ["playback"]
             next_event(&mut body).await.is_none(),
             "the stream ends after the terminal event"
         );
+    }
+
+    // --- the hover preview (docs/video-hover-preview-implementation.md) -----
+
+    const PREVIEW_ITEM: &str = "b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7";
+
+    /// A source that makes every preview assertion mean something: longer
+    /// than the 16 s window, taller than the 480 px cap, and carrying an
+    /// audio track the preset must drop. Flat colour at 10 fps so building it
+    /// costs a fraction of a second; returns `false` where this machine
+    /// cannot, so the test skips rather than fails.
+    fn write_preview_source(path: &std::path::Path) -> bool {
+        let status = std::process::Command::new(crate::media_tools::ffmpeg())
+            .args(["-y", "-v", "error"])
+            .args(["-f", "lavfi", "-i", "color=c=0x2040A0:s=1280x720:d=20:r=10"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=20"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "30"])
+            .args(["-c:a", "aac", "-shortest"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
+    }
+
+    /// An index database with one video item pointing at a real file.
+    async fn preview_fixture_db(
+        source: &std::path::Path,
+    ) -> (DbConnection<ReadOnlyNoUserData>, RetainedDbs) {
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        sqlx::query(
+            "INSERT INTO items (id, sha256, md5, type, duration, time_added) \
+             VALUES (1, ?, 'md5_1', 'video/mp4', 20.0, '2024-01-01T00:00:00')",
+        )
+        .bind(PREVIEW_ITEM)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
+            .bind("2024-01-01T00:00:00")
+            .bind(crate::test_utils::absent_root())
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO files \
+             (id, sha256, item_id, path, filename, last_modified, scan_id, available) \
+             VALUES (10, ?, 1, ?, 'hover-source.mp4', '2024-01-02T00:00:00', 1, 1)",
+        )
+        .bind(PREVIEW_ITEM)
+        .bind(source.to_string_lossy().into_owned())
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        (
+            DbConnection::<ReadOnlyNoUserData>::for_tests(index_conn, "hover-preview", "test"),
+            (storage_conn, user_data_conn),
+        )
+    }
+
+    /// `ffprobe -show_streams -show_format`, as JSON.
+    fn probe_json(path: &std::path::Path) -> serde_json::Value {
+        let output = std::process::Command::new(crate::media_tools::ffprobe())
+            .args(["-v", "error", "-show_streams", "-show_format"])
+            .args(["-of", "json"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ffprobe runs");
+        assert!(
+            output.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("ffprobe emits json")
+    }
+
+    /// The whole rung-1 request end to end against the real toolchain: the
+    /// POST a hovered cell makes (`preset=preview`, `end_cs=1600`) is accepted
+    /// as it stands, encodes, and publishes the artifact the plan promised —
+    /// at most 16 s, no taller than 480 px, silent — from a source that is
+    /// none of those things.
+    ///
+    /// Nothing here is a preview-specific code path: the existing trim bound
+    /// and the ordinary preset table already produce it, which is the whole
+    /// reason B5 adds no request validation. Skips (never fails) where there
+    /// is no ffmpeg.
+    #[tokio::test]
+    async fn a_preview_post_publishes_a_short_silent_capped_artifact() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let source = fixtures.path().join("hover-source.mp4");
+        if !write_preview_source(&source) {
+            return;
+        }
+        // The fixture has to be worth probing against.
+        let before = probe_json(&source);
+        assert!(
+            before["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|stream| stream["codec_type"] == "audio"),
+            "the source carries the audio the preset must drop"
+        );
+
+        let settings = test_settings();
+        let (db, _attached) = preview_fixture_db(&source).await;
+        let response = video_transcode(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            db,
+            Json(TranscodeRequest {
+                id: PREVIEW_ITEM.to_string(),
+                id_type: ItemIdentifierType::Sha256,
+                preset: PREVIEW_PRESET_ID.to_string(),
+                start_cs: None,
+                // The 16 s window, in the centiseconds every trim bound uses.
+                end_cs: Some(1600),
+                cut: None,
+            }),
+        )
+        .await
+        .expect("the preview request is accepted as it stands");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let json = body_json(response).await;
+        assert_eq!(json["outcome"], "created");
+        let id = parse_job_id(json["job"]["id"].as_str().expect("a job id")).unwrap();
+
+        // Bounded rather than unbounded: 4 s is far past a 16 s flat-colour
+        // encode, and a regression fails here instead of hanging the suite.
+        use crate::media_tools::transcode::pool::TranscodeJobEvent;
+        let mut artifact = None;
+        for _ in 0..400 {
+            match pool::job_snapshot(id).await.unwrap().map(|snap| snap.event) {
+                Some(TranscodeJobEvent::Done { artifact: done }) => {
+                    artifact = Some(done);
+                    break;
+                }
+                Some(TranscodeJobEvent::Failed { error, .. }) => {
+                    panic!("the preview encode failed: {error}")
+                }
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        let artifact = artifact.expect("the preview job never settled");
+        assert_eq!(artifact.mime_type, "video/mp4");
+
+        let cache = pool::transcode_cache().await.unwrap();
+        let cached = cache
+            .lookup(&artifact.key)
+            .await
+            .expect("the artifact is in the cache");
+        let probe = probe_json(&cached.path);
+        let streams = probe["streams"].as_array().unwrap().clone();
+        assert!(
+            !streams.iter().any(|stream| stream["codec_type"] == "audio"),
+            "the preview is silent: {streams:?}"
+        );
+        let video = streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .expect("a video stream");
+        assert_eq!(video["codec_name"], "h264");
+        let width = video["width"].as_u64().unwrap();
+        let height = video["height"].as_u64().unwrap();
+        assert!(height <= 480, "the height cap applies: {width}x{height}");
+        assert!(
+            width.min(height) <= 480,
+            "so the short side is within it too: {width}x{height}"
+        );
+        let duration: f64 = probe["format"]["duration"]
+            .as_str()
+            .expect("a container duration")
+            .parse()
+            .expect("a number");
+        // A frame of slack at the fixture's 10 fps: the boundary frame may
+        // land either side of the cut and the container rounds its duration.
+        assert!(
+            duration <= 16.1,
+            "the preview is the 16 s window, not the source's 20 s: {duration}"
+        );
+
+        cache.clear(true).await.unwrap();
     }
 }
