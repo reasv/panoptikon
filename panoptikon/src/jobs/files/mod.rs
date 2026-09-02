@@ -113,7 +113,7 @@ use crate::{
         animated_plans, animated_rendition_set, animated_serves_original, display_byte_bound,
         display_plan, encode_rendition, grid_plans, grid_plans_for_stored_thumbnail,
         grid_renditions, has_alpha_pixels, is_animated_image, is_loop_tier, loop_keeps_original,
-        poster_plans, rendition_beats_original, source_class, static_rendition_set,
+        poster_plans, source_class, static_rendition_set, still_keeps_original,
         stored_thumbnail_rendition_set, tier_format,
     },
 };
@@ -3222,7 +3222,7 @@ impl ScanContext {
             GridLadder::Unknown => return TierQuestion::none(),
             GridLadder::Animated => {
                 return self
-                    .animated_tier_question(sha256, mime_type, path, image_facts, &stored_tiers)
+                    .animated_tier_question(sha256, path, image_facts, &stored_tiers)
                     .await;
             }
             GridLadder::Static => {}
@@ -3249,7 +3249,6 @@ impl ScanContext {
     async fn animated_tier_question(
         &mut self,
         sha256: &str,
-        mime_type: &str,
         path: &Path,
         image_facts: Option<&ImageFacts>,
         stored_tiers: &[TierGeometry],
@@ -3269,9 +3268,9 @@ impl ScanContext {
             height,
             tier_format(facts.has_transparency, self.formats),
         );
-        let reusable_loops = reusable_loop_rows(stored_tiers, &set, mime_type);
+        let reusable_loops = reusable_loop_rows(stored_tiers, &set);
         let wanted = wanted_tier_geometry(0, &set);
-        let tiers_match = tier_geometry_matches(stored_tiers, &wanted, mime_type);
+        let tiers_match = tier_geometry_matches(stored_tiers, &wanted);
         // A moving picture never carries a still display rendition: its
         // `display` answer is its own file or a stored loop (R3). The one
         // thing that can leave one behind is an older rule — an animated WebP
@@ -3348,29 +3347,9 @@ impl ScanContext {
                     [stored] => {
                         (stored.idx, stored.width, stored.height)
                             == (0, i64::from(expected_width), i64::from(expected_height))
-                            // Exact on the format, with no exception for the
-                            // item's own mime type. Both kinds of row name
-                            // the format the generator *used*: a real
-                            // rendition its container, and the
-                            // keep-the-original sentinel the container it
-                            // tried (`build_image_renditions`). So one
-                            // comparison settles both — a sentinel counts as
-                            // the final answer it is exactly while the format
-                            // it was attempted with is still the verdict, and
-                            // a real rendition matches only its own.
-                            //
-                            // The `|| stored.media_type == mime_type` this
-                            // replaces broke in both directions: a JPEG
-                            // source's JPEG rendition matched *every* verdict,
-                            // so a `thumbnail_formats` flip never regenerated
-                            // it; and a sentinel was terminal across format
-                            // changes, so a database that visited `["jpeg"]`
-                            // once served the 3 MB original of a transparent
-                            // PNG forever. `visuals.rs`'s
-                            // `rendition_media_type_matches` states the same
-                            // hazard for the still tiers; the loop row keeps
-                            // its own exception there, and only there,
-                            // because a loop has exactly one format.
+                            // Plain equality, sentinel rows included
+                            // (`crate::visual_tiers`, "The keep-the-original
+                            // sentinel").
                             && stored.media_type == format.media_type()
                     }
                     _ => false,
@@ -3385,7 +3364,7 @@ impl ScanContext {
                     tier_format(facts.has_transparency, self.formats),
                 ),
             );
-            if display_matches && tier_geometry_matches(stored_tiers, &wanted, mime_type) {
+            if display_matches && tier_geometry_matches(stored_tiers, &wanted) {
                 return None;
             }
             return Some(TierWork::Image {
@@ -3418,7 +3397,7 @@ impl ScanContext {
                 &stored_thumbnail_rendition_set(width, height),
             ));
         }
-        if tier_geometry_matches(stored_tiers, &wanted, mime_type) {
+        if tier_geometry_matches(stored_tiers, &wanted) {
             return None;
         }
         // Only now, with work established, are the blobs worth reading.

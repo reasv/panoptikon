@@ -427,30 +427,29 @@ pub(super) fn wanted_tier_geometry(
 /// `>=` on the version, matching `has_thumbnail`/`has_frame`: a row a *newer*
 /// generator wrote is not stale, so a downgrade does not thrash the whole
 /// library back to the older renditions.
-pub(super) fn tier_geometry_matches(
-    stored: &[TierGeometry],
-    wanted: &[TierGeometry],
-    item_mime_type: &str,
-) -> bool {
+pub(super) fn tier_geometry_matches(stored: &[TierGeometry], wanted: &[TierGeometry]) -> bool {
     stored.len() == wanted.len()
         && stored
             .iter()
             .zip(wanted)
-            .all(|(stored, wanted)| rendition_row_matches(stored, wanted, item_mime_type))
+            .all(|(stored, wanted)| rendition_row_matches(stored, wanted))
 }
 
 /// Whether one stored row is the row the current ladder wants: same
-/// discriminator, same geometry, a generator version at least as new, and a
+/// discriminator, same geometry, a generator version at least as new, and the
 /// media type the current rule would have written.
-pub(super) fn rendition_row_matches(
-    stored: &TierGeometry,
-    wanted: &TierGeometry,
-    item_mime_type: &str,
-) -> bool {
+///
+/// Plain equality on the media type, with no exception for either kind of
+/// row. Every row names the format its generator *tried*, sentinels included
+/// (`crate::visual_tiers`, "The keep-the-original sentinel"), so one
+/// comparison settles both: a sentinel counts as the final answer it is
+/// exactly while the format it was attempted with is still the verdict, and a
+/// real rendition matches only its own.
+pub(super) fn rendition_row_matches(stored: &TierGeometry, wanted: &TierGeometry) -> bool {
     (stored.idx, &stored.tier, stored.width, stored.height)
         == (wanted.idx, &wanted.tier, wanted.width, wanted.height)
         && stored.version >= wanted.version
-        && rendition_media_type_matches(stored, wanted, item_mime_type)
+        && stored.media_type == wanted.media_type
 }
 
 /// The stored H.264 loop rows the current ladder still wants, named by their
@@ -469,7 +468,6 @@ pub(super) fn rendition_row_matches(
 pub(super) fn reusable_loop_rows(
     stored: &[TierGeometry],
     set: &[WantedRendition],
-    mime_type: &str,
 ) -> Vec<TierGeometry> {
     set.iter()
         .filter(|rendition| is_loop_tier(rendition.tier))
@@ -485,31 +483,10 @@ pub(super) fn reusable_loop_rows(
             stored
                 .iter()
                 .find(|row| row.idx == 0 && row.tier == rendition.tier)
-                .filter(|row| rendition_row_matches(row, &wanted, mime_type))
+                .filter(|row| rendition_row_matches(row, &wanted))
                 .cloned()
         })
         .collect()
-}
-
-/// Whether a stored row's media type is one the current rule would have
-/// written.
-///
-/// Exact, with one settled exception: a **loop** row naming the item's own
-/// mime type is the keep-the-original sentinel — "no encode of this source
-/// came out smaller" — which is a verdict about the content and as final as a
-/// hit. Treating it as a mismatch would re-run ffmpeg over exactly the files
-/// ffmpeg cannot improve, on every scan, forever.
-///
-/// Still tiers get no such exception: their rows are never sentinels, and an
-/// item whose own type is `image/jpeg` would otherwise pin a stale JPEG
-/// against a WebP verdict.
-fn rendition_media_type_matches(
-    stored: &TierGeometry,
-    wanted: &TierGeometry,
-    item_mime_type: &str,
-) -> bool {
-    stored.media_type == wanted.media_type
-        || (is_loop_tier(&stored.tier) && stored.media_type == item_mime_type)
 }
 
 /// The size of the file a display rendition is decided against. Its own
@@ -662,30 +639,19 @@ pub(super) fn build_image_renditions(
             let thumb = render_display_rendition(&image, target_width, target_height);
             let keep_alpha = format == RenditionFormat::Webp && transparency == Some(true);
             let encoded = encode_image(0, &thumb, format, RenditionScale::Display, keep_alpha)?;
-            // The keep-the-original sentinel (§2 R2): a rendition that is not
-            // comfortably smaller than the file it stands in for is not worth a
-            // second copy of the picture, so the geometry is stored without the
-            // bytes and the endpoint serves the original. The geometry is
-            // stored all the same, or the dispatcher would ask for this
-            // rendition again on every scan forever — the loop row's
-            // convention, now on `thumbnails`.
-            if rendition_beats_original(encoded.bytes.len() as u64, file_size) {
-                out.thumbnails.push(encoded);
-            } else {
-                // The row names the format that was **attempted**, never the
-                // source's own mime type. The verdict "no encode came out
-                // comfortably smaller" is a verdict about *this* encoder, so
-                // a later format flip — a policy edit, a transparency
-                // measurement — has to be able to see that the attempt it is
-                // looking at was made with the other one and try again.
-                // Naming the source instead froze the sentinel across every
-                // format change, and, where the source's type happened to be
-                // the rendition's, made a real rendition indistinguishable
-                // from a verdict.
+            // The keep-the-original sentinel (§2 R2, and `crate::visual_tiers`'s
+            // module docs): a rendition that is not comfortably smaller than
+            // the file it stands in for is not worth a second copy of the
+            // picture. The geometry is stored without the bytes — keeping the
+            // encoded `media_type`, which is the format the attempt was made
+            // with — and the endpoint serves the original.
+            if still_keeps_original(encoded.bytes.len() as u64, file_size) {
                 out.thumbnails.push(StoredImage {
                     bytes: Vec::new(),
                     ..encoded
                 });
+            } else {
+                out.thumbnails.push(encoded);
             }
             out.blurhash_source = Some(thumb);
         }
@@ -854,11 +820,9 @@ pub(super) fn build_animated_tiers(
         tiers.push(StoredTier {
             idx: 0,
             tier,
-            media_type: if keeps_original {
-                mime_type.to_string()
-            } else {
-                LOOP_MEDIA_TYPE.to_string()
-            },
+            // The format the encode was **attempted** with, sentinel or not
+            // (`crate::visual_tiers`, "The keep-the-original sentinel").
+            media_type: LOOP_MEDIA_TYPE.to_string(),
             width: i64::from(plan.width),
             height: i64::from(plan.height),
             version: LOOP_PROCESS_VERSION,
@@ -2294,8 +2258,8 @@ mod tests {
             "an encode no smaller than its source must not be stored"
         );
         assert_eq!(
-            animated.media_type, "image/gif",
-            "the row names what the endpoint will actually serve"
+            animated.media_type, LOOP_MEDIA_TYPE,
+            "a sentinel names the format the encode was attempted with"
         );
         assert_eq!(
             (animated.width, animated.height),
@@ -2875,7 +2839,7 @@ mod tests {
                     &static_rendition_set(50 * MB, width, height, format),
                 );
                 assert!(
-                    tier_geometry_matches(&stored, &wanted, "image/png"),
+                    tier_geometry_matches(&stored, &wanted),
                     "{width}x{height}: stored {stored:?}"
                 );
                 // The media type is part of the comparison, which is what
@@ -2891,7 +2855,7 @@ mod tests {
                 );
                 assert!(
                     stored.is_empty()
-                        || !tier_geometry_matches(&stored, &wanted_other, "image/png"),
+                        || !tier_geometry_matches(&stored, &wanted_other),
                     "{width}x{height}: a format flip has to be work"
                 );
             }

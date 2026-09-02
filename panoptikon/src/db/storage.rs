@@ -14,13 +14,10 @@ pub(crate) struct StoredImage {
     /// longer all JPEG — a lossless source's is WebP — so the type travels
     /// with the bytes instead of being assumed from the table.
     ///
-    /// On the one row that carries no bytes — the keep-the-original sentinel,
-    /// which says the original file is the rendition (see [`StoredTier::bytes`]
-    /// for the same convention) — this is the format that was **attempted**,
-    /// not the item's own mime type. The verdict is about that encoder, so
-    /// recording which one made it is what lets a later format flip retry it
-    /// instead of freezing on it. Nothing serves this value: a sentinel is
-    /// answered with the original file, under the file's own content type.
+    /// It names the format the generator **tried**; a sentinel row is final
+    /// only while that format is still the verdict. The rule and its reasons
+    /// are written once, in `crate::visual_tiers`'s module docs under "The
+    /// keep-the-original sentinel".
     pub media_type: String,
     pub bytes: Vec<u8>,
 }
@@ -36,8 +33,12 @@ pub(crate) struct StoredTier {
     /// item's video loop — never a free-form string.
     pub tier: &'static str,
     /// What the endpoint serves these bytes as: `image/jpeg` or `image/webp`
-    /// for a still rendition, `video/mp4` for a loop, and the *item's own*
-    /// mime type for a row that carries no bytes (see [`TierPayload`]).
+    /// for a still rendition, `video/mp4` for a loop.
+    ///
+    /// It names the format the generator **tried**; a sentinel row is final
+    /// only while that format is still the verdict. The rule and its reasons
+    /// are written once, in `crate::visual_tiers`'s module docs under "The
+    /// keep-the-original sentinel".
     pub media_type: String,
     pub width: i64,
     pub height: i64,
@@ -71,12 +72,8 @@ impl StoredTier {
 /// those would be an ffmpeg run per animation in the library.
 #[derive(Clone)]
 pub(crate) enum TierPayload {
-    /// Bytes this pass produced, to be written.
-    ///
-    /// **Empty means the original file is the rendition** — the
-    /// keep-the-original sentinel, whose geometry still has to be stored or
-    /// the backfill dispatcher would ask for the rendition again on every
-    /// scan forever.
+    /// Bytes this pass produced, to be written. **Empty is the
+    /// keep-the-original sentinel** (`crate::visual_tiers`).
     Encoded(Vec<u8>),
     /// A row already in the table that the current ladder still wants,
     /// verified against the same plan the set was built from. Named so the
@@ -622,8 +619,8 @@ pub(crate) struct StoredRendition {
     /// different bytes. A validator that ignored it would let an immutable
     /// response keep handing back the superseded bytes for a year.
     pub version: i64,
-    /// Empty for the one row that means "the original file is the rendition"
-    /// (see [`StoredTier::bytes`]).
+    /// Empty for a row that means "the original file is the rendition"
+    /// (`crate::visual_tiers`, "The keep-the-original sentinel").
     pub bytes: Vec<u8>,
 }
 

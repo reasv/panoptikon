@@ -69,6 +69,29 @@
 //! `animated_floor: null` from `/api/client-config` means **no loops at all**:
 //! with no floor to evaluate every animated cell asks `still=true`, and
 //! nothing mounts a `<video>`.
+//!
+//! # The keep-the-original sentinel
+//!
+//! One convention, both rendition tables. A row with an **empty blob** means
+//! "no encode of this source came out comfortably smaller, so the original
+//! file is the rendition": `thumbnails` for a still ([`still_keeps_original`]),
+//! `thumbnail_tiers` for a loop ([`loop_keeps_original`]).
+//!
+//! The geometry is stored all the same, or the backfill dispatcher would ask
+//! for the rendition again on every scan forever — the row *is* the answer,
+//! as final as a hit, and the endpoint serves the item's own file for it.
+//!
+//! Its `media_type` names the format the generator **tried**, never the
+//! source's own type. A sentinel is final only while that format is still the
+//! verdict: the judgement is about one encoder, so a later format flip — a
+//! policy edit, a transparency measurement — has to be able to see which one
+//! made it and try the other. Naming the source instead froze the sentinel
+//! across every format change and, where the source's type happened to be the
+//! rendition's, made a real rendition indistinguishable from a verdict.
+//!
+//! One consequence worth stating, because it is what the rule buys: comparing
+//! a stored row against a wanted one is then plain equality on the media
+//! type, with no exception anywhere, for either table.
 
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
 use serde::Deserialize;
@@ -536,15 +559,19 @@ pub(crate) fn tier_format(
     policy.resolve(wanted, 1, 1)
 }
 
-/// Whether an encoded rendition is worth storing at all, or the original is
-/// the better answer and a **sentinel** row records that (the loop's existing
-/// convention, now on `thumbnails` too).
+/// Whether a still rendition is *not* worth storing, so the original is the
+/// answer and a sentinel row records that (see this module's docs).
 ///
 /// Not a byte contest between candidates — the format is already decided — but
 /// the floor under it: an efficient 6 MiB JPEG whose re-encode saves nothing
-/// would otherwise cost a second copy of itself for no gain.
-pub(crate) fn rendition_beats_original(encoded_len: u64, source_len: u64) -> bool {
-    encoded_len * KEEP_ORIGINAL_DENOMINATOR <= source_len * KEEP_ORIGINAL_NUMERATOR
+/// would otherwise cost a second copy of itself for no gain. The rendition
+/// has to come in at three quarters of the source or better.
+///
+/// Named for its answer rather than against it, matching
+/// [`loop_keeps_original`]: the two sentinels are one convention, and reading
+/// them at opposite polarities is how a call site comes to invert one.
+pub(crate) fn still_keeps_original(encoded_len: u64, source_len: u64) -> bool {
+    encoded_len * KEEP_ORIGINAL_DENOMINATOR > source_len * KEEP_ORIGINAL_NUMERATOR
 }
 
 /// `min(2560/short, sqrt(24MP/pixels), 1)` applied to both sides.
@@ -960,7 +987,8 @@ pub(crate) fn poster_plans(width: u32, height: u32) -> Vec<(ThumbnailTier, TierP
 
 /// The settled encoded-larger-than-the-source edge (§2): whether an item
 /// keeps serving its **original** at the grid tiers because no H.264 encode
-/// of it came out smaller.
+/// of it came out smaller — the loop half of the sentinel convention this
+/// module's docs write out.
 ///
 /// Real for the shape the loop pipeline meets most often at the small end —
 /// a few flat-colour frames at large dimensions, where GIF's palette coding
@@ -1490,13 +1518,13 @@ mod tests {
     // picture buys nothing.
     #[test]
     fn a_rendition_has_to_be_three_quarters_of_its_source_or_less() {
-        assert!(rendition_beats_original(750, 1000));
-        assert!(rendition_beats_original(749, 1000));
-        assert!(!rendition_beats_original(751, 1000));
-        assert!(!rendition_beats_original(1000, 1000));
-        assert!(!rendition_beats_original(4000, 1000));
+        assert!(!still_keeps_original(750, 1000));
+        assert!(!still_keeps_original(749, 1000));
+        assert!(still_keeps_original(751, 1000));
+        assert!(still_keeps_original(1000, 1000));
+        assert!(still_keeps_original(4000, 1000));
         // The ordinary case by a wide margin: a WebP of a big PNG.
-        assert!(rendition_beats_original(400_000, 4 * MB));
+        assert!(!still_keeps_original(400_000, 4 * MB));
     }
 
     #[test]
