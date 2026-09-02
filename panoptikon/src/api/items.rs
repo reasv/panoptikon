@@ -2378,10 +2378,6 @@ VALUES (?1, 0, 'image/jpeg', 9000, 1000, 1, ?2)
 
         // 1400x1400 keeps every pixel at the display cap, while its grid loop
         // is downscaled to 1024 — so the display answer is the second row.
-        let store = |conn_bytes: Vec<u8>, media: &'static str| {
-            (conn_bytes, media)
-        };
-        let (bytes, media) = store(b"0123456789abcdef".to_vec(), "video/mp4");
         sqlx::query(
             r#"
 INSERT INTO storage.thumbnail_tiers (
@@ -2391,8 +2387,8 @@ VALUES (?1, 0, 'loop-display', 'image/gif', ?2, 1400, 1400, 1, ?3)
             "#,
         )
         .bind(&item.sha256)
-        .bind(media)
-        .bind(bytes)
+        .bind("video/mp4")
+        .bind(b"0123456789abcdef".to_vec())
         .execute(&mut index_conn)
         .await
         .unwrap();
