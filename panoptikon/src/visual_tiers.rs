@@ -1363,7 +1363,27 @@ pub(crate) fn encode_rendition(
 /// stays off: the grid decodes these, and a progressive scan is slower to
 /// decode for a picture nobody watches load.
 fn encode_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
-    use jpeg_encoder::{ColorType, Encoder, QuantizationTableType, SamplingFactor};
+    encode_jpeg_with(
+        image,
+        quality,
+        true,
+        jpeg_encoder::QuantizationTableType::ImageMagick,
+    )
+}
+
+/// [`encode_jpeg`] with its two invisible settings named.
+///
+/// Everything else — 4:4:4, baseline, the 16-bit frame-header guard — is the
+/// same code, and has to be: the test that pins those two settings reads them
+/// as the *difference* between two encodes of the same picture, which is only
+/// evidence if the rest of the encoder is identical.
+fn encode_jpeg_with(
+    image: &DynamicImage,
+    quality: u8,
+    optimized_huffman: bool,
+    tables: jpeg_encoder::QuantizationTableType,
+) -> Result<Vec<u8>, String> {
+    use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 
     // Borrowed where the picture is already 8-bit RGB, which every rendition
     // of a decoded photograph is: `to_rgb8` copies the whole buffer even then.
@@ -1373,7 +1393,7 @@ fn encode_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
     };
     let (width, height) = (rgb.width(), rgb.height());
     // The container's own limit, not ours: JPEG's frame header carries the
-    // dimensions in 16 bits. Nothing in the ladder reaches it — [`display_plan`]
+    // dimensions in 16 bits. Nothing in the ladder reaches it — [`display_shape`]
     // refuses to plan a rendition past [`JPEG_MAX_SIDE`], and a grid tier is at
     // most `2 * tier` on its long side — so this is the encoder's guard
     // against a caller that has not asked the rule.
@@ -1384,11 +1404,8 @@ fn encode_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
     let mut encoder = Encoder::new(&mut buffer, quality);
     encoder.set_sampling_factor(SamplingFactor::F_1_1);
     encoder.set_progressive(false);
-    encoder.set_optimized_huffman_tables(true);
-    encoder.set_quantization_tables(
-        QuantizationTableType::ImageMagick,
-        QuantizationTableType::ImageMagick,
-    );
+    encoder.set_optimized_huffman_tables(optimized_huffman);
+    encoder.set_quantization_tables(tables.clone(), tables);
     encoder
         .encode(&rgb, width_16, height_16, ColorType::Rgb)
         .map_err(|err| err.to_string())?;
@@ -2449,45 +2466,47 @@ mod tests {
         // left at the crate's default. A differential rather than a table of
         // literal bytes: what has to hold is that these are *departures*, and
         // the crate is free to renumber its own tables.
-        let stock = encode_jpeg_variant(
+        let stock = encode_jpeg_with(
             &image,
             GRID_JPEG_QUALITY,
             false,
             jpeg_encoder::QuantizationTableType::Default,
-        );
+        )
+        .expect("the encoder runs on decoded pixels");
 
         // Optimized Huffman tables: built from this image's own symbol
         // statistics, not the Annex-K tables the crate emits by default. Worth
         // several percent of every grid rendition in the library for one extra
         // pass at encode time.
-        let ours = jpeg_segments(&bytes, 0xC4);
+        let ours = jpeg_tables(&bytes, 0xC4);
         assert!(!ours.is_empty(), "the encoder writes its Huffman tables");
         assert_ne!(
             ours,
-            jpeg_segments(&stock, 0xC4),
+            jpeg_tables(&stock, 0xC4),
             "optimized Huffman tables are off by default; these are the \
              standard ones"
         );
 
         // ImageMagick quantization, which is mozjpeg's table 3 and where the
         // measured 91%-of-today's-bytes at higher SSIM comes from.
-        let ours = jpeg_segments(&bytes, 0xDB);
+        let ours = jpeg_tables(&bytes, 0xDB);
         assert!(!ours.is_empty(), "the encoder writes its quantization tables");
         assert_ne!(
             ours,
-            jpeg_segments(&stock, 0xDB),
+            jpeg_tables(&stock, 0xDB),
             "the quantization tables are the crate's default ones, not \
              QuantizationTableType::ImageMagick"
         );
         assert_eq!(
             ours,
-            jpeg_segments(
-                &encode_jpeg_variant(
+            jpeg_tables(
+                &encode_jpeg_with(
                     &image,
                     GRID_JPEG_QUALITY,
                     true,
                     jpeg_encoder::QuantizationTableType::ImageMagick,
-                ),
+                )
+                .expect("the encoder runs on decoded pixels"),
                 0xDB
             ),
             "and they are exactly the ImageMagick tables at this quality"
@@ -2565,74 +2584,56 @@ mod tests {
         DynamicImage::ImageRgba8(buffer)
     }
 
-    /// The same picture through the same encoder with two of its settings
-    /// dialled to something else, so a test can read a setting the frame
-    /// header does not carry as the difference between two encodes.
-    fn encode_jpeg_variant(
-        image: &DynamicImage,
-        quality: u8,
-        optimized_huffman: bool,
-        tables: jpeg_encoder::QuantizationTableType,
-    ) -> Vec<u8> {
-        use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
-
-        let rgb = image.to_rgb8();
-        let mut buffer = Vec::new();
-        let mut encoder = Encoder::new(&mut buffer, quality);
-        encoder.set_sampling_factor(SamplingFactor::F_1_1);
-        encoder.set_progressive(false);
-        encoder.set_optimized_huffman_tables(optimized_huffman);
-        encoder.set_quantization_tables(tables.clone(), tables);
-        encoder
-            .encode(&rgb, rgb.width() as u16, rgb.height() as u16, ColorType::Rgb)
-            .expect("the encoder runs on decoded pixels");
-        buffer
-    }
-
-    /// Every segment carrying `marker`, payload only, in file order. JPEG may
-    /// split its tables over several segments, so the answer is a list.
-    fn jpeg_segments(bytes: &[u8], marker: u8) -> Vec<Vec<u8>> {
+    /// Every marker segment of a JPEG as `(marker, payload)`, in file order.
+    ///
+    /// One walker for both questions asked of these bytes — which segments
+    /// carry a table, and what the frame header says — because two walkers
+    /// over the same byte format is two places to get the start-of-scan
+    /// boundary wrong, and past it the entropy-coded data reads as markers.
+    fn jpeg_segments(bytes: &[u8]) -> Vec<(u8, &[u8])> {
         let mut segments = Vec::new();
         let mut index = 2; // Past SOI.
         while index + 4 <= bytes.len() {
             if bytes[index] != 0xFF {
                 break;
             }
-            let found = bytes[index + 1];
-            // Start of scan: everything past it is entropy-coded data, not
-            // segments, and walking into it would read noise as markers.
-            if found == 0xDA {
+            let marker = bytes[index + 1];
+            // Start of scan: everything past it is entropy-coded data.
+            if marker == 0xDA {
                 break;
             }
             let length = usize::from(u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]));
-            if found == marker {
-                let end = (index + 2 + length).min(bytes.len());
-                segments.push(bytes[index + 4..end].to_vec());
-            }
+            let end = (index + 2 + length).min(bytes.len());
+            segments.push((marker, &bytes[index + 4..end]));
             index += 2 + length;
         }
         segments
     }
 
-    /// The frame marker and the luma component's sampling byte, walked out of
-    /// the JPEG's segment list. `None` when there is no frame header at all.
+    /// The payloads carrying `marker`. JPEG may split its tables over several
+    /// segments, so the answer is a list.
+    fn jpeg_tables(bytes: &[u8], marker: u8) -> Vec<Vec<u8>> {
+        jpeg_segments(bytes)
+            .into_iter()
+            .filter(|(found, _)| *found == marker)
+            .map(|(_, payload)| payload.to_vec())
+            .collect()
+    }
+
+    /// The frame marker and the luma component's sampling byte. `None` when
+    /// there is no frame header at all.
     fn jpeg_frame(bytes: &[u8]) -> Option<(u8, u8)> {
-        let mut index = 2; // Past SOI.
-        while index + 4 <= bytes.len() {
-            if bytes[index] != 0xFF {
-                return None;
-            }
-            let marker = bytes[index + 1];
-            let length = usize::from(u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]));
-            // SOF0..SOF3 and SOF5..SOF15, excluding the non-frame FFC4/FFC8/FFCC.
-            if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
-                // length(2) precision(1) height(2) width(2) components(1),
-                // then per component: id(1) sampling(1) quant table(1).
-                let sampling = *bytes.get(index + 2 + 8 + 1)?;
-                return Some((marker, sampling));
-            }
-            index += 2 + length;
-        }
-        None
+        jpeg_segments(bytes)
+            .into_iter()
+            // SOF0..SOF3 and SOF5..SOF15, excluding the non-frame
+            // FFC4/FFC8/FFCC.
+            .find(|(marker, _)| {
+                (0xC0..=0xCF).contains(marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC)
+            })
+            .and_then(|(marker, payload)| {
+                // precision(1) height(2) width(2) components(1), then per
+                // component: id(1) sampling(1) quant table(1).
+                Some((marker, *payload.get(6 + 1)?))
+            })
     }
 }

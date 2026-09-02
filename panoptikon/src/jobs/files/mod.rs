@@ -7330,6 +7330,86 @@ LIMIT 1
         encoder.encode_frames(built).unwrap();
     }
 
+    /// A 1400x1400 picture with an alpha channel that is actually *used* — a
+    /// transparent 32px corner — over a cheap gradient.
+    ///
+    /// The size is the point twice over: past 1.25x every grid tier, so all
+    /// three are stored, and the corner makes R4's verdict `1` from the
+    /// pixels rather than from the header (only 2.3% of PNGs that carry an
+    /// alpha channel use it).
+    fn alpha_logo(side: u32) -> image::RgbaImage {
+        image::RgbaImage::from_fn(side, side, |x, y| {
+            let alpha = if x < 32 && y < 32 { 0 } else { 255 };
+            image::Rgba([(x / 8) as u8, (y / 8) as u8, 40, alpha])
+        })
+    }
+
+    /// [`alpha_logo`] filled with noise instead of a gradient, so the PNG is
+    /// far past the lossless class's 2 MiB byte bound and a display rendition
+    /// is genuinely owed rather than merely allowed.
+    ///
+    /// A fixed xorshift rather than a random source: a fixture whose byte
+    /// count moves between runs is a byte-bound test that passes by luck.
+    fn noise_rgba(side: u32) -> image::RgbaImage {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        image::RgbaImage::from_fn(side, side, |x, y| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let bytes = state.to_le_bytes();
+            let alpha = if x < 32 && y < 32 { 0 } else { 255 };
+            image::Rgba([bytes[0], bytes[1], bytes[2], alpha])
+        })
+    }
+
+    /// One row of `storage.thumbnail_tiers` as the tests read it back.
+    #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+    struct TierSnapshot {
+        id: i64,
+        idx: i64,
+        tier: String,
+        width: i64,
+        height: i64,
+        version: i64,
+        media_type: String,
+        thumbnail: Vec<u8>,
+    }
+
+    /// Every stored grid rendition, in the dispatcher's own order.
+    ///
+    /// One read behind every projection below. Seven queries for seven views
+    /// of one table is seven chances for two assertions in the same test to
+    /// be looking at rows in different orders — and the rowid assertions in
+    /// particular are only evidence while the order is fixed.
+    async fn tier_snapshot(conn: &mut sqlx::SqliteConnection) -> Vec<TierSnapshot> {
+        sqlx::query_as(
+            "SELECT id, idx, tier, width, height, version, media_type, thumbnail \
+             FROM storage.thumbnail_tiers ORDER BY idx, tier, id",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
+    }
+
+    /// One row of `storage.thumbnails` as the tests read it back.
+    #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+    struct DisplaySnapshot {
+        id: i64,
+        idx: i64,
+        media_type: String,
+        thumbnail: Vec<u8>,
+    }
+
+    /// Every stored display rendition, by index. See [`tier_snapshot`].
+    async fn display_snapshot(conn: &mut sqlx::SqliteConnection) -> Vec<DisplaySnapshot> {
+        sqlx::query_as(
+            "SELECT id, idx, media_type, thumbnail FROM storage.thumbnails ORDER BY idx, id",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
+    }
+
     /// (kind, outcome, attempts, skip_after, version) per marker, by kind.
     async fn visual_attempt_rows(
         conn: &mut sqlx::SqliteConnection,
@@ -7355,10 +7435,11 @@ LIMIT 1
     /// proof no pass rewrote them — which is exactly what the ladder's
     /// write-once discipline claims.
     async fn tier_ids(conn: &mut sqlx::SqliteConnection) -> Vec<i64> {
-        sqlx::query_scalar("SELECT id FROM storage.thumbnail_tiers ORDER BY id")
-            .fetch_all(conn)
+        tier_snapshot(conn)
             .await
-            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
     }
 
     fn tier(name: &str, width: i64, height: i64) -> (String, i64, i64) {
@@ -7629,15 +7710,7 @@ LIMIT 1
     async fn transparency_is_measured_once_and_only_rewrites_on_a_changed_verdict() {
         let test_env = test_data_dir();
         let env = visuals_env(test_env.path(), &["media-transparency"]).await;
-        // An alpha channel that is actually used, on a picture big enough to
-        // owe every grid tier.
-        let transparent = image::RgbaImage::from_fn(1400, 1400, |x, y| {
-            let alpha = if x < 32 && y < 32 { 0 } else { 255 };
-            image::Rgba([(x / 8) as u8, (y / 8) as u8, 40, alpha])
-        });
-        transparent
-            .save(env.media_dirs[0].join("logo.png"))
-            .unwrap();
+        alpha_logo(1400).save(env.media_dirs[0].join("logo.png")).unwrap();
         env.scan().await;
 
         {
@@ -7735,12 +7808,7 @@ LIMIT 1
     async fn a_policy_flip_regenerates_only_the_rows_it_moves() {
         let test_env = test_data_dir();
         let mut env = visuals_env(test_env.path(), &["media-policy"]).await;
-        image::RgbaImage::from_fn(1400, 1400, |x, y| {
-            let alpha = if x < 32 && y < 32 { 0 } else { 255 };
-            image::Rgba([(x / 8) as u8, (y / 8) as u8, 40, alpha])
-        })
-        .save(env.media_dirs[0].join("logo.png"))
-        .unwrap();
+        alpha_logo(1400).save(env.media_dirs[0].join("logo.png")).unwrap();
         image::RgbImage::new(1400, 1400)
             .save(env.media_dirs[0].join("photo.jpg"))
             .unwrap();
@@ -7892,20 +7960,11 @@ LIMIT 1
     async fn a_display_sentinel_is_retried_when_the_format_verdict_moves() {
         let test_env = test_data_dir();
         let mut env = visuals_env(test_env.path(), &["media-sentinel-retry"]).await;
-        // Noise, so the PNG is far past the lossless class's 2 MiB bound and a
-        // rendition is genuinely owed; the alpha corner makes it WebP by R4 as
-        // well as by source class.
-        let mut state = 0x2545_f491_4f6c_dd1d_u64;
-        image::RgbaImage::from_fn(1400, 1400, |x, y| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            let bytes = state.to_le_bytes();
-            let alpha = if x < 32 && y < 32 { 0 } else { 255 };
-            image::Rgba([bytes[0], bytes[1], bytes[2], alpha])
-        })
-        .save(env.media_dirs[0].join("logo.png"))
-        .unwrap();
+        // Past the lossless class's 2 MiB bound, so a rendition is genuinely
+        // owed; the alpha corner makes it WebP by R4 as well as by class.
+        noise_rgba(1400)
+            .save(env.media_dirs[0].join("logo.png"))
+            .unwrap();
         env.scan().await;
 
         {
@@ -7950,6 +8009,12 @@ LIMIT 1
         // The row this build writes: the same verdict, naming the encoder that
         // reached it. Unchanged policy, so it is final and nothing is asked
         // for again.
+        //
+        // Planted rather than provoked: reaching this state honestly needs a
+        // source whose WebP re-encode comes out over three quarters of its
+        // bytes, which is a property of a real photograph's entropy and not
+        // of anything a fixture can be written to have. The verdict is what
+        // the test is about; how the encoder arrived at it is not.
         {
             let mut conn = env.write().await;
             sqlx::query("UPDATE storage.thumbnails SET thumbnail = X''")
@@ -8073,12 +8138,8 @@ LIMIT 1
     /// Whether every stored display rendition carries bytes — the difference
     /// between a picture and the keep-the-original verdict.
     async fn display_has_bytes(conn: &mut sqlx::SqliteConnection) -> bool {
-        let lengths: Vec<i64> =
-            sqlx::query_scalar("SELECT length(thumbnail) FROM storage.thumbnails ORDER BY idx")
-                .fetch_all(conn)
-                .await
-                .unwrap();
-        !lengths.is_empty() && lengths.iter().all(|length| *length > 0)
+        let rows = display_snapshot(conn).await;
+        !rows.is_empty() && rows.iter().all(|row| !row.thumbnail.is_empty())
     }
 
     /// The rowids of the stored H.264 loop rows.
@@ -8088,12 +8149,12 @@ LIMIT 1
     /// retained payload exists for, and the one a byte comparison alone would
     /// miss for a deterministic encoder.
     async fn loop_tier_ids(conn: &mut sqlx::SqliteConnection) -> Vec<i64> {
-        sqlx::query_scalar(
-            "SELECT id FROM storage.thumbnail_tiers WHERE tier LIKE 'loop%' ORDER BY id",
-        )
-        .fetch_all(conn)
-        .await
-        .unwrap()
+        tier_snapshot(conn)
+            .await
+            .into_iter()
+            .filter(|row| row.tier.starts_with("loop"))
+            .map(|row| row.id)
+            .collect()
     }
 
     /// The whole point of `LOOP_PROCESS_VERSION` being separate: a
@@ -8231,18 +8292,20 @@ LIMIT 1
 
     /// The media type of every stored display rendition, by index.
     async fn display_media_types(conn: &mut sqlx::SqliteConnection) -> Vec<String> {
-        sqlx::query_scalar("SELECT media_type FROM storage.thumbnails ORDER BY idx")
-            .fetch_all(conn)
+        display_snapshot(conn)
             .await
-            .unwrap()
+            .into_iter()
+            .map(|row| row.media_type)
+            .collect()
     }
 
-    /// The `version` stamp on every tier row, in rowid order.
+    /// The `version` stamp on every tier row.
     async fn tier_versions(conn: &mut sqlx::SqliteConnection) -> Vec<i64> {
-        sqlx::query_scalar("SELECT version FROM storage.thumbnail_tiers ORDER BY id")
-            .fetch_all(conn)
+        tier_snapshot(conn)
             .await
-            .unwrap()
+            .into_iter()
+            .map(|row| row.version)
+            .collect()
     }
 
     // A generator change the stored geometry cannot see — a different crop
@@ -8695,12 +8758,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     /// Every stored grid rendition as `(tier, media_type)`, in the
     /// dispatcher's own order.
     async fn tier_media_types(conn: &mut sqlx::SqliteConnection) -> Vec<(String, String)> {
-        sqlx::query_as(
-            "SELECT tier, media_type FROM storage.thumbnail_tiers ORDER BY idx, tier",
-        )
-        .fetch_all(conn)
-        .await
-        .unwrap()
+        tier_snapshot(conn)
+            .await
+            .into_iter()
+            .map(|row| (row.tier, row.media_type))
+            .collect()
     }
 
     // An item whose display rendition is already the one the current rule
@@ -8761,10 +8823,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     /// The stored display renditions as `(rowid, bytes)`. The store is a
     /// delete-then-insert, so an unchanged rowid is proof nothing rewrote it.
     async fn display_rows(conn: &mut sqlx::SqliteConnection) -> Vec<(i64, Vec<u8>)> {
-        sqlx::query_as("SELECT id, thumbnail FROM storage.thumbnails ORDER BY id")
-            .fetch_all(conn)
+        display_snapshot(conn)
             .await
-            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.thumbnail))
+            .collect()
     }
 
     async fn blurhash_of(conn: &mut sqlx::SqliteConnection) -> Option<String> {
@@ -12876,12 +12939,11 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     /// Every stored grid tier as `(tier, width, height)`, in the order the
     /// dispatcher's own read returns them.
     async fn tier_rows(conn: &mut sqlx::SqliteConnection) -> Vec<(String, i64, i64)> {
-        sqlx::query_as(
-            "SELECT tier, width, height FROM storage.thumbnail_tiers ORDER BY idx, tier",
-        )
-        .fetch_all(conn)
-        .await
-        .unwrap()
+        tier_snapshot(conn)
+            .await
+            .into_iter()
+            .map(|row| (row.tier, row.width, row.height))
+            .collect()
     }
 
     // VACUUM must run outside the writer's usual transaction wrapper; both
