@@ -682,8 +682,14 @@ async fn execute_folder_scan(
     let mut attempt_scan_id: Option<i64> = None;
 
     for folder in starting_points {
+        // Per-root, not `scan_time`: roots are walked one after another, so a
+        // run-wide start would make every root's recorded duration the
+        // cumulative time of every root before it (`end_time` is stamped when
+        // that root finishes). `scan_time` stays run-wide because it is also
+        // the `time_added` every file this run indexes is stamped with.
+        let root_start_time = current_iso_timestamp();
         let scan_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddFileScan {
-            scan_time: scan_time.clone(),
+            scan_time: root_start_time.clone(),
             path: folder.clone(),
             reply,
         })
