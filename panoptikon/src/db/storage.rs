@@ -1073,7 +1073,7 @@ VALUES
                 media_type: "image/gif".to_string(),
                 has_bytes: false,
             }],
-            "an empty blob is visible to the dispatcher as work, not as a row              it can leave alone"
+            "an empty blob is visible to the dispatcher as work, not as a row it can leave alone"
         );
     }
 

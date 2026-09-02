@@ -129,9 +129,15 @@ Deviations from §2/§3, all adopted:
   user-QA item (4) below.
 - One shared `components/LoopVideo.tsx` for grid and filmstrip; `AnimateMode`
   and `SMALL_CELL_THRESHOLD_PX` live in `lib/thumbnailTier.ts`.
-- Extreme-aspect animated cards **never hover-arm**: their whole-image swap
-  shows the original file, which animates natively, so a loop would be fetched
-  only to be unmounted.
+- An extreme-aspect animated card hover-arms **exactly when it has no
+  whole-image swap** (`extremeCropArmsHover` in `lib/cellPicture.ts`). With a
+  swap the gesture is spoken for: it shows the original file, which animates
+  natively, so a loop would be fetched only to be unmounted the moment the
+  swap landed. Past the display-loop trigger `displaySrc` is null, there is no
+  swap, and the cropped loop arms and hover-plays through the same director,
+  dwell and cap as any other loop cell; without that such a card had no motion
+  path in hover mode at all while carrying the play badge. (Corrected
+  2026-09-02 after user QA; the original rule was a blanket "never hover-arm".)
 - Found and fixed en route: the director's scroll-velocity sampler read only
   `scrollTop`, so horizontal (filmstrip) pans could never trigger the
   fast-scroll suspend.
