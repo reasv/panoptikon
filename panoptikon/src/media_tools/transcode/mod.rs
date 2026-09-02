@@ -297,10 +297,19 @@ mod tests {
             format!("{}-clip.mp4", &sha[..10])
         );
 
+        // The stem is whatever this platform's `Path` makes of the string:
+        // forward slashes separate everywhere, backslashes only on Windows,
+        // where on Unix they would be part of one long file name.
         assert_eq!(
-            path_stem(std::path::Path::new(r"C:\videos\holiday.mp4")).as_deref(),
+            path_stem(std::path::Path::new("/videos/holiday.mp4")).as_deref(),
             Some("holiday")
         );
+        if cfg!(windows) {
+            assert_eq!(
+                path_stem(std::path::Path::new(r"C:\videos\holiday.mp4")).as_deref(),
+                Some("holiday")
+            );
+        }
         assert_eq!(path_stem(std::path::Path::new("")), None);
     }
 

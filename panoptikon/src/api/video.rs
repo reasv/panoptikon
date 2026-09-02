@@ -2038,16 +2038,17 @@ transcode_presets = ["playback"]
         .unwrap();
         sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
             .bind("2024-01-01T00:00:00")
-            .bind(r"C:\gone")
+            .bind(crate::test_utils::absent_root())
             .execute(&mut dbs.index_conn)
             .await
             .unwrap();
         // A path that does not exist: the handler must still answer.
         sqlx::query(
             "INSERT INTO files (id, sha256, item_id, path, filename, last_modified, scan_id, available) \
-             VALUES (10, ?, 1, 'C:\\gone\\holiday.mp4', 'holiday.mp4', '2024-01-02T00:00:00', 1, 1)",
+             VALUES (10, ?, 1, ?, 'holiday.mp4', '2024-01-02T00:00:00', 1, 1)",
         )
         .bind(SHA)
+        .bind(crate::test_utils::absent_path("holiday.mp4"))
         .execute(&mut dbs.index_conn)
         .await
         .unwrap();
@@ -2162,7 +2163,7 @@ transcode_presets = ["playback"]
         }
         sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
             .bind("2024-01-01T00:00:00")
-            .bind(r"C:\gone")
+            .bind(crate::test_utils::absent_root())
             .execute(&mut dbs.index_conn)
             .await
             .unwrap();
@@ -2181,7 +2182,7 @@ transcode_presets = ["playback"]
                 10,
                 1,
                 WITH_OUTRO,
-                r"C:\gone\first-name.mp4".to_string(),
+                crate::test_utils::absent_path("first-name.mp4"),
                 "first-name.mp4".to_string(),
                 1,
             ),
@@ -2499,7 +2500,7 @@ transcode_presets = ["playback"]
         .unwrap();
         sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
             .bind("2024-01-01T00:00:00")
-            .bind(r"C:\gone")
+            .bind(crate::test_utils::absent_root())
             .execute(&mut dbs.index_conn)
             .await
             .unwrap();
@@ -2671,7 +2672,7 @@ transcode_presets = ["playback"]
         let mut dbs = crate::db::migrations::setup_test_databases().await;
         sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
             .bind("2024-01-01T00:00:00")
-            .bind(r"C:\gone")
+            .bind(crate::test_utils::absent_root())
             .execute(&mut dbs.index_conn)
             .await
             .unwrap();

@@ -12610,14 +12610,83 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
     // failure mode a cache must not have.
     #[test]
     fn the_sweep_defers_when_the_walk_could_not_read_the_tree() {
-        let stored = [r"C:\M\Gone.png", r"C:\M\Here.png"];
-        let rows: HashMap<String, ScanErrorSkip> = stored
+        let rows = sweep_fixture_rows(&["Gone.png", "Here.png"]);
+        // The walker reports the stored spelling; what a *different* casing
+        // means is the platform's question, answered by the two tests below.
+        let seen: HashSet<String> = [fold_scan_path(&sweep_fixture_path("Here.png"))]
+            .into_iter()
+            .collect();
+
+        // A clean walk sweeps exactly the row it never reached, by the path
+        // that is actually in the table.
+        assert_eq!(
+            sweepable_scan_errors(0, &rows, &seen),
+            vec![sweep_fixture_path("Gone.png")]
+        );
+        // One walk error and nothing is swept until a clean walk.
+        assert!(sweepable_scan_errors(1, &rows, &seen).is_empty());
+        // The normal case — no rows at all — costs nothing either way.
+        assert!(sweepable_scan_errors(0, &HashMap::new(), &seen).is_empty());
+        assert!(sweepable_scan_errors(3, &HashMap::new(), &seen).is_empty());
+    }
+
+    // On Windows a walk can report a file in a casing the ledger never stored
+    // (a root re-registered as `d:\media`, a watcher event), and the folded
+    // key must still count it as reached — otherwise the sweep deletes the
+    // row of a file that is right there. Only `Gone.png` is swept, and by its
+    // stored bytes, not the folded key.
+    #[cfg(windows)]
+    #[test]
+    fn the_sweep_tolerates_the_walkers_casing_on_windows() {
+        let rows = sweep_fixture_rows(&["Gone.png", "Here.png"]);
+        let seen: HashSet<String> = [fold_scan_path(r"C:\m\here.png")].into_iter().collect();
+        assert_eq!(
+            sweepable_scan_errors(0, &rows, &seen),
+            vec![sweep_fixture_path("Gone.png")]
+        );
+    }
+
+    // Everywhere else `fold_scan_path` is the identity: two paths differing
+    // only in case are two different files. A walk that reports `/m/here.png`
+    // has therefore *not* reached `/M/Here.png`, so both rows are unreached
+    // and a clean walk sweeps both.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_sweep_treats_casing_as_identity_off_windows() {
+        let rows = sweep_fixture_rows(&["Gone.png", "Here.png"]);
+        let seen: HashSet<String> = [fold_scan_path("/m/here.png")].into_iter().collect();
+        let mut swept = sweepable_scan_errors(0, &rows, &seen);
+        swept.sort();
+        assert_eq!(
+            swept,
+            vec![
+                sweep_fixture_path("Gone.png"),
+                sweep_fixture_path("Here.png")
+            ]
+        );
+    }
+
+    /// A ledger path for the sweep tests, under a root spelled the way this
+    /// platform spells absolute paths, so the casing rules under test are the
+    /// ones `fold_scan_path` actually applies here.
+    fn sweep_fixture_path(name: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\M\{name}")
+        } else {
+            format!("/M/{name}")
+        }
+    }
+
+    /// Ledger rows for `names`, keyed the way the sweep looks them up.
+    fn sweep_fixture_rows(names: &[&str]) -> HashMap<String, ScanErrorSkip> {
+        names
             .iter()
-            .map(|path| {
+            .map(|name| {
+                let path = sweep_fixture_path(name);
                 (
-                    fold_scan_path(path),
+                    fold_scan_path(&path),
                     ScanErrorSkip {
-                        path: path.to_string(),
+                        path,
                         last_modified: "2026-01-01T00:00:00".to_string(),
                         file_size: 1,
                         attempts: 1,
@@ -12626,21 +12695,7 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
                     },
                 )
             })
-            .collect();
-        // The walker's own casing, which on Windows need not be the stored one.
-        let seen: HashSet<String> = [fold_scan_path(r"C:\m\here.png")].into_iter().collect();
-
-        // A clean walk sweeps exactly the row it never reached, by the path
-        // that is actually in the table.
-        assert_eq!(
-            sweepable_scan_errors(0, &rows, &seen),
-            vec![r"C:\M\Gone.png".to_string()]
-        );
-        // One walk error and nothing is swept until a clean walk.
-        assert!(sweepable_scan_errors(1, &rows, &seen).is_empty());
-        // The normal case — no rows at all — costs nothing either way.
-        assert!(sweepable_scan_errors(0, &HashMap::new(), &seen).is_empty());
-        assert!(sweepable_scan_errors(3, &HashMap::new(), &seen).is_empty());
+            .collect()
     }
 
     // A file the walk reached but a *later* gate rejected — here the filescan
