@@ -106,6 +106,12 @@ thumbnail_font = "${PANOPTIKON_FONT:-}"     # TTF font for thumbnail text labels
 # h264_videotoolbox, h264_mf (the bare vendor spelling, e.g. "nvenc", works
 # too). Quality-channel exports always use libx264 regardless.
 # hwaccel = "auto"
+# Whether a hovered grid or filmstrip cell may transcode a short preview of a
+# video the browser cannot play itself. "auto" allows it only where the
+# hardware encoder above validated, "on" always, "off" never. Hovering a video
+# the browser can already play costs the server only Range reads and is not
+# governed here; a policy denies both with [policies.client] hover_preview.
+# hover_preview = "auto"
 # Animated-mosaic limits (see the pinboard render surface).
 # max_mosaic_inputs = 12
 # max_mosaic_loop_mb = 512

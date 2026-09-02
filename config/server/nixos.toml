@@ -55,6 +55,7 @@ thumbnail_font = "${PANOPTIKON_FONT:-}"
 # cache_size_mb = 8192
 # cache_size_max_mb = 262144           # ceiling for PUT /api/video/cache
 # hwaccel = "auto"                     # "auto" | "off" | h264_nvenc | h264_amf | h264_qsv | h264_videotoolbox | h264_mf
+# hover_preview = "auto"               # hover preview transcodes: "auto" (only with a hardware encoder) | "on" | "off"
 # max_mosaic_inputs = 12
 # max_mosaic_loop_mb = 512
 # max_animated_image_seconds = 30

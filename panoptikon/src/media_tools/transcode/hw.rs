@@ -106,6 +106,72 @@ pub(crate) fn fast_h264_encoder() -> Option<&'static str> {
     })
 }
 
+/// `[transcode] hover_preview`, parsed
+/// (docs/video-hover-preview-implementation.md §3, B2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoverPreview {
+    /// Offer the preview transcode wherever the policy allows it.
+    On,
+    /// Never offer it; the direct rung is unaffected.
+    Off,
+    /// Offer it only where the fast channel has a validated hardware encoder.
+    Auto,
+}
+
+/// Parses the config value. `None` means the value names nothing, which is a
+/// config error rather than a silent default — the same contract
+/// [`parse_hwaccel`] keeps.
+pub(crate) fn parse_hover_preview(value: &str) -> Option<HoverPreview> {
+    let value = value.trim();
+    for (name, parsed) in [
+        ("on", HoverPreview::On),
+        ("off", HoverPreview::Off),
+        ("auto", HoverPreview::Auto),
+    ] {
+        if value.eq_ignore_ascii_case(name) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+/// The accepted `hover_preview` values, for config error messages.
+pub(crate) fn hover_preview_values() -> &'static str {
+    "\"auto\", \"on\", \"off\""
+}
+
+/// The setting resolved against a hardware probe, with the probe injected so
+/// the matrix is testable without a toolchain — and, more to the point, so it
+/// is never *run* for the two settings that already have their answer:
+/// `fast_h264_encoder` spawns ffmpeg twice on its first call, and `"off"` must
+/// cost nothing.
+pub(crate) fn resolve_hover_preview(
+    setting: HoverPreview,
+    hardware_encoder: impl FnOnce() -> bool,
+) -> bool {
+    match setting {
+        HoverPreview::On => true,
+        HoverPreview::Off => false,
+        HoverPreview::Auto => hardware_encoder(),
+    }
+}
+
+/// The live answer for this process: the configured setting against the real
+/// probe.
+///
+/// **Blocking** in the `"auto"` case on a cold process — the first call runs
+/// the encoder listing and the validation encode (up to
+/// [`VALIDATE_TIMEOUT`]). Callers on an async runtime must reach it through
+/// `spawn_blocking`.
+pub(crate) fn hover_preview_enabled() -> bool {
+    let configured = crate::config::runtime().transcode.hover_preview.clone();
+    // Config load rejected anything else; a RuntimeConfig built outside
+    // Settings::validate falls back to the shipped default rather than
+    // silently turning the feature off.
+    let setting = parse_hover_preview(&configured).unwrap_or(HoverPreview::Auto);
+    resolve_hover_preview(setting, || fast_h264_encoder().is_some())
+}
+
 /// Software AV1 encoders, in preference order: SVT-AV1 is ~2x faster than
 /// libaom at the settings run.rs pins for each, but plenty of real builds
 /// ship without it — static_ffmpeg's win32 "essentials" build, notably,
@@ -440,6 +506,60 @@ Encoders:
         assert_eq!(parse_hwaccel("libx264"), None);
         assert_eq!(parse_hwaccel(""), None);
         assert!(hwaccel_values().contains("h264_videotoolbox"));
+    }
+
+    /// `hover_preview` parsing: three keywords, case- and space-insensitive
+    /// like `hwaccel` beside it, and anything else a config error rather than
+    /// a silent default.
+    #[test]
+    fn hover_preview_values_parse() {
+        assert_eq!(parse_hover_preview("auto"), Some(HoverPreview::Auto));
+        assert_eq!(parse_hover_preview(" AUTO "), Some(HoverPreview::Auto));
+        assert_eq!(parse_hover_preview("on"), Some(HoverPreview::On));
+        assert_eq!(parse_hover_preview("On"), Some(HoverPreview::On));
+        assert_eq!(parse_hover_preview("off"), Some(HoverPreview::Off));
+        assert_eq!(parse_hover_preview("OFF"), Some(HoverPreview::Off));
+        assert_eq!(parse_hover_preview("true"), None);
+        assert_eq!(parse_hover_preview("yes"), None);
+        assert_eq!(parse_hover_preview(""), None);
+        for value in ["auto", "on", "off"] {
+            assert!(hover_preview_values().contains(value));
+        }
+    }
+
+    /// The whole resolution matrix, with the probe stubbed: `"auto"` is the
+    /// only setting that consults it, and the two that do not must never
+    /// *run* it — `fast_h264_encoder` spawns ffmpeg twice, which is exactly
+    /// the cost `"off"` exists to avoid and `"on"` has already decided
+    /// against needing.
+    #[test]
+    fn hover_preview_resolves_against_the_probe_only_on_auto() {
+        use std::cell::Cell;
+
+        let probes = Cell::new(0u32);
+        for (setting, hardware, expected) in [
+            (HoverPreview::On, true, true),
+            (HoverPreview::On, false, true),
+            (HoverPreview::Off, true, false),
+            (HoverPreview::Off, false, false),
+            (HoverPreview::Auto, true, true),
+            (HoverPreview::Auto, false, false),
+        ] {
+            probes.set(0);
+            assert_eq!(
+                resolve_hover_preview(setting, || {
+                    probes.set(probes.get() + 1);
+                    hardware
+                }),
+                expected,
+                "{setting:?} with hardware={hardware}"
+            );
+            assert_eq!(
+                probes.get(),
+                u32::from(setting == HoverPreview::Auto),
+                "{setting:?} consults the probe exactly when it is auto"
+            );
+        }
     }
 
     /// Selection: listing alone never wins, `off` refuses even a working
