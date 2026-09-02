@@ -3276,13 +3276,30 @@ impl ScanContext {
                     [stored] => {
                         (stored.idx, stored.width, stored.height)
                             == (0, i64::from(expected_width), i64::from(expected_height))
-                            // The keep-the-original sentinel is an answer, not
-                            // a stale row: it says no encode of this source
-                            // came out comfortably smaller, which is a verdict
-                            // about the content and as final as a hit. It
-                            // names the item's own type and carries no bytes.
-                            && (stored.media_type == format.media_type()
-                                || stored.media_type == mime_type)
+                            // Exact on the format, with no exception for the
+                            // item's own mime type. Both kinds of row name
+                            // the format the generator *used*: a real
+                            // rendition its container, and the
+                            // keep-the-original sentinel the container it
+                            // tried (`build_image_renditions`). So one
+                            // comparison settles both — a sentinel counts as
+                            // the final answer it is exactly while the format
+                            // it was attempted with is still the verdict, and
+                            // a real rendition matches only its own.
+                            //
+                            // The `|| stored.media_type == mime_type` this
+                            // replaces broke in both directions: a JPEG
+                            // source's JPEG rendition matched *every* verdict,
+                            // so a `thumbnail_formats` flip never regenerated
+                            // it; and a sentinel was terminal across format
+                            // changes, so a database that visited `["jpeg"]`
+                            // once served the 3 MB original of a transparent
+                            // PNG forever. `visuals.rs`'s
+                            // `rendition_media_type_matches` states the same
+                            // hazard for the still tiers; the loop row keeps
+                            // its own exception there, and only there,
+                            // because a loop has exactly one format.
+                            && stored.media_type == format.media_type()
                     }
                     _ => false,
                 },
@@ -7826,6 +7843,204 @@ LIMIT 1
 
         let (_, totals) = env.scan().await;
         assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+    }
+
+    /// A **JPEG** item's JPEG display rendition still follows the policy.
+    ///
+    /// The regression this pins: the dispatcher used to accept any display row
+    /// whose media type was the item's own, as a stand-in for recognising the
+    /// keep-the-original sentinel. For every JPEG source with a real JPEG
+    /// rendition — most of a photo library — that made the display row match
+    /// *every* verdict, so a `thumbnail_formats` edit moved the grid tiers and
+    /// silently left the display rendition on the old format forever.
+    #[tokio::test]
+    async fn a_jpeg_display_rendition_follows_the_format_policy() {
+        let test_env = test_data_dir();
+        let mut env = visuals_env(test_env.path(), &["media-jpeg-display"]).await;
+        // Past the 4096 short-side trigger, so a rendition is owed; capped at
+        // 2560, so it is a real downscale the encode comfortably wins.
+        image::RgbImage::from_fn(4100, 4100, |x, y| {
+            image::Rgb([(x / 16) as u8, (y / 16) as u8, 128])
+        })
+        .save(env.media_dirs[0].join("big.jpg"))
+        .unwrap();
+        env.scan().await;
+
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/jpeg".to_string()],
+                "a JPEG source keeps JPEG: a WebP of one decodes 2.33x slower"
+            );
+            assert!(
+                display_has_bytes(&mut conn).await,
+                "the premise: a real rendition, not the keep-the-original verdict"
+            );
+        }
+
+        // The storage-constrained deployment: `jpeg` withdrawn, so every JPEG
+        // verdict — the display rendition included — becomes a WebP.
+        env.config.thumbnail_formats = vec!["webp".to_string()];
+        SystemConfigStore::new(env.root.clone())
+            .save(&env.index_db, &env.config)
+            .unwrap();
+
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/webp".to_string()],
+                "the display row moves with the policy, not only the grid tiers"
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+
+        // ... and back, which is the half a one-way comparison can pass by
+        // accident.
+        env.config.thumbnail_formats = SystemConfig::default().thumbnail_formats;
+        SystemConfigStore::new(env.root.clone())
+            .save(&env.index_db, &env.config)
+            .unwrap();
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/jpeg".to_string()]
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles again");
+    }
+
+    /// A display **sentinel** is an answer about one encoder, not about the
+    /// item forever.
+    ///
+    /// Two halves. First the row a pre-fix build wrote — empty bytes carrying
+    /// the *source's* mime type — which the dispatcher used to read as "this
+    /// item is settled" under every verdict there is: a database that visited
+    /// `["jpeg"]` once, where a flattened JPEG of a transparent PNG need not
+    /// come out comfortably smaller, went on serving the multi-megabyte
+    /// original after the policy was put back. It has to be retried exactly
+    /// once and replaced by the WebP the current rule wants.
+    ///
+    /// Then the row this build writes, which names the format it attempted:
+    /// honoured while that format is still the verdict, re-attempted the
+    /// moment the verdict moves. (The writer's half of that convention is
+    /// `visuals::tests::a_display_sentinel_names_the_format_it_attempted`.)
+    #[tokio::test]
+    async fn a_display_sentinel_is_retried_when_the_format_verdict_moves() {
+        let test_env = test_data_dir();
+        let mut env = visuals_env(test_env.path(), &["media-sentinel-retry"]).await;
+        // Noise, so the PNG is far past the lossless class's 2 MiB bound and a
+        // rendition is genuinely owed; the alpha corner makes it WebP by R4 as
+        // well as by source class.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        image::RgbaImage::from_fn(1400, 1400, |x, y| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let bytes = state.to_le_bytes();
+            let alpha = if x < 32 && y < 32 { 0 } else { 255 };
+            image::Rgba([bytes[0], bytes[1], bytes[2], alpha])
+        })
+        .save(env.media_dirs[0].join("logo.png"))
+        .unwrap();
+        env.scan().await;
+
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/webp".to_string()]
+            );
+            assert!(display_has_bytes(&mut conn).await);
+        }
+
+        // Rewound to what a pre-fix build left behind: the keep-the-original
+        // verdict, wearing the item's own type.
+        {
+            let mut conn = env.write().await;
+            sqlx::query(
+                "UPDATE storage.thumbnails SET thumbnail = X'', media_type = 'image/png'",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 1,
+            "a verdict about a format nobody can name is no verdict at all"
+        );
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/webp".to_string()]
+            );
+            assert!(
+                display_has_bytes(&mut conn).await,
+                "the rendition is restored rather than the original served forever"
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+
+        // The row this build writes: the same verdict, naming the encoder that
+        // reached it. Unchanged policy, so it is final and nothing is asked
+        // for again.
+        {
+            let mut conn = env.write().await;
+            sqlx::query("UPDATE storage.thumbnails SET thumbnail = X''")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(
+            totals.backfilled_visuals, 0,
+            "a sentinel naming the current verdict is an answer, not a stale row"
+        );
+        {
+            let mut conn = env.read().await;
+            assert!(!display_has_bytes(&mut conn).await, "still the sentinel");
+        }
+
+        // Move the verdict and it is re-attempted, which is the whole
+        // difference between "this encoder could not win" and "nothing can".
+        env.config.thumbnail_formats = vec!["jpeg".to_string()];
+        SystemConfigStore::new(env.root.clone())
+            .save(&env.index_db, &env.config)
+            .unwrap();
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 1);
+        {
+            let mut conn = env.read().await;
+            assert_eq!(
+                display_media_types(&mut conn).await,
+                vec!["image/jpeg".to_string()],
+                "the other encoder gets its turn"
+            );
+        }
+        let (_, totals) = env.scan().await;
+        assert_eq!(totals.backfilled_visuals, 0, "and it settles");
+    }
+
+    /// Whether every stored display rendition carries bytes — the difference
+    /// between a picture and the keep-the-original verdict.
+    async fn display_has_bytes(conn: &mut sqlx::SqliteConnection) -> bool {
+        let lengths: Vec<i64> =
+            sqlx::query_scalar("SELECT length(thumbnail) FROM storage.thumbnails ORDER BY idx")
+                .fetch_all(conn)
+                .await
+                .unwrap();
+        !lengths.is_empty() && lengths.iter().all(|length| *length > 0)
     }
 
     /// The whole point of `LOOP_PROCESS_VERSION` being separate: a

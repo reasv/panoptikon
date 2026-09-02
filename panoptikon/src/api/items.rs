@@ -488,9 +488,9 @@ fn rendition_extension(media_type: &str) -> &'static str {
     match media_type {
         "image/webp" => "webp",
         "video/mp4" => "mp4",
-        // Every other stored rendition is a JPEG, and a sentinel row's type is
-        // the item's own — which never reaches here, because a sentinel is
-        // answered with the file.
+        // Every other stored rendition is a JPEG. A sentinel row names the
+        // format its encode was attempted with and never reaches here anyway,
+        // because a sentinel is answered with the file itself.
         _ => "jpg",
     }
 }

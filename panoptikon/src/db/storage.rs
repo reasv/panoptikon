@@ -14,9 +14,13 @@ pub(crate) struct StoredImage {
     /// longer all JPEG — a lossless source's is WebP — so the type travels
     /// with the bytes instead of being assumed from the table.
     ///
-    /// The **item's own** mime type on the one row that carries no bytes: the
-    /// keep-the-original sentinel, which says the original file is the
-    /// rendition (see [`StoredTier::bytes`] for the same convention).
+    /// On the one row that carries no bytes — the keep-the-original sentinel,
+    /// which says the original file is the rendition (see [`StoredTier::bytes`]
+    /// for the same convention) — this is the format that was **attempted**,
+    /// not the item's own mime type. The verdict is about that encoder, so
+    /// recording which one made it is what lets a later format flip retry it
+    /// instead of freezing on it. Nothing serves this value: a sentinel is
+    /// answered with the original file, under the file's own content type.
     pub media_type: String,
     pub bytes: Vec<u8>,
 }

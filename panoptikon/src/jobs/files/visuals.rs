@@ -632,12 +632,19 @@ pub(super) fn build_image_renditions(
             if rendition_beats_original(encoded.bytes.len() as u64, file_size) {
                 out.thumbnails.push(encoded);
             } else {
+                // The row names the format that was **attempted**, never the
+                // source's own mime type. The verdict "no encode came out
+                // comfortably smaller" is a verdict about *this* encoder, so
+                // a later format flip — a policy edit, a transparency
+                // measurement — has to be able to see that the attempt it is
+                // looking at was made with the other one and try again.
+                // Naming the source instead froze the sentinel across every
+                // format change, and, where the source's type happened to be
+                // the rendition's, made a real rendition indistinguishable
+                // from a verdict.
                 out.thumbnails.push(StoredImage {
-                    idx: 0,
-                    width: encoded.width,
-                    height: encoded.height,
-                    media_type: mime_type.to_string(),
                     bytes: Vec::new(),
+                    ..encoded
                 });
             }
             out.blurhash_source = Some(thumb);
@@ -2086,6 +2093,69 @@ mod tests {
     // The one fixture the two test modules share; it stays with the scan's
     // own tests, which also plant animated GIFs.
     use super::super::tests::write_animated_gif;
+
+    /// The **display** sentinel names the format it attempted, never the
+    /// item's own mime type (§2 R2, as adjudicated after the format-flip
+    /// review).
+    ///
+    /// Reached the way a library reaches it: pure noise is what a lossy codec
+    /// is worst at, so a WebP of it does not come out comfortably smaller
+    /// than a plausible PNG of the same picture, and the pass records the
+    /// verdict instead of a second copy. What the row has to carry is *which*
+    /// encoder reached that verdict — "no encode was smaller" is a statement
+    /// about `image/webp` here, and a later policy edit or transparency
+    /// measurement that moves the verdict to JPEG has to be able to see that
+    /// the stored answer was about the other one. Naming `image/png` instead
+    /// froze the sentinel across every format change there is.
+    #[test]
+    fn a_display_sentinel_names_the_format_it_attempted() {
+        // 2560 is the rendition cap, so the plan keeps every pixel and the
+        // encode has no downscale to win with.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(2560, 2560, |_, _| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let bytes = state.to_le_bytes();
+            image::Rgb([bytes[0], bytes[1], bytes[2]])
+        }));
+        // Just past the lossless class's byte bound, which is what makes a
+        // rendition owed at all at this geometry.
+        let file_size = crate::visual_tiers::DISPLAY_MAX_FILE_SIZE_LOSSLESS + 1;
+
+        let mut out = ProducedVisuals::default();
+        build_image_renditions(
+            &mut out,
+            Path::new("noise.png"),
+            "image/png",
+            file_size,
+            image,
+            ImageLadderWork {
+                display: true,
+                // The display half alone: the grid tiers are a different
+                // rule and would only cost three more encodes here.
+                tiers: GridLadder::Nothing,
+                rotation: None,
+                formats: FormatPolicy::default(),
+                transparency: Some(false),
+                loops: Vec::new(),
+            },
+        )
+        .expect("the pass runs on decoded pixels");
+
+        let [row] = out.thumbnails.as_slice() else {
+            panic!("exactly one display row");
+        };
+        assert!(
+            row.bytes.is_empty(),
+            "the premise: no WebP of this picture is comfortably smaller than              a lossless original of it"
+        );
+        assert_eq!(
+            row.media_type, "image/webp",
+            "the format the encode was attempted with, not the source's own"
+        );
+        assert_eq!((row.width, row.height), (2560, 2560));
+    }
 
     /// The settled encoded-larger-than-the-source edge (§2), reached the way
     /// a library reaches it rather than by planting a row: a dithered
