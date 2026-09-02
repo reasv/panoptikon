@@ -8921,9 +8921,10 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         fs::create_dir_all(&media_dir).unwrap();
         // An image the display rule really does store a rendition for, so a
         // missing one is meaningful rather than the normal state of most
-        // images. Under the dimension-first rule that takes *bytes*: 9000x1000
-        // uncompressed is 27 MB, past the 24 MB bound while every pixel bound
-        // is clear, so the rendition is a plain re-encode.
+        // images. Under the dimension-first rule that takes *bytes*: a BMP is
+        // a lossless source, and 9000x1000 uncompressed is 27 MB — far past
+        // that class's 2 MiB bound, while every pixel bound is clear, so the
+        // rendition is a plain re-encode.
         image::RgbImage::new(9000, 1000)
             .save(media_dir.join("large.bmp"))
             .unwrap();
@@ -9130,8 +9131,8 @@ VALUES (?1, 'loop', 'image/gif', ?2, 'failed', 2, 2, '2026-01-01', '2026-01-01')
         fs::create_dir_all(&media_dir).unwrap();
 
         // 9000x1000 uncompressed = 27 MB. Truncating 100 KB leaves it well
-        // past the display rule's 24 MB byte bound, so this one really would
-        // get a stored rendition.
+        // past the lossless class's 2 MiB byte bound, so this one really
+        // would get a stored rendition.
         let large = media_dir.join("large.bmp");
         image::RgbImage::new(9000, 1000).save(&large).unwrap();
         let full_len = fs::metadata(&large).unwrap().len();
