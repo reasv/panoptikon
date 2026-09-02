@@ -206,6 +206,8 @@ pub(super) async fn load_base_frames(
                     // `storage.frames` has no media type column of its own;
                     // these are the JPEGs `encode_jpeg` just wrote.
                     media_type: "image/jpeg".to_string(),
+                    // Stamped by `store_frames`; see `StoredImage::version`.
+                    version: 0,
                     bytes: encode_jpeg(img)?,
                 });
             }

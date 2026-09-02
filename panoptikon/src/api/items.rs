@@ -665,7 +665,7 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
 /// | 5 | animated grid, `still=true`, poster stored | `thumbnail_tiers.grid-*` | stored | `…-{tier}-v{ver}-still` | exact hit ? immutable : no-cache |
 /// | 6 | animated grid, `still=true`, no poster | the file | the file's | + `-still` | as row 4 |
 /// | 7 | static ladder, tier rendition found | `thumbnail_tiers` row | stored | `…-{tier}-v{ver}` + variant | exact or `fall_up_is_final` ? immutable : no-cache |
-/// | 8 | static ladder, display rendition found | `thumbnails` row | stored | `sha-thumb{idx}-{w}x{h}-{fmt}` + variant | `size == display` or `fall_up_is_final` ? immutable : no-cache |
+/// | 8 | static ladder, display rendition found | `thumbnails` row | stored | `sha-thumb{idx}-{w}x{h}-{fmt}-v{ver}` + variant | `size == display` or `fall_up_is_final` ? immutable : no-cache |
 /// | 8b | display rendition is the sentinel (no bytes) | the file | the file's | + variant | `size == display` or `fall_up_is_final` ? immutable/drifted : no-cache |
 /// | 2b | animated `display`, over the trigger | `thumbnail_tiers.loop`/`loop-display` | stored (`video/mp4`) | `sha-thumb0-{tier}-v{ver}` | immutable |
 /// | 9 | image, nothing stored | the file | the file's | + variant | `fall_up_is_final` ? immutable/drifted : no-cache |
@@ -685,10 +685,11 @@ fn tier_fall_up_is_final(item: &ItemRecord, size: ThumbnailTier) -> bool {
 /// * **Rendition rows never drift** — they are derived from exactly the
 ///   content the URL names — so their lifetime is [`rendition_cache_control`]
 ///   alone.
-/// * The **display** row's ETag carries its geometry and its format, because
-///   both can change under the same URL: the display rendition has no version
-///   column, and its rule now decides a container as well as a size. The tier
-///   rows say the same thing with `-v{ver}` instead.
+/// * The **display** row's ETag carries its geometry, its format *and* its
+///   generator version, because all three can change under the same URL: the
+///   rule is short-side based, its container follows the source class, and a
+///   generator bump regenerates in place. The tier rows carry the same three
+///   facts, the geometry implicitly in the tier name.
 #[allow(clippy::too_many_arguments)]
 async fn thumbnail_response(
     conn: &mut sqlx::SqliteConnection,
@@ -857,18 +858,22 @@ async fn thumbnail_response(
             )
             .await;
         }
-        // Geometry *and* format in the validator, because both can change
-        // under this URL and nothing else here can see it: the display
-        // rendition carries no generator version, its rule is now short-side
-        // based (the geometry moves), and its container follows the source
-        // class, the transparency measurement and the per-database policy (the
-        // format moves). A bare `sha-thumb{idx}` served immutably would hand
-        // pre-upgrade bytes back for a year.
-        let etag = format!(
-            "\"{sha256}-thumb{index}-{}x{}-{}{still_suffix}\"",
+        // Geometry, format *and* generator version, because every one of
+        // them can change under this URL and nothing else here can see it:
+        // the rule is short-side based (the geometry moves), the container
+        // follows the source class, the transparency measurement and the
+        // per-database policy (the format moves), and a version bump
+        // regenerates the same picture at the same `(item, idx)` with
+        // different bytes. A bare `sha-thumb{idx}` served immutably would
+        // hand pre-upgrade bytes back for a year.
+        let etag = display_etag(
+            sha256,
+            index,
             stored.width,
             stored.height,
-            media_type_tag(&stored.media_type)
+            &stored.media_type,
+            stored.version,
+            still_suffix,
         );
         let filename = format!(
             "{original_filename_no_ext}.{}",
@@ -934,6 +939,27 @@ async fn thumbnail_response(
 /// entirely.
 fn tier_etag(sha256: &str, index: i64, tier: &str, version: i64, still_suffix: &str) -> String {
     format!("\"{sha256}-thumb{index}-{tier}-v{version}{still_suffix}\"")
+}
+
+/// The validator for one stored **display** rendition, and the only place its
+/// shape is written.
+///
+/// The tier rows name a tier whose geometry and format are fixed by the rule;
+/// a display rendition's are not, so it names them itself — and the generator
+/// version alongside, for exactly the reason [`tier_etag`] carries one.
+fn display_etag(
+    sha256: &str,
+    index: i64,
+    width: i64,
+    height: i64,
+    media_type: &str,
+    version: i64,
+    still_suffix: &str,
+) -> String {
+    format!(
+        "\"{sha256}-thumb{index}-{width}x{height}-{}-v{version}{still_suffix}\"",
+        media_type_tag(media_type)
+    )
 }
 
 /// The `still` variant's ETag suffix, which is part of every ETag on this
@@ -2264,7 +2290,7 @@ VALUES (?1, 0, 'image/jpeg', 9000, 1000, 1, ?2)
         // bytes this URL answers with, under the same URL.
         assert_eq!(
             response.headers().get(header::ETAG).unwrap(),
-            format!("\"{}-thumb0-9000x1000-jpeg\"", item.sha256).as_str()
+            format!("\"{}-thumb0-9000x1000-jpeg-v1\"", item.sha256).as_str()
         );
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -2599,7 +2625,19 @@ VALUES (?1, 0, 'image/png', 'image/webp', 2560, 284, 1, ?2)
             .to_str()
             .unwrap()
             .to_string();
-        assert_eq!(etag, format!("\"{}-thumb0-2560x284-webp\"", item.sha256));
+        assert_eq!(etag, format!("\"{}-thumb0-2560x284-webp-v1\"", item.sha256));
+        // Every input that can change the bytes under this URL moves the
+        // validator, the generator version included: a bump regenerates the
+        // same picture at the same `(item, idx)`, and an immutable response
+        // with a blind validator would hold the superseded bytes for a year.
+        assert_ne!(
+            display_etag(&item.sha256, 0, 2560, 284, "image/webp", 1, ""),
+            display_etag(&item.sha256, 0, 2560, 284, "image/webp", 2, "")
+        );
+        assert_ne!(
+            display_etag(&item.sha256, 0, 2560, 284, "image/webp", 1, ""),
+            display_etag(&item.sha256, 0, 2560, 284, "image/jpeg", 1, "")
+        );
 
         let mut ranged = HeaderMap::new();
         ranged.insert(header::RANGE, "bytes=2-5".parse().unwrap());

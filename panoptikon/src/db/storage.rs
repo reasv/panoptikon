@@ -19,6 +19,16 @@ pub(crate) struct StoredImage {
     /// are written once, in `crate::visual_tiers`'s module docs under "The
     /// keep-the-original sentinel".
     pub media_type: String,
+    /// The generator version the row carries.
+    ///
+    /// Stamped by [`store_thumbnails`] and [`store_frames`] from their own
+    /// `process_version` argument, never from here — a generation pass makes
+    /// pictures, not stamps, and the two writers use different constants for
+    /// the same picture. It is *read* because the display rendition's ETag
+    /// names it: a regeneration lands at the same `(item, idx)` with
+    /// different bytes, and a validator blind to the version would keep an
+    /// immutable response on the superseded picture for a year.
+    pub version: i64,
     pub bytes: Vec<u8>,
 }
 
@@ -351,7 +361,7 @@ pub(crate) async fn get_thumbnail_image(
 ) -> ApiResult<Option<StoredImage>> {
     let row = sqlx::query(
         r#"
-SELECT idx, width, height, media_type, thumbnail
+SELECT idx, width, height, media_type, version, thumbnail
 FROM storage.thumbnails
 WHERE item_sha256 = ?1 AND idx = ?2
 LIMIT 1
@@ -380,6 +390,9 @@ LIMIT 1
         media_type: row
             .try_get("media_type")
             .map_err(|err| field("media_type", err))?,
+        version: row
+            .try_get("version")
+            .map_err(|err| field("version", err))?,
         bytes: row
             .try_get("thumbnail")
             .map_err(|err| field("thumbnail", err))?,
@@ -508,15 +521,18 @@ pub(crate) struct ThumbnailGeometry {
     pub width: i64,
     pub height: i64,
     pub media_type: String,
+    /// See [`StoredImage::version`]: the row's stamp, which the display
+    /// rendition's ETag names.
+    pub version: i64,
 }
 
 pub(crate) async fn get_thumbnail_geometry(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
 ) -> ApiResult<Vec<ThumbnailGeometry>> {
-    let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+    let rows: Vec<(i64, i64, i64, String, i64)> = sqlx::query_as(
         r#"
-SELECT idx, width, height, media_type
+SELECT idx, width, height, media_type, version
 FROM storage.thumbnails
 WHERE item_sha256 = ?1
 ORDER BY idx
@@ -531,11 +547,12 @@ ORDER BY idx
     })?;
     Ok(rows
         .into_iter()
-        .map(|(idx, width, height, media_type)| ThumbnailGeometry {
+        .map(|(idx, width, height, media_type, version)| ThumbnailGeometry {
             idx,
             width,
             height,
             media_type,
+            version,
         })
         .collect())
 }
@@ -1051,6 +1068,7 @@ VALUES
                     width: 163,
                     height: 4096,
                     media_type: "image/jpeg".to_string(),
+                    version: 0,
                     bytes: vec![0_u8],
                 }],
             )
@@ -1138,6 +1156,7 @@ VALUES
             width: 10,
             height: 10,
             media_type: "image/jpeg".to_string(),
+            version: 0,
             bytes: vec![0_u8],
         };
         store_thumbnails(

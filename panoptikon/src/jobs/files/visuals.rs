@@ -2110,6 +2110,9 @@ pub(super) fn encode_image(
         width: image.width() as i64,
         height: image.height() as i64,
         media_type: format.media_type().to_string(),
+        // The stamp is the storage layer's ([`StoredImage::version`]); a pass
+        // produces pictures, not versions.
+        version: 0,
         bytes,
     })
 }
