@@ -148,7 +148,7 @@ pub(crate) async fn enqueue_data_extraction(
     // the job will actually run with.
     let store = SystemConfigStore::from_env();
     let config = store.load(&conn.index_db)?;
-    validate_external_inputs(&query.inference_ids).await?;
+    validate_external_inputs(&job_inference_context().primary, &query.inference_ids).await?;
     let mut jobs = Vec::new();
     for inference_id in query.inference_ids {
         let model = crate::jobs::extraction::load_model_metadata(&inference_id).await?;
@@ -471,14 +471,19 @@ pub(crate) async fn update_config(
             config.cron_schedule
         )));
     }
-    validate_external_inputs(
-        &config
-            .cron_jobs
-            .iter()
-            .map(|job| job.inference_id.clone())
-            .collect::<Vec<_>>(),
-    )
-    .await?;
+    // External-input validation is scoped to the cron-job models this save
+    // ADDS. The stored config already schedules the rest, and every other
+    // key (scan toggles, folders, thumbnail formats...) has nothing to do
+    // with inference — so a save of any of them must not depend on the
+    // inference upstream being reachable. Before this comparison an
+    // unreachable upstream failed every save (a 500 in-process, a 508 loop
+    // when the upstream defaulted to the gateway's own API URL), which is
+    // exactly the "commit path rejects unrelated saves" failure CLAUDE.md
+    // rules out.
+    let store = SystemConfigStore::from_env();
+    let before = store.load_readonly(&conn.index_db)?;
+    let added = newly_scheduled_inference_ids(&before, &config);
+    validate_external_inputs(&job_inference_context().primary, &added).await?;
     // Normalize retired quantizer kinds into the section that gets SAVED —
     // the load path already reads `binary` as `int8`, so rewriting the file
     // is what makes it converge and stops the load-time warning; rejecting
@@ -498,7 +503,6 @@ pub(crate) async fn update_config(
             return Err(ApiError::bad_request(message));
         }
     }
-    let store = SystemConfigStore::from_env();
     store.save(&conn.index_db, &config)?;
     let config = store.load(&conn.index_db)?;
     let _ = continuous_scan::notify_config_change(&conn.index_db).await;
@@ -525,16 +529,41 @@ pub(crate) async fn update_config(
     Ok(Json(config))
 }
 
+/// The cron-job inference IDs that `after` schedules and `before` does not,
+/// in `after`'s order and without duplicates. These are the only models a
+/// config save has to validate against the inference upstream: everything
+/// `before` already scheduled went through this check when it was added.
+fn newly_scheduled_inference_ids(before: &SystemConfig, after: &SystemConfig) -> Vec<String> {
+    let known = before
+        .cron_jobs
+        .iter()
+        .map(|job| job.inference_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut added: Vec<String> = Vec::new();
+    for job in &after.cron_jobs {
+        if !known.contains(job.inference_id.as_str()) && !added.contains(&job.inference_id) {
+            added.push(job.inference_id.clone());
+        }
+    }
+    added
+}
+
 /// Validate declarations when the upstream supports the additive endpoint.
 /// Older remote Python Inferio servers do not have it, so a 404 preserves
 /// their previous behavior; every other discovery failure is surfaced.
 /// Load-time Inferio validation remains authoritative for current servers.
-async fn validate_external_inputs(inference_ids: &[String]) -> Result<(), ApiError> {
-    let status = match job_inference_context()
-        .primary
-        .get_external_inputs_optional()
-        .await
-    {
+///
+/// With nothing to validate the upstream is never contacted: callers pass
+/// only the models a request introduces, so a request that introduces none
+/// must succeed even when the inference server is down.
+async fn validate_external_inputs(
+    client: &crate::inferio_client::InferenceApiClient,
+    inference_ids: &[String],
+) -> Result<(), ApiError> {
+    if inference_ids.is_empty() {
+        return Ok(());
+    }
+    let status = match client.get_external_inputs_optional().await {
         Ok(Some(status)) => status,
         Ok(None) => return Ok(()),
         Err(error) => {
@@ -1250,7 +1279,124 @@ pub(crate) async fn get_continuous_scan_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::http::Uri;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn config_scheduling(inference_ids: &[&str]) -> SystemConfig {
+        SystemConfig {
+            cron_jobs: inference_ids
+                .iter()
+                .map(|id| crate::db::system_config::CronJob {
+                    inference_id: id.to_string(),
+                    batch_size: None,
+                    threshold: None,
+                })
+                .collect(),
+            ..SystemConfig::default()
+        }
+    }
+
+    /// Only the cron-job models a save introduces need external-input
+    /// validation; re-saving the same schedule (or an unrelated key) adds
+    /// nothing, and removed models are not the upstream's business.
+    #[test]
+    fn only_newly_scheduled_cron_models_need_validation() {
+        let before = config_scheduling(&["tags/a", "clip/b"]);
+
+        let same = config_scheduling(&["clip/b", "tags/a"]);
+        assert!(newly_scheduled_inference_ids(&before, &same).is_empty());
+
+        let mut unrelated = before.clone();
+        unrelated.detect_outros = !before.detect_outros;
+        unrelated.included_folders.push("/somewhere".into());
+        assert!(newly_scheduled_inference_ids(&before, &unrelated).is_empty());
+
+        let removed = config_scheduling(&["tags/a"]);
+        assert!(newly_scheduled_inference_ids(&before, &removed).is_empty());
+
+        let added = config_scheduling(&["tags/a", "ocr/c", "clip/b", "ocr/c", "clip/d"]);
+        assert_eq!(
+            newly_scheduled_inference_ids(&before, &added),
+            vec!["ocr/c".to_string(), "clip/d".to_string()]
+        );
+
+        // First save on a database whose config.toml does not exist yet:
+        // the "before" is the default (empty) schedule, so every model is new.
+        let fresh = SystemConfig::default();
+        assert_eq!(
+            newly_scheduled_inference_ids(&fresh, &removed),
+            vec!["tags/a".to_string()]
+        );
+    }
+
+    /// The unreachable-upstream regression: a save that schedules no new
+    /// model must not even contact the inference server, while a save that
+    /// does still surfaces a broken upstream.
+    #[tokio::test]
+    async fn no_new_models_means_no_inference_request() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/api/inference/external-inputs",
+            get(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let broken = crate::inferio_client::InferenceApiClient::new_with_metadata_cache(
+            format!("http://{addr}"),
+            false,
+        )
+        .unwrap();
+
+        validate_external_inputs(&broken, &[]).await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "an empty set must not hit the upstream"
+        );
+
+        let error = validate_external_inputs(&broken, &["tags/new".to_string()])
+            .await
+            .unwrap_err();
+        // The client retries 5xx responses, so only the fact of contact
+        // is asserted, not the exact count.
+        assert!(hits.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // A server that is not listening at all (the "inference server is
+        // down" deployment) behaves the same way: silent for an empty set,
+        // an error once there is something to validate.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let unreachable = crate::inferio_client::InferenceApiClient::new_with_metadata_cache(
+            format!("http://{dead_addr}"),
+            false,
+        )
+        .unwrap();
+        validate_external_inputs(&unreachable, &[]).await.unwrap();
+        assert!(
+            validate_external_inputs(&unreachable, &["tags/new".to_string()])
+                .await
+                .is_err()
+        );
+    }
 
     /// The UI sends list params FastAPI-style
     /// (?inference_ids=a&inference_ids=b). Plain axum::extract::Query
