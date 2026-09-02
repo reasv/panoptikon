@@ -264,3 +264,65 @@ adjudication → fixer, per wave. Nothing pushed.
   a per-frame decode trace; today static and animated share the 5 MiB bound.
 - Video stills as WebP; PQL-rule-driven per-item format policy (the row-level
   `media_type` and expected-vs-stored comparison already leave room for it).
+
+## 10. Outcome (2026-09-02)
+
+Implemented and merged: backend `2b76ac7` (35 commits), UI `rust-ui@47ea696`
+(23 commits), gitlink bump `a40a180`. Nothing pushed. Two adversarial rounds
+per branch, an integration round and a final round on isolated stacks, then
+five Fable architectural reviews applied (backend 17 commits, UI 15).
+
+**Verified on real fixtures** (final round, 2,991 files incl. every Phase-C
+worst case): zero ffmpeg spawns across eight rescans — a library-wide
+transparency pass and a full static-tier regeneration over 37 animated items
+left all 42 loop rows byte- and rowid-identical; the loop-sentinel migration
+flipped exactly the five empty rows of a pre-review database and the next
+scan wrote nothing; a `["jpeg"]` policy flip and restore returned the store
+byte-identical; at the slider minimum the grid decodes 4× fewer megapixels
+and transfers 4.1× fewer bytes, and at every other size the request stream is
+identical to the pre-package build (the per-item orientation-aware tier
+choice never asks for a larger rung than width-only did on the measured
+corpora). 1171 backend tests, 20 UI suites under the new `npm test`.
+
+**Corrections adopted after the reviews** (each with a test):
+- Loop reuse now runs on every animated-ladder dispatch path, per row, with
+  retained rows *named* (`TierPayload::Retained`) instead of copied through
+  the worker — before this the real upgrade pass would have re-encoded every
+  loop despite the unit test proving the tier bump did not.
+- One sentinel convention on both tables: the row names the format the
+  generator *tried* (loops: `video/mp4`); a sentinel is final only while that
+  format is still the verdict. Migration `20260902130000` rewrites the
+  pre-review loop sentinels.
+- `JPEG_MAX_SIDE` (65535) joins `WEBP_MAX_SIDE`: a shape no container can hold
+  serves the original by rule instead of failing as a file verdict.
+- Display ETag = `{sha}-thumb{idx}-{w}x{h}-{fmt}-v{ver}[-still]`.
+- The display rule is `display_shape` (geometry + trigger, what the serve side
+  asks) composed with the policy (what the generator asks).
+- Gallery large view: on a `<video>` error the fallback is the bare URL first
+  (a keep-original sentinel answers the animating original), `still=true`
+  second — `still=true` at the display size answers the ≤1024 poster for any
+  animated item above the raw floor, never the original.
+- The grid card chooses its tier per row from the box edge its picture's
+  short side must cover under `object-cover` (`coverBindingEdge`), latched at
+  mount; `smallCell` is derived in the card, not passed.
+- One URL builder per element kind (`lib/thumbnailURL.ts`): a bare-URL
+  builder that takes a sha, and a picture builder that *requires* the row and
+  the trigger, so an `<img>` consumer cannot forget `still=true`.
+
+**Traps recorded:** a hand-launched `next start` behind a scratch gateway does
+its SSR fetches against the default API base (production) unless
+`PANOPTIKON_API_URL` is set; Edge without
+`--disable-features=CalculateNativeWinOcclusion` never issues a `<video>`
+request while occluded (poster forever, no error — looks exactly like a broken
+fallback); tailwind-merge does not know a custom `@utility`, so a shadcn
+`<Button>` under one keeps its own `rounded-md`; editing a committed migration's
+comment changes its checksum (self-healed, but a WARN on upgrade).
+
+**User QA:** the format switch is invisible by design except: the gallery's
+14 MiB PNGs now load as ~1 MiB WebP; transparent PNGs show the background
+through in the grid and gallery instead of black; heavy GIFs open as loops
+(sentinel ones as the animating original); the scan settings page gains
+"Thumbnail Formats"; the first scan after upgrade regenerates every tier once
+(one decode per image) and the DB file shrinks only after the maintenance
+VACUUM. Grid-xs at the slider minimum is the visible perf change.
+
