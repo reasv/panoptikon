@@ -203,6 +203,15 @@ quality is the point). Fast channel = HW encoder when the probe validated
 one, else `libx264 -preset veryfast`. Playback-cache renditions always use
 the fast channel (throwaway quality, latency matters).
 
+*Amended 2026-09-03*: `preview` joins the table for the grid/filmstrip hover
+preview (`docs/video-hover-preview-implementation.md` §3) — h264 mp4, **no
+audio**, CRF 26, cap 480p/30 fps, fast channel, on a `Surface::Preview` of its
+own so it never appears in a clip or mosaic dropdown. The 16 s window is a
+trim bound the client sends (`end_cs = 1600`), not a preset field, so a short
+video previews whole under the same key it would have anyway. `-an` needs no
+new code: `run.rs` already emits it for any preset with no `acodec`, which
+until now was only the animated-image containers.
+
 Built-ins (initial set): `playback` (h264+aac mp4, cap 1080p, fast),
 `clip` (quality) / `clip-fast`, `webp-anim`, `mosaic-mp4` (quality) /
 `mosaic-mp4-fast`, `mosaic-webm`. Animated AVIF was deliberately deferred
@@ -345,8 +354,11 @@ Capability: `pub video_transcode: bool` in `ClientCapabilities`, probed off
 `POST /api/video/transcode` per the four-edit pattern; UI gates via
 `clientConfig` with the `!== false` default-on convention. Per-policy limits
 ride the free-form `[policies.client]` table (e.g. `transcode_presets`,
-`max_transcode_resolution`) — profiles stay global, only exposure/limits are
-per-policy.
+`max_transcode_resolution`, `hover_preview`) — profiles stay global, only
+exposure/limits are per-policy. `hover_preview = false` turns the
+grid/filmstrip hover preview off for a policy, direct playback of the
+original included; absent means allowed, so no seeded config needs a new live
+line.
 
 ## 8. Feature specifics
 

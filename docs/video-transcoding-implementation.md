@@ -223,6 +223,27 @@ code has no Settings handle); `validate_transcode()` in
 is a tunable default), appended to all five `config/server/*.toml`,
 including a commented `[transcode.profiles.small-share]` example.
 
+`hover_preview` ("auto" | "on" | "off", default `"auto"`) joins them with the
+grid/filmstrip hover preview (`docs/video-hover-preview-implementation.md`):
+`"auto"` allows the `preview` rendition only where `hw::fast_h264_encoder()`
+validated one, since a software encode of every cell a pointer crosses is a
+CPU bill the host did not ask for. Parsed by `hw::parse_hover_preview`,
+rejected at config load like `hwaccel`, resolved by
+`hw::resolve_hover_preview` (probe injected, so `"on"`/`"off"` never spawn
+ffmpeg) and published per policy on `/api/client-config` as
+`hover_preview: {direct, transcode}`; `[policies.client] hover_preview =
+false` denies both rungs, and dropping `preview` from that policy's
+`transcode_presets` denies the transcode rung alone.
+
+**Preview jobs get no priority lane.** They are `JobWeight::Light` like every
+other single-file job and take their ordinary FIFO place behind gallery
+playback transcodes and clip exports, which at the default
+`max_concurrent_jobs = 1` means a hovered cell waits for whatever is already
+encoding — and says so, through the queue position the pool already reports.
+A lane that let a skimmed pointer jump ahead of an export the user is waiting
+on would be the wrong trade; the 16 s cap and the client's one-preview-at-a-
+time rule are what keep the queue short instead.
+
 ### API (`api/video.rs`)
 
 - `POST /api/video/transcode` — `{id, id_type, preset, start_cs?, end_cs?}`
