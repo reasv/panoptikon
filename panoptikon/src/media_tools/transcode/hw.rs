@@ -156,6 +156,23 @@ pub(crate) fn resolve_hover_preview(
     }
 }
 
+/// Whether gateway startup should warm the hardware-encoder probe for this
+/// setting, given the raw `[transcode] hover_preview` value.
+///
+/// The pure half of the startup decision, and deliberately *the same*
+/// question [`resolve_hover_preview`] asks: it is true exactly when that
+/// function would call its probe closure, so the warm-up and the answer it
+/// warms can never disagree about which settings need a toolchain. `"on"` and
+/// `"off"` have already decided, so warming for them would spawn ffmpeg twice
+/// for nothing — which on `"off"` is precisely the cost the setting exists to
+/// avoid.
+pub(crate) fn hover_preview_probe_warm_needed(configured: &str) -> bool {
+    matches!(
+        parse_hover_preview(configured).unwrap_or(HoverPreview::Auto),
+        HoverPreview::Auto
+    )
+}
+
 /// The live answer for this process: the configured setting against the real
 /// probe.
 ///
@@ -163,6 +180,11 @@ pub(crate) fn resolve_hover_preview(
 /// the encoder listing and the validation encode (up to
 /// [`VALIDATE_TIMEOUT`]). Callers on an async runtime must reach it through
 /// `spawn_blocking`.
+///
+/// Gateway startup warms that first call in the background (`main`, gated on
+/// [`hover_preview_probe_warm_needed`]), so in a served process this is
+/// normally a `OnceLock` read; the `spawn_blocking` at the call site is the
+/// fallback for a cold or short-lived one.
 pub(crate) fn hover_preview_enabled() -> bool {
     let configured = crate::config::runtime().transcode.hover_preview.clone();
     // Config load rejected anything else; a RuntimeConfig built outside
@@ -558,6 +580,38 @@ Encoders:
                 probes.get(),
                 u32::from(setting == HoverPreview::Auto),
                 "{setting:?} consults the probe exactly when it is auto"
+            );
+        }
+    }
+
+    /// The startup warm-up decision, pinned against the resolution it warms:
+    /// `main` schedules the probe exactly when `resolve_hover_preview` would
+    /// call one, invalid values included (both fall back to `auto`). Two
+    /// separate readings of "is this auto?" would drift, and the drift would
+    /// be invisible — a warm-up that never fires just moves the cost back
+    /// onto the first page load it was added to spare.
+    #[test]
+    fn startup_warms_the_probe_exactly_when_the_resolution_would_run_it() {
+        assert!(hover_preview_probe_warm_needed("auto"));
+        assert!(hover_preview_probe_warm_needed(" AUTO "));
+        assert!(!hover_preview_probe_warm_needed("on"));
+        assert!(!hover_preview_probe_warm_needed("off"));
+        assert!(
+            hover_preview_probe_warm_needed("nonsense"),
+            "an unparseable value falls back to auto, as the resolution does"
+        );
+
+        for value in ["auto", " AUTO ", "on", "off", "nonsense", ""] {
+            let setting = parse_hover_preview(value).unwrap_or(HoverPreview::Auto);
+            let mut probed = false;
+            let _ = resolve_hover_preview(setting, || {
+                probed = true;
+                false
+            });
+            assert_eq!(
+                probed,
+                hover_preview_probe_warm_needed(value),
+                "{value:?} must warm iff its resolution probes"
             );
         }
     }
