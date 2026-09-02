@@ -631,6 +631,67 @@ WHERE sha256 = ?3 AND rotation IS NULL
     Ok(result.rows_affected())
 }
 
+/// The scan dispatcher's transparency question
+/// (docs/thumbnail-format-implementation.md §2, R4): "is this an image whose
+/// pixels nothing has examined?" `false` means the item has been examined, has
+/// no pixels of its own to examine, or is not indexed.
+///
+/// Images only, and scoped in SQL rather than trusting the dispatcher's
+/// extension guess, for the same reason as [`item_rotation_pending`]: the
+/// index's own `type` is what the column's semantics are documented against.
+/// The half-open range is what `idx_items_transparency_pending` can serve;
+/// `LIKE 'image/%'` is the anti-pattern this codebase has already paid for
+/// elsewhere.
+pub(crate) async fn item_transparency_pending(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        r#"
+SELECT 1
+FROM items
+WHERE sha256 = ?1
+  AND has_transparency IS NULL
+  AND type >= 'image/' AND type < 'image0'
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read an item's transparency state");
+        ApiError::internal("Failed to query item")
+    })?;
+    Ok(row.is_some())
+}
+
+/// Stores one item's measured transparency.
+///
+/// Guarded on `has_transparency IS NULL`, which is the whole write policy: the
+/// column holds a measurement, a measurement is written once, and neither a
+/// concurrent pass over identical content nor a re-dispatch that slipped
+/// through may overwrite one. Like [`set_item_codecs`] there is no
+/// negative-cache delete: a file whose pixels do not decode records nothing at
+/// all and is settled by the visuals marker instead.
+pub(crate) async fn set_item_transparency(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+    has_transparency: bool,
+) -> ApiResult<u64> {
+    let result = sqlx::query(
+        "UPDATE items SET has_transparency = ?1 WHERE sha256 = ?2 AND has_transparency IS NULL",
+    )
+    .bind(has_transparency)
+    .bind(sha256)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, sha256, "failed to store an item's transparency");
+        ApiError::internal("Failed to store item transparency")
+    })?;
+    Ok(result.rows_affected())
+}
+
 /// What the scan's dimension-first questions are answered from, for one item.
 ///
 /// Every field is indexed metadata, deliberately: the served-directly
@@ -655,24 +716,30 @@ pub(crate) struct ItemVisualFacts {
     /// and the picture the `width`/`height` above describe, `NULL` for an item
     /// nothing has examined. See [`ItemScanMeta::rotation`].
     pub rotation: Option<i64>,
+    /// `items.has_transparency`: whether the pixels are anywhere non-opaque,
+    /// `NULL` for an item nothing has examined. It decides the *format* of
+    /// every rendition of the item (R4), so the dispatcher needs it to predict
+    /// what the generator would write.
+    pub has_transparency: Option<bool>,
 }
 
-/// One read for all four, because the questions above are asked about the same
+/// One read for all five, because the questions above are asked about the same
 /// file in the same dispatch and the deployment this runs on scans a library
 /// over SMB.
 pub(crate) async fn get_item_visual_facts(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
 ) -> ApiResult<Option<ItemVisualFacts>> {
-    let row: Option<ItemVisualFacts> =
-        sqlx::query_as("SELECT width, height, duration, rotation FROM items WHERE sha256 = ?1")
-            .bind(sha256)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "failed to read item visual facts");
-                ApiError::internal("Failed to query item")
-            })?;
+    let row: Option<ItemVisualFacts> = sqlx::query_as(
+        "SELECT width, height, duration, rotation, has_transparency FROM items WHERE sha256 = ?1",
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to read item visual facts");
+        ApiError::internal("Failed to query item")
+    })?;
     Ok(row)
 }
 

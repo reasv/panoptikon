@@ -9,6 +9,15 @@ pub(crate) struct StoredImage {
     pub idx: i64,
     pub width: i64,
     pub height: i64,
+    /// What the endpoint serves these bytes as
+    /// (docs/thumbnail-format-implementation.md §3). Display renditions are no
+    /// longer all JPEG — a lossless source's is WebP — so the type travels
+    /// with the bytes instead of being assumed from the table.
+    ///
+    /// The **item's own** mime type on the one row that carries no bytes: the
+    /// keep-the-original sentinel, which says the original file is the
+    /// rendition (see [`StoredTier::bytes`] for the same convention).
+    pub media_type: String,
     pub bytes: Vec<u8>,
 }
 
@@ -22,12 +31,18 @@ pub(crate) struct StoredTier {
     /// `ThumbnailTier::as_str`, or `visual_tiers::LOOP_TIER` for an animated
     /// item's video loop — never a free-form string.
     pub tier: &'static str,
-    /// What the endpoint serves these bytes as: `image/jpeg` for every still
-    /// rendition, `video/mp4` for a loop, and the *item's own* mime type for
-    /// the one row that carries no bytes (see `bytes`).
+    /// What the endpoint serves these bytes as: `image/jpeg` or `image/webp`
+    /// for a still rendition, `video/mp4` for a loop, and the *item's own*
+    /// mime type for a row that carries no bytes (see `bytes`).
     pub media_type: String,
     pub width: i64,
     pub height: i64,
+    /// The generator version these bytes were made at — per row, not per set:
+    /// an animated item's posters carry `TIER_PROCESS_VERSION` and its loops
+    /// `LOOP_PROCESS_VERSION`, which is what lets a still-encoder change
+    /// regenerate every poster in the library without re-running ffmpeg over
+    /// every animation (docs/thumbnail-format-implementation.md §3).
+    pub version: i64,
     /// **Empty means the original file is the rendition.** Only the loop row
     /// is ever written that way, and only for the settled
     /// encoded-larger-than-the-source verdict: the geometry still has to be
@@ -50,6 +65,11 @@ pub(crate) struct TierGeometry {
     /// different crop anchor, a different filter, a different quality — so
     /// the dispatcher compares this too and treats an older stamp as work.
     pub version: i64,
+    /// The stored `media_type`. Compared alongside the geometry, because
+    /// nothing else can see a format change: R4's transparency measurement,
+    /// R5's policy edit and the display switch all leave the dimensions where
+    /// they were (docs/thumbnail-format-implementation.md §4).
+    pub media_type: String,
 }
 
 pub(crate) async fn has_thumbnail(
@@ -170,14 +190,15 @@ WHERE item_sha256 = ?1 AND version <= ?2
         sqlx::query(
             r#"
 INSERT INTO storage.thumbnails (
-    item_sha256, idx, item_mime_type, width, height, version, thumbnail
+    item_sha256, idx, item_mime_type, media_type, width, height, version, thumbnail
 )
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
         )
         .bind(sha256)
         .bind(thumb.idx)
         .bind(mime_type)
+        .bind(&thumb.media_type)
         .bind(thumb.width)
         .bind(thumb.height)
         .bind(process_version)
@@ -287,9 +308,11 @@ LIMIT 1
     Ok(Some(bytes))
 }
 
-/// [`get_thumbnail_bytes`] with the stored geometry attached: the compose
-/// path materializes the blob to disk and synthesizes the input's
-/// `StreamInfo` from these dimensions instead of probing what it just wrote.
+/// [`get_thumbnail_bytes`] with the stored geometry and media type attached:
+/// the thumbnail endpoint needs all three (they are the response's
+/// Content-Type, filename extension and ETag), and the compose path
+/// synthesizes its input's `StreamInfo` from the dimensions instead of probing
+/// what it just wrote.
 pub(crate) async fn get_thumbnail_image(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
@@ -297,7 +320,7 @@ pub(crate) async fn get_thumbnail_image(
 ) -> ApiResult<Option<StoredImage>> {
     let row = sqlx::query(
         r#"
-SELECT idx, width, height, thumbnail
+SELECT idx, width, height, media_type, thumbnail
 FROM storage.thumbnails
 WHERE item_sha256 = ?1 AND idx = ?2
 LIMIT 1
@@ -323,6 +346,9 @@ LIMIT 1
         idx: row.try_get("idx").map_err(|err| field("idx", err))?,
         width: row.try_get("width").map_err(|err| field("width", err))?,
         height: row.try_get("height").map_err(|err| field("height", err))?,
+        media_type: row
+            .try_get("media_type")
+            .map_err(|err| field("media_type", err))?,
         bytes: row
             .try_get("thumbnail")
             .map_err(|err| field("thumbnail", err))?,
@@ -341,11 +367,14 @@ LIMIT 1
 /// No `visual_attempts` delete: the negative cache shadows `thumbnails` and
 /// `frames`, and a tier is neither — a tier is derived from a rendition the
 /// positive cache already holds, or from a decode that cache already settled.
+///
+/// The generator version is per row rather than per call
+/// ([`StoredTier::version`]): one write can carry posters at
+/// `TIER_PROCESS_VERSION` beside loops at `LOOP_PROCESS_VERSION`.
 pub(crate) async fn store_thumbnail_tiers(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
     mime_type: &str,
-    process_version: i64,
     tiers: &[StoredTier],
 ) -> ApiResult<()> {
     sqlx::query(
@@ -378,7 +407,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         .bind(&tier.media_type)
         .bind(tier.width)
         .bind(tier.height)
-        .bind(process_version)
+        .bind(tier.version)
         .bind(&tier.bytes)
         .execute(&mut *conn)
         .await
@@ -418,16 +447,29 @@ WHERE item_sha256 = ?1
     Ok(result.rows_affected())
 }
 
-/// Every stored display rendition of an item as `(idx, width, height)`,
-/// ordered by index. Geometry only — the blobs stay on disk, because this
-/// answers a dispatcher question asked once per file per scan.
+/// Every stored display rendition of an item, ordered by index. Geometry and
+/// media type only — the blobs stay on disk, because this answers a dispatcher
+/// question asked once per file per scan.
+///
+/// The media type is part of the answer for the same reason it is part of
+/// [`TierGeometry`]: a format change moves no dimension, so a comparison that
+/// saw only the geometry would call a stored JPEG the WebP the current rule
+/// wants, forever.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThumbnailGeometry {
+    pub idx: i64,
+    pub width: i64,
+    pub height: i64,
+    pub media_type: String,
+}
+
 pub(crate) async fn get_thumbnail_geometry(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
-) -> ApiResult<Vec<(i64, i64, i64)>> {
-    sqlx::query_as(
+) -> ApiResult<Vec<ThumbnailGeometry>> {
+    let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
         r#"
-SELECT idx, width, height
+SELECT idx, width, height, media_type
 FROM storage.thumbnails
 WHERE item_sha256 = ?1
 ORDER BY idx
@@ -439,7 +481,16 @@ ORDER BY idx
     .map_err(|err| {
         tracing::error!(error = %err, "failed to read thumbnail geometry");
         ApiError::internal("Failed to read thumbnails")
-    })
+    })?;
+    Ok(rows
+        .into_iter()
+        .map(|(idx, width, height, media_type)| ThumbnailGeometry {
+            idx,
+            width,
+            height,
+            media_type,
+        })
+        .collect())
 }
 
 /// Every stored grid tier of an item, geometry only. See
@@ -448,9 +499,9 @@ pub(crate) async fn get_thumbnail_tier_geometry(
     conn: &mut sqlx::SqliteConnection,
     sha256: &str,
 ) -> ApiResult<Vec<TierGeometry>> {
-    let rows: Vec<(i64, String, i64, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(i64, String, i64, i64, i64, String)> = sqlx::query_as(
         r#"
-SELECT idx, tier, width, height, version
+SELECT idx, tier, width, height, version, media_type
 FROM storage.thumbnail_tiers
 WHERE item_sha256 = ?1
 ORDER BY idx, tier
@@ -465,13 +516,16 @@ ORDER BY idx, tier
     })?;
     Ok(rows
         .into_iter()
-        .map(|(idx, tier, width, height, version)| TierGeometry {
-            idx,
-            tier,
-            width,
-            height,
-            version,
-        })
+        .map(
+            |(idx, tier, width, height, version, media_type)| TierGeometry {
+                idx,
+                tier,
+                width,
+                height,
+                version,
+                media_type,
+            },
+        )
         .collect())
 }
 
@@ -776,6 +830,7 @@ VALUES
             media_type: "image/jpeg".to_string(),
             width,
             height: width,
+            version: 1,
             bytes: vec![0_u8],
         };
 
@@ -783,18 +838,25 @@ VALUES
             conn,
             "sha_one",
             "image/png",
-            1,
             &[tier("grid-m", 1024), tier("grid-s", 512)],
         )
         .await
         .unwrap();
         // A second item, so the replace has to discriminate.
-        store_thumbnail_tiers(conn, "sha_two", "image/png", 1, &[tier("grid-s", 512)])
+        store_thumbnail_tiers(
+            conn,
+            "sha_two",
+            "image/png",
+            &[tier("grid-s", 512)])
             .await
             .unwrap();
 
         // A rule change that wants only the larger tier: the smaller one goes.
-        store_thumbnail_tiers(conn, "sha_one", "image/png", 1, &[tier("grid-m", 900)])
+        store_thumbnail_tiers(
+            conn,
+            "sha_one",
+            "image/png",
+            &[tier("grid-m", 900)])
             .await
             .unwrap();
         assert_eq!(
@@ -805,6 +867,7 @@ VALUES
                 width: 900,
                 height: 900,
                 version: 1,
+                media_type: "image/jpeg".to_string(),
             }]
         );
         assert_eq!(
@@ -817,7 +880,11 @@ VALUES
         );
 
         // And an empty set is a real instruction: this item wants no tier.
-        store_thumbnail_tiers(conn, "sha_one", "image/png", 1, &[])
+        store_thumbnail_tiers(
+            conn,
+            "sha_one",
+            "image/png",
+            &[])
             .await
             .unwrap();
         assert!(
@@ -846,7 +913,6 @@ VALUES
             conn,
             "sha_loop",
             "image/gif",
-            1,
             &[
                 StoredTier {
                     idx: 0,
@@ -854,6 +920,7 @@ VALUES
                     media_type: "image/jpeg".to_string(),
                     width: 1024,
                     height: 1024,
+                    version: 2,
                     bytes: vec![1_u8],
                 },
                 StoredTier {
@@ -862,6 +929,7 @@ VALUES
                     media_type: "video/mp4".to_string(),
                     width: 1024,
                     height: 1024,
+                    version: 1,
                     bytes: vec![2_u8],
                 },
             ],
@@ -886,13 +954,13 @@ VALUES
             conn,
             "sha_loop",
             "image/gif",
-            1,
             &[StoredTier {
                 idx: 0,
                 tier: "loop",
                 media_type: "image/gif".to_string(),
                 width: 512,
                 height: 512,
+                version: 1,
                 bytes: Vec::new(),
             }],
         )
@@ -912,6 +980,7 @@ VALUES
                 width: 512,
                 height: 512,
                 version: 1,
+                media_type: "image/gif".to_string(),
             }],
             "the dispatcher still sees a loop it does not have to re-encode"
         );
@@ -934,6 +1003,7 @@ VALUES
                     idx: 0,
                     width: 163,
                     height: 4096,
+                    media_type: "image/jpeg".to_string(),
                     bytes: vec![0_u8],
                 }],
             )
@@ -1020,6 +1090,7 @@ VALUES
             idx: 0,
             width: 10,
             height: 10,
+            media_type: "image/jpeg".to_string(),
             bytes: vec![0_u8],
         };
         store_thumbnails(
