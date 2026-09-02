@@ -1164,7 +1164,7 @@ impl Actor for IndexDbWriter {
                 // failed, and a job whose every item failed writes nothing a
                 // recount could see.
                 let mark_dirty =
-                    !state.tags_dirty_marked && !(tags.is_empty() && text_entries.is_empty());
+                    !state.tags_dirty_marked && (!tags.is_empty() || !text_entries.is_empty());
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move {

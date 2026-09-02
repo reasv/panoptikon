@@ -931,9 +931,14 @@ impl UpdateCoordinator {
             return Err(format!("Update installation failed: {error}"));
         }
         emit_progress(app, "restarting", 0, None, true);
+        #[cfg(windows)]
+        {
+            Ok(())
+        }
         #[cfg(not(windows))]
-        app.restart();
-        Ok(())
+        {
+            app.restart()
+        }
     }
 
     async fn validate_exact_install_target(

@@ -170,6 +170,11 @@ pub(crate) struct JobGuard {
 }
 
 impl JobGuard {
+    /// Closes the job object, reaping any grandchildren still inside it.
+    /// Spelled as a method rather than `drop(guard)` because on non-Windows
+    /// targets the guard carries nothing and has no `Drop` impl.
+    pub(crate) fn release(self) {}
+
     pub(crate) fn assign(child: &std::process::Child) -> JobGuard {
         #[cfg(windows)]
         {

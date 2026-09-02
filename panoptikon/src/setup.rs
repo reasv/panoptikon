@@ -1070,7 +1070,7 @@ async fn run_uv_logged(
         .wait()
         .await
         .with_context(|| format!("failed to wait for {what}"))?;
-    drop(job_guard);
+    job_guard.release();
     let _ = stdout_task.await;
     let _ = stderr_task.await;
     if !status.success() {

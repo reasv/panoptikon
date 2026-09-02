@@ -390,13 +390,13 @@ async fn run_logged(
         _ = stopped(stop) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            // Dropping the guard closes the job object, reaping any
+            // Releasing the guard closes the job object, reaping any
             // grandchildren start_kill did not reach.
-            drop(job_guard);
+            job_guard.release();
             return Ok(CommandEnd::Stopped);
         }
     };
-    drop(job_guard);
+    job_guard.release();
     // The forwarders end on pipe EOF; join so trailing output lands in the
     // log before the exit status does.
     let _ = stdout_task.await;
