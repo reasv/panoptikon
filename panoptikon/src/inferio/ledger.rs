@@ -926,7 +926,10 @@ struct Ingested {
 /// The middle one is the one that matters on a host where `nvidia-smi` is
 /// missing, broken, or does not list the board — without it every grant request
 /// would spawn a blocking subprocess that answers nothing, forever. One failed
-/// attempt buys the same quiet period a successful sample would have.
+/// attempt buys the same quiet period a successful sample would have. The first
+/// is a *latch*, and a latch that is never released disables this board's
+/// refreshes for the life of the process, so [`ProbeGuard`] clears it on every
+/// exit from a probe — panic included.
 ///
 /// One reason to probe ahead of the staleness clock: the reading has been
 /// *adjusted* for a resident that left the board
@@ -952,6 +955,81 @@ fn refresh_due(board: &GpuLedger) -> bool {
         .free
         .as_ref()
         .is_none_or(|sample| sample.at.elapsed() > EXTERNAL_SAMPLE_MAX_AGE)
+}
+
+/// Clears a board's in-flight `refreshing` flag on *every* exit from a host
+/// probe, a panic or an abandoned blocking task included.
+///
+/// The flag is set before the query runs and settled by
+/// [`VramLedger::record_external_probe`] when the answer lands; the normal path
+/// says so with [`ProbeGuard::settled`], and this guard then does nothing at
+/// all — the flag is cleared and the backoff stamped at exactly the point they
+/// always were. It exists for the exit nobody writes code for: if the query
+/// unwinds, the flag stays `true` for the life of the process, [`refresh_due`]
+/// answers false for that board forever, and every future refresh is silently
+/// disabled. A probe that unwound also buys the failure backoff a probe that
+/// answered nothing would, so the very next request does not walk straight back
+/// into a query that is panicking on this host.
+struct ProbeGuard<'a> {
+    ledger: &'a VramLedger,
+    /// The board the probe was started *for* — the one whose flag it set.
+    gpu: &'a str,
+    settled: bool,
+}
+
+impl<'a> ProbeGuard<'a> {
+    /// Arm the guard for a probe just started for `gpu`.
+    fn new(ledger: &'a VramLedger, gpu: &'a str) -> Self {
+        Self {
+            ledger,
+            gpu,
+            settled: false,
+        }
+    }
+
+    /// The probe recorded its answer: [`VramLedger::record_external_probe`] has
+    /// already settled the flag and the backoff, so the drop must not touch
+    /// either.
+    fn settled(mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let at = Instant::now();
+        let was_failing = {
+            let mut state = self.ledger.lock();
+            let Some(board) = state.gpus.get_mut(self.gpu) else {
+                return;
+            };
+            // Read before the stamp below overwrites it, exactly as
+            // `record_external_probe` does: `Some` means this continues a
+            // streak the previous attempt already warned about.
+            let was_failing = board.last_refresh_failed_at.is_some();
+            board.refreshing = false;
+            board.last_refresh_failed_at = Some(at);
+            was_failing
+        };
+        if was_failing {
+            tracing::debug!(
+                gpu = %self.gpu,
+                "the host memory probe unwound again without an answer; \
+                 in-flight flag cleared and still on the previous free sample"
+            );
+        } else {
+            tracing::warn!(
+                gpu = %self.gpu,
+                backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
+                "the host memory probe unwound without an answer; in-flight \
+                 flag cleared so the board stays refreshable, keeping the \
+                 previous free sample and backing off before the next attempt"
+            );
+        }
+    }
 }
 
 /// How many measurements the telemetry ring dropped before the ledger read
@@ -1186,6 +1264,9 @@ struct ProbeStub {
     boards: Option<Vec<GpuMemory>>,
     /// How many times it has been asked.
     calls: u32,
+    /// A probe that unwinds instead of answering — a panicking driver query,
+    /// or a blocking task the runtime tore down mid-flight.
+    panics: bool,
 }
 
 impl LedgerState {
@@ -4059,7 +4140,11 @@ impl VramLedger {
             return;
         }
         let ledger = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        let probed = gpu.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            // Clears the in-flight flag however this task leaves, including on
+            // an unwind out of the query below (see `ProbeGuard`).
+            let guard = ProbeGuard::new(&ledger, &probed);
             // One coherent snapshot of every board, so per-board readings can
             // never be stitched together from different moments. Through
             // `run_memory_query` rather than the query directly, so both probe
@@ -4067,8 +4152,65 @@ impl VramLedger {
             // reach the host down one of them.
             let boards = ledger.run_memory_query();
             let source = ledger.memory_query.free_source();
-            ledger.record_external_probe(&gpu, boards, source);
+            ledger.record_external_probe(&probed, boards, source);
+            guard.settled();
         });
+        // The guard above covers a panic *inside* the task. A task that never
+        // ran at all — aborted, or the runtime shut down under it — runs no
+        // guard, so the join is watched rather than dropped: otherwise the
+        // failure is swallowed by the `JoinHandle` and the flag is stranded.
+        let ledger = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(err) = handle.await {
+                ledger.settle_abandoned_probe(&gpu, &err);
+            }
+        });
+    }
+
+    /// Settle a dispatch-path probe whose blocking task delivered nothing.
+    ///
+    /// A panic inside the task is already handled by its own [`ProbeGuard`], so
+    /// this normally finds the flag settled and only says so at DEBUG. It is
+    /// the case where the closure never ran — the task was aborted, or the
+    /// runtime shut down under it — that would otherwise leave `refreshing`
+    /// latched at `true` with nothing anywhere to clear it. Only the first
+    /// failure of a streak warns, for the same reason
+    /// [`Self::record_external_probe`]'s does.
+    fn settle_abandoned_probe(&self, gpu: &str, err: &tokio::task::JoinError) {
+        let at = Instant::now();
+        let outcome = {
+            let mut state = self.lock();
+            state.gpus.get_mut(gpu).map(|board| {
+                let stranded = board.refreshing;
+                let was_failing = board.last_refresh_failed_at.is_some();
+                if stranded {
+                    board.refreshing = false;
+                    board.last_refresh_failed_at = Some(at);
+                }
+                (stranded, was_failing)
+            })
+        };
+        // Snapshotted under the lock, logged once it is dropped (review F8).
+        let Some((stranded, was_failing)) = outcome else {
+            return;
+        };
+        if stranded && !was_failing {
+            tracing::warn!(
+                gpu = %gpu,
+                error = %err,
+                backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
+                "the host memory probe task did not finish; in-flight flag \
+                 cleared so the board stays refreshable, keeping the previous \
+                 free sample and backing off before the next attempt"
+            );
+        } else {
+            tracing::debug!(
+                gpu = %gpu,
+                error = %err,
+                stranded,
+                "the host memory probe task did not finish"
+            );
+        }
     }
 
     /// Probe the host for this board's free memory **before** a load is
@@ -4124,6 +4266,11 @@ impl VramLedger {
             board.refreshing = true;
             (reason, age_ms)
         };
+        // Armed the moment the flag is set and before anything that could
+        // unwind: it clears the flag however this call leaves, including an
+        // unwind out of the query below, which propagates through the load
+        // path to the caller and would otherwise strand it (see `ProbeGuard`).
+        let guard = ProbeGuard::new(self, gpu);
         tracing::debug!(
             model,
             gpu,
@@ -4148,6 +4295,7 @@ impl VramLedger {
             self.run_memory_query()
         };
         self.record_external_probe(gpu, boards, self.memory_query.free_source());
+        guard.settled();
     }
 
     /// Whether this ledger consults the host probe at all. Production always
@@ -4170,7 +4318,15 @@ impl VramLedger {
             let mut state = self.lock();
             if let Some(stub) = state.probe_stub.as_mut() {
                 stub.calls += 1;
-                return stub.boards.clone();
+                let panics = stub.panics;
+                let boards = stub.boards.clone();
+                // Dropped before the unwind: the real query holds no ledger
+                // lock while it runs, so neither does the stand-in for it.
+                drop(state);
+                if panics {
+                    panic!("the host memory probe panicked (probe stub)");
+                }
+                return boards;
             }
         }
         self.memory_query.run()
@@ -4503,7 +4659,22 @@ impl VramLedger {
     /// so their free readings are exactly what they fed in).
     #[cfg(test)]
     fn install_probe_stub(&self, boards: Option<Vec<GpuMemory>>) {
-        self.lock().probe_stub = Some(ProbeStub { boards, calls: 0 });
+        self.lock().probe_stub = Some(ProbeStub {
+            boards,
+            calls: 0,
+            panics: false,
+        });
+    }
+
+    /// Install a fake host probe that *panics* instead of answering, counting
+    /// what asks it exactly as [`Self::install_probe_stub`] does.
+    #[cfg(test)]
+    fn install_panicking_probe_stub(&self) {
+        self.lock().probe_stub = Some(ProbeStub {
+            boards: None,
+            calls: 0,
+            panics: true,
+        });
     }
 
     /// How many times the stub installed by [`Self::install_probe_stub`] has
@@ -9159,6 +9330,75 @@ mod tests {
         let other = boards.iter().find(|b| b.gpu_uuid == OTHER).unwrap();
         assert_eq!(pinned.external_mb, 30_000);
         assert_eq!(other.external_mb, 21_000);
+    }
+
+    /// A probe that *unwinds* must leave the board refreshable. The in-flight
+    /// flag is the first thing `refresh_due` reads, so one left latched at
+    /// `true` disables every future refresh for that board for the life of the
+    /// process — one panicking driver query and the host probe silently stops
+    /// being a host probe. `ProbeGuard` clears the flag on the unwind and buys
+    /// the same failure backoff a probe that answered nothing would. (The
+    /// dispatch path's `spawn_blocking` closure carries the same guard, and its
+    /// join is watched for the task that never runs at all.)
+    #[test]
+    fn a_panicking_probe_leaves_the_board_refreshable() {
+        let ledger = ledger(32_000, no_margin());
+        ledger.install_panicking_probe_stub();
+        // The panics below are the point of the test; the default hook would
+        // print a backtrace for each.
+        let quietly = |body: &dyn Fn()| {
+            let hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            std::panic::set_hook(hook);
+            outcome
+        };
+
+        let outcome = quietly(&|| {
+            drop(ledger.reserve_load("g/a", item_cost(4), BOARD, None));
+        });
+        assert!(outcome.is_err(), "the probe panicked through the load path");
+        assert_eq!(ledger.probe_calls(), 1);
+        {
+            let state = ledger.lock();
+            let board = state.gpus.get(BOARD).expect("the board");
+            assert!(
+                !board.refreshing,
+                "the guard cleared the in-flight flag on the unwind"
+            );
+            assert!(
+                board.last_refresh_failed_at.is_some(),
+                "and stamped the failure backoff, so the next request does not \
+                 walk straight back into a query that is panicking on this host"
+            );
+            assert!(!refresh_due(board), "which is why it is not due right now");
+        }
+
+        // Once that backoff expires the board is due again — which it never
+        // would be if the flag were still latched.
+        ledger
+            .lock()
+            .gpus
+            .get_mut(BOARD)
+            .expect("the board")
+            .last_refresh_failed_at =
+            Some(Instant::now() - EXTERNAL_SAMPLE_MAX_AGE - Duration::from_secs(1));
+        assert!(
+            refresh_due(ledger.lock().gpus.get(BOARD).expect("the board")),
+            "the panic cost this board one backoff window, not every future \
+             refresh"
+        );
+
+        // End to end: the next load reservation really does probe again.
+        let outcome = quietly(&|| {
+            drop(ledger.reserve_load("g/a", item_cost(4), BOARD, None));
+        });
+        assert!(outcome.is_err());
+        assert_eq!(
+            ledger.probe_calls(),
+            2,
+            "refreshes for this board were not silently disabled"
+        );
     }
 
     /// Reading telemetry by watermark is what makes ring overflow visible: the
