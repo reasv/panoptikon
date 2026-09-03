@@ -176,8 +176,8 @@ fn submit(job: SpawnJob) -> std::io::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel::<SpawnJob>();
         std::thread::Builder::new()
             .name("panoptikon-spawner".to_owned())
-            // Only forks live here; the default stack is ample and a small
-            // one keeps the child's copy cheap.
+            // Nothing but forks runs here, and this is also the stack the
+            // pre-exec hook runs on in the child, so keep it small.
             .stack_size(512 * 1024)
             .spawn(move || {
                 // `for` ends only if every sender is dropped, and the one
