@@ -497,7 +497,9 @@ pub struct TranscodeConfig {
     /// The byte cap that picks a hover preview's rung, published to clients on
     /// `/api/client-config`. A video at or under it is played from its own
     /// file; over it, the client asks for the first 16 s — remuxed when the
-    /// estimated slice fits under the cap, re-encoded otherwise.
+    /// estimated slice fits under the cap, re-encoded otherwise. A video of
+    /// 16 s or less has no shorter slice to estimate, so over the cap it is
+    /// always re-encoded.
     ///
     /// It exists because `preload="none"` does not bound what a browser
     /// fetches: Chromium answers one open-ended range and buffers as far

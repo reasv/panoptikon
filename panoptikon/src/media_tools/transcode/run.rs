@@ -1496,7 +1496,10 @@ mod tests {
         assert_eq!(
             resolve_encoder(&preset, Some("h264_nvenc"), Some("libsvtav1")),
             ENCODER_COPY,
-            "and a validated encoder does not change the identity, so the key              survives a hardware flip"
+            concat!(
+                "and a validated encoder does not change the identity, ",
+                "so the key survives a hardware flip"
+            )
         );
 
         let trim = args_of(&spec_for("preview-trim", None, Some(1600)));

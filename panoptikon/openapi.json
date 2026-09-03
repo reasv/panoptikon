@@ -7564,7 +7564,7 @@
           "max_bytes": {
             "type": "integer",
             "format": "int64",
-            "description": "The byte cap the ladder turns on (`[transcode]\nhover_preview_max_bytes`). A file at or under it plays directly; over\nit, the client estimates the 16 s slice as `size * min(16, duration) /\nduration` and takes rung 1 when that fits, rung 2 otherwise. An item\nwith no known duration cannot be estimated and never takes rung 1.",
+            "description": "The byte cap the ladder turns on (`[transcode]\nhover_preview_max_bytes`). A file at or under it plays directly; over\nit, the client estimates the 16 s slice as `size * min(16, duration) /\nduration` and takes rung 1 when that fits, rung 2 otherwise. An item\nwith no known duration cannot be estimated and never takes rung 1.\n\nSo is an item of 16 s or less: its estimate is the whole file, which\nis over the cap by the time this step is reached, and it goes straight\nto the re-encode. The trim rung only ever serves items *longer* than\nthe window.",
             "minimum": 0
           },
           "transcode": {

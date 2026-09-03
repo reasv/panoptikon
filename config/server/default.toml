@@ -115,7 +115,8 @@ thumbnail_font = "${PANOPTIKON_FONT:-}"     # TTF font for thumbnail text labels
 # hover_preview = "auto"
 # Byte cap that picks a hover preview's rung: a video at or under it plays
 # from its own file, over it the client asks for the first 16 s (remuxed when
-# that slice fits under the cap, re-encoded otherwise). 16 MiB.
+# that slice fits under the cap, re-encoded otherwise - a video of 16 s or
+# less has no shorter slice, so over the cap it is always re-encoded). 16 MiB.
 # hover_preview_max_bytes = 16777216
 # Animated-mosaic limits (see the pinboard render surface).
 # max_mosaic_inputs = 12

@@ -21,7 +21,7 @@ replaced it. §1 records what did not change.
 |---|---|---|
 | V1 | Trigger | the existing hover arm (real pointermove, 200 ms dwell, not scroll-suspended). Never on intersection, never on scroll settle. At most one previewing cell; leave/switch cancels. |
 | V2 | Rung 0 — direct playback | for a `playable` item (the codec/container ladder in `lib/videoPlayability.ts`, fed by the `video_codec`/`audio_codec` columns the search rows already carry) **whose file is at or under the byte cap**: a muted `<video preload="none" loop playsinline>` on the original file URL, Range-served. **Nothing is requested before the dwell fires**: until then the cell holds a plain `<img>` poster and no `<video>` element exists, so the grid as a whole issues zero video requests. On leave the element is unmounted and its request aborted (`abortVideo`). |
-| V2b | Rung 1 — preview trim | over the cap, when the estimated slice fits under it and the codec is browser-playable and mp4-muxable: the new `preview-trim` preset — the source's own packets remuxed into a 16 s mp4, no decode and no encode. §3. |
+| V2b | Rung 1 — preview trim | over the cap, for an item **longer than 16 s** whose estimated slice fits under the cap and whose codec is browser-playable and mp4-muxable: the new `preview-trim` preset — the source's own packets remuxed into a 16 s mp4, no decode and no encode. An item of 16 s or less has no shorter slice to offer, so it skips this rung entirely. §2, §3. |
 | V3 | Rung 2 — preview transcode | for a `needs-transcode` item (and a `playable` one that downgraded on a decode error), and for anything the two cheaper rungs cannot serve: the `preview` preset — first 16 s, mp4/H.264, no audio, short side ≤ 480 (`max_height 480`), fps ≤ 30, Fast channel, CRF 26. |
 | V3b | Rung 3 | nothing. The cell keeps its still. |
 | V4 | Rapid hover switching | one preview job per client at a time. A job this client *created* is cancelled (`DELETE /api/video/jobs/{id}`) on leave or switch if not done; a job it *joined* is never cancelled (it is someone else's). A cancelled key is freed by the pool, so re-hover resubmits. Cache hits skip the queue. |
@@ -67,6 +67,15 @@ the server publishes the inputs:
    is browser-playable and mp4-muxable → **rung 1**, `preview-trim`.
 3. else, when the policy and server offer it → **rung 2**, `preview`.
 4. else nothing.
+
+**The trim rung is reachable only for items longer than 16 s.** For an item of
+16 s or less, `min(16, duration)` is the whole duration, so the estimate is the
+whole file — which step 1 has already established is *over* the cap. Such an
+item therefore falls straight through step 2 to the encode rung. This is not a
+special case in the code; it is what the formula says, and it is the right
+answer: there is no shorter slice of a short file to serve, so the only way to
+get it under the cap is to re-encode it. (Confirmed by the verifier at a
+1 MiB cap.)
 
 The cap is a *byte* bound, not a pixel one: what the browser pulls is bytes,
 and rungs 1 and 2 both cost the server a job, so the question at every step is

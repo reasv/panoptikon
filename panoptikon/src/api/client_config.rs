@@ -189,6 +189,11 @@ pub(crate) struct HoverPreview {
     /// it, the client estimates the 16 s slice as `size * min(16, duration) /
     /// duration` and takes rung 1 when that fits, rung 2 otherwise. An item
     /// with no known duration cannot be estimated and never takes rung 1.
+    ///
+    /// So is an item of 16 s or less: its estimate is the whole file, which
+    /// is over the cap by the time this step is reached, and it goes straight
+    /// to the re-encode. The trim rung only ever serves items *longer* than
+    /// the window.
     pub max_bytes: u64,
 }
 
