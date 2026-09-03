@@ -7,6 +7,10 @@ It joins, by wall-clock timestamp:
     vramrec.jsonl         the independent NVML/RAM oracle
     healthrec.jsonl       the gateway's own ledger view
     hog.jsonl             what the external pressure generator actually held
+    fds.jsonl             optional descriptor recording for the gateway pid
+                          (`{"t_wall"|"iso", "fds", "sockets"[, "limit"]}`;
+                          the plain `<iso> fds=N sockets=M` form Phase 6 used
+                          is read too)
     panoptikon.log        the ledger's structured log lines (commit 49822c8b)
     calibration.before/after.toml   the persisted cost profiles
     jobs.json             `/api/jobs/data/history` (LogRecord) and/or
@@ -31,6 +35,11 @@ Options:
     --expect-ooms N       the scenario deliberately provokes N OOMs   (default 0)
     --expect-deaths N     ... and N worker deaths                     (default 0)
     --expect-failures N   ... and N failed items                      (default 0)
+    --expect-failed-jobs N  ... and N whole *jobs* that end not-`completed`.
+                          A scenario whose job is supposed to fail as a whole
+                          (S4g's "no room to load", a load-failure fixture)
+                          would otherwise FAIL `job_outcome` for succeeding at
+                          its own point                                (default 0)
     --baseline-jobs PATH  a C0 `jobs.json` for the throughput comparison
     --baseline-items-per-s F   or the number directly
     --idle-window S       trailing seconds treated as "idle" for the
@@ -157,6 +166,55 @@ def _iso_epoch(text: str) -> Optional[float]:
         return None
 
 
+FDREC_LINE = re.compile(
+    r"^(?P<ts>\S+)\s+fds=(?P<fds>\d+)(?:\s+sockets=(?P<sockets>\d+))?"
+    r"(?:\s+limit=(?P<limit>\d+))?\s*$"
+)
+
+
+def read_fds(path: Optional[Path]) -> List[Dict[str, Any]]:
+    """Descriptor samples for the gateway process, if anything recorded them.
+
+    No tool in this directory records them: Phase 6 needed the number after
+    the fact (finding F6, the container `nofile` blocker) and sampled
+    `/proc/<pid>/fd` from a shell loop into `fdrec.txt`. Both that plain form
+    (`<iso> fds=N sockets=M [limit=N]`) and a JSONL form with the same keys
+    are accepted, so a scenario can produce whichever is cheaper. See the
+    README's "Recording file descriptors" for the recipe and the gap.
+    """
+    if path is None or not path.is_file():
+        return []
+    rows: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("{"):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+        else:
+            match = FDREC_LINE.match(line)
+            if match is None:
+                continue
+            row = {
+                "iso": match.group("ts"),
+                "fds": int(match.group("fds")),
+                "sockets": (int(match.group("sockets"))
+                            if match.group("sockets") is not None else None),
+                "limit": (int(match.group("limit"))
+                          if match.group("limit") is not None else None),
+            }
+        if row.get("t_wall") is None and row.get("iso"):
+            row["t_wall"] = _iso_epoch(str(row["iso"]).replace("Z", "+00:00")
+                                       if str(row["iso"]).endswith("Z")
+                                       else str(row["iso"]))
+        if row.get("fds") is not None:
+            rows.append(row)
+    return rows
+
+
 def read_toml(path: Optional[Path]) -> Optional[Dict[str, Any]]:
     if path is None or not path.is_file():
         return None
@@ -202,6 +260,7 @@ class Context:
     after: Optional[Dict[str, Any]]
     jobs: Optional[Any]
     probes: List[Dict[str, Any]]
+    fds: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.vram_samples = [row for row in self.vramrec if row.get("kind") == "sample"]
@@ -872,44 +931,111 @@ def check_job_outcome(ctx: Context) -> Verdict:
     bad_outcomes = [row for row in queue_outcomes
                     if row.get("status") not in (None, "completed")]
     over = failed > ctx.args.expect_failures
-    verdict = "FAIL" if (over or bad_outcomes) else "PASS"
+    # A scenario can declare that a whole job is *meant* to fail -- S4g asks a
+    # 2.5 GB model to load onto a board with 1 GB free, and the correct
+    # behaviour is a failed job with a readable per-model error. Without this
+    # knob such a scenario reports `job_outcome FAIL` for doing exactly what it
+    # set out to do (Phase 3, tool note 1).
+    expected_bad = ctx.args.expect_failed_jobs
+    over_jobs = len(bad_outcomes) > expected_bad
+    verdict = "FAIL" if (over or over_jobs) else "PASS"
     return Verdict(
         "job_outcome", verdict,
         f"{len(records)} job record(s): {completed} completed items, "
         f"{failed} failed (expected <= {ctx.args.expect_failures}), "
         f"{errors} errors; queue outcomes: "
-        f"{[row.get('status') for row in queue_outcomes] or 'none'}",
+        f"{[row.get('status') for row in queue_outcomes] or 'none'}"
+        + (f" ({len(bad_outcomes)} not completed, expected <= {expected_bad})"
+           if (bad_outcomes or expected_bad) else ""),
         {"completed": completed, "failed": failed, "errors": errors,
-         "outcomes": queue_outcomes, "records": len(records)},
+         "outcomes": queue_outcomes, "records": len(records),
+         "failed_jobs": len(bad_outcomes),
+         "expected_failed_jobs": expected_bad},
     )
 
 
 def check_ledger_invariant(ctx: Context) -> Verdict:
-    """Sum of charges plus load reservations must never exceed `limit_mb`."""
+    """The admission invariant, in both of the forms run1 showed it has.
+
+    **Strict form** (as §6 states it): on every board sample, the sum of our
+    charges plus our load reservations is at most `limit_mb`.
+
+    **"Our own residents" form** (findings T6 and P5-2): the strict form
+    *cannot* hold once the board is nearly full, and not because anything
+    over-committed. `limit = total - external x (1 + margin)` charges the
+    margin against the neighbour's level, so the limit reaches **0** while a
+    model we already loaded legitimately holds gigabytes -- measured at
+    `limit_mb = 2813` with 10 GB free and `0` with 4 GB free, with our own
+    residents holding 1.2-3.8 GB, and nothing in the design would unload
+    them. What still has to hold there is the form the ledger actually
+    enforces: **a grant never exceeds the headroom it was priced against, nor
+    the oracle's live free memory** (that is `grant_safety`, reported here
+    too so the two are read together).
+
+    So a breach in a sample whose `limit_mb` is 0 is arithmetic, not
+    over-commitment, and this check reports it as **WARN**; a breach against a
+    non-zero limit is a real violation and FAILs.
+    """
     if not ctx.health_samples:
         return Verdict("ledger_invariant", "SKIP", "no healthrec.jsonl")
     breaches = []
+    zero_limit_breaches = []
     checked = 0
+    zero_limit_samples = 0
     for sample in ctx.health_samples:
         for board in (sample.get("health") or {}).get("boards") or []:
             limit = board.get("limit_mb")
             if limit is None:
                 continue
             checked += 1
+            if int(limit) == 0:
+                zero_limit_samples += 1
             used = int(board.get("charges_mb") or 0) + int(
                 board.get("load_reservations_mb") or 0)
             if used > int(limit):
-                breaches.append({"iso": sample["iso"], "gpu": board.get("gpu_uuid"),
-                                 "charges_mb": board.get("charges_mb"),
-                                 "load_reservations_mb": board.get("load_reservations_mb"),
-                                 "limit_mb": limit})
+                row = {"iso": sample["iso"], "gpu": board.get("gpu_uuid"),
+                       "charges_mb": board.get("charges_mb"),
+                       "load_reservations_mb": board.get("load_reservations_mb"),
+                       "limit_mb": limit,
+                       "external_mb": board.get("external_mb")}
+                (zero_limit_breaches if int(limit) == 0 else breaches).append(row)
     if checked == 0:
         return Verdict("ledger_invariant", "SKIP", "no board carried a limit_mb")
-    verdict = "PASS" if not breaches else "FAIL"
-    return Verdict("ledger_invariant", verdict,
-                   f"{len(breaches)} of {checked} board-samples had "
-                   f"charges + load reservations > limit_mb",
-                   {"checked": checked, "breaches": breaches[:10]})
+
+    # The restated form, from the grant lines rather than the health samples.
+    grants = ctx.log_events("issued a memory grant")
+    over_headroom = 0
+    for event in grants:
+        fields = event["fields"]
+        mb, headroom = fields.get("mb"), fields.get("headroom_mb")
+        if isinstance(mb, (int, float)) and isinstance(headroom, (int, float)):
+            over_headroom += int(mb > headroom)
+
+    total_breaches = len(breaches) + len(zero_limit_breaches)
+    if breaches:
+        verdict = "FAIL"
+    elif zero_limit_breaches:
+        verdict = "WARN"
+    else:
+        verdict = "PASS"
+    detail = (f"strict: {total_breaches} of {checked} board-samples had "
+              f"charges + load reservations > limit_mb")
+    if zero_limit_breaches:
+        detail += (f", of which {len(zero_limit_breaches)} had limit_mb = 0 "
+                   f"(the margin zeroes the limit once external x (1+margin) "
+                   f"> total -- our own residents cannot be bounded by it; "
+                   f"T6/P5-2)")
+    detail += (f"; {zero_limit_samples} of {checked} samples were at "
+               f"limit_mb = 0. our own residents: "
+               + (f"{over_headroom} of {len(grants)} grants exceeded the "
+                  f"headroom they were priced against"
+                  if grants else "no grant lines to check"))
+    return Verdict("ledger_invariant", verdict, detail,
+                   {"checked": checked, "breaches": breaches[:10],
+                    "zero_limit_breaches": zero_limit_breaches[:10],
+                    "zero_limit_samples": zero_limit_samples,
+                    "grants": len(grants),
+                    "grants_over_headroom": over_headroom})
 
 
 def check_hog_tracking(ctx: Context) -> Verdict:
@@ -1002,6 +1128,64 @@ def check_ramp_progress(ctx: Context) -> Verdict:
     return Verdict("ramp_progress", "INFO", detail, {"models": rows})
 
 
+def check_peak_fds(ctx: Context) -> Verdict:
+    """Peak open descriptors for the gateway process, if anything recorded them.
+
+    Report-only, and it exists because of Phase 6's F6: with local inference
+    every in-flight predict is loopback HTTP inside one process, so it costs
+    **two** sockets in one descriptor table, and the in-flight budget now
+    follows the ledger's grant. In the shipped container (`nofile` soft 1024)
+    a 2000-item job reached 983 sockets, `accept` began failing with EMFILE,
+    SQLite could not open its files and 1849 items went unprocessed. The
+    branch raises its own soft limit at startup and clamps the in-flight
+    ceiling by the descriptor budget, so this row is how a platform pass
+    re-verifies that on its own deployment shape.
+
+    No recorder in this directory produces the input; see the README's
+    "Recording file descriptors".
+    """
+    rows = ctx.fds
+    if not rows:
+        # Second-chance sources, in case a future recorder carries the count.
+        for sample in ctx.health_samples:
+            value = (sample.get("health") or {}).get("open_fds")
+            if value is not None:
+                rows = rows or []
+                rows.append({"iso": sample["iso"], "t_wall": sample["t_wall"],
+                             "fds": int(value), "sockets": None, "limit": None})
+    if not rows:
+        for sample in ctx.vram_samples:
+            for proc in sample.get("procs", []) or []:
+                value = proc.get("num_fds")
+                if value is not None:
+                    rows.append({"iso": sample["iso"], "t_wall": sample["t_wall"],
+                                 "fds": int(value), "sockets": None,
+                                 "limit": None})
+    if not rows:
+        return Verdict(
+            "peak_fds", "SKIP",
+            "no fds.jsonl / fdrec.txt in the scenario and no descriptor count "
+            "in healthrec or vramrec -- record it per the README "
+            '("Recording file descriptors") on any run that reaches a '
+            "unit_budget above ~100, and on every containerised run")
+    peak = max(int(row["fds"]) for row in rows)
+    sockets = [int(row["sockets"]) for row in rows if row.get("sockets") is not None]
+    limits = [int(row["limit"]) for row in rows if row.get("limit") is not None]
+    peak_sockets = max(sockets) if sockets else None
+    limit = min(limits) if limits else None
+    detail = f"peak {peak} open descriptors over {len(rows)} samples"
+    if peak_sockets is not None:
+        detail += f", {peak_sockets} of them sockets at the peak of that series"
+    if limit is not None:
+        detail += (f"; soft limit {limit} "
+                   f"({_pct(peak, limit):.0f}% of it)")
+        if peak >= limit:
+            detail += " -- AT THE LIMIT: expect EMFILE (F6)"
+    return Verdict("peak_fds", "INFO", detail,
+                   {"peak_fds": peak, "peak_sockets": peak_sockets,
+                    "soft_limit": limit, "samples": len(rows)})
+
+
 CHECKS: Dict[str, Callable[[Context], Verdict]] = {
     "oracle_agreement": check_oracle_agreement,
     "base_accuracy": check_base_accuracy,
@@ -1016,6 +1200,7 @@ CHECKS: Dict[str, Callable[[Context], Verdict]] = {
     "persistence": check_persistence,
     "job_outcome": check_job_outcome,
     "ledger_invariant": check_ledger_invariant,
+    "peak_fds": check_peak_fds,
     "hog_tracking": check_hog_tracking,
     "ramp_progress": check_ramp_progress,
 }
@@ -1128,6 +1313,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--expect-ooms", type=int, default=0)
     parser.add_argument("--expect-deaths", type=int, default=0)
     parser.add_argument("--expect-failures", type=int, default=0)
+    parser.add_argument("--expect-failed-jobs", type=int, default=0,
+                        help="whole jobs whose outcome is meant to be a "
+                             "failure (S4g and the load-failure fixtures)")
     parser.add_argument("--baseline-jobs")
     parser.add_argument("--baseline-items-per-s", type=float, default=None)
     parser.add_argument("--throughput-floor", type=float, default=0.9)
@@ -1178,6 +1366,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         after=read_toml(pick(args.after, "calibration.after.toml")),
         jobs=read_json(pick(args.jobs, "jobs.json")),
         probes=probes,
+        fds=read_fds(pick(None, "fds.jsonl")) or read_fds(pick(None, "fdrec.txt")),
     )
 
     selected = (

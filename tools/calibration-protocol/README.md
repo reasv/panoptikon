@@ -33,9 +33,9 @@ schema; this table is the index, not the reference.
 | `oracle_calibrate.py` | The §2 instrument calibration: does the oracle see a known allocation? One command, PASS/FAIL. |
 | `newrun.py` | Creates `results/<run-id>/<scenario>/`, records `host.json`, seeds `runlog.md`. |
 | `runlog.md` | Per-scenario report template (§7). |
-| `config/` | Per-configuration server TOMLs and env files (C0–C3) plus `run-gateway.sh`. |
+| `config/` | Per-configuration server TOMLs and env files (C0–C3, C7) plus `run-gateway.sh`, the C7 registry (`registry-C7/`) and the S13 `nvidia-smi` shims (`nvidia-smi-shims/`). |
 | `fixtures/` | CUDA-touching fixture impls, their user registry, and `install-fixtures.sh`. |
-| `compose/` | Copies of any docker compose files used for pressure; never the user's own files. Created on demand (Phase 3). |
+| `compose/` | Copies of any docker compose files used for pressure, and the C4/C5/C6 compose files plus the Phase 6 overlays (raised `nofile`, master image); never the user's own files. |
 
 Results go under `results/<run-id>/<scenario>/` (git-ignored), corpora under
 `results/corpus/<tier>/`.
@@ -237,6 +237,7 @@ python/.venv/bin/python tools/calibration-protocol/oracle_calibrate.py \
 analyze.py --scenario results/<run>/<scenario>
            [--checks all|a,b,c] [--list-checks]
            [--expect-ooms N] [--expect-deaths N] [--expect-failures N]
+           [--expect-failed-jobs N]
            [--baseline-jobs FILE | --baseline-items-per-s F]
            [--throughput-floor 0.9] [--utilization-floor 0.25]
            [--idle-window 60] [--join-tolerance 1.5] [--base-window 10]
@@ -249,8 +250,9 @@ analyze.py --scenario results/<run>/<scenario>
 Checks (`--list-checks`): `oracle_agreement`, `base_accuracy`,
 `footprint_agreement`, `slope_accuracy`, `grant_safety`, `failures`,
 `deflation_recovery`, `idle_liveness`, `utilization`, `throughput`,
-`persistence`, `job_outcome`, `ledger_invariant`, `hog_tracking`,
-`ramp_progress`. A scenario declares which ones apply by passing `--checks`.
+`persistence`, `job_outcome`, `ledger_invariant`, `peak_fds`,
+`hog_tracking`, `ramp_progress`. A scenario declares which ones apply by
+passing `--checks`.
 Verdicts are `PASS` / `FAIL` / `WARN` / `INFO` (report-only) / `SKIP` (inputs
 absent); the exit code is 1 if anything FAILed. Every row prints the numbers
 behind it so a near-miss can be adjudicated by a human.
@@ -259,6 +261,59 @@ behind it so a near-miss can be adjudicated by a human.
 log lines added in commit `49822c8b` — it needs
 `RUST_LOG=info,panoptikon::inferio=trace,panoptikon::db::batch_auto=debug` and
 `INFERIO_WORKER_LOG_LEVEL=DEBUG` in the gateway's environment.
+
+Three things about the verdicts are worth knowing before reading a table
+(all three come from run1):
+
+- **`--expect-failures` counts failed *items*, `--expect-failed-jobs` counts
+  whole jobs whose outcome is not `completed`.** A scenario like S4g, whose
+  job is *supposed* to fail (a 2.5 GB model asked to load onto a board with
+  1 GB free), needs the second knob or it reports `job_outcome FAIL` for
+  succeeding at its own point.
+- **`ledger_invariant` has two forms and reports both.** The strict form —
+  Σ charges + load reservations ≤ `limit_mb` — cannot hold on a nearly-full
+  board, because `limit = total − external × (1 + margin)` reaches **0** while
+  a model we already loaded legitimately holds gigabytes and nothing would
+  unload it (findings T6 / P5-2). Breaches in samples whose `limit_mb` is 0
+  are therefore **WARN** and the detail says so; a breach against a non-zero
+  limit still **FAILs**. The form that must always hold is the one the ledger
+  actually enforces and `grant_safety` measures — a grant never exceeds the
+  headroom it was priced against, nor the oracle's live free memory — and the
+  `ledger_invariant` row now restates it inline so the two are read together.
+- **`utilization` wants the bisect probe as well as the sweep**
+  (`--probe probe-<m>.json --probe bisect-<m>.json`): the check prefers
+  `bisect.largest_ok_units` and only falls back to the sweep's largest batch.
+
+### Recording file descriptors
+
+**No tool in this directory records them** — the gap is deliberate and
+documented rather than filled, because the number is only interesting on a
+containerised or descriptor-constrained run, and sampling it costs one shell
+loop. `analyze.py`'s `peak_fds` row reads either `fds.jsonl`
+(`{"iso": …, "fds": N, "sockets": M, "limit": L}` per line) or the plainer
+`fdrec.txt` (`<iso> fds=N sockets=M [limit=L]`), whichever the scenario
+directory holds, and SKIPs with a pointer to this section when neither is
+there. Phase 6 recorded it like this (container case; `PID` is the gateway's
+pid, 1 inside the container):
+
+```bash
+docker exec <container> sh -c 'ulimit -n'     # the soft limit, once
+while :; do
+  printf '%s fds=%s sockets=%s limit=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+    "$(docker exec <container> sh -c 'ls /proc/1/fd | wc -l')" \
+    "$(docker exec <container> sh -c 'ls -l /proc/1/fd | grep -c socket')" \
+    1024
+  sleep 0.5
+done > "$DIR/fdrec.txt"
+```
+
+Bare-host equivalent: `ls /proc/$PID/fd | wc -l`. Record it on **every
+containerised run** and on any bare run whose `unit_budget` passes ~100: with
+local inference each in-flight predict is loopback HTTP inside one process and
+costs **two** sockets in one descriptor table, which is what made Phase 6's F6
+a release blocker (983 sockets against a 1024 soft limit, 1 849 items
+unprocessed).
 
 ## A scenario, end to end
 
@@ -291,9 +346,26 @@ $V $T/analyze.py --scenario "$DIR" --probe "$DIR/probe-wd.json" \
 ## Phase 0 state
 
 `results/phase0/` holds the instrument-calibration evidence:
-`oracle-calibration.md` (the numbers, and the recipe for the 10 GB / 40 GB GPU
-calibrations that are deferred until SGLang is stopped),
-`oracle-gpu/`, `oracle-gpu-driver/`, `oracle-ram/`, `oracle-ram-firstpass/`
-(the raw recordings) and `probe-minilm-smoke.json` (a `ceiling_probe.py` run at
-batch 1–2).
-`results/corpus/{smoke,ramp}/` are generated; `soak` is not.
+`oracle-calibration.md` (the numbers, including the 10 GB / 40 GB GPU
+calibrations, which had to wait for SGLang to be stopped in Phase 2a),
+`oracle-gpu/`, `oracle-gpu-driver/`, `oracle-gpu-full-dev0/`,
+`oracle-gpu-full-dev1/`, `oracle-ram/`, `oracle-ram-16g/`,
+`oracle-ram-firstpass/` (the raw recordings) and `probe-minilm-smoke.json`
+(a `ceiling_probe.py` run at batch 1–2). **The gate is open on this host:**
+board `used` is +2 MiB and NVML per-process −6 MiB against known 10 GB and
+40 GB allocations on both boards, RAM +32 MiB RSS at 16 GiB.
+
+Corpora under `results/corpus/` (all git-ignored, all regenerable from
+`corpus.py` with the seed each runlog records): `smoke` (205), `ramp` (2 000),
+`ramp8` (16 000 — S4b–S4e need a corpus that outlives a 10-minute profile),
+`text` (2 000, for the token model via `loadgen.py`; `.txt` is not indexable,
+so it cannot be driven by a job), `poison`, `poisonmix`, `pixmix`, `ocr` and
+`audio`. `soak` is not generated.
+
+## Run results
+
+`results/run1/` (git-ignored) holds the first full execution of the protocol,
+2026-09-03, one directory per scenario with its `runlog.md`; `results/run1/
+README.md` indexes them with each leg's verdict headline, the binary commit it
+ran on, and which calibration stores are **poisoned** and must not be used to
+seed a later scenario.
