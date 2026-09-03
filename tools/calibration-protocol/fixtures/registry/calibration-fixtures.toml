@@ -130,3 +130,15 @@ metadata.description = "Fails merged batches with a non-OOM error (torch-free)"
 [group.calibfixture.inference_ids.dying_cpu]
 config.impl_class = "dying_test"
 metadata.description = "Kills its worker mid-predict (torch-free)"
+
+# B17 probe: ignores an orchestrator trim for 70 s, past the fatal 60 s
+# TRIM_DEADLINE (worker.rs:113). Each predict allocates and frees `pool_mb`
+# so the replica reports pool growth over TRIM_SLACK_MB (256 MB) while idle,
+# which is what makes `flag_trims_locked` pick it when a neighbour on the same
+# board is squeezed. See ../impls/hang_trim_cuda_impl.py.
+[group.calibfixture.inference_ids.hang_trim_cuda]
+config.impl_class = "hang_trim_cuda_test"
+config.load_mb    = 64
+config.pool_mb    = 512
+config.hang_secs  = 70
+metadata.description = "Ignores a trim for 70 s, past the 60 s TRIM_DEADLINE (B17)"
