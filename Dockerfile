@@ -111,8 +111,12 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 # ffmpeg/ffprobe binaries setup's static-ffmpeg prefetch downloads — the
 # image wires the apt ffmpeg via [jobs] in docker.toml instead.
 #
-# uv's default link mode (reflink/clone) fails on some storage drivers, e.g.
-# overlay2 backed by ZFS ("os error 11"); copying always works.
+# uv installs out of its cache by hardlinking on Linux (reflink/clone is the
+# macOS default), and on some storage drivers that fails outright — overlay2
+# backed by ZFS ("os error 11") is the case this was hit on. Copying always
+# works. Deliberately an ENV and not a per-RUN assignment: it is inherited by
+# a `panoptikon setup` re-run *inside* a running container, which hits the
+# same driver. Copy mode is only ever slower, never wrong.
 ENV UV_LINK_MODE=copy
 ARG ACCELERATOR=cpu
 RUN panoptikon setup --accelerator ${ACCELERATOR} \
