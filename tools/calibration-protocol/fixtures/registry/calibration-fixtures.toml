@@ -8,9 +8,11 @@
 #
 #   *_cpu   the shipped torch-free fixtures in
 #           python/tests/inferio_worker/fixture_impls/. They never touch CUDA,
-#           so the worker reports no gpu_uuid and no base_mb: on a multi-board
-#           CUDA host resolve_board() cannot place them and they run UNPRICED
-#           (they still register through the single-board fallback on C2/C3).
+#           so the worker reports no gpu_uuid and no base_mb: resolve_board()
+#           cannot place them and they run UNPRICED. Phase 4 measured this on
+#           C2 as well: the single-board fallback needs gpu_bdf or gpu_total_mb
+#           (ledger.rs:1821), which a torch-free worker never sends, so one
+#           visible board does NOT rescue them (results/run1/S5-cpu-C2).
 #   *_cuda  the variants in ../impls/, which allocate and touch one small CUDA
 #           tensor in load(). They report gpu_uuid + gpu_name + gpu_total_mb
 #           and a base_mb on the "nvml" tier, so the ledger admits them to a

@@ -27,10 +27,18 @@ carries no `gpu_uuid` and no `base_mb`: `_finish_load`'s `touched_gpu` gate
 (`python/inferio_worker/memory.py`) stays shut because neither the allocated
 nor the reserved counter moved, and `device_identity()` has no live CUDA
 context to read. `VramLedger::resolve_board` then has nothing to join on, so
-on a two-board host the fixture is never admitted to a ledger and its windows
-run **unpriced** — which is the opposite of what the fixture scenarios are
-meant to exercise. (With exactly one visible board the single-board fallback
-still admits it, which is why the torch-free ids remain usable on C2.)
+the fixture is never admitted to a ledger and its windows run **unpriced** —
+which is the opposite of what the fixture scenarios are meant to exercise.
+
+**Correction (Phase 4, measured in `results/run1/S5-cpu-C2`):** the single-board
+fallback does **not** rescue them. `resolve_board` (`ledger.rs:1821`) requires
+`claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some()`
+before it will place a UUID-less worker on the only board, and a torch-free
+worker reports neither. On C2 all four `*_cpu` ids logged `the worker reports no
+board this GPU inventory lists; dispatching this model without VRAM admission …
+boards=1` and ran with **zero grants**. The `*_cpu` family is therefore an
+**unpriced-path** fixture on any CUDA host, one board or two; use the `*_cuda`
+ids whenever the ledger is the thing under test.
 
 Each variant therefore allocates and touches one `float32` tensor of
 `load_mb` MiB (default 64) on the pinned device inside `load()`, and holds it
