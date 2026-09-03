@@ -1,0 +1,103 @@
+# User registry for the calibration protocol's fault-injection fixtures.
+# Phase 0 of docs/batch-calibration-test-protocol.md (§3, "fixture" row of the
+# models table); shape copied from the manager's test registry
+# (panoptikon/src/inferio/manager.rs, TEST_REGISTRY_TOML) and
+# config/inference/example.toml.
+#
+# Two families of the same four behaviours:
+#
+#   *_cpu   the shipped torch-free fixtures in
+#           python/tests/inferio_worker/fixture_impls/. They never touch CUDA,
+#           so the worker reports no gpu_uuid and no base_mb: on a multi-board
+#           CUDA host resolve_board() cannot place them and they run UNPRICED
+#           (they still register through the single-board fallback on C2/C3).
+#   *_cuda  the variants in ../impls/, which allocate and touch one small CUDA
+#           tensor in load(). They report gpu_uuid + gpu_name + gpu_total_mb
+#           and a base_mb on the "nvml" tier, so the ledger admits them to a
+#           board and prices their windows. These are the ones to use on C1.
+#           Measured on this host at load_mb = 64: base_mb 722, base_method
+#           "nvml", reserved_at_load_mb 64 (the rest is the CUDA context).
+#
+# Install: either point [inference_local].config_dirs at this directory (see
+# ../README.md) or run ../install-fixtures.sh, which copies this file into
+# config/inference/ and the impls into inferio_custom/.
+
+# Never shadow a shipped inference_id by accident.
+allow_override = false
+
+[group.calibfixture]
+config.impl_class = "echo_test"   # overridden per inference_id below
+
+[group.calibfixture.metadata]
+name                 = "Calibration protocol fixtures"
+description          = """Fault-injection fixtures for the batch-calibration \
+  test protocol: deterministic OOM on the second batch, batch-1 OOM, non-OOM \
+  merged-batch failure, and worker death on demand. Not a real model."""
+default_batch_size   = 64
+default_inference_id = "oom_second_batch_cuda"
+target_entities      = ["items"]
+# NOTE: the fixtures return {"batch": n} / {"ok": true}, not tags. Drive them
+# through POST /api/inference/predict/<id> (loadgen.py), not through an
+# extraction job -- an extraction job would reject the payload because it does
+# not match the declared output_type. The declaration is here only because the
+# registry expects one.
+output_type          = "tags"
+input_mime_types     = ["image/"]
+
+# item/count, like the wd taggers: one unit per input, so a window's units are
+# just its length and the ramp is the cleanest to read.
+[group.calibfixture.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
+
+[group.calibfixture.metadata.input_spec]
+handler = "image_frames"
+
+# --- CUDA-touching variants (use these on C1: priced, board-resolved) ---
+
+# Succeeds on batch 1, then raises the bare driver OOM text on batch 2 of the
+# same worker. Fires once per worker lifetime.
+[group.calibfixture.inference_ids.oom_second_batch_cuda]
+config.impl_class = "oom_second_batch_cuda_test"
+config.load_mb    = 64
+metadata.description = "OOMs on the second GPU batch (CUDA-touching, priced)"
+
+# Always raises INFERENCE_OOM_BATCH_SIZE_1: the "even one item does not fit"
+# path, which no amount of deflation can rescue.
+[group.calibfixture.inference_ids.oom_cuda]
+config.impl_class = "oom_cuda_test"
+config.load_mb    = 64
+metadata.description = "Batch-1 OOM every time (CUDA-touching, priced)"
+
+# Non-OOM failure for any merged batch; singles succeed. Exercises the
+# per-request fallback without the OOM classifier firing.
+[group.calibfixture.inference_ids.failbatch_cuda]
+config.impl_class = "failbatch_cuda_test"
+config.load_mb    = 64
+metadata.description = "Fails merged batches with a non-OOM error (CUDA-touching, priced)"
+
+# os._exit(3) inside predict: worker death with a request in flight.
+[group.calibfixture.inference_ids.dying_cuda]
+config.impl_class = "dying_cuda_test"
+config.load_mb    = 64
+metadata.description = "Kills its worker mid-predict (CUDA-touching, priced)"
+
+# --- torch-free originals (unpriced on C1; single-board fallback on C2) ---
+
+[group.calibfixture.inference_ids.oom_second_batch_cpu]
+config.impl_class = "oom_second_batch_test"
+metadata.description = "OOMs on the second GPU batch (torch-free)"
+
+[group.calibfixture.inference_ids.oom_cpu]
+config.impl_class = "oom_test"
+metadata.description = "Batch-1 OOM every time (torch-free)"
+
+[group.calibfixture.inference_ids.failbatch_cpu]
+config.impl_class = "failbatch_test"
+metadata.description = "Fails merged batches with a non-OOM error (torch-free)"
+
+[group.calibfixture.inference_ids.dying_cpu]
+config.impl_class = "dying_test"
+metadata.description = "Kills its worker mid-predict (torch-free)"

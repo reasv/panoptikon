@@ -786,7 +786,7 @@ curl $B/api/inference/metadata                                         # registr
 curl $B/api/inference/health                                           # vram[], models[], gpus[]
 curl -X PUT "$B/api/inference/load/tags/wd-vit-tagger-v3?cache_key=t&lru_size=1&ttl_seconds=60"
 curl -X DELETE $B/api/inference/cache/t
-curl -F 'data={"inputs":[{}]}' -F 'files=@img.jpg;filename=0' -X POST $B/api/inference/predict/tags/wd-vit-tagger-v3
+curl -F 'data={"inputs":[{}]}' -F 'files=@img.jpg;filename=0' -X POST "$B/api/inference/predict/tags/wd-vit-tagger-v3?cache_key=calib&lru_size=1&ttl_seconds=60"   # all three query params are required (PredictParams has no serde default)
 curl $B/api/client-config                                              # readiness
 curl -X POST $B/api/search/pql -H 'Content-Type: application/json' -d '{"query":{},"page_size":10}'
 ```

@@ -1,0 +1,298 @@
+# ==========================================================================
+# Calibration protocol server config: C3
+# C1 with CUDA_VISIBLE_DEVICES=1 (index form): documented off-switch, inventory blanked, unpriced path. The restriction lives in env.C3, not here.
+#
+# Generated in Phase 0 from /home/admin/projects/panoptikon/config/server/default.toml
+# (docs/batch-calibration-test-protocol.md §3). Do not edit the shipped
+# config; edit this copy. Every line that differs from the shipped default
+# is marked "CALIB" and explained inline. The deviations are:
+#
+#   1. Ports. Each configuration gets its own listener ports so two of them
+#      can be up at once (e.g. C0 baseline next to C1) without a bind
+#      clash. C1 keeps the shipped 6342/6343/6339 so the API recipes in
+#      the code map (§3.3) work verbatim.
+#   2. [upstreams.ui] local = false -- API-only runs, no next build.
+#   3. [inference_local] python / impl_dirs / config_dirs / pythonpath as
+#      absolute paths -- forced by --root's chdir, and it pins C0 to the
+#      master worktree's venv. Also disables startup auto-setup.
+#
+# Nothing else differs: the vram budget table stays empty (built-in
+# defaults: margin 0.10, no cap_fraction), logging stays on the
+# ${LOGLEVEL:-INFO} template with RUST_LOG from env.C3 winning, and the
+# rulesets/policies are byte-identical to the shipped file.
+#
+# Used as:  tools/calibration-protocol/config/run-gateway.sh C3 <root dir>
+# ==========================================================================
+
+# Panoptikon's canonical local configuration. The server loads this file by
+# default and owns the API, inference orchestrator, databases, jobs, and UI.
+
+[logging]
+# The .env file keeps auto-loading; LOGLEVEL set there (e.g. DEBUG) feeds
+# this key via env templating, exactly like the old LOGLEVEL env read did.
+# RUST_LOG still takes precedence when set.
+level = "${LOGLEVEL:-INFO}"
+
+[server]
+# Bind address for the primary server listener.
+host = "127.0.0.1"
+# Port for the gateway listener. 6342 is the port the legacy Python server
+# used, so existing links and clients keep working.
+port = 6372  # CALIB: per-configuration port
+# If true, use X-Forwarded-Host / Forwarded to select policy host.
+trust_forwarded_headers = true
+
+# Test endpoint: same gateway, same routes, but the "test_endpoint" policy
+# below locks it to the "stdtest" DBs. Point coding agents (or a browser
+# preview) at http://127.0.0.1:6343 and everything they do defaults to —
+# and cannot leave — the stdtest index/user-data DBs, no manual DB
+# selection needed. (Missing DBs: POST http://127.0.0.1:6343/api/db/create)
+[[server.endpoints]]
+name = "test"
+port = 6373  # CALIB: per-configuration port
+
+# Legacy entrypoint: 6339 was the UI port back when the Next.js frontend
+# was the entry point, so old links and bookmarks land here. Serves the
+# same routes as the primary listener; the "localhost" policy below
+# matches it by host.
+[[server.endpoints]]
+name = "legacy_ui"
+port = 6369  # CALIB: per-configuration port
+
+[upstreams.ui]
+# Next.js frontend base URL; with local = true this is also the host/port
+# the spawned `next start` binds to. Internal upstream only — never an
+# entrypoint (that's what freed 6339 for the legacy_ui listener above).
+# With local = false you run the UI server yourself. Its server-side
+# rendering calls this gateway back: set PANOPTIKON_API_URL in its
+# environment to name the listener (this is what the gateway does for a
+# UI it launches), or leave it unset and the UI follows the loopback
+# origin the gateway signs into each proxied request's policy token —
+# never a fixed port, which may belong to a different instance. The UI
+# cannot verify that token, so bind a hand-run UI to loopback; and if this
+# gateway's [server] host is a specific non-loopback address, the minted
+# origin is not loopback and the UI refuses it: set the variable instead.
+base_url = "http://127.0.0.1:6370"  # CALIB: per-configuration port
+# local = true          # CALIB: superseded by `local = false` below.
+# Path to the panoptikon-ui checkout. The standard location is the ui/
+# git submodule (populated by cloning with --recurse-submodules, or by
+# `git submodule update --init`).
+# CALIB deviation: the calibration runs are API-only, so the gateway must not
+# spawn `npm install` + `next build` + `next start` (minutes of wall time and
+# a few GB of RAM that would pollute every throughput measurement). `/` and
+# every non-/api path answer 502; nothing the protocol drives goes through
+# the UI. Flip local back to true (and drop --root, or symlink ui/ under it)
+# if a scenario ever needs the frontend.
+local = false
+dir = "ui"
+# If you manage a separate UI checkout yourself, point dir at it instead:
+# dir = "../panoptikon-ui"
+
+[upstreams.api]
+# API backend base URL. Unused when local = true: every /api route is
+# served in-process and unmatched /api paths return 404 (they must not be
+# proxied — this base_url points back at the gateway itself).
+base_url = "http://127.0.0.1:6372"  # CALIB: per-configuration port
+local = true
+
+# No [[upstreams.inference]] entries: with [inference_local] enabled the
+# gateway synthesizes a loopback entry pointing at itself.
+
+# Serve /api/inference/* in-process (Rust inferio orchestrator).
+[inference_local]
+enabled = true
+
+# CALIB deviation: absolute paths for everything the orchestrator resolves
+# relative to the working directory. `--root <results dir>` is implemented as a
+# chdir at startup (panoptikon/src/main.rs, `root`), so the shipped defaults
+# ("python/inferio/impl", "inferio_custom", "config/inference", "python",
+# "python/.venv/bin/python") would be looked for *under the results dir* and
+# not found. Pinning them here is also what keeps C0 (the master worktree) on
+# its own venv and sources.
+#
+# Setting `python` additionally short-circuits the startup auto-setup
+# (setup.rs:1214 returns early when `local.python.is_some()`), which is
+# deliberate: the venv is synced by hand in Phase 0 *with* the `test` group,
+# and a `uv sync --locked --extra cu128` from the server would drop it.
+python      = "/home/admin/projects/panoptikon/python/.venv/bin/python"
+impl_dirs   = ["/home/admin/projects/panoptikon/python/inferio/impl", "/home/admin/projects/panoptikon/inferio_custom"]
+config_dirs = ["/home/admin/projects/panoptikon/python/inferio/config", "/home/admin/projects/panoptikon/config/inference"]
+pythonpath  = ["/home/admin/projects/panoptikon/python"]
+
+[inference_local.python_env]
+# The release smoke test sets this templated value to false so it can exercise
+# first-run UI startup without downloading the multi-GB inference environment.
+auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
+
+# How much of each GPU the inference orchestrator may admit work into. Two
+# composable limits; when both are set the budget is the min. The header below
+# is live and the table deliberately empty: an empty table freezes nothing —
+# every absent key tracks its built-in default across upgrades — while giving
+# the keys a section to belong to. Uncommenting a bare `margin = …` with no
+# header above it would otherwise land it in whichever table precedes this one.
+[inference_local.vram]
+# Margin over OTHER processes' VRAM usage (our own workers are measured, never
+# inflated): usable = total - other_used * (1 + margin). Default 0.10, on.
+# margin = 0.10
+# Hard ceiling as a fraction of the board's total VRAM; the server lever for
+# partitioning one card between services. Default: off.
+# cap_fraction = 0.90
+
+# Per-GPU-instance overrides, keyed by board UUID (`nvidia-smi -L` prints
+# them). Two identical cards share a calibration profile but can carry
+# different budgets — e.g. the one driving the monitors gets a bigger margin.
+# Absent keys inherit the section defaults above. Uncomment BOTH lines: the
+# value on its own would join [inference_local.vram] and move every board.
+# [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
+# margin = 0.25
+
+[search]
+# Size of the in-process embedding cache used by search preprocessing.
+# Default: 1024. Uncomment to override (leaving it commented tracks the
+# built-in default, so a future default change reaches you on upgrade).
+# embedding_cache_size = 1024
+
+# Host-resource limits and external tools for scan/extraction jobs. See the
+# configuration reference in panoptikon/README.md for the full key list.
+[jobs]
+# Explicit paths to bundled native dependencies. Empty means "unset": the
+# built-in search order applies. The ${VAR:-} templates keep .env-based
+# overrides working.
+pdfium = "${PDFIUM_PATH:-}"                 # pdfium dynamic library (PDF thumbnails)
+html_renderer = "${HTML_RENDERER_PATH:-}"   # Chromium-family browser (HTML thumbnails)
+thumbnail_font = "${PANOPTIKON_FONT:-}"     # TTF font for thumbnail text labels
+# Per-image decode allocation ceiling in MiB (decompression-bomb guard;
+# legitimate very large images must fit under it). 0 = unlimited.
+# image_decode_memory_limit_mb = 8192
+
+# Backend video transcoding (docs/video-transcoding-design.md): playback
+# compatibility, clip export, pinboard renders. Every key below is a tunable
+# default -- leaving it commented tracks the built-in default on upgrade.
+# [transcode]
+# max_concurrent_jobs = 1
+# cache_dir = ""                       # empty = <data_folder>/transcode-cache
+# cache_size_mb = 8192
+# cache_size_max_mb = 262144           # ceiling for PUT /api/video/cache
+# Hardware encoder for the "fast" channel. "auto" probes and validates,
+# "off" always uses libx264, or name one: h264_nvenc, h264_amf, h264_qsv,
+# h264_videotoolbox, h264_mf (the bare vendor spelling, e.g. "nvenc", works
+# too). Quality-channel exports always use libx264 regardless.
+# hwaccel = "auto"
+# Animated-mosaic limits (see the pinboard render surface).
+# max_mosaic_inputs = 12
+# max_mosaic_loop_mb = 512
+# max_animated_image_seconds = 30
+# max_output_seconds = 300
+# compose_light_threshold = 2
+
+# Custom encoding profiles. Absent = the built-in presets; an explicit empty
+# table (profiles = {}) = none at all; entries merge by name over the
+# built-ins, so a profile named after one patches just the fields it lists.
+# A name that matches no built-in must give at least container, vcodec and a
+# rate control. Surface tags decide which UI dropdowns offer it.
+# [transcode.profiles.small-share]
+# label = "Small (share)"
+# container = "mp4"                    # mp4 | webm | webp
+# vcodec = "h264"                      # codec family, not the encoder
+# acodec = "aac"                       # or audio = false for no audio track
+# crf = 28                             # or bitrate_kbps = 2500
+# max_height = 720                     # 0 = uncapped
+# channel = "fast"                     # quality | fast
+# surfaces = ["clip"]                  # playback | clip | mosaic
+
+# --------- Rulesets ---------
+# Rulesets define which methods + paths are allowed for a policy.
+# If a policy references a ruleset, anything not matched is denied.
+
+# Example: allow access to all paths and methods.
+[rulesets.allow_all]
+allow_all = true
+
+# This still allows bookmarks (safe for public demos).
+[rulesets.restricted_demo]
+allow = [
+    { methods = [
+        "GET",
+    ], path_prefix = "/docs" },
+    { methods = [
+        "GET",
+    ], path = "/openapi.json" },
+
+    { methods = [
+        "GET",
+        "POST",
+    ], path_prefix = "/api/search/" },
+    { methods = [
+        "GET",
+    ], path_prefix = "/api/items/" },
+
+    # Serving an already-encoded rendition (and listing the presets) is safe
+    # for a public profile; POST /api/video/transcode, which spawns ffmpeg, is
+    # deliberately not granted.
+    { methods = [
+        "GET",
+    ], path = "/api/video/artifact" },
+    { methods = [
+        "GET",
+    ], path = "/api/video/presets" },
+
+    { methods = [
+        "GET",
+        "POST",
+        "DELETE",
+        "PUT",
+    ], path_prefix = "/api/bookmarks/" },
+
+    { methods = [
+        "GET",
+    ], path = "/api/db" },
+
+    { methods = [
+        "GET",
+    ], path = "/api/inference/cache" },
+]
+
+# --------- Policies ---------
+# Policies are checked in order. First match wins.
+
+# Requests arriving on the "test" endpoint (port 6343) are confined to the
+# "stdtest" DBs regardless of Host header. Must come before the localhost
+# policy: those requests would match it too, and first match wins.
+[[policies]]
+name = "test_endpoint"
+ruleset = "allow_all"
+
+[policies.match]
+endpoints = ["test"]
+
+[policies.index_db]
+default = "stdtest"
+allow = ["stdtest"]
+
+[policies.user_data_db]
+default = "stdtest"
+allow = ["stdtest"]
+
+[[policies]]
+name = "localhost"
+ruleset = "allow_all"
+
+[policies.match]
+hosts = ["localhost", "127.0.0.1"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+
+# Free-form per-policy client settings, returned verbatim by
+# GET /api/client-config as the "client" object (alongside capability
+# booleans derived from the policy's ruleset). Recognized-by-convention
+# keys: search_throttle_ms, disable_backend_open, home_redirect.
+# Default: empty object.
+# [policies.client]
+# search_throttle_ms = 0
+# home_redirect = "/search"

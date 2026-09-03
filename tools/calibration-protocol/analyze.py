@@ -1,0 +1,1216 @@
+#!/usr/bin/env python3
+"""analyze.py - join one scenario's recordings and print the verdict table.
+
+Implements the verdict table of `docs/batch-calibration-test-protocol.md` §6.
+It joins, by wall-clock timestamp:
+
+    vramrec.jsonl         the independent NVML/RAM oracle
+    healthrec.jsonl       the gateway's own ledger view
+    hog.jsonl             what the external pressure generator actually held
+    panoptikon.log        the ledger's structured log lines (commit 49822c8b)
+    calibration.before/after.toml   the persisted cost profiles
+    jobs.json             `/api/jobs/data/history` (LogRecord) and/or
+                          `/api/jobs/queue` output
+    probe*.json           one or more ceiling_probe.py results
+
+Usage
+-----
+    analyze.py --scenario results/<run>/<scenario>
+    analyze.py --scenario DIR --checks oracle_agreement,grant_safety,failures
+    analyze.py --scenario DIR --json verdicts.json --plot timeline.png
+    analyze.py --list-checks
+
+    # any file can be overridden individually
+    analyze.py --vramrec a.jsonl --healthrec b.jsonl --log c.log --probe p.json
+
+Options:
+    --scenario DIR        directory holding the standard file names
+    --checks LIST         comma-separated check names, or `all` (default: all
+                          checks whose inputs are present). A scenario declares
+                          which verdicts apply by passing this list.
+    --expect-ooms N       the scenario deliberately provokes N OOMs   (default 0)
+    --expect-deaths N     ... and N worker deaths                     (default 0)
+    --expect-failures N   ... and N failed items                      (default 0)
+    --baseline-jobs PATH  a C0 `jobs.json` for the throughput comparison
+    --baseline-items-per-s F   or the number directly
+    --idle-window S       trailing seconds treated as "idle" for the
+                          liveness/recovery checks                  (default 60)
+    --join-tolerance S    max |dt| when joining two recordings      (default 1.5)
+    --base-window S       max |dt| between a worker's admission and the oracle
+                          sample `base_accuracy` compares it against (default 10)
+    --throughput-floor F  ratio of the C0 baseline that passes      (default 0.9)
+    --utilization-floor F ratio of the probe boundary that passes  (default 0.25)
+    --worker-pattern RE   which vramrec PIDs are ours
+                          (default `inferio_worker`)
+    --json PATH           machine-readable verdicts
+    --plot PATH           PNG timeline (skipped, with a note, if matplotlib is
+                          not importable -- it is never required)
+    --quiet               table only
+
+Exit code is 1 if any selected check FAILs, else 0.
+
+Verdicts
+--------
+    PASS  the threshold held               FAIL  it did not
+    WARN  close to a threshold, or the scenario expected the deviation
+    INFO  measured and reported, never judged (report-only rows in §6)
+    SKIP  the inputs for this check were not present
+
+Every row prints the numbers behind the verdict, so a threshold that is missed
+by a small margin can be adjudicated by a human rather than by this script.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import json
+import math
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# --------------------------------------------------------------------------
+# Loading
+# --------------------------------------------------------------------------
+
+
+def read_jsonl(path: Optional[Path]) -> List[Dict[str, Any]]:
+    if path is None or not path.is_file():
+        return []
+    rows = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # a truncated tail from a killed recorder
+    return rows
+
+
+LOG_LINE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}T[0-9:.]+Z)\s+(?P<level>[A-Z]+)\s+"
+    r"(?P<target>[A-Za-z0-9_:.\-]+):\s*(?P<rest>.*)$"
+)
+FIELD_START = re.compile(r"(?<![\w.])([a-z_][a-z0-9_]*)=")
+FIELD = re.compile(r'([a-z_][a-z0-9_]*)=("(?:[^"\\]|\\.)*"|\S+)')
+
+
+def parse_log(path: Optional[Path]) -> List[Dict[str, Any]]:
+    """Parse `tracing_subscriber`'s default text format.
+
+    A line is `<rfc3339> <LEVEL> <target>: <message> k=v k="v" ...`; the
+    message is everything before the first `k=` token.
+    """
+    if path is None or not path.is_file():
+        return []
+    events: List[Dict[str, Any]] = []
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            match = LOG_LINE.match(line.rstrip("\n"))
+            if match is None:
+                continue
+            rest = match.group("rest")
+            first = FIELD_START.search(rest)
+            message = rest[: first.start()].strip() if first else rest.strip()
+            fields: Dict[str, Any] = {}
+            if first:
+                for key, raw in FIELD.findall(rest[first.start():]):
+                    fields[key] = _coerce(raw)
+            events.append({
+                "ts": match.group("ts"),
+                "t_wall": _iso_epoch(match.group("ts")),
+                "level": match.group("level"),
+                "target": match.group("target"),
+                "message": message,
+                "fields": fields,
+                "line": line.rstrip("\n"),
+            })
+    return events
+
+
+def _coerce(raw: str) -> Any:
+    if raw.startswith('"') and raw.endswith('"'):
+        return raw[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    if raw in ("true", "false"):
+        return raw == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        return raw
+
+
+def _iso_epoch(text: str) -> Optional[float]:
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def read_toml(path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if path is None or not path.is_file():
+        return None
+    import tomllib
+
+    try:
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+    except Exception as exc:
+        return {"__error__": f"{type(exc).__name__}: {exc}"}
+
+
+def read_json(path: Optional[Path]) -> Optional[Any]:
+    if path is None or not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Context
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Verdict:
+    name: str
+    verdict: str          # PASS | FAIL | WARN | INFO | SKIP
+    detail: str
+    numbers: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Context:
+    args: argparse.Namespace
+    vramrec: List[Dict[str, Any]]
+    healthrec: List[Dict[str, Any]]
+    hog: List[Dict[str, Any]]
+    log: List[Dict[str, Any]]
+    before: Optional[Dict[str, Any]]
+    after: Optional[Dict[str, Any]]
+    jobs: Optional[Any]
+    probes: List[Dict[str, Any]]
+
+    def __post_init__(self) -> None:
+        self.vram_samples = [row for row in self.vramrec if row.get("kind") == "sample"]
+        self.health_samples = [row for row in self.healthrec if row.get("kind") == "sample"]
+        self.hog_samples = [row for row in self.hog if row.get("kind") in ("state", "final")]
+        self._vram_times = [row["t_wall"] for row in self.vram_samples]
+        self._hog_times = [row["t_wall"] for row in self.hog_samples]
+        self.worker_re = re.compile(self.args.worker_pattern)
+
+    # -- joining ----------------------------------------------------------
+    def vram_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
+        return _nearest(self.vram_samples, self._vram_times, t_wall,
+                        self.args.join_tolerance)
+
+    def hog_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
+        return _nearest(self.hog_samples, self._hog_times, t_wall,
+                        self.args.join_tolerance)
+
+    # -- oracle -----------------------------------------------------------
+    def oracle_board(self, sample: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
+        for board in sample.get("gpus", []):
+            if board.get("uuid") == uuid:
+                return board
+        return None
+
+    def our_pids_mb(self, board: Dict[str, Any]) -> Tuple[int, List[int]]:
+        """Sum of NVML per-process usage for PIDs that are our workers.
+
+        A PID is ours when its cmdline matches `--worker-pattern`, or when its
+        environ carries BOTH `INFERIO_WORKER` and `PANOPTIKON_DEVICE_PIN` -- the
+        pair the orchestrator sets on a spawned worker (`worker.rs:597-681`).
+        `ceiling_probe.py` sets the pin alone, and `hog.py` neither, so neither
+        is mistaken for a resident.
+        """
+        total = 0
+        pids: List[int] = []
+        for proc in board.get("procs", []):
+            cmdline = proc.get("cmdline") or ""
+            env = proc.get("env") or {}
+            ours = bool(self.worker_re.search(cmdline)) or (
+                "PANOPTIKON_DEVICE_PIN" in env and "INFERIO_WORKER" in env
+            )
+            if not ours:
+                continue
+            pids.append(proc["pid"])
+            if proc.get("used_mb"):
+                total += int(proc["used_mb"])
+        return total, pids
+
+    def log_events(self, message: str) -> List[Dict[str, Any]]:
+        return [event for event in self.log if event["message"] == message]
+
+    def log_matching(self, needle: str) -> List[Dict[str, Any]]:
+        return [event for event in self.log if needle in event["message"]]
+
+    def idle_cutoff(self) -> Optional[float]:
+        if not self.health_samples:
+            return None
+        return self.health_samples[-1]["t_wall"] - self.args.idle_window
+
+
+def _nearest(rows: List[Dict[str, Any]], times: List[float], target: float,
+             tolerance: float) -> Optional[Dict[str, Any]]:
+    if not rows:
+        return None
+    index = bisect.bisect_left(times, target)
+    best = None
+    best_dt = None
+    for candidate in (index - 1, index, index + 1):
+        if 0 <= candidate < len(rows):
+            dt = abs(times[candidate] - target)
+            if best_dt is None or dt < best_dt:
+                best, best_dt = rows[candidate], dt
+    if best_dt is None or best_dt > tolerance:
+        return None
+    return best
+
+
+def _pct(value: float, of: float) -> float:
+    return 100.0 * value / of if of else float("inf")
+
+
+# --------------------------------------------------------------------------
+# Checks
+# --------------------------------------------------------------------------
+
+
+def check_oracle_agreement(ctx: Context) -> Verdict:
+    """`external_mb` vs (board used - our workers' NVML usage): +/-1 GiB or 2%."""
+    if not ctx.health_samples or not ctx.vram_samples:
+        return Verdict("oracle_agreement", "SKIP",
+                       "needs both healthrec.jsonl and vramrec.jsonl")
+    joined = 0
+    worst = 0.0
+    worst_row: Dict[str, Any] = {}
+    breaches = 0
+    per_board: Dict[str, float] = {}
+    for sample in ctx.health_samples:
+        health = sample.get("health") or {}
+        if not health.get("ok"):
+            continue
+        vram = ctx.vram_at(sample["t_wall"])
+        if vram is None:
+            continue
+        for board in health.get("boards") or []:
+            uuid = board.get("gpu_uuid")
+            oracle = ctx.oracle_board(vram, uuid)
+            if oracle is None or oracle.get("used_mb") is None:
+                continue
+            if not board.get("external_known"):
+                continue
+            ours, _ = ctx.our_pids_mb(oracle)
+            oracle_external = max(0, int(oracle["used_mb"]) - ours)
+            delta = abs(int(board.get("external_mb") or 0) - oracle_external)
+            total = int(board.get("total_mb") or oracle.get("total_mb") or 0)
+            allowance = max(1024.0, 0.02 * total)
+            joined += 1
+            per_board[uuid] = max(per_board.get(uuid, 0.0), float(delta))
+            if delta > worst:
+                worst = float(delta)
+                worst_row = {
+                    "iso": sample["iso"], "gpu": uuid,
+                    "external_mb": board.get("external_mb"),
+                    "oracle_external_mb": oracle_external,
+                    "board_used_mb": oracle.get("used_mb"),
+                    "our_pids_mb": ours,
+                    "allowance_mb": round(allowance),
+                }
+            if delta > allowance:
+                breaches += 1
+    if joined == 0:
+        return Verdict("oracle_agreement", "SKIP",
+                       "no health sample could be joined to a vramrec sample "
+                       f"within {ctx.args.join_tolerance}s")
+    verdict = "PASS" if breaches == 0 else "FAIL"
+    return Verdict(
+        "oracle_agreement", verdict,
+        f"worst |external_mb - oracle| = {worst:.0f} MiB over {joined} joined "
+        f"board-samples; {breaches} outside the allowance",
+        {"joined": joined, "breaches": breaches, "worst_mb": worst,
+         "per_board_worst_mb": per_board, "worst_sample": worst_row},
+    )
+
+
+def check_base_accuracy(ctx: Context) -> Verdict:
+    """`base_mb` vs the oracle's per-process usage at load time: +/-10% (nvml).
+
+    The comparison is anchored at the moment the worker was admitted, not at an
+    arbitrary later sample: NVML's per-process figure includes allocator pool
+    growth, so after the first window it measures base + pool, and only the
+    load-time reading is comparable to `base_mb`.
+    """
+    if not ctx.health_samples or not ctx.vram_samples:
+        return Verdict("base_accuracy", "SKIP", "needs healthrec and vramrec")
+
+    # When was each replica admitted? The ledger's own log line is exact; the
+    # first health sample that shows it is the fallback.
+    admitted: Dict[Tuple[str, str], float] = {}
+    for event in ctx.log_events("admitted a worker to a board's ledger"):
+        key = (str(event["fields"].get("model")), str(event["fields"].get("gpu")))
+        if event["t_wall"] and key not in admitted:
+            admitted[key] = event["t_wall"]
+
+    seen: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for sample in ctx.health_samples:
+        for model in (sample.get("health") or {}).get("models") or []:
+            for replica in model.get("replicas") or []:
+                uuid = replica.get("gpu_uuid") or replica.get("gpu")
+                if replica.get("base_mb") is None or uuid is None:
+                    continue
+                key = (model["inference_id"], uuid)
+                if key in seen:
+                    continue
+                seen[key] = {
+                    "t_wall": admitted.get(key, sample["t_wall"]),
+                    "anchor": "log" if key in admitted else "first health sample",
+                    "base_mb": replica["base_mb"],
+                    "base_method": replica.get("base_method"),
+                }
+    if not seen:
+        return Verdict("base_accuracy", "SKIP", "no replica reported a base_mb")
+
+    rows: List[Dict[str, Any]] = []
+    for (model, uuid), info in seen.items():
+        vram = _nearest(ctx.vram_samples, ctx._vram_times, info["t_wall"],
+                        ctx.args.base_window)
+        if vram is None:
+            rows.append({"model": model, "gpu": uuid, **info,
+                         "note": "no oracle sample near the admission"})
+            continue
+        oracle = ctx.oracle_board(vram, uuid)
+        if oracle is None:
+            rows.append({"model": model, "gpu": uuid, **info,
+                         "note": "board absent from the oracle sample"})
+            continue
+        ours, pids = ctx.our_pids_mb(oracle)
+        if len(pids) != 1:
+            rows.append({"model": model, "gpu": uuid, **info, "pids": pids,
+                         "oracle_sum_mb": ours,
+                         "note": f"{len(pids)} worker PIDs on the board: "
+                                 "attribution is ambiguous"})
+            continue
+        # The lifetime minimum is a second, weaker estimate of the same thing.
+        floor = None
+        for sample in ctx.vram_samples:
+            board = ctx.oracle_board(sample, uuid)
+            if board is None:
+                continue
+            for proc in board.get("procs", []):
+                if proc["pid"] == pids[0] and proc.get("used_mb"):
+                    floor = proc["used_mb"] if floor is None else min(floor, proc["used_mb"])
+        error = abs(info["base_mb"] - ours)
+        rows.append({"model": model, "gpu": uuid, **info, "pid": pids[0],
+                     "oracle_pid_mb": ours, "oracle_pid_min_mb": floor,
+                     "error_mb": error,
+                     "error_pct": round(_pct(error, max(1, ours)), 2)})
+
+    judged = [row for row in rows if row.get("error_pct") is not None
+              and row.get("base_method") == "nvml"]
+    reported = [row for row in rows if row.get("error_pct") is not None]
+    if not reported:
+        return Verdict("base_accuracy", "SKIP",
+                       "; ".join(f"{row['model']}: {row.get('note')}" for row in rows),
+                       {"rows": rows})
+    detail = "; ".join(
+        f"{row['model']} base_mb={row['base_mb']} ({row['base_method']}) vs oracle "
+        f"PID {row['oracle_pid_mb']} MiB at admission = {row['error_pct']}% "
+        f"(lifetime min {row['oracle_pid_min_mb']})"
+        for row in reported
+    )
+    if not judged:
+        return Verdict("base_accuracy", "INFO",
+                       detail + "  [report-only: base_method is not nvml]",
+                       {"rows": rows})
+    worst = max(judged, key=lambda row: row["error_pct"])
+    verdict = "PASS" if worst["error_pct"] <= 10.0 else "FAIL"
+    return Verdict("base_accuracy", verdict, detail + "  [threshold 10%]",
+                   {"rows": rows, "worst": worst})
+
+
+def check_footprint_agreement(ctx: Context) -> Verdict:
+    """Per board: `footprints_mb` vs the summed NVML usage of our PIDs."""
+    if not ctx.health_samples or not ctx.vram_samples:
+        return Verdict("footprint_agreement", "SKIP", "needs healthrec and vramrec")
+    worst = 0.0
+    worst_row: Dict[str, Any] = {}
+    joined = 0
+    for sample in ctx.health_samples:
+        health = sample.get("health") or {}
+        vram = ctx.vram_at(sample["t_wall"])
+        if vram is None:
+            continue
+        for board in health.get("boards") or []:
+            oracle = ctx.oracle_board(vram, board.get("gpu_uuid"))
+            if oracle is None:
+                continue
+            ours, pids = ctx.our_pids_mb(oracle)
+            if not pids:
+                continue
+            joined += 1
+            delta = abs(int(board.get("footprints_mb") or 0) - ours)
+            if delta > worst:
+                worst = float(delta)
+                worst_row = {"iso": sample["iso"], "gpu": board.get("gpu_uuid"),
+                             "footprints_mb": board.get("footprints_mb"),
+                             "oracle_our_pids_mb": ours, "pids": pids}
+    if joined == 0:
+        return Verdict("footprint_agreement", "SKIP", "no worker PID seen on any board")
+    return Verdict("footprint_agreement", "INFO",
+                   f"worst |footprints_mb - Sum(our PIDs)| = {worst:.0f} MiB "
+                   f"over {joined} board-samples (report-only: footprints "
+                   f"exclude pool growth the grant already counts)",
+                   {"joined": joined, "worst_mb": worst, "worst_sample": worst_row})
+
+
+def check_slope_accuracy(ctx: Context) -> Verdict:
+    """Persisted slope vs ceiling_probe's: -30% .. +100%."""
+    profiles = (ctx.after or {}).get("profile") or []
+    if not profiles:
+        return Verdict("slope_accuracy", "SKIP", "no calibration.after.toml profiles")
+    if not ctx.probes:
+        return Verdict("slope_accuracy", "SKIP", "no ceiling_probe result (--probe)")
+    rows = []
+    verdict = "PASS"
+    for probe in ctx.probes:
+        fit = probe.get("fit")
+        if not fit:
+            rows.append({"model": probe.get("model"), "probe_slope": None,
+                         "note": "probe produced no fit"})
+            continue
+        model = probe.get("model")
+        match = next((p for p in profiles if p.get("inference_id") == model), None)
+        if match is None:
+            rows.append({"model": model, "probe_slope": fit["slope_mb_per_unit"],
+                         "note": "model absent from the store"})
+            verdict = "FAIL" if verdict != "FAIL" else verdict
+            continue
+        ledger = float(match.get("slope_mb_per_unit") or 0.0)
+        probe_slope = float(fit["slope_mb_per_unit"])
+        ratio = ledger / probe_slope if probe_slope else float("inf")
+        ok = 0.70 <= ratio <= 2.00
+        rows.append({"model": model, "ledger_slope": ledger,
+                     "probe_slope": probe_slope, "ratio": round(ratio, 4),
+                     "ok": ok,
+                     "ledger_base_mb": match.get("base_mb"),
+                     "probe_base_mb": (probe.get("load") or {}).get("base_nvml_mb")})
+        if not ok:
+            verdict = "FAIL"
+    detail = "; ".join(
+        f"{row['model']}: ledger {row.get('ledger_slope')} vs probe "
+        f"{row.get('probe_slope')} MiB/unit (ratio {row.get('ratio')})"
+        if row.get("ratio") is not None else f"{row['model']}: {row.get('note')}"
+        for row in rows
+    )
+    return Verdict("slope_accuracy", verdict,
+                   detail + "  [allowed 0.70x .. 2.00x]", {"models": rows})
+
+
+def check_grant_safety(ctx: Context) -> Verdict:
+    """Grants must fit the headroom they were priced against and live free memory."""
+    grants = ctx.log_events("issued a memory grant")
+    if not grants:
+        return Verdict("grant_safety", "SKIP",
+                       "no 'issued a memory grant' lines "
+                       "(RUST_LOG=info,panoptikon::inferio=trace?)")
+    over_headroom = []
+    over_free = []
+    joined = 0
+    for event in grants:
+        fields = event["fields"]
+        mb = fields.get("mb")
+        headroom = fields.get("headroom_mb")
+        if isinstance(mb, (int, float)) and isinstance(headroom, (int, float)):
+            if mb > headroom:
+                over_headroom.append({"iso": event["ts"], **fields})
+        vram = ctx.vram_at(event["t_wall"]) if event["t_wall"] else None
+        if vram is not None and isinstance(mb, (int, float)):
+            oracle = ctx.oracle_board(vram, fields.get("gpu"))
+            if oracle and oracle.get("free_mb") is not None:
+                joined += 1
+                if mb > oracle["free_mb"]:
+                    over_free.append({"iso": event["ts"], "mb": mb,
+                                      "oracle_free_mb": oracle["free_mb"],
+                                      "gpu": fields.get("gpu"),
+                                      "model": fields.get("model")})
+    zero_mb = sum(1 for event in grants if event["fields"].get("mb") == 0)
+    verdict = "PASS" if not over_headroom and not over_free else "FAIL"
+    return Verdict(
+        "grant_safety", verdict,
+        f"{len(grants)} grants; {len(over_headroom)} exceeded the headroom they "
+        f"were priced against; {len(over_free)} exceeded the oracle's live free "
+        f"memory ({joined} joined); {zero_mb} were memory-blind (mb=0, B1)",
+        {"grants": len(grants), "over_headroom": over_headroom[:10],
+         "over_free": over_free[:10], "zero_mb_grants": zero_mb,
+         "joined": joined},
+    )
+
+
+def check_failures(ctx: Context) -> Verdict:
+    """OOM negatives, worker deaths and merged-window fallbacks in the log."""
+    if not ctx.log:
+        return Verdict("failures", "SKIP", "no panoptikon.log")
+    negatives = [
+        event for event in ctx.log_events("settled a granted window")
+        if event["level"] == "WARN"
+    ]
+    reasons: Dict[str, int] = {}
+    for event in negatives:
+        reason = str(event["fields"].get("reason", "?"))
+        reasons[reason] = reasons.get(reason, 0) + 1
+    ooms = reasons.get("oom", 0)
+    collapses = reasons.get("throughput_collapse", 0)
+    unified_deaths = reasons.get("unified_board_death", 0)
+    deaths = len(ctx.log_matching("worker died fatally"))
+    fallbacks = ctx.log_matching("falling back to per-request prediction")
+    oom_fallbacks = sum(1 for event in fallbacks if event["fields"].get("oom") is True)
+    expected_ooms = ctx.args.expect_ooms
+    expected_deaths = ctx.args.expect_deaths
+    bad = ooms > expected_ooms or deaths > expected_deaths
+    verdict = "FAIL" if bad else ("WARN" if (ooms or deaths) else "PASS")
+    return Verdict(
+        "failures", verdict,
+        f"{ooms} OOM negatives (expected <= {expected_ooms}), "
+        f"{collapses} throughput-collapse negatives, "
+        f"{unified_deaths} unified-board death negatives, "
+        f"{deaths} fatal worker deaths (expected <= {expected_deaths}), "
+        f"{len(fallbacks)} merged-window fallbacks ({oom_fallbacks} OOM)",
+        {"negative_reasons": reasons, "worker_deaths": deaths,
+         "fallbacks": len(fallbacks), "oom_fallbacks": oom_fallbacks,
+         "first_death": (ctx.log_matching("worker died fatally") or [{}])[0].get("line")},
+    )
+
+
+def check_deflation_recovery(ctx: Context) -> Verdict:
+    """Deflation must return to 0 within 3 clean windows per level."""
+    if not ctx.health_samples:
+        return Verdict("deflation_recovery", "SKIP", "no healthrec.jsonl")
+    peak: Dict[str, int] = {}
+    last: Dict[str, int] = {}
+    series: Dict[str, List[Tuple[float, int]]] = {}
+    for sample in ctx.health_samples:
+        for worker in (sample.get("health") or {}).get("workers") or []:
+            key = f"{worker['inference_id']}@{worker.get('gpu_uuid')}"
+            value = int(worker.get("deflation") or 0)
+            peak[key] = max(peak.get(key, 0), value)
+            last[key] = value
+            series.setdefault(key, []).append((sample["t_wall"], value))
+    if not peak:
+        return Verdict("deflation_recovery", "SKIP", "no workers in any health sample")
+    cutoff = ctx.idle_cutoff()
+    stuck = {key: value for key, value in last.items() if value > 0}
+    max_peak = max(peak.values())
+    if max_peak == 0:
+        return Verdict("deflation_recovery", "PASS",
+                       "deflation never left 0 on any worker",
+                       {"peak": peak})
+    verdict = "PASS" if not stuck else "FAIL"
+    return Verdict(
+        "deflation_recovery", verdict,
+        f"peak deflation {max_peak} ({', '.join(f'{k}={v}' for k, v in peak.items())}); "
+        f"at the end of the recording {len(stuck)} worker(s) were still deflated"
+        + (f" ({stuck})" if stuck else ""),
+        {"peak": peak, "final": last, "idle_cutoff": cutoff},
+    )
+
+
+def check_idle_liveness(ctx: Context) -> Verdict:
+    """`grants_outstanding` must be 0 once the load stops."""
+    if not ctx.health_samples:
+        return Verdict("idle_liveness", "SKIP", "no healthrec.jsonl")
+    cutoff = ctx.idle_cutoff()
+    tail = [row for row in ctx.health_samples if row["t_wall"] >= (cutoff or 0)]
+    if not tail:
+        return Verdict("idle_liveness", "SKIP", "no samples in the idle window")
+    busy = []
+    for sample in tail:
+        health = sample.get("health") or {}
+        pending = sum(
+            int(worker.get("pending_requests") or 0)
+            for worker in health.get("workers") or []
+        )
+        outstanding = sum(
+            int(board.get("grants_outstanding") or 0)
+            for board in health.get("boards") or []
+        )
+        if outstanding and not pending:
+            busy.append({"iso": sample["iso"], "grants_outstanding": outstanding})
+    last = tail[-1]
+    final = sum(int(board.get("grants_outstanding") or 0)
+                for board in (last.get("health") or {}).get("boards") or [])
+    verdict = "PASS" if final == 0 else "FAIL"
+    return Verdict(
+        "idle_liveness", verdict,
+        f"final grants_outstanding = {final} over the last "
+        f"{ctx.args.idle_window:.0f}s ({len(tail)} samples); "
+        f"{len(busy)} sample(s) held a grant with no pending request",
+        {"final_outstanding": final, "idle_samples": len(tail),
+         "grant_without_demand": busy[:5]},
+    )
+
+
+def check_utilization(ctx: Context) -> Verdict:
+    """Admitted units vs the probe's OOM boundary (or knee)."""
+    if not ctx.health_samples:
+        return Verdict("utilization", "SKIP", "no healthrec.jsonl")
+    peak: Dict[str, int] = {}
+    for sample in ctx.health_samples:
+        for worker in (sample.get("health") or {}).get("workers") or []:
+            key = worker["inference_id"]
+            peak[key] = max(peak.get(key, 0), int(worker.get("unit_budget") or 0))
+    if not peak:
+        return Verdict("utilization", "SKIP", "no workers in any health sample")
+    boundaries: Dict[str, Optional[int]] = {}
+    for probe in ctx.probes:
+        bisect_info = probe.get("bisect") or {}
+        boundaries[probe.get("model")] = (
+            bisect_info.get("largest_ok_units")
+            or (probe.get("batches") or [{}])[-1].get("units")
+        )
+    rows = []
+    verdict = "INFO"
+    threshold = ctx.args.utilization_floor
+    for model, admitted in peak.items():
+        boundary = boundaries.get(model)
+        if not boundary:
+            rows.append({"model": model, "peak_unit_budget": admitted,
+                         "boundary_units": None})
+            continue
+        ratio = admitted / boundary
+        ok = ratio >= threshold
+        rows.append({"model": model, "peak_unit_budget": admitted,
+                     "boundary_units": boundary, "ratio": round(ratio, 4),
+                     "ok": ok})
+        verdict = "PASS" if (verdict in ("INFO", "PASS") and ok) else "FAIL"
+    detail = "; ".join(
+        f"{row['model']}: peak unit_budget {row['peak_unit_budget']}"
+        + (f" / probe boundary {row['boundary_units']} = {row['ratio']:.2f}"
+           if row.get("boundary_units") else " (no probe boundary)")
+        for row in rows
+    )
+    return Verdict("utilization", verdict,
+                   detail + f"  [floor {threshold:.2f}]", {"models": rows})
+
+
+def check_throughput(ctx: Context) -> Verdict:
+    """Items/s from `LogRecord` vs the C0 baseline."""
+    records = _log_records(ctx.jobs)
+    if not records:
+        return Verdict("throughput", "SKIP",
+                       "jobs.json has no LogRecord history entries")
+    ours = _items_per_s(records)
+    baseline = ctx.args.baseline_items_per_s
+    if baseline is None and ctx.args.baseline_jobs:
+        baseline_records = _log_records(read_json(Path(ctx.args.baseline_jobs)))
+        baseline = _items_per_s(baseline_records)
+    if not baseline:
+        return Verdict("throughput", "INFO",
+                       f"{ours:.3f} items/s over {len(records)} job(s); "
+                       "no baseline given (--baseline-jobs/--baseline-items-per-s)",
+                       {"items_per_s": ours, "jobs": len(records)})
+    ratio = ours / baseline if baseline else float("inf")
+    verdict = "PASS" if ratio >= ctx.args.throughput_floor else "FAIL"
+    return Verdict("throughput", verdict,
+                   f"{ours:.3f} items/s vs baseline {baseline:.3f} = "
+                   f"{ratio:.2f}x  [floor {ctx.args.throughput_floor:.2f}x]",
+                   {"items_per_s": ours, "baseline_items_per_s": baseline,
+                    "ratio": ratio, "jobs": len(records)})
+
+
+def _log_records(payload: Any) -> List[Dict[str, Any]]:
+    if payload is None:
+        return []
+    if isinstance(payload, dict):
+        for key in ("history", "logs", "records", "data"):
+            if isinstance(payload.get(key), list):
+                payload = payload[key]
+                break
+        else:
+            payload = [payload] if "total_segments" in payload else []
+    if not isinstance(payload, list):
+        return []
+    return [row for row in payload
+            if isinstance(row, dict) and "total_segments" in row]
+
+
+def _items_per_s(records: List[Dict[str, Any]]) -> float:
+    items = 0.0
+    seconds = 0.0
+    for record in records:
+        items += float(record.get("total_segments") or 0)
+        start = _iso_epoch(str(record.get("start_time", "")).replace(" ", "T"))
+        end = _iso_epoch(str(record.get("end_time", "")).replace(" ", "T"))
+        if start and end and end > start:
+            seconds += end - start
+        else:
+            seconds += float(record.get("inference_time") or 0) + float(
+                record.get("data_load_time") or 0)
+    return items / seconds if seconds else 0.0
+
+
+def check_persistence(ctx: Context) -> Verdict:
+    """The store must be written within 30 s of an anchor advance."""
+    queued = ctx.log_events("queued a calibration profile update for the store")
+    writes = ctx.log_events("wrote the local calibration store")
+    after = ctx.after
+    if after is None:
+        return Verdict("persistence", "SKIP", "no calibration.after.toml")
+    profiles = after.get("profile") or []
+    if not queued and not writes:
+        return Verdict(
+            "persistence", "INFO" if profiles else "SKIP",
+            f"{len(profiles)} profile(s) on disk; no store log lines to time "
+            "the debounce against",
+            {"profiles": len(profiles)},
+        )
+    worst = None
+    for event in queued:
+        if event["fields"].get("reason") != "anchor_advanced":
+            continue
+        later = [write for write in writes
+                 if write["t_wall"] and event["t_wall"]
+                 and write["t_wall"] >= event["t_wall"]]
+        if not later:
+            worst = float("inf")
+            break
+        delay = later[0]["t_wall"] - event["t_wall"]
+        worst = delay if worst is None else max(worst, delay)
+    anchors = {
+        profile.get("inference_id"): profile.get("max_units_measured")
+        for profile in profiles
+    }
+    before_anchors = {
+        profile.get("inference_id"): profile.get("max_units_measured")
+        for profile in ((ctx.before or {}).get("profile") or [])
+    }
+    regressions = {
+        model: (before_anchors[model], anchors[model])
+        for model in anchors
+        if model in before_anchors
+        and (before_anchors[model] or 0) > (anchors[model] or 0)
+    }
+    if worst is None:
+        verdict = "INFO"
+        detail = (f"{len(profiles)} profile(s); no anchor_advanced update was "
+                  f"queued during the recording")
+    elif worst == float("inf"):
+        verdict = "FAIL"
+        detail = "an anchor advance was queued but the store was never written"
+    else:
+        verdict = "PASS" if worst <= 30.0 else "FAIL"
+        detail = (f"worst anchor-advance -> store-write delay {worst:.1f}s "
+                  f"[threshold 30s]; {len(writes)} write(s), "
+                  f"{len(profiles)} profile(s)")
+    if regressions:
+        verdict = "FAIL"
+        detail += f"; anchor regressed for {regressions}"
+    return Verdict("persistence", verdict, detail,
+                   {"queued": len(queued), "writes": len(writes),
+                    "profiles": len(profiles), "anchors": anchors,
+                    "before_anchors": before_anchors,
+                    "regressions": regressions})
+
+
+def check_job_outcome(ctx: Context) -> Verdict:
+    """Jobs must complete; item failures only where the scenario poisoned them."""
+    records = _log_records(ctx.jobs)
+    queue_outcomes: List[Dict[str, Any]] = []
+    if isinstance(ctx.jobs, dict) and isinstance(ctx.jobs.get("outcomes"), list):
+        queue_outcomes = ctx.jobs["outcomes"]
+    for sample in reversed(ctx.health_samples):
+        if queue_outcomes:
+            break
+        outcomes = (sample.get("queue") or {}).get("outcomes")
+        if outcomes:
+            queue_outcomes = outcomes
+    if not records and not queue_outcomes:
+        return Verdict("job_outcome", "SKIP", "no jobs.json and no queue outcomes")
+    failed = sum(int(record.get("failed") or 0) for record in records)
+    errors = sum(int(record.get("errors") or 0) for record in records)
+    completed = sum(int(record.get("completed") or 0) for record in records)
+    bad_outcomes = [row for row in queue_outcomes
+                    if row.get("status") not in (None, "completed")]
+    over = failed > ctx.args.expect_failures
+    verdict = "FAIL" if (over or bad_outcomes) else "PASS"
+    return Verdict(
+        "job_outcome", verdict,
+        f"{len(records)} job record(s): {completed} completed items, "
+        f"{failed} failed (expected <= {ctx.args.expect_failures}), "
+        f"{errors} errors; queue outcomes: "
+        f"{[row.get('status') for row in queue_outcomes] or 'none'}",
+        {"completed": completed, "failed": failed, "errors": errors,
+         "outcomes": queue_outcomes, "records": len(records)},
+    )
+
+
+def check_ledger_invariant(ctx: Context) -> Verdict:
+    """Sum of charges plus load reservations must never exceed `limit_mb`."""
+    if not ctx.health_samples:
+        return Verdict("ledger_invariant", "SKIP", "no healthrec.jsonl")
+    breaches = []
+    checked = 0
+    for sample in ctx.health_samples:
+        for board in (sample.get("health") or {}).get("boards") or []:
+            limit = board.get("limit_mb")
+            if limit is None:
+                continue
+            checked += 1
+            used = int(board.get("charges_mb") or 0) + int(
+                board.get("load_reservations_mb") or 0)
+            if used > int(limit):
+                breaches.append({"iso": sample["iso"], "gpu": board.get("gpu_uuid"),
+                                 "charges_mb": board.get("charges_mb"),
+                                 "load_reservations_mb": board.get("load_reservations_mb"),
+                                 "limit_mb": limit})
+    if checked == 0:
+        return Verdict("ledger_invariant", "SKIP", "no board carried a limit_mb")
+    verdict = "PASS" if not breaches else "FAIL"
+    return Verdict("ledger_invariant", verdict,
+                   f"{len(breaches)} of {checked} board-samples had "
+                   f"charges + load reservations > limit_mb",
+                   {"checked": checked, "breaches": breaches[:10]})
+
+
+def check_hog_tracking(ctx: Context) -> Verdict:
+    """`external_mb` must follow what hog.py actually holds."""
+    if not ctx.hog_samples or not ctx.health_samples:
+        return Verdict("hog_tracking", "SKIP", "needs hog.jsonl and healthrec.jsonl")
+    header = next((row for row in ctx.hog if row.get("kind") == "header"), {})
+    gpu_uuid = header.get("gpu_uuid")
+    if header.get("target") == "ram":
+        return Verdict("hog_tracking", "INFO",
+                       "the hog pressured RAM, not a board; see the vramrec "
+                       "MemAvailable series", {"header": header})
+    rows = []
+    worst_lag = 0.0
+    worst = None
+    for sample in ctx.health_samples:
+        board = next((entry for entry in (sample.get("health") or {}).get("boards") or []
+                      if entry.get("gpu_uuid") == gpu_uuid), None)
+        if board is None or not board.get("external_known"):
+            continue
+        hog = ctx.hog_at(sample["t_wall"])
+        if hog is None:
+            continue
+        vram = ctx.vram_at(sample["t_wall"])
+        oracle_used = None
+        if vram is not None:
+            oracle = ctx.oracle_board(vram, gpu_uuid)
+            oracle_used = oracle.get("used_mb") if oracle else None
+        rows.append({"t_wall": sample["t_wall"], "iso": sample["iso"],
+                     "external_mb": board.get("external_mb"),
+                     "hog_held_mb": hog.get("held_mb"),
+                     "board_used_mb": oracle_used,
+                     "sample_age_ms": board.get("external_sample_age_ms")})
+    if not rows:
+        return Verdict("hog_tracking", "SKIP",
+                       f"no health sample joined the hog on board {gpu_uuid}")
+    ages = [row["sample_age_ms"] for row in rows if row["sample_age_ms"] is not None]
+    max_age = max(ages) / 1000.0 if ages else None
+    # Track the correlation of the two deltas rather than absolute agreement:
+    # `external` also contains whatever else lives on the board.
+    deltas = []
+    for previous, current in zip(rows, rows[1:]):
+        d_hog = (current["hog_held_mb"] or 0) - (previous["hog_held_mb"] or 0)
+        d_ext = (current["external_mb"] or 0) - (previous["external_mb"] or 0)
+        if abs(d_hog) >= 256:
+            deltas.append({"iso": current["iso"], "d_hog_mb": d_hog,
+                           "d_external_mb": d_ext})
+    return Verdict(
+        "hog_tracking", "INFO",
+        f"{len(rows)} joined samples on {gpu_uuid}; hog held "
+        f"{min(row['hog_held_mb'] or 0 for row in rows)}.."
+        f"{max(row['hog_held_mb'] or 0 for row in rows)} MiB; external_mb "
+        f"{min(row['external_mb'] or 0 for row in rows)}.."
+        f"{max(row['external_mb'] or 0 for row in rows)} MiB; worst "
+        f"external_sample_age {max_age if max_age is None else round(max_age, 1)}s; "
+        f"{len(deltas)} step(s) >= 256 MiB",
+        {"joined": len(rows), "steps": deltas[:20],
+         "max_external_sample_age_s": max_age},
+    )
+
+
+def check_ramp_progress(ctx: Context) -> Verdict:
+    """The ramp must actually move: ramp_step / unit_budget over time."""
+    if not ctx.health_samples:
+        return Verdict("ramp_progress", "SKIP", "no healthrec.jsonl")
+    series: Dict[str, List[int]] = {}
+    fits: Dict[str, int] = {}
+    for sample in ctx.health_samples:
+        for worker in (sample.get("health") or {}).get("workers") or []:
+            key = worker["inference_id"]
+            series.setdefault(key, []).append(int(worker.get("unit_budget") or 0))
+            if worker.get("fit_samples"):
+                fits[key] = max(fits.get(key, 0), int(worker["fit_samples"]))
+    if not series:
+        return Verdict("ramp_progress", "SKIP", "no workers in any health sample")
+    rows = {
+        model: {"first": values[0], "peak": max(values), "last": values[-1],
+                "fit_samples": fits.get(model, 0)}
+        for model, values in series.items()
+    }
+    stalled_at_64 = [model for model, row in rows.items() if row["peak"] == 64]
+    detail = "; ".join(
+        f"{model}: unit_budget {row['first']} -> peak {row['peak']} "
+        f"(last {row['last']}, fit samples {row['fit_samples']})"
+        for model, row in rows.items()
+    )
+    if stalled_at_64:
+        detail += (f"  [peak exactly 64 for {', '.join(stalled_at_64)}: check "
+                   f"REQUEST_UNIT_BUDGET, finding B16]")
+    return Verdict("ramp_progress", "INFO", detail, {"models": rows})
+
+
+CHECKS: Dict[str, Callable[[Context], Verdict]] = {
+    "oracle_agreement": check_oracle_agreement,
+    "base_accuracy": check_base_accuracy,
+    "footprint_agreement": check_footprint_agreement,
+    "slope_accuracy": check_slope_accuracy,
+    "grant_safety": check_grant_safety,
+    "failures": check_failures,
+    "deflation_recovery": check_deflation_recovery,
+    "idle_liveness": check_idle_liveness,
+    "utilization": check_utilization,
+    "throughput": check_throughput,
+    "persistence": check_persistence,
+    "job_outcome": check_job_outcome,
+    "ledger_invariant": check_ledger_invariant,
+    "hog_tracking": check_hog_tracking,
+    "ramp_progress": check_ramp_progress,
+}
+
+
+# --------------------------------------------------------------------------
+# Plot (optional)
+# --------------------------------------------------------------------------
+
+
+def make_plot(ctx: Context, path: Path) -> str:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        return f"skipped ({type(exc).__name__}: matplotlib not available)"
+    figure, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+    base = None
+    for row in ctx.vram_samples:
+        base = row["t_wall"]
+        break
+    if base is None:
+        return "skipped (no vramrec samples)"
+
+    boards: Dict[str, List[Tuple[float, int]]] = {}
+    for row in ctx.vram_samples:
+        for board in row.get("gpus", []):
+            if board.get("used_mb") is not None:
+                boards.setdefault(board["uuid"], []).append(
+                    (row["t_wall"] - base, board["used_mb"]))
+    for uuid, points in boards.items():
+        axes[0].plot([p[0] for p in points], [p[1] for p in points],
+                     label=f"oracle used {uuid[:16]}", linewidth=1)
+    if ctx.hog_samples:
+        axes[0].plot([row["t_wall"] - base for row in ctx.hog_samples],
+                     [row.get("held_mb") or 0 for row in ctx.hog_samples],
+                     label="hog held", linewidth=1, linestyle="--")
+    axes[0].set_ylabel("MiB")
+    axes[0].legend(fontsize=7)
+    axes[0].set_title("board memory")
+
+    series: Dict[str, List[Tuple[float, Any]]] = {}
+    for sample in ctx.health_samples:
+        for board in (sample.get("health") or {}).get("boards") or []:
+            for key in ("external_mb", "headroom_mb", "grants_mb"):
+                series.setdefault(f"{key} {board.get('gpu_uuid', '')[:12]}", []).append(
+                    (sample["t_wall"] - base, board.get(key)))
+    for label, points in series.items():
+        axes[1].plot([p[0] for p in points], [p[1] for p in points],
+                     label=label, linewidth=1)
+    axes[1].set_ylabel("MiB")
+    axes[1].legend(fontsize=7)
+    axes[1].set_title("ledger view")
+
+    budgets: Dict[str, List[Tuple[float, int]]] = {}
+    deflations: Dict[str, List[Tuple[float, int]]] = {}
+    for sample in ctx.health_samples:
+        for worker in (sample.get("health") or {}).get("workers") or []:
+            budgets.setdefault(worker["inference_id"], []).append(
+                (sample["t_wall"] - base, worker.get("unit_budget")))
+            deflations.setdefault(worker["inference_id"], []).append(
+                (sample["t_wall"] - base, worker.get("deflation")))
+    for label, points in budgets.items():
+        axes[2].plot([p[0] for p in points], [p[1] for p in points],
+                     label=f"unit_budget {label}", linewidth=1)
+    for label, points in deflations.items():
+        axes[2].plot([p[0] for p in points], [p[1] for p in points],
+                     label=f"deflation {label}", linewidth=1, linestyle=":")
+    for event in ctx.log:
+        if event["level"] == "WARN" and event["message"] == "settled a granted window":
+            if event["t_wall"]:
+                axes[2].axvline(event["t_wall"] - base, color="red", alpha=0.3,
+                                linewidth=0.8)
+    axes[2].set_ylabel("units")
+    axes[2].set_xlabel("seconds since the first oracle sample")
+    axes[2].legend(fontsize=7)
+    axes[2].set_title("admission (red = negative sample)")
+
+    figure.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=110)
+    return f"wrote {path}"
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Join one scenario's recordings and print the §6 verdict table.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--scenario", help="directory with the standard file names")
+    parser.add_argument("--vramrec")
+    parser.add_argument("--healthrec")
+    parser.add_argument("--hog")
+    parser.add_argument("--log", dest="logfile")
+    parser.add_argument("--before", help="calibration.before.toml")
+    parser.add_argument("--after", help="calibration.after.toml")
+    parser.add_argument("--jobs", help="jobs.json")
+    parser.add_argument("--probe", action="append", default=[],
+                        help="ceiling_probe.py result (repeatable)")
+    parser.add_argument("--checks", default="all",
+                        help="comma-separated check names, or `all`")
+    parser.add_argument("--list-checks", action="store_true")
+    parser.add_argument("--expect-ooms", type=int, default=0)
+    parser.add_argument("--expect-deaths", type=int, default=0)
+    parser.add_argument("--expect-failures", type=int, default=0)
+    parser.add_argument("--baseline-jobs")
+    parser.add_argument("--baseline-items-per-s", type=float, default=None)
+    parser.add_argument("--throughput-floor", type=float, default=0.9)
+    parser.add_argument("--utilization-floor", type=float, default=0.25)
+    parser.add_argument("--idle-window", type=float, default=60.0)
+    parser.add_argument("--join-tolerance", type=float, default=1.5)
+    parser.add_argument("--base-window", type=float, default=10.0,
+                        help="max |dt| between a worker admission and the "
+                             "oracle sample base_accuracy compares against")
+    parser.add_argument("--worker-pattern", default="inferio_worker")
+    parser.add_argument("--json", dest="json_out")
+    parser.add_argument("--plot")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.list_checks:
+        for name, fn in CHECKS.items():
+            summary = (fn.__doc__ or "").strip().splitlines()[0]
+            print(f"{name:22s} {summary}")
+        return 0
+
+    root = Path(args.scenario).resolve() if args.scenario else None
+
+    def pick(explicit: Optional[str], default_name: str) -> Optional[Path]:
+        if explicit:
+            return Path(explicit)
+        if root is None:
+            return None
+        candidate = root / default_name
+        return candidate if candidate.exists() else None
+
+    probes = []
+    probe_paths = [Path(path) for path in args.probe]
+    if root is not None and not probe_paths:
+        probe_paths = sorted(root.glob("probe*.json"))
+    for path in probe_paths:
+        payload = read_json(path)
+        if payload:
+            probes.append(payload)
+
+    ctx = Context(
+        args=args,
+        vramrec=read_jsonl(pick(args.vramrec, "vramrec.jsonl")),
+        healthrec=read_jsonl(pick(args.healthrec, "healthrec.jsonl")),
+        hog=read_jsonl(pick(args.hog, "hog.jsonl")),
+        log=parse_log(pick(args.logfile, "panoptikon.log")),
+        before=read_toml(pick(args.before, "calibration.before.toml")),
+        after=read_toml(pick(args.after, "calibration.after.toml")),
+        jobs=read_json(pick(args.jobs, "jobs.json")),
+        probes=probes,
+    )
+
+    selected = (
+        list(CHECKS)
+        if args.checks.strip() == "all"
+        else [name.strip() for name in args.checks.split(",") if name.strip()]
+    )
+    unknown = [name for name in selected if name not in CHECKS]
+    if unknown:
+        parser.error(f"unknown check(s): {', '.join(unknown)}")
+
+    verdicts = [CHECKS[name](ctx) for name in selected]
+
+    if not args.quiet:
+        print(f"scenario: {root or '(explicit paths)'}")
+        print(f"inputs:   vramrec {len(ctx.vram_samples)} samples, "
+              f"healthrec {len(ctx.health_samples)}, hog {len(ctx.hog_samples)}, "
+              f"log {len(ctx.log)} events, probes {len(ctx.probes)}, "
+              f"profiles after {len((ctx.after or {}).get('profile') or [])}")
+        print()
+    width = max(len(verdict.name) for verdict in verdicts) if verdicts else 10
+    print(f"{'CHECK'.ljust(width)}  VERDICT  DETAIL")
+    print(f"{'-' * width}  -------  {'-' * 60}")
+    for verdict in verdicts:
+        print(f"{verdict.name.ljust(width)}  {verdict.verdict:<7}  {verdict.detail}")
+
+    if args.plot:
+        note = make_plot(ctx, Path(args.plot))
+        if not args.quiet:
+            print(f"\nplot: {note}")
+
+    if args.json_out:
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json_out).write_text(
+            json.dumps(
+                {
+                    "scenario": str(root) if root else None,
+                    "inputs": {
+                        "vramrec_samples": len(ctx.vram_samples),
+                        "healthrec_samples": len(ctx.health_samples),
+                        "hog_samples": len(ctx.hog_samples),
+                        "log_events": len(ctx.log),
+                        "probes": len(ctx.probes),
+                    },
+                    "verdicts": [
+                        {"name": v.name, "verdict": v.verdict, "detail": v.detail,
+                         "numbers": v.numbers}
+                        for v in verdicts
+                    ],
+                },
+                indent=1, default=str,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        if not args.quiet:
+            print(f"json: wrote {args.json_out}")
+
+    return 1 if any(verdict.verdict == "FAIL" for verdict in verdicts) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
