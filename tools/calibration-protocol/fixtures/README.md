@@ -15,7 +15,7 @@ fixtures/
     oom_timed_cuda_impl.py          "oom_timed_cuda_test"    (Phase 4)
     dies_on_load_cuda_impl.py       "dies_on_load_cuda_test" (Phase 4)
   registry/
-    calibration-fixtures.toml  group `calibfixture`, 8 inference ids
+    calibration-fixtures.toml  group `calibfixture`, 11 inference ids
   install-fixtures.sh          copies both into the shipped default locations
 ```
 
@@ -110,7 +110,9 @@ plus the two Phase-4 additions `calibfixture/oom_timed_cuda` (batch-1 OOM for
 `oom_secs` after load, healthy afterwards — the only way to time deflation's
 *recovery* on one resident worker) and `calibfixture/dies_on_load_cuda`
 (raises inside `load()`, for the respawn-cadence measurement, finding B15).
-Use the `_cuda` ids on C1 (priced, board-resolved) and either family on C2.
+Use the `_cuda` ids whenever the ledger is under test (priced, board-resolved);
+the `_cpu` family exercises the **unpriced** path on any CUDA host (see the
+correction above).
 
 `oom_second_batch_cpu` (the shipped torch-free impl) tests `batches >= 2`, so
 it OOMs on the second batch **and on every batch after it, for the worker's
