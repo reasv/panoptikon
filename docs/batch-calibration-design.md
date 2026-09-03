@@ -409,7 +409,12 @@ on a model that has not been fitted yet.
   `load_reservation` at the *expected* base (local profile → shipped
   profile → conservative constant), replaced by the measured value when
   the load response lands. This is also item 8's trigger arriving early:
-  expected base exceeding headroom is the evict-before-load signal.
+  expected base exceeding headroom is the evict-before-load signal. That
+  signal needs a *measured* board, so the load path first probes the host
+  for the board's free memory when its reading is missing or stale — the
+  staleness refresh only runs from a grant request, which needs a resident
+  worker, and a board that has never had one would otherwise be priced as
+  empty however full it is.
   One wrinkle: `dtype` is in the profile key, but dtype negotiation
   (Package 1) resolves *during* the load — on the first-ever load of a
   model on a GPU the orchestrator cannot know which dtype's profile to

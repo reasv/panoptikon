@@ -92,7 +92,7 @@ use serde::{Deserialize, Serialize};
 
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
 use super::cost::{CostAggregation, CostDimension, CostUnit};
-use super::gpu::{GpuInventory, MemoryQuery as GpuMemoryQuery};
+use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
 use super::worker::{LoadReport, TelemetryHandle};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
@@ -1170,6 +1170,22 @@ struct LedgerState {
     profile_skip_logged: HashSet<(String, String, &'static str)>,
     next_id: u64,
     next_fit_version: u64,
+    /// Test seam for the host probe. Production always shells out through
+    /// [`VramLedger::memory_query`]; the ledger's own tests install a fixed
+    /// answer (and count the calls) so the load-path probe can be exercised
+    /// without a driver — `probe_external` is off in those ledgers precisely
+    /// so their free readings are exactly what they fed in.
+    #[cfg(test)]
+    probe_stub: Option<ProbeStub>,
+}
+
+/// The fake host probe a test installs (see [`LedgerState::probe_stub`]).
+#[cfg(test)]
+struct ProbeStub {
+    /// What the probe answers; `None` is a probe that answered nothing.
+    boards: Option<Vec<GpuMemory>>,
+    /// How many times it has been asked.
+    calls: u32,
 }
 
 impl LedgerState {
@@ -1564,7 +1580,10 @@ impl VramLedger {
     ///
     /// Expected base exceeding headroom logs a warning — that is item 8's
     /// evict-before-load *trigger* arriving early; the eviction response itself
-    /// waits for step 2.
+    /// waits for step 2. The board is probed first when its free reading is
+    /// missing or stale, because that trigger is otherwise unreachable on a
+    /// board no worker has ever been resident on
+    /// ([`Self::refresh_external_for_load`]).
     pub fn reserve_load(
         self: &Arc<Self>,
         inference_id: &str,
@@ -1572,6 +1591,21 @@ impl VramLedger {
         gpu: &str,
         dtype: Option<&str>,
     ) -> Option<LoadReservation> {
+        self.reserve_load_signalling(inference_id, cost, gpu, dtype)
+            .map(|(reservation, _)| reservation)
+    }
+
+    /// [`Self::reserve_load`], also answering whether the expected base
+    /// exceeded the board's headroom — the evict-before-load signal, returned
+    /// so a test can assert on the decision itself rather than on the warning
+    /// it logs.
+    fn reserve_load_signalling(
+        self: &Arc<Self>,
+        inference_id: &str,
+        cost: CostDimension,
+        gpu: &str,
+        dtype: Option<&str>,
+    ) -> Option<(LoadReservation, bool)> {
         if !cost.scales() {
             return None;
         }
@@ -1616,6 +1650,13 @@ impl VramLedger {
                 dtype: dtype.as_deref(),
             })
         });
+        // Measure the board before pricing the load against it. `request_grant`
+        // is the only other probe trigger and it needs a resident worker, so a
+        // board that has never had one has no reading at all and would be
+        // priced as empty — which is exactly how a board holding 95 GB of
+        // someone else's memory took four 4 GB reservations against a headroom
+        // of its full total and launched four loads into a torch OOM (T2).
+        self.refresh_external_for_load(inference_id, gpu);
         let (id, expected, headroom) = {
             let mut state = self.lock();
             // Re-read both facts under the retaken lock. A load that finished
@@ -1646,7 +1687,8 @@ impl VramLedger {
                 .insert(id, expected);
             (id, expected, headroom)
         };
-        if expected > headroom {
+        let exceeds_headroom = expected > headroom;
+        if exceeds_headroom {
             tracing::warn!(
                 model = %inference_id,
                 gpu = %gpu,
@@ -1657,11 +1699,14 @@ impl VramLedger {
                  squeezed to their contention floor"
             );
         }
-        Some(LoadReservation {
-            ledger: Arc::downgrade(self),
-            gpu: gpu.to_owned(),
-            id,
-        })
+        Some((
+            LoadReservation {
+                ledger: Arc::downgrade(self),
+                gpu: gpu.to_owned(),
+                id,
+            },
+            exceeds_headroom,
+        ))
     }
 
     fn release_load_reservation(&self, gpu: &str, id: u64) {
@@ -4018,121 +4063,212 @@ impl VramLedger {
             // One coherent snapshot of every board, so per-board readings can
             // never be stitched together from different moments.
             let boards = query.run();
-            let source = query.free_source();
-            let at = Instant::now();
-            let mut state = ledger.lock();
-            let mut answered = false;
-            // Snapshotted under the lock, logged once it is dropped (review F8).
-            let mut refreshed = Vec::new();
-            let uuids: Vec<String> = state.gpus.keys().cloned().collect();
-            for uuid in uuids {
-                let found = boards
-                    .as_ref()
-                    .and_then(|boards| boards.iter().find(|entry| entry.uuid == uuid))
-                    .map(|entry| entry.free_mb);
-                if let Some(free_mb) = found {
-                    if uuid == gpu {
-                        answered = true;
-                    }
-                    // Read before the record below replaces it: how stale the
-                    // reading this refresh supersedes had become.
-                    let previous_age_ms = state
-                        .gpus
-                        .get(&uuid)
-                        .and_then(|board| board.free.as_ref())
-                        .map(|sample| at.saturating_duration_since(sample.at).as_millis() as u64);
-                    // No total and no model: this is the orchestrator's own
-                    // driver reading, not a worker's claim about which board
-                    // it is on — and `MemoryQuery::Mps` deliberately reports
-                    // physical RAM in that field rather than the board's
-                    // policy total, so checking it would drop every refresh
-                    // on that backend.
-                    Self::record_free_locked(
-                        &mut state,
-                        &uuid,
-                        free_mb,
-                        source.to_owned(),
-                        at,
-                        None,
-                        None,
-                    );
-                    let total_mb = state.gpus.get(&uuid).map_or(0, |board| board.total_mb);
-                    let external_mb = Self::external_locked(&state, &uuid).unwrap_or(0);
-                    // The record above is allowed to *drop* the reading — a
-                    // fresher sample already overtook it, or a
-                    // non-authoritative source offered it to a board that has
-                    // seen an authoritative one. The line must not claim a
-                    // refresh those paths discarded, so it carries whether the
-                    // board's sample is in fact this probe's.
-                    let recorded = state
-                        .gpus
-                        .get(&uuid)
-                        .and_then(|board| board.free.as_ref())
-                        .is_some_and(|sample| sample.at == at);
-                    refreshed.push((
-                        uuid,
-                        free_mb,
-                        total_mb,
-                        external_mb,
-                        previous_age_ms,
-                        recorded,
-                    ));
+            ledger.record_external_probe(&gpu, boards, query.free_source());
+        });
+    }
+
+    /// Probe the host for this board's free memory **before** a load is
+    /// priced, when the board's reading is missing, stale, or standing in for
+    /// a departed resident (T2).
+    ///
+    /// [`Self::maybe_refresh_external`] is the only other trigger and it needs
+    /// a *resident* worker to hang off, so a board that has never hosted one
+    /// has no sample at all: `external` reads 0, `limit` reads the board's
+    /// total, and the evict-before-load signal below (expected base exceeding
+    /// headroom) cannot fire however full the board is. The one question asked
+    /// before a worker exists — "can this model be loaded at all?" — is
+    /// exactly the one that needs the measurement.
+    ///
+    /// Synchronous, unlike the dispatch-path refresh: a load already costs
+    /// seconds, it is serialized behind the manager's load lock, and pricing
+    /// it against a reading that lands afterwards would answer the question
+    /// too late. The in-flight and failure-backoff suppressions in
+    /// [`refresh_due`] still apply, so a host whose probe answers nothing pays
+    /// at most one timed-out attempt per [`EXTERNAL_SAMPLE_MAX_AGE`].
+    fn refresh_external_for_load(&self, model: &str, gpu: &str) {
+        if !self.probes_the_host() {
+            return;
+        }
+        // Snapshotted under the lock and logged with it dropped, as every
+        // other line on this path is (review F8).
+        let (reason, age_ms) = {
+            let mut state = self.lock();
+            let Some(board) = state.gpus.get_mut(gpu) else {
+                return;
+            };
+            if !refresh_due(board) {
+                return;
+            }
+            let reason = if board.free.is_none() {
+                "no free sample: this board has never had a resident"
+            } else if board.free_adjusted_at.is_some() {
+                "the reading was adjusted for a departed resident"
+            } else {
+                "the free sample is older than the staleness clock"
+            };
+            let age_ms = board
+                .free
+                .as_ref()
+                .map(|sample| sample.at.elapsed().as_millis() as u64);
+            board.refreshing = true;
+            (reason, age_ms)
+        };
+        tracing::debug!(
+            model,
+            gpu,
+            reason,
+            sample_age_ms = ?age_ms,
+            "probing the host for this board's free memory before pricing a \
+             load against it"
+        );
+        let boards = self.run_memory_query();
+        self.record_external_probe(gpu, boards, self.memory_query.free_source());
+    }
+
+    /// Whether this ledger consults the host probe at all. Production always
+    /// does; the ledger's unit tests only when one of them has installed a
+    /// stub for it.
+    fn probes_the_host(&self) -> bool {
+        #[cfg(test)]
+        {
+            if self.lock().probe_stub.is_some() {
+                return true;
+            }
+        }
+        self.probe_external
+    }
+
+    /// One coherent snapshot of every board's free memory.
+    fn run_memory_query(&self) -> Option<Vec<GpuMemory>> {
+        #[cfg(test)]
+        {
+            let mut state = self.lock();
+            if let Some(stub) = state.probe_stub.as_mut() {
+                stub.calls += 1;
+                return stub.boards.clone();
+            }
+        }
+        self.memory_query.run()
+    }
+
+    /// Write a host probe's answer back into the ledger, whichever path ran
+    /// it: every board it enumerated gets the reading, and `gpu` — the board
+    /// the probe was started *for* — is the one whose in-flight flag and
+    /// failure backoff this settles.
+    fn record_external_probe(&self, gpu: &str, boards: Option<Vec<GpuMemory>>, source: &str) {
+        let at = Instant::now();
+        let mut state = self.lock();
+        let mut answered = false;
+        // Snapshotted under the lock, logged once it is dropped (review F8).
+        let mut refreshed = Vec::new();
+        let uuids: Vec<String> = state.gpus.keys().cloned().collect();
+        for uuid in uuids {
+            let found = boards
+                .as_ref()
+                .and_then(|boards| boards.iter().find(|entry| entry.uuid == uuid))
+                .map(|entry| entry.free_mb);
+            if let Some(free_mb) = found {
+                if uuid == gpu {
+                    answered = true;
                 }
-            }
-            // Read before the stamp below overwrites it: it is cleared on
-            // every success, so `Some` here means the previous attempt already
-            // failed and this one continues a streak.
-            let was_failing = state
-                .gpus
-                .get(&gpu)
-                .is_some_and(|board| board.last_refresh_failed_at.is_some());
-            // Only the board this refresh was started for clears its own
-            // in-flight flag: clearing everyone's would let a second board
-            // start a redundant probe while this one is still running, and
-            // would clear a flag another probe set.
-            if let Some(board) = state.gpus.get_mut(&gpu) {
-                board.refreshing = false;
-                board.last_refresh_failed_at = if answered { None } else { Some(at) };
-            }
-            drop(state);
-            for (uuid, free_mb, total_mb, external_mb, previous_age_ms, recorded) in refreshed {
-                tracing::debug!(
-                    gpu = %uuid,
-                    source,
+                // Read before the record below replaces it: how stale the
+                // reading this refresh supersedes had become.
+                let previous_age_ms = state
+                    .gpus
+                    .get(&uuid)
+                    .and_then(|board| board.free.as_ref())
+                    .map(|sample| at.saturating_duration_since(sample.at).as_millis() as u64);
+                // No total and no model: this is the orchestrator's own
+                // driver reading, not a worker's claim about which board
+                // it is on — and `MemoryQuery::Mps` deliberately reports
+                // physical RAM in that field rather than the board's
+                // policy total, so checking it would drop every refresh
+                // on that backend.
+                Self::record_free_locked(
+                    &mut state,
+                    &uuid,
+                    free_mb,
+                    source.to_owned(),
+                    at,
+                    None,
+                    None,
+                );
+                let total_mb = state.gpus.get(&uuid).map_or(0, |board| board.total_mb);
+                let external_mb = Self::external_locked(&state, &uuid).unwrap_or(0);
+                // The record above is allowed to *drop* the reading — a
+                // fresher sample already overtook it, or a
+                // non-authoritative source offered it to a board that has
+                // seen an authoritative one. The line must not claim a
+                // refresh those paths discarded, so it carries whether the
+                // board's sample is in fact this probe's.
+                let recorded = state
+                    .gpus
+                    .get(&uuid)
+                    .and_then(|board| board.free.as_ref())
+                    .is_some_and(|sample| sample.at == at);
+                refreshed.push((
+                    uuid,
                     free_mb,
                     total_mb,
                     external_mb,
-                    previous_age_ms = ?previous_age_ms,
+                    previous_age_ms,
                     recorded,
-                    "refreshed the board's free memory from the host probe"
+                ));
+            }
+        }
+        // Read before the stamp below overwrites it: it is cleared on
+        // every success, so `Some` here means the previous attempt already
+        // failed and this one continues a streak.
+        let was_failing = state
+            .gpus
+            .get(gpu)
+            .is_some_and(|board| board.last_refresh_failed_at.is_some());
+        // Only the board this refresh was started for clears its own
+        // in-flight flag: clearing everyone's would let a second board
+        // start a redundant probe while this one is still running, and
+        // would clear a flag another probe set.
+        if let Some(board) = state.gpus.get_mut(gpu) {
+            board.refreshing = false;
+            board.last_refresh_failed_at = if answered { None } else { Some(at) };
+        }
+        drop(state);
+        for (uuid, free_mb, total_mb, external_mb, previous_age_ms, recorded) in refreshed {
+            tracing::debug!(
+                gpu = %uuid,
+                source,
+                free_mb,
+                total_mb,
+                external_mb,
+                previous_age_ms = ?previous_age_ms,
+                recorded,
+                "refreshed the board's free memory from the host probe"
+            );
+        }
+        // Only the *first* failure of a streak warns. A board this probe
+        // never enumerates fails every attempt, and the backoff spaces
+        // those one `EXTERNAL_SAMPLE_MAX_AGE` apart for as long as traffic
+        // keeps asking — a warning on each would be six a minute for a
+        // condition the shrink clamp already makes safe.
+        if !answered {
+            if was_failing {
+                tracing::debug!(
+                    gpu = %gpu,
+                    source,
+                    backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
+                    "the host memory probe still answers nothing for this \
+                     board; still on the previous free sample"
+                );
+            } else {
+                tracing::warn!(
+                    gpu = %gpu,
+                    source,
+                    backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
+                    "the host memory probe answered nothing for this board; \
+                     keeping the previous free sample and backing off before \
+                     the next attempt"
                 );
             }
-            // Only the *first* failure of a streak warns. A board this probe
-            // never enumerates fails every attempt, and the backoff spaces
-            // those one `EXTERNAL_SAMPLE_MAX_AGE` apart for as long as traffic
-            // keeps asking — a warning on each would be six a minute for a
-            // condition the shrink clamp already makes safe.
-            if !answered {
-                if was_failing {
-                    tracing::debug!(
-                        gpu = %gpu,
-                        source,
-                        backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
-                        "the host memory probe still answers nothing for this \
-                         board; still on the previous free sample"
-                    );
-                } else {
-                    tracing::warn!(
-                        gpu = %gpu,
-                        source,
-                        backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
-                        "the host memory probe answered nothing for this board; \
-                         keeping the previous free sample and backing off before \
-                         the next attempt"
-                    );
-                }
-            }
-        });
+        }
     }
 
     // ------------------------------------------------------------------
@@ -4334,6 +4470,22 @@ impl VramLedger {
             memory_query: GpuMemoryQuery::NvidiaSmi,
             probe_external: false,
         })
+    }
+
+    /// Install a fake host probe answering `boards` — `None` for a probe that
+    /// answers nothing — and start counting what asks it. Turns the probe path
+    /// on for a ledger whose `probe_external` is off (every test ledger's is,
+    /// so their free readings are exactly what they fed in).
+    #[cfg(test)]
+    fn install_probe_stub(&self, boards: Option<Vec<GpuMemory>>) {
+        self.lock().probe_stub = Some(ProbeStub { boards, calls: 0 });
+    }
+
+    /// How many times the stub installed by [`Self::install_probe_stub`] has
+    /// been asked.
+    #[cfg(test)]
+    fn probe_calls(&self) -> u32 {
+        self.lock().probe_stub.as_ref().map_or(0, |stub| stub.calls)
     }
 
     #[cfg(test)]
@@ -8781,6 +8933,110 @@ mod tests {
         assert!(
             !refresh_due(&adjusted(None, true)),
             "and so does one already in flight"
+        );
+    }
+
+    /// T2: a board with no resident has never been probed — `request_grant` is
+    /// the only other trigger and it needs a worker to hang off — so the load
+    /// path probes it itself. Without that, a board holding 95 GB of someone
+    /// else's memory prices a load against its full total and the
+    /// evict-before-load signal never fires (the Phase 3 S4g run: four 4 GiB
+    /// reservations against a headroom of 97 887, four torch OOMs).
+    #[test]
+    fn a_load_reservation_probes_a_board_with_no_reading() {
+        let ledger = ledger(97_887, no_margin());
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: BOARD.to_owned(),
+            total_mb: 97_887,
+            free_mb: 2_271,
+        }]));
+        assert!(
+            !ledger.health()[0].external_known,
+            "nothing has ever read this board"
+        );
+
+        let (reservation, exceeds_headroom) = ledger
+            .reserve_load_signalling("g/nemotron", item_cost(4), BOARD, None)
+            .expect("a known board charges the load");
+        assert_eq!(ledger.probe_calls(), 1, "the load path probed the host");
+        let board = &ledger.health()[0];
+        assert!(
+            board.external_known,
+            "and priced the load against a reading"
+        );
+        assert_eq!(
+            board.external_mb, 95_616,
+            "97_887 − 2_271, with no resident of ours to net off"
+        );
+        assert_eq!(
+            board.limit_mb, 2_271,
+            "at margin 0 the limit is what is free"
+        );
+        assert_eq!(board.load_reservations_mb, CONSERVATIVE_BASE_MB);
+        assert!(
+            exceeds_headroom,
+            "4 GiB expected against 2 271 MiB of headroom: the \
+             evict-before-load signal fires"
+        );
+
+        drop(reservation);
+        assert_eq!(ledger.health()[0].load_reservations_mb, 0);
+    }
+
+    /// The load probe is the staleness refresh's rule applied on a second
+    /// path, not a second policy: a board whose reading is current is not
+    /// re-read, so a busy host pays nothing for this.
+    #[test]
+    fn a_fresh_reading_suppresses_the_load_probe() {
+        let ledger = ledger(32_000, no_margin());
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: BOARD.to_owned(),
+            total_mb: 32_000,
+            free_mb: 1_000,
+        }]));
+        ledger.lock().gpus.get_mut(BOARD).expect("the board").free = Some(FreeSample {
+            free_mb: 20_000,
+            source: "nvml".to_owned(),
+            at: Instant::now(),
+        });
+
+        let (_reservation, exceeds_headroom) = ledger
+            .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .expect("a known board charges the load");
+        assert_eq!(ledger.probe_calls(), 0, "a reading this fresh needs none");
+        assert_eq!(
+            ledger.health()[0].external_mb,
+            12_000,
+            "the sample the board already had, not the stub's 31 000"
+        );
+        assert!(!exceeds_headroom, "4 GiB against 20 000 MiB of headroom");
+    }
+
+    /// And the failure backoff wins on this path too: a host whose probe
+    /// answers nothing must not pay a timed-out subprocess per load attempt —
+    /// a model that fails to load is retried.
+    #[test]
+    fn a_failed_probe_suppresses_the_next_load_probe() {
+        let ledger = ledger(32_000, no_margin());
+        ledger.install_probe_stub(None);
+
+        let first = ledger
+            .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .expect("a known board charges the load");
+        assert_eq!(ledger.probe_calls(), 1);
+        assert!(
+            !ledger.health()[0].external_known,
+            "the probe answered nothing, so the board is still unread"
+        );
+        drop(first);
+
+        let _second = ledger
+            .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .expect("a known board charges the load");
+        assert_eq!(
+            ledger.probe_calls(),
+            1,
+            "still inside the backoff window the first failure bought"
         );
     }
 
