@@ -33,7 +33,9 @@ use super::TranscodeParams;
 use super::compose::{ComposeParams, ComposeSource, FilterPlan, StreamInfo};
 use super::presets::{Channel, Container, QualityMode, ResolvedPreset};
 use crate::media_tools::{cache_wrapped_args, ffmpeg_inputs_all_exist};
-use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_process_group_pid};
+use crate::process_tree::{
+    JobGuard, detach_from_console, die_with_parent, kill_process_group_pid, spawn_supervised,
+};
 
 /// The two software-x264 invocations, named as encoder *identities* rather
 /// than encoder names: the x264 `-preset` changes the output bytes, so it is
@@ -967,7 +969,10 @@ fn run_ffmpeg_once(
         .stderr(Stdio::piped());
     detach_from_console(&mut command);
     die_with_parent(&mut command);
-    let mut child = command.spawn().map_err(EncodeError::Spawn)?;
+    // Armed with `die_with_parent`, so it is forked from the permanent
+    // spawner thread: this runner is itself a `spawn_blocking` thread, which
+    // the pool retires after its idle keep-alive (F11).
+    let mut child = spawn_supervised(command).map_err(EncodeError::Spawn)?;
     let _job = JobGuard::assign(&child);
 
     let stderr = child.stderr.take().expect("stderr was piped");

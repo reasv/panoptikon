@@ -61,7 +61,9 @@ use tokio::time::timeout;
 use super::ledger::{FitSnapshot, Grant};
 use super::registry::SpawnSpec;
 use super::slot_error::{ERROR_SLOT_KEY, SlotError, slot_error_from_parts};
-use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_process_group};
+use crate::process_tree::{
+    JobGuard, detach_from_console, die_with_parent, kill_process_group, spawn_supervised_tokio,
+};
 
 /// Protocol version this orchestrator speaks; workers answering anything
 /// else in the handshake are killed.
@@ -883,8 +885,11 @@ impl Worker {
         impl_class: &str,
         device: Option<String>,
     ) -> Result<Worker> {
-        let mut command = worker_command(cfg, device.as_deref())?;
-        let mut child = command.spawn().with_context(|| {
+        let command = worker_command(cfg, device.as_deref())?;
+        // Through the permanent spawner thread, never `command.spawn()`:
+        // `worker_command` armed PR_SET_PDEATHSIG, whose scope on Linux is
+        // the forking *thread* (F11 — see `process_tree::die_with_parent`).
+        let mut child = spawn_supervised_tokio(command).await.with_context(|| {
             format!(
                 "failed to spawn inferio worker for impl class {impl_class} via {}",
                 cfg.python.display()
@@ -2760,6 +2765,48 @@ mod tests {
         // instance.unload() when not loaded).
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0));
+    }
+
+    /// F11, end to end: the thread that asks for a worker does not get to
+    /// decide how long the worker lives.
+    ///
+    /// `worker_command` arms PR_SET_PDEATHSIG, which on Linux fires when the
+    /// **forking thread** exits — and tokio retires threads underneath us
+    /// (`block_in_place` demotes a runtime worker into the blocking pool,
+    /// which reaps it after a 10 s idle keep-alive; the load-path host probe
+    /// did exactly that milliseconds before every worker fork). Here the
+    /// forking thread is one that is *guaranteed* to be gone — a plain
+    /// `std::thread` driving the spawn on the runtime handle and then
+    /// exiting — so the kernel would have delivered the SIGKILL immediately.
+    /// The worker survives because `Worker::spawn` forks from the permanent
+    /// spawner thread instead (`process_tree::spawn_supervised_tokio`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_outlives_the_thread_that_forked_it() {
+        let handle = tokio::runtime::Handle::current();
+        let cfg = test_spawn_config();
+        let mut worker = std::thread::spawn(move || {
+            handle.block_on(Worker::spawn_configured(
+                &cfg,
+                "test/echo",
+                &spec("echo_test"),
+                None,
+            ))
+        })
+        .join()
+        .expect("the forking thread finished")
+        .expect("spawn + handshake");
+        // The requesting thread is gone; a thread-scoped PDEATHSIG is
+        // delivered on its `exit`, so this wait is generous, not a race.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        worker
+            .ping()
+            .await
+            .expect("the worker outlived the thread that asked for it");
+        assert!(
+            worker.last_death().is_none(),
+            "and nothing killed it in the meantime"
+        );
+        worker.kill().await;
     }
 
     /// A worker killed externally mid-session (simulating an OOM kill or a

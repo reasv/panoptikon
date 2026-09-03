@@ -38,7 +38,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt as _, BufReader};
 use tokio::process::Command;
 
 use crate::config::{Accelerator, Settings};
-use crate::process_tree::{JobGuard, detach_from_console, die_with_parent};
+use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, spawn_supervised_tokio};
 
 /// Pinned standalone uv release (astral-sh/uv GitHub release tag) downloaded
 /// when no usable `uv` is on PATH. Downloads land in
@@ -1133,8 +1133,10 @@ async fn run_uv_logged(
         .kill_on_drop(true);
     detach_from_console(&mut command);
     die_with_parent(&mut command);
-    let mut child = command
-        .spawn()
+    // Armed with `die_with_parent`, so it is forked from the permanent
+    // spawner thread and not from whichever runtime thread got here (F11).
+    let mut child = spawn_supervised_tokio(command)
+        .await
         .with_context(|| format!("failed to spawn {what} ('{}')", uv.display()))?;
     let job_guard = JobGuard::assign_tokio(&child);
     let stdout = child.stdout.take().expect("stdout is piped");

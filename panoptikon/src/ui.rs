@@ -20,7 +20,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::config::{Settings, UiBuildPolicy};
-use crate::process_tree::{JobGuard, detach_from_console, die_with_parent};
+use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, spawn_supervised_tokio};
 
 /// Restart backoff for unexpected exits and failed install/build steps:
 /// 1s doubling to 30s, reset once a start stays up for [`STABLE_UPTIME`].
@@ -376,8 +376,10 @@ async fn run_logged(
         .kill_on_drop(true);
     detach_from_console(&mut command);
     die_with_parent(&mut command);
-    let mut child = command
-        .spawn()
+    // Armed with `die_with_parent`, so it is forked from the permanent
+    // spawner thread and not from whichever runtime thread got here (F11).
+    let mut child = spawn_supervised_tokio(command)
+        .await
         .with_context(|| format!("failed to spawn {what}"))?;
     let job_guard = JobGuard::assign_tokio(&child);
     let stdout = child.stdout.take().expect("stdout is piped");

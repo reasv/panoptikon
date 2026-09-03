@@ -730,6 +730,21 @@ window is in flight per worker either way, so a trim never races a batch.
 
 - Spawn → send `handshake` → response deadline (config, default 30 s).
   Timeout/exit/garbage → kill, surface stderr tail in the load error.
+- **Every worker is forked from one permanent thread.** The spawn arms
+  `PR_SET_PDEATHSIG` (SIGKILL) so that a gateway death which runs no
+  destructors still reaps the worker — but on Linux the kernel delivers that
+  signal when the forking **thread** exits, not when the process does. Tokio
+  retires threads routinely (its multi-thread workers are blocking-pool
+  threads, and a `block_in_place` demotes one into that pool, which reaps it
+  after a 10 s idle keep-alive), so a worker forked by "whichever thread got
+  here" is killed by the kernel seconds later, mid-inference, with no
+  traceback (finding F11: 8/8 deaths, 1–3 ms after the forking thread's
+  `exit`). `process_tree::spawn_supervised_tokio` therefore funnels every
+  armed spawn through a single dedicated thread that never exits; the child
+  is created inside the caller runtime's `Handle::enter()`, so tokio's
+  SIGCHLD/reaping machinery still belongs to the runtime that will `wait()`
+  on it. The user-visible death contract is unchanged: worker processes
+  still die with the gateway.
 - `load` deadline is long (weights + dep imports; config, default 600 s).
 - `predict` has no fixed deadline in v1 (arbitrary models); cancellation =
   kill the worker (it is the model — there is nothing softer to cancel).
