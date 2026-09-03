@@ -79,6 +79,15 @@ config.impl_class = "failbatch_cuda_test"
 config.load_mb    = 64
 metadata.description = "Fails merged batches with a non-OOM error (CUDA-touching, priced)"
 
+# B11 probe: a NON-memory failure whose text merely contains "out of memory".
+# `message_reports_oom` (ledger.rs:4119) classifies on that substring, so this
+# id answers whether a harmless error can deflate a healthy model.
+[group.calibfixture.inference_ids.failbatch_oomtext_cuda]
+config.impl_class = "failbatch_cuda_test"
+config.load_mb    = 64
+config.message    = "refusing merged batch of {n}: the caption cache is out of memory slots"
+metadata.description = "Non-OOM merged-batch failure whose text contains 'out of memory' (B11)"
+
 # Batch-1 OOM for the first `oom_secs` after load, healthy afterwards. The only
 # fixture that can show `deflation` climbing AND recovering on one resident
 # worker (protocol §4 S5: "how long does recovery take once you switch to a

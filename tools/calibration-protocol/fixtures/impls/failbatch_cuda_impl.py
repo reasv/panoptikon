@@ -13,6 +13,10 @@ allocator's reserved/allocated counters across the load window so the
 (`nvml` own-PID tier on bare Linux).
 
 Config keys (from the registry TOML, passed as **kwargs):
+  message: the ValueError text, `{n}` = batch size (default "refusing merged
+           batch of {n}"). Phase 4 uses a second registration whose message
+           merely *contains* the words "out of memory" to probe finding B11
+           (`message_reports_oom` matches any line containing them).
   load_mb: MiB of device memory to hold for the model's lifetime (default 64).
   device:  torch device string (default "cuda"); the worker is pinned with
            CUDA_VISIBLE_DEVICES so "cuda" is always the intended board.
@@ -30,6 +34,7 @@ class FailBatchCudaModel:
         self.config = config
         self.load_mb = int(config.get("load_mb", 64))
         self.device = str(config.get("device", "cuda"))
+        self.message = config.get("message") or "refusing merged batch of {n}"
         self._ballast = None
 
     def predict(self, inputs):
@@ -37,7 +42,7 @@ class FailBatchCudaModel:
 
         time.sleep(0.3)
         if len(inputs) > 1:
-            raise ValueError(f"refusing merged batch of {len(inputs)}")
+            raise ValueError(self.message.format(n=len(inputs)))
         return [{"ok": True} for _ in inputs]
 
     @classmethod
