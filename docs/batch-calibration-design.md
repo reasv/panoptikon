@@ -716,7 +716,12 @@ gpu          = "NVIDIA GeForce RTX 5090"
 platform     = "windows"               # windows | linux | macos
 backend      = "cuda"                  # accelerator extra (cuda | rocm | mps | cpu)
 torch        = "2.7.1+cu128"
-dtype        = "fp16"                  # negotiated dtype actually in use
+dtype        = "fp16"                  # load precision actually in use;
+                                       # "unknown" when the impl negotiates
+                                       # none and its weights could not be
+                                       # read (a value, not an omission:
+                                       # an absent key component makes the
+                                       # whole entry unkeyable)
 unit         = "item"                  # cost dimension in force when measured;
 aggregation  = "count"                 # part of the key (see below)
 

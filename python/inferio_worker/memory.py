@@ -42,7 +42,9 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from collections.abc import Iterable
+from types import ModuleType
 from typing import Any
 
 logger = logging.getLogger("inferio_worker.memory")
@@ -2047,9 +2049,17 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
         payload["base_method"] = method
     if reserved is not None:
         payload["reserved_at_load_mb"] = reserved
-    dtype = resolved_dtype_name(instance)
-    if dtype is not None:
+    dtype, dtype_method = resolved_dtype(instance)
+    # The sentinel is reported only for a process that has a footprint to key
+    # (`base_mb` above). Without one the orchestrator can persist nothing
+    # anyway — its write policy needs a base — and a worker that measured
+    # nothing at all must go on answering a plain `ok`, exactly as it did
+    # before any of this existed (this function's docstring). A dtype we
+    # actually *know* is reported either way: it is additive, and it is what
+    # a later reload of the same model is keyed against.
+    if dtype != DTYPE_UNKNOWN or "base_mb" in payload:
         payload["dtype"] = dtype
+        payload["dtype_method"] = dtype_method
     uuid, name = device_identity()
     if uuid is not None:
         payload["gpu_uuid"] = uuid
@@ -2242,6 +2252,54 @@ _DTYPE_NAMES = {
 }
 
 
+# What the worker reports when nothing states a precision and no module
+# could be found to read one off. A **value**, not an omission: `dtype` is
+# part of the calibration profile key (docs/batch-calibration-design.md,
+# "File format"), and an absent key component makes the entry unkeyable — so
+# the orchestrator's write policy drops it and the model is re-measured from
+# scratch on every run, forever, which is what the five shipped models that
+# state no dtype were actually doing. The sentinel is stable for a given
+# impl — nothing about one load makes it appear and not the next — so an
+# entry written under it is found again by the next run; and the day that
+# impl starts negotiating a real dtype the key moves and the old row is
+# ignored, exactly as a dtype *change* is (design, "Invalidation").
+DTYPE_UNKNOWN = "unknown"
+
+# How the reported dtype was arrived at, reported beside it as
+# `dtype_method`: the impl stated it (`select_dtype`, `resolved_dtype`), it
+# was read off a real `torch.dtype` attribute, it was read off the loaded
+# weights, or nothing could answer.
+DTYPE_METHOD_SELECTED = "selected"
+DTYPE_METHOD_ATTRIBUTE = "attribute"
+DTYPE_METHOD_INFERRED = "inferred"
+DTYPE_METHOD_UNKNOWN = "unknown"
+
+# Bounds on the hunt for a `torch.nn.Module` inside the impl instance. Depth
+# 2 reaches `self.model` (every torch impl here) and `self.model.<part>` (the
+# non-module wrappers: easyocr's Reader, a HF pipeline); the budget is the
+# backstop for a cyclic or fan-out-heavy graph, since the walk visits objects
+# this module knows nothing about.
+_WALK_DEPTH = 2
+_WALK_BUDGET = 256
+
+# How many elements of one *container* the walk unpacks. An impl attribute
+# can be a list of ten thousand tag strings as easily as a pair of towers,
+# and none of those strings is a module: the objects worth reaching are the
+# first few, and the queue must not be allowed to grow with the size of a
+# label file. Attribute dictionaries are not capped — an object with more
+# than a handful of attributes is normal, and [`_WALK_BUDGET`] bounds the
+# work done on them; the one namespace big enough for the *queue* to matter
+# is an imported Python module's, and [`_walk_children`] refuses those.
+_WALK_FANOUT = 16
+
+# Attribute names looked at first at each level of that walk. An impl holds
+# other modules besides the one whose precision is the answer (a projection
+# head, a preprocessor that happens to be a Module), and the walk reports the
+# first module it finds, so the conventional names for "the model" go first
+# and `__dict__` order decides only among the rest.
+_MODEL_ATTRS = ("model", "_model", "module", "net", "pipeline", "reader")
+
+
 def _dtype_name(value: Any) -> str | None:
     if value is None:
         return None
@@ -2258,7 +2316,7 @@ def _is_torch_dtype(value: Any) -> bool:
 
 
 def resolved_dtype_name(instance: Any) -> str | None:
-    """The load precision actually in use: `"fp16"`/`"bf16"`/`"fp32"`, else None.
+    """The precision the impl *stated*, or None if it stated none.
 
     Three sources, in order of authority:
 
@@ -2276,11 +2334,19 @@ def resolved_dtype_name(instance: Any) -> str | None:
        Preferring a string here is how a profile ends up keyed on a
        precision the model is not running in.
 
-    None whenever nothing negotiated a precision (CPU impls, remote APIs).
+    None whenever nothing negotiated a precision. That is the *common* case,
+    not the exotic one — four shipped impls call `select_dtype` and none of
+    the rest sets any of the three — which is why what the worker reports
+    comes from [`resolved_dtype`] rather than from here.
     """
+    return _stated_dtype(instance)[0]
+
+
+def _stated_dtype(instance: Any) -> tuple[str | None, str | None]:
+    """`(name, method)` from the three sources that state a precision."""
     name = _dtype_name(getattr(instance, "resolved_dtype", None))
     if name is not None:
-        return name
+        return name, DTYPE_METHOD_SELECTED
     utils = sys.modules.get("inferio.impl.utils")
     getter = getattr(utils, "last_selected_dtype", None) if utils else None
     if getter is not None:
@@ -2289,14 +2355,153 @@ def resolved_dtype_name(instance: Any) -> str | None:
         except Exception:
             name = None
         if name is not None:
-            return name
+            return name, DTYPE_METHOD_SELECTED
     for attribute in ("dtype", "_dtype"):
         value = getattr(instance, attribute, None)
         if _is_torch_dtype(value):
             name = _dtype_name(value)
             if name is not None:
-                return name
+                return name, DTYPE_METHOD_ATTRIBUTE
+    return None, None
+
+
+def _walk_children(value: Any) -> list[Any]:
+    """The objects one level inside `value`, for the module hunt.
+
+    Instance attributes come from `__dict__` and never from `dir()` +
+    `getattr`: an impl's properties can load, download or move a model, and
+    a *measurement* harness must not trigger any of that to find out what
+    dtype it loaded in. The plain containers are unwrapped too, because a
+    multi-part impl holds its towers in a list or a dict as often as in an
+    attribute each. The conventional names for "the model" are returned
+    first, so an impl that also holds a Module-shaped preprocessor is still
+    answered by its model.
+    """
+    if isinstance(value, (str, bytes, bytearray)):
+        return []
+    # An imported *Python* module is never a `torch.nn.Module`, and its
+    # `__dict__` is a real dict of every name it defines — thousands, for
+    # `torch` itself. An impl that keeps one on an attribute (`self.np =
+    # numpy`) would otherwise push that whole namespace onto the queue: the
+    # visit budget still bounds the *work*, but nothing would bound the
+    # queue, and this is the only realistic source of a namespace that size.
+    if isinstance(value, ModuleType):
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)[:_WALK_FANOUT]
+    if isinstance(value, dict):
+        return list(value.values())[:_WALK_FANOUT]
+    try:
+        namespace = getattr(value, "__dict__", None)
+    except Exception:
+        return []
+    if isinstance(namespace, dict):
+        named = [namespace[name] for name in _MODEL_ATTRS if name in namespace]
+        rest = [
+            child
+            for name, child in namespace.items()
+            if name not in _MODEL_ATTRS
+        ]
+        return named + rest
+    return []
+
+
+def _module_dtype_name(module: Any) -> str | None:
+    """The first floating-point parameter's (else buffer's) dtype name.
+
+    "Floating-point" needs no `is_floating_point` call: [`_DTYPE_NAMES`] maps
+    the three float dtypes this design keys on and nothing else, so a tensor
+    whose dtype does not map (a quantized `int8` weight, a `long` index
+    buffer, the odd `float64`) is skipped by construction and the search goes
+    on to the next tensor. Parameters before buffers: a buffer can be a
+    running mean kept in fp32 beside fp16 weights.
+    """
+    for accessor in ("parameters", "buffers"):
+        getter = getattr(module, accessor, None)
+        if not callable(getter):
+            continue
+        try:
+            for tensor in getter():
+                name = _dtype_name(getattr(tensor, "dtype", None))
+                if name is not None:
+                    return name
+        except Exception:
+            continue
     return None
+
+
+def _inferred_dtype_name(instance: Any) -> str | None:
+    """The dtype of the weights actually loaded, read off the model itself.
+
+    The impl said nothing, so ask the object it built. A breadth-first walk
+    from the instance finds the `torch.nn.Module` it is holding — directly
+    (`self.model`), or one level further in for the wrappers that are not
+    modules themselves (easyocr's `Reader` and its `detector`, a HF
+    `pipeline` and its `model`) — and the first float dtype among that
+    module's parameters is the precision it is running in.
+
+    Bounded on every axis ([`_WALK_DEPTH`], [`_WALK_BUDGET`],
+    [`_WALK_FANOUT`]) because this runs on the load path of every model: the
+    walk is over an object graph nobody here controls, and the answer is
+    worth a few dozen `__dict__` reads, never an unbounded traversal. `None`
+    when torch was never
+    imported, when it has no `nn` (a stub or a fake), or when nothing inside
+    the budget was a module — which is the honest answer for CTranslate2,
+    ONNX Runtime and every remote API.
+    """
+    torch = _torch()
+    nn = getattr(torch, "nn", None) if torch is not None else None
+    module_type = getattr(nn, "Module", None)
+    if not isinstance(module_type, type):
+        return None
+    seen: set[int] = set()
+    queue: deque[tuple[Any, int]] = deque([(instance, 0)])
+    budget = _WALK_BUDGET
+    while queue and budget > 0:
+        obj, depth = queue.popleft()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        budget -= 1
+        if isinstance(obj, module_type):
+            name = _module_dtype_name(obj)
+            if name is not None:
+                return name
+            # A module whose own parameters said nothing has submodules, and
+            # `parameters()` already recursed through every one of them.
+            continue
+        if depth >= _WALK_DEPTH:
+            continue
+        for child in _walk_children(obj):
+            queue.append((child, depth + 1))
+    return None
+
+
+def resolved_dtype(instance: Any) -> tuple[str, str]:
+    """`(dtype, dtype_method)` for the load response — never absent.
+
+    The store key is `(… torch, dtype)`, so a load that reports no dtype
+    writes no profile, ever, silently. Only four shipped impls call
+    `select_dtype`, so the three *stated* sources above answer for four
+    models and nothing else; the weights themselves answer for every torch
+    model, and the sentinel answers for the rest. The method travels beside
+    the value so a consumer can tell a negotiated precision (`"selected"`)
+    from one read off an attribute (`"attribute"`) or off the weights
+    (`"inferred"`), and both from `"unknown"` — the key treats all four
+    alike, but a maintainer reading a store should not have to guess which
+    kind of evidence a row was keyed on.
+    """
+    name, method = _stated_dtype(instance)
+    if name is not None and method is not None:
+        return name, method
+    try:
+        name = _inferred_dtype_name(instance)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("dtype inference failed: %s", exc)
+        name = None
+    if name is not None:
+        return name, DTYPE_METHOD_INFERRED
+    return DTYPE_UNKNOWN, DTYPE_METHOD_UNKNOWN
 
 
 # ---------------------------------------------------------------------------

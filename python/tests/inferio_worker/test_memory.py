@@ -33,6 +33,31 @@ class FakeDtype:
         return self.name
 
 
+class FakeModule:
+    """Stand-in for a `torch.nn.Module` holding weights of a given dtype.
+
+    Only what the parameter walk touches: `parameters()` and `buffers()`
+    yielding objects with a `.dtype`. Real modules recurse into their
+    children through `parameters()`, which is exactly why the walk does not
+    have to.
+    """
+
+    def __init__(self, params: tuple = (), buffers: tuple = ()) -> None:
+        self._params = [SimpleNamespace(dtype=FakeDtype(n)) for n in params]
+        self._buffers = [SimpleNamespace(dtype=FakeDtype(n)) for n in buffers]
+
+    def parameters(self):
+        return iter(self._params)
+
+    def buffers(self):
+        return iter(self._buffers)
+
+
+def with_fake_nn() -> None:
+    """Give the injected fake torch an `nn.Module` type to match against."""
+    sys.modules["torch"].nn = SimpleNamespace(Module=FakeModule)
+
+
 class FakeCuda:
     """Just enough of `torch.cuda` for the memory helpers."""
 
@@ -642,6 +667,191 @@ def test_dtype_prefers_the_negotiated_value_over_config_strings(fake_torch) -> N
         assert (
             memory.resolved_dtype_name(SimpleNamespace(resolved_dtype="fp32")) == "fp32"
         ), "an explicit resolved_dtype is still the most authoritative"
+
+
+def test_dtype_is_inferred_from_the_loaded_weights(fake_torch) -> None:
+    # Expected behavior: an impl that states nothing (which is all of them
+    # but four) is not unkeyable — the weights it just loaded say what
+    # precision it is running in, and that is what the profile is keyed on.
+    with_fake_nn()
+
+    # The common shape: `self.model` is the module (wd tagger, CLIP, CLAP,
+    # sentence-transformers).
+    direct = SimpleNamespace(model=FakeModule(params=("torch.float16",)))
+    assert memory.resolved_dtype(direct) == ("fp16", "inferred")
+
+    # One level further in, for the wrappers that are not modules
+    # themselves: easyocr's `Reader` and its detector, a HF pipeline and its
+    # model.
+    reader = SimpleNamespace(
+        detector=None, recognizer=FakeModule(params=("torch.float32",))
+    )
+    assert memory.resolved_dtype(SimpleNamespace(model=reader)) == (
+        "fp32",
+        "inferred",
+    )
+
+    # Containers count as a level: an impl holding two towers in a list is
+    # not a different case from one holding them in two attributes.
+    towers = SimpleNamespace(parts=[FakeModule(params=("torch.bfloat16",))])
+    assert memory.resolved_dtype(towers) == ("bf16", "inferred")
+
+    # The model wins over another module that happens to be in there — a
+    # projection head, a preprocessor — however the attributes are ordered.
+    two = SimpleNamespace(
+        head=FakeModule(params=("torch.float32",)),
+        model=FakeModule(params=("torch.float16",)),
+    )
+    assert memory.resolved_dtype(two) == ("fp16", "inferred")
+
+    # Non-float tensors are skipped rather than reported: an int8 weight is
+    # not the compute precision, and a buffer answers when no parameter
+    # does.
+    quantized = FakeModule(
+        params=("torch.int8", "torch.uint8"), buffers=("torch.float16",)
+    )
+    assert memory.resolved_dtype(SimpleNamespace(model=quantized)) == (
+        "fp16",
+        "inferred",
+    )
+
+    # And the weights never outrank a stated dtype: `select_dtype` knows what
+    # was negotiated, the walk only knows what the first tensor happens to
+    # hold.
+    weights = FakeModule(params=("torch.float16",))
+    stated = SimpleNamespace(resolved_dtype="torch.bfloat16", model=weights)
+    assert memory.resolved_dtype(stated) == ("bf16", "selected")
+    attribute = SimpleNamespace(_dtype=FakeDtype("torch.float32"), model=weights)
+    assert memory.resolved_dtype(attribute) == ("fp32", "attribute")
+
+
+def test_a_non_torch_model_reports_the_unknown_sentinel(fake_torch) -> None:
+    # CTranslate2/faster-whisper, ONNX Runtime, a remote API: nothing in the
+    # instance is a module, so there is nothing to read a precision off.
+    # "unknown" is a value, not an omission — a key component that is absent
+    # makes the whole profile unkeyable, which is the bug this exists for.
+    with_fake_nn()
+    engine = SimpleNamespace(model=SimpleNamespace(compute_type="float16"))
+    assert memory.resolved_dtype(engine) == ("unknown", "unknown")
+    assert memory.resolved_dtype_name(engine) is None, (
+        "the stated-precision helper still answers None; only the reported "
+        "value falls back"
+    )
+    # A torch build with no `nn` (and a worker with no torch at all) is the
+    # same answer by a different route.
+    del sys.modules["torch"].nn
+    assert memory.resolved_dtype(SimpleNamespace(model=object())) == (
+        "unknown",
+        "unknown",
+    )
+
+
+def test_the_dtype_walk_never_touches_a_property(fake_torch) -> None:
+    # Expected behavior: an impl's properties can load, download or move a
+    # model. A measurement harness must not trigger any of that, so the walk
+    # reads `__dict__` and never `getattr` on the class's descriptors.
+    with_fake_nn()
+    touched: list[str] = []
+
+    class Impl:
+        def __init__(self) -> None:
+            self.model = FakeModule(params=("torch.float16",))
+
+        @property
+        def expensive(self):  # pragma: no cover - must never run
+            touched.append("expensive")
+            raise AssertionError("the walk read a property")
+
+    assert memory.resolved_dtype(Impl()) == ("fp16", "inferred")
+    assert touched == []
+
+
+def test_the_dtype_walk_survives_a_hostile_object_graph(fake_torch) -> None:
+    # Expected behavior: the walk runs on the load path of every model, over
+    # an object graph this module does not own. A module that refuses to
+    # enumerate its weights, a self-referencing attribute, and a container of
+    # a thousand things are all shapes a real impl can present, and none of
+    # them may hang, recurse or raise — the walk answers if it can and
+    # reports the sentinel if it cannot.
+    with_fake_nn()
+
+    class Angry(FakeModule):
+        """`parameters()` raises — a meta-device or offloaded module."""
+
+        def parameters(self):
+            raise RuntimeError("weights live on another device")
+
+    # The buffers still answer.
+    offloaded = SimpleNamespace(model=Angry(buffers=("torch.bfloat16",)))
+    assert memory.resolved_dtype(offloaded) == ("bf16", "inferred")
+
+    class Mute(Angry):
+        """Neither accessor answers."""
+
+        def buffers(self):
+            raise RuntimeError("nor here")
+
+    # And a module that answers nothing does not end the search: the next
+    # object in the queue is still reached.
+    both = SimpleNamespace(
+        model=Mute(), spare=FakeModule(params=("torch.float16",))
+    )
+    assert memory.resolved_dtype(both) == ("fp16", "inferred")
+
+    # A cycle is visited once. `weights` is last in `__dict__` order, so the
+    # walk goes through the loop to reach it.
+    loop = SimpleNamespace()
+    loop.me = loop
+    loop.peer = SimpleNamespace(back=loop)
+    loop.weights = FakeModule(params=("torch.float32",))
+    assert memory.resolved_dtype(loop) == ("fp32", "inferred")
+
+    # A cycle with no module in it terminates rather than spinning.
+    left = SimpleNamespace()
+    right = SimpleNamespace(other=left)
+    left.other = right
+    assert memory.resolved_dtype(left) == ("unknown", "unknown")
+
+    # A thousand modules in one dict: the container cap means only the first
+    # few are ever unwrapped, and one of them answers.
+    horde = SimpleNamespace(
+        bag={
+            f"m{i}": FakeModule(params=("torch.float16",)) for i in range(1000)
+        }
+    )
+    assert memory.resolved_dtype(horde) == ("fp16", "inferred")
+
+    # A thousand *attributes* are not capped, but the visit budget is: a
+    # module sitting past it is not found, and "unknown" — not a hang — is
+    # the answer. This asserts the bound, not a wish.
+    crowd = SimpleNamespace(**{f"a{i:04d}": object() for i in range(1000)})
+    crowd.zz_weights = FakeModule(params=("torch.float16",))
+    assert memory.resolved_dtype(crowd) == ("unknown", "unknown")
+    # The same crowd answers the moment the module is under a name the walk
+    # looks at first, which is what `_MODEL_ATTRS` is for.
+    crowd.model = FakeModule(params=("torch.float16",))
+    assert memory.resolved_dtype(crowd) == ("fp16", "inferred")
+
+
+def test_the_load_report_carries_the_dtype_and_how_it_was_obtained(
+    fake_torch,
+) -> None:
+    with_fake_nn()
+    impl = SimpleNamespace(model=FakeModule(params=("torch.float16",)))
+    before = memory.begin_load()
+    fake_torch.allocate(1024, reserved_mb=1536)
+    report = memory.finish_load(before, impl)
+    assert report["base_mb"] == 1536
+    assert report["dtype"] == "fp16"
+    assert report["dtype_method"] == "inferred"
+
+    # A process with no footprint to key reports neither: there is nothing
+    # for the orchestrator to persist without a base, and a worker that
+    # measured nothing must answer exactly as it did before this existed.
+    unmeasured = memory.finish_load(memory.begin_load(), object())
+    assert "base_mb" not in unmeasured, unmeasured
+    assert "dtype" not in unmeasured, unmeasured
+    assert "dtype_method" not in unmeasured, unmeasured
 
 
 def test_batch_measurement_is_per_call(fake_torch) -> None:

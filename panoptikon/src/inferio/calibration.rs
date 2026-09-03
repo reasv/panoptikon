@@ -136,7 +136,14 @@ pub struct CalibrationProfile {
     /// Full `torch.__version__`, e.g. `2.7.1+cu128`. Kept whole as
     /// provenance; lookup falls back to `major.minor`.
     pub torch: String,
-    /// Negotiated dtype actually in use (`fp16` | `bf16` | `fp32`).
+    /// Load precision actually in use (`fp16` | `bf16` | `fp32`), or
+    /// `unknown` for a model whose impl negotiates no precision and whose
+    /// weights the worker could not inspect (a CTranslate2/ONNX engine, a
+    /// remote API). The sentinel is a first-class key component here — it is
+    /// stable for a given impl, so an entry written under it is matched by
+    /// the next run, and nothing about this file or the matching rules
+    /// treats it specially. An entry with *no* dtype is what cannot exist:
+    /// it would match nothing and be rewritten forever.
     pub dtype: String,
     /// The model's cost dimension when this entry was measured — and part of
     /// the key, not decoration.

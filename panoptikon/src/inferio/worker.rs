@@ -260,9 +260,22 @@ pub struct LoadReport {
     /// worker sent it.
     pub base_method: Option<String>,
     pub reserved_at_load_mb: Option<u64>,
-    /// Negotiated load precision (`"fp16"`/`"bf16"`/`"fp32"`); part of the
-    /// profile key. `None` when nothing negotiated one.
+    /// Load precision (`"fp16"`/`"bf16"`/`"fp32"`, or `"unknown"`); part of
+    /// the profile key. `None` only from a worker that reported no footprint
+    /// at all — there is nothing to key then anyway — or an older one.
+    ///
+    /// `"unknown"` is a **value**, not a failure: the key needs every
+    /// component or the entry can never be read back, and a model whose impl
+    /// negotiates no precision and whose weights could not be inspected is
+    /// otherwise unkeyable forever. It is stable for a given impl, so an
+    /// entry written under it is found again by the next run.
     pub dtype: Option<String>,
+    /// How the worker arrived at [`Self::dtype`]: `"selected"` (the impl
+    /// negotiated it), `"attribute"` (a real `torch.dtype` on the instance),
+    /// `"inferred"` (read off the loaded weights) or `"unknown"`. Additive
+    /// and diagnostic — nothing keys on it; it is what tells a maintainer
+    /// reading the log or the store which kind of evidence a row rests on.
+    pub dtype_method: Option<String>,
     /// The board the worker's CUDA device 0 *actually* resolved to, as the
     /// worker itself read it (`GPU-…`). This — not the spawn pin, which may
     /// be an index, absent, or a UUID CUDA reordered — is the authoritative
@@ -943,6 +956,7 @@ impl Worker {
                 base_mb = report.base_mb,
                 base_method = report.base_method.as_deref(),
                 dtype = report.dtype.as_deref(),
+                dtype_method = report.dtype_method.as_deref(),
                 gpu_uuid = report.gpu_uuid.as_deref(),
                 gpu_name = report.gpu_name.as_deref(),
                 gpu_bdf = report.gpu_bdf.as_deref(),
@@ -1673,6 +1687,7 @@ impl LoadReport {
             base_method: field_string(payload, "base_method"),
             reserved_at_load_mb: field_u64(payload, "reserved_at_load_mb"),
             dtype: field_string(payload, "dtype"),
+            dtype_method: field_string(payload, "dtype_method"),
             gpu_uuid: field_string(payload, "gpu_uuid"),
             gpu_name: field_string(payload, "gpu_name"),
             gpu_bdf: field_string(payload, "gpu_bdf"),

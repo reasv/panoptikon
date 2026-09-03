@@ -1136,6 +1136,12 @@ struct LedgerState {
     /// describing another board's memory — the once-per-replica guard on
     /// that WARN (see [`VramLedger::record_free_locked`]).
     free_total_mismatch_logged: HashSet<(String, String)>,
+    /// `(model, board key, reason)` triples whose calibration-store skip has
+    /// already been explained: the once-per-reason guard on those DEBUG
+    /// lines (see [`VramLedger::note_unpersistable_locked`]). The write
+    /// policy is evaluated on every settled window, so without it a model
+    /// that can never be keyed would explain itself a few times a second.
+    profile_skip_logged: HashSet<(String, String, &'static str)>,
     next_id: u64,
     next_fit_version: u64,
 }
@@ -2318,7 +2324,11 @@ impl VramLedger {
     /// Four guards, each load-bearing:
     ///
     /// - `torch`/`dtype` must be known, or the entry could not be keyed (and
-    ///   an unkeyed entry can never be read back);
+    ///   an unkeyed entry can never be read back). A worker that measured a
+    ///   footprint at all now always reports a dtype — `"unknown"` when its
+    ///   impl negotiates none and its weights could not be inspected — so
+    ///   this guard is the old-worker and no-footprint case, not the common
+    ///   one it used to be silently catching;
     /// - `base_mb` must be known, or the profile would claim a base of 0 and
     ///   later suppress a real load reservation;
     /// - `local_samples > 0`, so a shipped baseline is never copied into the
@@ -2337,10 +2347,10 @@ impl VramLedger {
     /// slope 0, residual 0, 0 samples, which is precisely what the store's
     /// reader treats as "no fit here".
     fn pending_update_locked(state: &mut LedgerState, worker: WorkerId) -> Option<ProfileUpdate> {
+        // A replica deregistered between the settle and here has no model to
+        // name and nothing left to persist; every other exit below says why
+        // it took itself out.
         let entry = state.workers.get(&worker)?;
-        let torch = entry.torch.clone()?;
-        let dtype = entry.dtype.clone()?;
-        let base_mb = entry.base_mb?;
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let identity = (
             entry.inference_id.clone(),
@@ -2350,8 +2360,37 @@ impl VramLedger {
             entry.aggregation.as_str(),
             entry.base_method.clone(),
         );
-        let cal = state.calibration.get_mut(&key)?;
+        let (torch, dtype, base) = (entry.torch.clone(), entry.dtype.clone(), entry.base_mb);
+        // The key guards, and the one place in this design where doing
+        // nothing is invisible: a model whose worker reports no dtype writes
+        // no profile on any host, ever, and until these lines existed the
+        // only evidence was a store file that never appeared (the whole of a
+        // Phase-1 protocol run measured five shipped models and persisted
+        // none of them). Each reason is explained once per model and board.
+        let (torch, dtype, base_mb) = match (torch, dtype, base) {
+            (Some(torch), Some(dtype), Some(base_mb)) => (torch, dtype, base_mb),
+            (torch, dtype, _) => {
+                let reason = if torch.is_none() {
+                    "no_torch"
+                } else if dtype.is_none() {
+                    "no_dtype"
+                } else {
+                    "no_base"
+                };
+                Self::note_unpersistable_locked(&mut state.profile_skip_logged, &key, reason);
+                return None;
+            }
+        };
+        let Some(cal) = state.calibration.get_mut(&key) else {
+            Self::note_unpersistable_locked(&mut state.profile_skip_logged, &key, "no_calibration");
+            return None;
+        };
         if cal.local_samples == 0 {
+            Self::note_unpersistable_locked(
+                &mut state.profile_skip_logged,
+                &key,
+                "no_local_samples",
+            );
             return None;
         }
         // Read before the write below moves it on, so the log can say which
@@ -2420,6 +2459,49 @@ impl VramLedger {
             local_samples: cal.local_samples,
             ring: cal.samples.iter().copied().collect(),
         })
+    }
+
+    /// Say, **once** per `(model, board, reason)`, why a settled window
+    /// handed the store nothing.
+    ///
+    /// Deliberately not covering the write policy's own no-op — the
+    /// suppression predicate that fires when the anchor, fit and knee are all
+    /// where the last write left them. That one is the designed steady state:
+    /// it is reached on nearly every settle of every healthy model, and a
+    /// once-per-model line for it would read, in a log full of models that
+    /// *are* being persisted, exactly like the permanent silences this exists
+    /// to make visible. What is covered here is the key and the store state
+    /// instead. Three of those reasons are properties of the worker build and
+    /// do mean "and it will go on writing nothing" (`no_torch`, `no_dtype`,
+    /// `no_base`); the other two can clear on a later settle (`no_calibration`
+    /// once a replica is seeded, `no_local_samples` once a window measures
+    /// something). One line each is the price of not having to guess, from a
+    /// store file that never appeared, which kind of silence it was.
+    ///
+    /// Takes the log set rather than the whole state so it can be called
+    /// while the calibration entry is borrowed: the two are disjoint fields.
+    fn note_unpersistable_locked(
+        logged: &mut HashSet<(String, String, &'static str)>,
+        key: &(String, String),
+        reason: &'static str,
+    ) {
+        if !logged.insert((key.0.clone(), key.1.clone(), reason)) {
+            return;
+        }
+        let because = match reason {
+            "no_torch" => "the worker reported no torch version",
+            "no_dtype" => "the worker reported no dtype",
+            "no_base" => "the worker reported no load footprint",
+            "no_calibration" => "this replica has no calibration state on the board yet",
+            "no_local_samples" => "nothing has been measured locally yet",
+            other => other,
+        };
+        tracing::debug!(
+            model = %key.0,
+            gpu = %key.1,
+            reason,
+            "skipped the calibration store update: {because}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -6363,6 +6445,117 @@ mod tests {
             assert!(
                 profiles.updates.lock().unwrap().is_empty(),
                 "an incomplete profile key is never written"
+            );
+        }
+    }
+
+    /// `"unknown"` is a dtype like any other here. An impl that negotiates no
+    /// precision and whose weights could not be inspected (CTranslate2, ONNX,
+    /// a remote API on a RAM-priced host) still keys, so what this machine
+    /// measures about it survives the run instead of being thrown away — and
+    /// the sentinel is stable, so the next run finds the entry again.
+    #[test]
+    fn an_unknown_dtype_still_keys_and_persists() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("nvml".to_owned()),
+            reserved_at_load_mb: Some(0),
+            gpu_uuid: Some(BOARD.to_owned()),
+            torch_version: Some("2.7.1+cu128".to_owned()),
+            dtype: Some("unknown".to_owned()),
+            dtype_method: Some("unknown".to_owned()),
+            ..LoadReport::default()
+        }));
+        let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        measured_window(&handle, &admission, 4);
+
+        let update = profiles
+            .updates
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("a measured window with a full key is persisted");
+        assert_eq!(update.dtype, "unknown", "the sentinel is stored verbatim");
+        assert_eq!(update.torch, "2.7.1+cu128");
+        assert_eq!(update.base_mb, 1000);
+        assert_eq!(update.max_units_measured, 4);
+        assert!(
+            ledger.lock().profile_skip_logged.is_empty(),
+            "and nothing was skipped, so nothing was explained"
+        );
+    }
+
+    /// A worker that *cannot* be keyed says why — once per model, board and
+    /// reason. This is the whole of the diagnosis for a persistence layer
+    /// that would otherwise do nothing, on every host, forever, in silence.
+    #[test]
+    fn an_unpersistable_worker_says_why_once() {
+        for (report, reason) in [
+            (
+                LoadReport {
+                    base_mb: Some(1000),
+                    base_method: Some("nvml".to_owned()),
+                    reserved_at_load_mb: Some(0),
+                    gpu_uuid: Some(BOARD.to_owned()),
+                    dtype: Some("fp16".to_owned()),
+                    ..LoadReport::default()
+                },
+                "no_torch",
+            ),
+            (
+                LoadReport {
+                    base_mb: Some(1000),
+                    base_method: Some("nvml".to_owned()),
+                    reserved_at_load_mb: Some(0),
+                    gpu_uuid: Some(BOARD.to_owned()),
+                    torch_version: Some("2.7.1+cu128".to_owned()),
+                    ..LoadReport::default()
+                },
+                "no_dtype",
+            ),
+            (
+                LoadReport {
+                    reserved_at_load_mb: Some(0),
+                    gpu_uuid: Some(BOARD.to_owned()),
+                    torch_version: Some("2.7.1+cu128".to_owned()),
+                    dtype: Some("fp16".to_owned()),
+                    ..LoadReport::default()
+                },
+                "no_base",
+            ),
+        ] {
+            let profiles = Arc::new(FakeProfiles::default());
+            let ledger = ledger_with(100_000, no_margin(), &profiles);
+            let mut telemetry = WorkerTelemetry::default();
+            telemetry.load = Some(Timestamped::now(report));
+            let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
+            let admission = ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .unwrap();
+            push_memory(&handle, 90_000, 0);
+            // Several settles, because the explanation is the thing being
+            // rate-limited: the write policy runs on every one of them.
+            for _ in 0..5 {
+                measured_window(&handle, &admission, 4);
+            }
+            assert!(
+                profiles.updates.lock().unwrap().is_empty(),
+                "an incomplete profile key is still never written"
+            );
+            let logged: Vec<(String, String, &'static str)> =
+                ledger.lock().profile_skip_logged.iter().cloned().collect();
+            assert_eq!(
+                logged,
+                vec![("g/a".to_owned(), BOARD.to_owned(), reason)],
+                "one line, naming the model and the missing field"
             );
         }
     }

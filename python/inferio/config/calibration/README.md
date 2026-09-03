@@ -54,7 +54,10 @@ gpu          = "NVIDIA GeForce RTX 5090"   # GPU model name, exactly as nvidia-s
 platform     = "windows"               # windows | linux | macos
 backend      = "cuda"                  # accelerator extra: cuda | rocm | cpu
 torch        = "2.7.1+cu128"           # full torch.__version__
-dtype        = "fp16"                  # negotiated dtype actually in use
+dtype        = "fp16"                  # load precision actually in use; "unknown"
+                                       # when the impl negotiates none and its
+                                       # weights could not be read (a key value,
+                                       # not an omission — see the protocol doc)
 unit         = "item"                  # denormalized from metadata, for readability
 aggregation  = "count"
 
