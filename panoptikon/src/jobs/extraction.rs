@@ -75,6 +75,179 @@ fn request_unit_capacity(batch_cap: Option<i64>) -> usize {
     }
 }
 
+/// Floor on the job's total in-flight unit budget, and the value it starts
+/// at before the inference server has said anything.
+///
+/// It is [`REQUEST_UNIT_BUDGET`] on purpose, for a reason that has nothing to
+/// do with batch sizing: one chunked request acquires up to
+/// `request_unit_capacity` (<= [`REQUEST_UNIT_BUDGET`]) permits at once, so a
+/// budget any smaller could not satisfy a single request and the job would
+/// deadlock. It is also the value an inference server with no opinion leaves
+/// the job at, which is exactly the pre-feedback behaviour.
+const MIN_IN_FLIGHT_UNITS: usize = REQUEST_UNIT_BUDGET;
+
+/// Nominal intermediate bytes one work unit occupies while it is in flight,
+/// for [`in_flight_unit_ceiling`]. Extraction work units are re-encoded image
+/// frames, rendered PDF pages and audio chunks, all of which are far larger
+/// than this; a deliberately *small* stand-in makes the ceiling an
+/// over-estimate of what the byte budget can hold, which is what a ceiling
+/// should be — the byte budget itself, not this figure, is what actually
+/// bounds memory.
+const NOMINAL_UNIT_KIB: u32 = 256;
+
+/// Upper bound on the job's in-flight unit budget.
+///
+/// The inference server publishes a desired in-flight figure sized by *its*
+/// constraints (see `desired_in_flight_items` in `inferio/dispatch.rs`); this
+/// is core's own sanity bound on it, derived from the two limits core already
+/// applies to in-flight work, so that a large or bogus figure cannot make a
+/// job spawn unbounded work:
+///
+/// - **The intermediate byte budget** (`[jobs] intermediate_data_budget_mb`,
+///   default 1024 MB) is charged per item's loaded data, and an item takes
+///   its share *before* it asks for a single unit permit. At
+///   [`NOMINAL_UNIT_KIB`] per unit that budget can hold
+///   `intermediate_budget_kib / NOMINAL_UNIT_KIB` units at once — 4096 at the
+///   default. Permits past that are never claimed at all, because the items
+///   that would claim them are still parked on the byte budget, so minting
+///   them buys nothing.
+/// - **The loader slots** (`[jobs] loader_concurrency`, default 8) bound how
+///   many items are being loaded at once, each chunked into requests of at
+///   most [`REQUEST_UNIT_BUDGET`] units. `loader_concurrency ×
+///   REQUEST_UNIT_BUDGET` (512 at the defaults) is therefore work core can
+///   keep in flight even when the byte budget is configured tiny, so it is
+///   the floor of the ceiling rather than a second cap.
+///
+/// Never below [`MIN_IN_FLIGHT_UNITS`], so the clamp in
+/// [`UnitBudget::observe`] is always a valid range.
+fn in_flight_unit_ceiling(intermediate_budget_kib: u32, loader_concurrency: usize) -> usize {
+    let by_budget = (intermediate_budget_kib / NOMINAL_UNIT_KIB.max(1)) as usize;
+    let by_loaders = loader_concurrency
+        .max(1)
+        .saturating_mul(REQUEST_UNIT_BUDGET);
+    by_budget.max(by_loaders).max(MIN_IN_FLIGHT_UNITS)
+}
+
+/// The job's in-flight unit budget: a resizable semaphore whose capacity
+/// follows the inference server's desired in-flight figure.
+///
+/// Core sizes requests "by keeping the server fed" and must not learn about
+/// VRAM (`docs/batch-calibration-design.md`); the orchestrator, which owns
+/// the VRAM picture, publishes an item count on every predict response and
+/// this tracks it between [`MIN_IN_FLIGHT_UNITS`] and
+/// [`in_flight_unit_ceiling`]. Before the PR that added this, the capacity
+/// was the constant [`REQUEST_UNIT_BUDGET`], which capped the orchestrator's
+/// ramp at 64 items no matter how much headroom a board had (test protocol
+/// §8 G7).
+///
+/// **Shrinking never takes a permit away from work already in flight.**
+/// `Semaphore::forget_permits` only removes permits that are currently
+/// *available*; whatever it could not remove is remembered in
+/// `pending_shrink` and retried every time this budget is touched, so the
+/// permits still held by in-flight requests are simply not re-issued when
+/// they come back. The invariant is
+/// `permits in existence == target + pending_shrink`, and `target` never
+/// drops below [`MIN_IN_FLIGHT_UNITS`], so the count can neither go negative
+/// nor fall under one request's worth and deadlock.
+struct UnitBudget {
+    slots: Arc<Semaphore>,
+    ceiling: usize,
+    state: std::sync::Mutex<UnitBudgetState>,
+}
+
+#[derive(Debug)]
+struct UnitBudgetState {
+    /// Permits this budget wants to exist.
+    target: usize,
+    /// Permits still to be withdrawn from circulation because a shrink could
+    /// not be satisfied out of the available ones.
+    pending_shrink: usize,
+}
+
+impl UnitBudget {
+    fn new(ceiling: usize) -> Self {
+        let ceiling = ceiling.max(MIN_IN_FLIGHT_UNITS);
+        Self {
+            slots: Arc::new(Semaphore::new(MIN_IN_FLIGHT_UNITS)),
+            ceiling,
+            state: std::sync::Mutex::new(UnitBudgetState {
+                target: MIN_IN_FLIGHT_UNITS,
+                pending_shrink: 0,
+            }),
+        }
+    }
+
+    /// One request's permits, held for the duration of the predict call.
+    async fn acquire(&self, units: u32) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.slots)
+            .acquire_many_owned(units)
+            .await
+            .map_err(|_| anyhow::anyhow!("inference unit semaphore closed"))
+    }
+
+    /// Apply one predict response's desired in-flight figure.
+    ///
+    /// `None` is **no opinion**, not a figure of zero, and leaves the target
+    /// exactly where it was. Three things produce it: an inference server
+    /// from before this feature, a model that has not dispatched a window
+    /// yet, and — rarely — a model unloaded in the gap between the predict
+    /// completing and the response being encoded (see
+    /// `ModelManager::desired_in_flight_items`, which reads the figure after
+    /// the predict's pin has been released). Since the budget *starts* at
+    /// [`MIN_IN_FLIGHT_UNITS`], a server that never publishes anything keeps
+    /// the job at the floor — exactly the pre-feedback constant — while a
+    /// server that publishes and then misses one response does not lose the
+    /// figure it already gave.
+    fn observe(&self, desired: Option<u64>) {
+        let Some(items) = desired else {
+            // No opinion: nothing to resize toward, but permits may have come
+            // back since the last drain.
+            self.settle();
+            return;
+        };
+        let wanted = usize::try_from(items)
+            .unwrap_or(usize::MAX)
+            .clamp(MIN_IN_FLIGHT_UNITS, self.ceiling);
+        let mut state = self.state.lock().expect("unit budget mutex poisoned");
+        match wanted.cmp(&state.target) {
+            std::cmp::Ordering::Greater => {
+                let grow = wanted - state.target;
+                // Growth first cancels a shrink that never landed: those
+                // permits are still in existence, so minting more would
+                // overshoot the invariant.
+                let cancelled = state.pending_shrink.min(grow);
+                state.pending_shrink -= cancelled;
+                if grow > cancelled {
+                    self.slots.add_permits(grow - cancelled);
+                }
+                state.target = wanted;
+            }
+            std::cmp::Ordering::Less => {
+                state.pending_shrink += state.target - wanted;
+                state.target = wanted;
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        Self::drain_shrink(&self.slots, &mut state);
+    }
+
+    /// Retry a shrink that could not be satisfied earlier. Called whenever a
+    /// request's permits come back, which is when previously-outstanding
+    /// permits become withdrawable.
+    fn settle(&self) {
+        let mut state = self.state.lock().expect("unit budget mutex poisoned");
+        Self::drain_shrink(&self.slots, &mut state);
+    }
+
+    fn drain_shrink(slots: &Semaphore, state: &mut UnitBudgetState) {
+        if state.pending_shrink == 0 {
+            return;
+        }
+        let removed = slots.forget_permits(state.pending_shrink);
+        state.pending_shrink -= removed;
+    }
+}
+
 /// The cap as the inference API takes it: an item-count ceiling on GPU
 /// batches, `None` = auto. Forwarded verbatim; never clamped to the request
 /// budget, because it constrains a different thing.
@@ -532,7 +705,14 @@ async fn run_extraction_job_inner(
     // keeps in flight (design doc "Batch size UX", split #2). A capped job
     // still chunks no larger than its cap, so no single request outruns what
     // the far side may process in one batch.
-    let unit_slots = Arc::new(Semaphore::new(REQUEST_UNIT_BUDGET));
+    //
+    // It starts at the floor and then follows the desired in-flight figure
+    // the inference server publishes on each response — the one number that
+    // crosses the boundary, in items, so core never learns about VRAM.
+    let unit_slots = Arc::new(UnitBudget::new(in_flight_unit_ceiling(
+        context.intermediate_budget_kib,
+        context.loader_concurrency,
+    )));
     let unit_capacity = request_unit_capacity(defaults.batch_size);
     // The cap travels with each request; `None` = auto.
     let batch_cap = gpu_batch_cap(defaults.batch_size);
@@ -829,7 +1009,7 @@ async fn process_item(
     loader_permit: tokio::sync::OwnedSemaphorePermit,
     budget_slots: &Arc<Semaphore>,
     budget_capacity: u32,
-    unit_slots: &Arc<Semaphore>,
+    unit_slots: &Arc<UnitBudget>,
     unit_capacity: usize,
     batch_cap: Option<u32>,
     counters: Arc<Mutex<JobCounters>>,
@@ -1382,7 +1562,7 @@ struct ItemInference {
 async fn run_chunked_inference(
     setter_name: &str,
     pool: &InferencePool,
-    unit_slots: &Arc<Semaphore>,
+    unit_slots: &Arc<UnitBudget>,
     unit_capacity: usize,
     batch_cap: Option<u32>,
     inputs: &[InferenceInput],
@@ -1466,16 +1646,12 @@ async fn run_chunked_inference(
 async fn predict_units(
     setter_name: &str,
     pool: &InferencePool,
-    unit_slots: &Arc<Semaphore>,
+    unit_slots: &Arc<UnitBudget>,
     max_batch: Option<u32>,
     counters: &Arc<Mutex<JobCounters>>,
     inputs: &[InferenceInput],
 ) -> anyhow::Result<PredictResponse> {
-    let permits = unit_slots
-        .clone()
-        .acquire_many_owned(inputs.len() as u32)
-        .await
-        .map_err(|_| anyhow::anyhow!("inference unit semaphore closed"))?;
+    let permits = unit_slots.acquire(inputs.len() as u32).await?;
     let inference_span = counters.lock().await.inference_time.start();
     let response = pool
         .predict(
@@ -1494,7 +1670,15 @@ async fn predict_units(
         )
         .await;
     drop(inference_span);
+    // Release this request's permits *before* resizing, so a shrink can take
+    // them out of circulation immediately instead of waiting for the next
+    // response; `settle` covers the failure path, where there is no figure to
+    // apply but permits still came back.
     drop(permits);
+    match &response {
+        Ok(response) => unit_slots.observe(response.desired_in_flight_items),
+        Err(_) => unit_slots.settle(),
+    }
     response
 }
 
@@ -1539,6 +1723,10 @@ where
 {
     let mut merged: Option<PredictOutput> = None;
     let mut errors: Vec<PredictSlotError> = Vec::new();
+    // The figure the last submission that carried one published: an isolation
+    // pass is still a stream of real predicts, so the signal must survive it
+    // rather than reading as "the server has no opinion".
+    let mut desired_in_flight_items: Option<u64> = None;
     for (index, input) in inputs.iter().enumerate() {
         let response = predict_one(vec![input.clone()], ISOLATION_MAX_BATCH)
             .await
@@ -1555,6 +1743,7 @@ where
                 );
             })
             .with_context(|| format!("input {index} failed on its own too"))?;
+        desired_in_flight_items = response.desired_in_flight_items.or(desired_in_flight_items);
         for mut error in response.errors {
             error.index += index;
             errors.push(error);
@@ -1569,6 +1758,7 @@ where
     Ok(PredictResponse {
         outputs: merged.unwrap_or(PredictOutput::Json(Vec::new())),
         errors,
+        desired_in_flight_items,
     })
 }
 
@@ -2344,8 +2534,9 @@ mod tests {
 
     // The split the design turns on: core-side request sizing is the constant
     // and never the user's cap, while the cap goes to the inference side
-    // untouched. The job body wires exactly these two: `unit_slots` is
-    // `Semaphore::new(REQUEST_UNIT_BUDGET)` (no cap term at all),
+    // untouched. The job body wires exactly these two: `unit_slots` is a
+    // `UnitBudget` starting at `MIN_IN_FLIGHT_UNITS` and following the
+    // server's figure (no cap term at all),
     // `unit_capacity` is `request_unit_capacity`, and the value handed to
     // `pool.predict` is `gpu_batch_cap`'s — not the chunk size, which is what
     // it used to be.
@@ -2376,6 +2567,260 @@ mod tests {
         // And auto reaches the NOT NULL log column as its 0 sentinel.
         assert_eq!(logged_batch_size(None), 0);
         assert_eq!(logged_batch_size(Some(8)), 8);
+    }
+
+    // ------------------------------------------------------------------
+    // The in-flight unit budget follows the server's figure (§8 G7)
+    // ------------------------------------------------------------------
+
+    /// The ceiling is core's own bound on a number the server chooses, and it
+    /// comes from the two limits core already applies to in-flight work.
+    #[test]
+    fn the_in_flight_ceiling_comes_from_the_byte_budget_and_the_loader_slots() {
+        // Defaults: 1024 MB of intermediate budget, 8 loader slots. The byte
+        // budget is the binding term.
+        assert_eq!(in_flight_unit_ceiling(1024 * 1024, 8), 1024 * 1024 / 256);
+        // A tiny byte budget falls back to the loader-slot term, which is the
+        // work core can keep in flight regardless.
+        assert_eq!(
+            in_flight_unit_ceiling(1024, 8),
+            8 * REQUEST_UNIT_BUDGET,
+            "loader_concurrency x REQUEST_UNIT_BUDGET is the floor of the ceiling"
+        );
+        // Never below one request's worth, whatever the configuration says.
+        assert_eq!(in_flight_unit_ceiling(0, 0), MIN_IN_FLIGHT_UNITS);
+    }
+
+    /// Growth: the budget adds permits toward the figure, and stops at the
+    /// ceiling.
+    #[tokio::test]
+    async fn the_unit_budget_grows_toward_the_servers_figure() {
+        let budget = UnitBudget::new(1_000);
+        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
+
+        budget.observe(Some(512));
+        assert_eq!(budget.slots.available_permits(), 512);
+        // Idempotent: the same figure again mints nothing.
+        budget.observe(Some(512));
+        assert_eq!(budget.slots.available_permits(), 512);
+        // Bounded by core's ceiling, never by what the server asked for.
+        budget.observe(Some(1_000_000));
+        assert_eq!(budget.slots.available_permits(), 1_000);
+    }
+
+    /// Shrink, with nothing outstanding: permits are withdrawn immediately.
+    #[tokio::test]
+    async fn the_unit_budget_shrinks_toward_the_servers_figure() {
+        let budget = UnitBudget::new(1_000);
+        budget.observe(Some(512));
+        budget.observe(Some(128));
+        assert_eq!(budget.slots.available_permits(), 128);
+        // The floor is a hard floor: a request may acquire up to
+        // REQUEST_UNIT_BUDGET permits at once, so the budget must never go
+        // under that or a single request could never be served.
+        budget.observe(Some(1));
+        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
+    }
+
+    /// Shrinking while permits are outstanding never steals them: the
+    /// withdrawal is remembered and applied as they come back, and the count
+    /// never goes negative.
+    #[tokio::test]
+    async fn a_shrink_holds_back_permits_instead_of_stealing_them() {
+        let budget = UnitBudget::new(1_000);
+        budget.observe(Some(256));
+        // Two requests hold 192 of the 256 permits.
+        let first = budget.acquire(128).await.expect("permits");
+        let second = budget.acquire(64).await.expect("permits");
+        assert_eq!(budget.slots.available_permits(), 64);
+
+        budget.observe(Some(96));
+        // Only the 64 free permits could be withdrawn; the 192 outstanding
+        // ones are untouched and the rest of the shrink is still owed.
+        assert_eq!(budget.slots.available_permits(), 0);
+        assert_eq!(
+            budget.state.lock().unwrap().pending_shrink,
+            96,
+            "256 -> 96 owes 160; 64 were available, so 96 are still owed"
+        );
+
+        // As permits come back they are absorbed rather than re-issued.
+        drop(first);
+        budget.settle();
+        assert_eq!(budget.slots.available_permits(), 32);
+        assert_eq!(budget.state.lock().unwrap().pending_shrink, 0);
+        drop(second);
+        budget.settle();
+        assert_eq!(
+            budget.slots.available_permits(),
+            96,
+            "the target, reached once the outstanding permits returned"
+        );
+        assert_eq!(budget.state.lock().unwrap().target, 96);
+    }
+
+    /// A shrink that never landed is cancelled by a later growth instead of
+    /// double-counting: the permits it wanted to withdraw are still in
+    /// existence, so minting more on top would overshoot.
+    #[tokio::test]
+    async fn a_growth_cancels_a_shrink_that_never_landed() {
+        let budget = UnitBudget::new(1_000);
+        budget.observe(Some(256));
+        let held = budget.acquire(256).await.expect("permits");
+        assert_eq!(budget.slots.available_permits(), 0);
+
+        budget.observe(Some(128));
+        assert_eq!(budget.state.lock().unwrap().pending_shrink, 128);
+        budget.observe(Some(256));
+        assert_eq!(
+            budget.state.lock().unwrap().pending_shrink,
+            0,
+            "the growth cancelled the owed withdrawal"
+        );
+        drop(held);
+        budget.settle();
+        assert_eq!(
+            budget.slots.available_permits(),
+            256,
+            "and minted nothing extra: 256 in existence, not 384"
+        );
+    }
+
+    /// An absent figure is "no opinion", not a figure of zero: a server that
+    /// never publishes one leaves the job at the floor it started on — which
+    /// is exactly the constant budget core used before this feature — and a
+    /// server that publishes and then goes quiet keeps the last figure it
+    /// stood behind.
+    #[tokio::test]
+    async fn a_never_published_figure_means_the_floor_and_a_missing_one_changes_nothing() {
+        let budget = UnitBudget::new(1_000);
+        assert_eq!(MIN_IN_FLIGHT_UNITS, REQUEST_UNIT_BUDGET);
+
+        // Never published: the budget stays where it started.
+        budget.observe(None);
+        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
+        budget.observe(None);
+        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
+
+        // Published once, then a response with no header: the last figure
+        // stands rather than collapsing to the floor.
+        budget.observe(Some(512));
+        assert_eq!(budget.slots.available_permits(), 512);
+        budget.observe(None);
+        assert_eq!(budget.slots.available_permits(), 512);
+        assert_eq!(budget.state.lock().unwrap().target, 512);
+    }
+
+    /// And a headerless response still drains a shrink that earlier could not
+    /// be satisfied, because permits may have come back in the meantime.
+    #[tokio::test]
+    async fn a_missing_figure_still_settles_an_owed_shrink() {
+        let budget = UnitBudget::new(1_000);
+        budget.observe(Some(256));
+        let held = budget.acquire(256).await.expect("permits");
+        budget.observe(Some(128));
+        assert_eq!(budget.state.lock().unwrap().pending_shrink, 128);
+
+        drop(held);
+        budget.observe(None);
+        assert_eq!(budget.state.lock().unwrap().pending_shrink, 0);
+        assert_eq!(budget.slots.available_permits(), 128);
+    }
+
+    /// Adversarial: a shrink to the floor while *every* permit is
+    /// outstanding, then a growth well above where the target started. The
+    /// withheld permits must be counted once, not twice — minting the full
+    /// growth on top of a shrink that never landed would leave the budget
+    /// permanently larger than its own target.
+    #[tokio::test]
+    async fn a_shrink_under_the_outstanding_permits_then_a_growth_above_them() {
+        let budget = UnitBudget::new(4_096);
+        budget.observe(Some(1_024));
+        let held = budget.acquire(1_024).await.expect("permits");
+        assert_eq!(budget.slots.available_permits(), 0);
+
+        // All the way to the floor with nothing free to withdraw.
+        budget.observe(Some(1));
+        {
+            let state = budget.state.lock().unwrap();
+            assert_eq!(state.target, MIN_IN_FLIGHT_UNITS);
+            assert_eq!(state.pending_shrink, 1_024 - MIN_IN_FLIGHT_UNITS);
+        }
+        // ... and straight back up, past where it started.
+        budget.observe(Some(4_096));
+        {
+            let state = budget.state.lock().unwrap();
+            assert_eq!(state.target, 4_096);
+            assert_eq!(
+                state.pending_shrink, 0,
+                "the owed shrink is cancelled by the growth, not double-counted"
+            );
+        }
+        assert_eq!(
+            budget.slots.available_permits(),
+            4_096 - 1_024,
+            "4096 permits in existence, 1024 of them still out"
+        );
+        drop(held);
+        budget.settle();
+        assert_eq!(budget.slots.available_permits(), 4_096);
+    }
+
+    /// Adversarial: many in-flight requests observing conflicting figures at
+    /// once — a `u64::MAX` no header could honestly carry, a zero, and
+    /// figures on both sides of the current target — while permits are being
+    /// taken and returned underneath them. Whichever order the observations
+    /// land in, the budget must end consistent (nothing outstanding means
+    /// `available == target`), inside its own bounds, and still able to serve
+    /// one chunked request's worth.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_conflicting_figures_leave_the_budget_consistent() {
+        const CEILING: usize = 4_096;
+        let budget = Arc::new(UnitBudget::new(CEILING));
+        budget.observe(Some(2_048));
+
+        let figures = [u64::MAX, 0, 1, 64, 512, 2_048, 4_096, 100_000];
+        let mut tasks = tokio::task::JoinSet::new();
+        for round in 0..64usize {
+            let budget = Arc::clone(&budget);
+            let figure = figures[round % figures.len()];
+            tasks.spawn(async move {
+                // One request's worth: the largest single acquisition the job
+                // ever makes, and the one the floor exists to guarantee.
+                let permits = budget
+                    .acquire(REQUEST_UNIT_BUDGET as u32)
+                    .await
+                    .expect("permits");
+                tokio::task::yield_now().await;
+                drop(permits);
+                budget.observe(Some(figure));
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        // Nothing is outstanding now, so every withheld permit is
+        // withdrawable and the invariant collapses to `available == target`.
+        budget.settle();
+        let (target, pending) = {
+            let state = budget.state.lock().unwrap();
+            (state.target, state.pending_shrink)
+        };
+        assert_eq!(
+            pending, 0,
+            "every owed shrink landed once the permits came back"
+        );
+        assert_eq!(budget.slots.available_permits(), target);
+        assert!(
+            (MIN_IN_FLIGHT_UNITS..=CEILING).contains(&target),
+            "target {target} escaped [{MIN_IN_FLIGHT_UNITS}, {CEILING}] — a \
+             u64::MAX or a zero got through the clamp"
+        );
+        // The deadlock bound survived all of it.
+        let last = budget
+            .acquire(REQUEST_UNIT_BUDGET as u32)
+            .await
+            .expect("one chunked request's worth is always servable");
+        drop(last);
     }
 
     // The guard that keeps a boundary unload from landing on a model a newer
@@ -3450,6 +3895,7 @@ mod tests {
         PredictResponse {
             outputs: PredictOutput::Json(values),
             errors,
+            desired_in_flight_items: None,
         }
     }
 

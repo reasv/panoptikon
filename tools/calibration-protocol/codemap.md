@@ -238,12 +238,42 @@ build/deploy/API. The plan that uses this is
   terminate_grace_secs`); `TRIM_DEADLINE` 60 s fixed; **predict has no
   deadline**; a hung worker holds its grant forever. The manager's
   `load_lock` is taken at the top of every predict (`manager.rs:1161`).
-- Core request sizing: `REQUEST_UNIT_BUDGET = 64` (`extraction.rs:66`)
-  is both the per-request chunk and the **total** in-flight unit
-  semaphore per job (`:535`); master sized that semaphore by the user's
-  batch size. Being replaced by the feedback signal (plan §8 G7). Other
-  core bounds: `loader_concurrency` default 8, intermediate byte budget
-  default 1024 MB (`config.rs:530-536`).
+- Core request sizing (**changed by the §8 G7 fix; the feedback signal is
+  implemented**): `REQUEST_UNIT_BUDGET = 64` (`extraction.rs:66`) is now
+  only the per-request chunk. The per-job in-flight total is a resizable
+  `UnitBudget` (`extraction.rs:152`, state `:159`, built at `:712`) that
+  follows a figure the orchestrator publishes on every predict response:
+  `observe` (`:201`) grows by `add_permits` and shrinks by withholding
+  only *free* permits (`forget_permits`), retrying the remainder as
+  outstanding permits return (`settle` `:237`); it is called from
+  `predict_units` (`:1679`, `settle` on the error path `:1680`). Floor
+  `MIN_IN_FLIGHT_UNITS = 64` (`:87`, also the starting value, and a
+  deadlock bound since one chunk acquires up to 64 permits at once);
+  ceiling `in_flight_unit_ceiling` (`:123`) =
+  `max(intermediate_budget_kib / NOMINAL_UNIT_KIB, loader_concurrency × 64)`
+  with `NOMINAL_UNIT_KIB = 256` (`:96`) → **4096 units at the shipped
+  defaults**.
+  Master sized the semaphore by the user's batch size; the cap plays no
+  part in either number now. Other core bounds unchanged:
+  `loader_concurrency` default 8, intermediate byte budget default
+  1024 MB (`config.rs:530-536`).
+- The signal itself: `dispatch::desired_in_flight_items`
+  (`dispatch.rs:525`) — window target units × the just-formed window's
+  items-per-unit × `IN_FLIGHT_SLACK = 2` (`:459`), bounded by
+  `MAX_WINDOW_BYTES` through that window's bytes-per-item; pre-fit ratio
+  from `seed_units_per_item` (`:471`, with `TOKEN_SEED_UNITS = 512`
+  `:487`). Computed per window formation at `dispatch.rs:652` (the
+  `admission == None` arm publishes `unpriced_window_items × 2`) and
+  stored in `ModelStats::desired_in_flight_items` (`:194`, written
+  `:709`). `ModelManager::desired_in_flight_items`
+  (`manager.rs:900`) reads it; the HTTP layer puts it on the predict
+  response as the header `x-panoptikon-desired-in-flight-items`
+  (`http.rs:86`, attached by `with_desired_in_flight` `:543`, documented
+  in the `#[utoipa::path]` for `predict` and hence in `openapi.json`).
+  The client reads it back into `PredictResponse.desired_in_flight_items`
+  (`inferio_client.rs:86`, header constant `:92`). **Absent = no change**
+  from the last figure (an older server, a model with no window yet, or
+  the model unloaded in the gap); the caller's initial value is its floor.
 
 ### 1.7 Control surfaces
 

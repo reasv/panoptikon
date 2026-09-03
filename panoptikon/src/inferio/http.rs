@@ -70,6 +70,21 @@ use crate::config::Settings;
 /// Python renders "never expires" as `datetime.max.isoformat()`.
 const NEVER_EXPIRES: &str = "9999-12-31T23:59:59.999999";
 
+/// Response header carrying the orchestrator's desired in-flight figure, in
+/// **items**, for the model that just answered (test protocol §8 G7, brief
+/// (b); `docs/inferio-worker-protocol.md`, "Desired in-flight items").
+///
+/// A header rather than a body field because a predict answers in three
+/// encodings — raw `application/octet-stream`, `multipart/mixed` and the JSON
+/// `{"outputs": ...}` envelope — and only one of them has anywhere to put a
+/// scalar. A header is additive in all three, is ignored by every existing
+/// client, and is absent from a Python-era inference server, which is exactly
+/// the "no opinion" case the caller must already handle.
+///
+/// It is a *response* header, so the policy layer's inbound
+/// `x-panoptikon-*` strip (`policy.rs`) does not touch it.
+pub(crate) const DESIRED_IN_FLIGHT_HEADER: &str = "x-panoptikon-desired-in-flight-items";
+
 /// Shared state of the local inference service: the model manager plus the
 /// mtime-cached registry used by `/metadata`.
 pub struct InferioState {
@@ -426,6 +441,13 @@ struct CacheListResponse {
             (PredictJsonResponse = "application/json"),
             (BinaryBlob = "application/octet-stream"),
             (BinaryBlob = "multipart/mixed")
+        ), headers(
+            ("x-panoptikon-desired-in-flight-items" = String, description =
+                "Items the orchestrator would like the caller to keep inside \
+                 in-flight predict requests for this model. Additive and \
+                 optional: absent means the orchestrator has no opinion (an \
+                 older server, or a model that has not dispatched a window \
+                 yet) and the caller keeps its own floor.")
         )),
         (status = 400, description = "Malformed multipart body or inputs", body = crate::api_error::ErrorBody),
         (status = 422, description = "Missing required `data` form field", body = crate::api_error::ErrorBody),
@@ -502,7 +524,32 @@ async fn predict(
                 ApiError::internal("Prediction failed")
             }
         })?;
-    Ok(encode_output_response(outputs))
+    // Read straight after the predict. Deliberately not this request's own
+    // window: it is whatever window this model formed most recently, which
+    // under concurrent predicts may be a later one. That is the point — the
+    // figure is a running opinion about the model, not a receipt for one
+    // request, so stale by a window is exactly as useful. A model unloaded in
+    // the gap answers `None`, which omits the header for that one response.
+    let desired = state.manager.desired_in_flight_items(&full_id);
+    Ok(with_desired_in_flight(
+        encode_output_response(outputs),
+        desired,
+    ))
+}
+
+/// Attach [`DESIRED_IN_FLIGHT_HEADER`] to an already-encoded predict
+/// response, leaving the body and every other header byte-identical. `None`
+/// (or a value that will not fit a header) omits it.
+fn with_desired_in_flight(mut response: Response, desired: Option<u64>) -> Response {
+    if let Some(value) = desired
+        && let Ok(value) = header::HeaderValue::from_str(&value.to_string())
+    {
+        response.headers_mut().insert(
+            header::HeaderName::from_static(DESIRED_IN_FLIGHT_HEADER),
+            value,
+        );
+    }
+    response
 }
 
 /// `PUT /load/{group}/{inference_id}` — router.py `load_model`:
@@ -1347,6 +1394,13 @@ metadata.description = "echo fixture"
             )
             .await
             .expect("json predict");
+        // The desired in-flight figure rides on the response header, in
+        // every one of the three encodings — which is why it is a header and
+        // not a body field: only the JSON envelope could have carried it.
+        let desired = output
+            .desired_in_flight_items
+            .expect("the orchestrator published a figure");
+        assert!(desired > 0);
         match output.outputs {
             PredictOutput::Json(values) => {
                 assert_eq!(values, vec![json!({"echo": {"text": "hi"}})]);
@@ -1370,6 +1424,11 @@ metadata.description = "echo fixture"
             )
             .await
             .expect("binary predict");
+        assert_eq!(
+            output.desired_in_flight_items,
+            Some(desired),
+            "octet-stream responses carry it too"
+        );
         match output.outputs {
             PredictOutput::Binary(outputs) => {
                 assert_eq!(outputs, vec![b"echo:abc".to_vec()]);
@@ -1399,6 +1458,11 @@ metadata.description = "echo fixture"
             )
             .await
             .expect("multipart predict");
+        assert_eq!(
+            output.desired_in_flight_items,
+            Some(desired),
+            "and so do multipart/mixed responses"
+        );
         match output.outputs {
             PredictOutput::Binary(outputs) => {
                 assert_eq!(outputs, vec![b"echo:one".to_vec(), b"echo:two".to_vec()]);

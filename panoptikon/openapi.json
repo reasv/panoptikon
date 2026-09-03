@@ -1604,6 +1604,14 @@
         "responses": {
           "200": {
             "description": "Model outputs",
+            "headers": {
+              "x-panoptikon-desired-in-flight-items": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Items the orchestrator would like the caller to keep inside in-flight predict requests for this model. Additive and optional: absent means the orchestrator has no opinion (an older server, or a model that has not dispatched a window yet) and the caller keeps its own floor."
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {

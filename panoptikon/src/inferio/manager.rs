@@ -888,6 +888,24 @@ impl ModelManager {
         result
     }
 
+    /// Items the orchestrator would like a caller to keep inside in-flight
+    /// predict requests for this model (test protocol §8 G7, brief (b)).
+    ///
+    /// Written by the model's dispatcher on every window formation
+    /// (`dispatch::desired_in_flight_items`) and read here without
+    /// disturbing it — the same Relaxed-atomic contract `health()` uses. The
+    /// HTTP layer reads it right after a predict and puts it on the response;
+    /// `None` (model not loaded, or loaded but nothing dispatched yet) is
+    /// reported as an absent field, which callers read as "no opinion".
+    pub fn desired_in_flight_items(&self, inference_id: &str) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        let handle = state.models.get(inference_id)?;
+        match handle.stats.desired_in_flight_items.load(Relaxed) {
+            0 => None,
+            value => Some(value),
+        }
+    }
+
     /// `DELETE /cache/{key}/{group}/{id}`: remove one entry; unload the
     /// model when that was its last reference. Returns whether the entry
     /// existed.

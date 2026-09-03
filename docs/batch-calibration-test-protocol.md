@@ -618,6 +618,62 @@ confirm or refute them rather than rediscover them.
     window target within one or two windows and the ramp no longer stops
     at 64".
 
+  **Implemented (2026-09-03)** on this branch, by the commit *"Let core's
+  in-flight unit budget follow the server's desired item count"* (the hash
+  cannot be written inside the commit that carries this paragraph; it is
+  the branch's tip commit touching `inferio/dispatch.rs`,
+  `inferio/manager.rs`, `inferio/http.rs`, `inferio_client.rs`,
+  `jobs/extraction.rs`, `panoptikon/openapi.json` and
+  `docs/inferio-worker-protocol.md`). What was built:
+  - **Carrier: an HTTP *response header*,
+    `x-panoptikon-desired-in-flight-items`**, not a body field. Predict
+    answers in three encodings (`application/octet-stream`,
+    `multipart/mixed`, the JSON `{"outputs": [...]}` envelope) and only
+    the last could hold a scalar — a body field would be absent for
+    exactly the image and embedding models G7 is about. Documented in
+    `inferio-worker-protocol.md` ("Desired in-flight items") and in the
+    OpenAPI document, whose source of truth is the `#[utoipa::path]`
+    annotation in `inferio/http.rs`; `panoptikon/openapi.json` is the
+    regenerated fixture.
+  - **Derivation** (`dispatch::desired_in_flight_items`, per window
+    formation): the ledger's window target in units
+    (`admitted_units x WINDOW_DEPTH_MULTIPLIER`) times the just-formed
+    window's items-per-unit ratio times a slack of 2, then bounded by
+    `MAX_WINDOW_BYTES` converted through that window's bytes-per-item
+    (the byte bound takes no slack: a window at the wall cannot merge
+    another request anyway). Before any window exists the ratio comes
+    from a per-unit-class seed — 1 for `item` and for every
+    `count`-aggregated model, `PIXEL_FALLBACK_UNITS` (2 MP) for `pixel`,
+    a new `TOKEN_SEED_UNITS = 512` for `token`,
+    `AUDIO_FALLBACK_SECONDS` (30) for `audio-second`. Unpriced paths
+    (the `none` cost class, no inventory, unknown board) publish
+    `unpriced_window_items x 2`; the user's `max_batch` cap is
+    deliberately not folded in, since a cap bounds GPU batches, never
+    how much work the caller keeps in flight.
+  - **Core** (`jobs/extraction.rs`): the per-job unit semaphore is now a
+    `UnitBudget` that resizes toward the figure on each response. Floor
+    64 (`MIN_IN_FLIGHT_UNITS`, which is also the starting value; it is a
+    deadlock bound, since one chunked request acquires up to 64 permits
+    at once), ceiling `max(intermediate_budget_kib / NOMINAL_UNIT_KIB,
+    loader_concurrency x 64)` with `NOMINAL_UNIT_KIB = 256`, i.e. **4096
+    units at the shipped defaults**. Growth adds permits; a shrink
+    withdraws only free permits and withholds the remainder as
+    outstanding permits return, so it never interrupts work in flight.
+  - **Absent header = no change** from the last figure, not a drop to the
+    floor. Since the budget starts at the floor, a server that never
+    sends it leaves the job at 64 for the whole run (the pre-feature
+    behaviour), while one that sends it and then misses a response keeps
+    what it published.
+  - `REQUEST_UNIT_BUDGET = 64` stays as the per-request chunk, and
+    `ISOLATION_MAX_BATCH` is untouched. No grant arithmetic, ramp, knee
+    or user-visible default changed.
+  - **Follow-up, not done here:** `ui/lib/panoptikon.d.ts` is generated
+    from `panoptikon/openapi.json` by `npm run gen:api` in the `ui`
+    submodule (a separate repository), and the new response header
+    changes it. Nothing is broken meanwhile — the UI never calls the
+    predict endpoint — but it should be regenerated on the UI side
+    before release.
+
 ## 8b. Noted for after the run: throughput as a calibration target
 
 The user's framing of the feature: find the optimal batch size, adjust it

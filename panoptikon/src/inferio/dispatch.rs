@@ -187,6 +187,11 @@ pub(crate) struct ModelStats {
     /// Inputs in the most recently dispatched window. 0 = none dispatched
     /// yet. This is what a user cap bounds on the unpriced path.
     pub last_window_items: AtomicU32,
+    /// Items the orchestrator would like its callers to keep inside in-flight
+    /// predict requests for this model ([`desired_in_flight_items`]). 0 = not
+    /// computed yet (nothing dispatched), which the HTTP layer reports as an
+    /// absent field. Stored on every window formation.
+    pub desired_in_flight_items: AtomicU64,
     /// Predict requests ever queued on this dispatcher.
     pub total_predict_requests: AtomicU64,
     /// Windows ever dispatched to a replica. Counts merged dispatches, not
@@ -439,6 +444,109 @@ fn priced_item_bound(cap: Option<u32>) -> usize {
     }
 }
 
+// ----------------------------------------------------------------------
+// The desired in-flight figure (test protocol §8 G7)
+// ----------------------------------------------------------------------
+
+/// Slack on [`desired_in_flight_items`].
+///
+/// The figure exists so a caller keeps enough work inside in-flight requests
+/// for the dispatcher to *fill* a window; with exactly one window's worth in
+/// flight the queue is empty the instant a window is formed, so consecutive
+/// windows can never merge and the window target can never be reached. Two
+/// windows' worth is the smallest value that lets the next window be formed
+/// out of requests that were already queued while the current one runs.
+pub(crate) const IN_FLIGHT_SLACK: u64 = 2;
+
+/// Estimated units one item costs before any window of this model has been
+/// formed — the seed the ratio in [`desired_in_flight_items`] falls back to.
+///
+/// It mirrors [`request_units`] exactly: a `count`-aggregated model prices a
+/// window by its item count whatever its unit is, so its ratio is 1 by
+/// construction, and only the summing aggregations need the per-item unit
+/// estimate. The per-unit figures are the dispatcher's own fallbacks
+/// ([`PIXEL_FALLBACK_UNITS`], [`AUDIO_FALLBACK_SECONDS`],
+/// [`TOKEN_SEED_UNITS`]); the first dispatched window replaces all of this
+/// with a measured ratio.
+fn seed_units_per_item(cost: &CostDimension) -> u64 {
+    match cost.aggregation {
+        Some(CostAggregation::Count) | None => 1,
+        Some(CostAggregation::Sum) | Some(CostAggregation::MaxTimesCount) => match cost.unit {
+            CostUnit::None | CostUnit::Item => 1,
+            CostUnit::Pixel => PIXEL_FALLBACK_UNITS,
+            CostUnit::Token => TOKEN_SEED_UNITS,
+            CostUnit::AudioSecond => AUDIO_FALLBACK_SECONDS,
+        },
+    }
+}
+
+/// Pre-fit per-item token estimate: ~2 KiB of text at [`BYTES_PER_TOKEN`].
+/// Only ever used for the very first window of a `token`-priced, summing
+/// model, and only to convert a unit target into an item count — never to
+/// price anything.
+const TOKEN_SEED_UNITS: u64 = 512;
+
+/// The shape of one dispatched window, kept so the next one can convert the
+/// ledger's unit target into an item count with a *measured* ratio instead of
+/// a seed. All three fields are the dispatcher's own estimates, which is all
+/// this needs: it sizes a caller's pipelining, never a grant.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct WindowShape {
+    pub items: u64,
+    pub units: u64,
+    pub bytes: u64,
+}
+
+/// How many **items** the orchestrator would like the caller to keep inside
+/// in-flight predict requests for this model.
+///
+/// Core sizes its requests "by keeping the server fed" and must not learn
+/// about VRAM (`docs/batch-calibration-design.md`, "Batch size UX", split
+/// #2), so the one number that crosses the boundary is an item count — items
+/// and PDF pages are the only unit core counts. Everything VRAM-shaped (the
+/// ramp, the anchor, the knee, the board's headroom) stays on this side and
+/// reaches core only through this projection of the window target.
+///
+/// - `target_units` is the dispatcher's current window target
+///   ([`Admission::window_target_units`]), i.e. [`WINDOW_DEPTH_MULTIPLIER`]
+///   admitted GPU batches' worth of units.
+/// - `last` is the most recently formed window. Its `items / units` is the
+///   recent items-per-unit ratio; a window that priced nothing (or the very
+///   first one) falls back to `seed_units_per_item`.
+/// - The result is multiplied by [`IN_FLIGHT_SLACK`] so consecutive windows
+///   can merge, then bounded by the byte wall the dispatcher already applies
+///   ([`MAX_WINDOW_BYTES`]) converted through the same window's bytes-per-item.
+///   The byte bound is applied *without* the slack on purpose: past it no
+///   amount of extra in-flight work can make a window any bigger, because a
+///   window that hits the byte wall cannot merge another request anyway.
+///
+/// Always at least 1. The caller (core) applies its own floor and ceiling —
+/// this side deliberately knows nothing about core's memory budgets.
+pub(crate) fn desired_in_flight_items(
+    target_units: u64,
+    last: WindowShape,
+    seed_units_per_item: u64,
+) -> u64 {
+    let (items, units) = if last.items > 0 && last.units > 0 {
+        (u128::from(last.items), u128::from(last.units))
+    } else {
+        (1u128, u128::from(seed_units_per_item.max(1)))
+    };
+    let want = u128::from(target_units)
+        .saturating_mul(items)
+        .saturating_mul(u128::from(IN_FLIGHT_SLACK))
+        / units;
+    let want = u64::try_from(want.max(1)).unwrap_or(u64::MAX);
+    let byte_bound = if last.items > 0 && last.bytes > 0 {
+        let fits =
+            u128::from(MAX_WINDOW_BYTES as u64).saturating_mul(items) / u128::from(last.bytes);
+        u64::try_from(fits.max(1)).unwrap_or(u64::MAX)
+    } else {
+        u64::MAX
+    };
+    want.min(byte_bound).max(1)
+}
+
 /// Why the dispatcher loop ended.
 enum End {
     /// Channel closed or an explicit [`DispatchMsg::Shutdown`]: unload the
@@ -487,6 +595,11 @@ pub(crate) async fn run_dispatcher(
     let mut queue: VecDeque<Queued> = VecDeque::new();
     let mut free: Vec<Replica> = replicas;
     let mut in_flight: JoinSet<(Replica, BatchOutcome)> = JoinSet::new();
+    // Shape of the most recently formed window, for the units->items
+    // conversion behind `desired_in_flight_items`. Owned by this loop, which
+    // is the only place windows are formed.
+    let mut last_shape = WindowShape::default();
+    let seed_ratio = seed_units_per_item(&ctx.cost);
 
     let end = 'main: loop {
         // Dispatch: while any replica is free and requests are queued, that
@@ -519,6 +632,34 @@ pub(crate) async fn run_dispatcher(
                 .iter()
                 .map(|queued| queued.shape.items)
                 .fold(0usize, usize::saturating_add);
+            let window_bytes: usize = window
+                .iter()
+                .map(|queued| queued.shape.bytes)
+                .fold(0usize, usize::saturating_add);
+            // The window just formed is the freshest sample of this model's
+            // items-per-unit and bytes-per-item, so it — not the one before
+            // it — converts the target below. A window that priced nothing
+            // (every request estimated at zero units) says nothing about the
+            // ratio and leaves the last usable sample standing.
+            let shape = WindowShape {
+                items: window_items as u64,
+                units: window_units,
+                bytes: window_bytes as u64,
+            };
+            if shape.items > 0 && shape.units > 0 {
+                last_shape = shape;
+            }
+            let desired = match &replica.admission {
+                // Priced: project the ledger's unit target into items.
+                Some(_) => desired_in_flight_items(bounds.units, last_shape, seed_ratio),
+                // Unpriced: there is no unit target and no worker-side
+                // packer, so the frame the worker gets *is* the GPU batch and
+                // its size is the fixed `unpriced_window_items`. The same
+                // slack applies, and the user's own cap is deliberately not
+                // folded in: a cap bounds GPU batches, never how much work
+                // the caller keeps in flight.
+                None => u64::from(ctx.unpriced_window_items.max(1)).saturating_mul(IN_FLIGHT_SLACK),
+            };
             // The grant is taken *before* the window is handed off, so two
             // replicas can never be promised the same headroom.
             let plan = match &replica.admission {
@@ -565,6 +706,7 @@ pub(crate) async fn run_dispatcher(
             ctx.stats
                 .last_window_items
                 .store(u32::try_from(window_items).unwrap_or(u32::MAX), Relaxed);
+            ctx.stats.desired_in_flight_items.store(desired, Relaxed);
             ctx.stats.total_batches.fetch_add(1, Relaxed);
             ctx.stats.in_flight_windows.fetch_add(1, Relaxed);
             let inference_id = ctx.inference_id.clone();
@@ -1212,6 +1354,122 @@ mod tests {
             items,
             bytes,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The desired in-flight figure (test protocol §8 G7)
+    // ------------------------------------------------------------------
+
+    fn cost(unit: CostUnit, aggregation: Option<CostAggregation>) -> CostDimension {
+        CostDimension {
+            unit,
+            aggregation,
+            epoch: 1,
+            seed_units: Some(8),
+            degraded: false,
+        }
+    }
+
+    /// Before any window has been dispatched there is no measured ratio, so
+    /// the target is converted through the unit class's own seed estimate.
+    #[test]
+    fn the_desired_figure_uses_the_seed_ratio_before_the_first_window() {
+        // item/count: one unit per item, so the figure is the target itself
+        // times the merge slack.
+        assert_eq!(
+            desired_in_flight_items(192, WindowShape::default(), 1),
+            384,
+            "192 units of target, 1 unit per item, x2 slack"
+        );
+        // pixel/sum: the seed says ~2 MP per item, so a 6 MP target is three
+        // items' worth, six with the slack.
+        assert_eq!(
+            desired_in_flight_items(
+                3 * PIXEL_FALLBACK_UNITS,
+                WindowShape::default(),
+                PIXEL_FALLBACK_UNITS
+            ),
+            6
+        );
+        // The seed is the cost dimension's, not a constant.
+        assert_eq!(seed_units_per_item(&cost(CostUnit::Item, None)), 1);
+        assert_eq!(
+            seed_units_per_item(&cost(CostUnit::Pixel, Some(CostAggregation::Count))),
+            1,
+            "a count-aggregated model prices a window by items whatever its \
+             unit is, so its ratio is 1 by construction"
+        );
+        assert_eq!(
+            seed_units_per_item(&cost(CostUnit::Pixel, Some(CostAggregation::Sum))),
+            PIXEL_FALLBACK_UNITS
+        );
+        assert_eq!(
+            seed_units_per_item(&cost(
+                CostUnit::AudioSecond,
+                Some(CostAggregation::MaxTimesCount)
+            )),
+            AUDIO_FALLBACK_SECONDS
+        );
+    }
+
+    /// Once a window has been formed its own items/units is the ratio, which
+    /// is the whole point: a pixel model whose images are half the seed size
+    /// gets twice as many items asked for.
+    #[test]
+    fn the_desired_figure_follows_the_measured_ratio_after_a_window() {
+        let last = WindowShape {
+            items: 10,
+            units: 20_000_000,
+            bytes: 0,
+        };
+        // 2 MP per item measured; a 100 MP target is 50 items, 100 with slack.
+        assert_eq!(desired_in_flight_items(100_000_000, last, 1), 100);
+        // Half-size images -> twice the items for the same target.
+        let smaller = WindowShape {
+            items: 20,
+            units: 20_000_000,
+            bytes: 0,
+        };
+        assert_eq!(desired_in_flight_items(100_000_000, smaller, 1), 200);
+        // The measured ratio wins over the seed, even a wildly wrong one.
+        assert_eq!(
+            desired_in_flight_items(100_000_000, last, PIXEL_FALLBACK_UNITS * 1000),
+            100
+        );
+        // Never zero, however small the target.
+        assert_eq!(desired_in_flight_items(1, last, 1), 1);
+    }
+
+    /// The byte wall the dispatcher already applies bounds the figure: past
+    /// the point where one window's payload fills [`MAX_WINDOW_BYTES`], extra
+    /// in-flight work cannot make a window any bigger, because a window at
+    /// the wall cannot merge another request.
+    #[test]
+    fn the_desired_figure_is_bounded_by_the_window_byte_wall() {
+        // 4 items filled the whole byte allowance, so 4 items is the bound
+        // whatever the unit target says.
+        let fat = WindowShape {
+            items: 4,
+            units: 4,
+            bytes: MAX_WINDOW_BYTES as u64,
+        };
+        assert_eq!(desired_in_flight_items(1_000, fat, 1), 4);
+        // Half-full: 8 items fit, and the unit target (2 x 2 = 4) is the
+        // binding constraint instead.
+        let lean = WindowShape {
+            items: 4,
+            units: 4,
+            bytes: MAX_WINDOW_BYTES as u64 / 2,
+        };
+        assert_eq!(desired_in_flight_items(2, lean, 1), 4);
+        assert_eq!(desired_in_flight_items(1_000, lean, 1), 8);
+        // A window whose bytes were not estimated imposes no byte bound.
+        let unmeasured = WindowShape {
+            items: 4,
+            units: 4,
+            bytes: 0,
+        };
+        assert_eq!(desired_in_flight_items(1_000, unmeasured, 1), 2_000);
     }
 
     /// Window formation takes a FIFO prefix while the unit bound holds:
@@ -1875,6 +2133,15 @@ mod tests {
              emphatically not the cap of 1: the cap bounds items, never units"
         );
         assert_eq!(stats.last_window_items.load(Relaxed), 4);
+        // And the figure core reads off the response: the ledger's window
+        // target (seed 8 x WINDOW_DEPTH_MULTIPLIER) through this window's
+        // measured 1 unit per item, times the merge slack. It is emphatically
+        // not bounded by the cap of 1 — the cap bounds GPU batches, never how
+        // much work the caller keeps in flight.
+        assert_eq!(
+            stats.desired_in_flight_items.load(Relaxed),
+            8 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK
+        );
 
         tx.send(DispatchMsg::Shutdown).expect("shutdown");
         dispatcher.await.expect("dispatcher exits");

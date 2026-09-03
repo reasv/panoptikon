@@ -242,6 +242,71 @@ failure), where surviving binary outputs keep their
 `{"__error__": {...}}` object above. Batches without error slots keep the
 byte-identical legacy encoding.
 
+### Desired in-flight items (HTTP predict response header)
+
+`POST /api/inference/predict/{group}/{id}` answers with an additive, optional
+response header:
+
+```
+x-panoptikon-desired-in-flight-items: <positive integer>
+```
+
+It is the number of **items** the orchestrator would like the caller to keep
+inside its in-flight predict requests for that model — items and PDF pages,
+never pixels, tokens or seconds. It exists because the two sides own
+different halves of batch sizing (`docs/batch-calibration-design.md`, "Batch
+size UX", split #2): the orchestrator owns the VRAM picture (the ramp, the
+anchor, the knee, the board's headroom) and the caller sizes its requests "by
+keeping the server fed" without ever learning about VRAM. This header is the
+whole of what crosses that boundary.
+
+It is a header, not a body field, because a predict answers in three
+encodings — `application/octet-stream`, `multipart/mixed` and the JSON
+`{"outputs": [...]}` envelope — and only one of them has anywhere to put a
+scalar. Every existing client ignores it, and the header is a *response*
+header, so the gateway's inbound `x-panoptikon-*` strip does not apply.
+
+How the orchestrator derives it, per model (`inferio/dispatch.rs`,
+`desired_in_flight_items`):
+
+- **Priced models** (a known board and a cost dimension that scales): the
+  dispatcher's current window target in units — the ledger's admitted unit
+  budget times `WINDOW_DEPTH_MULTIPLIER` — converted into items through the
+  most recently formed window's items-per-unit ratio, or, before any window
+  has been formed, through the unit class's seed estimate (1 for
+  `item`-priced and for every `count`-aggregated model, ~2 MP for `pixel`,
+  ~512 tokens for `token`, 30 s for `audio-second`). Multiplied by a slack of
+  2 so that consecutive windows can merge, then bounded by the same
+  payload-byte wall the dispatcher applies to a window (`MAX_WINDOW_BYTES`)
+  converted through that window's bytes-per-item — past the byte wall a window
+  cannot merge another request anyway, so more work in flight buys nothing.
+- **Unpriced paths** — `none`-class (grantless) models, a host with no GPU
+  inventory, a board outside the enumeration — have no unit target and no
+  worker-side packer, so the frame the worker receives *is* the GPU batch and
+  its size is the fixed `default_batch_size`/`default_max_batch`. The figure
+  is that fixed size times the same slack of 2. The user's `max_batch` cap is
+  deliberately not folded in: a cap bounds the GPU batches the server forms,
+  never how much work the caller keeps in flight.
+
+The header is **absent** when the orchestrator has no opinion: a Python-era
+inference server, a model that has not dispatched a window yet, or a model
+unloaded between the predict and the response encoding. Absent means **no
+change from the last figure the caller was given** — never an error, and
+never a figure of zero. A caller's *initial* value is its own floor, so a
+server that never sends the header leaves the caller at that floor for the
+whole run, which is the pre-feature behaviour; a server that sends the header
+and then misses one response does not lose the figure it already published.
+A caller must never require the header.
+
+What the caller does with it is the caller's business. The gateway's own
+extraction jobs (`jobs/extraction.rs`) resize a per-job unit semaphore toward
+the figure on every response, clamped between a floor of one request's worth
+(64 units, which is also the value the semaphore starts at) and a ceiling
+derived from the job's intermediate byte budget and loader slots (4096 units
+at the shipped defaults). Growth adds permits; a shrink is applied only to
+permits that are free, and the remainder is withheld as outstanding permits
+come back, so a resize never interrupts work already in flight.
+
 ### Memory sensing (optional response fields)
 
 Added for batch calibration (`docs/batch-calibration-design.md`): the worker

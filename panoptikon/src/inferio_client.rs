@@ -76,13 +76,27 @@ pub(crate) struct PredictSlotError {
 pub(crate) struct PredictResponse {
     pub outputs: PredictOutput,
     pub errors: Vec<PredictSlotError>,
+    /// The orchestrator's desired in-flight figure for this model, in items
+    /// ([`DESIRED_IN_FLIGHT_HEADER`]). `None` when the server did not say —
+    /// a Python-era inference server, a model that has not dispatched a
+    /// window yet, or a value that is unparsable or zero (the orchestrator
+    /// never publishes zero, and reading one as a figure would ask a caller
+    /// to keep no work in flight at all). Callers treat `None` as "no
+    /// opinion" and keep their own floor.
+    pub desired_in_flight_items: Option<u64>,
 }
+
+/// Response header the local orchestrator publishes the figure on
+/// (`inferio::http::DESIRED_IN_FLIGHT_HEADER`; documented in
+/// `docs/inferio-worker-protocol.md`).
+pub(crate) const DESIRED_IN_FLIGHT_HEADER: &str = "x-panoptikon-desired-in-flight-items";
 
 impl PredictResponse {
     fn plain(outputs: PredictOutput) -> Self {
         Self {
             outputs,
             errors: Vec::new(),
+            desired_in_flight_items: None,
         }
     }
 }
@@ -190,8 +204,19 @@ impl InferenceApiClient {
                             .and_then(|value| value.to_str().ok())
                             .unwrap_or("")
                             .to_string();
+                        // Additive, optional: absent (or unparsable) leaves
+                        // the caller on its own floor. Read before the body
+                        // is consumed, which drops the response.
+                        let desired = response
+                            .headers()
+                            .get(DESIRED_IN_FLIGHT_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.trim().parse::<u64>().ok())
+                            .filter(|value| *value > 0);
                         let body = response.bytes().await?.to_vec();
-                        return parse_predict_response(&content_type, &body);
+                        let mut parsed = parse_predict_response(&content_type, &body)?;
+                        parsed.desired_in_flight_items = desired;
+                        return Ok(parsed);
                     }
 
                     let status = response.status();
@@ -487,6 +512,7 @@ fn parse_json_outputs(outputs: &[Value]) -> Result<PredictResponse> {
         return Ok(PredictResponse {
             outputs: PredictOutput::Json(survivors.into_iter().cloned().collect()),
             errors,
+            desired_in_flight_items: None,
         });
     }
     if wrapped != survivors.len() {
@@ -503,6 +529,7 @@ fn parse_json_outputs(outputs: &[Value]) -> Result<PredictResponse> {
     Ok(PredictResponse {
         outputs: PredictOutput::Binary(decoded),
         errors,
+        desired_in_flight_items: None,
     })
 }
 
