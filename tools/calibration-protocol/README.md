@@ -240,7 +240,7 @@ python/.venv/bin/python tools/calibration-protocol/oracle_calibrate.py \
 
 ```
 analyze.py --scenario results/<run>/<scenario>
-           [--checks all|a,b,c] [--list-checks]
+           [--checks all|a,b,c] [--list-checks] [--learning]
            [--expect-ooms N] [--expect-deaths N] [--expect-failures N]
            [--expect-failed-jobs N]
            [--baseline-jobs FILE | --baseline-items-per-s F]
@@ -256,19 +256,32 @@ Checks (`--list-checks`): `oracle_agreement`, `base_accuracy`,
 `footprint_agreement`, `slope_accuracy`, `grant_safety`, `failures`,
 `deflation_recovery`, `idle_liveness`, `utilization`, `throughput`,
 `persistence`, `job_outcome`, `ledger_invariant`, `peak_fds`,
-`hog_tracking`, `ramp_progress`. A scenario declares which ones apply by
-passing `--checks`.
+`hog_tracking`, `ramp_progress`, `calibration_learned`. A scenario declares
+which ones apply by passing `--checks`.
 Verdicts are `PASS` / `FAIL` / `WARN` / `INFO` (report-only) / `SKIP` (inputs
 absent); the exit code is 1 if anything FAILed. Every row prints the numbers
 behind it so a near-miss can be adjudicated by a human.
+
+**The check that decides safety is `grant_safety`, and within it the oracle
+clause**, which joins every `issued a memory grant` line to `vramrec.jsonl` and
+compares the grant with the board's *live free memory* at that instant. That
+clause needs `vramrec.jsonl`, and without it `grant_safety` reports **WARN**,
+never PASS, so a silently skipped safety clause is visible in the table. Its
+other clause — grant ≤ the headroom it was priced against — only re-checks the
+ledger's arithmetic against itself, and `ledger_invariant`'s strict form is not
+a substitute either: run1's S15 mutation 2 hard-zeroed `external`, so
+`limit_mb` became `total_mb` and `ledger_invariant` passed on **0 of 498**
+board-samples while the oracle clause caught **335 of 335** grants. Record
+`vramrec.jsonl` on every leg.
 
 `analyze.py` reconstructs the ledger's behaviour primarily from the structured
 log lines added in commit `49822c8b` — it needs
 `RUST_LOG=info,panoptikon::inferio=trace,panoptikon::db::batch_auto=debug` and
 `INFERIO_WORKER_LOG_LEVEL=DEBUG` in the gateway's environment.
 
-Three things about the verdicts are worth knowing before reading a table
-(all three come from run1):
+Six things about the verdicts are worth knowing before reading a table
+(all six come from run1; the last three close the holes the S15 mutation
+self-test exposed):
 
 - **`--expect-failures` counts failed *items*, `--expect-failed-jobs` counts
   whole jobs whose outcome is not `completed`.** A scenario like S4g, whose
@@ -288,6 +301,39 @@ Three things about the verdicts are worth knowing before reading a table
 - **`utilization` wants the bisect probe as well as the sweep**
   (`--probe probe-<m>.json --probe bisect-<m>.json`): the check prefers
   `bisect.largest_ok_units` and only falls back to the sweep's largest batch.
+- **`SKIP` never means "the run produced no measurement".** It means *this
+  harness did not record the input*, and it never sets the exit code. A fault
+  that destroys the measurement usually destroys the evidence with it, which is
+  how run1's S15 mutation 1 (the worker halving its reported
+  `peak_reserved_mb`) came back with `slope_accuracy SKIP` and
+  `persistence SKIP` and was caught by a single row that only existed because
+  that leg happened to have been run with `--probe`. So `slope_accuracy`,
+  `utilization` and `persistence` now split the two: "the store was never
+  written" / "no worker was ever admitted" is **WARN** (**FAIL** under
+  `--learning`), while "you gave me no probe file / no log" is **SKIP** with a
+  pointer to what to pass.
+- **A learning leg must declare itself, with `--learning`** (or, equivalently,
+  by naming `calibration_learned` in `--checks`; `--checks all` declares
+  nothing). Under that declaration `calibration_learned` FAILs on any of:
+  `fit samples == 0`, no `[[profile]]` in `calibration.after.toml`, or a peak
+  `unit_budget` that never rose above the first value recorded. The three
+  numbers are exactly the ones `ramp_progress` prints as INFO — the check only
+  promotes them to a verdict, which is what closes the whole class of "the
+  instrument stopped reporting" faults. Undeclared, the row is report-only.
+  Pass `--learning` on every S2/S3 cold-ramp leg.
+- **`hog_tracking` is INFO with one FAIL form.** `external` is a
+  window-boundary quantity with a real staleness (B2/T3), so a board that
+  updates *late* is behaving as designed and stays INFO. The one shape that is
+  not staleness: the hog held **≥ 1 GiB for more than 60 s** and `external_mb`
+  **never moved by a single MiB** across the whole recording — that is no
+  update at all, and it FAILs. 60 s is the practical threshold, well above the
+  ledger's 10 s staleness window plus one admission window (run1's worst
+  `external_sample_age_ms` was 166.9 s overall, but every such board still
+  *moved*). Calibrated against run1: the only FAIL among the 14 legs with a
+  hog is S15 mutation 2 (`external_locked` patched to return 0: `0..0 MiB`
+  against a hog holding 30 720 MiB for 77 s); the nearest miss is
+  `S11-C4-fixed`, a genuinely quiet board that held 30 s with a flat
+  `external_mb 775..775` and correctly stays INFO.
 
 ### Recording file descriptors
 
@@ -358,7 +404,8 @@ cp data/inferio/calibration.toml "$DIR/calibration.after.toml"
 cp data/panoptikon.log "$DIR/panoptikon.log"
 curl -s "http://127.0.0.1:6342/api/jobs/data/history?index_db=cal&page=1&page_size=50" \
     > "$DIR/jobs.json"
-$V $T/analyze.py --scenario "$DIR" --probe "$DIR/probe-wd.json" \
+# --learning: S2 is a cold ramp, so a leg that learns nothing must FAIL, not SKIP
+$V $T/analyze.py --scenario "$DIR" --probe "$DIR/probe-wd.json" --learning \
     --json "$DIR/verdicts.json" --plot "$DIR/timeline.png"
 ```
 

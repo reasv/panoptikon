@@ -32,6 +32,15 @@ Options:
     --checks LIST         comma-separated check names, or `all` (default: all
                           checks whose inputs are present). A scenario declares
                           which verdicts apply by passing this list.
+    --learning            this leg is a learning / cold-ramp scenario: it is
+                          *meant* to end with a fitted profile on disk. Naming
+                          `calibration_learned` in `--checks` declares the same
+                          thing. Under that declaration `calibration_learned`
+                          FAILs (rather than reporting) when nothing was
+                          learned, and the "no store was written" branch of
+                          `slope_accuracy`, `utilization` and `persistence`
+                          FAILs rather than WARNs. See "Declaring a learning
+                          leg" below.
     --expect-ooms N       the scenario deliberately provokes N OOMs   (default 0)
     --expect-deaths N     ... and N worker deaths                     (default 0)
     --expect-failures N   ... and N failed items                      (default 0)
@@ -67,6 +76,35 @@ Verdicts
 
 Every row prints the numbers behind the verdict, so a threshold that is missed
 by a small margin can be adjudicated by a human rather than by this script.
+
+SKIP is never a result
+----------------------
+`SKIP` means *the harness did not record the input*. It must never be the
+answer to "the run produced no measurement", because a fault that destroys the
+measurement usually destroys the evidence with it, and a SKIP never sets the
+exit code. Run1's S15 mutation 1 (the worker halving its reported
+`peak_reserved_mb`) learned nothing at all, wrote no store, and reported
+`slope_accuracy SKIP` + `persistence SKIP` -- all green but for one row that
+only existed because that leg happened to be run with `--probe`. So:
+
+* "the store was never written" is a **result**: WARN, or FAIL under
+  `--learning`.
+* "no probe file / no log / no recording was given to me" is a **harness
+  omission**: SKIP, with a pointer to what to pass.
+* `calibration_learned` turns the three numbers `ramp_progress` already prints
+  into a verdict, so a leg that stopped measuring cannot come back green.
+
+The check that decides safety
+-----------------------------
+It is `grant_safety`, and specifically its **second clause**: every
+`issued a memory grant` line is joined to the vramrec oracle and the grant is
+compared with the board's *live free memory* at that instant. That clause needs
+`vramrec.jsonl`; without it `grant_safety` reports **WARN**, never PASS, so the
+silently-skipped clause is visible in the table. `ledger_invariant`'s strict
+form is not a substitute: it passes on a completely broken ledger (run1 S15
+mutation 2 zeroed `external`, making `limit_mb == total_mb`, and 0 of 498
+board-samples were over the limit while 335 of 335 grants exceeded the oracle's
+live free memory).
 """
 
 from __future__ import annotations
@@ -371,6 +409,69 @@ def _pct(value: float, of: float) -> float:
     return 100.0 * value / of if of else float("inf")
 
 
+# The hog is judged to have been held "long enough for the ledger to have no
+# excuse" after this many seconds. `ledger.rs` refreshes `external` at grant
+# time with a 10 s staleness window and nothing polls, so the honest bound is
+# the staleness window plus one admission window; a window can be tens of
+# seconds under load (run1 measured `external_sample_age_ms` of 85.5 s with a
+# resident and 166.9 s overall, finding B2/T3). 60 s is the practical
+# threshold: it is far above any staleness window seen in run1 and far below
+# the length of any hog hold a scenario sets up, so a *late* update still
+# reports INFO and only a board that never moved at all FAILs.
+HOG_STALL_SECONDS = 60.0
+
+# A hold this large is unambiguous pressure: no allocator jitter reaches it.
+HOG_STALL_MB = 1024
+
+
+def _declared_learning(ctx: "Context") -> bool:
+    """Did this leg declare itself a learning / cold-ramp scenario?
+
+    Two equivalent declarations, so a scenario need not repeat itself: the
+    explicit `--learning` flag, or naming `calibration_learned` in `--checks`
+    (`--checks all` does not count -- it is the default and declares nothing).
+    """
+    if getattr(ctx.args, "learning", False):
+        return True
+    return "calibration_learned" in getattr(ctx.args, "explicit_checks", set())
+
+
+def _no_store_verdict(ctx: "Context") -> str:
+    """"Nothing was written to the calibration store" is a result, not a SKIP."""
+    return "FAIL" if _declared_learning(ctx) else "WARN"
+
+
+NO_STORE_HINT = ("this is a *result*, not a missing input: WARN, or FAIL when "
+                 "the leg declares itself a learning scenario (--learning / "
+                 "--checks calibration_learned)")
+
+
+def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]], Dict[str, int]]:
+    """Per-model `unit_budget` over time and the best `fit_samples` seen.
+
+    The single source for `ramp_progress` and `calibration_learned`, so the
+    verdict and the report-only row can never disagree about the numbers.
+    """
+    series: Dict[str, List[int]] = {}
+    fits: Dict[str, int] = {}
+    for sample in ctx.health_samples:
+        for worker in (sample.get("health") or {}).get("workers") or []:
+            key = worker["inference_id"]
+            series.setdefault(key, []).append(int(worker.get("unit_budget") or 0))
+            if worker.get("fit_samples"):
+                fits[key] = max(fits.get(key, 0), int(worker["fit_samples"]))
+    return series, fits
+
+
+def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
+    series, fits = _budget_series(ctx)
+    return {
+        model: {"first": values[0], "peak": max(values), "last": values[-1],
+                "fit_samples": fits.get(model, 0)}
+        for model, values in series.items()
+    }
+
+
 # --------------------------------------------------------------------------
 # Checks
 # --------------------------------------------------------------------------
@@ -572,12 +673,31 @@ def check_footprint_agreement(ctx: Context) -> Verdict:
 
 
 def check_slope_accuracy(ctx: Context) -> Verdict:
-    """Persisted slope vs ceiling_probe's: -30% .. +100%."""
+    """Persisted slope vs ceiling_probe's: -30% .. +100%.
+
+    The two ways this check cannot run are *not* the same thing and no longer
+    share a verdict (run1 S15 hole H2). "No store was written" is what the run
+    did; "no probe file was passed" is what the harness forgot.
+    """
     profiles = (ctx.after or {}).get("profile") or []
     if not profiles:
-        return Verdict("slope_accuracy", "SKIP", "no calibration.after.toml profiles")
+        return Verdict(
+            "slope_accuracy", _no_store_verdict(ctx),
+            ("no calibration.after.toml in the scenario directory"
+             if ctx.after is None else
+             "calibration.after.toml carries no [[profile]]")
+            + " -- there is no learned slope to compare, because nothing was "
+              "written to the store; " + NO_STORE_HINT,
+            {"profiles": 0, "after_present": ctx.after is not None,
+             "learning": _declared_learning(ctx)})
     if not ctx.probes:
-        return Verdict("slope_accuracy", "SKIP", "no ceiling_probe result (--probe)")
+        return Verdict("slope_accuracy", "SKIP",
+                       "no ceiling_probe result: pass --probe "
+                       "probe-<model>.json (and bisect-<model>.json), or drop "
+                       "probe*.json into the scenario directory. The store "
+                       f"itself holds {len(profiles)} profile(s), so this is a "
+                       "missing input, not a missing measurement",
+                       {"profiles": len(profiles)})
     rows = []
     verdict = "PASS"
     for probe in ctx.probes:
@@ -615,7 +735,20 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
 
 
 def check_grant_safety(ctx: Context) -> Verdict:
-    """Grants must fit the headroom they were priced against and live free memory."""
+    """THE safety check: grants vs their priced headroom AND the oracle's free memory.
+
+    The second clause is the one with teeth, and it is the only one: it joins
+    each grant to `vramrec.jsonl` and asks whether the grant exceeded the
+    board's *live free memory*. `ledger_invariant`'s strict form cannot stand
+    in for it -- run1's S15 mutation 2 zeroed `external`, so `limit_mb` became
+    `total_mb`, `ledger_invariant` passed on 0 of 498 breaches, and this clause
+    caught 335 of 335 grants over the oracle's free memory.
+
+    Without `vramrec.jsonl` that clause silently does not run, so the check
+    reports **WARN** rather than PASS: a scenario must never read as "safety
+    verified" on the priced-headroom clause alone, which only re-checks the
+    ledger's own arithmetic against itself.
+    """
     grants = ctx.log_events("issued a memory grant")
     if not grants:
         return Verdict("grant_safety", "SKIP",
@@ -642,15 +775,33 @@ def check_grant_safety(ctx: Context) -> Verdict:
                                       "gpu": fields.get("gpu"),
                                       "model": fields.get("model")})
     zero_mb = sum(1 for event in grants if event["fields"].get("mb") == 0)
-    verdict = "PASS" if not over_headroom and not over_free else "FAIL"
+    if over_headroom or over_free:
+        verdict = "FAIL"
+    elif joined == 0:
+        # The oracle clause never ran. This is the clause that decides safety,
+        # so the row must not read PASS (run1 S15 hole H4).
+        verdict = "WARN"
+    else:
+        verdict = "PASS"
+    detail = (f"{len(grants)} grants; {len(over_headroom)} exceeded the headroom "
+              f"they were priced against; {len(over_free)} exceeded the oracle's "
+              f"live free memory ({joined} joined); {zero_mb} were memory-blind "
+              f"(mb=0, B1)")
+    if verdict == "WARN":
+        detail += ("  -- ORACLE CLAUSE NOT RUN: "
+                   + ("no vramrec.jsonl in the scenario (record it with "
+                      "vramrec.py; it is what makes this the check that decides "
+                      "safety)"
+                      if not ctx.vram_samples else
+                      f"no grant joined a vramrec sample within "
+                      f"{ctx.args.join_tolerance}s")
+                   + ". Only the ledger's own arithmetic was verified")
     return Verdict(
-        "grant_safety", verdict,
-        f"{len(grants)} grants; {len(over_headroom)} exceeded the headroom they "
-        f"were priced against; {len(over_free)} exceeded the oracle's live free "
-        f"memory ({joined} joined); {zero_mb} were memory-blind (mb=0, B1)",
+        "grant_safety", verdict, detail,
         {"grants": len(grants), "over_headroom": over_headroom[:10],
          "over_free": over_free[:10], "zero_mb_grants": zero_mb,
-         "joined": joined},
+         "joined": joined, "vramrec_samples": len(ctx.vram_samples),
+         "oracle_clause_ran": joined > 0},
     )
 
 
@@ -758,16 +909,28 @@ def check_idle_liveness(ctx: Context) -> Verdict:
 
 
 def check_utilization(ctx: Context) -> Verdict:
-    """Admitted units vs the probe's OOM boundary (or knee)."""
+    """Admitted units vs the probe's OOM boundary (or knee).
+
+    Same H2 split as `slope_accuracy`: "no worker was ever admitted" is a
+    result, "no probe boundary was passed" is a harness omission.
+    """
     if not ctx.health_samples:
-        return Verdict("utilization", "SKIP", "no healthrec.jsonl")
+        return Verdict("utilization", "SKIP",
+                       "no healthrec.jsonl in the scenario -- record the "
+                       "gateway's own view with healthrec.py")
     peak: Dict[str, int] = {}
     for sample in ctx.health_samples:
         for worker in (sample.get("health") or {}).get("workers") or []:
             key = worker["inference_id"]
             peak[key] = max(peak.get(key, 0), int(worker.get("unit_budget") or 0))
     if not peak:
-        return Verdict("utilization", "SKIP", "no workers in any health sample")
+        return Verdict("utilization", _no_store_verdict(ctx),
+                       f"no worker appears in any of the "
+                       f"{len(ctx.health_samples)} health samples: nothing was "
+                       f"ever admitted, so there is no utilization to measure; "
+                       + NO_STORE_HINT,
+                       {"health_samples": len(ctx.health_samples),
+                        "learning": _declared_learning(ctx)})
     boundaries: Dict[str, Optional[int]] = {}
     for probe in ctx.probes:
         bisect_info = probe.get("bisect") or {}
@@ -796,6 +959,15 @@ def check_utilization(ctx: Context) -> Verdict:
            if row.get("boundary_units") else " (no probe boundary)")
         for row in rows
     )
+    if not any(row.get("boundary_units") for row in rows):
+        # Nothing to divide by: a missing input, so SKIP with the pointer --
+        # never a green row that looks like a measurement.
+        return Verdict("utilization", "SKIP",
+                       detail + "  -- no probe boundary for any model: pass "
+                       "--probe bisect-<model>.json (preferred: the check uses "
+                       "`bisect.largest_ok_units`) and/or "
+                       "--probe probe-<model>.json",
+                       {"models": rows})
     return Verdict("utilization", verdict,
                    detail + f"  [floor {threshold:.2f}]", {"models": rows})
 
@@ -857,19 +1029,34 @@ def _items_per_s(records: List[Dict[str, Any]]) -> float:
 
 
 def check_persistence(ctx: Context) -> Verdict:
-    """The store must be written within 30 s of an anchor advance."""
+    """The store must be written within 30 s of an anchor advance.
+
+    Same H2 split again: an absent or empty store is a result (WARN, FAIL under
+    `--learning`); an absent *log* is a harness omission (SKIP with a pointer).
+    """
     queued = ctx.log_events("queued a calibration profile update for the store")
     writes = ctx.log_events("wrote the local calibration store")
     after = ctx.after
-    if after is None:
-        return Verdict("persistence", "SKIP", "no calibration.after.toml")
-    profiles = after.get("profile") or []
+    profiles = (after or {}).get("profile") or []
+    if after is None or not profiles:
+        return Verdict(
+            "persistence", _no_store_verdict(ctx),
+            ("no calibration.after.toml in the scenario directory"
+             if after is None else
+             "calibration.after.toml carries no [[profile]]")
+            + " -- nothing was persisted; " + NO_STORE_HINT,
+            {"profiles": 0, "after_present": after is not None,
+             "queued": len(queued), "writes": len(writes),
+             "learning": _declared_learning(ctx)},
+        )
     if not queued and not writes:
         return Verdict(
-            "persistence", "INFO" if profiles else "SKIP",
-            f"{len(profiles)} profile(s) on disk; no store log lines to time "
-            "the debounce against",
-            {"profiles": len(profiles)},
+            "persistence", "SKIP",
+            f"{len(profiles)} profile(s) on disk, but the log carries no store "
+            "lines to time the debounce against: capture panoptikon.log with "
+            "RUST_LOG=info,panoptikon::inferio=trace (the store is there, so "
+            "this is a missing input, not a missing measurement)",
+            {"profiles": len(profiles), "log_events": len(ctx.log)},
         )
     worst = None
     for event in queued:
@@ -1047,7 +1234,18 @@ def check_ledger_invariant(ctx: Context) -> Verdict:
 
 
 def check_hog_tracking(ctx: Context) -> Verdict:
-    """`external_mb` must follow what hog.py actually holds."""
+    """`external_mb` must follow what hog.py actually holds (INFO, but see the FAIL form).
+
+    Report-only in general, because `external` is a window-boundary quantity
+    with a real staleness (finding B2/T3) and a board that updates *late* is
+    behaving as designed. There is exactly one shape that is not staleness at
+    all, and it FAILs: a hog that held at least `HOG_STALL_MB` for longer than
+    `HOG_STALL_SECONDS` while `external_mb` never moved by a single MiB across
+    the whole recording. That is not a late update, it is no update -- run1's
+    S15 mutation 2 (`external_locked` patched to return 0) reported
+    `external_mb 0..0 MiB` against a hog holding 30 720 MiB, and this row
+    reported it as an observation.
+    """
     if not ctx.hog_samples or not ctx.health_samples:
         return Verdict("hog_tracking", "SKIP", "needs hog.jsonl and healthrec.jsonl")
     header = next((row for row in ctx.hog if row.get("kind") == "header"), {})
@@ -1091,17 +1289,52 @@ def check_hog_tracking(ctx: Context) -> Verdict:
         if abs(d_hog) >= 256:
             deltas.append({"iso": current["iso"], "d_hog_mb": d_hog,
                            "d_external_mb": d_ext})
-    return Verdict(
-        "hog_tracking", "INFO",
+
+    # --- the FAIL form (run1 S15 hole H3) --------------------------------
+    # How long did the hog hold real pressure, counting only the wall time
+    # between two consecutive joined samples that were *both* above the
+    # threshold? (A single spike between two idle samples buys no time, and an
+    # oscillating hog is charged only for the intervals it was actually up.)
+    held_seconds = 0.0
+    for previous, current in zip(rows, rows[1:]):
+        if ((previous["hog_held_mb"] or 0) >= HOG_STALL_MB
+                and (current["hog_held_mb"] or 0) >= HOG_STALL_MB):
+            held_seconds += current["t_wall"] - previous["t_wall"]
+    externals = {row["external_mb"] for row in rows}
+    external_moved = len(externals) > 1
+    stalled = held_seconds > HOG_STALL_SECONDS and not external_moved
+
+    detail = (
         f"{len(rows)} joined samples on {gpu_uuid}; hog held "
         f"{min(row['hog_held_mb'] or 0 for row in rows)}.."
         f"{max(row['hog_held_mb'] or 0 for row in rows)} MiB; external_mb "
         f"{min(row['external_mb'] or 0 for row in rows)}.."
         f"{max(row['external_mb'] or 0 for row in rows)} MiB; worst "
         f"external_sample_age {max_age if max_age is None else round(max_age, 1)}s; "
-        f"{len(deltas)} step(s) >= 256 MiB",
+        f"{len(deltas)} step(s) >= 256 MiB"
+    )
+    if stalled:
+        detail += (f"  -- FAIL: the hog held >= {HOG_STALL_MB} MiB for "
+                   f"{held_seconds:.0f}s (> {HOG_STALL_SECONDS:.0f}s) and "
+                   f"external_mb never moved from "
+                   f"{next(iter(externals))} across the whole recording. That "
+                   f"is not the B2 staleness window -- a board that updates "
+                   f"late still moves")
+    else:
+        detail += (f"; the hog held >= {HOG_STALL_MB} MiB for "
+                   f"{held_seconds:.0f}s and external_mb "
+                   + ("moved" if external_moved else "never moved")
+                   + f" [FAIL needs both: > {HOG_STALL_SECONDS:.0f}s held and "
+                     f"no movement at all]")
+    return Verdict(
+        "hog_tracking", "FAIL" if stalled else "INFO", detail,
         {"joined": len(rows), "steps": deltas[:20],
-         "max_external_sample_age_s": max_age},
+         "max_external_sample_age_s": max_age,
+         "hog_held_seconds_over_threshold": round(held_seconds, 1),
+         "hog_threshold_mb": HOG_STALL_MB,
+         "stall_threshold_s": HOG_STALL_SECONDS,
+         "external_moved": external_moved,
+         "distinct_external_mb": len(externals)},
     )
 
 
@@ -1109,21 +1342,9 @@ def check_ramp_progress(ctx: Context) -> Verdict:
     """The ramp must actually move: ramp_step / unit_budget over time."""
     if not ctx.health_samples:
         return Verdict("ramp_progress", "SKIP", "no healthrec.jsonl")
-    series: Dict[str, List[int]] = {}
-    fits: Dict[str, int] = {}
-    for sample in ctx.health_samples:
-        for worker in (sample.get("health") or {}).get("workers") or []:
-            key = worker["inference_id"]
-            series.setdefault(key, []).append(int(worker.get("unit_budget") or 0))
-            if worker.get("fit_samples"):
-                fits[key] = max(fits.get(key, 0), int(worker["fit_samples"]))
-    if not series:
+    rows = _budget_rows(ctx)
+    if not rows:
         return Verdict("ramp_progress", "SKIP", "no workers in any health sample")
-    rows = {
-        model: {"first": values[0], "peak": max(values), "last": values[-1],
-                "fit_samples": fits.get(model, 0)}
-        for model, values in series.items()
-    }
     stalled_at_64 = [model for model, row in rows.items() if row["peak"] == 64]
     detail = "; ".join(
         f"{model}: unit_budget {row['first']} -> peak {row['peak']} "
@@ -1134,6 +1355,81 @@ def check_ramp_progress(ctx: Context) -> Verdict:
         detail += (f"  [peak exactly 64 for {', '.join(stalled_at_64)}: check "
                    f"REQUEST_UNIT_BUDGET, finding B16]")
     return Verdict("ramp_progress", "INFO", detail, {"models": rows})
+
+
+def check_calibration_learned(ctx: Context) -> Verdict:
+    """A learning leg must end having learned something: fit samples, a store, a moved anchor.
+
+    This is `ramp_progress`'s three numbers promoted to a verdict, and it exists
+    because of run1's S15 hole H1: a fault that destroys the *measurement* also
+    destroys the *evidence the other checks read*, and `analyze.py` turned that
+    into SKIP, which never sets the exit code. Mutation 1 (the worker halving
+    its reported `peak_reserved_mb`) put the high-water below the post-load
+    baseline, so the `grew` test never fired: `high_water_samples = 0` on all 96
+    grants, no fit ever formed, `unit_budget` never left the seed of 8 and no
+    store was ever written. `slope_accuracy` and `persistence` both SKIPped and
+    the leg was caught only by `utilization`, and only because it happened to
+    have been run with `--probe`.
+
+    FAILs -- rather than reporting -- only for a leg that declares itself a
+    learning scenario (`--learning`, or `calibration_learned` in `--checks`),
+    because a seeded or short leg legitimately learns nothing new. Three
+    conditions, any one of which is a failure:
+
+      * `fit samples == 0` for some model,
+      * no `[[profile]]` in `calibration.after.toml`,
+      * peak `unit_budget` never rose above the first value recorded.
+
+    The third reads the first health sample as "the seed". At healthrec's
+    default 500 ms that is within a sample of admission, and a leg that ramps
+    at all leaves it far behind (run1 S2: 8 -> 1024); a leg whose peak equals
+    its first sample never moved.
+    """
+    learning = _declared_learning(ctx)
+    profiles = (ctx.after or {}).get("profile") or []
+    rows = _budget_rows(ctx)
+
+    reasons: List[str] = []
+    if not rows:
+        reasons.append("no worker appears in any health sample"
+                       if ctx.health_samples else
+                       "no healthrec.jsonl, so no unit_budget or fit samples "
+                       "could be read")
+    else:
+        no_fit = sorted(model for model, row in rows.items()
+                        if row["fit_samples"] == 0)
+        if no_fit:
+            reasons.append("fit samples == 0 for " + ", ".join(no_fit))
+        stuck = sorted(f"{model} (seed {rows[model]['first']}, peak "
+                       f"{rows[model]['peak']})"
+                       for model in rows
+                       if rows[model]["peak"] <= rows[model]["first"])
+        if stuck:
+            reasons.append("peak unit_budget never left the seed for "
+                           + ", ".join(stuck))
+    if ctx.after is None:
+        reasons.append("no calibration.after.toml in the scenario directory")
+    elif not profiles:
+        reasons.append("calibration.after.toml carries no [[profile]]")
+
+    detail = "; ".join(
+        f"{model}: unit_budget {row['first']} -> peak {row['peak']} "
+        f"(last {row['last']}, fit samples {row['fit_samples']})"
+        for model, row in rows.items()
+    ) or "no worker series"
+    detail += f"; {len(profiles)} profile(s) in the store"
+    if reasons:
+        detail += "  -- NOTHING WAS LEARNED: " + "; ".join(reasons)
+    if learning:
+        verdict = "FAIL" if reasons else "PASS"
+    else:
+        verdict = "INFO"
+        detail += ("  [report-only: this leg did not declare itself a learning "
+                   "scenario -- pass --learning, or name calibration_learned "
+                   "in --checks, to make it a verdict]")
+    return Verdict("calibration_learned", verdict, detail,
+                   {"models": rows, "profiles": len(profiles),
+                    "learning": learning, "reasons": reasons})
 
 
 def check_peak_fds(ctx: Context) -> Verdict:
@@ -1211,6 +1507,7 @@ CHECKS: Dict[str, Callable[[Context], Verdict]] = {
     "peak_fds": check_peak_fds,
     "hog_tracking": check_hog_tracking,
     "ramp_progress": check_ramp_progress,
+    "calibration_learned": check_calibration_learned,
 }
 
 
@@ -1318,6 +1615,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--checks", default="all",
                         help="comma-separated check names, or `all`")
     parser.add_argument("--list-checks", action="store_true")
+    parser.add_argument("--learning", action="store_true",
+                        help="this leg is a learning / cold-ramp scenario and "
+                             "is meant to end with a fitted profile on disk. "
+                             "Naming calibration_learned in --checks declares "
+                             "the same thing. Makes calibration_learned a "
+                             "verdict, and makes the 'no store was written' "
+                             "branch of slope_accuracy / utilization / "
+                             "persistence FAIL instead of WARN")
     parser.add_argument("--expect-ooms", type=int, default=0)
     parser.add_argument("--expect-deaths", type=int, default=0)
     parser.add_argument("--expect-failures", type=int, default=0)
@@ -1338,11 +1643,43 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--plot")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
+    # Which checks did the scenario name for itself? `all` is the default and
+    # declares nothing, so it must not count as a declaration (see
+    # `_declared_learning`).
+    args.explicit_checks = (
+        set()
+        if args.checks.strip() == "all"
+        else {name.strip() for name in args.checks.split(",") if name.strip()}
+    )
 
     if args.list_checks:
         for name, fn in CHECKS.items():
             summary = (fn.__doc__ or "").strip().splitlines()[0]
             print(f"{name:22s} {summary}")
+        print()
+        print("The check that decides safety is `grant_safety`, and within it "
+              "the oracle clause:")
+        print("  every `issued a memory grant` line is joined to "
+              "vramrec.jsonl and the grant is")
+        print("  compared with the board's LIVE FREE MEMORY at that instant. "
+              "That clause needs")
+        print("  vramrec.jsonl; without it grant_safety reports WARN, never "
+              "PASS, so a silently")
+        print("  skipped safety clause is visible in the table. "
+              "`ledger_invariant`'s strict form is")
+        print("  not a substitute -- it passed on a ledger whose `external` "
+              "was hard-zeroed (0 of")
+        print("  498 board-samples over the limit) while this clause caught "
+              "335 of 335 grants")
+        print("  (run1 S15 mutation 2).")
+        print()
+        print("SKIP means an input was not recorded, never that the run "
+              "produced no measurement:")
+        print("  `slope_accuracy`, `utilization` and `persistence` report "
+              "WARN when the store was")
+        print("  never written, and FAIL when the leg declares itself a "
+              "learning scenario with")
+        print("  --learning (or by naming `calibration_learned` in --checks).")
         return 0
 
     root = Path(args.scenario).resolve() if args.scenario else None
@@ -1419,6 +1756,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "log_events": len(ctx.log),
                         "probes": len(ctx.probes),
                     },
+                    "learning": _declared_learning(ctx),
                     "verdicts": [
                         {"name": v.name, "verdict": v.verdict, "detail": v.detail,
                          "numbers": v.numbers}
