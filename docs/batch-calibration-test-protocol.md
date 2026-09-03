@@ -883,17 +883,86 @@ C1). Plus one run of every shipped model category on the `smoke`
 corpus to catch a load-path regression unrelated to calibration.
 
 ### S15 Protocol self-test (mutation runs)
-The protocol is only useful if it catches what it is meant to catch. Three
-deliberate faults, each on a throwaway branch, run through S2 and S4b:
-1. Worker under-reports `peak_reserved_mb` by 50 % (patch `measure_batch`).
-   Expected catch: slope check in S2 fails; S4b or S4c produces OOMs the
-   healthy run did not.
-2. Host ignores `external` (patch `external_locked` to return 0).
-   Expected catch: S4a grants exceed headroom against the oracle; S4b OOMs.
-3. Margin set to −0.5 in the config (if validation lets it through, that
-   is itself a finding). Expected catch: S4 series.
+The protocol is only useful if it catches what it is meant to catch.
+Deliberate faults, each on a throwaway branch, run through S2 and S4b.
 A fault the protocol misses is a hole in the protocol and gets a new
 check before the platform passes are run.
+
+**Revision after run1 (2026-09-03).** All three mutations were caught, but
+**not one of them by the check this section predicted**, and m1 exposed a
+real hole. The expectations below are the corrected ones; the four holes
+(H1–H4) are closed in `analyze.py` and the tooling README, and m4/m5 are
+new and unrun.
+
+1. **Worker under-reports `peak_reserved_mb` by 50 %** (patch
+   `measure_batch`). *Predicted:* slope check fails in S2; S4b or S4c
+   produces OOMs the healthy run did not. **Actual (run1 `S15-m1-S2`,
+   `S15-m1-S4b`): neither.** Halving the reported high-water puts it
+   *below* the post-load baseline (964 MiB base against a halved peak of
+   ≈500), so the `grew` test never fires: `high_water_samples = 0` on all
+   96 grants, no fit ever forms, `unit_budget` never leaves the seed of 8,
+   and **no store is ever written**. The direction is **sandbagging**, so
+   S4b produced **0 OOMs** and the job ran *faster* than the baseline
+   (`throughput` PASS 1.15×, the wrong way round). With no
+   `calibration.after.toml`, `slope_accuracy` and `persistence` both came
+   back **SKIP** — which never sets the exit code. The only FAIL was
+   `utilization` (peak `unit_budget` 8 / probe boundary 2560 = 0.00), and
+   it existed only because that leg happened to be run with `--probe`.
+   **Correct expected catch: `utilization` *and* `calibration_learned`**
+   (fit samples 0, no profile, anchor never left the seed), with
+   `slope_accuracy` and `persistence` as WARN/FAIL rather than SKIP. Run
+   every S15 leg with `--learning`.
+2. **Host ignores `external`** (patch `external_locked` to return 0).
+   *Expected catch: S4a grants exceed headroom against the oracle; S4b
+   OOMs.* **Confirmed, and earlier than predicted**: three FAILs on the
+   plain S2 leg before any hog is started — `grant_safety` **335 of 335**
+   grants over the oracle's live free memory, `slope_accuracy` (the store
+   it writes is degenerate: slope 0.0, samples 0, `max_units_measured` 1,
+   now flagged poisoned in `results/run1/README.md`) and `utilization`.
+   Note what did **not** fire: `ledger_invariant`'s strict form PASSed on
+   **0 of 498** board-samples, because zeroing `external` makes
+   `limit_mb == total_mb`. The check that decides safety is
+   `grant_safety`'s oracle clause, and it needs `vramrec.jsonl`.
+   On S4b it also FAILs the new `hog_tracking` form (`external_mb 0..0`
+   against a hog holding 30 720 MiB for 77 s).
+3. **Margin set to −0.5 in the config.** *Predicted catch: the S4 series.*
+   **Actual: the value never reaches the S4 series — it is rejected at
+   config load** (run1 `S15-m3-S2`), verbatim:
+
+   ```
+   Error: inference_local.vram margin must be a finite number >= 0 (got -0.5); it is a fraction of other processes' VRAM usage, e.g. 0.10 for 10%
+   ```
+
+   `Settings::validate` names the key, the constraint and an example, and
+   `ledger.rs` carries the same assumption as defence in depth
+   (`margin.max(0.0)` at both `limit_locked` and `headroom_locked`, plus
+   the `cap_fraction.is_finite()` filter). The failure mode is a hard
+   startup failure, not a degraded run — the right trade for an
+   admission-safety knob, given the shipped server TOML is user-owned.
+   **This is not a protocol hole**: a mutation the product refuses to run
+   is not a gap in the test. Restate the expectation as *"rejected at
+   config load with a message naming the key; if a future change ever
+   lets it through, the catch is `grant_safety` in the S4 series."*
+4. **`cap_fraction = 1.5`** — the other budget knob, which run1 never
+   exercised. Same shape as 3: does validation reject a fraction above 1,
+   and if it does not, does the S4 series catch a board budgeted at 150 %
+   of itself? *To run in the next pass.*
+5. **`cap_fraction = NaN`.** `ledger.rs` filters on
+   `cap_fraction.is_finite()`, so the interesting question is whether
+   `Settings::validate` rejects it first and with as legible a message as
+   the margin case, or whether the run silently proceeds on the filtered
+   default. *To run in the next pass.*
+
+**Holes found by run1's S15, and how they are closed.** All four are in
+`tools/calibration-protocol/analyze.py` and its README; §6 carries the
+rules.
+
+| Id | Hole | Closure |
+|---|---|---|
+| H1 | A fault that destroys the measurement destroys the evidence too, and `analyze.py` turned that into `SKIP`, which never sets the exit code. m1 without probe files reports **all green with three SKIPs**. | New check **`calibration_learned`** (FAIL, not SKIP) for a leg that declares itself a learning scenario (`--learning`, or naming the check in `--checks`): FAIL on any of `fit samples == 0`, no `[[profile]]` in `calibration.after.toml`, or a peak `unit_budget` that never left the seed. All three numbers were already printed by `ramp_progress` as INFO. |
+| H2 | `slope_accuracy` could not distinguish "no store was written" (a *result*) from "no probe file was passed" (a harness omission). Both were `SKIP`. | The two are split, in `slope_accuracy`, `utilization` and `persistence`: no store / no worker admitted → **WARN**, or **FAIL** under `--learning`; no probe / no log → **SKIP with a pointer** to what to pass. |
+| H3 | `hog_tracking` was INFO only. `external_mb 0..0 MiB` while a hog holds 30 720 MiB is not an observation. | A FAIL form that cannot re-fail the known B2 staleness: FAIL only when the hog held **≥ 1 GiB for more than 60 s** *and* `external_mb` **never moved at all** across the recording; a board that moves late is still INFO. Calibrated on run1's 14 hog legs — only m2's S4b FAILs. |
+| H4 | `ledger_invariant`'s strict form PASSes on a completely broken ledger (m2: 0 of 498). | Documented in `--list-checks` and the tooling README: **the check that decides safety is `grant_safety`'s oracle clause, and it needs `vramrec.jsonl`.** `grant_safety` now reports **WARN**, not PASS, when that clause could not run. |
 
 ## 5. Targeted probes from the code reading
 
@@ -958,6 +1027,24 @@ suspicion states; **B16** is cleared by the G7 fix; **B10**, **W3** and
 | Throughput vs C0 | LogRecord | ≥ 0.9 × idle board; ≥ 0.4 × under S4e |
 | Persistence | calibration.toml | written ≤ 30 s after anchor advance; resumes on restart |
 | Job outcome | `/api/jobs/queue` outcomes, failures | completed; failures only for poisoned items |
+| Calibration learned (a leg that declares `--learning`) | healthrec × calibration.toml | fit samples > 0, ≥ 1 `[[profile]]` on disk, and peak `unit_budget` above the seed — **FAIL**, never SKIP |
+| External tracking under a hog | healthrec × hog.jsonl | report-only, **except**: FAIL when the hog held ≥ 1 GiB for > 60 s and `external_mb` never moved at all |
+
+**The check that decides safety is `grant_safety`, and within it the
+oracle clause** — every `issued a memory grant` line joined to
+`vramrec.jsonl` and compared with the board's *live free memory* at that
+instant. It needs `vramrec.jsonl`, so **`grant_safety` reports WARN, not
+PASS, when that file is absent**, and a scenario without it has not had
+its safety verified. Its other clause (grant ≤ the headroom it was priced
+against) only re-checks the ledger's arithmetic against itself, and
+`ledger_invariant`'s strict form is not a substitute either: S15 mutation
+2 hard-zeroed `external`, so `limit_mb` became `total_mb` and
+`ledger_invariant` PASSed on 0 of 498 board-samples while the oracle
+clause caught 335 of 335 grants. Record `vramrec.jsonl` on every leg.
+
+**`SKIP` means an input was not recorded — never that the run produced no
+measurement.** A SKIP never sets the exit code, so any check whose inputs
+a *fault* can delete must report WARN or FAIL instead (H1/H2 above).
 
 ## 7. Execution plan for the autonomous session
 
