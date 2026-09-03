@@ -522,6 +522,9 @@ pub(crate) struct WindowShape {
 ///
 /// Always at least 1. The caller (core) applies its own floor and ceiling —
 /// this side deliberately knows nothing about core's memory budgets.
+///
+/// `target_units` itself comes from [`in_flight_target_units`], which is where
+/// a **squeezed** grant is accounted for.
 pub(crate) fn desired_in_flight_items(
     target_units: u64,
     last: WindowShape,
@@ -545,6 +548,36 @@ pub(crate) fn desired_in_flight_items(
         u64::MAX
     };
     want.min(byte_bound).max(1)
+}
+
+/// The unit target the in-flight figure is published from: the **granted**
+/// budget's own window depth when the ledger squeezed this window, and the
+/// anchor-derived window target otherwise.
+///
+/// `target` is what the dispatcher *asked* for: `admitted_units` times
+/// [`WINDOW_DEPTH_MULTIPLIER`], derived from the ramp anchor and the knee.
+/// When the board cannot afford that, the ledger issues a smaller
+/// `unit_budget` and flags the grant `squeezed`; publishing the target anyway
+/// tells the caller to keep feeding us windows sized for memory the board does
+/// not have. The window then runs for as long as it takes to chew through them
+/// at the squeezed batch size — 1 936 requests over 49 s on one 11-unit grant
+/// in the Phase 3 S4a run — with no grant, no high-water sample and no
+/// re-pricing in between, which is the opposite of what a tight board needs.
+///
+/// The result is never below `WINDOW_DEPTH_MULTIPLIER` batches' worth of the
+/// budget the worker was actually given, and [`IN_FLIGHT_SLACK`] doubles it
+/// again downstream, so the caller is always asked to keep several batches in
+/// flight: this shortens the blind window, it does not starve the worker. And
+/// it is bounded above by `target`, so it can only ever *lower* the figure —
+/// an unsqueezed grant restores it on the very next window.
+pub(crate) fn in_flight_target_units(target: u64, grant: Option<&Grant>) -> u64 {
+    match grant {
+        Some(grant) if grant.squeezed => grant
+            .unit_budget
+            .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
+            .clamp(1, target.max(1)),
+        _ => target,
+    }
 }
 
 /// Why the dispatcher loop ended.
@@ -599,6 +632,10 @@ pub(crate) async fn run_dispatcher(
     // conversion behind `desired_in_flight_items`. Owned by this loop, which
     // is the only place windows are formed.
     let mut last_shape = WindowShape::default();
+    // The grant the last window was formed under, kept for the same reason:
+    // when it was squeezed it, not the anchor-derived target, is what the next
+    // window's batches will be sized by.
+    let mut last_grant: Option<Grant> = None;
     let seed_ratio = seed_units_per_item(&ctx.cost);
 
     let end = 'main: loop {
@@ -612,7 +649,17 @@ pub(crate) async fn run_dispatcher(
             let cap = shapes[0].cap;
             let bounds = match &replica.admission {
                 Some(admission) => WindowBounds {
-                    units: admission.window_target_units(),
+                    // The published figure shortens the *caller's* pipelining,
+                    // which cannot shorten a window that is already formed —
+                    // and nothing obliges a caller to honour it at all. So the
+                    // same clamp applies here: after a squeezed grant the next
+                    // window is formed against the budget the board could
+                    // afford, keeping it the intended few batches deep instead
+                    // of hundreds, and each of those windows re-prices.
+                    units: in_flight_target_units(
+                        admission.window_target_units(),
+                        last_grant.as_ref(),
+                    ),
                     items: priced_item_bound(cap),
                     bytes: MAX_WINDOW_BYTES,
                 },
@@ -649,17 +696,6 @@ pub(crate) async fn run_dispatcher(
             if shape.items > 0 && shape.units > 0 {
                 last_shape = shape;
             }
-            let desired = match &replica.admission {
-                // Priced: project the ledger's unit target into items.
-                Some(_) => desired_in_flight_items(bounds.units, last_shape, seed_ratio),
-                // Unpriced: there is no unit target and no worker-side
-                // packer, so the frame the worker gets *is* the GPU batch and
-                // its size is the fixed `unpriced_window_items`. The same
-                // slack applies, and the user's own cap is deliberately not
-                // folded in: a cap bounds GPU batches, never how much work
-                // the caller keeps in flight.
-                None => u64::from(ctx.unpriced_window_items.max(1)).saturating_mul(IN_FLIGHT_SLACK),
-            };
             // The grant is taken *before* the window is handed off, so two
             // replicas can never be promised the same headroom.
             let plan = match &replica.admission {
@@ -692,6 +728,25 @@ pub(crate) async fn run_dispatcher(
                     fit: None,
                     item_bound: Some(bounds.items),
                 },
+            };
+            // Computed *after* the grant, so a squeezed one is what the caller
+            // is told about: the figure follows the memory the board actually
+            // had, not the target the ledger was asked for.
+            last_grant = plan.grant.as_ref().map(|token| *token.grant());
+            let desired = match &replica.admission {
+                // Priced: project the ledger's unit target into items.
+                Some(_) => desired_in_flight_items(
+                    in_flight_target_units(bounds.units, last_grant.as_ref()),
+                    last_shape,
+                    seed_ratio,
+                ),
+                // Unpriced: there is no unit target and no worker-side
+                // packer, so the frame the worker gets *is* the GPU batch and
+                // its size is the fixed `unpriced_window_items`. The same
+                // slack applies, and the user's own cap is deliberately not
+                // folded in: a cap bounds GPU batches, never how much work
+                // the caller keeps in flight.
+                None => u64::from(ctx.unpriced_window_items.max(1)).saturating_mul(IN_FLIGHT_SLACK),
             };
             // Health counters (Relaxed stores; see ModelStats docs).
             ctx.stats.queue_len.store(queue.len(), Relaxed);
@@ -1472,6 +1527,76 @@ mod tests {
         assert_eq!(desired_in_flight_items(1_000, unmeasured, 1), 2_000);
     }
 
+    /// T5: a squeezed grant is published as the budget the board could
+    /// afford, not as the anchor-derived target it was asked for. The Phase 3
+    /// S4a numbers: a target of 1 024 admitted units against a grant squeezed
+    /// to 11.
+    #[test]
+    fn a_squeezed_grant_lowers_the_published_target() {
+        let grant = |unit_budget: u64, squeezed: bool| Grant {
+            unit_budget,
+            mb: 512,
+            unit: CostUnit::Item,
+            aggregation: CostAggregation::Count,
+            user_cap_items: None,
+            squeezed,
+        };
+        let target = 1_024 * WINDOW_DEPTH_MULTIPLIER;
+
+        assert_eq!(
+            in_flight_target_units(target, Some(&grant(11, true))),
+            11 * WINDOW_DEPTH_MULTIPLIER,
+            "the granted budget's own window depth"
+        );
+        assert_eq!(
+            in_flight_target_units(target, Some(&grant(11, false))),
+            target,
+            "an unsqueezed grant publishes the target, however small the \
+             budget: the ramp, the ratchet or the work in hand held it back, \
+             and none of those is helped by asking the caller for less"
+        );
+        assert_eq!(
+            in_flight_target_units(target, None),
+            target,
+            "and so does a window the ledger refused a grant for"
+        );
+        assert_eq!(
+            in_flight_target_units(8, Some(&grant(64, true))),
+            8,
+            "never above the target it clamps"
+        );
+        assert_eq!(
+            in_flight_target_units(0, Some(&grant(0, true))),
+            1,
+            "and never zero"
+        );
+
+        // End to end through the conversion, at one unit per item: the figure
+        // core reads drops from 6 144 to 66, and is still six batches' worth
+        // of the budget the worker was actually given.
+        let last = WindowShape {
+            items: 1_936,
+            units: 1_936,
+            bytes: 0,
+        };
+        assert_eq!(
+            desired_in_flight_items(
+                in_flight_target_units(target, Some(&grant(11, false))),
+                last,
+                1
+            ),
+            target * IN_FLIGHT_SLACK
+        );
+        assert_eq!(
+            desired_in_flight_items(
+                in_flight_target_units(target, Some(&grant(11, true))),
+                last,
+                1
+            ),
+            11 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK
+        );
+    }
+
     /// Window formation takes a FIFO prefix while the unit bound holds:
     /// requests are never reordered or skipped to pack the window tighter (a
     /// later small request must not jump an earlier big one).
@@ -1908,6 +2033,7 @@ mod tests {
             unit: CostUnit::Item,
             aggregation: CostAggregation::Count,
             user_cap_items: Some(4),
+            squeezed: false,
         };
         let halved = halved_for_retry(Some(&grant)).expect("some");
         assert_eq!(halved.unit_budget, 4, "9 / 2");
@@ -1980,7 +2106,7 @@ mod tests {
     // Integration: the dispatcher, a live ledger, and a real worker
     // ------------------------------------------------------------------
 
-    use super::super::ledger::{VramBudget, VramLedger};
+    use super::super::ledger::{SEED_BATCH_FLOOR_MB, VramBudget, VramLedger};
     use super::super::worker::{LoadReport, Timestamped, Worker};
 
     const TEST_BOARD: &str = "GPU-dispatch-test";
@@ -2067,6 +2193,78 @@ mod tests {
             "the fixture must be on the priced path for this test to mean anything"
         );
         Replica { worker, admission }
+    }
+
+    /// T5, end to end: the figure the caller reads off the response follows
+    /// the memory the board actually had.
+    ///
+    /// Two identical windows over two boards. The only difference the
+    /// dispatcher sees is the ledger's `squeezed` flag — the grant itself is
+    /// the same four units either way, which is what makes the assertion about
+    /// the flag rather than about the window's size. On the tight board the
+    /// published figure drops from the anchor-derived window target to
+    /// `WINDOW_DEPTH_MULTIPLIER` batches' worth of the granted budget, so the
+    /// caller stops queueing work for memory the board does not have and the
+    /// next window re-prices instead of running blind.
+    #[tokio::test]
+    async fn a_squeezed_grant_lowers_the_published_in_flight_figure() {
+        async fn one_window(total_mb: u64) -> (u64, u64, bool) {
+            let cost = item_cost(8);
+            let ledger = VramLedger::for_test(
+                &[(TEST_BOARD, "TEST 9000", total_mb)],
+                VramBudget {
+                    margin: 0.0,
+                    cap_fraction: None,
+                },
+            );
+            let replica = priced_replica(&ledger, "batchsize_test", cost).await;
+            let stats = Arc::new(ModelStats::default());
+            let (tx, rx) = mpsc::unbounded_channel();
+            let dispatcher = tokio::spawn(run_dispatcher(
+                dispatcher_ctx(cost, Arc::clone(&stats)),
+                vec![replica],
+                rx,
+            ));
+            let (reply, answer) = oneshot::channel();
+            tx.send(DispatchMsg::Predict(DispatchRequest {
+                inputs: (0..4)
+                    .map(|index| WorkerInput {
+                        data: Some(json!(index)),
+                        file: None,
+                    })
+                    .collect(),
+                max_batch: None,
+                reply,
+            }))
+            .expect("queued");
+            answer.await.expect("replied").expect("succeeded");
+            let squeezed = ledger.health()[0].headroom_mb < SEED_BATCH_FLOOR_MB;
+            tx.send(DispatchMsg::Shutdown).expect("shutdown");
+            dispatcher.await.expect("dispatcher exits");
+            (
+                stats.desired_in_flight_items.load(Relaxed),
+                stats.last_grant_units.load(Relaxed),
+                squeezed,
+            )
+        }
+
+        // Roomy: a 512 MiB resident on a 32 GiB board. The window's own four
+        // units bound the grant — the ramp and the queue, not memory — so the
+        // target stands and the caller is asked for a full window's worth.
+        assert_eq!(
+            one_window(32_768).await,
+            (8 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK, 4, false),
+            "seed 8 x window depth x slack, through a measured 1 unit/item"
+        );
+        // Tight: the same resident on a 600 MiB board leaves 88 MiB of
+        // headroom — below the seed-batch contention floor — so the ledger
+        // flags the grant squeezed and the published figure follows the
+        // granted four units instead of the target's twenty-four.
+        assert_eq!(
+            one_window(600).await,
+            (4 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK, 4, true),
+            "the same grant, published against the board's own memory"
+        );
     }
 
     /// End to end on the priced path: a request's `max_batch` becomes the

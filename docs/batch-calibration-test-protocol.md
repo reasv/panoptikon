@@ -644,7 +644,18 @@ confirm or refute them rather than rediscover them.
     window's items-per-unit ratio times a slack of 2, then bounded by
     `MAX_WINDOW_BYTES` converted through that window's bytes-per-item
     (the byte bound takes no slack: a window at the wall cannot merge
-    another request anyway). Before any window exists the ratio comes
+    another request anyway). **Amended 2026-09-03 (finding T5):** the
+    unit target is the *granted* budget's window depth
+    (`unit_budget x WINDOW_DEPTH_MULTIPLIER`) whenever the ledger
+    flagged the grant `squeezed`, and the anchor-derived target
+    otherwise — `dispatch::in_flight_target_units`, which also clamps
+    the next window the dispatcher forms, since the header cannot
+    shorten a window that is already formed. As shipped on 2026-09-02
+    the figure was always the anchor-derived target, so a grant
+    squeezed to 11 units was followed by a window of 1 936 requests
+    that ran 49 s with no grant, no high-water sample and no
+    re-pricing while `/health` and the header kept publishing the
+    1 024-unit figure (Phase 3, S4a). Before any window exists the ratio comes
     from a per-unit-class seed — 1 for `item` and for every
     `count`-aggregated model, `PIXEL_FALLBACK_UNITS` (2 MP) for `pixel`,
     a new `TOKEN_SEED_UNITS = 512` for `token`,

@@ -2284,6 +2284,7 @@ mod tests {
             unit: super::super::cost::CostUnit::Item,
             aggregation: super::super::cost::CostAggregation::Count,
             user_cap_items: None,
+            squeezed: false,
         };
         let outputs = worker
             .predict(&inputs, Some(&grant), None)
@@ -2380,6 +2381,7 @@ mod tests {
             unit: super::super::cost::CostUnit::Item,
             aggregation: super::super::cost::CostAggregation::Count,
             user_cap_items: None,
+            squeezed: false,
         };
         let err = worker
             .predict(&inputs, Some(&grant), None)

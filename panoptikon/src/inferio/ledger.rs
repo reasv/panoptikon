@@ -3299,6 +3299,7 @@ impl VramLedger {
                 unit,
                 aggregation,
                 user_cap_items,
+                squeezed,
             },
             settled: false,
         })
@@ -4600,6 +4601,13 @@ pub struct Grant {
     /// The user's per-request "max batch size", forwarded as an item-count
     /// constraint. Never converted to units.
     pub user_cap_items: Option<u32>,
+    /// Whether *memory* is what held this window back, as opposed to the ramp,
+    /// the ratchet or the amount of work in hand (the same flag that decides
+    /// whether an idle neighbour is asked to trim its pool). The dispatcher
+    /// reads it to publish an in-flight figure derived from the budget the
+    /// board could actually afford rather than from the anchor-derived window
+    /// target it asked for (`dispatch::in_flight_target_units`).
+    pub squeezed: bool,
 }
 
 /// A held grant. Dropping it releases the reservation (the abort path);

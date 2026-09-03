@@ -280,6 +280,20 @@ How the orchestrator derives it, per model (`inferio/dispatch.rs`,
   payload-byte wall the dispatcher applies to a window (`MAX_WINDOW_BYTES`)
   converted through that window's bytes-per-item — past the byte wall a window
   cannot merge another request anyway, so more work in flight buys nothing.
+- **A squeezed window publishes the budget it was granted**, not the target it
+  asked for. When the board cannot afford the admitted unit budget the ledger
+  issues a smaller one and flags the grant *squeezed*; the figure is then
+  derived from that granted budget (times the same window depth and slack)
+  rather than from the anchor-derived target. Publishing the target under
+  pressure would keep the caller queueing work for memory the board does not
+  have, and the resulting window then runs for as long as it takes to chew
+  through it at the squeezed batch size, with no re-pricing in between — the
+  more squeezed the grant, the longer the server runs on a stale picture. The
+  figure still never falls below several of the batches the worker was
+  actually given, and an unsqueezed grant restores the target on the very next
+  window. The same clamp bounds the *window* the dispatcher forms next, since
+  the header can only shorten a caller's pipelining and cannot shorten a
+  window that is already formed (nor oblige a caller to honour it at all).
 - **Unpriced paths** — `none`-class (grantless) models, a host with no GPU
   inventory, a board outside the enumeration — have no unit target and no
   worker-side packer, so the frame the worker receives *is* the GPU batch and
