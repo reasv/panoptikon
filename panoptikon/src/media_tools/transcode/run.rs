@@ -38,6 +38,11 @@ use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, kill_p
 /// The two software-x264 invocations, named as encoder *identities* rather
 /// than encoder names: the x264 `-preset` changes the output bytes, so it is
 /// part of what the cache key must cover (see [`TranscodeParams::encoder`]).
+/// The identity of a stream copy. ffmpeg's own `-c:v copy` spelling, and a
+/// host-independent one: a copy resolves to the same string on every machine,
+/// so a `preview-trim` artifact keeps one cache key across a hardware flip
+/// that re-keys every real encode.
+pub(crate) const ENCODER_COPY: &str = "copy";
 pub(crate) const ENCODER_X264_QUALITY: &str = "libx264-medium";
 pub(crate) const ENCODER_X264_FAST: &str = "libx264-veryfast";
 
@@ -202,6 +207,12 @@ pub(crate) fn resolve_encoder(
     hw: Option<&str>,
     av1: Option<&str>,
 ) -> String {
+    // Before anything else, and before either probe: a copy has no encoder to
+    // pick, and asking the hardware probe would spawn ffmpeg twice to answer a
+    // question the preset already settled.
+    if preset.is_stream_copy() {
+        return ENCODER_COPY.to_string();
+    }
     if is_h264(&preset.vcodec) {
         return match preset.channel {
             Channel::Quality => ENCODER_X264_QUALITY.to_string(),
@@ -263,9 +274,18 @@ pub(crate) fn build_args(spec: &EncodeJobSpec) -> Vec<OsString> {
 
     push!("-nostdin", "-hide_banner", "-nostats", "-v", "error");
 
-    // Input `-ss` (fast seek) rather than output `-ss`: we always re-encode,
-    // so the fast seek is also exact, and the decoder skips the leading part
-    // of the file instead of decoding and discarding it.
+    // Input `-ss` (fast seek) rather than output `-ss`: an encode re-describes
+    // every frame anyway, so the fast seek is also exact, and the decoder
+    // skips the leading part of the file instead of decoding and discarding
+    // it.
+    //
+    // For a **stream copy** the same options are inexact by nature, and
+    // deliberately left that way (docs/video-hover-preview-implementation.md
+    // §4): the packets cannot be re-timed, so the cut lands on the source's
+    // own keyframe boundaries. A slice may therefore run a little past
+    // `end_cs`, to the end of the GOP that straddles it, and a source whose
+    // first keyframe is late starts late. Both are acceptable for a hover
+    // preview and neither is worth a decode to fix.
     if let Some(start_cs) = spec.params.start_cs {
         push!("-ss", seconds(start_cs));
     }
@@ -315,8 +335,13 @@ pub(crate) fn build_args(spec: &EncodeJobSpec) -> Vec<OsString> {
         push!("-loop", "0");
     }
 
-    args.push(OsString::from("-pix_fmt"));
-    args.push(OsString::from("yuv420p"));
+    // Never for a copy: the packets keep whatever pixel format they were
+    // encoded in, and naming one asks a filter chain that does not exist to
+    // convert them.
+    if !preset.is_stream_copy() {
+        args.push(OsString::from("-pix_fmt"));
+        args.push(OsString::from("yuv420p"));
+    }
     args.push(OsString::from("-y"));
     args.push(spec.output.clone().into_os_string());
     args
@@ -392,11 +417,23 @@ fn audio_encoder(acodec: &str) -> &str {
     }
 }
 
-fn video_args(encoder: &str, quality: QualityMode) -> Vec<OsString> {
+fn video_args(encoder: &str, quality: Option<QualityMode>) -> Vec<OsString> {
+    // A stream copy is the one vector with no rate control at all: the packets
+    // are moved, not re-described, so every knob below would be a lie.
+    if encoder == ENCODER_COPY {
+        return vec![OsString::from("-c:v"), OsString::from("copy")];
+    }
     let mut args: Vec<String> = Vec::new();
     let mut codec = |name: &str| {
         args.push("-c:v".to_string());
         args.push(name.to_string());
+    };
+    // Unreachable through config (only a copy preset resolves to no quality,
+    // and it returned above); a preset that got here without one still names
+    // its encoder rather than silently encoding at ffmpeg's default.
+    let Some(quality) = quality else {
+        codec(encoder);
+        return args.into_iter().map(OsString::from).collect();
     };
     match encoder {
         ENCODER_X264_QUALITY => {
@@ -1327,10 +1364,10 @@ mod tests {
     /// 100, so the CRF is remapped rather than passed through.
     #[test]
     fn every_encoder_maps_the_presets_quality() {
-        let args_for = |encoder: &str, quality| {
+        let args_for = |encoder: &str, quality: QualityMode| {
             let mut spec = spec_for("clip-fast", None, None);
             spec.params.encoder = encoder.to_string();
-            spec.params.preset.quality = quality;
+            spec.params.preset.quality = Some(quality);
             args_of(&spec)
         };
 
@@ -1444,6 +1481,50 @@ mod tests {
         assert_eq!(preview[at(&preview, "-t") + 1], "16.00");
         // An mp4 all the same: playback must not wait for a trailing moov.
         assert_eq!(preview[at(&preview, "-movflags") + 1], "+faststart");
+    }
+
+    /// The stream-copy vector: everything an encode would add must be absent,
+    /// because every one of those options describes work this job does not do
+    /// — and `-pix_fmt` in particular asks a filter chain that does not exist
+    /// to convert packets nothing decoded.
+    #[test]
+    fn the_preview_trim_preset_copies_instead_of_encoding() {
+        let preset = preset("preview-trim");
+        // The hardware slot never reaches a copy: the probe would spawn
+        // ffmpeg twice to answer a question the preset already settled.
+        assert_eq!(resolve_encoder(&preset, None, None), ENCODER_COPY);
+        assert_eq!(
+            resolve_encoder(&preset, Some("h264_nvenc"), Some("libsvtav1")),
+            ENCODER_COPY,
+            "and a validated encoder does not change the identity, so the key              survives a hardware flip"
+        );
+
+        let trim = args_of(&spec_for("preview-trim", None, Some(1600)));
+        assert_eq!(trim[at(&trim, "-c:v") + 1], "copy");
+        assert!(trim.contains(&"-an".to_string()), "{trim:?}");
+        assert!(!trim.contains(&"0:a:0?".to_string()), "{trim:?}");
+        assert_eq!(trim[at(&trim, "-t") + 1], "16.00");
+        assert_eq!(trim[at(&trim, "-movflags") + 1], "+faststart");
+        for absent in [
+            "-crf", "-b:v", "-preset", "-vf", "-fpsmax", "-pix_fmt", "-q:v", "-cq",
+        ] {
+            assert!(
+                !trim.contains(&absent.to_string()),
+                "{absent} has no meaning for a stream copy: {trim:?}"
+            );
+        }
+        for encoder in ["libx264", "h264_nvenc", "h264_mf", "libsvtav1"] {
+            assert!(
+                !trim.contains(&encoder.to_string()),
+                "no encoder is named at all: {trim:?}"
+            );
+        }
+        // A start bound still rides the input side; the inexactness that buys
+        // is the documented cost of not decoding.
+        let seeked = args_of(&spec_for("preview-trim", Some(500), Some(2100)));
+        assert_eq!(seeked[at(&seeked, "-ss") + 1], "5.00");
+        assert!(at(&seeked, "-ss") < at(&seeked, "-i"));
+        assert_eq!(seeked[at(&seeked, "-t") + 1], "16.00");
     }
 
     /// Per-container spelling: webp's quality knob is `-q:v`, vp9 needs an
@@ -1672,7 +1753,7 @@ mod tests {
     #[test]
     fn quality_mode_and_output_paths_reach_the_command_line() {
         let mut spec = spec_for("clip", None, None);
-        spec.params.preset.quality = QualityMode::BitrateKbps(2500);
+        spec.params.preset.quality = Some(QualityMode::BitrateKbps(2500));
         let args = args_of(&spec);
         assert_eq!(args[at(&args, "-b:v") + 1], "2500k");
         assert!(!args.contains(&"-crf".to_string()));
