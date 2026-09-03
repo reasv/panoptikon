@@ -482,6 +482,32 @@ pub struct TranscodeConfig {
     /// spelling, `nvenc` or `h264_nvenc`).
     #[serde(default = "default_transcode_hwaccel")]
     pub hwaccel: String,
+    /// Whether grid and filmstrip hover previews may request the `preview`
+    /// rendition: `"on"`, `"off"`, or `"auto"` — on only where the hardware
+    /// H.264 encoder probe validated one, since a software encode of every
+    /// cell the pointer crosses is a CPU bill the host did not ask for.
+    ///
+    /// Only the *re-encode* rung. The two cheaper rungs — playing the
+    /// original, and remuxing its first seconds with `preview-trim` — need no
+    /// encoder and are governed by [`Self::hover_preview_max_bytes`] instead;
+    /// a policy that wants none of them sets `[policies.client] hover_preview
+    /// = false`, which denies all three.
+    #[serde(default = "default_transcode_hover_preview")]
+    pub hover_preview: String,
+    /// The byte cap that picks a hover preview's rung, published to clients on
+    /// `/api/client-config`. A video at or under it is played from its own
+    /// file; over it, the client asks for the first 16 s — remuxed when the
+    /// estimated slice fits under the cap, re-encoded otherwise. A video of
+    /// 16 s or less has no shorter slice to estimate, so over the cap it is
+    /// always re-encoded.
+    ///
+    /// It exists because `preload="none"` does not bound what a browser
+    /// fetches: Chromium answers one open-ended range and buffers as far
+    /// ahead as it likes — measured at 9.9 MB of a 15.7 MB file for a single
+    /// three-second hover, which over a network mount is the whole cost of
+    /// the feature.
+    #[serde(default = "default_hover_preview_max_bytes")]
+    pub hover_preview_max_bytes: u64,
     /// Encoding profiles. Absent means the built-in presets; an explicit
     /// empty table means none at all; entries are merged by name over the
     /// built-ins (the `[vector_quants]` tri-state).
@@ -522,6 +548,17 @@ fn default_transcode_hwaccel() -> String {
     "auto".to_string()
 }
 
+fn default_transcode_hover_preview() -> String {
+    "auto".to_string()
+}
+
+/// 16 MiB: a couple of seconds of a 4K stream, a whole short clip, and far
+/// less than the 9.9 MB a single hover was measured pulling off a 15.7 MB
+/// file before the cap existed.
+fn default_hover_preview_max_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
 fn default_max_mosaic_inputs() -> usize {
     12
 }
@@ -550,6 +587,8 @@ impl Default for TranscodeConfig {
             cache_size_mb: default_transcode_cache_size_mb(),
             cache_size_max_mb: default_transcode_cache_size_max_mb(),
             hwaccel: default_transcode_hwaccel(),
+            hover_preview: default_transcode_hover_preview(),
+            hover_preview_max_bytes: default_hover_preview_max_bytes(),
             profiles: None,
             max_mosaic_inputs: default_max_mosaic_inputs(),
             max_mosaic_loop_mb: default_max_mosaic_loop_mb(),
@@ -945,7 +984,8 @@ pub struct PolicyConfig {
     /// per-policy UI configuration; `relay_enabled` is also enforced by the
     /// gateway's pairing bootstrap endpoints.
     /// Recognized-by-convention keys (documented, not enforced):
-    /// `search_throttle_ms`, `disable_backend_open`, `relay_enabled`.
+    /// `search_throttle_ms`, `disable_backend_open`, `relay_enabled`,
+    /// `transcode_presets`, `hover_preview`.
     /// Default: empty object (`relay_enabled` therefore defaults true).
     #[serde(default = "default_client_table")]
     pub client: serde_json::Value,
@@ -1470,8 +1510,16 @@ impl Settings {
                 hw::hwaccel_values()
             );
         }
+        if hw::parse_hover_preview(&transcode.hover_preview).is_none() {
+            anyhow::bail!(
+                "transcode.hover_preview '{}' is invalid: expected one of {}",
+                transcode.hover_preview,
+                hw::hover_preview_values()
+            );
+        }
         for (key, value) in [
             ("cache_size_mb", transcode.cache_size_mb),
+            ("hover_preview_max_bytes", transcode.hover_preview_max_bytes),
             ("max_concurrent_jobs", transcode.max_concurrent_jobs as u64),
             ("max_mosaic_inputs", transcode.max_mosaic_inputs as u64),
             ("max_mosaic_loop_mb", transcode.max_mosaic_loop_mb),

@@ -325,7 +325,7 @@ mod tests {
             TranscodeParams::new("sha", clip.clone(), quality.clone(), None, None).cache_key();
 
         let mut retuned = clip.clone();
-        retuned.quality = presets::QualityMode::Crf(20);
+        retuned.quality = Some(presets::QualityMode::Crf(20));
         assert_ne!(
             TranscodeParams::new("sha", retuned, quality.clone(), None, None).cache_key(),
             baseline

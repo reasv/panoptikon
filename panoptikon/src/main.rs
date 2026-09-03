@@ -344,6 +344,23 @@ async fn async_main() -> anyhow::Result<()> {
         )));
     }
 
+    // Warm the hardware H.264 probe when `[transcode] hover_preview` is
+    // "auto", the one setting whose answer needs a toolchain. The probe lists
+    // ffmpeg's encoders and runs a one-frame validation encode; without this,
+    // the first /api/client-config of the session pays for both on a page
+    // load, and that request is on every UI mount. Fire-and-forget on a
+    // blocking thread — nothing awaits it, the bind below is not delayed, and
+    // the client-config handler's own resolve stays the fallback: by then it
+    // is reading the warm OnceLock.
+    if media_tools::transcode::hw::hover_preview_probe_warm_needed(
+        &settings.transcode.hover_preview,
+    ) {
+        tokio::task::spawn_blocking(|| {
+            let encoder = media_tools::transcode::hw::fast_h264_encoder();
+            tracing::debug!(?encoder, "hover-preview hardware probe warmed");
+        });
+    }
+
     // Production UI ([upstreams.ui] local = true): npm install / next build
     // when stale, then a supervised `next start` on base_url's host/port —
     // all in a background task, so gateway startup is not blocked (the proxy

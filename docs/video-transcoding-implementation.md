@@ -223,6 +223,40 @@ code has no Settings handle); `validate_transcode()` in
 is a tunable default), appended to all five `config/server/*.toml`,
 including a commented `[transcode.profiles.small-share]` example.
 
+`hover_preview` ("auto" | "on" | "off", default `"auto"`) and
+`hover_preview_max_bytes` (16 MiB) join them with the grid/filmstrip hover
+preview (`docs/video-hover-preview-implementation.md`). `hover_preview`
+governs the **re-encode** rung only: `"auto"` allows the `preview` rendition
+where `hw::fast_h264_encoder()` validated one, since a software encode of
+every cell a pointer crosses is a CPU bill the host did not ask for. Parsed by
+`hw::parse_hover_preview`, rejected at config load like `hwaccel`, resolved by
+`hw::resolve_hover_preview` (probe injected, so `"on"`/`"off"` never spawn
+ffmpeg) and warmed at startup by `hw::hover_preview_probe_warm_needed` so no
+page load pays for it. `hover_preview_max_bytes` is the line the client's
+ladder turns on and is published verbatim. Both ride
+`/api/client-config` as `hover_preview: {direct, trim, transcode, max_bytes}`;
+`[policies.client] hover_preview = false` denies all three rungs, and dropping
+`preview` or `preview-trim` from that policy's `transcode_presets` denies that
+rung alone.
+
+**Stream copy** (`vcodec = "copy"`, `presets::STREAM_COPY_VCODEC`) is the
+first preset shape that does not encode: `resolve_encoder` short-circuits to
+`ENCODER_COPY` before either probe, `build_args` emits `-c:v copy` with no
+rate control, no `-vf`, no `-fpsmax` and no `-pix_fmt`, and load-time
+validation refuses a copy profile that names a crf/bitrate, a `max_height`, an
+`fps_max`, audio, or an animated-image container (inherited values are dropped
+instead, so `vcodec = "copy"` over a built-in stays expressible). Compositions
+refuse a copy preset by name — a filtergraph has no source packets to move.
+
+**Preview jobs get no priority lane.** They are `JobWeight::Light` like every
+other single-file job and take their ordinary FIFO place behind gallery
+playback transcodes and clip exports, which at the default
+`max_concurrent_jobs = 1` means a hovered cell waits for whatever is already
+encoding — and says so, through the queue position the pool already reports.
+A lane that let a skimmed pointer jump ahead of an export the user is waiting
+on would be the wrong trade; the 16 s cap and the client's one-preview-at-a-
+time rule are what keep the queue short instead.
+
 ### API (`api/video.rs`)
 
 - `POST /api/video/transcode` — `{id, id_type, preset, start_cs?, end_cs?}`

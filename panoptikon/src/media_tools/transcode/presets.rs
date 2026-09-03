@@ -16,6 +16,12 @@ use utoipa::ToSchema;
 /// DTO; the identifier charset is the same one database and policy names use.
 const MAX_PRESET_ID_LEN: usize = 64;
 
+/// The one `vcodec` value that names no codec at all: the video packets are
+/// remuxed as they are, with no decode and no encode
+/// (docs/video-hover-preview-implementation.md §4, B6). ffmpeg's own spelling,
+/// so a profile that writes it reads exactly like the `-c:v copy` it becomes.
+pub(crate) const STREAM_COPY_VCODEC: &str = "copy";
+
 /// Ceiling on a profile's frame-rate cap. Well past anything a browser plays;
 /// it exists so a typo cannot ask ffmpeg for an absurd `-fpsmax`.
 const MAX_FPS_MAX: f64 = 240.0;
@@ -97,6 +103,12 @@ pub enum Surface {
     Playback,
     Clip,
     Mosaic,
+    /// The grid/filmstrip hover preview
+    /// (docs/video-hover-preview-implementation.md). Its own surface rather
+    /// than a second `Playback` preset: a policy that offers the gallery's
+    /// full-size rendition need not also pay for a preview of every cell the
+    /// pointer crosses, and the UI never offers this one in a dropdown.
+    Preview,
 }
 
 /// Rate control. `Crf` is the quality target every built-in uses (and the
@@ -124,13 +136,30 @@ pub(crate) struct ResolvedPreset {
     pub(crate) vcodec: String,
     /// `None` means the output has no audio stream.
     pub(crate) acodec: Option<String>,
-    pub(crate) quality: QualityMode,
+    /// `None` only for a stream-copy preset, which has no rate control to
+    /// carry. `Some(q)` serializes exactly as the bare `q` did before the
+    /// option was introduced, so no existing artifact was re-keyed by it.
+    pub(crate) quality: Option<QualityMode>,
     /// Cap on output height in pixels; `None` keeps the source height.
     pub(crate) max_height: Option<i64>,
     pub(crate) fps_max: Option<f64>,
     pub(crate) channel: Channel,
     #[serde(skip)]
     pub(crate) surfaces: Vec<Surface>,
+}
+
+impl ResolvedPreset {
+    /// Whether this preset remuxes rather than encodes. Load-time validation
+    /// guarantees such a preset carries no rate control, no resolution or
+    /// frame-rate cap and no audio, so every consumer can read those as
+    /// "nothing to apply" rather than re-deriving the rule.
+    pub(crate) fn is_stream_copy(&self) -> bool {
+        is_stream_copy_vcodec(&self.vcodec)
+    }
+}
+
+fn is_stream_copy_vcodec(vcodec: &str) -> bool {
+    vcodec.trim().eq_ignore_ascii_case(STREAM_COPY_VCODEC)
 }
 
 /// `[transcode.profiles.<name>]`: a patch over a built-in, or a whole new
@@ -180,25 +209,67 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
         Container,
         &'static str,
         Option<&'static str>,
-        QualityMode,
+        Option<QualityMode>,
         Option<i64>,
         Option<f64>,
         Channel,
         &'static [Surface],
     );
 
-    const TABLE: [Row; 8] = [
+    const TABLE: [Row; 10] = [
         (
             "playback",
             "Playback",
             Container::Mp4,
             "h264",
             Some("aac"),
-            QualityMode::Crf(23),
+            Some(QualityMode::Crf(23)),
             Some(1080),
             None,
             Channel::Fast,
             &[Surface::Playback],
+        ),
+        (
+            "preview",
+            "Hover preview",
+            Container::Mp4,
+            "h264",
+            // Silent by design, not by accident: a grid full of cells the
+            // pointer skims cannot ask for audio, and `-an` costs nothing to
+            // encode. The container carries audio, so this is the one built-in
+            // mp4 that deliberately declines it.
+            None,
+            // A picture at most a few hundred CSS pixels wide, thrown away as
+            // soon as the pointer leaves: latency and bandwidth are the whole
+            // point, quality is not.
+            Some(QualityMode::Crf(26)),
+            Some(480),
+            Some(30.0),
+            Channel::Fast,
+            &[Surface::Preview],
+        ),
+        (
+            "preview-trim",
+            "Hover preview (trimmed)",
+            Container::Mp4,
+            // No decode, no encode: the source's own h264 packets remuxed
+            // into a short mp4. It exists because rung 0 — playing the
+            // original — turned out to cost megabytes a hover (Chromium
+            // buffers as far ahead as it likes, measured 9.9 MB of a 15.7 MB
+            // file for one three-second dwell), so a file over the byte cap
+            // is served its first seconds instead of its whole self.
+            STREAM_COPY_VCODEC,
+            None,
+            // A stream copy has no rate control, no scale and no frame-rate
+            // cap: there is nothing to decide, only packets to move.
+            None,
+            None,
+            None,
+            // I/O-bound rather than CPU-bound, so the channel is only a
+            // statement of intent; `resolve_encoder` never reaches the
+            // hardware probe for a copy.
+            Channel::Fast,
+            &[Surface::Preview],
         ),
         (
             "clip",
@@ -206,7 +277,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             Container::Mp4,
             "h264",
             Some("aac"),
-            QualityMode::Crf(18),
+            Some(QualityMode::Crf(18)),
             None,
             None,
             Channel::Quality,
@@ -218,7 +289,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             Container::Mp4,
             "h264",
             Some("aac"),
-            QualityMode::Crf(23),
+            Some(QualityMode::Crf(23)),
             None,
             None,
             Channel::Fast,
@@ -234,7 +305,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             // the libwebp default of 75: lossy WebP is intra-only VP8, so on
             // video content 75 blocks visibly, and the gif-substitute use
             // (Discord/Matrix paste) has size headroom to spend on quality.
-            QualityMode::Crf(85),
+            Some(QualityMode::Crf(85)),
             Some(720),
             // Halves 60 fps sources cleanly; 24/25/30 pass through untouched
             // (a 24-cap would judder 30 fps content).
@@ -251,7 +322,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             // A real inter-coded video codec in an image container, so it
             // beats webp-anim on both size and quality; second in the lineup
             // only because far fewer destinations animate it.
-            QualityMode::Crf(30),
+            Some(QualityMode::Crf(30)),
             Some(720),
             Some(30.0),
             Channel::Fast,
@@ -263,7 +334,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             Container::Mp4,
             "h264",
             Some("aac"),
-            QualityMode::Crf(18),
+            Some(QualityMode::Crf(18)),
             None,
             None,
             Channel::Quality,
@@ -275,7 +346,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             Container::Mp4,
             "h264",
             Some("aac"),
-            QualityMode::Crf(23),
+            Some(QualityMode::Crf(23)),
             None,
             None,
             Channel::Fast,
@@ -287,7 +358,7 @@ pub(crate) fn builtin_presets() -> Vec<ResolvedPreset> {
             Container::Webm,
             "vp9",
             Some("opus"),
-            QualityMode::Crf(32),
+            Some(QualityMode::Crf(32)),
             None,
             None,
             Channel::Quality,
@@ -406,7 +477,7 @@ fn resolve_one(
         .container
         .or_else(|| base.map(|preset| preset.container))
         .context("container is required")?;
-    let quality = match (patch.crf, patch.bitrate_kbps) {
+    let explicit_quality = match (patch.crf, patch.bitrate_kbps) {
         (Some(_), Some(_)) => bail!("crf and bitrate_kbps are mutually exclusive"),
         (Some(crf), None) => Some(QualityMode::Crf(crf)),
         (None, Some(kbps)) => {
@@ -426,20 +497,49 @@ fn resolve_one(
     if vcodec.trim().is_empty() {
         bail!("vcodec must not be empty");
     }
-    let quality = quality
-        .or_else(|| base.map(|preset| preset.quality))
-        .context("crf or bitrate_kbps is required")?;
-    if let QualityMode::Crf(crf) = quality {
-        let max = container.max_crf();
-        if !(0..=max).contains(&crf) {
-            bail!(
-                "crf must be between 0 and {max} for container {}",
-                container.ext()
-            );
-        }
+    // A stream copy has nothing to decide: no rate control, no scale, no
+    // frame-rate cap, no audio. Settings it *inherits* from a base are
+    // dropped (otherwise `vcodec = "copy"` over a built-in would be
+    // unexpressible, there being no way to clear a crf); settings the patch
+    // itself names are refused, because they say two contradictory things
+    // about the same output in one entry.
+    let copies = is_stream_copy_vcodec(&vcodec);
+    if copies && container.is_animated_image() {
+        bail!(
+            "container {} cannot stream-copy: its frames are re-encoded by definition",
+            container.ext()
+        );
     }
 
-    let acodec = resolve_acodec(patch, base)?;
+    let quality = if copies {
+        if explicit_quality.is_some() {
+            bail!("vcodec = \"copy\" re-encodes nothing, so it takes no crf or bitrate_kbps");
+        }
+        None
+    } else {
+        let quality = explicit_quality
+            .or_else(|| base.and_then(|preset| preset.quality))
+            .context("crf or bitrate_kbps is required")?;
+        if let QualityMode::Crf(crf) = quality {
+            let max = container.max_crf();
+            if !(0..=max).contains(&crf) {
+                bail!(
+                    "crf must be between 0 and {max} for container {}",
+                    container.ext()
+                );
+            }
+        }
+        Some(quality)
+    };
+
+    let acodec = if copies {
+        if patch.acodec.is_some() || patch.audio == Some(true) {
+            bail!("vcodec = \"copy\" copies the video stream only, so it takes no audio");
+        }
+        None
+    } else {
+        resolve_acodec(patch, base)?
+    };
     if acodec.is_some() && !container.carries_audio() {
         bail!("container {} cannot carry an audio stream", container.ext());
     }
@@ -447,14 +547,22 @@ fn resolve_one(
     let max_height = match patch.max_height {
         Some(0) => None,
         Some(height) if height < 0 => bail!("max_height must not be negative"),
+        Some(height) if copies => {
+            bail!("vcodec = \"copy\" cannot rescale, so max_height must be 0 or absent ({height})")
+        }
         Some(height) => Some(height),
+        None if copies => None,
         None => base.and_then(|preset| preset.max_height),
     };
     let fps_max = match patch.fps_max {
+        None if copies => None,
         None => base.and_then(|preset| preset.fps_max),
         Some(fps) => {
             if !fps.is_finite() || !(0.0..=MAX_FPS_MAX).contains(&fps) {
                 bail!("fps_max must be between 0 and {MAX_FPS_MAX}");
+            }
+            if copies && fps > 0.0 {
+                bail!("vcodec = \"copy\" cannot resample, so fps_max must be 0 or absent");
             }
             (fps > 0.0).then_some(fps)
         }
@@ -536,6 +644,8 @@ mod tests {
             ids,
             [
                 "playback",
+                "preview",
+                "preview-trim",
                 "clip",
                 "clip-fast",
                 "webp-anim",
@@ -548,13 +658,52 @@ mod tests {
 
         let playback = find_preset(&presets, "playback").unwrap();
         assert_eq!(playback.container, Container::Mp4);
-        assert_eq!(playback.quality, QualityMode::Crf(23));
+        assert_eq!(playback.quality, Some(QualityMode::Crf(23)));
         assert_eq!(playback.max_height, Some(1080));
         assert_eq!(playback.channel, Channel::Fast);
         assert!(playback.surfaces.contains(&Surface::Playback));
 
+        // The hover preview: the one built-in that pairs an audio-capable
+        // container with no audio stream, and the only h264 built-in that caps
+        // both height and frame rate. Every number here is a client contract
+        // in miniature — the 16 s window the UI asks for is trim, not preset,
+        // but the 480 and the silence are what make a skimmed grid affordable.
+        let preview = find_preset(&presets, "preview").unwrap();
+        assert_eq!(preview.container, Container::Mp4);
+        assert_eq!(preview.vcodec, "h264");
+        assert_eq!(preview.acodec, None);
+        assert_eq!(preview.quality, Some(QualityMode::Crf(26)));
+        assert_eq!(preview.max_height, Some(480));
+        assert_eq!(preview.fps_max, Some(30.0));
+        assert_eq!(preview.channel, Channel::Fast);
+        assert_eq!(preview.surfaces, vec![Surface::Preview]);
+        // Two rungs, two presets, one surface: the remux and the re-encode
+        // are both hover previews and neither belongs in a dropdown.
+        let preview_trim = find_preset(&presets, "preview-trim").unwrap();
+        assert_eq!(preview_trim.container, Container::Mp4);
+        assert_eq!(preview_trim.vcodec, STREAM_COPY_VCODEC);
+        assert!(preview_trim.is_stream_copy());
+        assert_eq!(preview_trim.acodec, None);
+        assert_eq!(preview_trim.quality, None, "a copy has no rate control");
+        assert_eq!(preview_trim.max_height, None, "and cannot rescale");
+        assert_eq!(preview_trim.fps_max, None, "or resample");
+        assert_eq!(preview_trim.surfaces, vec![Surface::Preview]);
+        assert!(
+            !preview.is_stream_copy(),
+            "the 480p rung really encodes; only its cheaper sibling copies"
+        );
+
+        // `quality` became an `Option` when the copy rung arrived, and that
+        // must have re-keyed nothing: `Some(q)` and a bare `q` serialize
+        // identically, and the serialization is half the cache key.
+        assert_eq!(
+            serde_json::to_string(&Some(QualityMode::Crf(23))).unwrap(),
+            serde_json::to_string(&QualityMode::Crf(23)).unwrap(),
+            "wrapping the quality in an Option must not orphan every artifact"
+        );
+
         let clip = find_preset(&presets, "clip").unwrap();
-        assert_eq!(clip.quality, QualityMode::Crf(18));
+        assert_eq!(clip.quality, Some(QualityMode::Crf(18)));
         assert_eq!(clip.channel, Channel::Quality);
         assert_eq!(clip.max_height, None);
 
@@ -564,27 +713,38 @@ mod tests {
         let webp = find_preset(&presets, "webp-anim").unwrap();
         assert_eq!(webp.container, Container::Webp);
         assert_eq!(webp.acodec, None);
-        assert_eq!(webp.quality, QualityMode::Crf(85));
+        assert_eq!(webp.quality, Some(QualityMode::Crf(85)));
         assert_eq!(webp.fps_max, Some(30.0));
         assert!(webp.surfaces.contains(&Surface::Clip) && webp.surfaces.contains(&Surface::Mosaic));
         let avif = find_preset(&presets, "avif-anim").unwrap();
         assert_eq!(avif.container, Container::Avif);
         assert_eq!(avif.vcodec, "av1");
         assert_eq!(avif.acodec, None);
-        assert_eq!(avif.quality, QualityMode::Crf(30));
+        assert_eq!(avif.quality, Some(QualityMode::Crf(30)));
         assert_eq!(avif.max_height, Some(720));
         assert_eq!(avif.fps_max, Some(30.0));
         assert_eq!(avif.surfaces, webp.surfaces);
         assert!(
             presets
                 .iter()
-                .all(|preset| preset.container.is_animated_image() == preset.fps_max.is_some()),
-            "the animated-image presets are exactly the fps-capped ones"
+                .all(|preset| !preset.container.is_animated_image() || preset.fps_max.is_some()),
+            "every animated-image preset is fps-capped"
+        );
+        let capped: Vec<&str> = presets
+            .iter()
+            .filter(|preset| preset.fps_max.is_some())
+            .map(|preset| preset.id.as_str())
+            .collect();
+        assert_eq!(
+            capped,
+            ["preview", "webp-anim", "avif-anim"],
+            "the fps cap is the animated-image containers plus the hover preview, \
+             whose cells are too small for a 60 fps source to be worth decoding"
         );
         let webm = find_preset(&presets, "mosaic-webm").unwrap();
         assert_eq!(webm.vcodec, "vp9");
         assert_eq!(webm.acodec.as_deref(), Some("opus"));
-        assert_eq!(webm.quality, QualityMode::Crf(32));
+        assert_eq!(webm.quality, Some(QualityMode::Crf(32)));
     }
 
     /// The tri-state: absent means the built-ins, an explicit empty table
@@ -601,7 +761,7 @@ mod tests {
         let resolved = resolve_presets(Some(&map));
         assert_eq!(resolved.len(), builtin_presets().len() + 1);
         let novel = find_preset(&resolved, "small-share").unwrap();
-        assert_eq!(novel.quality, QualityMode::Crf(28));
+        assert_eq!(novel.quality, Some(QualityMode::Crf(28)));
         // Nothing inherited: a novel profile with no acodec has no audio, and
         // its label defaults to its own name.
         assert_eq!(novel.acodec, None);
@@ -618,14 +778,14 @@ mod tests {
         let resolved = resolve_presets(Some(&map));
         assert_eq!(resolved.len(), builtin_presets().len());
         let clip = find_preset(&resolved, "clip").unwrap();
-        assert_eq!(clip.quality, QualityMode::Crf(14));
+        assert_eq!(clip.quality, Some(QualityMode::Crf(14)));
         assert_eq!(clip.label, "Clip (archival)");
         assert_eq!(clip.container, Container::Mp4);
         assert_eq!(clip.acodec.as_deref(), Some("aac"));
         assert_eq!(clip.channel, Channel::Quality);
         assert_eq!(clip.surfaces, vec![Surface::Clip]);
         // Built-in ordering survives a patch, so the presets DTO stays stable.
-        assert_eq!(resolved[1].id, "clip");
+        assert_eq!(resolved[3].id, "clip");
 
         // The clearing conventions: audio = false drops the stream, a 0 cap
         // means uncapped, and bitrate_kbps replaces an inherited crf.
@@ -637,7 +797,7 @@ mod tests {
         let playback = find_preset(&resolved, "playback").unwrap();
         assert_eq!(playback.acodec, None);
         assert_eq!(playback.max_height, None);
-        assert_eq!(playback.quality, QualityMode::BitrateKbps(2500));
+        assert_eq!(playback.quality, Some(QualityMode::BitrateKbps(2500)));
     }
 
     /// Surface tags are what the UI filters on, and they are patchable.
@@ -656,6 +816,16 @@ mod tests {
             .map(|preset| preset.id.as_str())
             .collect();
         assert_eq!(playback_ids, ["playback"]);
+        let preview_ids: Vec<&str> = presets
+            .iter()
+            .filter(|preset| preset.surfaces.contains(&Surface::Preview))
+            .map(|preset| preset.id.as_str())
+            .collect();
+        assert_eq!(
+            preview_ids,
+            ["preview", "preview-trim"],
+            "the hover surface is disjoint from the dropdown surfaces"
+        );
 
         let map = profiles(&[("mosaic-webm", "surfaces = [\"clip\", \"mosaic\"]")]);
         let resolved = resolve_presets(Some(&map));
@@ -664,6 +834,116 @@ mod tests {
                 .unwrap()
                 .surfaces
                 .contains(&Surface::Clip)
+        );
+    }
+
+    /// The stream-copy rules, all of which exist because a copy has nothing to
+    /// apply them to. Settings a patch *names* alongside `vcodec = "copy"` are
+    /// refused — one entry saying two contradictory things about one output —
+    /// while settings it merely *inherits* are dropped, because there is no
+    /// way to clear an inherited crf and `vcodec = "copy"` over a built-in
+    /// would otherwise be unexpressible.
+    #[test]
+    fn a_stream_copy_preset_carries_nothing_to_encode_with() {
+        let copy_err = |body: &str, needle: &str| {
+            let map = profiles(&[("remux", body)]);
+            let err = validate_profiles(Some(&map)).expect_err(needle);
+            let text = format!("{err:#}");
+            assert!(text.contains(needle), "expected '{needle}' in: {text}");
+        };
+
+        // A whole copy preset needs only a container and the codec.
+        let map = profiles(&[(
+            "remux",
+            "container = \"mp4\"
+vcodec = \"copy\"",
+        )]);
+        validate_profiles(Some(&map)).expect("a copy needs no rate control");
+        let resolved = resolve_presets(Some(&map));
+        let remux = find_preset(&resolved, "remux").unwrap();
+        assert!(remux.is_stream_copy());
+        assert_eq!(
+            (
+                remux.quality,
+                remux.max_height,
+                remux.fps_max,
+                &remux.acodec
+            ),
+            (None, None, None, &None)
+        );
+
+        copy_err(
+            "container = \"mp4\"
+vcodec = \"copy\"
+crf = 26",
+            "takes no crf or bitrate_kbps",
+        );
+        copy_err(
+            "container = \"mp4\"
+vcodec = \"copy\"
+bitrate_kbps = 2500",
+            "takes no crf or bitrate_kbps",
+        );
+        copy_err(
+            "container = \"mp4\"
+vcodec = \"copy\"
+max_height = 480",
+            "cannot rescale",
+        );
+        copy_err(
+            "container = \"mp4\"
+vcodec = \"copy\"
+fps_max = 30",
+            "cannot resample",
+        );
+        copy_err(
+            "container = \"mp4\"
+vcodec = \"copy\"
+acodec = \"aac\"",
+            "takes no audio",
+        );
+        copy_err(
+            "container = \"mp4\"
+vcodec = \"copy\"
+audio = true",
+            "takes no audio",
+        );
+        // An image container re-encodes its frames by definition, so there is
+        // nothing for a copy to move into one.
+        copy_err(
+            "container = \"webp\"
+vcodec = \"copy\"",
+            "cannot stream-copy",
+        );
+        // The explicit clearing spellings stay legal: they say the same thing
+        // the copy already does.
+        validate_profiles(Some(&profiles(&[(
+            "remux",
+            "container = \"mp4\"
+vcodec = \"copy\"
+max_height = 0
+fps_max = 0
+audio = false",
+        )])))
+        .expect("zeroes and audio = false agree with the copy");
+
+        // Turning a real preset into a copy drops everything it inherited
+        // rather than failing on values it never asked for.
+        let map = profiles(&[("playback", "vcodec = \"copy\"")]);
+        validate_profiles(Some(&map)).expect("a built-in can be patched into a copy");
+        let playback = find_preset(&resolve_presets(Some(&map)), "playback")
+            .unwrap()
+            .clone();
+        assert!(playback.is_stream_copy());
+        assert_eq!(
+            (
+                playback.quality,
+                playback.max_height,
+                playback.fps_max,
+                playback.acodec
+            ),
+            (None, None, None, None),
+            "the inherited crf 23, 1080 cap and aac track are all dropped"
         );
     }
 

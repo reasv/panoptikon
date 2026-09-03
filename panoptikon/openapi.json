@@ -6190,7 +6190,7 @@
             "description": "Ruleset-derived feature switches (see ClientCapabilities)."
           },
           "client": {
-            "description": "The policy's `[policies.client]` table, verbatim (empty object when\nunset). Free-form; recognized-by-convention keys include\n`search_throttle_ms`, `disable_backend_open`, and `relay_enabled`\n(Relay is enabled when the key is absent)."
+            "description": "The policy's `[policies.client]` table, verbatim (empty object when\nunset). Free-form; recognized-by-convention keys include\n`search_throttle_ms`, `disable_backend_open`, `relay_enabled`\n(Relay is enabled when the key is absent), `transcode_presets`, and\n`hover_preview` (see the resolved `hover_preview` field below, which\nis what a client should read)."
           },
           "desktop_managed": {
             "type": "boolean",
@@ -6208,6 +6208,17 @@
               {
                 "$ref": "#/components/schemas/DisplayLoopTrigger",
                 "description": "The display-tier loop trigger (see [`DisplayLoopTrigger`]).\n\nAlways `Some` today: the loop ladder is unconditional. The `Option` is\nreserved for a build that stores no loops at all, which would publish\n`null` here rather than a bound it does not serve by — with nothing to\nevaluate, every animated item is an `<img>` on its original file and\nno client mounts a `<video>`."
+              }
+            ]
+          },
+          "hover_preview": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HoverPreview",
+                "description": "What the hover preview may do under this policy (see\n[`HoverPreview`]). `null` means the feature does not exist on this\nserver at all — a client reading `null` arms nothing and never\nre-derives the answer from the capabilities beside it."
               }
             ]
           },
@@ -7533,6 +7544,36 @@
           "status": {
             "type": "string",
             "description": "`\"ok\"` normally, `\"shutting_down\"` once shutdown has begun."
+          }
+        }
+      },
+      "HoverPreview": {
+        "type": "object",
+        "description": "The server's resolved answer to \"may this client preview a video on\nhover?\", for the three rungs of the ladder\n(docs/video-hover-preview-implementation.md §2).\n\nResolved here rather than derived client-side: each rung is a conjunction\nof facts the client cannot see (the policy's own switch, the `[transcode]\nhover_preview` server default, whether this policy may POST a transcode at\nall, and whether the preset each rung needs survives that policy's\n`transcode_presets` limit).\n\nThe client picks a rung per item against `max_bytes`; the server only says\nwhich rungs exist and where the line is.\n\nThe three flags are independent answers, not a scale. Each names its own\nconjunction, and the only thing they share is the policy switch\n(`[policies.client] hover_preview`), which is a negative override on all\nthree — so a `direct: false` answer does mean the whole feature is off for\nthis policy, but no other pair of members implies anything about each\nother. A policy can perfectly well offer the re-encode and not the remux\n(`transcode_presets` listing `preview` alone), or the reverse.",
+        "required": [
+          "direct",
+          "trim",
+          "transcode",
+          "max_bytes"
+        ],
+        "properties": {
+          "direct": {
+            "type": "boolean",
+            "description": "Rung 0: mount a muted `<video>` on the item's own file, for a file at\nor under `max_bytes` the browser can already decode.\n\nRequires nothing but the policy switch: the rung costs the server only\nRange reads, needs no job and no preset, so there is nothing else that\ncould withhold it."
+          },
+          "max_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The byte cap the ladder turns on (`[transcode]\nhover_preview_max_bytes`). A file at or under it plays directly; over\nit, the client estimates the 16 s slice as `size * min(16, duration) /\nduration` and takes rung 1 when that fits, rung 2 otherwise. An item\nwith no known duration cannot be estimated and never takes rung 1.\n\nSo is an item of 16 s or less: its estimate is the whole file, which\nis over the cap by the time this step is reached, and it goes straight\nto the re-encode. The trim rung only ever serves items *longer* than\nthe window.",
+            "minimum": 0
+          },
+          "transcode": {
+            "type": "boolean",
+            "description": "Rung 2: request the 480p `preview` re-encode for an item neither\ncheaper rung can serve.\n\nRequires the policy switch, the `[transcode] hover_preview` server\ndefault, permission to `POST /api/video/transcode`, and `preview`\nsurviving that policy's `transcode_presets` limit."
+          },
+          "trim": {
+            "type": "boolean",
+            "description": "Rung 1: request the `preview-trim` rendition — the source's own\npackets remuxed, no decode and no encode — when the estimated 16 s\nslice fits under `max_bytes`.\n\nRequires the policy switch, permission to `POST /api/video/transcode`,\nand `preview-trim` surviving that policy's `transcode_presets` limit.\nDeliberately **not** gated on the hardware-encoder probe or on\n`[transcode] hover_preview`: there is no encoder in this rung to have\nan opinion about."
           }
         }
       },
@@ -11382,7 +11423,8 @@
         "enum": [
           "playback",
           "clip",
-          "mosaic"
+          "mosaic",
+          "preview"
         ]
       },
       "SystemConfig": {

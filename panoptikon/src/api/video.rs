@@ -74,6 +74,19 @@ const SSE_KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// `[policies.client]` key restricting which presets a policy exposes.
 const CLIENT_PRESETS_KEY: &str = "transcode_presets";
 
+/// The preset a grid or filmstrip cell asks for on hover
+/// (docs/video-hover-preview-implementation.md §3). Named here because
+/// `/api/client-config` has to answer "may this client transcode a preview?"
+/// before any cell asks, and the answer is partly this preset's presence on
+/// the policy's table.
+pub(crate) const PREVIEW_PRESET_ID: &str = "preview";
+
+/// The cheaper hover rung's preset: the source's own packets remuxed into a
+/// short mp4, no decode and no encode. Named here for the same reason as
+/// [`PREVIEW_PRESET_ID`] — `/api/client-config` publishes whether this policy
+/// exposes it, before any cell asks.
+pub(crate) const PREVIEW_TRIM_PRESET_ID: &str = "preview-trim";
+
 /// The only value `cut` accepts: the server-side outro cut.
 const CUT_OUTRO: &str = "outro";
 
@@ -441,8 +454,19 @@ pub async fn video_compose(
     Json(mut body): Json<ComposeRequest>,
 ) -> ApiResult<Response<Body>> {
     let preset = policy_preset(&state.settings, &context, &body.output.preset)?;
+    // Before any per-item work: a composition's frames come out of a
+    // filtergraph, so there are no source packets for a stream copy to move.
+    // Refused by name here rather than left to ffmpeg, which would fail the
+    // whole graph with "Filtergraph has an output, but codec is copy" after
+    // the job had already been queued and dispatched.
+    if preset.is_stream_copy() {
+        return Err(unprocessable(format!(
+            "preset '{}' is a stream copy, which cannot render a composition",
+            preset.id
+        )));
+    }
     let limits = ComposeLimits::from_config();
-    // The item cap first, because the pass below is the request's first
+    // The item cap next, because the pass below is the request's first
     // per-item cost: a document too long to be accepted must not buy a query
     // per pin on the way to being refused for its length.
     compose::validate_item_count(&body, limits).map_err(compose_rejection)?;
@@ -1384,6 +1408,14 @@ fn allowed_presets(policy: &PolicyConfig) -> Vec<ResolvedPreset> {
     filter_presets(presets, policy.client.get(CLIENT_PRESETS_KEY))
 }
 
+/// Whether this policy's `transcode_presets` limit leaves `id` on its table.
+///
+/// The same resolution the POST enforces, so `/api/client-config` cannot
+/// promise a rendition the transcode route would then refuse by name.
+pub(crate) fn policy_exposes_preset(policy: &PolicyConfig, id: &str) -> bool {
+    find_preset(&allowed_presets(policy), id).is_some()
+}
+
 /// Pure half of [`allowed_presets`]: an absent (or non-array) setting means
 /// no restriction; an explicit list — empty included — means exactly it.
 fn filter_presets(
@@ -1485,8 +1517,19 @@ mod tests {
             ["playback", "clip-fast"]
         );
         assert!(
-            filter_presets(all, Some(&serde_json::json!([]))).is_empty(),
+            filter_presets(all.clone(), Some(&serde_json::json!([]))).is_empty(),
             "an explicit empty list offers nothing"
+        );
+        // The hover preview is an ordinary preset on this table: it is offered
+        // by default and withheld by a list that omits it, which is how a
+        // policy denies rung 1 alone (V5).
+        assert!(ids(&filter_presets(all.clone(), None)).contains(&PREVIEW_PRESET_ID));
+        assert_eq!(
+            ids(&filter_presets(
+                all,
+                Some(&serde_json::json!(["playback", "preview"]))
+            )),
+            ["playback", "preview"]
         );
     }
 
@@ -1868,6 +1911,8 @@ transcode_presets = ["playback"]
             ids,
             [
                 "playback",
+                "preview",
+                "preview-trim",
                 "clip",
                 "clip-fast",
                 "webp-anim",
@@ -1877,25 +1922,40 @@ transcode_presets = ["playback"]
                 "mosaic-webm",
             ]
         );
-        assert_eq!(json["presets"][0]["ext"], "mp4");
-        assert_eq!(json["presets"][0]["channel"], "fast");
-        assert_eq!(json["presets"][0]["surfaces"][0], "playback");
-        assert_eq!(json["presets"][3]["ext"], "webp");
+        let row = |id: &str| {
+            json["presets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|preset| preset["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is on the table"))
+                .clone()
+        };
+        assert_eq!(row("playback")["ext"], "mp4");
+        assert_eq!(row("playback")["channel"], "fast");
+        assert_eq!(row("playback")["surfaces"][0], "playback");
+        assert_eq!(row("webp-anim")["ext"], "webp");
+        // The hover preview is listed like any other preset — the surface tag
+        // is what keeps it out of the clip and mosaic dropdowns, not absence
+        // from this response.
+        assert_eq!(row("preview")["surfaces"][0], "preview");
+        assert_eq!(row("preview")["channel"], "fast");
         // The preset's height cap rides along because it is a *rejection*: a
         // canvas taller than it is refused rather than rescaled, so a client
         // that cannot see it discovers it only by being turned away. Presets
         // with no cap carry no key rather than a null.
-        assert_eq!(json["presets"][0]["max_height"], 1080);
-        assert_eq!(json["presets"][3]["max_height"], 720);
+        assert_eq!(row("playback")["max_height"], 1080);
+        assert_eq!(row("webp-anim")["max_height"], 720);
+        assert_eq!(row("preview")["max_height"], 480);
         assert!(
-            json["presets"][1].get("max_height").is_none(),
+            row("clip").get("max_height").is_none(),
             "`clip` is uncapped: {}",
-            json["presets"][1]
+            row("clip")
         );
         // `fps_max` is deliberately absent from the DTO: an over-cap frame
         // rate is silently capped, never refused, so there is nothing a client
         // could do with the number.
-        assert!(json["presets"][0].get("fps_max").is_none());
+        assert!(row("preview").get("fps_max").is_none());
 
         // The compose limits ride along, so a client builder clamps against
         // what this server enforces rather than mirrored constants — the
@@ -3372,5 +3432,347 @@ transcode_presets = ["playback"]
             next_event(&mut body).await.is_none(),
             "the stream ends after the terminal event"
         );
+    }
+
+    // --- the hover preview (docs/video-hover-preview-implementation.md) -----
+
+    const PREVIEW_ITEM: &str = "b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7";
+
+    /// A source that makes every preview assertion mean something: longer
+    /// than the 16 s window, taller than the 480 px cap, and carrying an
+    /// audio track the preset must drop. Flat colour at 10 fps so building it
+    /// costs a fraction of a second; returns `false` where this machine
+    /// cannot, so the test skips rather than fails.
+    fn write_preview_source(path: &std::path::Path) -> bool {
+        let status = std::process::Command::new(crate::media_tools::ffmpeg())
+            .args(["-y", "-v", "error"])
+            .args(["-f", "lavfi", "-i", "color=c=0x2040A0:s=1280x720:d=20:r=10"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=20"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "30"])
+            .args(["-c:a", "aac", "-shortest"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
+    }
+
+    /// The sizes of the first `count` video packets, in order. A stream copy
+    /// moves packets verbatim, so this is what makes "no encoder ran" a
+    /// measurement rather than an inference: two encodes of the same source
+    /// can agree on codec, size and duration, but only a remux reproduces the
+    /// source's own packet boundaries byte for byte.
+    fn probe_packet_sizes(path: &std::path::Path, count: usize) -> Vec<u64> {
+        let output = std::process::Command::new(crate::media_tools::ffprobe())
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "packet=size", "-of", "csv=p=0"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ffprobe runs");
+        assert!(
+            output.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().trim_end_matches(',').parse().ok())
+            .take(count)
+            .collect()
+    }
+
+    /// The source's own numbers, as ffprobe reports them.
+    fn probe_video_stream(path: &std::path::Path) -> (u64, u64, f64, u64) {
+        let probe = probe_json(path);
+        let streams = probe["streams"].as_array().unwrap().clone();
+        let video = streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .expect("a video stream");
+        (
+            video["width"].as_u64().unwrap(),
+            video["height"].as_u64().unwrap(),
+            probe["format"]["duration"]
+                .as_str()
+                .expect("a container duration")
+                .parse()
+                .expect("a number"),
+            streams.len() as u64,
+        )
+    }
+
+    /// An index database with one video item pointing at a real file.
+    async fn preview_fixture_db(
+        source: &std::path::Path,
+    ) -> (DbConnection<ReadOnlyNoUserData>, RetainedDbs) {
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        sqlx::query(
+            "INSERT INTO items (id, sha256, md5, type, duration, time_added) \
+             VALUES (1, ?, 'md5_1', 'video/mp4', 20.0, '2024-01-01T00:00:00')",
+        )
+        .bind(PREVIEW_ITEM)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
+            .bind("2024-01-01T00:00:00")
+            .bind(crate::test_utils::absent_root())
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO files \
+             (id, sha256, item_id, path, filename, last_modified, scan_id, available) \
+             VALUES (10, ?, 1, ?, 'hover-source.mp4', '2024-01-02T00:00:00', 1, 1)",
+        )
+        .bind(PREVIEW_ITEM)
+        .bind(source.to_string_lossy().into_owned())
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        (
+            DbConnection::<ReadOnlyNoUserData>::for_tests(index_conn, "hover-preview", "test"),
+            (storage_conn, user_data_conn),
+        )
+    }
+
+    /// Waits for one job to publish its artifact. Bounded rather than
+    /// unbounded: 4 s is far past a 16 s flat-colour encode, and a regression
+    /// fails here instead of hanging the suite.
+    async fn settle(id: Uuid) -> ArtifactRef {
+        use crate::media_tools::transcode::pool::TranscodeJobEvent;
+        for _ in 0..400 {
+            match pool::job_snapshot(id).await.unwrap().map(|snap| snap.event) {
+                Some(TranscodeJobEvent::Done { artifact }) => return artifact,
+                Some(TranscodeJobEvent::Failed { error, .. }) => {
+                    panic!("the preview job failed: {error}")
+                }
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        panic!("the preview job never settled");
+    }
+
+    /// `ffprobe -show_streams -show_format`, as JSON.
+    fn probe_json(path: &std::path::Path) -> serde_json::Value {
+        let output = std::process::Command::new(crate::media_tools::ffprobe())
+            .args(["-v", "error", "-show_streams", "-show_format"])
+            .args(["-of", "json"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ffprobe runs");
+        assert!(
+            output.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("ffprobe emits json")
+    }
+
+    /// The whole rung-1 request end to end against the real toolchain: the
+    /// POST a hovered cell makes (`preset=preview`, `end_cs=1600`) is accepted
+    /// as it stands, encodes, and publishes the artifact the plan promised —
+    /// at most 16 s, no taller than 480 px, silent — from a source that is
+    /// none of those things.
+    ///
+    /// Nothing here is a preview-specific code path: the existing trim bound
+    /// and the ordinary preset table already produce it, which is the whole
+    /// reason B5 adds no request validation. Skips (never fails) where there
+    /// is no ffmpeg.
+    #[tokio::test]
+    async fn a_preview_post_publishes_a_short_silent_capped_artifact() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let source = fixtures.path().join("hover-source.mp4");
+        if !write_preview_source(&source) {
+            return;
+        }
+        // The fixture has to be worth probing against.
+        let before = probe_json(&source);
+        assert!(
+            before["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|stream| stream["codec_type"] == "audio"),
+            "the source carries the audio the preset must drop"
+        );
+
+        let settings = test_settings();
+        let (db, _attached) = preview_fixture_db(&source).await;
+        let response = video_transcode(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            db,
+            Json(TranscodeRequest {
+                id: PREVIEW_ITEM.to_string(),
+                id_type: ItemIdentifierType::Sha256,
+                preset: PREVIEW_PRESET_ID.to_string(),
+                start_cs: None,
+                // The 16 s window, in the centiseconds every trim bound uses.
+                end_cs: Some(1600),
+                cut: None,
+            }),
+        )
+        .await
+        .expect("the preview request is accepted as it stands");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let json = body_json(response).await;
+        assert_eq!(json["outcome"], "created");
+        let id = parse_job_id(json["job"]["id"].as_str().expect("a job id")).unwrap();
+
+        // Bounded rather than unbounded: 4 s is far past a 16 s flat-colour
+        // encode, and a regression fails here instead of hanging the suite.
+        let artifact = settle(id).await;
+        assert_eq!(artifact.mime_type, "video/mp4");
+
+        let cache = pool::transcode_cache().await.unwrap();
+        let cached = cache
+            .lookup(&artifact.key)
+            .await
+            .expect("the artifact is in the cache");
+        let probe = probe_json(&cached.path);
+        let streams = probe["streams"].as_array().unwrap().clone();
+        assert!(
+            !streams.iter().any(|stream| stream["codec_type"] == "audio"),
+            "the preview is silent: {streams:?}"
+        );
+        let video = streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .expect("a video stream");
+        assert_eq!(video["codec_name"], "h264");
+        let width = video["width"].as_u64().unwrap();
+        let height = video["height"].as_u64().unwrap();
+        assert!(height <= 480, "the height cap applies: {width}x{height}");
+        assert!(
+            width.min(height) <= 480,
+            "so the short side is within it too: {width}x{height}"
+        );
+        let duration: f64 = probe["format"]["duration"]
+            .as_str()
+            .expect("a container duration")
+            .parse()
+            .expect("a number");
+        // A frame of slack at the fixture's 10 fps: the boundary frame may
+        // land either side of the cut and the container rounds its duration.
+        assert!(
+            duration <= 16.1,
+            "the preview is the 16 s window, not the source's 20 s: {duration}"
+        );
+
+        cache.clear(true).await.unwrap();
+    }
+
+    /// The cheap rung, end to end: `preset=preview-trim&end_cs=1600` on a
+    /// browser-playable source produces the source's *own* packets in a short
+    /// mp4 — same codec, same pixels, roughly proportional bytes — with no
+    /// encoder ever named.
+    ///
+    /// The pixel and byte assertions are the ones that prove it: a re-encode
+    /// at this preset's (absent) settings would still be h264 in an mp4 of
+    /// about the right length, so only "the picture is bit-for-bit the size
+    /// the source was, and the bytes scale with the slice" distinguishes a
+    /// remux from a very good encode. Skips (never fails) without ffmpeg.
+    #[tokio::test]
+    async fn a_preview_trim_post_remuxes_rather_than_re_encodes() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let source = fixtures.path().join("hover-source.mp4");
+        if !write_preview_source(&source) {
+            return;
+        }
+        let (width, height, source_seconds, _) = probe_video_stream(&source);
+        let source_bytes = std::fs::metadata(&source).unwrap().len();
+        assert!(
+            source_seconds > 16.0 && height > 480,
+            "the fixture must be longer than the window and taller than the              encode rung's cap, or neither assertion below means anything"
+        );
+
+        let settings = test_settings();
+        let (db, _attached) = preview_fixture_db(&source).await;
+        let response = video_transcode(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            db,
+            Json(TranscodeRequest {
+                id: PREVIEW_ITEM.to_string(),
+                id_type: ItemIdentifierType::Sha256,
+                preset: PREVIEW_TRIM_PRESET_ID.to_string(),
+                start_cs: None,
+                end_cs: Some(1600),
+                cut: None,
+            }),
+        )
+        .await
+        .expect("a remux request needs no more validation than an encode");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let json = body_json(response).await;
+        assert_eq!(json["outcome"], "created");
+        let artifact = settle(parse_job_id(json["job"]["id"].as_str().unwrap()).unwrap()).await;
+        assert_eq!(artifact.mime_type, "video/mp4");
+
+        let cache = pool::transcode_cache().await.unwrap();
+        let cached = cache
+            .lookup(&artifact.key)
+            .await
+            .expect("the artifact is in the cache");
+        let probe = probe_json(&cached.path);
+        let streams = probe["streams"].as_array().unwrap().clone();
+        assert_eq!(streams.len(), 1, "video only, no audio: {streams:?}");
+        assert_eq!(streams[0]["codec_type"], "video");
+        assert_eq!(streams[0]["codec_name"], "h264");
+        assert_eq!(
+            (
+                streams[0]["width"].as_u64().unwrap(),
+                streams[0]["height"].as_u64().unwrap()
+            ),
+            (width, height),
+            "a copy cannot rescale, so the picture is the source's own"
+        );
+
+        let duration: f64 = probe["format"]["duration"]
+            .as_str()
+            .expect("a container duration")
+            .parse()
+            .expect("a number");
+        // The cut lands on keyframe boundaries, so the slice reaches 16 s and
+        // may run on to the end of the GOP that straddles it. One GOP of this
+        // fixture is well under two seconds.
+        assert!(
+            (16.0..=18.0).contains(&duration),
+            "the slice is the window rounded out to a keyframe: {duration}"
+        );
+
+        // And the proof that no encoder ran: the artifact's video packets are
+        // the source's own, byte for byte. Two encodes of one source can
+        // agree on codec, dimensions and length — only a copy reproduces the
+        // packet boundaries.
+        let want = probe_packet_sizes(&source, 40);
+        let got = probe_packet_sizes(&cached.path, 40);
+        assert!(want.len() >= 20, "the fixture has packets to compare");
+        assert_eq!(
+            got, want,
+            "a remux carries the source's packets unchanged; different sizes              mean something decoded and re-encoded them"
+        );
+        assert!(
+            (cached.size_bytes as u64) < source_bytes,
+            "and the slice is smaller than the whole file it came from              ({} vs {source_bytes})",
+            cached.size_bytes
+        );
+
+        cache.clear(true).await.unwrap();
     }
 }
