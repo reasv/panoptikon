@@ -775,12 +775,26 @@ window is in flight per worker either way, so a trim never races a batch.
 - **Who sent the signal.** The fatal path SIGKILLs the process group on
   every route into it, so a deadline timeout, a desynchronized stream or an
   unacknowledged unload reaches a *live* worker and reaps it as `signal: 9`
-  — the same shape a kernel OOM kill takes. The report therefore carries
-  `killed_by_gateway`, sampled (`try_wait`) immediately before the signal:
-  `true` means the process was still running and the signal is ours and
-  means nothing; `false` means it was already gone and the exit status is
-  how it really died. Only `signal: 9` with `killed_by_gateway = false` is
-  an outside kill (the kernel's OOM killer, the driver, an operator).
+  — the same shape a kernel OOM kill takes. The report therefore carries an
+  **attribution**, sampled immediately before the signal, with three states:
+  - `still_running` — the child was alive and its stdout still open: the
+    signal in the status is the gateway's own and says nothing about why.
+  - `reaped_before_signal` — `try_wait` already had the exit status: the
+    status is how the worker really died.
+  - `dying` — the child was on its way down but not yet reapable. This one
+    exists because `waitpid(WNOHANG)` does **not** report a thread-group
+    leader while any thread of the group is alive, and a CUDA worker's
+    driver threads take hundreds of milliseconds (475 ms measured) to unwind
+    a SIGKILL. Reached from two facts the gateway can check without waiting:
+    the worker's stdout is already at EOF (a live worker never closes it),
+    or on Linux `/proc/<pid>/stat` shows the leader as a zombie. Before this
+    state existed, the boolean it replaces reported exactly these deaths as
+    the gateway's own doing (F12).
+
+  Both outside states mean a `signal: 9` came from elsewhere — the kernel's
+  OOM killer, the driver, an operator. The WARN line carries the state as
+  `attribution=…` and keeps a derived `killed_by_gateway=` boolean, which is
+  true only for `still_running`.
   Deliberate kills that leave *no* death report — the `unload`/terminate/
   kill ladder, a failed handshake or configure, the whole-set teardown
   after one replica dies, a dropped in-flight window — announce themselves

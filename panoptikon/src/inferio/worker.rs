@@ -38,9 +38,12 @@
 //!   leak a worker tree. That ladder — and the fatal path's own kill — is
 //!   where a SIGKILL comes from *inside* the gateway, so both say so:
 //!   [`Worker::kill`] announces itself at INFO, and every death record
-//!   carries `killed_by_gateway`, sampled before the signal. A `signal: 9`
-//!   with `killed_by_gateway = false` is the only one that came from
-//!   outside (kernel OOM killer, driver, an operator).
+//!   carries a [`DeathAttribution`], sampled before the signal —
+//!   `reaped_before_signal` / `dying` / `still_running`. Only
+//!   `still_running` is the gateway's own kill; the other two are outside
+//!   deaths (kernel OOM killer, driver, an operator), and `dying` exists
+//!   because a thread-group leader whose threads are still unwinding a
+//!   SIGKILL is not reapable, so `try_wait` alone cannot see it (F12).
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -544,26 +547,96 @@ pub struct WorkerDeath {
     /// The terminating signal on Unix, when there was one. `Some(9)` is the
     /// SIGKILL shape an out-of-memory kill takes — but it is also the shape
     /// of the gateway's own teardown, so read it together with
-    /// `killed_by_gateway` and never on its own.
+    /// `attribution` and never on its own.
     pub signal: Option<i32>,
     /// Whether the child dumped core (Unix only; always false elsewhere).
     pub core_dumped: bool,
-    /// Whether the process was **still running** when the fatal path reached
-    /// it, i.e. whether the signal in `signal` is the gateway's own.
+    /// Who the signal in `signal` belongs to — see [`DeathAttribution`].
     ///
-    /// This is the only honest answer to "was that SIGKILL ours?", and it
-    /// has to be sampled before the kill: [`Worker::record_death`] SIGKILLs
-    /// the process group on *every* path, so a deadline timeout or a desync
-    /// on a perfectly live worker also produces `signal: 9` — and reading
-    /// that as a kernel OOM kill is exactly the misdiagnosis the record
-    /// exists to prevent. `false` means the child was already gone before
-    /// the gateway signalled it, so whatever killed it was external.
-    pub killed_by_gateway: bool,
+    /// Sampled before the kill, because [`Worker::record_death`] SIGKILLs
+    /// the process group on *every* path: a deadline timeout or a desync on
+    /// a perfectly live worker also produces `signal: 9`, and reading that
+    /// as a kernel OOM kill is exactly the misdiagnosis the record exists to
+    /// prevent.
+    pub attribution: DeathAttribution,
     /// What the orchestrator was doing when it noticed, e.g. `predict
     /// request failed: …` or the idle-reap wording.
     pub why: String,
     /// The last lines the worker wrote to stderr (see [`StderrTail`]).
     pub stderr_tail: String,
+}
+
+/// Whose signal killed this worker — the three states a pre-signal sample
+/// can actually distinguish, replacing the boolean `killed_by_gateway`.
+///
+/// The boolean was wrong on exactly the death it was added to explain (F12).
+/// It was `!try_wait().is_some()`, and `waitpid(WNOHANG)` does **not** report
+/// a thread-group leader while any thread of that group is still alive
+/// (`delay_group_leader`): a CUDA worker takes hundreds of milliseconds
+/// (475 ms measured) to unwind a SIGKILL, so a worker the *kernel* had
+/// already killed still read as "still running when the gateway gave up on
+/// it — the signal here is ours". Dying is therefore its own state, reached
+/// from two cheap facts sampled before we signal: the worker's stdout is
+/// already at EOF, or (Linux) `/proc/<pid>/stat` shows the leader as a
+/// zombie/dead task. Both mean the process was on its way out before the
+/// gateway touched it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeathAttribution {
+    /// The child had already exited *and* was reapable before the fatal
+    /// path signalled it: the exit status is how it really died.
+    ReapedBeforeSignal,
+    /// The child was already going down but not yet reapable — the state
+    /// `try_wait` alone cannot see. Also an outside death.
+    Dying,
+    /// The child was alive and its stream open when the gateway gave up on
+    /// it, so the SIGKILL in the status is the gateway's own and says
+    /// nothing about why the worker was in trouble.
+    StillRunning,
+}
+
+impl DeathAttribution {
+    /// Did the gateway kill a live worker? `false` for both outside deaths.
+    pub fn killed_by_gateway(self) -> bool {
+        matches!(self, DeathAttribution::StillRunning)
+    }
+
+    /// The stable log/report token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeathAttribution::ReapedBeforeSignal => "reaped_before_signal",
+            DeathAttribution::Dying => "dying",
+            DeathAttribution::StillRunning => "still_running",
+        }
+    }
+
+    /// The sentence the WARN line spells the attribution out in — operators
+    /// read this, not the token.
+    fn explanation(self) -> &'static str {
+        match self {
+            DeathAttribution::ReapedBeforeSignal => {
+                "the process had already exited before the gateway signalled it, so this exit \
+                 status is how it actually died — a signal 9 here came from outside (kernel OOM \
+                 killer, driver, operator)"
+            }
+            DeathAttribution::Dying => {
+                "the process was already on its way down before the gateway signalled it (its \
+                 stdout was at EOF, or the kernel still shows the leader unwinding), so the exit \
+                 status is not ours to explain — a signal 9 here came from outside; it reads as \
+                 'dying' rather than 'reaped' only because a thread-group leader is not reapable \
+                 while its threads are still unwinding"
+            }
+            DeathAttribution::StillRunning => {
+                "the process was still running and its stream still open when the gateway gave up \
+                 on it, so the signal here is the gateway's own SIGKILL and says nothing about why"
+            }
+        }
+    }
+}
+
+impl fmt::Display for DeathAttribution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl WorkerDeath {
@@ -601,6 +674,39 @@ fn signal_of(status: &ExitStatus) -> (Option<i32>, bool) {
 #[cfg(not(unix))]
 fn signal_of(_status: &ExitStatus) -> (Option<i32>, bool) {
     (None, false)
+}
+
+/// The Linux half of [`DeathAttribution::Dying`]: is this pid's thread-group
+/// leader already a zombie (or gone) while `waitpid(WNOHANG)` still refuses
+/// to report it?
+///
+/// That is precisely `delay_group_leader`: the leader has exited, so
+/// `/proc/<pid>/stat` renders its state as `Z`, but the group still has live
+/// threads (a CUDA worker's driver threads unwinding a SIGKILL take hundreds
+/// of milliseconds), so the child is not yet reapable. One small read of an
+/// in-memory file, only on the path where the worker is already dead.
+///
+/// The state is the field after the **last** `)`: `comm` is parenthesized
+/// and may itself contain parentheses and spaces.
+#[cfg(target_os = "linux")]
+fn leader_is_unwinding(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        // The entry is gone while we still hold the child unreaped: not a
+        // process any more, whatever the wait says.
+        return true;
+    };
+    let Some((_, after_comm)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    matches!(after_comm.split_whitespace().next(), Some("Z" | "X" | "x"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn leader_is_unwinding(_pid: Option<u32>) -> bool {
+    false
 }
 
 /// Bounded ring buffer of recent stderr lines, shared with the forwarder
@@ -665,6 +771,12 @@ pub struct Worker {
     unreachable: bool,
     /// The death report, recorded once by the first fatal path to run.
     death: Option<WorkerDeath>,
+    /// Test hook: pretend `try_wait` cannot see the exit status, which is
+    /// what a thread-group leader with threads still unwinding really does
+    /// (`delay_group_leader`) and what no test can produce with a plain
+    /// Python child. See `hide_exit_for_test`.
+    #[cfg(test)]
+    hide_exit_for_test: bool,
 }
 
 /// Why a fatal teardown happened.
@@ -931,6 +1043,8 @@ impl Worker {
             dead: false,
             unreachable: false,
             death: None,
+            #[cfg(test)]
+            hide_exit_for_test: false,
         };
 
         let impl_dirs = cfg
@@ -1586,6 +1700,54 @@ impl Worker {
         )
     }
 
+    /// Whose signal this death carries, sampled **before** the fatal path
+    /// signals anything — see [`DeathAttribution`] for why the three states
+    /// exist and why the old boolean was wrong on a CUDA worker.
+    ///
+    /// Cheap by construction: a fused non-blocking `try_wait`, a
+    /// zero-timeout `fill_buf` on a pipe we already own, and one small
+    /// `/proc` read on Linux that only happens when the first two disagree
+    /// with "reaped".
+    async fn attribute_death(&mut self) -> DeathAttribution {
+        if !self.exit_hidden() && matches!(self.child.try_wait(), Ok(Some(_))) {
+            return DeathAttribution::ReapedBeforeSignal;
+        }
+        if self.stdout_at_eof().await || leader_is_unwinding(self.pid) {
+            return DeathAttribution::Dying;
+        }
+        DeathAttribution::StillRunning
+    }
+
+    /// Is the worker's stdout already at EOF, right now, without waiting?
+    ///
+    /// EOF on that pipe means the process closed it, which a live worker
+    /// never does — it is the shape every "early eof" fatal error has. The
+    /// zero timeout keeps it a probe rather than a read: an open stream with
+    /// nothing to say answers `false` immediately, and `fill_buf` leaves any
+    /// bytes it did find in the reader's buffer (a stranded response frame
+    /// from a desync, say — data, not EOF, i.e. a *live* worker).
+    async fn stdout_at_eof(&mut self) -> bool {
+        match timeout(Duration::ZERO, self.stdout.fill_buf()).await {
+            Ok(Ok(buf)) => buf.is_empty(),
+            // An unreadable pipe is not evidence of an outside kill, and the
+            // conservative direction is to keep claiming the kill as ours.
+            Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
+    /// Whether the exit-status probe is being suppressed by a test that is
+    /// standing in for `delay_group_leader` (see the test hook below).
+    fn exit_hidden(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.hide_exit_for_test
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     /// The one place a worker dies: poison it, kill and reap the child,
     /// drain stderr, and record + log everything that distinguishes one
     /// death from another.
@@ -1610,7 +1772,7 @@ impl Worker {
         // child can of course die in the microseconds between this probe and
         // the signal; that race can only make us over-claim a kill, never
         // blame the kernel for one of ours.)
-        let killed_by_gateway = !matches!(self.child.try_wait(), Ok(Some(_)));
+        let attribution = self.attribute_death().await;
         kill_process_group(&self.child);
         let _ = self.child.start_kill();
         let status = match timeout(FATAL_REAP_GRACE, self.child.wait()).await {
@@ -1633,7 +1795,7 @@ impl Worker {
             status,
             signal,
             core_dumped,
-            killed_by_gateway,
+            attribution,
             why,
             stderr_tail: self.stderr_tail_snapshot(),
         };
@@ -1641,23 +1803,17 @@ impl Worker {
         // to the reader to infer from a nearby INFO line, because there is
         // no nearby INFO line on this path: `Worker::kill` announces the
         // unload ladder, but the SIGKILL above is this function's own.
-        let attribution = if death.killed_by_gateway {
-            "the process was still running when the gateway gave up on it, so the signal here \
-             is the gateway's own SIGKILL and says nothing about why"
-        } else {
-            "the process was already gone before the gateway signalled it, so this exit status \
-             is how it actually died — a signal 9 here came from outside (kernel OOM killer, \
-             driver, operator)"
-        };
         tracing::warn!(
             worker = %death.worker,
             pid = ?death.pid,
             status = %death.status_text(),
             signal = ?death.signal,
             core_dumped = death.core_dumped,
-            killed_by_gateway = death.killed_by_gateway,
-            "an inferio worker process is gone. Cause: {}. {attribution}. stderr tail:\n{}",
+            attribution = death.attribution.as_str(),
+            killed_by_gateway = death.attribution.killed_by_gateway(),
+            "an inferio worker process is gone. Cause: {}. {}. stderr tail:\n{}",
             death.why,
+            death.attribution.explanation(),
             death.stderr_tail,
         );
         self.death = Some(death.clone());
@@ -1764,6 +1920,17 @@ impl Worker {
     #[cfg(test)]
     pub(crate) fn strand_in_flight_for_test(&mut self) {
         self.in_flight = true;
+    }
+
+    /// Test hook: make the pre-signal `try_wait` blind, standing in for the
+    /// kernel's `delay_group_leader` — a thread-group leader that has
+    /// exited but is not reapable because other threads of the group are
+    /// still unwinding the same SIGKILL (measured at 475 ms on a CUDA
+    /// worker, which is what made the old boolean report an outside kill as
+    /// the gateway's own; F12). Everything else about the death is real.
+    #[cfg(test)]
+    pub(crate) fn hide_exit_for_test(&mut self) {
+        self.hide_exit_for_test = true;
     }
 }
 
@@ -2904,11 +3071,14 @@ mod tests {
             );
             assert!(!death.core_dumped);
         }
-        assert!(
-            !death.killed_by_gateway,
-            "the child was already gone when the fatal path reached it, so the \
-             signal in the record is the one that actually killed it"
+        assert_eq!(
+            death.attribution,
+            DeathAttribution::ReapedBeforeSignal,
+            "the child was already gone (and reapable) when the fatal path \
+             reached it, so the signal in the record is the one that actually \
+             killed it"
         );
+        assert!(!death.attribution.killed_by_gateway());
 
         // One death, recorded once, and it renders the way the logs and the
         // error chain show it.
@@ -2948,16 +3118,77 @@ mod tests {
         let death = worker
             .last_death()
             .expect("the desync poisoned the worker, which is a recorded death");
-        assert!(
-            death.killed_by_gateway,
+        assert_eq!(
+            death.attribution,
+            DeathAttribution::StillRunning,
             "the worker was alive until we killed it: {death}"
         );
+        assert!(death.attribution.killed_by_gateway());
         #[cfg(unix)]
         assert_eq!(
             death.signal,
             Some(9),
             "and it is our SIGKILL that shows up in the status: {death}"
         );
+    }
+
+    /// F12, the death this record kept getting backwards: a worker the
+    /// kernel killed, whose thread-group leader is not reapable yet.
+    ///
+    /// `waitpid(WNOHANG)` refuses to report a leader while any thread of its
+    /// group is alive, and a CUDA worker's driver threads take hundreds of
+    /// milliseconds to unwind a SIGKILL — so the old `!try_wait().is_some()`
+    /// boolean read "still running, the signal is ours" on precisely the
+    /// deaths it was added to attribute (8/8 in the F11 incident). The hook
+    /// stands in for that kernel state; everything else here is a real
+    /// process, really killed from outside, and the stream really at EOF.
+    #[tokio::test]
+    async fn a_kernel_kill_is_not_blamed_on_the_gateway_when_the_leader_reaps_late() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
+            .await
+            .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+
+        worker.kill_child_externally_for_test().await;
+        // From here `try_wait` answers nothing, exactly as it does for a
+        // leader whose CUDA threads are still unwinding.
+        worker.hide_exit_for_test();
+
+        worker
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!(1)),
+                    file: None,
+                }],
+                None,
+                None,
+            )
+            .await
+            .expect_err("predict against a dead worker must fail");
+
+        let death = worker.last_death().expect("the fatal path recorded it");
+        assert_eq!(
+            death.attribution,
+            DeathAttribution::Dying,
+            "the stream was at EOF before the gateway signalled anything, so \
+             the worker was already going down: {death}"
+        );
+        assert!(
+            !death.attribution.killed_by_gateway(),
+            "and that is an outside kill, not one of ours"
+        );
+    }
+
+    /// The Linux half of the same signal, on this process and on a pid that
+    /// cannot exist. A running thread-group leader is not "unwinding"; a
+    /// `/proc` entry that is gone is as dead as it gets.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_proc_probe_separates_a_live_leader_from_a_vanished_one() {
+        assert!(!leader_is_unwinding(Some(std::process::id())));
+        assert!(!leader_is_unwinding(None), "no pid is not evidence");
+        assert!(leader_is_unwinding(Some(u32::MAX)));
     }
 
     /// stdout hygiene end-to-end: the printing_test fixture print()s during
