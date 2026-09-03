@@ -42,8 +42,8 @@ pub const NOFILE_LIMIT_UNKNOWN: u64 = u64::MAX;
 /// containerd container), but it can be `RLIM_INFINITY`, and asking for
 /// infinity is both meaningless — the kernel still has a global
 /// `fs.nr_open` — and rejected outright on some systems. A million
-/// descriptors is far above anything the gateway can plausibly want and stays
-/// under the usual `fs.nr_open` of 1 048 576.
+/// descriptors is far above anything the gateway can plausibly want and does
+/// not exceed the usual `fs.nr_open` of 1 048 576.
 #[cfg(any(unix, test))]
 const NOFILE_RAISE_CAP: u64 = 1_048_576;
 
@@ -348,6 +348,36 @@ mod tests {
             *asked.borrow(),
             vec![NOFILE_RAISE_CAP, NOFILE_FALLBACK_TARGET]
         );
+    }
+
+    /// The fallback is a *raise* that asks for less, never a lowering. A
+    /// macOS-shaped host whose soft limit already sits above
+    /// [`NOFILE_FALLBACK_TARGET`] (`launchctl limit maxfiles` raised, hard
+    /// unlimited, the kernel still refusing the cap) must be left where it
+    /// is: asking for 10 240 there would cost the process descriptors it
+    /// already had.
+    #[test]
+    fn the_fallback_never_lowers_an_already_high_soft_limit() {
+        let asked = RefCell::new(Vec::new());
+        let outcome = raise_soft_limit_with(
+            || Ok((20_000, u64::MAX)),
+            |soft| {
+                asked.borrow_mut().push(soft);
+                Err(io_error(std::io::ErrorKind::InvalidInput))
+            },
+        );
+        assert!(
+            matches!(outcome, NofileRaise::Failed { soft: 20_000, .. }),
+            "expected the existing limit to be kept, got {outcome:?}"
+        );
+        assert_eq!(
+            *asked.borrow(),
+            vec![NOFILE_RAISE_CAP],
+            "the fallback must not be attempted below the current soft limit"
+        );
+        // And a hard limit somehow *below* the soft one asks for nothing at
+        // all rather than shrinking the process to it.
+        assert_eq!(raise_target(100_000, 1024), None);
     }
 
     /// A raise that fails outright is reported, not propagated: startup

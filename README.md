@@ -351,9 +351,9 @@ The server raises its own soft limit to the hard limit at startup, which is
 enough on Docker's defaults (hard limit 524 288) and needs no configuration.
 If you deliberately run with a low **hard** limit, the server bounds how much
 work it keeps in flight to fit — roughly `(hard_limit - 256) / 2` items — so
-batches simply stop growing instead of failing; give it a hard limit of at
-least a few thousand (`ulimits: nofile:` in compose, `--ulimit nofile=` for
-`docker run`) if you want full pipelining.
+batches simply stop growing instead of failing; for full pipelining give it a
+hard limit of at least ~8 500 (`ulimits: nofile:` in compose, `--ulimit
+nofile=` for `docker run`), which is what the shipped 4096-item ceiling needs.
 
 ### GPU (CUDA)
 

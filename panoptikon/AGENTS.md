@@ -27,6 +27,7 @@ Behavior (important)
   (`/STACK:8388608` for MSVC, `--stack,8388608` for GNU) to avoid startup stack
   overflows on the default main thread stack; Tokio worker threads are also
   configured with 8MB stacks.
+- File descriptors (`rlimit.rs`): `main` raises the soft `RLIMIT_NOFILE` to the hard limit before the runtime exists (Unix only; failure is logged, never fatal), so every thread and spawned child inherits it, and `jobs/extraction.rs` caps its in-flight unit window at `(soft_nofile - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM` because a local predict costs two sockets in this one process.
 - `upstreams.api.local = true` means the gateway owns the databases outright: it serves the full API locally (including `/api/jobs/*` and `/api/db/create`), runs the cron scheduler, and runs startup migrations across all on-disk DBs in `data_folder` (skipped when `readonly = true`, matching Python's READONLY). Do not run the Python server's cron against the same `data_folder` in this mode — it would double-schedule extraction jobs.
 - Graceful shutdown (`shutdown.rs`): first SIGINT/SIGTERM drains HTTP, stops cron + continuous-scan actors, cancels the running job (queued jobs dropped, new enqueues refused), and flushes index DB writers; 10s cleanup grace, 20s hard exit deadline, second signal exits immediately.
 - Desktop supervision: the hidden `--desktop-managed` flag enables parent

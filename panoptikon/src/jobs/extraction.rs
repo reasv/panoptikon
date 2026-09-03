@@ -120,6 +120,14 @@ const FDS_PER_IN_FLIGHT_ITEM: usize = 2;
 /// a large margin for more databases, more listeners, more worker replicas
 /// and the decode subprocesses a job spawns, and it costs nothing on a host
 /// whose limit is not pathological.
+///
+/// It is a constant, not a function of the configuration: the load phase's
+/// own descriptors (the source file, ffmpeg's pipes, the frame temp dir) are
+/// bounded by `[jobs] loader_concurrency` rather than by this window, and at
+/// the default of 8 they are a few dozen. A host that both raises
+/// `loader_concurrency` into the hundreds *and* runs under a small hard
+/// `nofile` limit would spend the reserve on loaders; the fix there is the
+/// limit, which is what the WARN below names.
 const FD_RESERVE: usize = 256;
 
 /// Upper bound on the job's in-flight unit budget.
@@ -2712,6 +2720,34 @@ mod tests {
             in_flight_unit_ceiling(1024 * 1024, 8, 0),
             MIN_IN_FLIGHT_UNITS
         );
+    }
+
+    /// The invariant the clamp exists for, swept rather than sampled: for
+    /// every descriptor budget that can hold the floor at all, the window's
+    /// worst-case sockets plus the reserve fit under the limit, and more
+    /// descriptors never buy a smaller window. Odd limits are the interesting
+    /// ones — the term floors a division, so an off-by-one in the reserve or
+    /// the divisor shows at 385, 387, ... and nowhere else.
+    #[test]
+    fn the_descriptor_clamp_always_fits_and_never_regresses() {
+        let need = MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE;
+        let mut previous = 0usize;
+        for soft in (need..need + 512).chain([4096usize, 8447, 65_536, 524_288]) {
+            let ceiling = in_flight_unit_ceiling(1024 * 1024, 8, soft as u64);
+            assert!(
+                ceiling * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE <= soft,
+                "a window of {ceiling} units does not fit under {soft} descriptors"
+            );
+            assert!(
+                ceiling >= MIN_IN_FLIGHT_UNITS,
+                "the deadlock floor was breached at {soft} descriptors"
+            );
+            assert!(
+                ceiling >= previous,
+                "raising the limit to {soft} shrank the window to {ceiling}"
+            );
+            previous = ceiling;
+        }
     }
 
     /// Growth: the budget adds permits toward the figure, and stops at the
