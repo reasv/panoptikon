@@ -139,25 +139,57 @@ impl DisplayLoopTrigger {
 const HOVER_PREVIEW_KEY: &str = "hover_preview";
 
 /// The server's resolved answer to "may this client preview a video on
-/// hover?", for the two rungs the UI has
-/// (docs/video-hover-preview-implementation.md, V8).
+/// hover?", for the three rungs of the ladder
+/// (docs/video-hover-preview-implementation.md §2).
 ///
-/// Resolved here rather than derived client-side: the transcode rung is a
-/// conjunction of four independent facts (the policy's own switch, the
-/// `[transcode] hover_preview` server default, whether this policy may POST a
-/// transcode at all, and whether the `preview` preset survives its
-/// `transcode_presets` limit), three of which the client cannot see.
+/// Resolved here rather than derived client-side: each rung is a conjunction
+/// of facts the client cannot see (the policy's own switch, the `[transcode]
+/// hover_preview` server default, whether this policy may POST a transcode at
+/// all, and whether the preset each rung needs survives that policy's
+/// `transcode_presets` limit).
+///
+/// The client picks a rung per item against `max_bytes`; the server only says
+/// which rungs exist and where the line is.
+///
+/// The three flags are independent answers, not a scale. Each names its own
+/// conjunction, and the only thing they share is the policy switch
+/// (`[policies.client] hover_preview`), which is a negative override on all
+/// three — so a `direct: false` answer does mean the whole feature is off for
+/// this policy, but no other pair of members implies anything about each
+/// other. A policy can perfectly well offer the re-encode and not the remux
+/// (`transcode_presets` listing `preview` alone), or the reverse.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct HoverPreview {
-    /// Rung 0: mount a muted `<video>` on the item's own file when the
-    /// browser can already decode it. Costs the server nothing but Range
-    /// reads, so only the policy switch can withhold it.
+    /// Rung 0: mount a muted `<video>` on the item's own file, for a file at
+    /// or under `max_bytes` the browser can already decode.
+    ///
+    /// Requires nothing but the policy switch: the rung costs the server only
+    /// Range reads, needs no job and no preset, so there is nothing else that
+    /// could withhold it.
     pub direct: bool,
-    /// Rung 1: request the `preview` rendition for an item the browser
-    /// cannot play. Implies `direct`: a policy that denies previews denies
-    /// both, and there is no arrangement in which the expensive rung is
-    /// allowed while the free one is not.
+    /// Rung 1: request the `preview-trim` rendition — the source's own
+    /// packets remuxed, no decode and no encode — when the estimated 16 s
+    /// slice fits under `max_bytes`.
+    ///
+    /// Requires the policy switch, permission to `POST /api/video/transcode`,
+    /// and `preview-trim` surviving that policy's `transcode_presets` limit.
+    /// Deliberately **not** gated on the hardware-encoder probe or on
+    /// `[transcode] hover_preview`: there is no encoder in this rung to have
+    /// an opinion about.
+    pub trim: bool,
+    /// Rung 2: request the 480p `preview` re-encode for an item neither
+    /// cheaper rung can serve.
+    ///
+    /// Requires the policy switch, the `[transcode] hover_preview` server
+    /// default, permission to `POST /api/video/transcode`, and `preview`
+    /// surviving that policy's `transcode_presets` limit.
     pub transcode: bool,
+    /// The byte cap the ladder turns on (`[transcode]
+    /// hover_preview_max_bytes`). A file at or under it plays directly; over
+    /// it, the client estimates the 16 s slice as `size * min(16, duration) /
+    /// duration` and takes rung 1 when that fits, rung 2 otherwise. An item
+    /// with no known duration cannot be estimated and never takes rung 1.
+    pub max_bytes: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -239,6 +271,7 @@ fn hover_preview_for(
     policy: &PolicyConfig,
     capabilities: &ClientCapabilities,
     transcode_default: bool,
+    max_bytes: u64,
 ) -> HoverPreview {
     // Only an explicit `false` denies: an absent key, and anything that is
     // not a boolean, leave the feature on.
@@ -247,15 +280,13 @@ fn hover_preview_for(
         .get(HOVER_PREVIEW_KEY)
         .and_then(serde_json::Value::as_bool)
         != Some(false);
+    let may_submit = direct && capabilities.video_transcode;
+    let exposes = |preset: &str| direct && crate::api::video::policy_exposes_preset(policy, preset);
     HoverPreview {
         direct,
-        transcode: direct
-            && transcode_default
-            && capabilities.video_transcode
-            && crate::api::video::policy_exposes_preset(
-                policy,
-                crate::api::video::PREVIEW_PRESET_ID,
-            ),
+        trim: may_submit && exposes(crate::api::video::PREVIEW_TRIM_PRESET_ID),
+        transcode: may_submit && transcode_default && exposes(crate::api::video::PREVIEW_PRESET_ID),
+        max_bytes,
     }
 }
 
@@ -265,7 +296,12 @@ pub(crate) fn build_client_config(
     hover_preview_default: bool,
 ) -> ClientConfigResponse {
     let capabilities = derive_capabilities(settings, policy);
-    let hover_preview = hover_preview_for(policy, &capabilities, hover_preview_default);
+    let hover_preview = hover_preview_for(
+        policy,
+        &capabilities,
+        hover_preview_default,
+        crate::config::runtime().transcode.hover_preview_max_bytes,
+    );
     ClientConfigResponse {
         policy: policy.name.clone(),
         capabilities,
@@ -469,28 +505,31 @@ disable_backend_open = true
         let desktop = &settings.policies[0];
         let demo = &settings.policies[1];
 
+        // (direct, trim, transcode) — the three rungs of the ladder.
         let rungs = |policy: &PolicyConfig, server: bool| {
             let hover = build_client_config(&settings, policy, server)
                 .hover_preview
                 .expect("this build always answers");
-            (hover.direct, hover.transcode)
+            (hover.direct, hover.trim, hover.transcode)
         };
 
         // Nothing withheld: an unrestricted policy on a server whose default
-        // resolved true gets both rungs.
-        assert_eq!(rungs(desktop, true), (true, true));
+        // resolved true gets all three rungs.
+        assert_eq!(rungs(desktop, true), (true, true, true));
         // `[transcode] hover_preview = "off"` (or an "auto" that found no
-        // hardware encoder) withholds only the expensive rung: playing an
+        // hardware encoder) withholds only the rung that encodes. The remux
+        // has no encoder to have an opinion about, and playing an
         // already-playable original costs the server nothing to permit.
-        assert_eq!(rungs(desktop, false), (true, false));
-        // The restricted_demo ruleset denies POST /api/video/transcode, so
-        // the transcode rung is impossible however the server is configured.
-        assert_eq!(rungs(demo, true), (true, false));
+        assert_eq!(rungs(desktop, false), (true, true, false));
+        // The restricted_demo ruleset denies POST /api/video/transcode, which
+        // takes both server-side rungs however the server is configured — a
+        // remux is still a job this policy may not create.
+        assert_eq!(rungs(demo, true), (true, false, false));
 
         // The policy key is a negative override that wins over everything.
         let mut denied = desktop.clone();
         denied.client["hover_preview"] = serde_json::Value::Bool(false);
-        assert_eq!(rungs(&denied, true), (false, false));
+        assert_eq!(rungs(&denied, true), (false, false, false));
         // Only an explicit `false`: absent, `true`, and a non-boolean all
         // leave the feature on, so no seeded config needs a new line.
         for value in [
@@ -500,31 +539,47 @@ disable_backend_open = true
         ] {
             let mut policy = desktop.clone();
             policy.client["hover_preview"] = value.clone();
-            assert_eq!(rungs(&policy, true), (true, true), "{value}");
+            assert_eq!(rungs(&policy, true), (true, true, true), "{value}");
         }
 
-        // A preset whitelist that omits `preview` denies the transcode rung
-        // by itself: the POST would refuse the preset by name, so promising
-        // it here would send every hovered cell into a 422.
+        // A preset whitelist governs each rung by its own preset: the POST
+        // refuses a preset by name, so promising one here would send every
+        // hovered cell into a 422.
         let mut limited = desktop.clone();
         limited.client["transcode_presets"] = serde_json::json!(["playback"]);
-        assert_eq!(rungs(&limited, true), (true, false));
-        limited.client["transcode_presets"] = serde_json::json!(["playback", "preview"]);
-        assert_eq!(rungs(&limited, true), (true, true));
+        assert_eq!(rungs(&limited, true), (true, false, false));
+        limited.client["transcode_presets"] = serde_json::json!(["preview-trim"]);
+        assert_eq!(rungs(&limited, true), (true, true, false));
+        limited.client["transcode_presets"] = serde_json::json!(["preview"]);
+        assert_eq!(rungs(&limited, true), (true, false, true));
+        limited.client["transcode_presets"] = serde_json::json!(["preview", "preview-trim"]);
+        assert_eq!(rungs(&limited, true), (true, true, true));
     }
 
-    /// The field on the wire: two keys, always both, and `null` — never a
-    /// missing key — for a build with no hover preview at all. A client
+    /// The field on the wire: four keys, always all four, and `null` — never
+    /// a missing key — for a build with no hover preview at all. A client
     /// reading an absent key as "no answer" would have to guess, and the one
     /// guess it must never make is "allowed".
     #[test]
-    fn the_hover_preview_field_is_two_keys_or_an_explicit_null() {
+    fn the_hover_preview_field_is_four_keys_or_an_explicit_null() {
         let settings = two_policy_settings();
         let response = build_client_config(&settings, &settings.policies[0], true);
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(
             json["hover_preview"],
-            serde_json::json!({ "direct": true, "transcode": true })
+            serde_json::json!({
+                "direct": true,
+                "trim": true,
+                "transcode": true,
+                "max_bytes": crate::config::runtime().transcode.hover_preview_max_bytes,
+            })
+        );
+        // The cap is a number the client does arithmetic with, so it is
+        // published verbatim rather than as a tier or a bucket.
+        assert_eq!(
+            response.hover_preview.as_ref().unwrap().max_bytes,
+            16 * 1024 * 1024,
+            "the shipped default is 16 MiB"
         );
 
         let json = serde_json::to_value(ClientConfigResponse {
