@@ -40,6 +40,10 @@ Key options
     --warmup N          untimed batches of size 1 before measuring (default 1)
     --bisect-oom        binary-search the largest batch that does not OOM
     --bisect-max N      upper bound for the search               (default 1024)
+    --bisect-start N    first size the doubling phase probes; skips the cheap
+                        sizes when the boundary is known to be far above them
+    --bisect-budget S   stop refining after S seconds of bisect probes and
+                        report the bracket reached (0 = no limit)
     --repo PATH         repo root (default: two levels above this file)
     --impl-dir PATH     extra impl dir (repeatable)
     --registry PATH     extra registry TOML (repeatable)
@@ -85,6 +89,7 @@ Output schema (JSON)
                 "reserved_at_bisect_start_mb": int|null,
                 "largest_ok_units": int|null,
                 "largest_ok_items": int|null, "first_oom_items": int|null,
+                "low_items": int, "high_items": int, "stopped_early": bool,
                 "trace": [{"items": int, "ok": bool, "units": int,
                            "oom": bool, "absorbed_halvings": int,
                            "error": str|null}]} | null}
@@ -404,6 +409,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="untimed single-item batches before measuring")
     parser.add_argument("--bisect-oom", action="store_true")
     parser.add_argument("--bisect-max", type=int, default=1024)
+    parser.add_argument("--bisect-start", type=int, default=1,
+                        help="first batch size the doubling phase probes")
+    parser.add_argument("--bisect-budget", type=float, default=0.0,
+                        help="seconds of bisect probing before the refinement "
+                             "stops and reports the bracket (0 = no limit)")
     parser.add_argument("--repo", default=str(here.parents[2]),
                         help="repository root")
     parser.add_argument("--impl-dir", action="append", default=[])
@@ -598,10 +608,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                   "reserved_at_bisect_start_mb": int(torch.cuda.memory_reserved() // MIB),
                   "trace": [],
                   "largest_ok_items": None, "largest_ok_units": None,
-                  "first_oom_items": None}
+                  "first_oom_items": None, "stopped_early": False}
+        bisect_started = time.monotonic()
         low, high = 1, args.bisect_max
         # Grow first: double until something fails or the ceiling is hit.
-        probe = 1
+        probe = max(1, args.bisect_start)
         while probe <= args.bisect_max:
             record = run_batch(probe, -2)
             bisect["trace"].append({"items": probe, "ok": record["ok"] and not record["oom"],
@@ -621,6 +632,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             high = args.bisect_max
         while high - low > 1:
+            if args.bisect_budget > 0 and (
+                    time.monotonic() - bisect_started > args.bisect_budget):
+                bisect["stopped_early"] = True
+                break
             mid = (low + high) // 2
             record = run_batch(mid, -2)
             bisect["trace"].append({"items": mid, "ok": record["ok"] and not record["oom"],
@@ -635,6 +650,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 high = mid
                 bisect["first_oom_items"] = mid
                 settle_after_failure()
+        bisect["low_items"] = low
+        bisect["high_items"] = high
 
     result = {
         **plan,
