@@ -38,9 +38,10 @@ Tiers
     pdf     ~120 PDFs of 1 .. 40 pages.
     soak    ~12000 items: ramp + pixmix + text + audio + pdf, mixed.
     poison  deliberate failure inputs for S5: a truncated JPEG, a zero-byte
-            file, a file literally named `out of memory.png`, and one very
-            large PNG (see --poison-side; the default already costs ~1 GB of
-            RAM to encode).
+            file, a truncated PNG literally named `out of memory.png` (B11:
+            it must fail, so that its error text carries those words), and
+            one very large PNG (see --poison-side; the default already costs
+            ~1 GB of RAM to encode).
 
 Output
 ------
@@ -466,8 +467,17 @@ def gen_junk(spec: Dict[str, Any]) -> Dict[str, Any]:
         buffer.unlink()
         path.write_bytes(blob[: len(blob) // 2])
     elif style == "named_oom":
+        # The point of this item (protocol §4 S5, finding B11) is a *failing*
+        # input whose error text carries the words "out of memory" only because
+        # of its file name. A valid PNG decodes fine and never reaches the
+        # ledger's `message_reports_oom` classifier, so the file is written
+        # truncated: the impl rejects it, and the rejection message names it.
+        buffer = Path(str(path) + ".full")
         image = _base_image(256, 256, _rng(spec["seed"], spec["index"]), False, False)
-        image.save(path, "PNG")
+        image.save(buffer, "PNG")
+        blob = buffer.read_bytes()
+        buffer.unlink()
+        path.write_bytes(blob[: len(blob) // 2])
     else:
         raise SystemExit(f"corpus: unknown junk style {style!r}")
     return {
