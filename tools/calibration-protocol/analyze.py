@@ -280,6 +280,26 @@ def _nearest(rows: List[Dict[str, Any]], times: List[float], target: float,
     return best
 
 
+def _at_or_after(rows: List[Dict[str, Any]], times: List[float], target: float,
+                 tolerance: float) -> Optional[Dict[str, Any]]:
+    """The first sample at or after `target`, else the nearest one before it.
+
+    `_nearest` is wrong for a quantity that is still *rising* at `target`.
+    NVML's per-process figure climbs throughout a model load and the worker
+    reports `base_mb` only once the load has finished, so an oracle sample
+    taken 60 ms *before* the admission line can be hundreds of MiB short while
+    the sample 190 ms after it agrees to within the driver's own 8-10 MiB
+    per-process offset. Measured in run1/S1: 812 MiB at 05:53:38.108 against a
+    reported 964, and 974 MiB at 05:53:38.353.
+    """
+    if not rows:
+        return None
+    index = bisect.bisect_left(times, target)
+    if index < len(rows) and times[index] - target <= tolerance:
+        return rows[index]
+    return _nearest(rows, times, target, tolerance)
+
+
 def _pct(value: float, of: float) -> float:
     return 100.0 * value / of if of else float("inf")
 
@@ -386,8 +406,8 @@ def check_base_accuracy(ctx: Context) -> Verdict:
 
     rows: List[Dict[str, Any]] = []
     for (model, uuid), info in seen.items():
-        vram = _nearest(ctx.vram_samples, ctx._vram_times, info["t_wall"],
-                        ctx.args.base_window)
+        vram = _at_or_after(ctx.vram_samples, ctx._vram_times, info["t_wall"],
+                            ctx.args.base_window)
         if vram is None:
             rows.append({"model": model, "gpu": uuid, **info,
                          "note": "no oracle sample near the admission"})
@@ -417,6 +437,13 @@ def check_base_accuracy(ctx: Context) -> Verdict:
         rows.append({"model": model, "gpu": uuid, **info, "pid": pids[0],
                      "oracle_pid_mb": ours, "oracle_pid_min_mb": floor,
                      "error_mb": error,
+                     # How far after the admission the oracle sample sits. A
+                     # model that loads and runs its first batch inside one
+                     # sample period cannot be resolved: the sample then
+                     # carries the batch's cuBLAS/cuDNN workspace as well as
+                     # the base, and the row is a comment on the cadence, not
+                     # on the ledger (run1/S14: MiniLM, 654 vs 774).
+                     "oracle_dt_ms": round((vram["t_wall"] - info["t_wall"]) * 1000.0),
                      "error_pct": round(_pct(error, max(1, ours)), 2)})
 
     judged = [row for row in rows if row.get("error_pct") is not None
@@ -428,8 +455,8 @@ def check_base_accuracy(ctx: Context) -> Verdict:
                        {"rows": rows})
     detail = "; ".join(
         f"{row['model']} base_mb={row['base_mb']} ({row['base_method']}) vs oracle "
-        f"PID {row['oracle_pid_mb']} MiB at admission = {row['error_pct']}% "
-        f"(lifetime min {row['oracle_pid_min_mb']})"
+        f"PID {row['oracle_pid_mb']} MiB at admission+{row['oracle_dt_ms']}ms = "
+        f"{row['error_pct']}% (lifetime min {row['oracle_pid_min_mb']})"
         for row in reported
     )
     if not judged:
