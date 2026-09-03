@@ -42,10 +42,14 @@ Options:
     --tolerance-mb N      pass band around the held amount             (default 64)
     --ram-tolerance-mb N  pass band for the RSS and release deltas    (default 512)
     --chunk-mb N          hog chunk size                              (default 128)
-    --alloc-timeout S     extra seconds added to each hog's lifetime to let a
-                          slow allocation reach the target before the hold
-                          window is measured. On a host where touching fresh
-                          pages runs at ~10 MiB/s (see `results/phase0/
+    --alloc-timeout S     budget for the allocation phase: how long a slow
+                          allocation may take to reach the target before the
+                          hold window is measured. The driver watches the hog's
+                          own state log and ends the hold `--hold` seconds after
+                          the target is actually reached, so a generous budget
+                          costs nothing when allocation turns out to be fast.
+                          On a host where touching fresh pages runs at
+                          ~10 MiB/s (see `results/phase0/
                           oracle-calibration.md`), an 8 GiB RAM hog needs
                           ~700 s here.                                 (default 0)
     --out DIR             results directory
@@ -97,6 +101,24 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
+
+
+def _held_mb(path: Path) -> float:
+    """The last `held_mb` the hog wrote, or -1 if it has not written one yet."""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            held = -1.0
+            for line in handle:
+                line = line.strip()
+                if not line or '"held_mb"' not in line:
+                    continue
+                try:
+                    held = float(json.loads(line).get("held_mb", held))
+                except Exception:
+                    continue
+            return held
+    except OSError:
+        return -1.0
 
 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -212,9 +234,29 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.target == "gpu":
                 cmd += ["--device", str(args.device)]
             cmd += ["hold", str(size)]
-            print(f"[{size} MiB] running hog for {duration:.0f}s ...",
+            print(f"[{size} MiB] running hog (budget {duration:.0f}s) ...",
                   file=sys.stderr)
-            subprocess.run(cmd, check=False)
+            hog = subprocess.Popen(cmd)
+            # `duration` is the hog's own safety net. The hold we actually want
+            # is `--hold` seconds *after the target is reached*, so watch the
+            # hog's state log and end it there: otherwise a generous
+            # --alloc-timeout is spent holding, not allocating, and a 16 GiB RAM
+            # leg that filled in 107 s would still sit there for 40 minutes.
+            reached_at: Optional[float] = None
+            deadline = time.monotonic() + duration + 30.0
+            while hog.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.5)
+                if reached_at is None:
+                    if _held_mb(hog_path) >= size:
+                        reached_at = time.monotonic()
+                elif time.monotonic() - reached_at >= args.hold:
+                    hog.terminate()
+                    break
+            try:
+                hog.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                hog.kill()
+                hog.wait(timeout=30)
             time.sleep(args.settle)
             results.append({"requested_mb": size, "hog_path": str(hog_path)})
     finally:
