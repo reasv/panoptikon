@@ -203,14 +203,27 @@ quality is the point). Fast channel = HW encoder when the probe validated
 one, else `libx264 -preset veryfast`. Playback-cache renditions always use
 the fast channel (throwaway quality, latency matters).
 
-*Amended 2026-09-03*: `preview` joins the table for the grid/filmstrip hover
-preview (`docs/video-hover-preview-implementation.md` §3) — h264 mp4, **no
-audio**, CRF 26, cap 480p/30 fps, fast channel, on a `Surface::Preview` of its
-own so it never appears in a clip or mosaic dropdown. The 16 s window is a
-trim bound the client sends (`end_cs = 1600`), not a preset field, so a short
-video previews whole under the same key it would have anyway. `-an` needs no
-new code: `run.rs` already emits it for any preset with no `acodec`, which
-until now was only the animated-image containers.
+*Amended 2026-09-03*: two presets join the table for the grid/filmstrip hover
+preview (`docs/video-hover-preview-implementation.md`), both on a
+`Surface::Preview` of their own so neither appears in a clip or mosaic
+dropdown, and both taking the 16 s window as a trim bound the client sends
+(`end_cs = 1600`) rather than as a preset field — a short video previews whole
+under the same key it would have had anyway.
+
+- `preview` — h264 mp4, **no audio**, CRF 26, cap 480p/30 fps, fast channel.
+  `-an` needed no new code: `run.rs` already emits it for any preset with no
+  `acodec`, which until now was only the animated-image containers.
+- `preview-trim` — mp4, `vcodec = "copy"`, no audio, no rate control, no caps.
+  The **first non-encoding preset**: the source's own packets remuxed, so the
+  cut lands on keyframe boundaries (a slice may run on to the end of the GOP
+  that straddles `end_cs`, and a source whose first keyframe is late starts
+  late — both acceptable for a hover). It resolves to the host-independent
+  encoder identity `copy`, so its artifacts keep one cache key across a
+  hardware flip that re-keys every real encode. A codec that will not mux into
+  mp4 simply fails the job, and the client falls to `preview`.
+
+The copy shape cost `ResolvedPreset::quality` an `Option`. That re-keyed
+nothing: `Some(q)` and a bare `q` serialize identically, which a test pins.
 
 Built-ins (initial set): `playback` (h264+aac mp4, cap 1080p, fast),
 `clip` (quality) / `clip-fast`, `webp-anim`, `mosaic-mp4` (quality) /
