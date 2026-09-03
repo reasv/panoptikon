@@ -12,6 +12,7 @@ is written out in full so any result can be reproduced by hand.
 | Date (UTC) | <DATE> |
 | Host | <HOST> |
 | Branch / commit | <BRANCH> / <COMMIT> |
+| **Binary built at** | <BINARY-COMMIT> — the release binary is often several commits behind the tree, and a fix that landed after the build is *not* in the result |
 | Driver | <DRIVER> |
 | GPUs | <GPUS> |
 | Note | <NOTE> |
@@ -29,6 +30,9 @@ What was running before the scenario started, and what this scenario changed.
 - Calibration store state at the start (present / deleted / edited; snapshot
   copied to `calibration.before.toml`):
 - Models used and whether they were already in the HF cache:
+- `ulimit -n` for the gateway process (and, in a container, `docker exec …
+  ulimit -n`): every in-flight predict costs two sockets in one descriptor
+  table, so this bounds the ramp (§8 G7, finding F6):
 
 ## 2. Commands
 
@@ -42,6 +46,10 @@ DIR=$(python/.venv/bin/python tools/calibration-protocol/newrun.py --scenario <S
 python/.venv/bin/python tools/calibration-protocol/vramrec.py   --out "$DIR/vramrec.jsonl"   &
 python/.venv/bin/python tools/calibration-protocol/healthrec.py --out "$DIR/healthrec.jsonl" &
 python/.venv/bin/python tools/calibration-protocol/hog.py --out "$DIR/hog.jsonl" --port 6401 ... &
+# descriptors, on any containerised run or any run that passes ~100 units
+# (recipe: tools/calibration-protocol/README.md, "Recording file descriptors")
+while :; do printf '%s fds=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+    "$(ls /proc/$GW_PID/fd | wc -l)"; sleep 0.5; done > "$DIR/fdrec.txt" &
 
 # the scenario itself
 ...
@@ -124,3 +132,4 @@ plus anything about the host state that must hold for it to reproduce.
 | `jobs.json` | | |
 | `verdicts.json` | | |
 | `timeline.png` | | |
+| `fdrec.txt` / `fds.jsonl` | | descriptor samples, if recorded |

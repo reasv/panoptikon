@@ -182,6 +182,17 @@ build/deploy/API. The plan that uses this is
   `:2123-2238`): once per (model, board) per run; fit adopted if none
   and slope > 0; knee adopted even from a baseline; anchor/ring/
   `local_samples` only from a local profile with the exact torch string.
+- `Grant.squeezed` (`ledger.rs:4807`, set at `:3292-3302`): true when the
+  board could afford **less** than the window target the anchor asked
+  for. Two consumers, both added during run1: `flag_trims_locked` (a
+  squeezed neighbour is what justifies asking an idle resident to release
+  its pool) and `dispatch::in_flight_target_units` (`dispatch.rs:601`),
+  which publishes the **granted** budget's window depth instead of the
+  anchor-derived one and clamps the next window the dispatcher forms —
+  the header alone cannot shorten a window that is already formed. Before
+  `22eb33f9` a grant squeezed to 11 units was followed by a window of
+  1 936 requests that ran 49 s with no grant, no high-water sample and no
+  re-pricing (finding T5).
 
 ### 1.5 Persistence (`calibration.rs`)
 
@@ -246,6 +257,58 @@ build/deploy/API. The plan that uses this is
   (`manager.rs:1068-1085`) WARN "worker died fatally; dropping model from
   all caches". **The next predict respawns immediately, serially under
   `load_lock`, with no counter, backoff or cap.**
+- **Death record** `WorkerDeath` (`worker.rs:534-565`), built by
+  `Worker::record_death` (`:1600`) on **every** fatal path and logged as
+  WARN *"an inferio worker process is gone. Cause: …"* with `worker`,
+  `pid` (captured at spawn, since the reap clears `Child::id()`),
+  `status`, `signal`, `core_dumped`, `killed_by_gateway` and the stderr
+  tail. The child is reaped with `FATAL_REAP_GRACE = 5 s` (`:109`);
+  `status = None` means it was wedged rather than gone.
+  `killed_by_gateway` is sampled **before** the record's own SIGKILL of
+  the process group, because that kill happens on every path. Caveat
+  measured in run1 (finding F12): `try_wait` cannot see a thread-group
+  leader whose CUDA threads are still unwinding a SIGKILL (**475 ms**
+  measured), so on exactly the externally-killed CUDA worker the flag can
+  read `true`; read it together with the stderr tail, never alone.
+- **Idle liveness sweep**: `DispatchMsg::ReapIdle` (`dispatch.rs:279`,
+  handled `:834`/`:882`, acted on `:992`) `try_wait`s every replica in
+  the free pool on the manager's tick (`manager.rs:1128`) and runs
+  `Worker::reap_if_exited` (`worker.rs:1680`), which produces the same
+  death record a request-path failure would. It is the **only** way a
+  dead `none`-cost model is ever noticed: with no request there is no
+  read on the pipe, so EOF is never seen and `/health` keeps advertising
+  a replica that does not exist (finding P5-6, measured at 13 minutes).
+  A worker already poisoned by an earlier fatal path answers `None`, so a
+  death is never reported twice. Prewarm-**parked** workers are not swept
+  (open item V3).
+- **Descriptor budget** (`panoptikon/src/rlimit.rs`, new): local
+  inference is loopback HTTP inside one process, so an in-flight predict
+  costs **two** sockets in one descriptor table.
+  `raise_soft_limit_at_startup` (`main.rs:149`, logged at `:219` once
+  logging exists) lifts the soft `RLIMIT_NOFILE` to the hard limit —
+  containerd's default OCI spec gives a container soft 1024 / hard
+  524 288, the same pair as a bare login shell — and `soft_nofile_limit`
+  feeds `jobs::extraction::in_flight_unit_ceiling` a third term,
+  `by_fds = (soft − FD_RESERVE 256) / FDS_PER_IN_FLIGHT_ITEM 2`
+  (`extraction.rs:109,131,176-192`), which **caps** the other two rather
+  than joining the max. `NOFILE_LIMIT_UNKNOWN` makes the term
+  unconditionally non-binding where there is no rlimit to read
+  (Windows). Motivating failure: Phase 6 finding F6.
+- **`PR_SET_PDEATHSIG` is thread-scoped** (`process_tree.rs:114-135`,
+  armed between fork and exec): on Linux it fires when the **forking
+  thread** exits, not the forking process. Its doc comment's premise —
+  that spawns happen on tokio core worker threads which live for the
+  life of the runtime — stops holding the moment anything calls
+  `block_in_place`, because Tokio launches its runtime workers *through*
+  the blocking pool and a demoted pool thread exits after `KEEP_ALIVE =
+  10 s` idle. The load-path host probe (`ledger.rs:4295`,
+  `refresh_external_for_load`) does exactly that, milliseconds before the
+  worker is forked (`worker.rs:887`), and `refresh_due` arms it for the
+  first load after every boot and after every worker departure. Run1
+  measured 8/8 worker SIGKILLs Δ 1–3 ms from the forking thread's exit,
+  self-sustaining, costing 15 924 of 16 000 items on a job that still
+  reported *completed* (finding **F11**; explains P5-1 and F8 in full).
+  Negative control: a host with no board never probes and never dies.
 - Deadlines (`worker.rs:119-145`): handshake/configure/ping 30 s,
   load/prewarm 600 s, unload_grace 10 s, terminate_grace 5 s
   (`[inference_local] handshake_secs/load_secs/unload_grace_secs/
@@ -264,9 +327,12 @@ build/deploy/API. The plan that uses this is
   `MIN_IN_FLIGHT_UNITS = 64` (`:87`, also the starting value, and a
   deadlock bound since one chunk acquires up to 64 permits at once);
   ceiling `in_flight_unit_ceiling` (`:123`) =
-  `max(intermediate_budget_kib / NOMINAL_UNIT_KIB, loader_concurrency × 64)`
-  with `NOMINAL_UNIT_KIB = 256` (`:96`) → **4096 units at the shipped
-  defaults**.
+  `min(max(intermediate_budget_kib / NOMINAL_UNIT_KIB,
+  loader_concurrency × 64, 64), max(by_fds, 64))` with
+  `NOMINAL_UNIT_KIB = 256` (`:96`) and the descriptor term `by_fds`
+  described under §1.6 → **4096 units at the shipped defaults** (the
+  descriptor term binds only where the *soft* limit survives startup
+  below ~8 500).
   Master sized the semaphore by the user's batch size; the cap plays no
   part in either number now. Other core bounds unchanged:
   `loader_concurrency` default 8, intermediate byte budget default
@@ -397,6 +463,17 @@ Pre-existing:
 - manager.rs: DEBUG "resolved cost dimension"; DEBUG "replica loaded";
   WARN "worker died fatally; dropping model from all caches"; DEBUG
   "unloading model".
+- worker.rs (added by `c8d64a5a`): **WARN "an inferio worker process is
+  gone. Cause: {why}. {attribution}. stderr tail: …"** with `worker`,
+  `pid`, `status`, `signal`, `core_dumped`, `killed_by_gateway` — one per
+  death, on every fatal path including the requestless idle reap
+  ("the worker process exited while idle (no request was in flight)").
+- rlimit.rs / extraction.rs (added by `d5e42c78`): INFO "raised the open
+  file descriptor soft limit to the hard limit"
+  (`soft_nofile_before/after`) or INFO "open file descriptor limit is
+  already at its maximum"; WARN "could not raise…" / "could not read…";
+  WARN when the descriptor budget would put the in-flight ceiling under
+  the floor of 64 (`reserve`, `fds_per_item`).
 - worker.rs: DEBUG "worker reported its load footprint" (base_mb,
   base_method, dtype, gpu_uuid, gpu_bdf, gpu_total_mb, torch).
 - calibration.rs (WARN): store cannot be read / serialize failure /
@@ -669,11 +746,34 @@ Smallest per class: `tags/wd-vit-tagger-v3` (~350 MB),
   [group.oomtest.inference_ids.test]
   ```
   Caveats: torch-free fixtures report no `gpu_uuid`/`base_mb`, so on CUDA
-  they register only via the single-board fallback (single visible
-  board) or run unpriced; a fixture that allocates one CUDA tensor at
-  load registers normally. `oom_second_batch` fires once per worker
-  lifetime. The extraction job's `output_type` must match what the
-  fixture returns.
+  they ~~register only via the single-board fallback (single visible
+  board) or~~ run unpriced — **measured in run1: the single-board
+  fallback needs a `gpu_bdf` or a `gpu_total_mb` and a torch-free worker
+  sends neither, so they are never ledger-admitted on a CUDA host at
+  all**; a fixture that allocates one CUDA tensor at load registers
+  normally. `oom_second_batch` (the shipped torch-free one) OOMs on
+  **every** batch from the second on, not once. The extraction job's
+  `output_type` must match what the fixture returns.
+
+**The protocol's own fixtures** (`tools/calibration-protocol/fixtures/`,
+installed into `inferio_custom/` + `config/inference/` by
+`install-fixtures.sh`; both destinations are git-ignored so the checkout
+stays clean). One registry group, `calibfixture`, `item`/`count`,
+`seed_units = 8`, `input_spec.handler = "image_frames"`; every CUDA
+variant allocates `load_mb` (64) of real device memory at load so it
+resolves to a board and is **priced**:
+
+| Inference id | Behaviour | Probes |
+|---|---|---|
+| `calibfixture/oom_second_batch_cuda` | Succeeds on batch 1, then raises the bare driver OOM text on exactly `oom_batches` (default 1) batches | the OOM backstop, the merged-window fallback, deflation → 0 |
+| `calibfixture/oom_cuda` | `INFERENCE_OOM_BATCH_SIZE_1:` every time — "even one item does not fit", which no deflation can rescue | B8's climb |
+| `calibfixture/oom_timed_cuda` | Batch-1 OOM for `oom_secs` (120) after load, healthy afterwards | the only way to time deflation's **recovery** on one resident (7.04 levels/s) |
+| `calibfixture/failbatch_cuda` | Non-OOM `ValueError` for any merged batch; singles succeed | per-request fallback with **no** deflation |
+| `calibfixture/failbatch_oomtext_cuda` | Same impl with `message = "refusing merged batch of {n}: the caption cache is out of memory slots"` | **B11** — does a substring deflate a healthy model? (it does) |
+| `calibfixture/dies_on_load_cuda` | Raises inside `load()`; never becomes resident | **B15** respawn cadence on the predict path |
+| `calibfixture/dying_cuda` | `os._exit(3)` inside predict | **B7** death mid-window, respawn at the anchor |
+| `calibfixture/hang_trim_cuda` | Grows the pool by `pool_mb` (512) per predict so `flag_trims_locked` picks it, and ignores the trim for `hang_secs` (70) by rebinding `inferio_worker.memory.empty_cache` only when no predict is in flight | **B17** — the fatal trim (it kills the worker at ~20 s, not 60) |
+| `calibfixture/{oom_second_batch,oom,failbatch,dying}_cpu` | the torch-free originals | the **unpriced path** only (see the caveat above) |
 
 ### 2.7 Env vars honoured by the worker
 
@@ -794,7 +894,7 @@ curl -X POST "$B/api/jobs/folders/rescan?index_db=cal"                 # 202 Job
 curl -X POST "$B/api/jobs/data/extraction?index_db=cal&inference_ids=tags/wd-vit-tagger-v3[&batch_size=8]"
 curl $B/api/jobs/queue                                                 # {"queue":[…], "outcomes":[…]}
 curl "$B/api/jobs/data/history?index_db=cal&page=1&page_size=50"       # LogRecord{batch_size(0=auto), total_segments, errors, data_load_time, inference_time, failed, completed, status}
-curl "$B/api/jobs/data/failures?index_db=cal"
+curl "$B/api/jobs/data/failures?index_db=cal"   # run1: stayed {"total":0,"failures":[]} in every leg, including 125 easyOCR OOMs and a whole-job failure — the reason is only in the job row's `errors` and the gateway log (findings T8/Q8)
 curl -X POST "$B/api/jobs/cancel"; curl -X DELETE "$B/api/jobs/queue?queue_ids=3"
 curl $B/api/inference/metadata                                         # registry + calibration overlay
 curl $B/api/inference/health                                           # vram[], models[], gpus[]
@@ -822,6 +922,18 @@ No per-job log endpoint: job progress is in the gateway log and in
   cargo test --release -p panoptikon vq_int8_verify -- --ignored`),
   `pql/explain_plan.rs`, `pql/quant_ab.rs`, `pql/fts_probe.rs`,
   `media_tools/outro_equivalence.rs`.
+- **Protocol shims** (`tools/calibration-protocol/config/nvidia-smi-shims/`,
+  for S13): `slow-all` (sleeps 6 s on every query — also hits the *boot*
+  inventory probe, which times out at 5.000 s, and
+  `accelerator_report`'s untimed capability query, which waits the full
+  6 s and adds ~11 s to boot), `slow-memory` (slow only on
+  `--query-gpu=uuid,memory.total,memory.free`, so the inventory is normal
+  and only refreshes are slow — this is the one B13 needs) and
+  `malformed` (a row that parses nowhere). The **hidden** case is not a
+  shim: `find_nvidia_smi` (`capability.rs:148`) walks `PATH` and there is
+  no config key, so it needs a scratch mirror of the directory holding
+  `nvidia-smi` with that one entry missing; recipe in the shims'
+  `README.md`. Never leave a shim on a `PATH` the user inherits.
 - CI: `release.yml` on `v*` tags only (3 OS builds + smoke: boot with
   `PANOPTIKON_AUTO_SETUP=false`, `/api/client-config`, UI, then
   `db/create`, folders, rescan, poll queue, PQL, thumbnail, file serve;
