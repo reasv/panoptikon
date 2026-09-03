@@ -104,5 +104,11 @@ plus the two Phase-4 additions `calibfixture/oom_timed_cuda` (batch-1 OOM for
 (raises inside `load()`, for the respawn-cadence measurement, finding B15).
 Use the `_cuda` ids on C1 (priced, board-resolved) and either family on C2.
 
-`oom_second_batch_*` fires **once per worker lifetime** (the counter lives on
-the instance), so a scenario that wants a second OOM must force a respawn.
+`oom_second_batch_cpu` (the shipped torch-free impl) tests `batches >= 2`, so
+it OOMs on the second batch **and on every batch after it, for the worker's
+whole lifetime**. Under a real gateway the per-request fallback turns that
+into one negative settle per retry: Phase 4's first S5 leg reached
+`deflation = 2 227` in 40 s. `oom_second_batch_cuda` therefore takes an
+`oom_batches` config key (default **1**), so it OOMs exactly once — which is
+the case §4 S5 describes. Set `oom_batches` high to get the old behaviour;
+use `calibfixture/oom_cuda` for a permanent OOM.

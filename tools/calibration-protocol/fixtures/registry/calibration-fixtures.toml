@@ -58,11 +58,12 @@ handler = "image_frames"
 # --- CUDA-touching variants (use these on C1: priced, board-resolved) ---
 
 # Succeeds on batch 1, then raises the bare driver OOM text on batch 2 of the
-# same worker. Fires once per worker lifetime.
+# same worker. Exactly `oom_batches` batches OOM (see ../README.md).
 [group.calibfixture.inference_ids.oom_second_batch_cuda]
 config.impl_class = "oom_second_batch_cuda_test"
 config.load_mb    = 64
-metadata.description = "OOMs on the second GPU batch (CUDA-touching, priced)"
+config.oom_batches = 1
+metadata.description = "OOMs once, on the second GPU batch (CUDA-touching, priced)"
 
 # Always raises INFERENCE_OOM_BATCH_SIZE_1: the "even one item does not fit"
 # path, which no amount of deflation can rescue.

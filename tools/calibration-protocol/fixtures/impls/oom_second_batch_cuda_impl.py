@@ -12,10 +12,24 @@ allocator's reserved/allocated counters across the load window so the
 `touched_gpu` gate in `_finish_load` opens and a `base_mb` is resolved
 (`nvml` own-PID tier on bare Linux).
 
+Deliberate deviation from the torch-free original, found in Phase 4: the
+shipped fixture's test is `self.batches >= 2`, so it OOMs on the second batch
+**and on every batch after it, forever**. Under a real gateway that is not
+"one OOM": the harness falls back to per-request prediction, each retry is
+its own batch, each raises, and the ledger books a negative settle for every
+one — `deflation` reached 2 227 in 40 s in the first S5 leg. That is the
+`oom_cuda` fixture's job. Here the OOM count is bounded by `oom_batches`
+(default 1), so the scenario the protocol describes — one negative,
+`deflation = 1`, recovery after three clean windows — is what actually
+happens.
+
 Config keys (from the registry TOML, passed as **kwargs):
   load_mb: MiB of device memory to hold for the model's lifetime (default 64).
   device:  torch device string (default "cuda"); the worker is pinned with
            CUDA_VISIBLE_DEVICES so "cuda" is always the intended board.
+  oom_batches: how many batches OOM, starting with the second (default 1).
+           0 disables the OOM; a large value reproduces the shipped
+           torch-free behaviour.
 
 Keep this stdlib+torch only and self-contained: the worker's discovery
 (`inferio_worker/discovery.py`) loads each file as a standalone module, so
@@ -30,11 +44,12 @@ class OomSecondBatchCudaModel:
         self.config = config
         self.load_mb = int(config.get("load_mb", 64))
         self.device = str(config.get("device", "cuda"))
+        self.oom_batches = int(config.get("oom_batches", 1))
         self._ballast = None
 
     def predict(self, inputs):
         self.batches = getattr(self, "batches", 0) + 1
-        if self.batches >= 2:
+        if 2 <= self.batches < 2 + self.oom_batches:
             raise RuntimeError(
                 "CUDA out of memory. Tried to allocate 2.00 GiB (fixture)"
             )
