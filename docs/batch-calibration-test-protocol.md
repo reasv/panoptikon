@@ -684,6 +684,48 @@ confirm or refute them rather than rediscover them.
   - `REQUEST_UNIT_BUDGET = 64` stays as the per-request chunk, and
     `ISOLATION_MAX_BATCH` is untouched. No grant arithmetic, ramp, knee
     or user-visible default changed.
+  - **Amended 2026-09-03 (Phase 6, finding F6): the ceiling is also
+    clamped by the process's file-descriptor budget, and the gateway
+    raises that budget at startup.** With local inference every in-flight
+    predict is loopback HTTP from the gateway to a listener in the *same*
+    process, so it costs two sockets in one descriptor table. Nothing in
+    the ramp knew that: in the shipped Docker image, whose `nofile` soft
+    limit is containerd's default 1024 (hard 524 288), a 2000-item job
+    drove the gateway to 983 sockets / 1024 descriptors, `accept` started
+    failing with `EMFILE`, SQLite could not open its files, and the job
+    ended `status: -1` with 1849 items unprocessed; the same job on the
+    master image peaked at 177 descriptors and finished 2000/2000. Two
+    changes, both on this branch. (i) `main` raises the soft
+    `RLIMIT_NOFILE` to the hard limit before the tokio runtime is built
+    (`panoptikon/src/rlimit.rs`), so every thread and child process
+    inherits it; the outcome is logged at INFO once logging exists, at
+    WARN if the raise is refused, and a soft limit already at the hard
+    one is a silent no-op. This alone fixes the container, which had 524
+    288 descriptors available all along. (ii) `in_flight_unit_ceiling`
+    gains a third term for the case where the *hard* limit is also small:
+    `by_fds = (soft_nofile - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM` with
+    `FDS_PER_IN_FLIGHT_ITEM = 2` (the client socket plus the accepted
+    server socket) and `FD_RESERVE = 256` (the ~50 non-window descriptors
+    master held at 177 total, with margin for more databases, listeners,
+    worker replicas and decode subprocesses), and the ceiling becomes
+    `min(max(by_budget, by_loaders, 64), max(by_fds, 64))` — the
+    descriptor term is a **cap** on the other two, not a third term to
+    maximise with, because descriptors are the one resource a job can
+    exhaust process-wide rather than merely oversubscribe. The floor of
+    64 still wins under it (it is a deadlock bound), with a WARN naming
+    the limit when the budget is below `64 x 2 + 256 = 384`. On a host
+    whose limit is 524 288 the term is not binding and the shipped
+    defaults are unchanged (4096 units). On non-Unix there is no
+    `RLIMIT_NOFILE` to read and the term is fed a sentinel that can never
+    bind. **Not changed:** the server-side header derivation — the
+    orchestrator cannot know a remote caller's descriptor budget, so
+    bounding the figure by one's own is the caller's job (stated in
+    `inferio-worker-protocol.md`). **Considered and not done:** a
+    server-side accept guard, because `axum` 0.8 already logs an accept
+    error and backs off for one second rather than giving up
+    (`serve::listener::handle_accept_error`) — the Phase 6 symptom
+    "axum stopped accepting" was that backoff, and the damage in-process
+    was SQLite's, which the descriptor clamp is what prevents.
   - **Follow-up, not done here:** `ui/lib/panoptikon.d.ts` is generated
     from `panoptikon/openapi.json` by `npm run gen:api` in the `ui`
     submodule (a separate repository), and the new response header

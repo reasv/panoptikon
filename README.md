@@ -344,6 +344,17 @@ Since the server cannot open files on *your* machine from inside a
 container, pair it with [Panoptikon Relay](https://github.com/reasv/panoptikon-relay)
 on your client (see above).
 
+**File descriptors.** Local inference is served over loopback HTTP by the same
+process that calls it, so each batch item in flight costs about two sockets;
+container runtimes commonly start a process at a soft `nofile` limit of 1024.
+The server raises its own soft limit to the hard limit at startup, which is
+enough on Docker's defaults (hard limit 524 288) and needs no configuration.
+If you deliberately run with a low **hard** limit, the server bounds how much
+work it keeps in flight to fit — roughly `(hard_limit - 256) / 2` items — so
+batches simply stop growing instead of failing; give it a hard limit of at
+least a few thousand (`ulimits: nofile:` in compose, `--ulimit nofile=` for
+`docker run`) if you want full pipelining.
+
 ### GPU (CUDA)
 
 For NVIDIA GPU inference — recommended, and what most users want — use the

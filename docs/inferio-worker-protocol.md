@@ -325,10 +325,24 @@ What the caller does with it is the caller's business. The gateway's own
 extraction jobs (`jobs/extraction.rs`) resize a per-job unit semaphore toward
 the figure on every response, clamped between a floor of one request's worth
 (64 units, which is also the value the semaphore starts at) and a ceiling
-derived from the job's intermediate byte budget and loader slots (4096 units
-at the shipped defaults). Growth adds permits; a shrink is applied only to
-permits that are free, and the remainder is withheld as outstanding permits
-come back, so a resize never interrupts work already in flight.
+derived from the job's intermediate byte budget, loader slots and descriptor
+budget (4096 units at the shipped defaults). Growth adds permits; a shrink is
+applied only to permits that are free, and the remainder is withheld as
+outstanding permits come back, so a resize never interrupts work already in
+flight.
+
+**A caller must bound the figure by its own file-descriptor budget.** The
+figure is sized by the *server's* memory picture and the server cannot see the
+client's `RLIMIT_NOFILE`, so honouring it literally is how a caller runs out
+of sockets: each in-flight predict costs one client socket, and when the
+inference server is the same process (the gateway's `inference_local`) it
+costs a second for the accepted end, so N items in flight cost up to 2N
+descriptors in one descriptor table on top of databases, listeners and worker
+pipes. The gateway therefore raises its own soft limit to the hard limit at
+startup and caps the ceiling above at
+`(soft_nofile - 256) / 2` (`jobs/extraction.rs`, `FD_RESERVE` and
+`FDS_PER_IN_FLIGHT_ITEM`). Ignoring a published figure — downward, never
+upward — is always allowed.
 
 ### Memory sensing (optional response fields)
 
