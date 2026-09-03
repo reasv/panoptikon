@@ -715,10 +715,10 @@ impl MemoryQuery {
     /// any failure, in which case the ledger keeps the stale reading, which
     /// the worker's per-batch shrink clamp makes safe.
     ///
-    /// Blocking, and never called on a Tokio worker thread as-is: the
-    /// dispatch-path refresh runs it under `spawn_blocking`, and the
-    /// load-path probe (`VramLedger::refresh_external_for_load`, which does
-    /// wait for the answer) under `block_in_place`.
+    /// Blocking, and never called on a Tokio worker thread as-is: both probe
+    /// paths run it under `spawn_blocking` — the dispatch-path refresh drops
+    /// the join handle, the load-path probe
+    /// (`VramLedger::refresh_external_for_load`) awaits it.
     pub fn run(&self) -> Option<Vec<GpuMemory>> {
         match self {
             Self::NvidiaSmi => query_memory_nvidia_smi(),

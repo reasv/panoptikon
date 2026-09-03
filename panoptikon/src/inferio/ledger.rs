@@ -1667,7 +1667,7 @@ impl VramLedger {
     /// missing or stale, because that trigger is otherwise unreachable on a
     /// board no worker has ever been resident on
     /// ([`Self::refresh_external_for_load`]).
-    pub fn reserve_load(
+    pub async fn reserve_load(
         self: &Arc<Self>,
         inference_id: &str,
         cost: CostDimension,
@@ -1675,6 +1675,7 @@ impl VramLedger {
         dtype: Option<&str>,
     ) -> Option<LoadReservation> {
         self.reserve_load_signalling(inference_id, cost, gpu, dtype)
+            .await
             .map(|(reservation, _)| reservation)
     }
 
@@ -1682,7 +1683,7 @@ impl VramLedger {
     /// exceeded the board's headroom — the evict-before-load signal, returned
     /// so a test can assert on the decision itself rather than on the warning
     /// it logs.
-    fn reserve_load_signalling(
+    async fn reserve_load_signalling(
         self: &Arc<Self>,
         inference_id: &str,
         cost: CostDimension,
@@ -1739,7 +1740,7 @@ impl VramLedger {
         // priced as empty — which is exactly how a board holding 95 GB of
         // someone else's memory took four 4 GB reservations against a headroom
         // of its full total and launched four loads into a torch OOM (T2).
-        self.refresh_external_for_load(inference_id, gpu);
+        self.refresh_external_for_load(inference_id, gpu).await;
         let (id, expected, headroom) = {
             let mut state = self.lock();
             // Re-read both facts under the retaken lock. A load that finished
@@ -4227,20 +4228,29 @@ impl VramLedger {
     /// before a worker exists — "can this model be loaded at all?" — is
     /// exactly the one that needs the measurement.
     ///
-    /// Synchronous, unlike the dispatch-path refresh: a load already costs
-    /// seconds, it is serialized behind the manager's load lock, and pricing
-    /// it against a reading that lands afterwards would answer the question
-    /// too late. The in-flight and failure-backoff suppressions in
-    /// [`refresh_due`] still apply, so a host whose probe answers nothing pays
-    /// at most one timed-out attempt per [`EXTERNAL_SAMPLE_MAX_AGE`]. The
-    /// ledger lock is dropped before the query runs, and the query itself goes
-    /// through `block_in_place` on the multi-thread runtime, so "synchronous"
-    /// costs the caller its own latency and not a worker thread's.
+    /// Awaited, unlike the dispatch-path refresh, which is fired and
+    /// forgotten: a load already costs seconds, it is serialized behind the
+    /// manager's load lock, and pricing it against a reading that lands
+    /// afterwards would answer the question too late. The in-flight and
+    /// failure-backoff suppressions in [`refresh_due`] still apply, so a host
+    /// whose probe answers nothing pays at most one timed-out attempt per
+    /// [`EXTERNAL_SAMPLE_MAX_AGE`]. The ledger lock is dropped before the
+    /// query runs, and the query itself goes to the blocking pool, so waiting
+    /// for it costs the caller its own latency and no runtime thread at all.
+    ///
+    /// It used to be `block_in_place`, which was correct about the pool and
+    /// wrong about everything downstream of it: `block_in_place` hands the
+    /// caller's scheduler core to another thread and leaves the caller as an
+    /// ordinary blocking-pool thread, which the pool retires after 10 s idle
+    /// — and the worker this load then forked was tied to that thread by
+    /// `PR_SET_PDEATHSIG` (F11). The spawner in `process_tree` is what makes
+    /// worker lifetime independent of it; this is the other half, and it
+    /// leaves no demoted threads to be reasoned about at all.
     ///
     /// One probe answers for *every* enumerated board, so a load pinned to
     /// several boards pays one: the first board's probe records the rest, and
     /// [`refresh_due`] is then false for them.
-    fn refresh_external_for_load(&self, model: &str, gpu: &str) {
+    async fn refresh_external_for_load(self: &Arc<Self>, model: &str, gpu: &str) {
         if !self.probes_the_host() {
             return;
         }
@@ -4268,11 +4278,6 @@ impl VramLedger {
             board.refreshing = true;
             (reason, age_ms)
         };
-        // Armed the moment the flag is set and before anything that could
-        // unwind: it clears the flag however this call leaves, including an
-        // unwind out of the query below, which propagates through the load
-        // path to the caller and would otherwise strand it (see `ProbeGuard`).
-        let guard = ProbeGuard::new(self, gpu);
         tracing::debug!(
             model,
             gpu,
@@ -4281,23 +4286,36 @@ impl VramLedger {
             "probing the host for this board's free memory before pricing a \
              load against it"
         );
-        // Blocking the calling task inline would hold a Tokio worker thread
-        // for the whole `nvidia-smi` timeout. `block_in_place` hands that
-        // worker's remaining tasks to another thread first, which is what
-        // makes a synchronous probe safe on the runtime the server actually
-        // runs (`main.rs` builds a multi-thread one). It panics on a
-        // current-thread runtime and outside a runtime altogether, so those
-        // fall through to the plain call: there is no worker pool to protect
-        // in either case, and the probe still returns within its own timeout.
-        let boards = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
-            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-        }) {
-            tokio::task::block_in_place(|| self.run_memory_query())
-        } else {
-            self.run_memory_query()
+        // Everything from here runs on the blocking pool, guard included:
+        // the guard clears the in-flight flag however the probe leaves —
+        // including an unwind out of the query, and including a caller that
+        // was cancelled while awaiting the join (see `ProbeGuard`).
+        let ledger = Arc::clone(self);
+        let probed = gpu.to_owned();
+        let probe = move || {
+            let guard = ProbeGuard::new(&ledger, &probed);
+            let boards = ledger.run_memory_query();
+            let source = ledger.memory_query.free_source();
+            ledger.record_external_probe(&probed, boards, source);
+            guard.settled();
         };
-        self.record_external_probe(gpu, boards, self.memory_query.free_source());
-        guard.settled();
+        if tokio::runtime::Handle::try_current().is_err() {
+            // No runtime to spawn onto (a synchronous unit test driving this
+            // through its own executor): the probe still has to happen, and
+            // there is no worker pool here to protect.
+            probe();
+            return;
+        }
+        match tokio::task::spawn_blocking(probe).await {
+            Ok(()) => {}
+            // A panicking driver query has always propagated through the
+            // load path to the caller; keep it doing that rather than
+            // swallowing it into a JoinError.
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            // The task never ran (aborted, or the runtime shut down under
+            // it), so no guard ran either and the flag needs settling.
+            Err(err) => self.settle_abandoned_probe(gpu, &err),
+        }
     }
 
     /// Whether this ledger consults the host probe at all. Production always
@@ -6190,12 +6208,13 @@ mod tests {
     /// A load reservation is charged from load-start and released on drop,
     /// with the expected base coming from this run's remembered map once a
     /// load of the same (model, board) has been measured.
-    #[test]
-    fn load_reservations_charge_and_release() {
+    #[tokio::test]
+    async fn load_reservations_charge_and_release() {
         let ledger = ledger(10_000, no_margin());
         assert_eq!(ledger.headroom_mb(BOARD), 10_000);
         let reservation = ledger
             .reserve_load("g/a", item_cost(4), BOARD, None)
+            .await
             .expect("known board");
         assert_eq!(
             ledger.headroom_mb(BOARD),
@@ -6214,6 +6233,7 @@ mod tests {
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let reservation = ledger
             .reserve_load("g/a", item_cost(4), BOARD, None)
+            .await
             .unwrap();
         assert_eq!(
             ledger.headroom_mb(BOARD),
@@ -6225,6 +6245,7 @@ mod tests {
         assert!(
             ledger
                 .reserve_load("g/a", item_cost(4), "GPU-nope", None)
+                .await
                 .is_none()
         );
     }
@@ -6233,8 +6254,8 @@ mod tests {
     /// has measured yet, and a first-ever load hands it no dtype and no torch
     /// build (both resolve *during* the load) — which is exactly why the
     /// store's answer for that tier is the most conservative one it has.
-    #[test]
-    fn profile_lookup_supplies_the_expected_base() {
+    #[tokio::test]
+    async fn profile_lookup_supplies_the_expected_base() {
         let profiles = Arc::new(FakeProfiles {
             base: Some(777),
             ..FakeProfiles::default()
@@ -6242,6 +6263,7 @@ mod tests {
         let ledger = ledger_with(10_000, no_margin(), &profiles);
         let _reservation = ledger
             .reserve_load("g/a", item_cost(4), BOARD, None)
+            .await
             .unwrap();
         assert_eq!(ledger.headroom_mb(BOARD), 10_000 - 777);
         let queries = profiles.queries.lock().unwrap();
@@ -6266,8 +6288,8 @@ mod tests {
     /// the stored profile's — so the reservation takes the larger. The design
     /// is explicit that over-reserving a load is cheap and under-reserving is
     /// a collision with incoming weights.
-    #[test]
-    fn the_load_reservation_takes_the_more_conservative_base() {
+    #[tokio::test]
+    async fn the_load_reservation_takes_the_more_conservative_base() {
         let profiles = Arc::new(FakeProfiles {
             base: Some(5000),
             ..FakeProfiles::default()
@@ -6277,6 +6299,7 @@ mod tests {
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let reservation = ledger
             .reserve_load("g/a", item_cost(4), BOARD, None)
+            .await
             .unwrap();
         assert_eq!(
             ledger.health()[0].load_reservations_mb,
@@ -6294,6 +6317,7 @@ mod tests {
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let _reservation = ledger
             .reserve_load("g/a", item_cost(4), BOARD, None)
+            .await
             .unwrap();
         assert_eq!(
             ledger.health()[0].load_reservations_mb,
@@ -7478,8 +7502,8 @@ mod tests {
     /// pin string finds nothing. Resolving both from the same registry
     /// entry is what closes it — and the same call fixes CUDA's
     /// abbreviated-UUID miss, which was never ROCm-specific.
-    #[test]
-    fn a_rocm_index_pin_reserves_against_the_board_it_names() {
+    #[tokio::test]
+    async fn a_rocm_index_pin_reserves_against_the_board_it_names() {
         let amd = |index: u32, bdf: &str| crate::inferio::gpu::GpuInfo {
             index,
             uuid: format!("GPU-BDF-{bdf}"),
@@ -7504,6 +7528,7 @@ mod tests {
         assert!(
             ledger
                 .reserve_load("g/a", item_cost(4), &pin, None)
+                .await
                 .is_none(),
             "the pin alone names no ledger board — this was the gap"
         );
@@ -7511,7 +7536,7 @@ mod tests {
             .resolve_board_key(Some("1"))
             .expect("the same request in the ledger's vocabulary");
         assert_eq!(key, AMD_B);
-        let reservation = ledger.reserve_load("g/a", item_cost(4), &key, None);
+        let reservation = ledger.reserve_load("g/a", item_cost(4), &key, None).await;
         assert!(reservation.is_some(), "and the pair does");
         // The reservation lands on the board the pin selected, not the other.
         let charged = |uuid: &str| {
@@ -9152,8 +9177,8 @@ mod tests {
     /// else's memory prices a load against its full total and the
     /// evict-before-load signal never fires (the Phase 3 S4g run: four 4 GiB
     /// reservations against a headroom of 97 887, four torch OOMs).
-    #[test]
-    fn a_load_reservation_probes_a_board_with_no_reading() {
+    #[tokio::test]
+    async fn a_load_reservation_probes_a_board_with_no_reading() {
         let ledger = ledger(97_887, no_margin());
         ledger.install_probe_stub(Some(vec![GpuMemory {
             uuid: BOARD.to_owned(),
@@ -9167,6 +9192,7 @@ mod tests {
 
         let (reservation, exceeds_headroom) = ledger
             .reserve_load_signalling("g/nemotron", item_cost(4), BOARD, None)
+            .await
             .expect("a known board charges the load");
         assert_eq!(ledger.probe_calls(), 1, "the load path probed the host");
         {
@@ -9209,8 +9235,8 @@ mod tests {
     /// The load probe is the staleness refresh's rule applied on a second
     /// path, not a second policy: a board whose reading is current is not
     /// re-read, so a busy host pays nothing for this.
-    #[test]
-    fn a_fresh_reading_suppresses_the_load_probe() {
+    #[tokio::test]
+    async fn a_fresh_reading_suppresses_the_load_probe() {
         let ledger = ledger(32_000, no_margin());
         ledger.install_probe_stub(Some(vec![GpuMemory {
             uuid: BOARD.to_owned(),
@@ -9225,6 +9251,7 @@ mod tests {
 
         let (_reservation, exceeds_headroom) = ledger
             .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .await
             .expect("a known board charges the load");
         assert_eq!(ledger.probe_calls(), 0, "a reading this fresh needs none");
         assert_eq!(
@@ -9238,13 +9265,14 @@ mod tests {
     /// And the failure backoff wins on this path too: a host whose probe
     /// answers nothing must not pay a timed-out subprocess per load attempt —
     /// a model that fails to load is retried.
-    #[test]
-    fn a_failed_probe_suppresses_the_next_load_probe() {
+    #[tokio::test]
+    async fn a_failed_probe_suppresses_the_next_load_probe() {
         let ledger = ledger(32_000, no_margin());
         ledger.install_probe_stub(None);
 
         let first = ledger
             .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .await
             .expect("a known board charges the load");
         assert_eq!(ledger.probe_calls(), 1);
         assert!(
@@ -9255,6 +9283,7 @@ mod tests {
 
         let _second = ledger
             .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .await
             .expect("a known board charges the load");
         assert_eq!(
             ledger.probe_calls(),
@@ -9268,8 +9297,8 @@ mod tests {
     /// board it did answer for still gets the reading (the snapshot is real),
     /// but the pinned board stays unread, keeps its full-total headroom, and
     /// buys the same backoff a probe that answered nothing would.
-    #[test]
-    fn a_probe_that_misses_the_pinned_board_backs_off_like_a_failure() {
+    #[tokio::test]
+    async fn a_probe_that_misses_the_pinned_board_backs_off_like_a_failure() {
         const OTHER: &str = "GPU-bbbb";
         let ledger = VramLedger::for_test(
             &[(BOARD, "TEST 9000", 32_000), (OTHER, "TEST 9000", 32_000)],
@@ -9283,6 +9312,7 @@ mod tests {
 
         let _first = ledger
             .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .await
             .expect("a known board charges the load");
         assert_eq!(ledger.probe_calls(), 1);
         let boards = ledger.health();
@@ -9301,6 +9331,7 @@ mod tests {
 
         let _second = ledger
             .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .await
             .expect("a known board charges the load");
         assert_eq!(
             ledger.probe_calls(),
@@ -9313,8 +9344,8 @@ mod tests {
     /// One probe answers for every board it enumerates, so a load pinned to
     /// several boards pays exactly one: the first board's probe records the
     /// rest, and `refresh_due` is false for them by the time they are priced.
-    #[test]
-    fn one_probe_serves_every_board_a_load_is_pinned_to() {
+    #[tokio::test]
+    async fn one_probe_serves_every_board_a_load_is_pinned_to() {
         const OTHER: &str = "GPU-bbbb";
         let ledger = VramLedger::for_test(
             &[(BOARD, "TEST 9000", 32_000), (OTHER, "TEST 9000", 24_000)],
@@ -9333,8 +9364,8 @@ mod tests {
             },
         ]));
 
-        let _one = ledger.reserve_load("g/a", item_cost(4), BOARD, None);
-        let _two = ledger.reserve_load("g/a", item_cost(4), OTHER, None);
+        let _one = ledger.reserve_load("g/a", item_cost(4), BOARD, None).await;
+        let _two = ledger.reserve_load("g/a", item_cost(4), OTHER, None).await;
         assert_eq!(
             ledger.probe_calls(),
             1,
@@ -9355,10 +9386,24 @@ mod tests {
     /// the same failure backoff a probe that answered nothing would. (The
     /// dispatch path's `spawn_blocking` closure carries the same guard, and its
     /// join is watched for the task that never runs at all.)
+    ///
+    /// Stays a synchronous test on purpose: the reservation is driven through
+    /// a runtime of its own inside `catch_unwind`, because the panic has to
+    /// be caught *around* the await — a `#[tokio::test]` would need the
+    /// unwind to cross its own `block_on`.
     #[test]
     fn a_panicking_probe_leaves_the_board_refreshable() {
         let ledger = ledger(32_000, no_margin());
         ledger.install_panicking_probe_stub();
+        // The panic travels: probe stub → blocking pool → `JoinError` →
+        // `resume_unwind` in the load path → here.
+        let reserve = |ledger: &Arc<VramLedger>| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for one reservation");
+            drop(runtime.block_on(ledger.reserve_load("g/a", item_cost(4), BOARD, None)));
+        };
         // The panics below are the point of the test; the default hook would
         // print a backtrace for each.
         let quietly = |body: &dyn Fn()| {
@@ -9369,9 +9414,7 @@ mod tests {
             outcome
         };
 
-        let outcome = quietly(&|| {
-            drop(ledger.reserve_load("g/a", item_cost(4), BOARD, None));
-        });
+        let outcome = quietly(&|| reserve(&ledger));
         assert!(outcome.is_err(), "the probe panicked through the load path");
         assert_eq!(ledger.probe_calls(), 1);
         {
@@ -9405,9 +9448,7 @@ mod tests {
         );
 
         // End to end: the next load reservation really does probe again.
-        let outcome = quietly(&|| {
-            drop(ledger.reserve_load("g/a", item_cost(4), BOARD, None));
-        });
+        let outcome = quietly(&|| reserve(&ledger));
         assert!(outcome.is_err());
         assert_eq!(
             ledger.probe_calls(),
@@ -9496,8 +9537,8 @@ mod tests {
     /// and its VRAM (if it has any) lands in the external term by design — so a
     /// 4 GB charge held for the seconds its load takes would push its
     /// neighbours to their contention floor to protect nothing.
-    #[test]
-    fn a_none_class_load_reserves_nothing() {
+    #[tokio::test]
+    async fn a_none_class_load_reserves_nothing() {
         let ledger = ledger(10_000, no_margin());
         let none_class = CostDimension {
             unit: CostUnit::None,
@@ -9520,6 +9561,7 @@ mod tests {
         assert!(
             ledger
                 .reserve_load("g/api", none_class, BOARD, None)
+                .await
                 .is_none(),
             "the none class is never reserved for"
         );
@@ -9535,6 +9577,7 @@ mod tests {
         // the assertion above about the class rather than about the board.
         let charged = ledger
             .reserve_load("g/b", item_cost(4), BOARD, None)
+            .await
             .expect("charged");
         assert_eq!(
             ledger.health()[0].load_reservations_mb,
@@ -9554,12 +9597,13 @@ mod tests {
     /// API behind a torch import, a CPU-fallback impl — needs no reservation:
     /// holding 4 GB against the board would squeeze every concurrent window for
     /// the duration of a load that allocates nothing we can see.
-    #[test]
-    fn a_footprintless_model_reserves_nothing_on_reload() {
+    #[tokio::test]
+    async fn a_footprintless_model_reserves_nothing_on_reload() {
         let ledger = ledger(10_000, no_margin());
         // First load: nothing is known, so the conservative constant is held.
         let first = ledger
             .reserve_load("g/a", item_cost(4), BOARD, None)
+            .await
             .expect("charged");
         assert_eq!(
             ledger.health()[0].load_reservations_mb,
@@ -9574,6 +9618,7 @@ mod tests {
         assert!(
             ledger
                 .reserve_load("g/a", item_cost(4), BOARD, None)
+                .await
                 .is_none(),
             "a model with no footprint is not reserved for again"
         );
@@ -9581,6 +9626,7 @@ mod tests {
         // A different model on the same board is unaffected.
         let other = ledger
             .reserve_load("g/b", item_cost(4), BOARD, None)
+            .await
             .expect("charged");
         assert_eq!(
             ledger.health()[0].load_reservations_mb,

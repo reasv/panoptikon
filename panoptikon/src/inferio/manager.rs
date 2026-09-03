@@ -1463,11 +1463,22 @@ impl ModelManager {
         // Keyed by board key, never by the pin: the pin is written in the
         // backend's visibility vocabulary and only coincides with the ledger
         // key on a CUDA host with a full-UUID pin.
-        let _load_reservations: Vec<LoadReservation> = board_keys
-            .iter()
-            .flatten()
-            .filter_map(|gpu| self.ledger.reserve_load(inference_id, cost, gpu, None))
-            .collect();
+        //
+        // Sequential rather than joined: the reservations are microseconds of
+        // bookkeeping apart from the host probe one of them may run, and that
+        // probe is single-flight per board anyway — the first board's answer
+        // enumerates every other one, so a second concurrent probe would be
+        // suppressed rather than parallel.
+        let mut _load_reservations: Vec<LoadReservation> = Vec::new();
+        for gpu in board_keys.iter().flatten() {
+            if let Some(reservation) = self
+                .ledger
+                .reserve_load(inference_id, cost, gpu, None)
+                .await
+            {
+                _load_reservations.push(reservation);
+            }
+        }
         let spawns: Vec<_> = device_pins
             .iter()
             .enumerate()
