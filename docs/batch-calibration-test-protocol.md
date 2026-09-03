@@ -420,7 +420,10 @@ row (whole inventory unknown, WARN, unpriced).
 ### S14 Regression sanity
 The CI smoke sequence (`.github/workflows/release.yml`) against C1 and C4:
 DB create, folders, rescan, PQL search, thumbnail, file serve, 403 on
-port 6339. Plus one run of every shipped model category on the `smoke`
+port 6339 (the 403 assertion is Docker-only: `docker.toml` gives 6339 the
+`public` endpoint with `restricted_demo`, while `default.toml` gives it
+`legacy_ui` with the `localhost` policy, which correctly answers 200 on
+C1). Plus one run of every shipped model category on the `smoke`
 corpus to catch a load-path regression unrelated to calibration.
 
 ### S15 Protocol self-test (mutation runs)

@@ -788,7 +788,7 @@ curl -X PUT "$B/api/inference/load/tags/wd-vit-tagger-v3?cache_key=t&lru_size=1&
 curl -X DELETE $B/api/inference/cache/t
 curl -F 'data={"inputs":[{}]}' -F 'files=@img.jpg;filename=0' -X POST "$B/api/inference/predict/tags/wd-vit-tagger-v3?cache_key=calib&lru_size=1&ttl_seconds=60"   # all three query params are required (PredictParams has no serde default)
 curl $B/api/client-config                                              # readiness
-curl -X POST $B/api/search/pql -H 'Content-Type: application/json' -d '{"query":{},"page_size":10}'
+curl -X POST $B/api/search/pql -H 'Content-Type: application/json' -d '{"query":{"match_tags":{"tags":["1girl"],"match_any":true}},"page_size":5}'   # `{"query":{}}` is rejected (untagged enum QueryElement); use a real clause as CI does
 ```
 No per-job log endpoint: job progress is in the gateway log and in
 `LogRecord` afterwards. The job queue runs one job at a time.
