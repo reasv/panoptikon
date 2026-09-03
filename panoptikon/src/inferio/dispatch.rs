@@ -102,6 +102,13 @@
 //! shutdown is the opposite: in-flight windows finish, then every replica
 //! gets the graceful unload ladder, concurrently.
 //!
+//! A death is normally discovered by a request failing on the pipe, which
+//! leaves an *idle* replica's death invisible: a model nobody predicts
+//! against reads nothing, so EOF is never noticed. [`DispatchMsg::ReapIdle`]
+//! closes that hole — the manager's sweeper ticks it, and every free replica
+//! is `try_wait`ed. A replica found gone takes the same path as one that
+//! died mid-request, minus the window settlement it has no window for.
+//!
 //! The in-flight drain on graceful shutdown is bounded by `unload_grace`:
 //! `predict` itself has no deadline (how long a model legitimately takes is
 //! unknowable), so a worker wedged in a GPU kernel would otherwise hang the
@@ -258,6 +265,18 @@ pub(crate) enum DispatchMsg {
     /// of an in-flight window is not something the one-request-at-a-time
     /// protocol allows anyway.
     Trim(u64),
+    /// Liveness sweep for the replicas that are **idle**: `try_wait` each one
+    /// in the free pool and, if any child has already exited, take the
+    /// model down the normal death path (P5-6).
+    ///
+    /// Ticked by the manager's sweeper. Only the free pool is checked, and
+    /// deliberately: a busy replica's death is discovered by the window
+    /// running on it (EOF on the pipe), which is prompter and carries the
+    /// request context. It is the replicas nobody is talking to that go
+    /// unnoticed — a `none`-cost model that is loaded and never predicted
+    /// against advertises a replica in `/health` indefinitely after its
+    /// worker is gone.
+    ReapIdle,
     /// Graceful unload: fail anything still queued, then run the worker's
     /// unload -> terminate -> kill ladder and exit the task.
     Shutdown,
@@ -812,6 +831,11 @@ pub(crate) async fn run_dispatcher(
                 Some(DispatchMsg::Trim(worker_id)) => {
                     try_trim(&ctx, &mut free, &mut in_flight, worker_id, queue.len());
                 }
+                Some(DispatchMsg::ReapIdle) => {
+                    if let Some(message) = reap_idle_replicas(&ctx, &mut free).await {
+                        break End::Fatal(message);
+                    }
+                }
             },
             Some(finished) = in_flight.join_next(), if !in_flight.is_empty() => {
                 match finished {
@@ -854,6 +878,11 @@ pub(crate) async fn run_dispatcher(
                 }
                 Ok(DispatchMsg::Trim(worker_id)) => {
                     try_trim(&ctx, &mut free, &mut in_flight, worker_id, queue.len());
+                }
+                Ok(DispatchMsg::ReapIdle) => {
+                    if let Some(message) = reap_idle_replicas(&ctx, &mut free).await {
+                        break 'main End::Fatal(message);
+                    }
                 }
                 Ok(DispatchMsg::Shutdown) => break 'main End::Graceful,
                 Err(_) => break,
@@ -958,6 +987,44 @@ pub(crate) async fn run_dispatcher(
             }
         }
     }
+}
+
+/// Act on a [`DispatchMsg::ReapIdle`]: `try_wait` every replica in the free
+/// pool and answer with a fatal message if one of them is already gone.
+///
+/// Returning the message rather than tearing down here keeps a death found
+/// while idle on **exactly** the request-path death route: the caller breaks
+/// with [`End::Fatal`], so the queue is failed, sibling replicas are killed,
+/// and `handle_worker_death` drops the model from every cache — one code
+/// path, one policy.
+///
+/// What it deliberately does *not* do is settle a window. On unified boards
+/// a death mid-window is a synthetic negative sample about batch size
+/// (docs/unified-memory-admission.md, DP-2); an idle replica has no window
+/// and no grant in flight, so there is nothing to settle and nothing this
+/// death could honestly say about a batch size. It stays a liveness fact.
+/// (On discrete boards a death is never a memory negative at all.)
+///
+/// Only one death is reported per tick: the first one already condemns the
+/// whole set under the Phase 3 policy, and the survivors are killed by the
+/// teardown moments later.
+async fn reap_idle_replicas(ctx: &DispatcherContext, free: &mut [Replica]) -> Option<String> {
+    for replica in free.iter_mut() {
+        let Some(death) = replica.worker.reap_if_exited().await else {
+            continue;
+        };
+        tracing::warn!(
+            model = %ctx.inference_id,
+            pid = ?death.pid,
+            "an idle replica's worker process was found dead by the liveness sweep; \
+             taking the model down so the next request reloads it"
+        );
+        return Some(format!(
+            "inferio worker for model {} exited while idle: {death}",
+            ctx.inference_id
+        ));
+    }
+    None
 }
 
 /// Act on a [`DispatchMsg::Trim`], or decline it.

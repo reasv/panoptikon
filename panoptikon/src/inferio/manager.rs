@@ -1104,7 +1104,16 @@ impl ModelManager {
     }
 
     /// Sweeper tick: expire TTLs, unload models whose last reference
-    /// expired, and reap finished drain tasks.
+    /// expired, reap finished drain tasks, and ask every surviving model's
+    /// dispatcher to check that its idle replicas are still alive.
+    ///
+    /// The liveness ask is what stops a dead *grantless* model from being
+    /// advertised forever (P5-6): a death is otherwise only discovered by a
+    /// request failing on the pipe, and a model nobody predicts against
+    /// never reads from it. Sent after the TTL expiry so a model already
+    /// unloading is not asked (`begin_unload` removed it), and as a message
+    /// rather than a direct probe because the dispatcher — not the manager —
+    /// owns the workers.
     fn sweep(&self) {
         let mut state = self.state.lock().unwrap();
         if state.shutting_down {
@@ -1114,6 +1123,9 @@ impl ModelManager {
         let unloads = state.cache.expire(Local::now());
         for id in unloads {
             Self::begin_unload(&mut state, &id);
+        }
+        for handle in state.models.values() {
+            let _ = handle.tx.send(DispatchMsg::ReapIdle);
         }
         drop(state);
         self.deliver_pending_trims();
@@ -1932,6 +1944,12 @@ config.impl_class = "failbatch_test"
 config.impl_class = "dying_test"
 [group.dying.inference_ids.test]
 
+# Dies while idle, a second after load: the liveness-sweep fixture (P5-6).
+[group.idledeath]
+config.impl_class = "idle_death_test"
+config.die_after_seconds = 1.0
+[group.idledeath.inference_ids.test]
+
 [group.nan]
 config.impl_class = "nan_test"
 [group.nan.inference_ids.test]
@@ -2519,6 +2537,67 @@ config.replicas = 2
             let outputs = task.await.unwrap().expect("fallback saves merged requests");
             assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": true}))]);
         }
+
+        manager.shutdown().await;
+    }
+
+    /// P5-6: a replica that dies while **idle** is found by the sweeper.
+    ///
+    /// Nothing reads an idle worker's pipe, so the EOF a death produces is
+    /// never noticed by a request — a grantless model can be advertised in
+    /// `/health` for as long as nobody predicts against it. The fixture dies
+    /// a second after load with no request in flight; only the sweeper's
+    /// `ReapIdle` tick can discover it, and when it does the model takes the
+    /// normal death route: dropped from `/health`, dropped from every cache.
+    #[tokio::test]
+    async fn an_idle_replica_that_dies_is_found_by_the_liveness_sweep() {
+        let setup = test_manager(Duration::from_millis(100), 32);
+        let manager = &setup.manager;
+
+        // One predict to make it resident (and to prove it was healthy).
+        // ttl -1: it must stay loaded, so a disappearance is the sweep's
+        // doing and never a TTL expiry.
+        let outputs = manager
+            .predict(
+                "idledeath/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("the fixture serves normally before it dies");
+        assert_eq!(outputs.len(), 1);
+        let health = manager.health();
+        assert_eq!(health.model_count, 1, "the model is resident");
+        assert_eq!(
+            health.models[0].replicas.total, 1,
+            "its replica is advertised"
+        );
+
+        // Now the worker exits under the manager, idle. Poll rather than
+        // sleep a fixed span: without the reap tick this never happens and
+        // the test fails on the bound instead of flaking on timing.
+        let mut found = false;
+        for _ in 0..200 {
+            if manager.health().model_count == 0 {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            found,
+            "the sweep never noticed the dead idle replica; /health still says {:?}",
+            manager.health().models
+        );
+        assert!(
+            manager.cached_models().is_empty(),
+            "the dead model is dropped from every cache, not just from /health"
+        );
+        assert_eq!(manager.loaded_generation("idledeath/test"), None);
 
         manager.shutdown().await;
     }

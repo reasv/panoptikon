@@ -736,6 +736,36 @@ window is in flight per worker either way, so a trim never races a batch.
   tree is additionally under a kill-on-close Job Object on Windows.
 - Unexpected worker exit at any point: all pending/queued requests for that
   model fail with the stderr tail; the model is marked unloaded.
+- Every fatal path — whichever request was on the wire — reaps the child and
+  records one **death report** before the error is returned: the worker
+  label, the pid latched at spawn, the exit status, the terminating signal
+  and core-dumped flag on Unix, what the orchestrator was doing, whether the
+  gateway itself did the killing, and the stderr tail. It is logged at WARN
+  by the supervisor itself, so a death that answers no request still leaves
+  a line.
+- **Who sent the signal.** The fatal path SIGKILLs the process group on
+  every route into it, so a deadline timeout, a desynchronized stream or an
+  unacknowledged unload reaches a *live* worker and reaps it as `signal: 9`
+  — the same shape a kernel OOM kill takes. The report therefore carries
+  `killed_by_gateway`, sampled (`try_wait`) immediately before the signal:
+  `true` means the process was still running and the signal is ours and
+  means nothing; `false` means it was already gone and the exit status is
+  how it really died. Only `signal: 9` with `killed_by_gateway = false` is
+  an outside kill (the kernel's OOM killer, the driver, an operator).
+  Deliberate kills that leave *no* death report — the `unload`/terminate/
+  kill ladder, a failed handshake or configure, the whole-set teardown
+  after one replica dies, a dropped in-flight window — announce themselves
+  at INFO before signalling instead, so no gateway SIGKILL is anonymous.
+- **Idle replicas are swept for liveness.** A worker's death is normally
+  discovered by a request hitting EOF on its stdout, which never happens for
+  a model nobody predicts against — so the manager's sweeper ticks each
+  dispatcher, which `try_wait`s every replica in its free pool. A replica
+  found already exited gets the same treatment as one that died mid-request
+  (whole model down, dropped from every cache, next request reloads),
+  except that it settles no window: it had none in flight, so it is a
+  liveness fact and never a memory negative on a unified board. Busy
+  replicas are deliberately not swept — their window discovers the death
+  sooner and with the request context attached.
 
 ## Environment (spawn contract)
 

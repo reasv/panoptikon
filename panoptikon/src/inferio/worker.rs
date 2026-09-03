@@ -24,12 +24,23 @@
 //!   type), deadline timeouts, and worker exit/EOF are fatal: the child is
 //!   killed and reaped, the `Worker` is poisoned, and the error carries the
 //!   exit status plus the stderr tail.
+//! - Every fatal path — whichever request was on the wire, and the
+//!   requestless idle reap ([`Worker::reap_if_exited`]) too — funnels through
+//!   one place that reaps the child and records a [`WorkerDeath`]: pid, exit
+//!   status, Unix signal and core-dumped flag, and the stderr tail. It is
+//!   logged at WARN there (so a death with no request context is still
+//!   visible) and kept on the `Worker` for [`Worker::last_death`].
 //! - Graceful stop is the `unload` → terminate → kill ladder with the
 //!   deadlines from [`WorkerDeadlines`]. The child additionally sits under a
 //!   kill-on-close Job Object on Windows (with PR_SET_PDEATHSIG plus
 //!   process-group SIGKILL filling that role on Unix) and tokio
 //!   `kill_on_drop`, so neither a drop path nor gateway death itself can
-//!   leak a worker tree.
+//!   leak a worker tree. That ladder — and the fatal path's own kill — is
+//!   where a SIGKILL comes from *inside* the gateway, so both say so:
+//!   [`Worker::kill`] announces itself at INFO, and every death record
+//!   carries `killed_by_gateway`, sampled before the signal. A `signal: 9`
+//!   with `killed_by_gateway = false` is the only one that came from
+//!   outside (kernel OOM killer, driver, an operator).
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -506,6 +517,90 @@ impl fmt::Display for WorkerError {
 
 impl std::error::Error for WorkerError {}
 
+/// Everything the gateway knows about one worker process's death, captured
+/// once by [`Worker::fatal`]/[`Worker::reap_if_exited`] at the moment the
+/// child is reaped.
+///
+/// Exists because the interesting half of a death is gone by the time anyone
+/// asks: `Child::id()` is `None` after the reap, the exit status can be read
+/// exactly once, and the stderr forwarder is about to be joined. A worker
+/// killed by the kernel's OOM killer and one that raised in Python are the
+/// same "early eof" from the reader's point of view — the signal number and
+/// the stderr tail are the only things that tell them apart, so they are
+/// gathered eagerly and rendered together.
+#[derive(Debug, Clone)]
+pub struct WorkerDeath {
+    /// The worker's log label: impl_class before `configure`, the
+    /// inference_id after it.
+    pub worker: String,
+    /// The child's pid, captured at spawn (the reap clears `Child::id()`).
+    /// Correlates a death with an NVML/`ps` observation of the same process.
+    pub pid: Option<u32>,
+    /// The reaped status, or `None` if the child could not be reaped within
+    /// [`FATAL_REAP_GRACE`] (it was wedged rather than gone).
+    pub status: Option<ExitStatus>,
+    /// The terminating signal on Unix, when there was one. `Some(9)` is the
+    /// SIGKILL shape an out-of-memory kill takes — but it is also the shape
+    /// of the gateway's own teardown, so read it together with
+    /// `killed_by_gateway` and never on its own.
+    pub signal: Option<i32>,
+    /// Whether the child dumped core (Unix only; always false elsewhere).
+    pub core_dumped: bool,
+    /// Whether the process was **still running** when the fatal path reached
+    /// it, i.e. whether the signal in `signal` is the gateway's own.
+    ///
+    /// This is the only honest answer to "was that SIGKILL ours?", and it
+    /// has to be sampled before the kill: [`Worker::record_death`] SIGKILLs
+    /// the process group on *every* path, so a deadline timeout or a desync
+    /// on a perfectly live worker also produces `signal: 9` — and reading
+    /// that as a kernel OOM kill is exactly the misdiagnosis the record
+    /// exists to prevent. `false` means the child was already gone before
+    /// the gateway signalled it, so whatever killed it was external.
+    pub killed_by_gateway: bool,
+    /// What the orchestrator was doing when it noticed, e.g. `predict
+    /// request failed: …` or the idle-reap wording.
+    pub why: String,
+    /// The last lines the worker wrote to stderr (see [`StderrTail`]).
+    pub stderr_tail: String,
+}
+
+impl WorkerDeath {
+    /// The exit status rendered the way the logs and error chain show it.
+    fn status_text(&self) -> String {
+        match self.status {
+            Some(status) => status.to_string(),
+            None => "still running (kill timed out)".to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for WorkerDeath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "process status: {}", self.status_text())?;
+        if !self.stderr_tail.is_empty() {
+            write!(f, "; stderr tail:\n{}", self.stderr_tail)?;
+        } else {
+            write!(f, "; stderr tail: <empty>")?;
+        }
+        Ok(())
+    }
+}
+
+/// Split a reaped [`ExitStatus`] into the two Unix-only facts that make a
+/// death diagnosable: the terminating signal (9 = the shape an OOM kill
+/// takes) and whether it dumped core. Both are `None`/`false` off Unix,
+/// where `ExitStatus`'s own rendering is all there is.
+#[cfg(unix)]
+fn signal_of(status: &ExitStatus) -> (Option<i32>, bool) {
+    use std::os::unix::process::ExitStatusExt;
+    (status.signal(), status.core_dumped())
+}
+
+#[cfg(not(unix))]
+fn signal_of(_status: &ExitStatus) -> (Option<i32>, bool) {
+    (None, false)
+}
+
 /// Bounded ring buffer of recent stderr lines, shared with the forwarder
 /// task; snapshots are attached to error reports.
 #[derive(Default)]
@@ -540,6 +635,10 @@ pub struct Worker {
     /// (its identity — a pooled worker may serve any model of the family).
     label: String,
     child: Child,
+    /// The child's pid, latched at spawn: `Child::id()` answers `None` once
+    /// the child has been reaped, which is exactly when a death report needs
+    /// it.
+    pid: Option<u32>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     stderr: Arc<Mutex<StderrTail>>,
@@ -562,6 +661,8 @@ pub struct Worker {
     /// subset of `dead`: every fatal error poisons the worker, but only some
     /// of them mean the process went away on its own.
     unreachable: bool,
+    /// The death report, recorded once by the first fatal path to run.
+    death: Option<WorkerDeath>,
 }
 
 /// Why a fatal teardown happened.
@@ -792,6 +893,10 @@ impl Worker {
         // Belt and braces on Windows: kill_on_drop only reaches the direct
         // child, the job object reaps the whole tree on any drop path.
         let job_guard = JobGuard::assign_tokio(&child);
+        // Latched now: the reap clears it, and a death report without a pid
+        // cannot be lined up against NVML, `ps` or a kernel log.
+        let pid = child.id();
+        tracing::debug!(worker = %impl_class, pid = ?pid, "spawned an inferio worker");
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
         let stderr = child.stderr.take().expect("stderr is piped");
@@ -805,6 +910,7 @@ impl Worker {
         let mut worker = Worker {
             label: impl_class.to_owned(),
             child,
+            pid,
             stdin,
             stdout,
             stderr: tail,
@@ -819,6 +925,7 @@ impl Worker {
             in_flight: false,
             dead: false,
             unreachable: false,
+            death: None,
         };
 
         let impl_dirs = cfg
@@ -1232,10 +1339,19 @@ impl Worker {
                 Ok(status)
             }
             Err(err) => {
-                let tail = self.stderr_tail_snapshot();
+                // Recorded as a death rather than merely killed: the usual
+                // reason an unload is not acknowledged is that the process
+                // is already gone, and that is exactly the case whose exit
+                // status and stderr tail nobody could see before.
+                let death = self
+                    .record_death(
+                        format!("graceful shutdown failed: {err:#}"),
+                        FatalCause::Desync,
+                    )
+                    .await;
                 self.kill().await;
                 Err(err.context(format!(
-                    "graceful shutdown of inferio worker {name} failed; worker killed; stderr tail:\n{tail}"
+                    "graceful shutdown of inferio worker {name} failed; worker killed; {death}"
                 )))
             }
         }
@@ -1243,7 +1359,25 @@ impl Worker {
 
     /// Hard stop: terminate, wait `terminate_grace`, kill again if needed,
     /// and reap. Never fails; also the cancel path for in-flight predicts.
+    ///
+    /// This is where a SIGKILL comes from *inside* the gateway — the
+    /// `unload_grace` → `terminate_grace` ladder, a handshake/configure
+    /// failure, and the whole-set teardown that follows one replica's death
+    /// all land here — so it says so, at INFO, before signalling: these are
+    /// the kills that leave no death record behind at all, so without the
+    /// line they leave no trace of who signalled the pid. Silent when the
+    /// worker is already poisoned: that death has been reported once
+    /// already (with its own `killed_by_gateway`, which is the attribution
+    /// for *that* kill) and this call is only completing the reap.
     pub async fn kill(mut self) {
+        if !self.dead {
+            tracing::info!(
+                worker = %self.label,
+                pid = ?self.pid,
+                "the gateway is stopping this inferio worker (terminate + kill ladder); \
+                 a SIGKILL on this pid is ours, not the kernel's"
+            );
+        }
         // Group first, then the child: descendants must not survive the
         // reap below turning the group kill into a no-op (Unix; Windows
         // relies on the job object dropping with self).
@@ -1431,29 +1565,149 @@ impl Worker {
         self.fatal(why, cause).await
     }
 
-    /// Poison the worker after an unrecoverable failure: kill, reap, drain
-    /// stderr, and build the error carrying exit status + stderr tail.
+    /// Poison the worker after an unrecoverable failure: [`Self::record_death`]
+    /// and then wrap that record in the error the caller propagates.
+    ///
+    /// The rendering is deliberately unchanged from before the death record
+    /// existed — `…failed fatally: {why}; process status: {status}; stderr
+    /// tail:\n{tail}` — because it is what the HTTP layer logs for a failed
+    /// predict and what operators grep for.
     async fn fatal(&mut self, why: String, cause: FatalCause) -> anyhow::Error {
+        let death = self.record_death(why, cause).await;
+        anyhow!(
+            "inferio worker {} failed fatally: {}; {death}",
+            death.worker,
+            death.why
+        )
+    }
+
+    /// The one place a worker dies: poison it, kill and reap the child,
+    /// drain stderr, and record + log everything that distinguishes one
+    /// death from another.
+    ///
+    /// Every fatal path goes through here — whichever request was on the
+    /// wire, and the requestless [`Self::reap_if_exited`] too — because the
+    /// diagnosis is the same question every time and half its inputs are
+    /// destroyed by the reap. Logged here rather than left to the caller
+    /// precisely because some callers have nowhere to log to: an idle
+    /// replica's death answers no request, so without this line it produces
+    /// no output at all.
+    async fn record_death(&mut self, why: String, cause: FatalCause) -> WorkerDeath {
         self.dead = true;
         self.unreachable = matches!(cause, FatalCause::Unreachable);
         self.in_flight = false;
+        // Sampled *before* the kill below, because the kill below is
+        // indiscriminate: a deadline timeout, a desync or an unacknowledged
+        // unload all reach here with the process alive and answering, and
+        // all of them would otherwise be reported as `signal: 9` — the exact
+        // shape of a kernel OOM kill. `try_wait` is non-blocking and fused,
+        // so the `wait()` further down still yields the same status. (The
+        // child can of course die in the microseconds between this probe and
+        // the signal; that race can only make us over-claim a kill, never
+        // blame the kernel for one of ours.)
+        let killed_by_gateway = !matches!(self.child.try_wait(), Ok(Some(_)));
         kill_process_group(&self.child);
         let _ = self.child.start_kill();
         let status = match timeout(FATAL_REAP_GRACE, self.child.wait()).await {
-            Ok(Ok(status)) => status.to_string(),
-            Ok(Err(err)) => format!("wait failed: {err}"),
-            Err(_) => "still running (kill timed out)".to_owned(),
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(err)) => {
+                tracing::debug!(worker = %self.label, "reaping the dead worker failed: {err}");
+                None
+            }
+            Err(_) => None,
         };
         // The forwarder ends on stderr EOF once the child is gone; awaiting
         // it makes the tail snapshot complete instead of racy.
         if let Some(task) = self.stderr_task.take() {
             let _ = timeout(STDERR_JOIN_GRACE, task).await;
         }
-        let tail = self.stderr_tail_snapshot();
-        anyhow!(
-            "inferio worker {} failed fatally: {why}; process status: {status}; stderr tail:\n{tail}",
-            self.label
-        )
+        let (signal, core_dumped) = status.as_ref().map(signal_of).unwrap_or((None, false));
+        let death = WorkerDeath {
+            worker: self.label.clone(),
+            pid: self.pid,
+            status,
+            signal,
+            core_dumped,
+            killed_by_gateway,
+            why,
+            stderr_tail: self.stderr_tail_snapshot(),
+        };
+        // The two halves of the diagnosis are said in words rather than left
+        // to the reader to infer from a nearby INFO line, because there is
+        // no nearby INFO line on this path: `Worker::kill` announces the
+        // unload ladder, but the SIGKILL above is this function's own.
+        let attribution = if death.killed_by_gateway {
+            "the process was still running when the gateway gave up on it, so the signal here \
+             is the gateway's own SIGKILL and says nothing about why"
+        } else {
+            "the process was already gone before the gateway signalled it, so this exit status \
+             is how it actually died — a signal 9 here came from outside (kernel OOM killer, \
+             driver, operator)"
+        };
+        tracing::warn!(
+            worker = %death.worker,
+            pid = ?death.pid,
+            status = %death.status_text(),
+            signal = ?death.signal,
+            core_dumped = death.core_dumped,
+            killed_by_gateway = death.killed_by_gateway,
+            "an inferio worker process is gone. Cause: {}. {attribution}. stderr tail:\n{}",
+            death.why,
+            death.stderr_tail,
+        );
+        self.death = Some(death.clone());
+        death
+    }
+
+    /// Requestless liveness check for an **idle** replica: if the child has
+    /// already exited, run the same death handling a request-path failure
+    /// would (poison, reap, log, record) and hand the caller the report.
+    ///
+    /// `try_wait` is non-blocking and does not consume the child, so this is
+    /// cheap enough to run on the sweeper's tick for every resident replica.
+    /// It is the only way a `none`-cost model that nobody predicts against
+    /// is ever discovered to be dead: with no request there is no read on
+    /// the pipe, so EOF is never noticed and `/health` keeps advertising a
+    /// replica that does not exist (P5-6).
+    ///
+    /// Answers `None` for a worker already poisoned by an earlier fatal
+    /// path: that death was reported once and must not be reported twice.
+    pub(crate) async fn reap_if_exited(&mut self) -> Option<WorkerDeath> {
+        if self.dead {
+            return None;
+        }
+        match self.child.try_wait() {
+            Ok(Some(_)) => Some(
+                self.record_death(
+                    "the worker process exited while idle (no request was in flight)".to_owned(),
+                    // The process went away on its own: this is a death, not
+                    // a stream the dispatcher tore down. No window can be
+                    // settled by it — an idle replica has none in flight —
+                    // so it produces no unified-board negative either way.
+                    FatalCause::Unreachable,
+                )
+                .await,
+            ),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::debug!(
+                    worker = %self.label,
+                    "could not check whether the worker is still running: {err}"
+                );
+                None
+            }
+        }
+    }
+
+    /// The recorded death, if this worker has died.
+    ///
+    /// Test hook: production reads a death through the WARN line
+    /// [`Self::record_death`] emits, or through the report
+    /// [`Self::reap_if_exited`] hands back. This is how a test asserts on the
+    /// signal number without scraping a log.
+    #[cfg(test)]
+    pub(crate) fn last_death(&self) -> Option<&WorkerDeath> {
+        self.death.as_ref()
     }
 
     /// Did this worker *die*, as opposed to being poisoned by a desync we
@@ -1516,6 +1770,16 @@ impl Worker {
 #[cfg(unix)]
 impl Drop for Worker {
     fn drop(&mut self) {
+        // `Child::id()` is cleared by the reap, so this is only ever an
+        // unreaped worker — a dropped in-flight window, a cancel — and it is
+        // the third place inside the gateway a SIGKILL can come from.
+        if self.child.id().is_some() {
+            tracing::debug!(
+                worker = %self.label,
+                pid = ?self.pid,
+                "dropping a live inferio worker; its process group is being killed by the gateway"
+            );
+        }
         kill_process_group(&self.child);
     }
 }
@@ -2536,6 +2800,117 @@ mod tests {
         // The worker is poisoned: further requests fail fast.
         let err = worker.ping().await.expect_err("dead worker stays dead");
         assert!(format!("{err:#}").contains("dead"));
+    }
+
+    /// P5-1: the fatal path records *why* a worker is gone, not just that it
+    /// is. The exit status alone cannot separate "the kernel's OOM killer
+    /// took it" from "it raised in Python", so the record carries the
+    /// terminating signal, the pid it belongs to, and the stderr tail —
+    /// eagerly, because the reap destroys all three.
+    #[tokio::test]
+    async fn a_fatal_path_records_the_exit_signal_and_pid() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
+            .await
+            .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+        assert!(
+            worker.last_death().is_none(),
+            "a live worker has no death record"
+        );
+
+        worker.kill_child_externally_for_test().await;
+        worker
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!(1)),
+                    file: None,
+                }],
+                None,
+                None,
+            )
+            .await
+            .expect_err("predict against a dead worker must fail");
+
+        let death = worker
+            .last_death()
+            .expect("the fatal path recorded the death");
+        assert_eq!(death.worker, "test/echo", "labelled with the model");
+        assert!(death.pid.is_some(), "the pid was latched before the reap");
+        assert!(
+            death.status.is_some(),
+            "the child was reaped and its status kept: {death}"
+        );
+        assert!(
+            death.why.contains("predict request failed"),
+            "the record says what the orchestrator was doing: {}",
+            death.why
+        );
+        #[cfg(unix)]
+        {
+            // kill_child_externally_for_test SIGKILLs, which is the shape an
+            // out-of-memory kill takes — the thing P5-1 could not diagnose.
+            assert_eq!(
+                death.signal,
+                Some(9),
+                "a SIGKILL is reported as one: {death}"
+            );
+            assert!(!death.core_dumped);
+        }
+        assert!(
+            !death.killed_by_gateway,
+            "the child was already gone when the fatal path reached it, so the \
+             signal in the record is the one that actually killed it"
+        );
+
+        // One death, recorded once, and it renders the way the logs and the
+        // error chain show it.
+        assert!(format!("{death}").contains("process status"));
+    }
+
+    /// The other half of P5-1, and the one that can misdiagnose an incident:
+    /// the fatal path SIGKILLs the process group *itself*, on every route
+    /// into it. A desync (the shape a cancelled request leaves), a deadline
+    /// timeout or an unacknowledged unload therefore all reach a **live**
+    /// worker and reap it as `signal: 9` — indistinguishable, from the exit
+    /// status alone, from the kernel OOM kill this record exists to identify.
+    /// `killed_by_gateway` is sampled before the signal, so it separates
+    /// them; without it every one of these would read as an outside kill.
+    #[tokio::test]
+    async fn a_gateway_kill_of_a_live_worker_is_not_reported_as_an_outside_kill() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
+            .await
+            .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+
+        // Alive and answering; only the stream is unusable.
+        worker.strand_in_flight_for_test();
+        worker
+            .predict(
+                &[WorkerInput {
+                    data: Some(json!(1)),
+                    file: None,
+                }],
+                None,
+                None,
+            )
+            .await
+            .expect_err("a desynchronized stream cannot be resynchronized");
+
+        let death = worker
+            .last_death()
+            .expect("the desync poisoned the worker, which is a recorded death");
+        assert!(
+            death.killed_by_gateway,
+            "the worker was alive until we killed it: {death}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            death.signal,
+            Some(9),
+            "and it is our SIGKILL that shows up in the status: {death}"
+        );
     }
 
     /// stdout hygiene end-to-end: the printing_test fixture print()s during
