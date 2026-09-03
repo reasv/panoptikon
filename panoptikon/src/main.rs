@@ -24,6 +24,10 @@ mod pql;
 mod process_tree;
 mod proxy;
 mod resources;
+/// The process's open-file-descriptor budget: the startup raise of the soft
+/// `RLIMIT_NOFILE` and the reader the extraction job's in-flight ceiling
+/// clamps itself with.
+mod rlimit;
 mod setup;
 mod shutdown;
 #[cfg(test)]
@@ -131,6 +135,19 @@ enum Command {
 const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
+    // Raise the soft open-file-descriptor limit to the hard limit before
+    // anything opens a descriptor, and before the runtime exists: rlimits are
+    // per-process and inherited by every thread and child (inference workers,
+    // the UI server), so this is the one place that fixes all of them. A
+    // typical Linux shell and a containerd container both start the process
+    // at soft 1024 / hard 524 288 while local inference costs two sockets per
+    // in-flight predict (test protocol §8 G7, Phase 6 finding F6). Failure is
+    // never fatal — `jobs::extraction` reads whatever limit survives and
+    // bounds its in-flight window by it. The outcome is logged by
+    // `async_main` once logging has been configured; up here there is nowhere
+    // to log to yet.
+    rlimit::raise_soft_limit_at_startup();
+
     // Build a custom tokio runtime with a larger worker thread stack size.
     // The default 2MB stack can be insufficient for deeply nested async code,
     // especially in debug builds where stack frames are larger due to unoptimized
@@ -197,6 +214,9 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!("{message}");
     }
     env_template::warn_dotenv_diagnostics(&dotenv_diagnostics);
+    // Same shape as the first-run messages: the descriptor-limit raise
+    // happened in `main`, long before there was a logger to say so.
+    rlimit::log_startup_raise();
     settings.log_warnings();
 
     // Policy-token HMAC key: random per boot unless [server]

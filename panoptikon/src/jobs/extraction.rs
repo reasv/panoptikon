@@ -95,6 +95,33 @@ const MIN_IN_FLIGHT_UNITS: usize = REQUEST_UNIT_BUDGET;
 /// bounds memory.
 const NOMINAL_UNIT_KIB: u32 = 256;
 
+/// File descriptors one in-flight work unit costs the gateway process.
+///
+/// An in-flight unit sits inside a predict request, and with local inference
+/// enabled that request is HTTP over loopback to a listener **in this same
+/// process**: the client socket and the accepted server socket are two
+/// descriptors in one descriptor table. (Against a remote inference server
+/// only the client end is ours, so 2 is the worst case and the one to size
+/// for.) Units, not items, because that is what this ceiling is denominated
+/// in and one unit per item is the common case; an item worth several units
+/// costs the same two sockets, so counting units over-estimates, which is the
+/// safe direction for a cap.
+const FDS_PER_IN_FLIGHT_ITEM: usize = 2;
+
+/// Descriptors held back from the in-flight window for everything else the
+/// process has open.
+///
+/// Measured on the master build during a 2000-item Docker job (Phase 6
+/// finding F6), the gateway peaked at **177** descriptors in total while
+/// running a 64-item window — i.e. roughly 50 that were not window sockets:
+/// the index and storage SQLite connections and their WAL/SHM files, the two
+/// or more TCP listeners, the inference worker's stdio pipes, the log files,
+/// the UI server's socket, epoll and eventfd handles. 256 is that figure with
+/// a large margin for more databases, more listeners, more worker replicas
+/// and the decode subprocesses a job spawns, and it costs nothing on a host
+/// whose limit is not pathological.
+const FD_RESERVE: usize = 256;
+
 /// Upper bound on the job's in-flight unit budget.
 ///
 /// The inference server publishes a desired in-flight figure sized by *its*
@@ -117,15 +144,44 @@ const NOMINAL_UNIT_KIB: u32 = 256;
 ///   REQUEST_UNIT_BUDGET` (512 at the defaults) is therefore work core can
 ///   keep in flight even when the byte budget is configured tiny, so it is
 ///   the floor of the ceiling rather than a second cap.
+/// - **The process's descriptor budget** (`soft_nofile`, the soft
+///   `RLIMIT_NOFILE` after the startup raise in `crate::rlimit`) is a *cap*
+///   on the maximum of the two terms above, not a third quantity to take the
+///   maximum with: descriptors are the one resource the job can exhaust
+///   process-wide rather than merely oversubscribe. See
+///   [`FDS_PER_IN_FLIGHT_ITEM`] and [`FD_RESERVE`].
 ///
 /// Never below [`MIN_IN_FLIGHT_UNITS`], so the clamp in
-/// [`UnitBudget::observe`] is always a valid range.
-fn in_flight_unit_ceiling(intermediate_budget_kib: u32, loader_concurrency: usize) -> usize {
+/// [`UnitBudget::observe`] is always a valid range — including when the
+/// descriptor budget is smaller than the floor needs, which is a
+/// misconfigured host rather than something the job can size around.
+fn in_flight_unit_ceiling(
+    intermediate_budget_kib: u32,
+    loader_concurrency: usize,
+    soft_nofile: u64,
+) -> usize {
     let by_budget = (intermediate_budget_kib / NOMINAL_UNIT_KIB.max(1)) as usize;
     let by_loaders = loader_concurrency
         .max(1)
         .saturating_mul(REQUEST_UNIT_BUDGET);
-    by_budget.max(by_loaders).max(MIN_IN_FLIGHT_UNITS)
+    let wanted = by_budget.max(by_loaders).max(MIN_IN_FLIGHT_UNITS);
+    let by_fds = usize::try_from(soft_nofile)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(FD_RESERVE)
+        / FDS_PER_IN_FLIGHT_ITEM;
+    if by_fds < MIN_IN_FLIGHT_UNITS {
+        tracing::warn!(
+            soft_nofile,
+            reserve = FD_RESERVE,
+            fds_per_item = FDS_PER_IN_FLIGHT_ITEM,
+            floor = MIN_IN_FLIGHT_UNITS,
+            "the open file descriptor limit is below what one job's minimum \
+             in-flight window needs; the job runs at the floor anyway and may \
+             hit 'Too many open files' — raise the hard limit (ulimit -Hn, \
+             or the container runtime's nofile setting)"
+        );
+    }
+    wanted.min(by_fds.max(MIN_IN_FLIGHT_UNITS))
 }
 
 /// The job's in-flight unit budget: a resizable semaphore whose capacity
@@ -712,6 +768,7 @@ async fn run_extraction_job_inner(
     let unit_slots = Arc::new(UnitBudget::new(in_flight_unit_ceiling(
         context.intermediate_budget_kib,
         context.loader_concurrency,
+        crate::rlimit::soft_nofile_limit(),
     )));
     let unit_capacity = request_unit_capacity(defaults.batch_size);
     // The cap travels with each request; `None` = auto.
@@ -2577,18 +2634,84 @@ mod tests {
     /// comes from the two limits core already applies to in-flight work.
     #[test]
     fn the_in_flight_ceiling_comes_from_the_byte_budget_and_the_loader_slots() {
+        // A descriptor budget that cannot bind, so the other two terms show.
+        const FDS: u64 = 524_288;
         // Defaults: 1024 MB of intermediate budget, 8 loader slots. The byte
         // budget is the binding term.
-        assert_eq!(in_flight_unit_ceiling(1024 * 1024, 8), 1024 * 1024 / 256);
+        assert_eq!(
+            in_flight_unit_ceiling(1024 * 1024, 8, FDS),
+            1024 * 1024 / 256
+        );
         // A tiny byte budget falls back to the loader-slot term, which is the
         // work core can keep in flight regardless.
         assert_eq!(
-            in_flight_unit_ceiling(1024, 8),
+            in_flight_unit_ceiling(1024, 8, FDS),
             8 * REQUEST_UNIT_BUDGET,
             "loader_concurrency x REQUEST_UNIT_BUDGET is the floor of the ceiling"
         );
         // Never below one request's worth, whatever the configuration says.
-        assert_eq!(in_flight_unit_ceiling(0, 0), MIN_IN_FLIGHT_UNITS);
+        assert_eq!(in_flight_unit_ceiling(0, 0, FDS), MIN_IN_FLIGHT_UNITS);
+    }
+
+    /// The descriptor term (Phase 6 finding F6). Every in-flight unit costs
+    /// two sockets in this process when inference is local, so the soft
+    /// `RLIMIT_NOFILE` caps the window however much byte budget and however
+    /// many loader slots the configuration offers.
+    #[test]
+    fn the_in_flight_ceiling_is_capped_by_the_descriptor_budget() {
+        // The shipped container's soft limit, and the shape that produced the
+        // regression: the byte budget alone would offer 4096 units, i.e.
+        // ~8192 sockets against 1024 descriptors.
+        let ceiling = in_flight_unit_ceiling(1024 * 1024, 8, 1024);
+        assert_eq!(
+            ceiling,
+            (1024 - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM,
+            "the descriptor budget, not the byte budget, is the binding term"
+        );
+        assert!(
+            ceiling * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE <= 1024,
+            "the window's sockets plus the reserve must fit under the limit"
+        );
+
+        // A large budget — the limit after the startup raise on any ordinary
+        // host — leaves the pre-F6 value untouched, so nothing about the
+        // shipped defaults changes on a correctly configured machine.
+        assert_eq!(
+            in_flight_unit_ceiling(1024 * 1024, 8, 524_288),
+            1024 * 1024 / 256
+        );
+        // Including the "no limit to read" sentinel from a non-Unix host,
+        // where the term must not overflow into a *small* number.
+        assert_eq!(
+            in_flight_unit_ceiling(1024 * 1024, 8, crate::rlimit::NOFILE_LIMIT_UNKNOWN),
+            1024 * 1024 / 256
+        );
+
+        // A descriptor budget too small even for the floor: the floor wins
+        // anyway, because a budget below one request's worth would deadlock
+        // the job outright (`MIN_IN_FLIGHT_UNITS` is a deadlock bound, not a
+        // performance choice). The job logs a WARN and runs at 64.
+        let need = MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE;
+        assert_eq!(
+            in_flight_unit_ceiling(1024 * 1024, 8, 256),
+            MIN_IN_FLIGHT_UNITS
+        );
+        assert_eq!(
+            in_flight_unit_ceiling(1024 * 1024, 8, need as u64 - 1),
+            MIN_IN_FLIGHT_UNITS
+        );
+        // One descriptor more and the fd term is exactly the floor, so the
+        // two paths agree at the boundary.
+        assert_eq!(
+            in_flight_unit_ceiling(1024 * 1024, 8, need as u64),
+            MIN_IN_FLIGHT_UNITS
+        );
+        // Zero, which `soft_nofile_limit` never returns but arithmetic must
+        // survive.
+        assert_eq!(
+            in_flight_unit_ceiling(1024 * 1024, 8, 0),
+            MIN_IN_FLIGHT_UNITS
+        );
     }
 
     /// Growth: the budget adds permits toward the figure, and stops at the
