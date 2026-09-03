@@ -27,8 +27,8 @@
 //! `/metadata` overlay.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value as JsonValue;
 
@@ -174,24 +174,149 @@ pub(super) fn find_nvidia_smi() -> Option<PathBuf> {
     None
 }
 
-/// Run to completion or give up after `timeout`. On timeout the child is
-/// left to finish on its own (nvidia-smi is short-lived); only the boot
-/// path must not stall behind a wedged driver.
+/// How often the wait below looks at the child. Small enough to add nothing
+/// measurable to a healthy ~100 ms `nvidia-smi`, large enough that a 5 s
+/// give-up costs a few hundred wakeups.
+const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Run to completion or give up after `timeout`, **killing the child** if it
+/// is still running when we do.
+///
+/// The kill is the point (F13). This used to hand the command to a detached
+/// thread and walk away from a timed-out `nvidia-smi`, leaving the process
+/// and the thread reading it behind — measured at 1.04 s of overlap against
+/// a deliberately slow binary. Bounded today by the caller's own 10 s
+/// failure backoff, but a probe slower than that backoff accumulates one
+/// process and one thread per attempt, indefinitely. Killing and reaping
+/// here makes the give-up final: at most one probe process exists at a time.
+///
+/// The kill is a **process-group** kill, which is why the probe is spawned
+/// into a group of its own: a wrapper script's `sleep` inherits the pipes,
+/// so killing only the direct child leaves the readers blocked on a write
+/// end nobody closed — the abandonment this fixes, one level down.
+///
+/// The output is drained on two threads while the child runs, so a child
+/// that fills a pipe cannot deadlock the wait. On the give-up path those
+/// threads are left to notice the closed pipes on their own rather than
+/// joined: every writer has just been killed, so they end in microseconds,
+/// and not joining means a descendant that somehow escaped the group can
+/// never wedge the caller (this runs on the boot path).
 pub(super) fn output_with_timeout(
     mut cmd: Command,
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(cmd.output());
-    });
-    rx.recv_timeout(timeout).ok()?.ok()
+    use std::io::Read;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Its own process group (its own console-signal group on Windows), so
+    // the give-up below can take the whole probe down and not this process.
+    crate::process_tree::detach_from_console(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    let stdout = {
+        let mut pipe = child.stdout.take();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(pipe) = pipe.as_mut() {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stderr = {
+        let mut pipe = child.stderr.take();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(pipe) = pipe.as_mut() {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            // Unwaitable is as good as gone; fall through to the kill.
+            Err(_) => break None,
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(PROBE_POLL_INTERVAL);
+    };
+    let Some(status) = status else {
+        // Group first, then the child itself, then reap it: no process of
+        // this attempt outlives the call, so a probe slower than the
+        // caller's backoff cannot accumulate one per attempt.
+        crate::process_tree::kill_process_group_pid(Some(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+        drop((stdout, stderr));
+        return None;
+    };
+    Some(std::process::Output {
+        status,
+        stdout: stdout.join().ok()?,
+        stderr: stderr.join().ok()?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The rewrite still has to be a plain `output()` when the child
+    /// answers in time: status, stdout and stderr, all three.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_answers_returns_its_output() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf out; printf err >&2");
+        let output = output_with_timeout(cmd, Duration::from_secs(5)).expect("the probe answered");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    /// F13: giving up on a probe must *end* the probe. An abandoned child
+    /// keeps running (1.04 s of overlap measured against a deliberately slow
+    /// nvidia-smi shim), so a binary slower than the caller's 10 s failure
+    /// backoff would accumulate one process and one reader thread per
+    /// attempt. The child here would create a marker one second in; the
+    /// timeout is 200 ms, and the marker must never appear.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_probe_child_is_killed_rather_than_abandoned() {
+        let marker = std::env::temp_dir().join(format!("panoptikon-f13-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 1; : > '{}'", marker.display()));
+
+        let started = Instant::now();
+        assert!(
+            output_with_timeout(cmd, Duration::from_millis(200)).is_none(),
+            "the probe did not answer within its timeout"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "and it gave up at the timeout rather than at the child's pace: {:?}",
+            started.elapsed()
+        );
+
+        // Well past the point the child would have written it.
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert!(
+            !marker.exists(),
+            "the timed-out child kept running: {}",
+            marker.display()
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
 
     #[test]
     fn parses_a_capability_field() {
