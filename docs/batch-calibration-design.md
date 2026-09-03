@@ -431,7 +431,13 @@ on a model that has not been fitted yet.
   genuinely external usage — sibling workers, contexts and workspaces
   included, are never margin-inflated. `external` is clamped at ≥ 0:
   `free` and the per-worker samples come from different moments, and
-  sampling skew must never manufacture phantom headroom. Samples arrive
+  sampling skew must never manufacture phantom headroom. When a replica
+  leaves the board its footprint is credited back to the freshest free
+  reading as it drops out of the sum — nothing samples a board *because*
+  a worker left, so without the credit the departed replica's whole
+  footprint would be reattributed to `external` and margin-inflated
+  against the next model to load — and the adjusted reading is flagged
+  for a live re-read on the next grant. Samples arrive
   only on response frames, so after a long idle gap the first window
   prices `external` from a stale sample; the shrink clamp makes that
   safe, and the orchestrator refreshes via NVML (the Package-1 probe

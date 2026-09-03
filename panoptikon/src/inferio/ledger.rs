@@ -567,6 +567,12 @@ struct WorkerEntry {
     /// silicon rather than per instance (two identical cards share one
     /// profile and carry separate budgets).
     gpu_name: String,
+    /// When this replica's load report was recorded, host-side
+    /// (`Timestamped::captured_at`). Read by [`VramLedger::forget_worker`]:
+    /// a free reading older than this one never saw the replica's memory as
+    /// in use, so crediting the departing footprint against it would invent
+    /// headroom instead of preserving `external`.
+    loaded_at: Instant,
     /// The replica's shared telemetry, read by watermark on every window
     /// completion (never drained — `/health` reads it too).
     telemetry: TelemetryHandle,
@@ -921,6 +927,14 @@ struct Ingested {
 /// missing, broken, or does not list the board — without it every grant request
 /// would spawn a blocking subprocess that answers nothing, forever. One failed
 /// attempt buys the same quiet period a successful sample would have.
+///
+/// One reason to probe ahead of the staleness clock: the reading has been
+/// *adjusted* for a resident that left the board
+/// ([`VramLedger::forget_worker`]). That arithmetic keeps `external` honest
+/// across the departure, but it is bookkeeping standing in for a measurement,
+/// and the driver can settle the question. The two suppressions above still
+/// apply — a probe already in flight will answer it, and a host whose probe
+/// answers nothing must not be asked again on every grant.
 fn refresh_due(board: &GpuLedger) -> bool {
     if board.refreshing {
         return false;
@@ -930,6 +944,9 @@ fn refresh_due(board: &GpuLedger) -> bool {
         .is_some_and(|at| at.elapsed() <= EXTERNAL_SAMPLE_MAX_AGE)
     {
         return false;
+    }
+    if board.free_adjusted_at.is_some() {
+        return true;
     }
     board
         .free
@@ -1107,6 +1124,15 @@ struct GpuLedger {
     /// A host where `nvidia-smi` is missing or broken would otherwise spawn a
     /// blocking task on every single grant request, forever.
     last_refresh_failed_at: Option<Instant>,
+    /// When [`VramLedger::forget_worker`] last adjusted this board's free
+    /// sample for a departed resident's footprint, if no real reading has
+    /// landed since. Two things read it, both in
+    /// [`VramLedger::record_free_locked`]'s neighbourhood: the next grant
+    /// request re-reads the driver instead of waiting out
+    /// [`EXTERNAL_SAMPLE_MAX_AGE`] ([`refresh_due`]), and a reading *captured
+    /// before* the departure is refused — it counted the departed footprint as
+    /// in use, and that footprint has already left the `external` sum.
+    free_adjusted_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -1474,6 +1500,7 @@ impl VramLedger {
                         load_reservations: HashMap::new(),
                         refreshing: false,
                         last_refresh_failed_at: None,
+                        free_adjusted_at: None,
                     },
                 )
             })
@@ -2102,6 +2129,7 @@ impl VramLedger {
                 inference_id: inference_id.to_owned(),
                 gpu,
                 gpu_name: board_name,
+                loaded_at,
                 telemetry: Arc::clone(telemetry),
                 unit: cost.unit,
                 aggregation,
@@ -2148,8 +2176,106 @@ impl VramLedger {
     /// still holds disappears with it. Runs from [`Admission`]'s `Drop`, so a
     /// dying worker's grants are released with the handle the dispatcher
     /// owned — the same lifetime as the aborted windows themselves.
+    ///
+    /// The board's free reading is adjusted by the departed footprint at the
+    /// same moment. `external = total − free − Σ footprint(residents)`, and
+    /// the freshest free sample predates the unload by construction — nothing
+    /// samples the board *because* a worker left. Dropping the footprint from
+    /// the sum while the sample still counts that memory as in use
+    /// reattributes every megabyte the replica held to *external* usage, which
+    /// is then margin-inflated against the next model to load: a 27 GB resident
+    /// unloads and the board reports 27 GB of phantom foreign memory until some
+    /// grant request happens to trigger a staleness refresh — never, on an idle
+    /// gateway. Crediting the footprint to `free` — the memory did become free
+    /// — holds `external` at exactly the value it had while the replica was
+    /// resident, which is the physical truth about everyone else's usage.
+    ///
+    /// It is arithmetic standing in for a measurement, so the departure is
+    /// stamped on the board: the next grant request refreshes immediately
+    /// rather than waiting out the staleness window ([`refresh_due`]), and a
+    /// worker sample captured *before* the departure — one settled after it,
+    /// which the per-worker ingest makes reachable — is refused rather than
+    /// allowed to undo the credit ([`Self::record_free_locked`]). The stamp
+    /// clears when a reading from after the departure lands. The sample's own
+    /// `at` is left alone: it still says truthfully when the board was last
+    /// *read*, which is what `/health`'s `external_sample_age_ms` and the
+    /// refresh log's `recorded`/`previous_age` bookkeeping report.
+    ///
+    /// The credit is only right if the reading it adjusts actually *counted*
+    /// the footprint — i.e. was taken after this replica loaded — so that is
+    /// checked rather than assumed. A board whose freshest reading predates the
+    /// load is reachable: the replica's own load response carried no free
+    /// figure, or the reading was dropped by the currency check or the
+    /// source-precedence rule, and nothing has landed since. Crediting there
+    /// would subtract memory the reading never saw as in use and *under*-state
+    /// `external` — phantom headroom, the one direction this ledger cannot
+    /// absorb. So the credit is skipped and only the refresh is forced:
+    /// `external` stays over-stated (the conservative direction, and exactly
+    /// what it read before the departure) until the probe settles it.
     fn forget_worker(&self, worker: WorkerId) {
-        self.lock().workers.remove(&worker);
+        let mut state = self.lock();
+        let Some(entry) = state.workers.remove(&worker) else {
+            return;
+        };
+        let footprint_mb = entry.footprint_mb();
+        if footprint_mb == 0 {
+            return;
+        }
+        let Some(board) = state.gpus.get_mut(&entry.gpu) else {
+            return;
+        };
+        let total_mb = board.total_mb;
+        let Some(sample) = board.free.as_mut() else {
+            // Nothing to adjust and nothing to flag: a board with no reading
+            // at all is already due a refresh, and reports no `external`.
+            return;
+        };
+        // A reading from before this replica loaded never counted its
+        // footprint, so there is nothing of it to give back — force the
+        // refresh and leave the figure alone (see above).
+        let credited = sample.at >= entry.loaded_at;
+        // Bounded by the board's total so the credit cannot walk a reading
+        // arbitrarily far past the memory that exists. It is inert wherever it
+        // could change `external`: `external > 0` means `free + Σ ours <
+        // total`, and this resident's footprint is one term of that `Σ`, so
+        // `free + footprint < total` and the bound never binds. It binds only
+        // where `external` is already pinned at 0 — including on a unified
+        // board, where a stored free reading legitimately *exceeds* the
+        // board's policy total (`mps::query_memory`, `cpu::query_memory`
+        // deliberately do not clamp, and `external`'s own saturation is what
+        // makes that safe). Truncating there costs nothing: `external_locked`
+        // is the only reader of this figure, and it saturates.
+        if credited {
+            sample.free_mb = sample.free_mb.saturating_add(footprint_mb).min(total_mb);
+        }
+        let adjusted_free_mb = sample.free_mb;
+        board.free_adjusted_at = Some(Instant::now());
+        let (model, gpu) = (entry.inference_id, entry.gpu);
+        // Snapshotted under the lock, emitted with it dropped, as every other
+        // ledger log line is (review F8).
+        drop(state);
+        if credited {
+            tracing::debug!(
+                model = %model,
+                gpu = %gpu,
+                footprint_mb,
+                adjusted_free_mb,
+                "credited a departed replica's footprint back to the board's \
+                 free reading, so its memory is not reattributed to external \
+                 usage, and flagged the reading for a refresh"
+            );
+        } else {
+            tracing::debug!(
+                model = %model,
+                gpu = %gpu,
+                footprint_mb,
+                free_mb = adjusted_free_mb,
+                "a replica departed a board whose freshest free reading predates \
+                 its load, so there is no footprint in that reading to credit \
+                 back; leaving it as it stands — external usage reads high until \
+                 the refresh this flagged settles it"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2622,9 +2748,26 @@ impl VramLedger {
         if !fresher {
             return;
         }
+        // A reading captured *before* a resident left this board saw that
+        // resident's memory as in use, and its footprint has since left the
+        // `external` sum — so applying it now would reattribute the departed
+        // memory to external usage, which is the very thing
+        // [`VramLedger::forget_worker`]'s credit exists to prevent. Such a
+        // sample is not merely stale; it is denominated against a board
+        // population that no longer exists. Dropping it leaves the credit — and
+        // the forced refresh — standing until a reading from after the
+        // departure arrives.
+        if board
+            .free_adjusted_at
+            .is_some_and(|adjusted_at| at < adjusted_at)
+        {
+            return;
+        }
         if authoritative {
             board.seen_authoritative_free = true;
         }
+        // A real reading from after the departure supersedes the credit.
+        board.free_adjusted_at = None;
         board.free = Some(FreeSample {
             free_mb,
             source,
@@ -4168,6 +4311,7 @@ impl VramLedger {
                         load_reservations: HashMap::new(),
                         refreshing: false,
                         last_refresh_failed_at: None,
+                        free_adjusted_at: None,
                     },
                 )
             })
@@ -8329,6 +8473,224 @@ mod tests {
         assert_eq!(board.limit_mb, sysfs_limit);
     }
 
+    /// A replica that leaves the board must not have its memory reattributed
+    /// to *external* usage. `external = total − free − Σ footprint(residents)`
+    /// and the freshest free sample always predates the unload — nothing
+    /// samples the board because a worker left — so dropping the footprint
+    /// from the sum while the sample still counts that memory as in use turns
+    /// the whole departed resident into phantom foreign memory, which the next
+    /// model to load is then margin-charged for. On an idle gateway nothing
+    /// corrects it: only a grant request refreshes, and there are no grants.
+    #[test]
+    fn a_departed_replicas_footprint_is_not_reattributed_to_external() {
+        let ledger = ledger(32_000, no_margin());
+        let handle = loaded(Some(4_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        // 20 GB free with our 4 GB resident on a 32 GB board: 8 GB is
+        // somebody else's.
+        push_memory_with_total(&handle, 20_000, 0, Some(32_000), "nvml");
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].external_mb, 8_000, "8 GB is external");
+
+        drop(admission);
+
+        let board = &ledger.health()[0];
+        assert_eq!(
+            board.external_mb, 8_000,
+            "the departure changed nothing about anyone else's usage"
+        );
+        assert_eq!(
+            board.total_mb - board.limit_mb,
+            8_000,
+            "nor about the limit"
+        );
+        let state = ledger.lock();
+        assert!(
+            refresh_due(state.gpus.get(BOARD).expect("the board")),
+            "and the adjusted reading is due a live probe, whatever its age"
+        );
+    }
+
+    /// The adjustment is arithmetic standing in for a measurement, so the next
+    /// real reading overrides it outright — including when the departed memory
+    /// did *not* come back to the board (something else took it meanwhile).
+    #[test]
+    fn a_later_free_reading_supersedes_the_departure_adjustment() {
+        let ledger = ledger(32_000, no_margin());
+        let departing = loaded(Some(4_000), Some(0));
+        let staying = loaded(Some(1_000), Some(0));
+        let leaving = ledger
+            .register_worker("g/a", item_cost(4), &departing, None)
+            .expect("admitted");
+        let _resident = ledger
+            .register_worker("g/b", item_cost(4), &staying, None)
+            .expect("admitted");
+        push_memory_with_total(&departing, 20_000, 0, Some(32_000), "nvml");
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].external_mb, 7_000, "32 − 20 − (4 + 1)");
+
+        // A reading the surviving replica captured while the other was still
+        // resident, but which is not ingested until after it left: settles are
+        // per replica, so this ordering is ordinary. It counted the departed
+        // memory as in use, so applying it would undo the credit.
+        push_memory_with_total(&staying, 20_100, 0, Some(32_000), "nvml");
+
+        drop(leaving);
+        assert_eq!(
+            ledger.health()[0].external_mb,
+            7_000,
+            "unchanged by the exit"
+        );
+
+        ledger.ingest_all_for_test();
+        assert_eq!(
+            ledger.health()[0].external_mb,
+            7_000,
+            "and a reading from before the exit does not undo the credit"
+        );
+        assert!(
+            refresh_due(ledger.lock().gpus.get(BOARD).expect("the board")),
+            "the board is still waiting on a reading of its own"
+        );
+
+        // The driver settles it: only 21 GB came free, so a gigabyte of what
+        // the credit assumed was ours is in fact somebody else's now.
+        push_memory_with_total(&staying, 21_000, 0, Some(32_000), "nvml");
+        ledger.ingest_all_for_test();
+        let board = &ledger.health()[0];
+        assert_eq!(board.external_mb, 10_000, "32 − 21 − 1, the reading's own");
+        let state = ledger.lock();
+        assert!(
+            !refresh_due(state.gpus.get(BOARD).expect("the board")),
+            "a real reading clears the forced refresh with it"
+        );
+    }
+
+    /// The credit is the *footprint*, not the base, and it survives being
+    /// applied twice in a row. Both halves are easy to get wrong: crediting
+    /// `base_mb` would strand a replica's pool growth in `external` (a model
+    /// that grew 2 GB past its load-time pool leaves 2 GB of phantom foreign
+    /// memory behind), and a second departure landing on an already-adjusted
+    /// sample must credit against the adjusted figure rather than the last
+    /// reading the driver gave.
+    #[test]
+    fn back_to_back_departures_credit_each_replicas_grown_footprint() {
+        let ledger = ledger(32_000, no_margin());
+        // 4 GB of weights over a 1 GB load-time pool, and a second, quiet
+        // replica whose pool never moved.
+        let grown = loaded(Some(4_000), Some(1_000));
+        let quiet = loaded(Some(1_000), Some(0));
+        let first = ledger
+            .register_worker("g/a", item_cost(4), &grown, None)
+            .expect("admitted");
+        let second = ledger
+            .register_worker("g/b", item_cost(4), &quiet, None)
+            .expect("admitted");
+        // The pool grew to 3 GB, so `g/a`'s footprint is 4 000 + (3 000 −
+        // 1 000) = 6 000 — half as much again as its base.
+        push_memory_with_total(&grown, 20_000, 3_000, Some(32_000), "nvml");
+        ledger.ingest_all_for_test();
+        let board = &ledger.health()[0];
+        assert_eq!(board.footprints_mb, 7_000, "6 000 grown + 1 000 quiet");
+        assert_eq!(board.external_mb, 5_000, "32 − 20 − 7");
+
+        drop(first);
+        let board = &ledger.health()[0];
+        assert_eq!(board.footprints_mb, 1_000, "only the quiet replica is left");
+        assert_eq!(
+            board.external_mb, 5_000,
+            "the whole footprint — pool growth included — was credited, not \
+             just the base"
+        );
+
+        drop(second);
+        let board = &ledger.health()[0];
+        assert_eq!(board.footprints_mb, 0, "the board is empty");
+        assert_eq!(
+            board.external_mb, 5_000,
+            "the second departure credits against the first's adjusted figure"
+        );
+        assert!(
+            refresh_due(ledger.lock().gpus.get(BOARD).expect("the board")),
+            "and the board is still waiting on a reading of its own"
+        );
+    }
+
+    /// A departure from a board that has never had a free reading adjusts
+    /// nothing and flags nothing — and, in particular, does not leave a stamp
+    /// that would refuse the board's *first* reading when it finally lands.
+    #[test]
+    fn a_departure_from_a_board_with_no_reading_does_not_refuse_the_first_one() {
+        let ledger = ledger(32_000, no_margin());
+        let departing = loaded(Some(4_000), Some(0));
+        let staying = loaded(Some(1_000), Some(0));
+        let leaving = ledger
+            .register_worker("g/a", item_cost(4), &departing, None)
+            .expect("admitted");
+        let _resident = ledger
+            .register_worker("g/b", item_cost(4), &staying, None)
+            .expect("admitted");
+        assert!(
+            !ledger.health()[0].external_known,
+            "no reading has ever landed on this board"
+        );
+
+        drop(leaving);
+        push_memory_with_total(&staying, 27_000, 0, Some(32_000), "nvml");
+        ledger.ingest_all_for_test();
+        let board = &ledger.health()[0];
+        assert!(board.external_known, "the first reading was accepted");
+        assert_eq!(board.external_mb, 4_000, "32 − 27 − 1, the reading's own");
+    }
+
+    /// The credit is gated on the reading having *counted* the departing
+    /// footprint. A board whose freshest reading predates the replica's load —
+    /// its load response carried no free figure, and nothing has landed since —
+    /// gets no credit: subtracting a footprint that reading never saw would
+    /// invent headroom. `external` is left reading high (the direction it read
+    /// before the load, and the safe one) and the refresh is forced anyway.
+    #[test]
+    fn a_reading_that_predates_the_load_is_not_credited() {
+        let ledger = ledger(32_000, no_margin());
+        // The board's only reading rides the first replica's load report, so
+        // it is stamped before the second replica exists.
+        let first = loaded(Some(1_000), Some(0));
+        {
+            let mut telemetry = first.lock().unwrap();
+            let load = telemetry.load.as_mut().expect("the load report");
+            load.value.memory = Some(MemorySample {
+                free_mb: Some(20_000),
+                total_mb: Some(32_000),
+                free_source: Some("nvml".to_owned()),
+                reserved_mb: Some(0),
+                allocated_mb: Some(0),
+            });
+        }
+        let _resident = ledger
+            .register_worker("g/a", item_cost(4), &first, None)
+            .expect("admitted");
+        let late = loaded(Some(4_000), Some(0));
+        let leaving = ledger
+            .register_worker("g/b", item_cost(4), &late, None)
+            .expect("admitted");
+        assert_eq!(ledger.health()[0].external_mb, 7_000, "32 − 20 − (1 + 4)");
+
+        drop(leaving);
+
+        let board = &ledger.health()[0];
+        assert_eq!(
+            board.external_mb, 11_000,
+            "the reading never saw the 4 GB, so there is none of it to give \
+             back: external reads high rather than inventing headroom"
+        );
+        assert!(
+            refresh_due(ledger.lock().gpus.get(BOARD).expect("the board")),
+            "and the probe is what settles it"
+        );
+    }
+
     /// The staleness refresh backs off after a failure. Without it, a host where
     /// `nvidia-smi` is missing or does not list the board spawns a blocking
     /// subprocess on every single grant request, forever.
@@ -8347,6 +8709,7 @@ mod tests {
                 load_reservations: HashMap::new(),
                 refreshing,
                 last_refresh_failed_at: failed,
+                free_adjusted_at: None,
             };
         let stale = || {
             Some(FreeSample {
@@ -8387,6 +8750,37 @@ mod tests {
         assert!(
             !refresh_due(&fresh(stale(), None, true)),
             "a probe already in flight for this board"
+        );
+        // The departure stamp forces a probe past the staleness clock, but it
+        // is the weakest of the three conditions: a host whose `nvidia-smi`
+        // answers nothing still buys its quiet period, and a probe already in
+        // flight still answers for it. Without that ordering every grant after
+        // an unload would spawn a subprocess on such a host — the very thing
+        // the backoff exists to stop.
+        let adjusted = |failed: Option<Instant>, refreshing: bool| {
+            let mut board = fresh(
+                Some(FreeSample {
+                    free_mb: 1000,
+                    source: "nvml".to_owned(),
+                    at: Instant::now(),
+                }),
+                failed,
+                refreshing,
+            );
+            board.free_adjusted_at = Some(Instant::now());
+            board
+        };
+        assert!(
+            refresh_due(&adjusted(None, false)),
+            "an adjusted reading is probed however fresh its own timestamp"
+        );
+        assert!(
+            !refresh_due(&adjusted(Some(Instant::now()), false)),
+            "but a probe that just failed still wins over the stamp"
+        );
+        assert!(
+            !refresh_due(&adjusted(None, true)),
+            "and so does one already in flight"
         );
     }
 

@@ -48,13 +48,20 @@ build/deploy/API. The plan that uses this is
 - Host refresh (`gpu.rs:772-786` `query_memory_nvidia_smi`): `nvidia-smi
   --query-gpu=uuid,memory.total,memory.free`, 5 s timeout, all-or-nothing
   parse (`:793-820`). Triggered **only** from `VramLedger::request_grant`
-  (`ledger.rs:2808` → `maybe_refresh_external`) when `refresh_due`
-  (`:865-880`): no refresh in flight for that board, no failure within
-  10 s, freshest free sample older than `EXTERNAL_SAMPLE_MAX_AGE = 10 s`
-  (`:150`). Runs in `spawn_blocking`; the grant uses the stale value
-  meanwhile. **No periodic poller; `/health` never refreshes.** Design
-  doc promised an NVML per-process snapshot; the code reads free/total
-  only.
+  (`ledger.rs:3128` → `maybe_refresh_external`, `:3988`) when `refresh_due`
+  (`:938`), now four conditions in order: no refresh in flight for that
+  board, no failure within 10 s, **the board carries a departure stamp**,
+  else freshest free sample older than `EXTERNAL_SAMPLE_MAX_AGE = 10 s`
+  (`:150`). The stamp (`GpuLedger::free_adjusted_at`, `:1135`) is set by
+  `forget_worker` (`:2215`) on every worker departure and cleared by the
+  next reading that lands, so an unload forces the *next* grant to
+  re-probe whatever the sample's age — but the in-flight and
+  failure-backoff suppressions still win, so a host whose probe answers
+  nothing is not re-probed on every grant. Runs in `spawn_blocking`; the
+  grant uses the stale value meanwhile. **No periodic poller; `/health`
+  never refreshes** (it does not need to: the departure is accounted for
+  synchronously, see § external below). Design doc promised an NVML
+  per-process snapshot; the code reads free/total only.
 - Worker samples are the primary source: load and every predict response
   carry `memory{free_mb,total_mb,free_source,reserved_mb,allocated_mb}`.
   Recorded at registration (`ledger.rs:2008-2020`) and every settle
@@ -64,6 +71,13 @@ build/deploy/API. The plan that uses this is
   (`:2438-2443`); older samples ignored; a sample whose own `total_mb`
   disagrees with the board (±5 %/512 MB) is discarded with a once-per-
   (model, board) WARN (`:2399-2437`).
+- On departure (`forget_worker`, `ledger.rs:2215`) the board's free sample
+  is *credited* with the departing replica's footprint, so `external` does
+  not absorb it when the footprint leaves the `Σ` below; skipped (refresh
+  still forced) when the sample predates that replica's load, since such a
+  reading never counted the footprint. A worker sample captured before the
+  departure is refused by `record_free_locked` rather than allowed to undo
+  the credit.
 - `external = max(0, total − free − Σ footprint(registered workers))`
   (`:2462-2467`); `footprint = base + max(0, reserved −
   reserved_at_load)` (`:641-655`). `base` is measured **by the worker**.
