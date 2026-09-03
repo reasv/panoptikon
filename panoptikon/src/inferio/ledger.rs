@@ -958,7 +958,9 @@ fn refresh_due(board: &GpuLedger) -> bool {
 }
 
 /// Clears a board's in-flight `refreshing` flag on *every* exit from a host
-/// probe, a panic or an abandoned blocking task included.
+/// probe, a panic included. A blocking task that never ran at all constructs
+/// no guard, so that one case is not this type's:
+/// [`VramLedger::settle_abandoned_probe`] covers it from the join side.
 ///
 /// The flag is set before the query runs and settled by
 /// [`VramLedger::record_external_probe`] when the answer lands; the normal path
@@ -9167,6 +9169,19 @@ mod tests {
             .reserve_load_signalling("g/nemotron", item_cost(4), BOARD, None)
             .expect("a known board charges the load");
         assert_eq!(ledger.probe_calls(), 1, "the load path probed the host");
+        {
+            // A probe that *answered* leaves neither the in-flight flag nor a
+            // failure backoff behind: `record_external_probe` settles both and
+            // `ProbeGuard` is disarmed, so the next stale reading is re-probed
+            // immediately rather than sitting out a backoff it never earned.
+            let state = ledger.lock();
+            let board = state.gpus.get(BOARD).expect("the board");
+            assert!(!board.refreshing, "the in-flight flag was settled");
+            assert!(
+                board.last_refresh_failed_at.is_none(),
+                "and a probe that answered bought no failure backoff"
+            );
+        }
         let board = &ledger.health()[0];
         assert!(
             board.external_known,
