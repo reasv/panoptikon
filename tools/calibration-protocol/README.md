@@ -149,10 +149,15 @@ loadgen.py [--base URL] --out FILE [--corpus manifest.json]
            --model 'id=<inference_id>[,concurrency=N][,items=N][,corpus=PATH]
                     [,group=G][,kind=K][,mode=auto|file|text][,requests=N]
                     [,max_batch=N][,cache_key=S][,lru_size=N][,ttl_seconds=N]
-                    [,order=sequential|random][,data={"threshold":0.1}]'
+                    [,order=sequential|random][,interval=S]
+                    [,data={"threshold":0.1}]'
            [--model ...] [--duration S] [--requests N] [--timeout S]
            [--seed N] [--warmup-load] [--quiet]
 ```
+
+`interval=S` paces the *starts* of one slot's requests S seconds apart (a
+model's rate is `concurrency / interval`), which is what a soak's low-rate
+background load needs; without it a slot runs flat out.
 
 Records per request: latency, status, item count, the corpus item ids, the
 summed units in every dimension, the output count and any

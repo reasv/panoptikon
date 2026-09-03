@@ -31,6 +31,10 @@ Model spec (comma-separated `key=value`, repeatable `--model`):
     lru_size=N              `?lru_size=`                            (default 1)
     ttl_seconds=N           `?ttl_seconds=`                       (default 600)
     order=sequential|random iteration order over the corpus (default sequential)
+    interval=SECONDS        minimum wall time between the *starts* of two
+                            consecutive requests on one slot, so a long soak
+                            can hold a low steady rate (default 0 = flat out).
+                            With concurrency=N the model's rate is N/interval.
     data=<json object>      merged into every input entry (e.g. `{"threshold":0.1}`)
 
 Other options: --duration S, --requests N (per model, overridden by the spec),
@@ -186,6 +190,7 @@ class ModelSpec:
         self.lru_size = int(fields.get("lru_size", 1))
         self.ttl_seconds = int(fields.get("ttl_seconds", 600))
         self.order = fields.get("order", "sequential")
+        self.interval = float(fields.get("interval", 0.0))
         self.data = json.loads(fields["data"]) if "data" in fields else {}
         if not self.corpus:
             raise SystemExit(f"loadgen: model {self.id} has no corpus= and no --corpus")
@@ -199,7 +204,7 @@ class ModelSpec:
         return {
             "id": self.id, "concurrency": self.concurrency, "items": self.items,
             "corpus": self.corpus, "group": self.group, "kind": self.kind,
-            "mode": self.mode, "requests": self.requests,
+            "mode": self.mode, "requests": self.requests, "interval": self.interval,
             "max_batch": self.max_batch, "cache_key": self.cache_key,
             "order": self.order, "pool_size": len(self.pool),
             "data": self.data,
@@ -453,9 +458,24 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     def worker(spec: ModelSpec, slot: int) -> None:
         rng = random.Random(args.seed + slot * 7919 + hash(spec.id) % 100003)
+        next_start = time.monotonic()
         while not _stop.is_set():
             if deadline is not None and time.monotonic() >= deadline:
                 return
+            if spec.interval > 0.0:
+                # Pace the *starts*, so a slow response does not add to the gap
+                # and the rate stays what the scenario asked for.
+                while not _stop.is_set():
+                    wait = next_start - time.monotonic()
+                    if wait <= 0:
+                        break
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return
+                    _stop.wait(min(wait, 0.25))
+                if _stop.is_set():
+                    return
+                now = time.monotonic()
+                next_start = max(now, next_start + spec.interval)
             items = spec.take(spec.items, rng)
             if items is None:
                 return
