@@ -166,7 +166,8 @@ type SpawnJob = Box<dyn FnOnce() + Send + 'static>;
 /// allowed to return: it is the thread whose lifetime PR_SET_PDEATHSIG ties
 /// the children to, so "it exits" and "every worker dies" are the same
 /// sentence. Nothing runs on it but `Command::spawn` — no user code, no
-/// blocking I/O — so a job cannot wedge the queue behind it.
+/// blocking I/O — so a job cannot wedge the queue behind it, and a job that
+/// unwinds is caught rather than allowed to end the thread.
 static SPAWNER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<SpawnJob>>> =
     std::sync::OnceLock::new();
 
@@ -183,7 +184,33 @@ fn submit(job: SpawnJob) -> std::io::Result<()> {
                 // `for` ends only if every sender is dropped, and the one
                 // sender lives in a `static` — so this loop never ends.
                 for job in rx {
-                    job();
+                    // And neither does a panicking job end it. The thread's
+                    // *exit* is what the kernel delivers PR_SET_PDEATHSIG
+                    // on, so an unwind out of one job would SIGKILL every
+                    // child ever forked here — the whole failure this thread
+                    // exists to prevent, triggered by one bad spawn.
+                    // `Command::spawn` reports its own failures as errors,
+                    // but the tokio flavour also registers the child's pipes
+                    // and its SIGCHLD source with the current runtime, and
+                    // that panics when the runtime has no I/O driver — so a
+                    // job is not panic-free by construction. Contained here:
+                    // the job's reply channel dies with it, so its own
+                    // caller gets a spawn error, and every other child keeps
+                    // the parent thread it was forked from.
+                    if let Err(payload) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                    {
+                        let reason = payload
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("a non-string panic payload");
+                        tracing::error!(
+                            "a supervised spawn panicked ({reason}); its caller sees a failed \
+                             spawn, and the spawner thread survives so that no already-forked \
+                             child is killed by the kernel"
+                        );
+                    }
                 }
             })
             .expect("the process spawner thread must start");
@@ -204,10 +231,15 @@ pub(crate) fn spawn_supervised(
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     submit(Box::new(move || {
         let mut command = command;
+        // No cancelled-caller case to handle here, unlike the tokio flavour:
+        // this receiver is waited on unconditionally, one statement below.
         let _ = tx.send(command.spawn());
     }))?;
-    rx.recv()
-        .unwrap_or_else(|_| Err(std::io::Error::other("the process spawner thread died")))
+    rx.recv().unwrap_or_else(|_| {
+        Err(std::io::Error::other(
+            "the supervised spawn produced no answer (it panicked, or the spawner thread is gone)",
+        ))
+    })
 }
 
 /// Spawn a `tokio` child from the permanent spawner thread — the async
@@ -235,10 +267,24 @@ pub(crate) async fn spawn_supervised_tokio(
         // Held across the send so that a child nobody is waiting for any
         // more (a cancelled caller) is also *dropped* in runtime context.
         let _guard = handle.enter();
-        let _ = tx.send(command.spawn());
+        if let Err(Ok(mut child)) = tx.send(command.spawn()) {
+            // The caller went away between the submit and the reply, so
+            // nothing will ever supervise this child — and it is tied by
+            // PR_SET_PDEATHSIG to a thread that never exits, so "nobody
+            // waits for it" would mean "it runs until the gateway does".
+            // Killed here rather than left to the command's own
+            // `kill_on_drop` (every current caller sets it, but the spawner
+            // is not the place to depend on that), group first so a child
+            // that already forked its own helpers takes them with it.
+            kill_process_group(&child);
+            let _ = child.start_kill();
+        }
     }))?;
-    rx.await
-        .unwrap_or_else(|_| Err(std::io::Error::other("the process spawner thread died")))
+    rx.await.unwrap_or_else(|_| {
+        Err(std::io::Error::other(
+            "the supervised spawn produced no answer (it panicked, or the spawner thread is gone)",
+        ))
+    })
 }
 
 /// SIGKILL the child's whole process group. The spawn made the child its
@@ -457,6 +503,92 @@ mod tests {
         assert!(
             alive,
             "the child must survive its requester: {died:?} (spawner thread gone?)"
+        );
+    }
+
+    /// One panicking job must not end the thread, because ending the thread
+    /// is exactly how every child forked from it dies. `Command::spawn`
+    /// reports its own failures as errors, but the tokio flavour registers
+    /// the child with the current runtime and panics if that runtime has no
+    /// I/O driver — one such spawn anywhere in the process would otherwise
+    /// SIGKILL every worker in it.
+    #[test]
+    fn a_panicking_job_does_not_take_the_spawner_with_it() {
+        // Forked before the panic; its survival is the assertion.
+        let mut before = spawn_supervised(armed_sleeper()).expect("spawn sleep");
+
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let (ran, unwound) = std::sync::mpsc::channel::<()>();
+        submit(Box::new(move || {
+            // Dropped by the unwind, which is how this test waits for it.
+            let _ran = ran;
+            panic!("a spawn job panicked");
+        }))
+        .expect("the job was queued");
+        assert!(
+            unwound.recv().is_err(),
+            "the job ran and unwound without answering"
+        );
+        std::panic::set_hook(hook);
+
+        // The spawner still answers...
+        let mut after = spawn_supervised(armed_sleeper()).expect("the spawner survived the panic");
+        // ...and the child forked before the panic still has its parent.
+        let died = wait_for_exit(&mut before, Duration::from_millis(250));
+        for child in [&mut before, &mut after] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            died.is_none(),
+            "the panic retired the forking thread and the kernel killed a child: {died:?}"
+        );
+    }
+
+    /// A requester cancelled while awaiting its child must not leave that
+    /// child running: nobody is left to supervise it, and the thread it is
+    /// PDEATHSIG-tied to never exits, so it would run until the gateway
+    /// stopped. The child here would create a marker one second in.
+    #[tokio::test]
+    async fn a_cancelled_requester_leaves_no_child_behind() {
+        let marker =
+            std::env::temp_dir().join(format!("panoptikon-spawner-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 1; : > '{}'", marker.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_from_console(&mut command);
+        die_with_parent(&mut command);
+
+        // Occupy the spawner first, so the reply cannot land before the
+        // cancel below and the test cannot silently assert nothing.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        submit(Box::new(move || {
+            let _ = held.recv_timeout(Duration::from_secs(5));
+        }))
+        .expect("the gate job was queued");
+
+        // One poll submits the job; the elapsed timeout then drops the
+        // caller, exactly as a cancelled load would.
+        let cancelled = tokio::time::timeout(Duration::ZERO, spawn_supervised_tokio(command)).await;
+        assert!(
+            cancelled.is_err(),
+            "the requester has to be gone before its child arrives for this test to mean anything"
+        );
+        let _ = release.send(());
+
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let stranded = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !stranded,
+            "the abandoned child ran to completion: {}",
+            marker.display()
         );
     }
 }

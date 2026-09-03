@@ -175,8 +175,8 @@ pub(super) fn find_nvidia_smi() -> Option<PathBuf> {
 }
 
 /// How often the wait below looks at the child. Small enough to add nothing
-/// measurable to a healthy ~100 ms `nvidia-smi`, large enough that a 5 s
-/// give-up costs a few hundred wakeups.
+/// measurable to a healthy ~100 ms `nvidia-smi`, large enough that waiting
+/// out the 5 s give-up costs a thousand wakeups rather than a million.
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Run to completion or give up after `timeout`, **killing the child** if it

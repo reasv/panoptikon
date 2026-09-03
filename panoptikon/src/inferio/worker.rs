@@ -3191,6 +3191,65 @@ mod tests {
         assert!(leader_is_unwinding(Some(u32::MAX)));
     }
 
+    /// The attribution probes, against the case that defeats the cheap half
+    /// of them: an unread response frame sitting in the worker's stdout.
+    ///
+    /// A live worker with a stranded frame is *not* at EOF, which is the
+    /// right answer — that is a worker still talking. But the same bytes are
+    /// still readable after the kernel kills it, so the EOF probe alone
+    /// would then read "still running" and hand the gateway the blame for a
+    /// death that was not its doing (F12, one level down). The `/proc`
+    /// probe is what keeps that honest, and it is reached because the two
+    /// facts are or-ed rather than tried in isolation. Neither probe may
+    /// consume the frame, so the last assertion reads it back.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_stranded_frame_does_not_make_a_kernel_kill_look_like_ours() {
+        let cfg = test_spawn_config();
+        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
+            .await
+            .expect("spawn + handshake");
+        // A request whose answer nobody will read: the shape a cancelled
+        // request future leaves behind.
+        let bytes = encode_frame(&Value::Map(vec![
+            (Value::from("type"), Value::from("ping")),
+            (Value::from("id"), Value::from(9_999u64)),
+        ]))
+        .expect("a ping frame encodes");
+        send_bytes(&mut worker.stdin, &bytes)
+            .await
+            .expect("the live worker takes the request");
+        // Long enough for the answer to be in the pipe rather than in
+        // flight; the assertions below do not race it either way.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            worker.attribute_death().await,
+            DeathAttribution::StillRunning,
+            "a worker with an unread answer in its stdout is alive"
+        );
+
+        // Really killed from outside, with those bytes still readable.
+        worker.kill_child_externally_for_test().await;
+        worker.hide_exit_for_test();
+        assert!(
+            !worker.stdout_at_eof().await,
+            "the stranded frame is still there, so the EOF probe cannot see this death"
+        );
+        assert_eq!(
+            worker.attribute_death().await,
+            DeathAttribution::Dying,
+            "and the /proc probe is what stops the gateway claiming the kill"
+        );
+
+        let frame = read_frame(&mut worker.stdout)
+            .await
+            .expect("neither probe consumed the frame");
+        let Value::Map(map) = frame else {
+            panic!("the worker answers with a map");
+        };
+        assert_eq!(map_get(&map, "id").and_then(Value::as_u64), Some(9_999));
+    }
+
     /// stdout hygiene end-to-end: the printing_test fixture print()s during
     /// load/predict/unload, which lands on stderr in the worker (fd 1 is
     /// dup2'd to stderr before impl code runs) — so every protocol frame
