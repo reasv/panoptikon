@@ -1,0 +1,37 @@
+# ==========================================================================
+# Overlay for docker-compose.C4.yml (and C5): raise the container's file
+# descriptor limit.
+#
+# WHY THIS EXISTS. Phase 6 / S11 found that a container started from the
+# shipped compose shape gets `nofile` **1024** on this host (containerd's
+# default OCI rlimit; dockerd itself runs with 524 287, and there is no
+# `default-ulimits` in /etc/docker/daemon.json). A normal extraction job on
+# an idle 97 GB board drives enough concurrent in-flight predicts that the
+# gateway runs out of descriptors mid-job:
+#
+#     ERROR axum::serve::listener: accept error: Too many open files (os error 24)
+#     ERROR panoptikon::db::extraction_write: failed to insert item_data
+#           error=... (code: 14) unable to open database file
+#     ERROR ... failed to spawn inferio worker ...: Too many open files (os error 24)
+#
+# and the job ends `status: -1`. That failure IS a Phase 6 result and is
+# recorded as such (results/run1/S11-C4/runlog.md), so C4 itself is left
+# alone: it must keep reproducing the shipped behaviour.
+#
+# This overlay exists only so the rest of S11 — base method, base error,
+# external tracking, the hog legs, the store key — can be measured on a run
+# that survives long enough to produce them. It changes nothing else.
+#
+#   docker compose -f docker-compose.C4.yml -f docker-compose.C4-nofile.yml up -d
+#   docker compose -f docker-compose.C5.yml -f docker-compose.C4-nofile.yml up -d
+#
+# 524288 matches the bare host's soft limit (`ulimit -n` on this box), so a
+# run with this overlay is comparable with the bare-host C1 scenarios.
+# ==========================================================================
+
+services:
+  panoptikon:
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
