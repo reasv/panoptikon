@@ -1,0 +1,93 @@
+# ==========================================================================
+# Calibration protocol configuration C6 — Docker CPU image, cgroup-limited.
+# docs/batch-calibration-test-protocol.md §3 (C6), scenario S12, finding B19.
+#
+# The CPU unified board: no GPU at all, so the orchestrator prices work
+# against system RAM (`CPU` board key, `ram`/`rss` tiers, cap_fraction 0.75,
+# death-as-negative). The cgroup limit is what keeps the experiment off the
+# host's own OOM killer while the scenario deliberately starves the worker.
+#
+# Copied from the repo root docker-compose.yml. Deviations, all marked CALIB:
+#
+#   1. `image: panoptikon:calib-cpu`, no `build:`. Built once by hand:
+#        docker build --build-arg ACCELERATOR=cpu -t panoptikon:calib-cpu .
+#      A SEPARATE image from C4/C5 on purpose: `panoptikon setup` would
+#      otherwise have to re-sync the venv between accelerators, which is the
+#      "without clobbering the cu128 venv" clause in the protocol's C6 row.
+#   2. No `deploy.resources.reservations.devices` block: no GPU is passed
+#      in, which is the point. torch.cuda.is_available() is False inside.
+#   3. `mem_limit: 16g` (+ `memswap_limit`) — see the note below.
+#   4. Host ports 6462/6459.
+#   5. Its own project/container/volume names: calib-c6-*.
+#
+# THE MEMORY LIMIT. The protocol names `mem_limit: 16g`; Compose v2 honours
+# it directly for a non-swarm `up`, and `deploy.resources.limits.memory:
+# 16g` is the equivalent spelling (Compose v2 applies deploy limits outside
+# swarm too). Only one of the two is used here to keep `config` output
+# unambiguous. `memswap_limit` is set EQUAL to `mem_limit`, which is
+# Docker's way of saying "no swap": without it the kernel lets the worker
+# spill into host swap and the OOM kill S12 is waiting for never arrives (or
+# arrives after the box has thrashed for minutes).
+#
+# EXPECTED FINDING (B19): the CPU board reads HOST RAM, not the cgroup
+# limit, so /api/inference/health will report something like `CPU (64 GB)`
+# with a ~46 GB budget while the kernel kills the worker at 16 GB. Record
+# the board total and whether the death-negative path is all that stands
+# between a Docker CPU user and a respawn loop. Do not "fix" it here.
+#
+# Usage:
+#   docker compose -f docker-compose.C6.yml up -d
+#   docker compose -f docker-compose.C6.yml down -v
+# Admin API: http://127.0.0.1:6462  Public listener: http://127.0.0.1:6459
+# ==========================================================================
+
+name: calib-c6  # CALIB: per-configuration compose project
+
+services:
+  panoptikon:
+    # CALIB: the CPU-wheel image, kept separate from the cu128 one.
+    image: panoptikon:calib-cpu
+    container_name: panoptikon-calib-c6  # CALIB: per-configuration
+    restart: "no"  # CALIB: an OOM kill is the measurement; do not respawn
+    # CALIB: no `deploy:` device reservation — C6 must see no GPU.
+    # CALIB: the cgroup ceiling S12 runs against. memswap_limit == mem_limit
+    # disables swap for the container so the kill lands at the limit.
+    mem_limit: 16g
+    memswap_limit: 16g
+    ports:
+      # CALIB: 6462 -> container 6342, PRIVATE admin listener, loopback only.
+      - "127.0.0.1:6462:6342"
+      # CALIB: 6459 -> container 6339, PUBLIC restricted listener.
+      - "127.0.0.1:6459:6339"
+    volumes:
+      - calib-c6-data:/app/data
+      - calib-c6-config:/app/config
+      - calib-c6-cache:/home/ubuntu/.cache
+      # CALIB: the generated calibration corpus, read-only. S12 runs
+      # tags/wd-vit-tagger-v3 over the `smoke` tier.
+      - ../results/corpus:/media/corpus:ro
+      # Fixture impls — uncomment both if a scenario needs them. See README.md.
+      # - ../fixtures/impls:/app/inferio_custom:ro
+      # - ../fixtures/registry/calibration-fixtures.toml:/app/config/inference/calibration-fixtures.toml:ro
+    environment:
+      # Same logging triple as C4/C5 — see README.md.
+      - RUST_LOG=info,panoptikon::inferio=trace
+      - INFERIO_WORKER_LOG_LEVEL=DEBUG
+      - LOGLEVEL=DEBUG
+      # INFERIO_DEVICE is deliberately NOT set here. The gateway writes it
+      # onto the worker itself whenever the RESOLVED accelerator is cpu
+      # (accelerator_env.rs worker_env(Accelerator::Cpu)), and the CPU image's
+      # venv sentinel resolves to exactly that — so setting it in compose
+      # would only mask a regression in the coherence marker S12 checks for
+      # in the worker's /proc/<pid>/environ.
+      # - INFERIO_DEVICE=cpu
+      # Inert without the NVIDIA runtime; baked into the image ENV anyway.
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+volumes:
+  calib-c6-data:
+    name: calib-c6-data  # CALIB: explicit, so it is not project-prefixed
+  calib-c6-config:
+    name: calib-c6-config
+  calib-c6-cache:
+    name: calib-c6-cache
