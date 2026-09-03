@@ -110,6 +110,10 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 # same layer: the uv wheel cache (the venv keeps its own copies) and the
 # ffmpeg/ffprobe binaries setup's static-ffmpeg prefetch downloads — the
 # image wires the apt ffmpeg via [jobs] in docker.toml instead.
+#
+# uv's default link mode (reflink/clone) fails on some storage drivers, e.g.
+# overlay2 backed by ZFS ("os error 11"); copying always works.
+ENV UV_LINK_MODE=copy
 ARG ACCELERATOR=cpu
 RUN panoptikon setup --accelerator ${ACCELERATOR} \
     && cp /app/runtime/venv/lib/python*/site-packages/pypdfium2_raw/libpdfium.so \
