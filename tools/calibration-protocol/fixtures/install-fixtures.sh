@@ -58,7 +58,8 @@ DST_CFG="$TREE/config/inference"
 # The four behaviours the protocol needs, torch-free originals.
 ORIGINALS=(oom_second_batch_impl.py oom_impl.py failbatch_impl.py dying_impl.py)
 # The CUDA-touching variants, which are the ones that get priced on C1.
-VARIANTS=(oom_second_batch_cuda_impl.py oom_cuda_impl.py failbatch_cuda_impl.py dying_cuda_impl.py)
+VARIANTS=(oom_second_batch_cuda_impl.py oom_cuda_impl.py failbatch_cuda_impl.py dying_cuda_impl.py
+          oom_timed_cuda_impl.py dies_on_load_cuda_impl.py)
 REGISTRY=calibration-fixtures.toml
 
 if [ "$UNINSTALL" = 1 ]; then
@@ -80,4 +81,5 @@ echo "installed into $TREE"
 echo "  impls    -> $DST_IMPL"
 echo "  registry -> $DST_CFG/$REGISTRY"
 echo "inference ids: calibfixture/{oom_second_batch,oom,failbatch,dying}_{cuda,cpu}"
+echo "               calibfixture/{oom_timed,dies_on_load}_cuda"
 echo "verify with: curl \$B/api/inference/metadata | jq '.. | .calibfixture? // empty'"

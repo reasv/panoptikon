@@ -11,10 +11,17 @@ server TOMLs are seeded once and user-owned).
 | `server-C0.toml` + `env.C0` | "before" baseline: master worktree | 6352 / 6353 / 6349, 6350 | `../../../panoptikon-master/target/release/panoptikon` |
 | `server-C2.toml` + `env.C2` | C1 + `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (UUID form) | 6362 / 6363 / 6359, 6360 | branch |
 | `server-C3.toml` + `env.C3` | C1 + `CUDA_VISIBLE_DEVICES=1` (index form) | 6372 / 6373 / 6369, 6370 | branch |
+| `server-C7.toml` + `env.C7` | C1 + the user registry `registry-C7/registry-C7.toml` (MobileCLIP-S1 pinned to GPU 1; `enable_batching = true` on `doctr/easyocr_standard_en`) | 6382 / 6383 / 6379, 6380 | branch |
 
-C4–C7 are not here: C4/C5/C6 are Docker configurations (image build args and
-compose overlays, Phase 6) and C7 is C1 plus a user registry file, so it uses
-`server-C1.toml` unchanged.
+C4–C6 are not here: they are Docker configurations (image build args and
+compose overlays, Phase 6).
+
+`registry-C7/` is a directory of its own because `[inference_local].config_dirs`
+scans **every** `*.toml` in each directory it is given, and this directory holds
+the server configs, which are not registries. The registry file sets
+`allow_override = true` and restates each redefined id in full — redefinition
+replaces the id's config *and* its id-level metadata, so an omitted
+`metadata.cost` would silently fall back to the group's default.
 
 ## Running one
 

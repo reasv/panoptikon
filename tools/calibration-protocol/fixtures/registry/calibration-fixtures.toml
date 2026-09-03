@@ -78,6 +78,23 @@ config.impl_class = "failbatch_cuda_test"
 config.load_mb    = 64
 metadata.description = "Fails merged batches with a non-OOM error (CUDA-touching, priced)"
 
+# Batch-1 OOM for the first `oom_secs` after load, healthy afterwards. The only
+# fixture that can show `deflation` climbing AND recovering on one resident
+# worker (protocol §4 S5: "how long does recovery take once you switch to a
+# healthy model on the same replica").
+[group.calibfixture.inference_ids.oom_timed_cuda]
+config.impl_class = "oom_timed_cuda_test"
+config.load_mb    = 64
+config.oom_secs   = 120
+metadata.description = "Batch-1 OOM for 120 s after load, then healthy (CUDA-touching, priced)"
+
+# Raises inside load(): the model never becomes resident. Measures the respawn
+# cadence and the time a request stream takes to fail (finding B15).
+[group.calibfixture.inference_ids.dies_on_load_cuda]
+config.impl_class = "dies_on_load_cuda_test"
+config.load_mb    = 64
+metadata.description = "Fails in load() every time (CUDA-touching)"
+
 # os._exit(3) inside predict: worker death with a request in flight.
 [group.calibfixture.inference_ids.dying_cuda]
 config.impl_class = "dying_cuda_test"
