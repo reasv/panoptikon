@@ -297,18 +297,32 @@ there. Phase 6 recorded it like this (container case; `PID` is the gateway's
 pid, 1 inside the container):
 
 ```bash
-docker exec <container> sh -c 'ulimit -n'     # the soft limit, once
+# The limit that matters is pid 1's, NOT `docker exec … ulimit -n`: an exec is
+# a new process and gets the container's configured OCI rlimit (1024 here),
+# while the gateway raises its OWN soft limit to the hard one at start-up
+# (panoptikon/src/rlimit.rs). Reading the wrong one puts a number 512x too
+# small in the `limit=` column, and analyze.py's `peak_fds` row reports the
+# percentage against it. Run1 Phase 7b hit exactly this.
+LIMIT=$(docker exec <container> awk '/Max open files/{print $4}' /proc/1/limits)
 while :; do
   printf '%s fds=%s sockets=%s limit=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
     "$(docker exec <container> sh -c 'ls /proc/1/fd | wc -l')" \
     "$(docker exec <container> sh -c 'ls -l /proc/1/fd | grep -c socket')" \
-    1024
+    "$LIMIT"
   sleep 0.5
 done > "$DIR/fdrec.txt"
 ```
 
-Bare-host equivalent: `ls /proc/$PID/fd | wc -l`. Record it on **every
+Bare-host equivalent: `ls /proc/$PID/fd | wc -l`, with the limit from
+`awk '/Max open files/{print $4}' /proc/$PID/limits`.
+
+**Container logs need no pre-processing.** `docker.toml` sets
+`[logging] file = ""`, so `docker logs <container>` is the only sink, and the
+gateway writes ANSI colour to it; `analyze.py` strips those escapes when it
+reads the log, so a raw `docker logs > panoptikon.log` capture parses like a
+file sink. (Before that was added, a container leg reported `log 0 events` and
+silently SKIPped `grant_safety`, `failures` and `persistence`.) Record it on **every
 containerised run** and on any bare run whose `unit_budget` passes ~100: with
 local inference each in-flight predict is loopback HTTP inside one process and
 costs **two** sockets in one descriptor table, which is what made Phase 6's F6

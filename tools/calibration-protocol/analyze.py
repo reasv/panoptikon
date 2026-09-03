@@ -109,20 +109,28 @@ LOG_LINE = re.compile(
 )
 FIELD_START = re.compile(r"(?<![\w.])([a-z_][a-z0-9_]*)=")
 FIELD = re.compile(r'([a-z_][a-z0-9_]*)=("(?:[^"\\]|\\.)*"|\S+)')
+# `docker logs` hands back exactly what the process wrote, and the gateway
+# writes ANSI colour to a terminal-less stdout, so a container leg's log is
+# full of `\x1b[32m` runs that break LOG_LINE on the very first field (the
+# level). Stripping them here rather than in every caller is what keeps a
+# Docker scenario from silently reporting `log 0 events` and three green
+# SKIPs where it should have three PASSes (run1 Phase 7b, S11-C4-fixed).
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def parse_log(path: Optional[Path]) -> List[Dict[str, Any]]:
     """Parse `tracing_subscriber`'s default text format.
 
     A line is `<rfc3339> <LEVEL> <target>: <message> k=v k="v" ...`; the
-    message is everything before the first `k=` token.
+    message is everything before the first `k=` token. ANSI escapes are
+    stripped first, so a raw `docker logs` capture parses like a file sink.
     """
     if path is None or not path.is_file():
         return []
     events: List[Dict[str, Any]] = []
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            match = LOG_LINE.match(line.rstrip("\n"))
+            match = LOG_LINE.match(ANSI.sub("", line).rstrip("\n"))
             if match is None:
                 continue
             rest = match.group("rest")
