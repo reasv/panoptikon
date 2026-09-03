@@ -264,12 +264,18 @@ build/deploy/API. The plan that uses this is
   `status`, `signal`, `core_dumped`, `killed_by_gateway` and the stderr
   tail. The child is reaped with `FATAL_REAP_GRACE = 5 s` (`:109`);
   `status = None` means it was wedged rather than gone.
-  `killed_by_gateway` is sampled **before** the record's own SIGKILL of
-  the process group, because that kill happens on every path. Caveat
-  measured in run1 (finding F12): `try_wait` cannot see a thread-group
-  leader whose CUDA threads are still unwinding a SIGKILL (**475 ms**
-  measured), so on exactly the externally-killed CUDA worker the flag can
-  read `true`; read it together with the stderr tail, never alone.
+  The attribution is sampled **before** the record's own SIGKILL of the
+  process group, because that kill happens on every path. It is
+  three-valued since `5becf29c` (`DeathAttribution`, `worker.rs:584`,
+  logged as `attribution=` and spelled out in the WARN's sentence):
+  `reaped_before_signal` and `dying` both mean *the process was already
+  going down, so the signal came from outside*, and only `still_running`
+  means the gateway's own SIGKILL — `killed_by_gateway()` is exactly that
+  third case. The middle value exists because of run1's finding F12:
+  `try_wait` cannot report a thread-group leader while its CUDA threads
+  are still unwinding a SIGKILL (**475 ms** measured), so the boolean it
+  replaced read "the gateway did it" on precisely the externally-killed
+  CUDA worker it had been added to explain.
 - **Idle liveness sweep**: `DispatchMsg::ReapIdle` (`dispatch.rs:279`,
   handled `:834`/`:882`, acted on `:992`) `try_wait`s every replica in
   the free pool on the manager's tick (`manager.rs:1128`) and runs
@@ -294,21 +300,29 @@ build/deploy/API. The plan that uses this is
   than joining the max. `NOFILE_LIMIT_UNKNOWN` makes the term
   unconditionally non-binding where there is no rlimit to read
   (Windows). Motivating failure: Phase 6 finding F6.
-- **`PR_SET_PDEATHSIG` is thread-scoped** (`process_tree.rs:114-135`,
-  armed between fork and exec): on Linux it fires when the **forking
-  thread** exits, not the forking process. Its doc comment's premise —
-  that spawns happen on tokio core worker threads which live for the
-  life of the runtime — stops holding the moment anything calls
-  `block_in_place`, because Tokio launches its runtime workers *through*
-  the blocking pool and a demoted pool thread exits after `KEEP_ALIVE =
-  10 s` idle. The load-path host probe (`ledger.rs:4295`,
-  `refresh_external_for_load`) does exactly that, milliseconds before the
-  worker is forked (`worker.rs:887`), and `refresh_due` arms it for the
-  first load after every boot and after every worker departure. Run1
-  measured 8/8 worker SIGKILLs Δ 1–3 ms from the forking thread's exit,
-  self-sustaining, costing 15 924 of 16 000 items on a job that still
-  reported *completed* (finding **F11**; explains P5-1 and F8 in full).
-  Negative control: a host with no board never probes and never dies.
+- **`PR_SET_PDEATHSIG` is thread-scoped**, and this was run1's blocker
+  (**F11**). On Linux it fires when the **forking thread** exits, not the
+  forking process, and the premise that spawns happen on tokio core
+  worker threads that live for the life of the runtime stops holding the
+  moment anything calls `block_in_place`: Tokio launches its runtime
+  workers *through* the blocking pool, and a demoted pool thread exits
+  after `KEEP_ALIVE = 10 s` idle. The load-path host probe
+  (`ledger.rs`, `refresh_external_for_load`) does exactly that
+  milliseconds before a worker is forked, and `refresh_due` arms it for
+  the first load after every boot and after every worker departure — so
+  the gateway SIGKILLed its own workers ~10 s after each such load, 8/8
+  with Δ 1–3 ms from the forking thread's exit, self-sustaining, costing
+  15 924 of 16 000 items on a job that still reported *completed*
+  (explains P5-1 and F8 in full). **Fixed in `f9cf10fa`**: every command
+  armed with `die_with_parent` is now forked from **one permanently
+  alive spawner thread** — `process_tree::spawn_supervised` (blocking
+  callers, e.g. the transcode runner) and `spawn_supervised_tokio` (every
+  inferio worker), the latter creating the child inside the *caller's*
+  `Handle::enter()` so the runtime that registers the child with the
+  signal/IO drivers is the one that later `wait()`s on it. When reading
+  older recordings, note which binary they ran on: everything before
+  `8546cd63` has no such probe, and everything between it and `f9cf10fa`
+  has the bug.
 - Deadlines (`worker.rs:119-145`): handshake/configure/ping 30 s,
   load/prewarm 600 s, unload_grace 10 s, terminate_grace 5 s
   (`[inference_local] handshake_secs/load_secs/unload_grace_secs/
