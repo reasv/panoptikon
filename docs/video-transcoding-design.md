@@ -435,14 +435,24 @@ learns pinboard semantics and never parses the `h` codec.
   lives in the browser's decoded timeline — and, on a pin playing a
   transcoded rendition, in that rendition's timeline, while the composition
   always composites the original file.
-  - `end_cs` stays **required** on an outro span and carries the untrimmed
-    end. It is the server's fallback for a pin whose outro it cannot resolve
-    (never detected, `detect_outros` switched off since the board was drawn,
-    or a boundary that would not shorten the span) — one pin's vanished
-    outro must not fail a board of twelve, which is the whole reason this is
-    not the clip route's 404. It is also what the client's own length and
-    loop-memory estimates run on until the answer comes back: an
-    over-estimate of both, which is the safe direction for a guard.
+  - `end_cs` stays **required** on an outro span and carries the client's own
+    *estimate* of the same boundary — where its pin was playing to. It is the
+    fallback for a pin whose outro the server cannot resolve (never detected,
+    `detect_outros` switched off since the board was drawn) — one pin's
+    vanished outro must not fail a board of twelve, which is the whole reason
+    this is not the clip route's 404. It must be the estimate and **not** the
+    untrimmed length, which was the first attempt and was wrong: the client's
+    length and loop-memory estimates size the canvas before the POST and run
+    on the document's own numbers, so an untrimmed `end_cs` has the two sides
+    disagree about the target length — and therefore about which items are
+    shorter than it and buffer a loop. Measured on a two-pin board (a 12 s
+    outro pin at 1920×1080 cut to 7.94 s, beside a 10 s pin at 1280×720): the
+    client saw 395.5 MB and shipped it, the server computed 708.9 MB and
+    refused it over the 512 MB `max_mosaic_loop_mb`. With the estimate in
+    `end_cs` both sides compute 708.9 MB and the client's clamp loop shrinks
+    the canvas instead. The client's estimate and the server's answer still
+    differ by a centisecond (round vs floor), which is exactly why the end is
+    named rather than trusted.
 - **Length policy:** default "longest loop completes once"; explicit length
   cap option; hard server-side cap for animated-image outputs (tunable,
   serde default), no cap needed for real video outputs.

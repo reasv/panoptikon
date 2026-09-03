@@ -31,7 +31,7 @@ use crate::api::http_file::{FILE_IO_TIMEOUT, ServeBody, ServeSpec, open_file_wit
 use crate::api::utils::serve_outro_metadata;
 use crate::api_error::ApiError;
 use crate::config::{PolicyConfig, Settings};
-use crate::db::files::get_item_content_end_ms;
+use crate::db::files::{get_item_content_end_ms, get_item_outro_inputs};
 use crate::db::items::{FileRecord, ItemIdentifierType, ItemRecord, get_item_metadata_unchecked};
 use crate::db::storage::{StoredImage, get_thumbnail_image};
 use crate::db::{DbConnection, ReadOnlyNoUserData};
@@ -417,8 +417,8 @@ fn submit_response(outcome: SubmitOutcome) -> Response<Body> {
         An item whose time is `outro_span` asks the server to end that span at the item's \
         detected outro, the composition's spelling of the clip route's `cut=outro` and resolved \
         here for the same reason: the boundary belongs to the file's own timeline, not the \
-        browser's. Its `end_cs` is the client's fallback and is used unchanged when this item \
-        has no usable outro — one pin's missing outro never fails the document.",
+        browser's. Its `end_cs` is the client's own estimate of that boundary, used unchanged \
+        when this item has no usable outro — one pin's missing outro never fails the document.",
     params(DbQueryParams),
     request_body = ComposeRequest,
     responses(
@@ -441,12 +441,16 @@ pub async fn video_compose(
     Json(mut body): Json<ComposeRequest>,
 ) -> ApiResult<Response<Body>> {
     let preset = policy_preset(&state.settings, &context, &body.output.preset)?;
-    // Before anything is validated or hashed: the document's outro spans are
-    // the one part of it the client deliberately left for the server to
-    // decide, and every layer below this line sees explicit centiseconds.
+    let limits = ComposeLimits::from_config();
+    // The item cap first, because the pass below is the request's first
+    // per-item cost: a document too long to be accepted must not buy a query
+    // per pin on the way to being refused for its length.
+    compose::validate_item_count(&body, limits).map_err(compose_rejection)?;
+    // Then the document's outro spans — the one part of it the client
+    // deliberately left for the server to decide. Everything below this line
+    // sees explicit centiseconds.
     resolve_outro_spans(&mut db, &mut body).await?;
-    let doc = compose::resolve_compose(&body, &preset, ComposeLimits::from_config())
-        .map_err(compose_rejection)?;
+    let doc = compose::resolve_compose(&body, &preset, limits).map_err(compose_rejection)?;
 
     // Every item's own file, by the same readability rule the single-file path
     // uses: handing ffmpeg a path on a dropped mount would produce a *verdict*
@@ -941,22 +945,34 @@ async fn resolve_outro_end_cs(
     sha256: &str,
     duration: Option<f64>,
 ) -> ApiResult<i64> {
-    let Some(content_end_ms) = get_item_content_end_ms(&mut db.conn, sha256).await? else {
-        return Err(no_outro());
-    };
+    let content_end_ms = get_item_content_end_ms(&mut db.conn, sha256).await?;
     if !serve_outro_metadata(&db.index_db, true).await {
         return Err(no_outro());
     }
-    // The player's own eligibility rule (`ui/lib/videoTrim.ts`: a card exists
-    // only while `duration - contentEnd > 0`). A boundary at or past the end
-    // of the item leaves nothing to cut away, and a `cut=outro` that quietly
-    // returned the full length would be indistinguishable, to the client, from
-    // one that trimmed a card. An item with no recorded duration cannot be
-    // judged this way, so it is not — the boundary is taken at face value.
+    usable_outro_cut_cs(content_end_ms, duration).ok_or_else(no_outro)
+}
+
+/// The cut a detected boundary implies for an item of this length, or `None`
+/// when the item has no *usable* outro.
+///
+/// THE eligibility rule, in one place because both export routes have to reach
+/// the same verdict on the same item: a clip cut at the outro and a
+/// composition cut at it must not disagree about whether there is a card, let
+/// alone about which frame it starts on. The clip route turns `None` into its
+/// 404; the composition route turns it into "leave this pin's own end alone".
+///
+/// It is the player's rule (`ui/lib/videoTrim.ts`: a card exists only while
+/// `duration - contentEnd > 0`). A boundary at or past the end of the item
+/// leaves nothing to cut away, and a cut that quietly returned the full length
+/// would be indistinguishable, to the client, from one that trimmed a card. An
+/// item with no recorded duration cannot be judged this way, so it is not —
+/// the boundary is taken at face value.
+fn usable_outro_cut_cs(content_end_ms: Option<i64>, duration: Option<f64>) -> Option<i64> {
+    let content_end_ms = content_end_ms?;
     if duration.is_some_and(|duration| (content_end_ms as f64) / 1000.0 >= duration) {
-        return Err(no_outro());
+        return None;
     }
-    Ok(outro_cut_cs(content_end_ms))
+    Some(outro_cut_cs(content_end_ms))
 }
 
 /// Rewrites every `outro_span` in a composition document into a plain span,
@@ -968,25 +984,18 @@ async fn resolve_outro_end_cs(
 /// span, and a mosaic cut at the outro is the same artifact as the identical
 /// hand-trimmed one.
 ///
-/// Where it deliberately differs from the clip route: **an unusable outro is
-/// not an error here.** A clip cut at the outro *is* the request, so a missing
-/// one is a 404; a composition is a board of pins, and one pin whose outro
-/// went away (never detected, `detect_outros` switched off since the board was
-/// drawn, a boundary that would not shorten this span anyway) must not fail
-/// the other eleven. Its own `end_cs` — the client's fallback, which is where
-/// playback would end without the cut — stands instead.
+/// Given the same item, the cut this produces is the same number the clip
+/// route produces — [`usable_outro_cut_cs`] on the same two columns, so the
+/// two routes cannot form different verdicts about whether a card exists or
+/// about which frame it starts on.
 ///
-/// The two guards on accepting a resolved cut are what "would not shorten this
-/// span" means, and neither needs the item's recorded duration: a *boundary* at
-/// or past the fallback end leaves no card to skip (the clip route's
-/// `content_end >= duration` rule, asked against the bound the client actually
-/// sent), and a cut that fails [`validate_bounds`] against this pin's start is
-/// a freeze frame rather than a clip — the same band playback's own outro
-/// default keeps clear of.
-///
-/// Given the same item, the cut this produces is the *same number* the clip
-/// route produces, from the same [`outro_cut_cs`] on the same column: a mosaic
-/// of one pin and a clip of that pin are cut at one frame.
+/// Where it deliberately differs: **an unusable outro is not an error here.**
+/// A clip cut at the outro *is* the request, so a missing one is a 404; a
+/// composition is a board of pins, and one pin whose outro went away (never
+/// detected, `detect_outros` switched off since the board was drawn, a cut
+/// inside the freeze band of this pin's own start) must not fail the other
+/// eleven. Its `end_cs` stands instead — the client's own estimate of the same
+/// boundary, which is where its pin was playing to.
 async fn resolve_outro_spans(
     db: &mut DbConnection<ReadOnlyNoUserData>,
     body: &mut ComposeRequest,
@@ -1006,25 +1015,20 @@ async fn resolve_outro_spans(
         let ItemTime::OutroSpan { start_cs, end_cs } = body.items[index].time else {
             continue;
         };
-        let content_end_ms = if serve {
-            get_item_content_end_ms(&mut db.conn, &body.items[index].sha256).await?
+        let cut = if serve {
+            let (content_end_ms, duration) =
+                get_item_outro_inputs(&mut db.conn, &body.items[index].sha256).await?;
+            usable_outro_cut_cs(content_end_ms, duration)
         } else {
             None
         };
-        let resolved = match content_end_ms {
-            // The BOUNDARY, not the cut, is what decides eligibility — the
-            // clip route's `content_end >= duration` rule, asked against the
-            // untrimmed end the client sent instead of against a duration this
-            // pass would otherwise have to look up. Testing the guarded cut
-            // here would part company with that route on exactly one item: a
-            // boundary at the file's own end, which is "no card" there and
-            // would quietly shave the guard's 60 ms of real content off here.
-            Some(ms)
-                if ms.div_euclid(MS_PER_CS) < end_cs
-                    && validate_bounds(Some(start_cs), Some(outro_cut_cs(ms))).is_ok() =>
-            {
-                outro_cut_cs(ms)
-            }
+        let resolved = match cut {
+            // The one guard the shared rule cannot apply, because it is about
+            // this pin rather than about the item: a cut inside the freeze band
+            // of the start the user placed is a still spelled as a range, which
+            // `resolve_compose` refuses outright — and which playback's own
+            // outro default keeps clear of with the same band.
+            Some(cut) if validate_bounds(Some(start_cs), Some(cut)).is_ok() => cut,
             _ => end_cs,
         };
         body.items[index].time = ItemTime::Span {
@@ -2396,7 +2400,17 @@ transcode_presets = ["playback"]
         crate::test_utils::write_detect_outros_config(OUTRO_INDEX_DB, true);
 
         for (case, sha, start_cs, end_cs, expected) in [
-            ("the detected cut wins", WITH_OUTRO, 0, 1200, 794),
+            // The client sends its OWN estimate of the cut as `end_cs`; the
+            // server's frame-exact answer replaces it either way, whether the
+            // estimate ran short or long.
+            (
+                "the resolved cut wins over a short estimate",
+                WITH_OUTRO,
+                0,
+                780,
+                794,
+            ),
+            ("…and over a long one", WITH_OUTRO, 0, 810, 794),
             (
                 "a start bound keeps its own cut",
                 WITH_OUTRO,
@@ -2414,29 +2428,15 @@ transcode_presets = ["playback"]
                 1200,
                 1200,
             ),
-            // The cut has to SHORTEN the span to be a cut: an end bound
-            // already inside the content is the clip route's
-            // `content_end >= duration` rule asked against the bound the
-            // client actually sent, which needs no duration lookup at all.
-            ("the span already ends first", WITH_OUTRO, 0, 500, 500),
-            // The rule is asked of the BOUNDARY (800 cs), not of the guarded
-            // cut (794): a span ending exactly where the content does is the
-            // clip route's "no card to skip", and accepting it here would
-            // shave the guard's 60 ms off real content — the one item on
-            // which the two routes could have disagreed.
+            // The eligibility rule is the CLIP route's, on the item's own
+            // duration — `usable_outro_cut_cs`, which both routes call — so
+            // an item the clip route calls "no card" is never cut here either.
             (
-                "the span ends where the content does",
-                WITH_OUTRO,
+                "the boundary is inside the guard",
+                DEGENERATE_OUTRO,
                 0,
-                800,
-                800,
-            ),
-            (
-                "…and one centisecond later does cut",
-                WITH_OUTRO,
-                0,
-                801,
-                794,
+                1200,
+                1200,
             ),
             // A cut this close to the start is a freeze frame, not a clip —
             // the band playback's own outro default keeps clear of.
@@ -2444,13 +2444,6 @@ transcode_presets = ["playback"]
                 "the cut is inside the freeze band",
                 WITH_OUTRO,
                 793,
-                1200,
-                1200,
-            ),
-            (
-                "the boundary is inside the guard",
-                DEGENERATE_OUTRO,
-                0,
                 1200,
                 1200,
             ),
@@ -2517,7 +2510,7 @@ transcode_presets = ["playback"]
             ])
         };
         let mut named = board(serde_json::json!({
-            "kind": "outro_span", "start_cs": 100, "end_cs": 1200
+            "kind": "outro_span", "start_cs": 100, "end_cs": 790
         }));
         let explicit = board(serde_json::json!({
             "kind": "span", "start_cs": 100, "end_cs": 794
@@ -2538,7 +2531,7 @@ transcode_presets = ["playback"]
         // reaches the hash.
         let rejection = compose::resolve_compose(
             &board(serde_json::json!({
-                "kind": "outro_span", "start_cs": 100, "end_cs": 1200
+                "kind": "outro_span", "start_cs": 100, "end_cs": 790
             })),
             &preset,
             limits,

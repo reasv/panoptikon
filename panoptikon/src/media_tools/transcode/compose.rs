@@ -128,14 +128,18 @@ pub(crate) enum ItemTime {
     /// the cut *off* the frame the content ends on. The outro is NAMED here,
     /// never measured by the client.
     ///
-    /// `end_cs` is still required, and is the client's own FALLBACK — where
-    /// playback would end if the server has no usable outro for this item
-    /// (never detected, `detect_outros` off since the board was drawn, or a
-    /// boundary that does not shorten the span). It is never the authority:
-    /// a resolvable outro always replaces it. Required rather than optional
-    /// because one pin's vanished outro must not fail a whole board, and
-    /// because the client's own length and loop-memory estimates need a number
-    /// before the round trip.
+    /// `end_cs` is still required, and is the client's own ESTIMATE of the
+    /// same boundary — where its pin was playing to. It is never the
+    /// authority: a resolvable outro always replaces it, and the two routinely
+    /// differ by a centisecond (the client rounds, `outro_cut_cs` floors).
+    /// Required rather than optional for two reasons. It is the fallback if
+    /// the item's outro has gone away by the time the POST lands, because one
+    /// pin's vanished outro must not fail a whole board. And the client's
+    /// length and loop-memory estimates — which size the canvas BEFORE the
+    /// round trip — run on the document's own numbers, so an `end_cs` left at
+    /// the untrimmed length would have the client and this server disagree
+    /// about the target length, and therefore about which items loop: a board
+    /// that passes the client's guard and earns a `loop_memory` 422 here.
     ///
     /// REQUEST-ONLY. `api/video.rs` rewrites every one of these into a plain
     /// [`ItemTime::Span`] before the document is resolved, so this variant
@@ -385,19 +389,16 @@ impl ComposeLimits {
 
 type Resolved<T> = Result<T, ComposeRejection>;
 
-/// Validates a composition and resolves everything the filtergraph reads.
+/// How many items a document may carry, checked on its own so the API layer
+/// can apply it BEFORE it does any per-item work.
 ///
-/// Source rectangles are deliberately *not* rejected against the real stream
-/// bounds here: the stream's dimensions are not known until the job runs (a
-/// probe of every input on the request path would be paid even by a cache
-/// hit), so an out-of-bounds source rectangle is clamped at graph-build time
-/// instead — see [`build_filtergraph`]. Everything else is decided here,
-/// before a job exists.
-pub(crate) fn resolve_compose(
-    request: &ComposeRequest,
-    preset: &ResolvedPreset,
-    limits: ComposeLimits,
-) -> Resolved<ResolvedCompose> {
+/// It is the cheapest rule there is and it bounds every other cost in the
+/// request, so nothing should be spent per item ahead of it — the outro
+/// resolution pass in `api/video.rs` issues one query per item, and a document
+/// that is going to be refused for its length must not pay for that first.
+/// [`resolve_compose`] still applies it, so a caller that forgets is only slow,
+/// never wrong.
+pub(crate) fn validate_item_count(request: &ComposeRequest, limits: ComposeLimits) -> Resolved<()> {
     if request.items.is_empty() {
         return Err(ComposeRejection::new(
             "no_items",
@@ -414,6 +415,23 @@ pub(crate) fn resolve_compose(
             ),
         ));
     }
+    Ok(())
+}
+
+/// Validates a composition and resolves everything the filtergraph reads.
+///
+/// Source rectangles are deliberately *not* rejected against the real stream
+/// bounds here: the stream's dimensions are not known until the job runs (a
+/// probe of every input on the request path would be paid even by a cache
+/// hit), so an out-of-bounds source rectangle is clamped at graph-build time
+/// instead — see [`build_filtergraph`]. Everything else is decided here,
+/// before a job exists.
+pub(crate) fn resolve_compose(
+    request: &ComposeRequest,
+    preset: &ResolvedPreset,
+    limits: ComposeLimits,
+) -> Resolved<ResolvedCompose> {
+    validate_item_count(request, limits)?;
 
     let canvas = &request.canvas;
     validate_canvas(canvas, preset)?;
@@ -523,7 +541,12 @@ fn resolve_items(
         .iter()
         .map(|item| {
             validate_item(item, canvas)?;
-            let audio = item.audio && carries_audio && matches!(item.time, ItemTime::Span { .. });
+            let audio = item.audio
+                && carries_audio
+                && matches!(
+                    item.time,
+                    ItemTime::Span { .. } | ItemTime::OutroSpan { .. }
+                );
             Ok(ComposeItem {
                 audio,
                 ..item.clone()
@@ -699,7 +722,9 @@ fn longest_span_cs(items: &[ComposeItem]) -> Option<i64> {
     items
         .iter()
         .filter_map(|item| match item.time {
-            ItemTime::Span { start_cs, end_cs } => Some(end_cs - start_cs),
+            ItemTime::Span { start_cs, end_cs } | ItemTime::OutroSpan { start_cs, end_cs } => {
+                Some(end_cs - start_cs)
+            }
             _ => None,
         })
         .max()
