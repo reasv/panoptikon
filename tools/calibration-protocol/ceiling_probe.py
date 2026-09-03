@@ -81,10 +81,19 @@ Output schema (JSON)
                   "delta_mb": int, "error": str|null}],
      "fit": {"slope_mb_per_unit": float, "intercept_mb": float,
              "residual_mb": float, "samples": int} | null,
-     "bisect": {"free_mb_at_start": int|null, "largest_ok_units": int|null,
+     "bisect": {"free_mb_at_start": int|null,
+                "reserved_at_bisect_start_mb": int|null,
+                "largest_ok_units": int|null,
                 "largest_ok_items": int|null, "first_oom_items": int|null,
                 "trace": [{"items": int, "ok": bool, "units": int,
+                           "oom": bool, "absorbed_halvings": int,
                            "error": str|null}]} | null}
+
+`free_mb_at_start` is the board's free memory when the search begins, which is
+*after* the `--batches` sweep: the caching allocator is still holding what that
+sweep reserved, so the memory a bisect probe can actually use is
+`free_mb_at_start + reserved_at_bisect_start_mb`. Compare a boundary against
+that sum, not against `free_mb_at_start` alone.
 
 Caveats
 -------
@@ -585,7 +594,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     bisect: Optional[Dict[str, Any]] = None
     if args.bisect_oom:
-        bisect = {"free_mb_at_start": nvml.free_mb(handle), "trace": [],
+        bisect = {"free_mb_at_start": nvml.free_mb(handle),
+                  "reserved_at_bisect_start_mb": int(torch.cuda.memory_reserved() // MIB),
+                  "trace": [],
                   "largest_ok_items": None, "largest_ok_units": None,
                   "first_oom_items": None}
         low, high = 1, args.bisect_max
@@ -594,7 +605,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         while probe <= args.bisect_max:
             record = run_batch(probe, -2)
             bisect["trace"].append({"items": probe, "ok": record["ok"] and not record["oom"],
-                                    "units": record["units"], "error": record["error"]})
+                                    "units": record["units"], "oom": record["oom"],
+                                    "absorbed_halvings": record["absorbed_halvings"],
+                                    "error": record["error"]})
             if record["ok"] and not record["oom"]:
                 low = probe
                 bisect["largest_ok_items"] = probe
@@ -611,7 +624,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             mid = (low + high) // 2
             record = run_batch(mid, -2)
             bisect["trace"].append({"items": mid, "ok": record["ok"] and not record["oom"],
-                                    "units": record["units"], "error": record["error"]})
+                                    "units": record["units"], "oom": record["oom"],
+                                    "absorbed_halvings": record["absorbed_halvings"],
+                                    "error": record["error"]})
             if record["ok"] and not record["oom"]:
                 low = mid
                 bisect["largest_ok_items"] = mid
