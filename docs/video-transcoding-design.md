@@ -444,6 +444,40 @@ learns pinboard semantics and never parses the `h` codec.
   trim start / file start, never the live playhead; stopped videos are
   stills — the equal-bounds freeze-frame trim encoding already carries the
   frame choice, so the client sends no playhead state at all.
+- **Outro cut (added 2026-09-03):** a pin whose playback ends at the
+  detected outro must *export* there too. The outro is never written into
+  the pin's `h` field (outro-skip design §1: it is a playback default, not a
+  user trim), so the composition needed its own way to say so, and it is the
+  clip route's rule in the document's own grammar: `time.kind =
+  "outro_span"` — same `start_cs`/`end_cs` as a span, with the end **named
+  rather than measured**. `POST /api/video/compose` rewrites every one into
+  a plain span before the document is validated or hashed, reading the same
+  `items.content_end_ms` with the same 60 ms guard, so nothing below the API
+  edge learns the variant exists and a mosaic cut at the outro is the same
+  cached artifact as the identical hand-trimmed one. The client emits it on
+  exactly playback's conditions (preference on, a detected boundary, no user
+  end bound of their own) and never computes the cut point: its own number
+  lives in the browser's decoded timeline — and, on a pin playing a
+  transcoded rendition, in that rendition's timeline, while the composition
+  always composites the original file.
+  - `end_cs` stays **required** on an outro span and carries the client's own
+    *estimate* of the same boundary — where its pin was playing to. It is the
+    fallback for a pin whose outro the server cannot resolve (never detected,
+    `detect_outros` switched off since the board was drawn) — one pin's
+    vanished outro must not fail a board of twelve, which is the whole reason
+    this is not the clip route's 404. It must be the estimate and **not** the
+    untrimmed length, which was the first attempt and was wrong: the client's
+    length and loop-memory estimates size the canvas before the POST and run
+    on the document's own numbers, so an untrimmed `end_cs` has the two sides
+    disagree about the target length — and therefore about which items are
+    shorter than it and buffer a loop. Measured on a two-pin board (a 12 s
+    outro pin at 1920×1080 cut to 7.94 s, beside a 10 s pin at 1280×720): the
+    client saw 395.5 MB and shipped it, the server computed 708.9 MB and
+    refused it over the 512 MB `max_mosaic_loop_mb`. With the estimate in
+    `end_cs` both sides compute 708.9 MB and the client's clamp loop shrinks
+    the canvas instead. The client's estimate and the server's answer still
+    differ by a centisecond (round vs floor), which is exactly why the end is
+    named rather than trusted.
 - **Length policy:** default "longest loop completes once"; explicit length
   cap option; hard server-side cap for animated-image outputs (tunable,
   serde default), no cap needed for real video outputs.
