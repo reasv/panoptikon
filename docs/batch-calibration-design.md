@@ -419,7 +419,11 @@ on a model that has not been fitted yet.
   conservative plausible dtype's base (fp32 profile if present, else the
   constant); the load response reports the actual dtype, and the
   orchestrator remembers the negotiated outcome per (model, GPU) for
-  subsequent loads.
+  subsequent loads. Two distinct states share the word: "dtype not yet
+  known" is the absent query (`None`, matches every profile, takes the
+  conservative maximum), while the literal key value `"unknown"` is a
+  worker's report that it neither selected a dtype nor could infer one
+  from its weights; it matches only itself.
 - **External usage is derived, not margin-guessed, for our own
   processes.** Every worker reports `memory_reserved` per response (and
   `reserved_at_load` once, on the load response), so the orchestrator
