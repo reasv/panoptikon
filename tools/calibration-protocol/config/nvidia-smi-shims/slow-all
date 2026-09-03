@@ -1,0 +1,10 @@
+#!/bin/sh
+# S13-2a: every nvidia-smi query takes 6 s, so the 5 s boot inventory probe
+# (gpu.rs `query`, capability::output_with_timeout) times out and the whole
+# inventory goes unknown. Put this dir FIRST on the gateway's PATH.
+#   SMI_SHIM_LOG=<file>   append one line per invocation (optional)
+#   SMI_SHIM_DELAY=<s>    override the 6 s delay
+#   SMI_SHIM_REAL=<path>  override /usr/bin/nvidia-smi
+echo "$(date -u +%FT%T.%3NZ) start $*" >> "${SMI_SHIM_LOG:-/dev/null}"
+sleep "${SMI_SHIM_DELAY:-6}"
+exec "${SMI_SHIM_REAL:-/usr/bin/nvidia-smi}" "$@"

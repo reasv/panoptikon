@@ -1,0 +1,10 @@
+#!/bin/sh
+# S13-3: answer instantly with an unparseable identity row, so
+# gpu.rs `parse_inventory` leaves the whole inventory unknown.
+# Same environment variables as `slow-all` (delay unused).
+echo "$(date -u +%FT%T.%3NZ) start $*" >> "${SMI_SHIM_LOG:-/dev/null}"
+case "$*" in
+  *memory.free*) echo "not-a-uuid, NaN, ---" ;;
+  *)             echo "zero, not-a-uuid, , not-a-number, ??" ;;
+esac
+exit 0
