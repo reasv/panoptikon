@@ -36,8 +36,12 @@ existing `useSyncExternalStore` pattern (`lib/state/valueBox.ts`), key
 stored value.
 
 **A2 Toggle** in `components/GridCellSizeControl.tsx`: segmented
-"Animate: Always / On hover" bound to the current range (D4), with a hint that
-it applies to the current size range. Must NOT add a URL param and must NOT
+"Animated images: Always / On hover" bound to the current range (D4). Laid out
+vertically (2026-09-04 QA): the name plus one sentence saying what the setting
+is, the full-width control, and under it one sentence saying what the current
+choice does and which size band it is for ("the size in use now; narrower /
+wider cells are set separately"). Renamed from "Animate" so it cannot be read
+as the video-preview setting beneath it. Must NOT add a URL param and must NOT
 touch save-as-default.
 
 **A3 Director** (`lib/state/animatedPlayback.ts`): add one capture-phase
