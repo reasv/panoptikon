@@ -4059,12 +4059,15 @@ impl VramLedger {
             return;
         }
         let ledger = Arc::clone(self);
-        let query = self.memory_query.clone();
         tokio::task::spawn_blocking(move || {
             // One coherent snapshot of every board, so per-board readings can
-            // never be stitched together from different moments.
-            let boards = query.run();
-            ledger.record_external_probe(&gpu, boards, query.free_source());
+            // never be stitched together from different moments. Through
+            // `run_memory_query` rather than the query directly, so both probe
+            // paths go past the same test seam and a stubbed ledger can never
+            // reach the host down one of them.
+            let boards = ledger.run_memory_query();
+            let source = ledger.memory_query.free_source();
+            ledger.record_external_probe(&gpu, boards, source);
         });
     }
 
@@ -4085,7 +4088,14 @@ impl VramLedger {
     /// it against a reading that lands afterwards would answer the question
     /// too late. The in-flight and failure-backoff suppressions in
     /// [`refresh_due`] still apply, so a host whose probe answers nothing pays
-    /// at most one timed-out attempt per [`EXTERNAL_SAMPLE_MAX_AGE`].
+    /// at most one timed-out attempt per [`EXTERNAL_SAMPLE_MAX_AGE`]. The
+    /// ledger lock is dropped before the query runs, and the query itself goes
+    /// through `block_in_place` on the multi-thread runtime, so "synchronous"
+    /// costs the caller its own latency and not a worker thread's.
+    ///
+    /// One probe answers for *every* enumerated board, so a load pinned to
+    /// several boards pays one: the first board's probe records the rest, and
+    /// [`refresh_due`] is then false for them.
     fn refresh_external_for_load(&self, model: &str, gpu: &str) {
         if !self.probes_the_host() {
             return;
@@ -4122,7 +4132,21 @@ impl VramLedger {
             "probing the host for this board's free memory before pricing a \
              load against it"
         );
-        let boards = self.run_memory_query();
+        // Blocking the calling task inline would hold a Tokio worker thread
+        // for the whole `nvidia-smi` timeout. `block_in_place` hands that
+        // worker's remaining tasks to another thread first, which is what
+        // makes a synchronous probe safe on the runtime the server actually
+        // runs (`main.rs` builds a multi-thread one). It panics on a
+        // current-thread runtime and outside a runtime altogether, so those
+        // fall through to the plain call: there is no worker pool to protect
+        // in either case, and the probe still returns within its own timeout.
+        let boards = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(|| self.run_memory_query())
+        } else {
+            self.run_memory_query()
+        };
         self.record_external_probe(gpu, boards, self.memory_query.free_source());
     }
 
@@ -7297,6 +7321,11 @@ mod tests {
         let inventory =
             GpuInventory::known_rocm(vec![amd(0, "0000:03:00.0"), amd(1, "0000:0c:00.0")]);
         let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
+        // A real ledger, so its `probe_external` is on and `reserve_load`'s
+        // load-path probe would otherwise go and read this machine's sysfs
+        // about two synthetic PCI addresses. The stub answers nothing, which
+        // is what the host would have said anyway, and keeps the test off it.
+        ledger.install_probe_stub(None);
         let pin = inventory.resolve_pin(Some("1")).expect("a HIP index");
         assert_eq!(pin, "1");
         assert!(
@@ -9046,6 +9075,90 @@ mod tests {
             1,
             "still inside the backoff window the first failure bought"
         );
+    }
+
+    /// A probe that enumerates *some other* board is a failure for the board
+    /// the load is being priced against, and must be accounted as one — the
+    /// board it did answer for still gets the reading (the snapshot is real),
+    /// but the pinned board stays unread, keeps its full-total headroom, and
+    /// buys the same backoff a probe that answered nothing would.
+    #[test]
+    fn a_probe_that_misses_the_pinned_board_backs_off_like_a_failure() {
+        const OTHER: &str = "GPU-bbbb";
+        let ledger = VramLedger::for_test(
+            &[(BOARD, "TEST 9000", 32_000), (OTHER, "TEST 9000", 32_000)],
+            no_margin(),
+        );
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: OTHER.to_owned(),
+            total_mb: 32_000,
+            free_mb: 1_000,
+        }]));
+
+        let _first = ledger
+            .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .expect("a known board charges the load");
+        assert_eq!(ledger.probe_calls(), 1);
+        let boards = ledger.health();
+        let pinned = boards.iter().find(|b| b.gpu_uuid == BOARD).unwrap();
+        let other = boards.iter().find(|b| b.gpu_uuid == OTHER).unwrap();
+        assert!(
+            !pinned.external_known,
+            "the snapshot said nothing about this board"
+        );
+        assert_eq!(pinned.limit_mb, 32_000, "so it is still priced as empty");
+        assert!(
+            other.external_known,
+            "the board the snapshot did cover is not thrown away with it"
+        );
+        assert_eq!(other.external_mb, 31_000);
+
+        let _second = ledger
+            .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .expect("a known board charges the load");
+        assert_eq!(
+            ledger.probe_calls(),
+            1,
+            "a board this probe never enumerates must not pay a subprocess per \
+             load attempt"
+        );
+    }
+
+    /// One probe answers for every board it enumerates, so a load pinned to
+    /// several boards pays exactly one: the first board's probe records the
+    /// rest, and `refresh_due` is false for them by the time they are priced.
+    #[test]
+    fn one_probe_serves_every_board_a_load_is_pinned_to() {
+        const OTHER: &str = "GPU-bbbb";
+        let ledger = VramLedger::for_test(
+            &[(BOARD, "TEST 9000", 32_000), (OTHER, "TEST 9000", 24_000)],
+            no_margin(),
+        );
+        ledger.install_probe_stub(Some(vec![
+            GpuMemory {
+                uuid: BOARD.to_owned(),
+                total_mb: 32_000,
+                free_mb: 2_000,
+            },
+            GpuMemory {
+                uuid: OTHER.to_owned(),
+                total_mb: 24_000,
+                free_mb: 3_000,
+            },
+        ]));
+
+        let _one = ledger.reserve_load("g/a", item_cost(4), BOARD, None);
+        let _two = ledger.reserve_load("g/a", item_cost(4), OTHER, None);
+        assert_eq!(
+            ledger.probe_calls(),
+            1,
+            "the second board was already measured by the first board's probe"
+        );
+        let boards = ledger.health();
+        let pinned = boards.iter().find(|b| b.gpu_uuid == BOARD).unwrap();
+        let other = boards.iter().find(|b| b.gpu_uuid == OTHER).unwrap();
+        assert_eq!(pinned.external_mb, 30_000);
+        assert_eq!(other.external_mb, 21_000);
     }
 
     /// Reading telemetry by watermark is what makes ring overflow visible: the

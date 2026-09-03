@@ -713,8 +713,12 @@ impl MemoryQuery {
     /// threshold (docs/batch-calibration-design.md: samples arrive only on
     /// response frames, so an idle board's picture goes stale). `None` on
     /// any failure, in which case the ledger keeps the stale reading, which
-    /// the worker's per-batch shrink clamp makes safe. Runs off the hot path
-    /// (`spawn_blocking`), never inline.
+    /// the worker's per-batch shrink clamp makes safe.
+    ///
+    /// Blocking, and never called on a Tokio worker thread as-is: the
+    /// dispatch-path refresh runs it under `spawn_blocking`, and the
+    /// load-path probe (`VramLedger::refresh_external_for_load`, which does
+    /// wait for the answer) under `block_in_place`.
     pub fn run(&self) -> Option<Vec<GpuMemory>> {
         match self {
             Self::NvidiaSmi => query_memory_nvidia_smi(),

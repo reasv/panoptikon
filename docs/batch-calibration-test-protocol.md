@@ -650,7 +650,10 @@ confirm or refute them rather than rediscover them.
     flagged the grant `squeezed`, and the anchor-derived target
     otherwise — `dispatch::in_flight_target_units`, which also clamps
     the next window the dispatcher forms, since the header cannot
-    shorten a window that is already formed. As shipped on 2026-09-02
+    shorten a window that is already formed. The published figure still
+    meets core's floor of 64 below, so under a hard squeeze (under ~11
+    granted units at one unit per item) the window clamp — which has no
+    floor — is what actually shortens the blind window. As shipped on 2026-09-02
     the figure was always the anchor-derived target, so a grant
     squeezed to 11 units was followed by a window of 1 936 requests
     that ran 49 s with no grant, no high-water sample and no

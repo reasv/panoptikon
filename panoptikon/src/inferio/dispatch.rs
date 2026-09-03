@@ -569,7 +569,16 @@ pub(crate) fn desired_in_flight_items(
 /// again downstream, so the caller is always asked to keep several batches in
 /// flight: this shortens the blind window, it does not starve the worker. And
 /// it is bounded above by `target`, so it can only ever *lower* the figure —
-/// an unsqueezed grant restores it on the very next window.
+/// an unsqueezed grant restores it on the very next window, because the
+/// dispatcher always applies this to the anchor-derived target and the grant
+/// in hand, never to a bound that already carries an earlier window's clamp.
+///
+/// Two callers, deliberately: the figure published to core, and the unit bound
+/// on the next window the dispatcher forms. They are not redundant. Core
+/// clamps what it is told to at least `MIN_IN_FLIGHT_UNITS` (64 items), so
+/// below about 11 granted units at one unit per item the header stops moving
+/// core's pipelining at all and the window bound — which has no floor — is the
+/// only thing keeping a hard-squeezed window from running blind.
 pub(crate) fn in_flight_target_units(target: u64, grant: Option<&Grant>) -> u64 {
     match grant {
         Some(grant) if grant.squeezed => grant
@@ -647,8 +656,15 @@ pub(crate) async fn run_dispatcher(
             let replica = free.pop().expect("checked non-empty");
             let shapes: Vec<WindowItem> = queue.iter().map(|queued| queued.shape).collect();
             let cap = shapes[0].cap;
+            // The anchor-derived target, read once so window formation and the
+            // published figure below cannot see two different values of it (it
+            // is a ledger read, and a neighbour's window can move it).
+            let window_target = replica
+                .admission
+                .as_ref()
+                .map(Admission::window_target_units);
             let bounds = match &replica.admission {
-                Some(admission) => WindowBounds {
+                Some(_) => WindowBounds {
                     // The published figure shortens the *caller's* pipelining,
                     // which cannot shorten a window that is already formed —
                     // and nothing obliges a caller to honour it at all. So the
@@ -657,7 +673,7 @@ pub(crate) async fn run_dispatcher(
                     // afford, keeping it the intended few batches deep instead
                     // of hundreds, and each of those windows re-prices.
                     units: in_flight_target_units(
-                        admission.window_target_units(),
+                        window_target.expect("the priced arm has an admission"),
                         last_grant.as_ref(),
                     ),
                     items: priced_item_bound(cap),
@@ -733,10 +749,16 @@ pub(crate) async fn run_dispatcher(
             // is told about: the figure follows the memory the board actually
             // had, not the target the ledger was asked for.
             last_grant = plan.grant.as_ref().map(|token| *token.grant());
-            let desired = match &replica.admission {
-                // Priced: project the ledger's unit target into items.
-                Some(_) => desired_in_flight_items(
-                    in_flight_target_units(bounds.units, last_grant.as_ref()),
+            let desired = match window_target {
+                // Priced: project the ledger's unit target into items. The
+                // clamp is applied to the *anchor-derived* target and this
+                // window's own grant, not to `bounds.units` — that one already
+                // carries the previous window's clamp, and composing the two
+                // would keep publishing a squeezed figure for a window whose
+                // grant came back unsqueezed (and, under an alternating
+                // squeeze, would never publish the target again).
+                Some(target) => desired_in_flight_items(
+                    in_flight_target_units(target, last_grant.as_ref()),
                     last_shape,
                     seed_ratio,
                 ),
@@ -1594,6 +1616,53 @@ mod tests {
                 1
             ),
             11 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK
+        );
+    }
+
+    /// The window clamp can bound a window below one request's own size, and
+    /// must not starve it when it does: core chunks at 64 units, so a grant
+    /// squeezed to 0 or 1 units clamps the next window to fewer units than the
+    /// very next request carries. `window_take_count`'s at-least-one rule is
+    /// what keeps that a *cap* rather than a stall — the request goes out
+    /// alone and the worker packs it inside the grant — and the window it
+    /// forms is what lifts the clamp for the window after.
+    #[test]
+    fn a_squeezed_window_clamp_never_starves_a_larger_request() {
+        let grant = |unit_budget: u64| Grant {
+            unit_budget,
+            mb: 512,
+            unit: CostUnit::Item,
+            aggregation: CostAggregation::Count,
+            user_cap_items: None,
+            squeezed: true,
+        };
+        let target = 1_024 * WINDOW_DEPTH_MULTIPLIER;
+        let queued = [shape(64, 64, None), shape(64, 64, None)];
+
+        for budget in [0, 1] {
+            let clamped = in_flight_target_units(target, Some(&grant(budget)));
+            assert!(
+                clamped < 64,
+                "the point of the case: {clamped} units bounds a window that \
+                 the next request alone overruns"
+            );
+            assert_eq!(
+                window_take_count(&queued, bounds(clamped, usize::MAX, usize::MAX)),
+                1,
+                "the first request is taken regardless of the bound"
+            );
+        }
+        // And the clamp lifts as soon as a grant comes back unsqueezed, so
+        // the 64-unit window above is the worst it costs.
+        assert_eq!(
+            in_flight_target_units(
+                target,
+                Some(&Grant {
+                    squeezed: false,
+                    ..grant(1)
+                })
+            ),
+            target
         );
     }
 

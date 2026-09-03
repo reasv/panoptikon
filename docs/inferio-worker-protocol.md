@@ -291,9 +291,18 @@ How the orchestrator derives it, per model (`inferio/dispatch.rs`,
   more squeezed the grant, the longer the server runs on a stale picture. The
   figure still never falls below several of the batches the worker was
   actually given, and an unsqueezed grant restores the target on the very next
-  window. The same clamp bounds the *window* the dispatcher forms next, since
-  the header can only shorten a caller's pipelining and cannot shorten a
-  window that is already formed (nor oblige a caller to honour it at all).
+  window (the figure is derived from the anchor target and *this* window's own
+  grant, never from the already-clamped bound the window was formed under, so
+  one unsqueezed grant is enough and an alternating squeeze still publishes
+  the target on its unsqueezed windows). The same clamp bounds the *window*
+  the dispatcher forms next, since the header can only shorten a caller's
+  pipelining and cannot shorten a window that is already formed (nor oblige a
+  caller to honour it at all) — and that window bound has no floor, whereas
+  the published figure meets core's own floor of 64 items
+  (`MIN_IN_FLIGHT_UNITS`). Under a hard squeeze — below ~11 granted units at
+  one unit per item, which is where `budget x 3 x 2` falls under 64 — the
+  header stops being what shortens the blind window and the window clamp is
+  the whole of it.
 - **Unpriced paths** — `none`-class (grantless) models, a host with no GPU
   inventory, a board outside the enumeration — have no unit target and no
   worker-side packer, so the frame the worker receives *is* the GPU batch and
