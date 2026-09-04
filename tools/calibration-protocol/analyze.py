@@ -315,6 +315,8 @@ class Context:
         self._vram_times = [row["t_wall"] for row in self.vram_samples]
         self._hog_times = [row["t_wall"] for row in self.hog_samples]
         self.worker_re = re.compile(self.args.worker_pattern)
+        self.worker_spawns = _worker_spawns(self.log)
+        self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
 
     # -- joining ----------------------------------------------------------
     def vram_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
@@ -335,18 +337,33 @@ class Context:
     def our_pids_mb(self, board: Dict[str, Any]) -> Tuple[int, List[int]]:
         """Sum of NVML per-process usage for PIDs that are our workers.
 
-        A PID is ours when its cmdline matches `--worker-pattern`, or when its
-        environ carries BOTH `INFERIO_WORKER` and `PANOPTIKON_DEVICE_PIN` -- the
-        pair the orchestrator sets on a spawned worker (`worker.rs:597-681`).
+        A PID is ours on any of three routes: the gateway's own
+        `spawned an inferio worker ... pid=Some(N)` line named it; its recorded
+        cmdline matches `--worker-pattern`; or its recorded environ carries
+        BOTH `INFERIO_WORKER` and `PANOPTIKON_DEVICE_PIN` -- the pair the
+        orchestrator sets on a spawned worker (`worker.rs:597-681`).
         `ceiling_probe.py` sets the pin alone, and `hog.py` neither, so neither
         is mistaken for a resident.
+
+        The log route exists because the other two believe the recording. A
+        worker first sighted by NVML inside its own fork/exec window used to be
+        recorded with the `[comm]` cmdline of the spawning helper and an empty
+        env for its whole life (run1/S9: `"[panoptikon-spaw]"`, 815 of 815
+        samples), which made a resident nemotron worker holding up to 66 GiB
+        count as *external* here and, in `base_accuracy`, handed the row a
+        different worker's process. `vramrec.py`'s `ProcCache` no longer
+        memoizes that negative, but the log route is what lets a recording
+        already on disk -- run1's included -- be re-analysed correctly, and it
+        is the route that survives any future `/proc` read failure.
         """
         total = 0
         pids: List[int] = []
         for proc in board.get("procs", []):
             cmdline = proc.get("cmdline") or ""
             env = proc.get("env") or {}
-            ours = bool(self.worker_re.search(cmdline)) or (
+            ours = proc["pid"] in self.spawned_pids or bool(
+                self.worker_re.search(cmdline)
+            ) or (
                 "PANOPTIKON_DEVICE_PIN" in env and "INFERIO_WORKER" in env
             )
             if not ours:
@@ -366,6 +383,44 @@ class Context:
         if not self.health_samples:
             return None
         return self.health_samples[-1]["t_wall"] - self.args.idle_window
+
+
+SPAWN_PID = re.compile(r"(\d+)")
+CONFIGURED_AS = "Configured as "
+
+
+def _worker_spawns(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Every `spawned an inferio worker` line, with the model it went on to be.
+
+    The spawn line names the impl class (`worker=nemotron-embed-vl`) and the
+    OS pid (`pid=Some(1998478)`), not the inference id. The worker itself logs
+    `Configured as <inference id>` a moment later under the same `worker=`
+    field, so pairing the two in order -- FIFO per impl class -- names the
+    model behind each pid. A spawn with no such line stays `model: None` and
+    is only ever used as "this pid is one of ours", never as evidence about
+    which model it is.
+    """
+    spawns: List[Dict[str, Any]] = []
+    pending: Dict[str, List[Dict[str, Any]]] = {}
+    for event in log:
+        worker = str(event["fields"].get("worker"))
+        if event["message"] == "spawned an inferio worker":
+            match = SPAWN_PID.search(str(event["fields"].get("pid", "")))
+            if match is None or event["t_wall"] is None:
+                continue
+            spawn = {"pid": int(match.group(1)), "worker": worker,
+                     "t_wall": event["t_wall"], "model": None}
+            spawns.append(spawn)
+            pending.setdefault(worker, []).append(spawn)
+            continue
+        index = event["message"].find(CONFIGURED_AS)
+        if index < 0:
+            continue
+        queue = pending.get(worker)
+        if not queue:
+            continue
+        queue.pop(0)["model"] = event["message"][index + len(CONFIGURED_AS):].strip()
+    return spawns
 
 
 def _nearest(rows: List[Dict[str, Any]], times: List[float], target: float,
