@@ -614,6 +614,11 @@ async fn predict(
     {
         Ok(outputs) => outputs,
         Err(err) => {
+            // R9's cooldown first: it is a *refusal to try*, so it is
+            // neither of the two failures below and carries its own status.
+            if let Some(response) = load_cooldown_response(&err) {
+                return Ok(response);
+            }
             let chain = format!("{err:#}");
             tracing::error!(model = %full_id, error = %chain, "prediction failed");
             // router.py detail strings: load failures vs. predict failures.
@@ -675,6 +680,43 @@ fn clamp_detail(text: &str) -> String {
     format!("{}…", &text[..end])
 }
 
+/// The pinned 503 of the per-model load-failure cooldown (R9), when this
+/// error is one: `Retry-After: <seconds>` plus
+/// `{"detail": {"kind": "load_cooldown", "model", "last_error", "retry_at",
+/// "failures"}}`. The whole chain is searched rather than the outermost
+/// error, so a caller that adds context to it still gets the right answer.
+///
+/// 503 rather than 500 because it is exactly what 503 means — the model is
+/// temporarily unavailable and the response says for how long — and because
+/// a job's client must be able to tell "do not bother retrying this now" from
+/// "this attempt failed".
+fn load_cooldown_response(err: &anyhow::Error) -> Option<Response> {
+    let cooldown = err
+        .chain()
+        .find_map(|source| source.downcast_ref::<super::manager::LoadCooldownError>())?;
+    tracing::warn!(
+        model = %cooldown.model,
+        failures = cooldown.failures,
+        retry_after_secs = cooldown.retry_after_secs,
+        "refusing a predict: the model is in its load-failure cooldown"
+    );
+    let mut response = structured_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        InferenceErrorFields {
+            kind: super::manager::LOAD_COOLDOWN_KIND.to_owned(),
+            message: Some(cooldown.to_string()),
+            model: Some(cooldown.model.clone()),
+            last_error: Some(clamp_detail(&cooldown.last_error)),
+            retry_at: Some(cooldown.retry_at.to_rfc3339()),
+            failures: Some(cooldown.failures),
+        },
+    );
+    if let Ok(value) = header::HeaderValue::from_str(&cooldown.retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    Some(response)
+}
+
 /// Attach [`DESIRED_IN_FLIGHT_HEADER`] to an already-encoded predict
 /// response, leaving the body and every other header byte-identical. `None`
 /// (or a value that will not fit a header) omits it.
@@ -713,9 +755,9 @@ async fn load_model(
     State(state): State<Arc<InferioState>>,
     Path((group, inference_id)): Path<(String, String)>,
     Query(params): Query<LoadParams>,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Response, ApiError> {
     let full_id = format!("{group}/{inference_id}");
-    state
+    if let Err(err) = state
         .manager
         .load_model(
             &full_id,
@@ -725,11 +767,16 @@ async fn load_model(
             params.prewarm,
         )
         .await
-        .map_err(|err| {
-            tracing::error!(model = %full_id, error = %format!("{err:#}"), "failed to load model");
-            ApiError::internal("Failed to load model")
-        })?;
-    Ok(Json(json!({"status": "loaded"})))
+    {
+        // The same cooldown answer the predict path gives (R9): an explicit
+        // load request is the one path that would otherwise keep asking.
+        if let Some(response) = load_cooldown_response(&err) {
+            return Ok(response);
+        }
+        tracing::error!(model = %full_id, error = %format!("{err:#}"), "failed to load model");
+        return Err(ApiError::internal("Failed to load model"));
+    }
+    Ok(Json(json!({"status": "loaded"})).into_response())
 }
 
 /// `DELETE /cache/{cache_key}/{group}/{inference_id}` — router.py

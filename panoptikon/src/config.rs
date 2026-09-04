@@ -195,6 +195,23 @@ pub struct InferenceLocalConfig {
     /// it. 0 is read as 1.
     #[serde(default = "default_max_concurrent_loads")]
     pub max_concurrent_loads: usize,
+    /// First window, in seconds, of the per-model load-failure cooldown
+    /// (R9). After a load fails, further loads of that model are refused for
+    /// this long; each consecutive failure doubles the window up to
+    /// `load_failure_cooldown_max_secs`, and a successful load clears it.
+    /// While a model is cooling down, predicts to it fail immediately with
+    /// 503 + `Retry-After` instead of spawning another worker (run1 finding
+    /// Q5/B15: a model dying on load was reloaded once per request with no
+    /// counter, backoff or cap — 93 loads in 182 s). Default: 2.
+    /// **0 disables the cooldown**, restoring the unbounded retry.
+    #[serde(default = "default_load_failure_cooldown_secs")]
+    pub load_failure_cooldown_secs: u64,
+    /// Ceiling on that window, in seconds. Default: 300 — a model that is
+    /// broken until an operator fixes something must not be retried forever,
+    /// and five minutes bounds how long a model that has *been* fixed stays
+    /// refused. Reaching it takes nine failures and about 8.5 minutes.
+    #[serde(default = "default_load_failure_cooldown_max_secs")]
+    pub load_failure_cooldown_max_secs: u64,
     /// Optional worker lifecycle deadline overrides (protocol doc defaults:
     /// handshake 30 s, load 600 s, unload grace 10 s, terminate grace 5 s).
     /// The unload grace also bounds how long an unload waits for in-flight
@@ -414,6 +431,14 @@ fn default_max_concurrent_loads() -> usize {
     1
 }
 
+fn default_load_failure_cooldown_secs() -> u64 {
+    2
+}
+
+fn default_load_failure_cooldown_max_secs() -> u64 {
+    300
+}
+
 impl Default for InferenceLocalConfig {
     fn default() -> Self {
         Self {
@@ -425,6 +450,8 @@ impl Default for InferenceLocalConfig {
             default_max_batch: default_inference_max_batch(),
             sweep_interval_secs: default_inference_sweep_interval_secs(),
             max_concurrent_loads: default_max_concurrent_loads(),
+            load_failure_cooldown_secs: default_load_failure_cooldown_secs(),
+            load_failure_cooldown_max_secs: default_load_failure_cooldown_max_secs(),
             handshake_secs: None,
             load_secs: None,
             unload_grace_secs: None,

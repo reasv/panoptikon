@@ -856,6 +856,24 @@ window is in flight per worker either way, so a trim never races a batch.
   in sorted key order; replicas whose board cannot be resolved share one
   bucket, so a host with no GPU inventory keeps a single host-wide load at a
   time exactly as before.
+- **A model that fails to load is not retried immediately** (R9). Each
+  consecutive failed load of one model arms a cooldown of
+  `load_failure_cooldown_secs × 2^(n−1)`, capped at
+  `load_failure_cooldown_max_secs` — 2, 4, 8 … 300 s at the shipped defaults,
+  nine failures to reach the cap. While it is armed, `POST /predict` and
+  `PUT /load` for that model answer **503** with a `Retry-After` header and
+  `{"detail": {"kind": "load_cooldown", "model", "last_error", "retry_at",
+  "failures"}}` instead of spawning another worker, and `GET /health` carries
+  the same state under `load_cooldowns[]`. A successful load clears it; a
+  history nobody has retried for longer than the cap is forgotten, so the
+  ladder starts over. This bounds the respawn loop after a death-on-load as
+  well: run1 measured 93 loads in 182 s for a model that raised in `load()`,
+  with no counter, backoff or cap on the predict path (finding Q5/B15).
+  Failures the orchestrator resolves *before* any process exists — an unknown
+  inference id, an external input the environment does not provide,
+  unparseable registry TOML — are deliberately excluded: they cost nothing,
+  they are deterministic, and the fix is a config edit the user expects to be
+  able to retry at once.
 - `predict` has no fixed deadline in v1 (arbitrary models); cancellation =
   kill the worker (it is the model — there is nothing softer to cancel).
 - `trim` has a fixed 60 s deadline, and timing out is fatal. The operation is a

@@ -216,12 +216,23 @@ pub struct LoadPolicy {
     /// concurrent reserver prices itself against the first's charge. 0 is
     /// read as 1.
     pub max_concurrent_loads: usize,
+    /// First window of the per-model load-failure cooldown (R9), doubled per
+    /// consecutive failure up to [`LoadPolicy::cooldown_max`].
+    ///
+    /// `Duration::ZERO` disables the cooldown entirely, which is the only
+    /// off switch: there is no separate boolean, because "how long" already
+    /// expresses "not at all".
+    pub cooldown_base: Duration,
+    /// Ceiling on the cooldown window.
+    pub cooldown_max: Duration,
 }
 
 impl Default for LoadPolicy {
     fn default() -> Self {
         Self {
             max_concurrent_loads: 1,
+            cooldown_base: Duration::from_secs(2),
+            cooldown_max: Duration::from_secs(300),
         }
     }
 }
@@ -230,7 +241,199 @@ impl From<&crate::config::InferenceLocalConfig> for LoadPolicy {
     fn from(local: &crate::config::InferenceLocalConfig) -> Self {
         Self {
             max_concurrent_loads: local.max_concurrent_loads,
+            cooldown_base: Duration::from_secs(local.load_failure_cooldown_secs),
+            cooldown_max: Duration::from_secs(local.load_failure_cooldown_max_secs),
         }
+    }
+}
+
+/// Machine-readable `kind` of the load-failure cooldown error on the wire
+/// (`{"detail": {"kind": "load_cooldown", …}}`, answered with 503 and a
+/// `Retry-After` header by `http.rs`). A job aborts on it rather than
+/// retrying every one of its items into the same wall.
+pub(crate) const LOAD_COOLDOWN_KIND: &str = "load_cooldown";
+
+/// Bound on the stored text of the last load failure. It is a Python
+/// traceback plus a stderr tail — tens of kilobytes is normal (run1 Q10
+/// measured 57 MB of forwarded tracebacks in 118 s) — and this copy is
+/// repeated on every refused request and in every `/health` poll, while the
+/// full text is in the log already. 2000 bytes matches the clamp the
+/// extraction ledger puts on its own audit strings.
+const MAX_COOLDOWN_ERROR_BYTES: usize = 2000;
+
+fn clamp_cooldown_error(text: &str) -> String {
+    if text.len() <= MAX_COOLDOWN_ERROR_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_COOLDOWN_ERROR_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// The error a load refused by the cooldown returns (R9). `http.rs` matches
+/// it out of the `anyhow` chain and renders the pinned 503.
+#[derive(Debug, Clone)]
+pub(crate) struct LoadCooldownError {
+    /// `group/name`.
+    pub model: String,
+    /// Consecutive failed loads counted so far.
+    pub failures: u32,
+    /// The failure that (re)armed the cooldown, clamped.
+    pub last_error: String,
+    /// Wall-clock instant the model may be retried at. Rendered from the
+    /// monotonic deadline at the moment of refusal, so a clock that steps
+    /// while a cooldown is running cannot lengthen or shorten it.
+    pub retry_at: DateTime<Local>,
+    /// The same interval in whole seconds, for `Retry-After`. At least 1: a
+    /// `Retry-After: 0` invites exactly the hammering this exists to stop.
+    pub retry_after_secs: u64,
+}
+
+impl std::fmt::Display for LoadCooldownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model {} is unavailable for another {} s: {} consecutive load \
+             failures put it in a cooldown until {}. Last failure: {}",
+            self.model,
+            self.retry_after_secs,
+            self.failures,
+            self.retry_at.to_rfc3339(),
+            self.last_error
+        )
+    }
+}
+
+impl std::error::Error for LoadCooldownError {}
+
+/// Why a `spawn_model` failed, in the one dimension R9's cooldown cares
+/// about: whether the attempt cost a worker process.
+///
+/// A load that never got past the registry — an unknown inference id, an
+/// external input the environment does not provide, unparseable registry
+/// TOML — is deterministic, costs microseconds, and is fixed by the user
+/// editing config or setting a variable. Counting it would refuse the
+/// corrected retry that follows a second later, which is exactly the flow the
+/// external-inputs UI drives. Everything after it — spawn, handshake,
+/// configure, `load`, a worker that dies streaming its weights — costs a
+/// process, heavy imports and possibly gigabytes of transfers, and is what
+/// finding Q5/B15 measured 93 of in 182 s.
+struct LoadFailure {
+    error: anyhow::Error,
+    costed_worker: bool,
+}
+
+impl LoadFailure {
+    fn config(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            costed_worker: false,
+        }
+    }
+
+    fn worker(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            costed_worker: true,
+        }
+    }
+}
+
+/// One model's load-failure history (R9).
+struct CooldownEntry {
+    failures: u32,
+    last_error: String,
+    /// Monotonic deadline. The wall clock is only ever *rendered* from it.
+    until: Instant,
+    /// The window `until` was computed with, for `/health` and for pruning.
+    window: Duration,
+}
+
+/// Per-model load-failure cooldowns (R9, finding Q5/B15: a model dying on
+/// load was reloaded once per request with no counter, backoff or cap — 93
+/// loads in 182 s, each one a process spawn and a torch import).
+///
+/// A pure state machine over an injected clock, like [`CacheState`]: the
+/// schedule is the part worth testing and it should not need a worker to
+/// test it.
+///
+/// The schedule is `base × 2^(failures−1)`, capped at `max`: with the
+/// shipped 2 s/300 s that is 2, 4, 8, 16, 32, 64, 128, 256, 300, 300 … —
+/// nine attempts and 8.5 minutes to reach the ceiling, which turns run1's 93
+/// loads in 182 s into 6. It escalates from the *first* failure deliberately:
+/// the load already failed, the next attempt costs another spawn and another
+/// weight stream, and 2 s is small enough that a genuinely transient failure
+/// (a claimed prewarmed worker that died in the gap) costs nothing worth
+/// naming. No jitter: this is one host's own retry ladder, not a fleet
+/// stampede, and every caller that arrives during a window is refused rather
+/// than queued, so there is no thundering herd to spread out.
+#[derive(Default)]
+struct LoadCooldowns {
+    entries: HashMap<String, CooldownEntry>,
+}
+
+impl LoadCooldowns {
+    /// Record a failed load and return the window it armed (`None` when
+    /// cooldowns are disabled).
+    fn note_failure(
+        &mut self,
+        inference_id: &str,
+        error: &str,
+        policy: &LoadPolicy,
+        now: Instant,
+    ) -> Option<Duration> {
+        if policy.cooldown_base.is_zero() {
+            return None;
+        }
+        let entry = self
+            .entries
+            .entry(inference_id.to_owned())
+            .or_insert(CooldownEntry {
+                failures: 0,
+                last_error: String::new(),
+                until: now,
+                window: Duration::ZERO,
+            });
+        entry.failures = entry.failures.saturating_add(1);
+        entry.last_error = clamp_cooldown_error(error);
+        // `failures - 1` doublings, clamped well below the point where the
+        // multiplication could overflow — the cap bites long before.
+        let doublings = (entry.failures - 1).min(32);
+        let window = policy
+            .cooldown_base
+            .checked_mul(1u32 << doublings)
+            .unwrap_or(policy.cooldown_max)
+            .min(policy.cooldown_max);
+        entry.window = window;
+        entry.until = now + window;
+        Some(window)
+    }
+
+    /// A successful load clears the history: the ladder is about
+    /// *consecutive* failures.
+    fn clear(&mut self, inference_id: &str) {
+        self.entries.remove(inference_id);
+    }
+
+    fn active(&self, inference_id: &str, now: Instant) -> Option<&CooldownEntry> {
+        self.entries
+            .get(inference_id)
+            .filter(|entry| entry.until > now)
+    }
+
+    /// Forget a model whose cooldown expired longer ago than the ceiling.
+    ///
+    /// Two reasons, one of them a bound: the counter is only meaningful while
+    /// the retries it is counting are still coming (a model that has been
+    /// left alone for longer than the longest window deserves the full ladder
+    /// again), and the keys come off the URL, so a map that only ever grew
+    /// would be an unbounded allocation any client could drive with one
+    /// failing load per made-up id.
+    fn prune(&mut self, policy: &LoadPolicy, now: Instant) {
+        self.entries
+            .retain(|_, entry| entry.until + policy.cooldown_max > now);
     }
 }
 
@@ -262,6 +465,31 @@ pub struct HealthReport {
     /// Empty on a host with no GPU inventory, where nothing is admitted and
     /// every model takes the unpriced dispatch path.
     pub vram: Vec<GpuBudgetHealth>,
+    /// Models whose loads are failing (R9), sorted by inference_id. An entry
+    /// exists from the first failed load until a load succeeds or the history
+    /// is pruned; `retry_after_secs` is 0 for one that has cooled down but is
+    /// still counting (the next failure waits twice as long).
+    pub load_cooldowns: Vec<LoadCooldownHealth>,
+}
+
+/// One model's load-failure cooldown in the [`HealthReport`] (R9). This is
+/// the only place the state is visible when the model is *not* loaded — and
+/// it never is, which is why it cannot live in `models[]`.
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct LoadCooldownHealth {
+    pub inference_id: String,
+    /// Consecutive failed loads.
+    pub failures: u32,
+    /// The failure that armed the current window (clamped to 2000 bytes).
+    pub last_error: String,
+    /// RFC 3339 wall-clock instant the model may be retried at, rendered from
+    /// the monotonic deadline when this report was built.
+    pub retry_at: String,
+    /// Whole seconds until then; 0 once the window has passed.
+    pub retry_after_secs: u64,
+    /// The window this failure count earned, in seconds — `base × 2^(n−1)`
+    /// capped at the configured maximum.
+    pub window_secs: u64,
 }
 
 /// One loaded model in the [`HealthReport`].
@@ -787,6 +1015,10 @@ struct ManagerState {
     draining: Vec<JoinHandle<()>>,
     next_generation: u64,
     shutting_down: bool,
+    /// Per-model load-failure cooldowns (R9). Under the state mutex rather
+    /// than beside the load locks because every read of it is already taking
+    /// this lock for the loaded-check next to it.
+    cooldowns: LoadCooldowns,
 }
 
 /// RAII handle for a pin refcount taken in [`CacheState`]. Every pin
@@ -1199,6 +1431,30 @@ impl ModelManager {
             })
             .collect();
         models.sort_by(|a, b| a.inference_id.cmp(&b.inference_id));
+        // R9: the models whose loads are failing, which by construction are
+        // never in `models` above.
+        let now = Instant::now();
+        let wall_now = Local::now();
+        let mut load_cooldowns: Vec<LoadCooldownHealth> = state
+            .cooldowns
+            .entries
+            .iter()
+            .map(|(inference_id, entry)| {
+                let remaining = entry.until.saturating_duration_since(now);
+                LoadCooldownHealth {
+                    inference_id: inference_id.clone(),
+                    failures: entry.failures,
+                    last_error: entry.last_error.clone(),
+                    retry_at: (wall_now
+                        + chrono::Duration::from_std(remaining)
+                            .unwrap_or_else(|_| chrono::Duration::zero()))
+                    .to_rfc3339(),
+                    retry_after_secs: remaining.as_secs(),
+                    window_secs: entry.window.as_secs(),
+                }
+            })
+            .collect();
+        load_cooldowns.sort_by(|a, b| a.inference_id.cmp(&b.inference_id));
         HealthReport {
             status: if state.shutting_down {
                 "shutting_down"
@@ -1218,6 +1474,7 @@ impl ModelManager {
                 .map(<[GpuInfo]>::to_vec)
                 .unwrap_or_default(),
             vram,
+            load_cooldowns,
         }
     }
 
@@ -1324,6 +1581,10 @@ impl ModelManager {
             return;
         }
         state.draining.retain(|handle| !handle.is_finished());
+        // R9: forget the load-failure history of a model nobody has retried
+        // for longer than the longest cooldown window (see `prune`).
+        let policy = self.cfg.loads;
+        state.cooldowns.prune(&policy, Instant::now());
         let unloads = state.cache.expire(Local::now());
         for id in unloads {
             Self::begin_unload(&mut state, &id);
@@ -1444,6 +1705,60 @@ impl ModelManager {
         Ok(TouchOutcome::NeedsSpawn(spawn_pin))
     }
 
+    /// R9: refuse the load outright while this model is inside its
+    /// load-failure cooldown, with everything the caller needs to say so
+    /// (`http.rs` renders the 503 + `Retry-After`; a job aborts rather than
+    /// walking every one of its items into the same wall).
+    ///
+    /// Deliberately *not* consulted for a model that is already loaded: the
+    /// cooldown is about the load path only, and a resident model's predicts
+    /// are none of its business.
+    fn check_load_cooldown(&self, inference_id: &str) -> Result<()> {
+        let now = Instant::now();
+        let state = self.state.lock().unwrap();
+        let Some(entry) = state.cooldowns.active(inference_id, now) else {
+            return Ok(());
+        };
+        let remaining = entry.until.saturating_duration_since(now);
+        let error = LoadCooldownError {
+            model: inference_id.to_owned(),
+            failures: entry.failures,
+            last_error: entry.last_error.clone(),
+            retry_at: Local::now()
+                + chrono::Duration::from_std(remaining)
+                    .unwrap_or_else(|_| chrono::Duration::zero()),
+            // Round up, and never below 1: `Retry-After: 0` invites exactly
+            // the hammering the cooldown exists to stop.
+            retry_after_secs: remaining.as_secs_f64().ceil().max(1.0) as u64,
+        };
+        drop(state);
+        tracing::debug!(
+            model = %inference_id,
+            failures = error.failures,
+            retry_after_secs = error.retry_after_secs,
+            "refusing a load: the model is in its load-failure cooldown"
+        );
+        Err(anyhow::Error::new(error))
+    }
+
+    /// Undo the bookkeeping of a load that was refused before it ever ran
+    /// (R9). Python's rule for a load that did not happen is that no LRU
+    /// entry is left behind (manager.py:89-95), and a refusal is exactly
+    /// that; without this, a cooling-down model would accumulate cache-key
+    /// references it can never serve. `pin` is the spawn-phase pin when the
+    /// refusal happened after it was taken — released under the same lock, as
+    /// everywhere else.
+    fn forget_refused_load(&self, inference_id: &str, cache_key: &str, pin: Option<PinGuard>) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(pin) = pin {
+            pin.release_locked(&mut state.cache);
+        }
+        let outcome = state.cache.remove(cache_key, inference_id);
+        if let Some(id) = outcome.unload {
+            Self::begin_unload(&mut state, &id);
+        }
+    }
+
     /// This model's load lock (module docs, lock 2), created on demand.
     ///
     /// The handle is built *before* the wait so that a caller cancelled while
@@ -1553,6 +1868,13 @@ impl ModelManager {
         )? {
             return Ok(sender);
         }
+        // R9, before the queueing starts: a model whose loads are failing is
+        // refused now rather than after each caller has waited its turn to
+        // spawn one more doomed worker.
+        if let Err(cooldown) = self.check_load_cooldown(inference_id) {
+            self.forget_refused_load(inference_id, cache_key, None);
+            return Err(cooldown);
+        }
 
         // Lock order (module docs): barrier, then this model's load lock,
         // then state, then — inside `spawn_model` — the admission gate.
@@ -1571,6 +1893,13 @@ impl ModelManager {
             TouchOutcome::Ready(sender) => return Ok(sender),
             TouchOutcome::NeedsSpawn(pin) => pin.expect("the second pass takes the spawn pin"),
         };
+        // Again under the model lock: what we queued behind may have been the
+        // very load that failed. Without this second check a burst of N
+        // requests still costs N spawns, which is exactly finding B15.
+        if let Err(cooldown) = self.check_load_cooldown(inference_id) {
+            self.forget_refused_load(inference_id, cache_key, Some(spawn_pin));
+            return Err(cooldown);
+        }
 
         let spawn_result = self.spawn_model(inference_id).await;
         let mut state = self.state.lock().unwrap();
@@ -1586,7 +1915,10 @@ impl ModelManager {
             cost,
         } = match spawn_result {
             Ok(spawned) => spawned,
-            Err(err) => {
+            Err(LoadFailure {
+                error,
+                costed_worker,
+            }) => {
                 // Python removes the requesting cache key's entry and
                 // re-raises (manager.py:89-95): no LRU entry is left behind
                 // after a failed load.
@@ -1594,7 +1926,41 @@ impl ModelManager {
                 if let Some(id) = outcome.unload {
                     Self::begin_unload(&mut state, &id);
                 }
-                return Err(err.context(format!("failed to load model {inference_id}")));
+                // R9: this is the one place a *load* is known to have failed
+                // — a worker that raised in `load()`, a spawn that could not
+                // start, a process that died streaming its weights (the
+                // respawn-after-death loop enters here too, since a respawn is
+                // a load like any other). The bookkeeping refusals above are
+                // deliberately not counted either: an lru_size refusal or an
+                // unload that raced the spawn says nothing about the model's
+                // ability to come up.
+                let chain = format!("{error:#}");
+                let window = costed_worker
+                    .then(|| {
+                        state.cooldowns.note_failure(
+                            inference_id,
+                            &chain,
+                            &self.cfg.loads,
+                            Instant::now(),
+                        )
+                    })
+                    .flatten();
+                let failures = state
+                    .cooldowns
+                    .entries
+                    .get(inference_id)
+                    .map_or(0, |entry| entry.failures);
+                drop(state);
+                if let Some(window) = window {
+                    tracing::warn!(
+                        model = %inference_id,
+                        failures,
+                        cooldown_secs = window.as_secs_f64(),
+                        "load failed; refusing further loads of this model until the \
+                         cooldown expires"
+                    );
+                }
+                return Err(error.context(format!("failed to load model {inference_id}")));
             }
         };
         if state.shutting_down || !state.cache.refs_non_empty(inference_id) {
@@ -1672,6 +2038,9 @@ impl ModelManager {
                 telemetry,
             },
         );
+        // R9: the ladder counts *consecutive* failures, and this model just
+        // came up.
+        state.cooldowns.clear(inference_id);
         drop(state);
         // Lazy warm (design §8): a model of this class just loaded (claim
         // or fresh spawn) — keep one warm worker of the class for next
@@ -1714,18 +2083,28 @@ impl ModelManager {
     /// inventory included). The claimed worker skips spawn + handshake +
     /// heavy imports and only needs `configure` + `load`; the remaining
     /// replicas fresh-spawn as before.
-    async fn spawn_model(&self, inference_id: &str) -> Result<SpawnedModel> {
+    async fn spawn_model(&self, inference_id: &str) -> Result<SpawnedModel, LoadFailure> {
+        // The registry phase, before any process exists. Its failures are
+        // config errors (unknown id, an unresolved external input, broken
+        // registry TOML) and are marked as costing no worker, so R9's
+        // cooldown does not refuse the user's corrected retry a second later.
         let (spec, registry_default_batch, cost) = {
             let mut registry = self.registry.lock().unwrap();
-            let snapshot = registry
+            let resolved = registry
                 .get()
-                .context("failed to load the inference registry")?;
-            let spec = snapshot.spawn_spec(inference_id)?;
-            (
-                spec,
-                registry_default_batch(&snapshot, inference_id),
-                CostDimension::resolve(&snapshot, inference_id),
-            )
+                .context("failed to load the inference registry")
+                .and_then(|snapshot| {
+                    let spec = snapshot.spawn_spec(inference_id)?;
+                    Ok((
+                        spec,
+                        registry_default_batch(&snapshot, inference_id),
+                        CostDimension::resolve(&snapshot, inference_id),
+                    ))
+                });
+            match resolved {
+                Ok(resolved) => resolved,
+                Err(error) => return Err(LoadFailure::config(error)),
+            }
         };
         tracing::debug!(
             model = %inference_id,
@@ -1922,7 +2301,7 @@ impl ModelManager {
             // and un-charge them (dropping the admissions).
             drop(admissions);
             futures_util::future::join_all(workers.into_iter().map(Worker::kill)).await;
-            return Err(err);
+            return Err(LoadFailure::worker(err));
         }
         Ok(SpawnedModel {
             workers,
@@ -4274,6 +4653,7 @@ config.replicas = 2
     async fn the_load_admission_gate_is_per_board() {
         let setup = test_manager_with_loads(LoadPolicy {
             max_concurrent_loads: 1,
+            ..LoadPolicy::default()
         });
         let manager = Arc::clone(&setup.manager);
         let board_a = [Some("GPU-0000".to_owned())];
@@ -4312,6 +4692,7 @@ config.replicas = 2
         // A multi-board set takes one permit per distinct board, deduped.
         let setup = test_manager_with_loads(LoadPolicy {
             max_concurrent_loads: 2,
+            ..LoadPolicy::default()
         });
         let manager = Arc::clone(&setup.manager);
         let spread = [
@@ -4379,4 +4760,228 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
+    // ------------------------------------------------------------------
+    // R9: per-model load-failure cooldown.
+    // ------------------------------------------------------------------
+
+    /// The schedule, on the injected clock: `base × 2^(n−1)`, capped, and the
+    /// cap is a ceiling on the *window*, not on the counter.
+    #[test]
+    fn cooldown_windows_double_and_cap() {
+        let policy = LoadPolicy {
+            max_concurrent_loads: 1,
+            cooldown_base: Duration::from_secs(2),
+            cooldown_max: Duration::from_secs(300),
+        };
+        let mut cooldowns = LoadCooldowns::default();
+        let now = Instant::now();
+        let windows: Vec<u64> = (0..12)
+            .map(|_| {
+                cooldowns
+                    .note_failure("g/a", "boom", &policy, now)
+                    .expect("cooldowns are enabled")
+                    .as_secs()
+            })
+            .collect();
+        assert_eq!(
+            windows,
+            vec![2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300, 300],
+            "the shipped ladder: nine failures and 8.5 minutes to the cap"
+        );
+        assert_eq!(cooldowns.entries["g/a"].failures, 12);
+        assert_eq!(cooldowns.entries["g/a"].last_error, "boom");
+        // The deadline is monotonic and the window is what set it.
+        assert!(
+            cooldowns
+                .active("g/a", now + Duration::from_secs(299))
+                .is_some()
+        );
+        assert!(
+            cooldowns
+                .active("g/a", now + Duration::from_secs(301))
+                .is_none()
+        );
+        assert!(
+            cooldowns.active("g/b", now).is_none(),
+            "other models untouched"
+        );
+    }
+
+    /// A successful load clears the ladder, and a zero base disables it.
+    #[test]
+    fn a_successful_load_clears_the_cooldown_and_zero_disables_it() {
+        let policy = LoadPolicy::default();
+        let mut cooldowns = LoadCooldowns::default();
+        let now = Instant::now();
+        cooldowns.note_failure("g/a", "boom", &policy, now);
+        cooldowns.note_failure("g/a", "boom", &policy, now);
+        assert_eq!(cooldowns.entries["g/a"].failures, 2);
+        cooldowns.clear("g/a");
+        assert!(cooldowns.active("g/a", now).is_none());
+        // The next failure starts the ladder over at the base window.
+        assert_eq!(
+            cooldowns.note_failure("g/a", "boom", &policy, now),
+            Some(Duration::from_secs(2))
+        );
+
+        let off = LoadPolicy {
+            cooldown_base: Duration::ZERO,
+            ..LoadPolicy::default()
+        };
+        let mut cooldowns = LoadCooldowns::default();
+        assert_eq!(cooldowns.note_failure("g/a", "boom", &off, now), None);
+        assert!(
+            cooldowns.active("g/a", now).is_none(),
+            "a zero base records nothing at all"
+        );
+    }
+
+    /// The history of a model nobody is retrying is forgotten, so the table
+    /// cannot grow without bound on ids that come off the URL.
+    #[test]
+    fn an_untouched_cooldown_is_pruned_after_the_cap() {
+        let policy = LoadPolicy::default();
+        let mut cooldowns = LoadCooldowns::default();
+        let now = Instant::now();
+        cooldowns.note_failure("g/a", "boom", &policy, now);
+        cooldowns.prune(&policy, now + Duration::from_secs(120));
+        assert_eq!(cooldowns.entries.len(), 1, "still inside window + cap");
+        cooldowns.prune(&policy, now + Duration::from_secs(303));
+        assert!(
+            cooldowns.entries.is_empty(),
+            "expired for longer than the ceiling: the ladder resets"
+        );
+    }
+
+    /// End to end on a model that cannot load: the first request pays a real
+    /// spawn, the second is refused without one, `/health` says so, and the
+    /// ladder escalates once the window passes. Under the old code every one
+    /// of these requests spawned a worker (run1 B15: 93 loads in 182 s).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_load_puts_the_model_in_a_cooldown() {
+        let setup = test_manager_with_loads(LoadPolicy {
+            max_concurrent_loads: 1,
+            // Short enough to watch the ladder inside a test, long enough
+            // that the refusal below cannot be a race.
+            cooldown_base: Duration::from_millis(600),
+            cooldown_max: Duration::from_secs(300),
+        });
+        let manager = Arc::clone(&setup.manager);
+        let predict = |manager: Arc<ModelManager>| async move {
+            manager
+                .predict(
+                    "missing/test",
+                    "k",
+                    10,
+                    -1,
+                    None,
+                    None,
+                    vec![data_input(json!(1))],
+                )
+                .await
+                .expect_err("this model has no impl class")
+        };
+
+        let attempt_started = Instant::now();
+        let first = predict(Arc::clone(&manager)).await;
+        let spawn_attempt = attempt_started.elapsed();
+        assert!(
+            format!("{first:#}").contains("failed to load model"),
+            "the first request pays a real load attempt: {first:#}"
+        );
+        assert!(
+            first
+                .chain()
+                .all(|source| source.downcast_ref::<LoadCooldownError>().is_none()),
+            "the failure that *arms* the cooldown is still reported as itself"
+        );
+
+        let refused_started = Instant::now();
+        let second = predict(Arc::clone(&manager)).await;
+        let refusal = refused_started.elapsed();
+        let cooldown = second
+            .chain()
+            .find_map(|source| source.downcast_ref::<LoadCooldownError>())
+            .expect("the second request is refused by the cooldown");
+        assert_eq!(cooldown.failures, 1);
+        assert_eq!(cooldown.model, "missing/test");
+        assert_eq!(
+            cooldown.retry_after_secs, 1,
+            "Retry-After rounds up and never reports 0"
+        );
+        assert!(
+            refusal < Duration::from_millis(200) && refusal < spawn_attempt,
+            "the refusal ({refusal:?}) must be far cheaper than the load attempt \
+             it replaces ({spawn_attempt:?})"
+        );
+        assert_eq!(
+            manager.cached_models().get("missing/test"),
+            None,
+            "a refused load leaves no cache entry either"
+        );
+
+        let health = manager.health();
+        assert_eq!(health.load_cooldowns.len(), 1);
+        let reported = &health.load_cooldowns[0];
+        assert_eq!(reported.inference_id, "missing/test");
+        assert_eq!(reported.failures, 1);
+        assert!(
+            !reported.last_error.is_empty(),
+            "health carries the failure that armed it"
+        );
+        assert!(
+            DateTime::parse_from_rfc3339(&reported.retry_at).is_ok(),
+            "retry_at is RFC 3339: {}",
+            reported.retry_at
+        );
+
+        // Past the window the model is tried again — and the second real
+        // failure doubles the wait.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let third = predict(Arc::clone(&manager)).await;
+        assert!(
+            format!("{third:#}").contains("failed to load model"),
+            "the expired cooldown lets exactly one attempt through: {third:#}"
+        );
+        let fourth = predict(Arc::clone(&manager)).await;
+        let cooldown = fourth
+            .chain()
+            .find_map(|source| source.downcast_ref::<LoadCooldownError>())
+            .expect("refused again");
+        assert_eq!(cooldown.failures, 2, "consecutive failures escalate");
+
+        manager.shutdown().await;
+    }
+
+    /// The wire contract Track E's job side matches on (pinned in the run2
+    /// brief): the kind token, an RFC 3339 `retry_at`, and a `Retry-After`
+    /// that is never 0. `http.rs` assembles these into
+    /// `{"detail": {"kind": "load_cooldown", …}}` with status 503.
+    #[test]
+    fn the_cooldown_error_carries_the_pinned_wire_fields() {
+        assert_eq!(LOAD_COOLDOWN_KIND, "load_cooldown");
+        let error = LoadCooldownError {
+            model: "g/a".to_owned(),
+            failures: 3,
+            last_error: "ImportError: no such impl".to_owned(),
+            retry_at: Local::now() + chrono::Duration::seconds(8),
+            retry_after_secs: 8,
+        };
+        assert!(DateTime::parse_from_rfc3339(&error.retry_at.to_rfc3339()).is_ok());
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("g/a") && rendered.contains("ImportError: no such impl"),
+            "the human message names the model and the failure: {rendered}"
+        );
+        assert!(
+            !rendered.contains("failed to load model"),
+            "must not collide with the load-failure detail string http.rs matches"
+        );
+        // The stored text is clamped so /health and every refusal stay small.
+        let long = "x".repeat(MAX_COOLDOWN_ERROR_BYTES * 2);
+        let clamped = clamp_cooldown_error(&long);
+        assert_eq!(clamped.chars().count(), MAX_COOLDOWN_ERROR_BYTES + 1);
+        assert!(clamped.ends_with('…'));
+        assert_eq!(clamp_cooldown_error("short"), "short");
+    }
 }
