@@ -342,6 +342,59 @@ Adopted from PR #25 (its best part), reworked onto the ledger:
 - Every item-failure log line carries `path`, `sha256`, `stage`,
   `error_class` (PR #25's logging improvement, kept).
 
+### The other half: failures with no verdict (run2, R2)
+
+Everything above is about failures that *are* a verdict on the media, and the
+rule that only those may be persisted is unchanged and load-bearing: a row in
+`item_extraction_errors` makes the work query skip an item, so writing one for
+a transient failure would suppress a perfectly good file.
+
+Run1 measured what that leaves behind. A single inference worker death failed a
+whole in-flight window — **1 542 items** — the items were transient failures so
+nothing was recorded anywhere, `/api/jobs/data/failures` answered
+`{"total": 0}`, and the job reported **completed** (findings F7 and Q8/T8). The
+user could not tell that a fifth of the work had not happened.
+
+Three changes, none of which touch the ledger's rule:
+
+1. **Re-queue once on a worker death.** The inference surface now names that
+   failure on the wire — `{"detail": {"kind": "worker_died", …}}` on the
+   predict 500 (`inferio/http.rs`) — and the client turns it into a typed
+   `InferenceFailure` the job matches on. The items in a died-on request were
+   never attempted, so `run_item_inference` re-submits that item's work
+   **once**; the next predict is what respawns the worker, so there is nothing
+   to wait for. One retry per item per job, so a job of N items can cost at
+   most 2N requests however many times the worker dies. A model that fails to
+   *load* surfaces as a load failure, not a death, so this cannot spin.
+2. **A per-job failure audit** (`data_job_failures`, `db/job_failures.rs`).
+   One row per item a job attempted, could not finish, and has no verdict for:
+   item, setter, stage, error text, whether its re-queue was spent, and when.
+   **Nothing joins it** — it suppresses nothing, and the item is selected again
+   on the next run exactly as before. Rows are written once at the end of the
+   job (a death fails a window at a time, so a writer round trip each would put
+   the burst on the critical path of the failure the job is recovering from),
+   bounded at 10 000 per job in the *listing* while the counts stay exact, and
+   pruned with the job history that explains them.
+3. **A job outcome, recorded rather than inferred.** `data_log.outcome` is one
+   of `completed`, `partial`, `failed`, `cancelled` (`''` on every row written
+   before the column existed, which reads as "still running"), with
+   `data_log.failure_reason` beside it, and the queue's `JobOutcomeStatus`
+   gains the matching `partial`. **`completed` now means every item was done.**
+   A job that ran to the end with unexplained failures is `partial`; one that
+   stopped early is `failed`, and *its record is finalized on that path too* —
+   a real `end_time`, the counters it reached and the reason, where run1
+   measured `end_time == start_time` and `failed = 0`. Cancellation is stamped
+   by a drop guard, which is the only code that knows when the job stopped.
+
+A **load-failure cooldown** (`{"kind": "load_cooldown"}`, HTTP 503 with
+`Retry-After`) is the one refusal that aborts the job outright rather than
+failing items: it is a statement about the model for a stated window, so every
+remaining item would get the same answer. The job's failure reason names the
+model, the retry instant and the last error.
+
+The failures endpoint serves all three: the ledger's verdicts, the per-job
+failures, and the jobs behind them — see "Audit surface" below.
+
 ### Batch isolation and the worker protocol (parity, req 1)
 
 Two layers:
@@ -714,6 +767,15 @@ the arbiter principle intends.
 - **API**: `GET /api/jobs/data/failures` (extraction ledger joined with
   `items`+`files` for path/sha256/mime, filterable by setter, class, stage,
   mime prefix; paginated) and `GET /api/jobs/scan/failures` (scan ledger).
+  Since run2 the extraction response carries **three** lists, each with its
+  own total and all sharing the `limit`/`offset` window: `failures` (the
+  ledger's verdicts, unchanged), `job_failures` (items a job could not finish
+  and has no verdict for, with the same representative-path join), and
+  `failed_jobs` (the `partial`/`failed`/`cancelled` job records, each with a
+  real `end_time`, the unexplained-failure count, the segment count and the
+  reason). `error_class` and `mime_prefix` describe a *verdict*, so a request
+  carrying either answers with the two job-side lists empty and their totals
+  zero rather than with an unfiltered approximation.
   Counts endpoint for badges. OpenAPI regen for the UI `.d.ts`.
 - **UI**: a "Failed files" card on the job-management page: table with path,
   setter, class, stage, error message, attempts, last seen. Not blocking

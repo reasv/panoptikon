@@ -251,6 +251,22 @@ build/deploy/API. The plan that uses this is
    transient, job continues; job fails "Systemic" only if every
    attempted item failed for non-media reasons. `inferio_client.rs:383-389`
    retries only 429/502/503/504/connect/timeout, not a 500 from an OOM.
+- **Death, seen from the job** (R2a): the predict 500 for a fatal worker
+  now carries a machine-readable kind —
+  `{"detail": {"kind": "worker_died", "message", "model", "last_error"}}`,
+  built by `structured_error` (`http.rs:170`) when the error chain
+  contains `FATAL_WORKER_MARKER "failed fatally"` (`:107`) and the load
+  marker does not (load failures keep precedence). The client parses it
+  into the typed `InferenceFailure` (`inferio_client.rs:121`, reached
+  with `inference_failure()`), and `jobs::extraction::run_item_inference`
+  (`:2134`) re-submits that item's work **once**
+  (`classify_item_failure` `:2205`, one retry per item per job, counted
+  in `JobCounters::requeued_items`); `run_chunked_inference` skips its
+  isolation pass for it (`is_unit_agnostic_failure`), since isolating
+  would re-ask a dead worker once per unit. Items that fail again are
+  recorded in `data_job_failures` and the job reports **partial**. A
+  `load_cooldown` 503 (R9) instead aborts the job through `JobAbort`
+  (`:696`) with the model, retry instant and last error as the reason.
 - Worker death mid-window: `roundtrip` EOF → fatal (`worker.rs:1305-1315,
   1422-1444`); dispatcher `End::Fatal` fails the queue, aborts sibling
   windows, kills all replicas; `handle_worker_death`
@@ -296,12 +312,43 @@ build/deploy/API. The plan that uses this is
   logging exists) lifts the soft `RLIMIT_NOFILE` to the hard limit —
   containerd's default OCI spec gives a container soft 1024 / hard
   524 288, the same pair as a bare login shell — and `soft_nofile_limit`
-  feeds `jobs::extraction::in_flight_unit_ceiling` a third term,
-  `by_fds = (soft − FD_RESERVE 256) / FDS_PER_IN_FLIGHT_ITEM 2`
-  (`extraction.rs:109,131,176-192`), which **caps** the other two rather
-  than joining the max. `NOFILE_LIMIT_UNKNOWN` makes the term
-  unconditionally non-binding where there is no rlimit to read
-  (Windows). Motivating failure: Phase 6 finding F6.
+  feeds `jobs::extraction::in_flight_unit_ceiling` a descriptor term.
+  **R10' made that term a function of the transport**
+  (`InFlightTransport`, `extraction.rs:130`; the ceiling `:215`):
+  - `PerRequest` (the HTTP/1.1 fallback) keeps the original
+    `by_fds = (soft − FD_RESERVE 256) / FDS_PER_IN_FLIGHT_ITEM 2`
+    (`extraction.rs:117,170`), which **caps** the other two terms rather
+    than joining the max;
+  - `Multiplexed` (h2c) has no per-unit socket cost at all: the whole
+    window costs `FDS_PER_POOLED_CONNECTION 2 ×
+    INFERENCE_POOL_CONNECTIONS 4` = **8** descriptors
+    (`extraction.rs:124`, `inferio_client.rs:281`), so the window is
+    whatever the byte budget and the loader slots allow, and the only
+    check left is a WARN when even the pool plus the reserve does not
+    fit. The clamp stays in both modes as defence in depth.
+  The job picks the mode from `InferencePool::requests_are_multiplexed`
+  (`jobs/inference_pool.rs:51`), read after the model load (which is what
+  resolves each endpoint's transport); an endpoint nothing has reached
+  answers "not multiplexed", the conservative direction.
+  `NOFILE_LIMIT_UNKNOWN` makes the term unconditionally non-binding where
+  there is no rlimit to read (Windows). Motivating failure: Phase 6
+  finding F6.
+- **Inference transport** (`inferio_client.rs`, R10'): one
+  `EndpointRuntime` per base URL, shared by every `InferenceApiClient`
+  for that endpoint (`endpoint_runtime` `:348`) — a pool that is not
+  shared is not a bound. It holds an h2c-prior-knowledge client and an
+  HTTP/1.1 client, both with `pool_max_idle_per_host =
+  INFERENCE_POOL_CONNECTIONS 4`, plus a semaphore of
+  `INFERENCE_MAX_CONCURRENT_REQUESTS 256`
+  (`INFERENCE_POOL_CONNECTIONS × H2_STREAMS_PER_CONNECTION 64`, `:301`)
+  applied on the h2c path only. `Transport` (`:260`) is resolved once per
+  endpoint by a `GET /cache` probe sent with prior knowledge (`transport`
+  `:409`): *any* HTTP answer means `H2c`, a transport error means
+  `Http11`; the result is remembered and cleared again on a connect /
+  request error so a restarted peer is re-probed. `known_transport`
+  (`:449`) reads it without probing, for the descriptor budget above. The
+  server end needs nothing beyond axum's `http2` feature: `axum::serve`
+  builds hyper-util's version-sniffing auto builder (`main.rs:711`).
 - **`PR_SET_PDEATHSIG` is thread-scoped**, and this was run1's blocker
   (**F11**). On Linux it fires when the **forking thread** exits, not the
   forking process, and the premise that spawns happen on tokio core
@@ -349,13 +396,14 @@ build/deploy/API. The plan that uses this is
   `predict_units` (`:1679`, `settle` on the error path `:1680`). Floor
   `MIN_IN_FLIGHT_UNITS = 64` (`:87`, also the starting value, and a
   deadlock bound since one chunk acquires up to 64 permits at once);
-  ceiling `in_flight_unit_ceiling` (`:123`) =
-  `min(max(intermediate_budget_kib / NOMINAL_UNIT_KIB,
-  loader_concurrency × 64, 64), max(by_fds, 64))` with
-  `NOMINAL_UNIT_KIB = 256` (`:96`) and the descriptor term `by_fds`
-  described under §1.6 → **4096 units at the shipped defaults** (the
-  descriptor term binds only where the *soft* limit survives startup
-  below ~8 500).
+  ceiling `in_flight_unit_ceiling` (`:215`) =
+  `wanted = max(intermediate_budget_kib / NOMINAL_UNIT_KIB,
+  loader_concurrency × 64, 64)` with `NOMINAL_UNIT_KIB = 256` (`:100`),
+  then `min(wanted, max(by_fds, 64))` on the HTTP/1.1 path and `wanted`
+  unchanged on the multiplexed one (R10'; the descriptor term is
+  described under §1.6) → **4096 units at the shipped defaults** (before
+  R10' the descriptor term bound wherever the *soft* limit survived
+  startup below ~8 500; over h2c it never binds).
   Master sized the semaphore by the user's batch size; the cap plays no
   part in either number now. Other core bounds unchanged:
   `loader_concurrency` default 8, intermediate byte budget default
@@ -539,6 +587,30 @@ through `TomlDocument::patch_serialized`, which removes the keys and the
 comment directly above each; errors only WARN); then `INSERT OR IGNORE`
 the stamp, the only step whose failure blocks startup. No backup, not
 reversible.
+
+### 1.9b Job failure audit (`db/job_failures.rs`, SQL `20260904120000_job_item_failures.sql`, R2b)
+
+`data_job_failures(job_id, item_id, setter_id, stage, error, requeued,
+occurred_at)` — one row per item a job attempted, could not finish, and has
+**no verdict** for. Deliberately *not* the retry ledger: nothing joins it, so
+it suppresses nothing and the item is selected again next run
+(`docs/failed-media-retry-design.md`, "The other half"). `job_id` is not a
+foreign key (job rows are deleted); retention is
+`prune_orphan_job_failures` (`:143`), run from `remove_incomplete_jobs` at
+the start of every extraction job. Written once at the end of the job
+(`record_job_failures` `:103`), buffered in `JobCounters::failures` and
+bounded at `MAX_RECORDED_JOB_FAILURES = 10 000`
+(`extraction.rs:576`) — the counts in `data_log` stay exact.
+
+`data_log` gains `outcome` (`''`/`completed`/`partial`/`failed`/`cancelled`;
+`''` on every pre-existing row, rendered as `running`) and
+`failure_reason`. Every terminal path writes them: the normal end, the
+early-return path through `finalize_unfinished_job` (`extraction.rs:853`,
+which is what gives a failed job a real `end_time` — run1 finding T8), and
+the cancel path through the `CancelledJobStamp` drop guard (`:793`) plus
+`finalize_cancelled_job` (`db/extraction_write.rs:150`), whose statement is
+guarded so either order of the two is correct. The queue's
+`JobOutcomeStatus` gains `partial` (`jobs/queue.rs`).
 
 ### 1.10 Suspected weak points (ranked; plan §5 maps each to a scenario)
 
@@ -962,8 +1034,8 @@ curl -X PUT -H 'Content-Type: application/json' --data @c2.json "$B/api/jobs/con
 curl -X POST "$B/api/jobs/folders/rescan?index_db=cal"                 # 202 JobModel
 curl -X POST "$B/api/jobs/data/extraction?index_db=cal&inference_ids=tags/wd-vit-tagger-v3[&batch_size=8]"
 curl $B/api/jobs/queue                                                 # {"queue":[…], "outcomes":[…]}
-curl "$B/api/jobs/data/history?index_db=cal&page=1&page_size=50"       # LogRecord{batch_size(0=auto), total_segments, errors, data_load_time, inference_time, failed, completed, status}
-curl "$B/api/jobs/data/failures?index_db=cal"   # run1: stayed {"total":0,"failures":[]} in every leg, including 125 easyOCR OOMs and a whole-job failure — the reason is only in the job row's `errors` and the gateway log (findings T8/Q8)
+curl "$B/api/jobs/data/history?index_db=cal&page=1&page_size=50"       # LogRecord{batch_size(0=auto), total_segments, errors, data_load_time, inference_time, failed, completed, status, outcome, failed_items, failure_reason}  (R2b added the last three; `outcome` is completed|partial|failed|cancelled|running)
+curl "$B/api/jobs/data/failures?index_db=cal"   # R2b: {total, failures[], job_failures_total, job_failures[], failed_jobs_total, failed_jobs[]} — the ledger's verdicts, the items a job could not finish and has no verdict for, and the partial/failed/cancelled job records (real end_time, failed_items, reason). run1: stayed {"total":0,"failures":[]} in every leg, including 125 easyOCR OOMs and a whole-job failure (findings T8/Q8)
 curl -X POST "$B/api/jobs/cancel"; curl -X DELETE "$B/api/jobs/queue?queue_ids=3"
 curl $B/api/inference/metadata                                         # registry + calibration overlay
 curl $B/api/inference/health                                           # vram[], models[], gpus[]
