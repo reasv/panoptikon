@@ -1385,13 +1385,36 @@ async fn run_extraction_job_inner(
                 "extraction job is partial: {reason}"
             );
         } else if guard.requeued_items > 0 {
-            tracing::info!(
-                requeued = guard.requeued_items,
-                setter = %model.setter_name,
-                "{} items were re-queued after an inference worker died and \
-                 then completed",
-                guard.requeued_items
+            // `partial_reason` being absent does **not** mean everything
+            // worked: it is also absent for a systemically failed job and for
+            // an aborted one, and this line used to tell both of those that
+            // the re-queued items "then completed" — two statements later the
+            // same code wrote `outcome: "failed", failed_items: 2000` (run2
+            // finding C5). The summary now states the outcome it is
+            // summarising, and its severity follows.
+            let summary = requeue_summary(
+                guard.requeued_items,
+                guard.errors,
+                guard.processed,
+                abort.reason(),
+                failure,
             );
+            if abort.is_set() || failure == JobFailure::Systemic {
+                tracing::warn!(
+                    requeued = guard.requeued_items,
+                    failed = guard.errors,
+                    attempted = guard.processed,
+                    setter = %model.setter_name,
+                    "{summary}"
+                );
+            } else {
+                tracing::info!(
+                    requeued = guard.requeued_items,
+                    attempted = guard.processed,
+                    setter = %model.setter_name,
+                    "{summary}"
+                );
+            }
         }
         // The one place the job's own word for how it ended is chosen. It is
         // written into the record, so "did this job finish everything?" stops
@@ -2307,6 +2330,35 @@ fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> Inferen
         return InferenceRecovery::Requeue;
     }
     InferenceRecovery::Fail
+}
+
+/// The one-line summary of a job that re-queued items after a worker death.
+///
+/// Split out and pure so it can be asserted directly: the bug it fixes (run2
+/// finding C5) was not in the arithmetic but in the *claim* — the branch that
+/// produced it is reached whenever there is no partial reason, which includes
+/// a systemic failure and an abort, and it asserted the re-queued items "then
+/// completed" for a job that failed all two thousand of them.
+///
+/// `abort_reason` and `failure` are the same two things the outcome itself is
+/// chosen from a few lines below, so the sentence and the record cannot
+/// disagree.
+fn requeue_summary(
+    requeued: i64,
+    errors: i64,
+    processed: i64,
+    abort_reason: Option<&str>,
+    failure: JobFailure,
+) -> String {
+    let head = format!("{requeued} items were re-queued after an inference worker died");
+    match (abort_reason, failure) {
+        (Some(reason), _) => format!("{head}; the job was then aborted: {reason}"),
+        (None, JobFailure::Systemic) => format!(
+            "{head}; every one of the {processed} attempted items failed anyway \
+             ({errors} failures)"
+        ),
+        (None, _) => format!("{head} and then completed"),
+    }
 }
 
 /// The `failure_reason` a failed model load leaves on the job record.
@@ -4243,6 +4295,48 @@ mod tests {
         assert!(
             reason.contains("CUDA out of memory"),
             "and so is the cause it used to swallow: {reason}"
+        );
+    }
+
+    /// **C5: the re-queue summary must state the outcome it is summarising.**
+    ///
+    /// The branch that produces it is reached whenever there is no *partial*
+    /// reason — which includes `JobFailure::Systemic` and an abort. Phase C
+    /// caught it asserting that 2 000 re-queued items "then completed" two
+    /// statements before the same code wrote `outcome: "failed",
+    /// failed_items: 2000`.
+    #[test]
+    fn the_requeue_summary_never_claims_a_failed_job_completed() {
+        let completed = requeue_summary(12, 0, 2_000, None, JobFailure::None);
+        assert_eq!(
+            completed,
+            "12 items were re-queued after an inference worker died and then completed"
+        );
+
+        let systemic = requeue_summary(2_000, 2_000, 2_000, None, JobFailure::Systemic);
+        assert!(
+            !systemic.contains("then completed"),
+            "a job that failed everything did not complete anything: {systemic}"
+        );
+        assert!(
+            systemic.contains("every one of the 2000 attempted items failed anyway"),
+            "and it says so, with the counts: {systemic}"
+        );
+
+        let aborted = requeue_summary(
+            7,
+            7,
+            2_000,
+            Some("Inference is unavailable: group/model-a is in a load-failure cooldown"),
+            JobFailure::None,
+        );
+        assert!(
+            !aborted.contains("then completed"),
+            "an aborted job did not complete either: {aborted}"
+        );
+        assert!(
+            aborted.contains("the job was then aborted: Inference is unavailable"),
+            "and it carries the abort reason: {aborted}"
         );
     }
 
