@@ -366,6 +366,32 @@ Three changes, none of which touch the ledger's rule:
    to wait for. One retry per item per job, so a job of N items can cost at
    most 2N requests however many times the worker dies. A model that fails to
    *load* surfaces as a load failure, not a death, so this cannot spin.
+
+   **That one-shot budget now covers every way an item's work is left undone,
+   not only a death.** Three of them the server names on the wire —
+   `worker_died`, `request_incomplete` (run2 defect P2: a request body that
+   never arrived whole) and `body_budget_exhausted` (a body it had no room to
+   read) — and one the *client* names about its own transport, because no
+   server can report that its answer failed to arrive: `kind = "transport"`,
+   carrying the phase the request stopped in (`connect`, `send`, `headers`,
+   `body`) and `reqwest`'s class for it. Until then a `REFUSED_STREAM` that
+   survived the client's three transport retries, or any connection error,
+   came back as an untyped error and cost the item permanently — the last
+   hole in *an item that was never attempted is never recorded as a failure*.
+
+   The first three phases mean no answer had been produced when the failure
+   was observed; `connect` additionally means nothing left the process, and
+   `send`/`headers` are honest that the server may have started work now
+   discarded — a wasted GPU pass, never a verdict. The `body` phase is the
+   one case where the server did the work and this end lost the answer, and
+   it earns the same single re-queue on a different ground: a predict is a
+   pure, idempotent inference over its inputs, so asking again can only cost
+   a repeated pass. `InferenceFailure::is_unattempted()` is the first claim,
+   `warrants_resubmission()` is the union, and the job's policy asks the
+   union. Both are keyed on the typed classification and never on a status —
+   an untyped 4xx or 5xx still earns nothing — and the transport phase can
+   only be written by the client that observed the error, so a peer cannot
+   claim it.
 2. **A per-job failure audit** (`data_job_failures`, `db/job_failures.rs`).
    One row per item a job attempted, could not finish, and has no verdict for:
    item, setter, stage, error text, whether its re-queue was spent, and when.

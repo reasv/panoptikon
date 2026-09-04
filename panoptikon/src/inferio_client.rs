@@ -126,6 +126,103 @@ pub(crate) const REQUEST_INCOMPLETE_KIND: &str = "request_incomplete";
 /// it finish parsing, which is why the server can name a retry delay at all.
 pub(crate) const BODY_BUDGET_KIND: &str = "body_budget_exhausted";
 
+/// `detail.kind` this client writes on a failure of **its own transport**: a
+/// predict that ended before an answer was read, or read to its end.
+///
+/// It is the one kind that never travels on the wire, and cannot: no server
+/// can report that its answer failed to arrive. The client synthesises it
+/// from the `reqwest` error and the point in the request the error was
+/// observed at ([`TransportPhase`]), so that the job path reads a transport
+/// accident the same way it reads the three the server names — through
+/// [`InferenceFailure`], never through prose or a status.
+pub(crate) const TRANSPORT_KIND: &str = "transport";
+
+/// How far a predict got before its transport failed, which is the whole of
+/// what such a failure says about the item.
+///
+/// The variants are in the request's own order, and the boundary that
+/// matters is between [`Self::Headers`] and [`Self::Body`]: everything above
+/// it means no answer had been produced, and below it means an answer was
+/// produced and this end lost it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportPhase {
+    /// **No connection was established** — refused, unreachable, a DNS or TLS
+    /// failure, or a connect timeout. Not one byte of the request left this
+    /// process, so no server saw it and no model ran. The strongest of the
+    /// four statements.
+    Connect,
+    /// **The connection was up and no response head came of it.** The request
+    /// was reset, refused as a stream (HTTP/2 `REFUSED_STREAM`, which RFC
+    /// 9113 §8.7 defines as "not processed" — the one reset that says so
+    /// outright), or its body stopped being writable.
+    ///
+    /// Precisely: `reqwest` reports the same `Kind::Request` for a request
+    /// that never landed and for a connection that died with a whole request
+    /// on it, and this client cannot tell those apart. So this phase does not
+    /// claim the batch was never parsed — it claims what it can see, which is
+    /// that no answer had been produced when the failure was observed.
+    ///
+    /// One case does slip in here from below: a server whose *response body*
+    /// fails immediately resets the stream, and a reset that overtakes its
+    /// own response head is observed as this phase rather than as
+    /// [`Self::Body`] (measured, over h2c). That over-claims in the harmless
+    /// direction — both phases buy the same single re-queue — and the
+    /// distinction survives wherever it can be drawn, which is wherever the
+    /// head arrived first.
+    Send,
+    /// **The request was delivered and no response head ever arrived** — the
+    /// connection went away, or the read deadline passed first.
+    ///
+    /// This is not proof the server did nothing: it may be mid-inference, and
+    /// a timeout leaves it running to completion into a stream nobody will
+    /// read. What it does prove is that no verdict about the media had been
+    /// produced when the failure was observed, and that none can now reach
+    /// this caller. That residue is a wasted GPU pass, not a wrong answer.
+    Headers,
+    /// **The response head arrived and the body did not survive the trip** —
+    /// a `GOAWAY` mid-body, a reset, a truncated body, a read timeout.
+    ///
+    /// The server did the work and answered; this end lost the answer. So
+    /// this phase is not "unattempted" and never claims to be: it is
+    /// re-submittable for the other reason, idempotence — see
+    /// [`InferenceFailure::warrants_resubmission`].
+    Body,
+}
+
+impl TransportPhase {
+    /// Stable and lowercase, for the log line and the job's audit text.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Send => "send",
+            Self::Headers => "headers",
+            Self::Body => "body",
+        }
+    }
+
+    /// Whether the failure was observed **before any answer existed**, which
+    /// is every phase that ends short of a response head. The one fact
+    /// [`InferenceFailure::is_unattempted`] needs from a transport failure.
+    pub fn is_before_any_answer(self) -> bool {
+        !matches!(self, Self::Body)
+    }
+}
+
+/// This client's classification of a transport failure: how far the request
+/// got, and what `reqwest` called the error.
+///
+/// The class is kept beside the phase because the phase is a judgement and
+/// the class is the evidence for it — a log line that says only "send"
+/// cannot be checked, and one that says `send`/`refused_stream` can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransportFailure {
+    /// How far the request got. This is what callers act on.
+    pub phase: TransportPhase,
+    /// `reqwest`'s own name for the error ([`reqwest_error_class`]), refined
+    /// with `refused_stream` where the chain names one.
+    pub class: &'static str,
+}
+
 /// A request the inference server refused, with the machine-readable half of
 /// its `{"detail": …}` body parsed out.
 ///
@@ -141,7 +238,9 @@ pub(crate) const BODY_BUDGET_KIND: &str = "body_budget_exhausted";
 /// "no machine-readable opinion" case every caller already handled.
 #[derive(Debug, Clone)]
 pub(crate) struct InferenceFailure {
-    /// HTTP status of the refusal.
+    /// HTTP status of the refusal, or **0 when there was no response at
+    /// all** — a client-side [`TRANSPORT_KIND`] failure. A zero here is
+    /// never a status a server sent; no status is.
     pub status: u16,
     /// `detail.kind`, when the body carried a structured detail.
     pub kind: Option<String>,
@@ -160,6 +259,11 @@ pub(crate) struct InferenceFailure {
     pub failures: Option<u32>,
     /// `Retry-After`, in seconds, when the server sent one.
     pub retry_after_secs: Option<u64>,
+    /// Set only by [`InferenceFailure::from_transport`], i.e. only when
+    /// *this* process observed the failure of its own request. It is
+    /// therefore unforgeable from the wire: [`InferenceFailure::parse`]
+    /// leaves it `None` whatever the body says.
+    pub transport: Option<TransportFailure>,
 }
 
 impl InferenceFailure {
@@ -179,6 +283,10 @@ impl InferenceFailure {
             retry_at: None,
             failures: None,
             retry_after_secs: retry_after,
+            // A peer cannot classify this client's transport, so a body that
+            // claims `kind = "transport"` still arrives with no phase and
+            // buys nothing with it.
+            transport: None,
         };
         let Ok(parsed) = serde_json::from_str::<Value>(body) else {
             return failure;
@@ -208,6 +316,36 @@ impl InferenceFailure {
         failure
     }
 
+    /// This client's own account of a predict whose transport failed:
+    /// `kind = "transport"`, the [`TransportPhase`] it failed in, and
+    /// `reqwest`'s class for it.
+    ///
+    /// `status` is 0 because there is no status — the request produced no
+    /// response, or none that could be read to its end. `message` is what
+    /// `reqwest` says, and `last_error` is the **whole source chain**, which
+    /// is the half worth having: `reqwest`'s own `Display` names the layer
+    /// ("error sending request for url (…)") while the cause underneath it
+    /// is `h2` saying `REFUSED_STREAM`, or `GOAWAY(ENHANCE_YOUR_CALM)`, or
+    /// `hyper` saying the connection closed before the message completed.
+    /// Run2 defect P2 cost a stress harness to identify precisely because
+    /// the log line named the layer and nothing else.
+    pub(crate) fn from_transport(phase: TransportPhase, err: &reqwest::Error) -> Self {
+        Self {
+            status: 0,
+            kind: Some(TRANSPORT_KIND.to_owned()),
+            message: err.to_string(),
+            model: None,
+            last_error: Some(error_chain(err)),
+            retry_at: None,
+            failures: None,
+            retry_after_secs: None,
+            transport: Some(TransportFailure {
+                phase,
+                class: reqwest_error_class(err),
+            }),
+        }
+    }
+
     /// The worker process died with the request in flight.
     pub fn is_worker_death(&self) -> bool {
         self.kind.as_deref() == Some(WORKER_DIED_KIND)
@@ -225,22 +363,80 @@ impl InferenceFailure {
         self.kind.as_deref() == Some(BODY_BUDGET_KIND)
     }
 
-    /// **The request's items were never attempted.** The three kinds that say
-    /// so are different accidents — a worker that died holding the request, a
-    /// request body that stopped arriving, and a body the server had no room
-    /// to read — but they are one fact for every caller: nothing was run,
-    /// nothing was decided about the media, and re-submitting the work is the
-    /// only answer that is not a lie about it. Callers act on this rather
-    /// than on any one kind, which is what made the third one a constant and
-    /// a line rather than a change of policy.
+    /// This client's classification of its own transport failure, when that
+    /// is what this failure is.
+    ///
+    /// Keyed on the phase field rather than on the kind string, which is what
+    /// makes it a local observation and never a peer's claim: only
+    /// [`Self::from_transport`] writes it, from a `reqwest` error this
+    /// process held. A server that answered `{"kind": "transport"}` would
+    /// still get `None` here, and would buy nothing with it.
+    pub fn transport_phase(&self) -> Option<TransportPhase> {
+        self.transport.map(|failure| failure.phase)
+    }
+
+    /// **No answer about this request's items had been produced when it
+    /// failed.** Four classifications say so: three the server's account of
+    /// itself — a worker that died holding the request, a request body that
+    /// stopped arriving, a body it had no room to read — and one this
+    /// client's account of its own transport, a predict that ended before a
+    /// response head ([`TransportPhase::Connect`], [`TransportPhase::Send`],
+    /// [`TransportPhase::Headers`]). Different accidents, one fact for every
+    /// caller: nothing was decided about the media, and re-submitting the
+    /// work is the only answer that is not a lie about it. Callers act on
+    /// this rather than on any one kind, which is what made each new one a
+    /// constant and a line rather than a change of policy.
+    ///
+    /// The transport phases are held to the same standard as the kinds, not
+    /// a weaker one, and the standard is *no verdict was produced* rather
+    /// than *no work was done*. `Connect` is the strongest of the four —
+    /// nothing left this process. `Send` and `Headers` are honest about
+    /// their residue: the server may have received the request and started
+    /// work that is now discarded, and a read timeout leaves it running to
+    /// completion into a stream nobody will read. That residue is a wasted
+    /// GPU pass. It is not a verdict, it cannot become one, and recording
+    /// the item as failed instead would be a claim about the media made on
+    /// no evidence at all.
+    ///
+    /// [`TransportPhase::Body`] is deliberately **not** here — an answer did
+    /// exist and this end lost it. It is re-submittable for the other
+    /// reason; see [`Self::warrants_resubmission`], which is what a job's
+    /// re-queue policy asks.
     ///
     /// Deliberately keyed on the typed kind and never on the status. An
     /// untyped 4xx is not evidence of anything — a stock FastAPI upstream
     /// answers 400 for a genuinely bad request too — and retrying every one
     /// of them would double the request cost of any systematic client bug
-    /// while fixing nothing.
+    /// while fixing nothing. A transport failure meets that bar for the same
+    /// reason the server-sent kinds do: something typed it at the point it
+    /// was observed, and here that something is this client.
     pub fn is_unattempted(&self) -> bool {
-        self.is_worker_death() || self.is_request_incomplete() || self.is_body_budget_exhausted()
+        self.is_worker_death()
+            || self.is_request_incomplete()
+            || self.is_body_budget_exhausted()
+            || self
+                .transport_phase()
+                .is_some_and(TransportPhase::is_before_any_answer)
+    }
+
+    /// **Re-submitting this request's items is correct.** The union of
+    /// [`Self::is_unattempted`] — no answer was produced — with the one case
+    /// where an answer *was* produced and did not survive the trip
+    /// ([`TransportPhase::Body`]).
+    ///
+    /// That second case rests on a property of the surface rather than on
+    /// ignorance: a predict is a pure, idempotent inference over the inputs
+    /// in its body. It writes nothing outside its response — the only state
+    /// it leaves behind is the model cache, which is keyed and would simply
+    /// be hit again — so asking a second time cannot double any effect. It
+    /// can only cost a repeated GPU pass, which is precisely what an item
+    /// with no verdict is worth.
+    ///
+    /// This, rather than `is_unattempted`, is the question a job's re-queue
+    /// policy is actually asking: *was this item's work left undone?* A lost
+    /// answer leaves it exactly as undone as a lost request.
+    pub fn warrants_resubmission(&self) -> bool {
+        self.is_unattempted() || self.transport_phase().is_some()
     }
 
     /// The model is inside its per-model load-failure cooldown.
@@ -251,9 +447,20 @@ impl InferenceFailure {
 
 impl std::fmt::Display for InferenceFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "inference request failed ({})", self.status)?;
+        if self.status == 0 {
+            // There is no status when there was no response; printing a 0
+            // would read as one.
+            write!(f, "inference request failed (no response)")?;
+        } else {
+            write!(f, "inference request failed ({})", self.status)?;
+        }
         if let Some(kind) = &self.kind {
-            write!(f, " [{kind}]")?;
+            match self.transport {
+                // The phase is the load-bearing half of a transport failure,
+                // so it is printed with the kind rather than after it.
+                Some(transport) => write!(f, " [{kind}/{}]", transport.phase.as_str())?,
+                None => write!(f, " [{kind}]")?,
+            }
         }
         if !self.message.is_empty() {
             write!(f, ": {}", self.message)?;
@@ -1221,7 +1428,39 @@ impl InferenceApiClient {
                             .and_then(|value| value.to_str().ok())
                             .and_then(|value| value.trim().parse::<u64>().ok())
                             .filter(|value| *value > 0);
-                        let body = response.bytes().await?.to_vec();
+                        let body = match response.bytes().await {
+                            Ok(body) => body.to_vec(),
+                            // The head arrived, so the server ran the batch
+                            // and answered; this end lost the answer (a
+                            // `GOAWAY` mid-body, a reset, a truncation). The
+                            // items have no verdict, and a predict is
+                            // idempotent, so this is typed for the job to
+                            // re-submit rather than returned as a bare
+                            // `reqwest` error the job can only read as a
+                            // verdict about the media.
+                            //
+                            // Not retried here and the transport memo is not
+                            // touched: this loop's retries exist for failures
+                            // that never reached the server, and re-sending a
+                            // whole batch to recover a lost answer is the
+                            // job's one-per-item budget to spend, not this
+                            // loop's three-per-request one.
+                            Err(err) => {
+                                let failure =
+                                    InferenceFailure::from_transport(TransportPhase::Body, &err);
+                                warn!(
+                                    %url,
+                                    phase = TransportPhase::Body.as_str(),
+                                    class = reqwest_error_class(&err),
+                                    error = %error_chain(&err),
+                                    "inference predict answered and the answer was lost in \
+                                     transit; its items have no verdict"
+                                );
+                                return Err(anyhow::Error::new(err))
+                                    .context(failure)
+                                    .context("inference predict response body failed");
+                            }
+                        };
                         let mut parsed = parse_predict_response(&content_type, &body)?;
                         parsed.desired_in_flight_items = desired;
                         return Ok(parsed);
@@ -1279,8 +1518,30 @@ impl InferenceApiClient {
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    warn!(%url, error = %err, "inference predict request failed");
-                    return Err(err).context("inference predict request failed");
+                    // Out of retries (or not the kind that earns them).
+                    // Typed by *where* the request stopped, because that is
+                    // the whole of what it says about the items: a predict
+                    // that ends before an answer is read leaves them without
+                    // a verdict about the media, exactly as a worker death
+                    // does. Untyped, the job could only record them as
+                    // failures — the last hole in "an item that was never
+                    // attempted is never recorded as a failure".
+                    let phase = send_phase(&err);
+                    let failure = InferenceFailure::from_transport(phase, &err);
+                    warn!(
+                        %url,
+                        phase = phase.as_str(),
+                        class = reqwest_error_class(&err),
+                        attempts,
+                        error = %error_chain(&err),
+                        "inference predict transport failure; its items have no verdict"
+                    );
+                    // The typed failure rides as context over the `reqwest`
+                    // error rather than replacing it, so `downcast_ref` finds
+                    // it and the cause chain is still there to read.
+                    return Err(anyhow::Error::new(err))
+                        .context(failure)
+                        .context("inference predict request failed");
                 }
             }
         }
@@ -1456,6 +1717,74 @@ fn should_retry_status(status: reqwest::StatusCode) -> bool {
 
 fn should_retry_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || is_refused_stream(err)
+}
+
+/// The phase a failed `send()` reached.
+///
+/// `send()` resolves when the **response head** arrives, so every error it
+/// can report happened before that; the only question left is whether a
+/// connection was made and whether the deadline was what ran out.
+///
+/// `reqwest`'s predicates are not disjoint — `is_connect` and `is_timeout`
+/// both walk the source chain — so the order is the claim: a connect timeout
+/// is a connect failure first, because "nothing left this process" is the
+/// stronger and more useful statement about it.
+fn send_phase(err: &reqwest::Error) -> TransportPhase {
+    if err.is_connect() {
+        TransportPhase::Connect
+    } else if err.is_timeout() {
+        // The request went out and nothing came back inside the deadline.
+        TransportPhase::Headers
+    } else {
+        // `Kind::Request` and everything else this call can raise: a reset, a
+        // refused stream, a `GOAWAY`, a request body that could not be
+        // written, a connection that closed before the message completed.
+        // The connection existed; no answer came of it.
+        TransportPhase::Send
+    }
+}
+
+/// `reqwest`'s own name for an error, for the log line and the audit.
+///
+/// Ordered so the most specific true claim wins: a refused stream is a
+/// `Kind::Request` like several others but is the only one RFC 9113 §8.7
+/// says was *not processed*, and a connect timeout is both `is_connect` and
+/// `is_timeout`.
+fn reqwest_error_class(err: &reqwest::Error) -> &'static str {
+    if is_refused_stream(err) {
+        "refused_stream"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_timeout() {
+        "timeout"
+    } else if err.is_decode() {
+        "decode"
+    } else if err.is_body() {
+        "body"
+    } else if err.is_request() {
+        "request"
+    } else if err.is_redirect() {
+        "redirect"
+    } else if err.is_builder() {
+        "builder"
+    } else if err.is_status() {
+        "status"
+    } else {
+        "unknown"
+    }
+}
+
+/// The whole source chain, joined. See [`InferenceFailure::from_transport`]
+/// for why the top-level `Display` alone is not enough to act on.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = err.to_string();
+    let mut source = err.source();
+    while let Some(current) = source {
+        rendered.push_str(" <- ");
+        rendered.push_str(&current.to_string());
+        source = current.source();
+    }
+    rendered
 }
 
 /// Whether the peer refused to *open* the stream — HTTP/2 `REFUSED_STREAM`.
@@ -2665,6 +2994,269 @@ mod tests {
             client.known_transport(),
             None,
             "a peer that answers neither protocol is not evidence for either"
+        );
+    }
+
+    /// **Every phase of a transport failure is classified by where the
+    /// request stopped.**
+    ///
+    /// On real `reqwest` errors, produced by real sockets, because the
+    /// classification *is* a reading of `reqwest`'s error: a test that built
+    /// the error itself would only prove this code agrees with that test's
+    /// idea of `reqwest`. Each case here is one of the shapes run2 measured
+    /// or reasoned about — a peer that is not there, a peer that accepts and
+    /// dies, a peer that goes quiet, and an answer truncated in flight.
+    #[tokio::test]
+    async fn each_phase_of_a_transport_failure_is_classified_by_where_it_stopped() {
+        // (1) connect — nothing is listening. Port 1 is below
+        // `ip_local_port_range`, so no other test in this binary can take it.
+        let closed: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(closed).await.is_err(),
+            "the premise of this case is that {closed} refuses connections"
+        );
+        let err = reqwest::Client::new()
+            .get(format!("http://{closed}/predict"))
+            .send()
+            .await
+            .expect_err("the port is closed");
+        assert!(err.is_connect(), "premise: {err}");
+        assert_eq!(send_phase(&err), TransportPhase::Connect);
+        assert_eq!(reqwest_error_class(&err), "connect");
+        let failure = InferenceFailure::from_transport(send_phase(&err), &err);
+        assert_eq!(failure.status, 0, "there is no status without a response");
+        assert_eq!(failure.kind.as_deref(), Some(TRANSPORT_KIND));
+        assert!(failure.is_unattempted() && failure.warrants_resubmission());
+
+        // (2) send — the connection is accepted and dropped. `reqwest` calls
+        // this neither a connect failure nor a timeout, which is exactly the
+        // ambiguous class `a_peer_that_answers_nothing_is_not_remembered_as_http11`
+        // exists for; here it must still be typed rather than left untyped.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dropping = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+        let err = reqwest::Client::new()
+            .get(format!("http://{dropping}/predict"))
+            .send()
+            .await
+            .expect_err("the peer answers nothing");
+        assert!(
+            !err.is_connect() && !err.is_timeout(),
+            "premise: this is the shape neither predicate catches: {err}"
+        );
+        assert_eq!(send_phase(&err), TransportPhase::Send);
+        assert!(
+            InferenceFailure::from_transport(send_phase(&err), &err).is_unattempted(),
+            "a connection that died with the request on it produced no answer"
+        );
+
+        // (3) headers — the peer accepts, holds the connection open and says
+        // nothing. The accepted halves are kept alive deliberately: dropping
+        // them would turn this back into case (2).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let err = reqwest::Client::builder()
+            .timeout(Duration::from_millis(250))
+            .build()
+            .unwrap()
+            .get(format!("http://{silent}/predict"))
+            .send()
+            .await
+            .expect_err("the peer never answers");
+        assert!(err.is_timeout(), "premise: {err}");
+        assert_eq!(send_phase(&err), TransportPhase::Headers);
+        assert_eq!(reqwest_error_class(&err), "timeout");
+        assert!(
+            InferenceFailure::from_transport(send_phase(&err), &err).is_unattempted(),
+            "no response head means no verdict had been produced"
+        );
+
+        // (4) body — the head arrives and the body is cut short. This one is
+        // *not* unattempted: the server answered and this end lost it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let truncating = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut scratch = [0u8; 1024];
+                let _ = socket.read(&mut scratch).await;
+                // A body one byte short of what the head promised, then EOF.
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nnot all of it")
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let err = reqwest::Client::new()
+            .get(format!("http://{truncating}/predict"))
+            .send()
+            .await
+            .expect("the head arrives")
+            .bytes()
+            .await
+            .expect_err("the body does not");
+        let failure = InferenceFailure::from_transport(TransportPhase::Body, &err);
+        assert_eq!(failure.transport_phase(), Some(TransportPhase::Body));
+        assert!(
+            !failure.is_unattempted(),
+            "the server answered; claiming nothing was attempted would be false"
+        );
+        assert!(
+            failure.warrants_resubmission(),
+            "and a lost answer leaves the item as undone as a lost request"
+        );
+        assert!(
+            failure.to_string().contains("[transport/body]"),
+            "the phase is the load-bearing half, so it is printed: {failure}"
+        );
+    }
+
+    /// **A predict that never reaches its peer comes back typed, past the
+    /// retry budget.**
+    ///
+    /// This is the hole run2 S1/P2 left open, end to end: three transport
+    /// retries are spent (1s + 2s + 4s, measured), and what the job then
+    /// holds is a classification rather than a bare `reqwest` error it could
+    /// only read as a verdict about the media.
+    ///
+    /// It also pins the memo rule the classification must not disturb
+    /// (`c6a7a9ef`): an endpoint that could not be reached is still not
+    /// remembered as an HTTP/1.1 one.
+    #[tokio::test]
+    async fn a_predict_that_never_reaches_its_peer_is_typed_and_requeueable() {
+        let closed: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(closed).await.is_err(),
+            "the premise of this test is that {closed} refuses connections"
+        );
+        let client =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{closed}"), false).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = client
+            .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+            .await
+            .expect_err("nothing is listening");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(7),
+            "the whole retry budget must be spent first (1s + 2s + 4s), took {elapsed:?}"
+        );
+
+        let failure = inference_failure(&err)
+            .expect("the typed failure survives the context the return path adds");
+        assert_eq!(failure.kind.as_deref(), Some(TRANSPORT_KIND));
+        assert_eq!(failure.transport_phase(), Some(TransportPhase::Connect));
+        assert!(failure.is_unattempted() && failure.warrants_resubmission());
+        assert!(
+            failure
+                .last_error
+                .as_deref()
+                .is_some_and(|chain| chain.contains(" <- ")),
+            "the cause chain is kept, not just reqwest's own sentence: {failure}"
+        );
+        assert!(
+            format!("{err:#}").contains("inference predict request failed"),
+            "and the human context is still the outermost layer: {err:#}"
+        );
+        assert_eq!(
+            client.known_transport(),
+            None,
+            "classifying a transport failure must not disturb the memo rule"
+        );
+    }
+
+    /// **An answer lost in transit is typed too, and is not called
+    /// unattempted.**
+    ///
+    /// The server here runs the batch and starts answering; the body dies
+    /// mid-stream. The job must re-submit — the item has no verdict — but on
+    /// the idempotence of a predict, not on a claim that nothing ran.
+    #[tokio::test]
+    async fn an_answer_lost_mid_body_is_typed_by_the_phase_it_died_in() {
+        let app = Router::new()
+            .route(
+                "/api/inference/cache",
+                get(|| async { Json(serde_json::json!({"cache": {}})) }),
+            )
+            .route(
+                "/api/inference/predict/{group}/{model}",
+                post(|| async {
+                    use futures_util::StreamExt;
+                    // The head and a first chunk, flushed; *then* the body
+                    // dies. The pause is what makes the case the one under
+                    // test: hyper resets the stream when the body errors, and
+                    // a reset that overtakes the head is a `Send`-phase
+                    // failure instead (see [`TransportPhase::Send`]).
+                    let head = futures_util::stream::once(async {
+                        Ok::<Vec<u8>, std::io::Error>(b"{\"outputs\":".to_vec())
+                    });
+                    let lost = futures_util::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        Err(std::io::Error::other("the answer was lost in transit"))
+                    });
+                    axum::body::Body::from_stream(head.chain(lost))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            crate::serve_with_stream_limit(listener, app, std::future::pending()).await
+        });
+
+        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+        let err = client
+            .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+            .await
+            .expect_err("the answer never arrives whole");
+
+        let failure = inference_failure(&err).expect("a lost answer is a classification too");
+        assert_eq!(failure.transport_phase(), Some(TransportPhase::Body));
+        assert!(
+            !failure.is_unattempted(),
+            "the server did the work; the client lost the answer"
+        );
+        assert!(
+            failure.warrants_resubmission(),
+            "a predict is idempotent, so asking again is the way to get the answer"
+        );
+        assert_eq!(
+            client.known_transport(),
+            Some(Transport::H2c),
+            "a body that died after the head says nothing about the protocol"
+        );
+    }
+
+    /// **A peer cannot claim this client's classification.** The phase is
+    /// written only by `from_transport`, from an error this process held, so
+    /// a body that says `kind = "transport"` buys nothing with it.
+    #[test]
+    fn a_peer_cannot_claim_the_clients_own_transport_classification() {
+        let failure = InferenceFailure::parse(
+            StatusCode::BAD_REQUEST,
+            None,
+            r#"{"detail":{"kind":"transport","message":"nice try"}}"#,
+        );
+        assert_eq!(failure.kind.as_deref(), Some(TRANSPORT_KIND));
+        assert_eq!(
+            failure.transport_phase(),
+            None,
+            "no phase came off the wire"
+        );
+        assert!(!failure.is_unattempted());
+        assert!(
+            !failure.warrants_resubmission(),
+            "an untyped-in-fact 400 must behave exactly as it did before"
         );
     }
 

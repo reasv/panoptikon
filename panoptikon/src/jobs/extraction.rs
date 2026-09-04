@@ -2216,25 +2216,45 @@ struct ItemInference {
 /// One item's inference, with the two failures that are **not** about the
 /// item handled before it can be blamed for them.
 ///
-/// - **The request was never attempted** — the worker died holding it
-///   ([`WORKER_DIED_KIND`]), or its request body never arrived in full
-///   ([`REQUEST_INCOMPLETE_KIND`], run2 defect P2). Either way the items in
-///   that request were never handed to a model, so nothing has been decided
-///   about the media. Recording them as errors makes one death cost a whole
-///   in-flight window — 1 542 items from a single death in run1 (finding
-///   F7), on a job that still reported *completed* — and makes one broken
-///   request body a permanent verdict on an image that is fine. So the
-///   item's work is re-submitted **once**. The next predict is what respawns
-///   the worker and reloads the model, so there is nothing to wait for and
-///   no sleep here; a model that then fails to *load* comes back as a load
-///   failure, not a death, so this cannot spin.
+/// - **The item's work was left undone.** Four ways, three of them the
+///   server's own account of itself and one this client's account of its
+///   transport:
+///
+///   - the worker died holding the request ([`WORKER_DIED_KIND`]);
+///   - the request body never arrived in full ([`REQUEST_INCOMPLETE_KIND`],
+///     run2 defect P2);
+///   - the server had no room to read the body ([`BODY_BUDGET_KIND`]);
+///   - the request's own transport failed before an answer was read, or read
+///     to its end (`kind = "transport"`, carrying the phase it stopped in) —
+///     a connection error, a reset, a `REFUSED_STREAM` past the client's
+///     three retries, a read that timed out before the response head, a
+///     `GOAWAY` mid-body.
+///
+///   The first three, and every transport failure short of a response head,
+///   mean nothing was decided about the media. The transport `body` phase is
+///   the one case where the server *did* decide and this end lost the
+///   answer; it is re-submitted for the other reason — a predict is a pure,
+///   idempotent inference over its inputs — and
+///   `InferenceFailure::warrants_resubmission` is the single predicate that
+///   spans both. Recording any of them as errors makes one death cost a
+///   whole in-flight window — 1 542 items from a single death in run1
+///   (finding F7), on a job that still reported *completed* — and makes one
+///   broken request body, or one reset stream, a permanent verdict on an
+///   image that is fine. So the item's work is re-submitted **once**. The
+///   next predict is what respawns the worker and reloads the model, so
+///   there is nothing to wait for and no sleep here; a model that then fails
+///   to *load* comes back as a load failure, not a death, so this cannot
+///   spin.
 ///
 ///   The judgement this encodes is narrow on purpose: it is the server's
 ///   typed `kind` that buys the retry, never the status. A transport-level
 ///   4xx from the gateway's own inference surface is not a verdict about the
 ///   media and is retried; an *untyped* 4xx from any upstream is left alone,
 ///   because "400" on its own is exactly as consistent with a request this
-///   process will keep getting wrong.
+///   process will keep getting wrong. A transport failure is held to the
+///   same standard and meets it the same way: it is typed by this client, at
+///   the point the error was observed, and never inferred from a status —
+///   there is no status to infer from.
 ///
 ///   Once per item, and only once, is the whole budget: a job of N items can
 ///   therefore cost at most 2N requests however many times the worker dies,
@@ -2286,13 +2306,22 @@ async fn run_item_inference(
                 requeued = true;
                 *requeued_out = true;
                 counters.lock().await.requeued_items += 1;
+                let failure = inference_failure(&err);
                 tracing::warn!(
                     setter = setter_name,
                     units = inputs.len(),
+                    // Which of the four it was, and — for a transport
+                    // failure — how far the request got, since that is the
+                    // whole of what it says about the item.
+                    kind = failure.and_then(|failure| failure.kind.as_deref()).unwrap_or("?"),
+                    phase = failure
+                        .and_then(|failure| failure.transport_phase())
+                        .map_or("", |phase| phase.as_str()),
                     error = %err,
-                    "this item's predict was never attempted — the worker died \
-                     holding it, its body never arrived, or the server had no \
-                     room to read it; re-queueing its work once instead of \
+                    "this item's predict left its work undone — the worker died \
+                     holding it, its body never arrived, the server had no room \
+                     to read it, or its transport failed before the answer \
+                     reached this end; re-queueing its work once instead of \
                      recording it as an error"
                 );
             }
@@ -2306,8 +2335,10 @@ async fn run_item_inference(
 /// above is then only "call, classify, act".
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InferenceRecovery {
-    /// Re-submit this item's work, once. Only a request the server says was
-    /// never attempted earns this, and only the first time for a given item.
+    /// Re-submit this item's work, once. Only a request whose work was
+    /// left undone earns this — the server saying it never attempted it, or
+    /// this client's own transport failing before the answer reached it —
+    /// and only the first time for a given item.
     Requeue,
     /// Stop the whole job with this reason. Only the load-failure cooldown
     /// earns it: it is a statement about the model for a stated window, so
@@ -2318,9 +2349,16 @@ enum InferenceRecovery {
 }
 
 /// The recovery policy. `already_requeued` is this item's one-shot budget:
-/// a second unattempted request on the retry is a real failure, so a job of
-/// N items can never cost more than 2N requests however many times the
-/// worker dies or a request body is cut short.
+/// a second request that leaves the work undone is a real failure of that
+/// item, so a job of N items can never cost more than 2N requests however
+/// many times the worker dies, a request body is cut short or a connection
+/// drops.
+///
+/// The question asked is `warrants_resubmission`, not `is_unattempted`: an
+/// answer that was produced and lost in transit leaves the item exactly as
+/// undone as a request that never landed, and a predict is idempotent, so
+/// both earn the same one retry out of the same budget. An untyped failure —
+/// of any status — still earns nothing.
 fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> InferenceRecovery {
     let Some(failure) = inference_failure(err) else {
         return InferenceRecovery::Fail;
@@ -2328,7 +2366,7 @@ fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> Inferen
     if failure.is_load_cooldown() {
         return InferenceRecovery::Abort(cooldown_reason(failure));
     }
-    if failure.is_unattempted() && !already_requeued {
+    if failure.warrants_resubmission() && !already_requeued {
         return InferenceRecovery::Requeue;
     }
     InferenceRecovery::Fail
@@ -2567,11 +2605,21 @@ async fn predict_units(
 
 /// Whether a failure says nothing about any individual work unit, so
 /// isolating the chunk one unit at a time can only repeat it: the worker
-/// process died with the request in flight, or the model is inside its
-/// load-failure cooldown.
+/// process died with the request in flight, the model is inside its
+/// load-failure cooldown, or this client's transport failed.
+///
+/// The transport case is the expensive one to get wrong, in both directions.
+/// A socket knows nothing about any work unit, so isolation can learn
+/// nothing from it; and isolation would not merely re-ask, it would re-ask
+/// once per unit *with the client's own three transport retries behind each
+/// re-ask* — up to `4 x chunk` requests against a connection that is simply
+/// gone, in front of the one re-queue this failure is actually owed.
 fn is_unit_agnostic_failure(err: &anyhow::Error) -> bool {
-    inference_failure(err)
-        .is_some_and(|failure| failure.is_worker_death() || failure.is_load_cooldown())
+    inference_failure(err).is_some_and(|failure| {
+        failure.is_worker_death()
+            || failure.is_load_cooldown()
+            || failure.transport_phase().is_some()
+    })
 }
 
 /// Whether a failure is the peer answering in a shape the protocol does not
@@ -4226,6 +4274,7 @@ mod tests {
             retry_at: None,
             failures: None,
             retry_after_secs: None,
+            transport: None,
         })
     }
 
@@ -4251,6 +4300,32 @@ mod tests {
                 .filter(|kind| *kind == crate::inferio_client::LOAD_COOLDOWN_KIND)
                 .map(|_| 3),
             retry_after_secs: None,
+            transport: None,
+        })
+    }
+
+    /// A client-side transport failure, shaped exactly as
+    /// `InferenceApiClient::from_transport` builds one: no status, because
+    /// there was no response, and a phase that only this process can have
+    /// written (`inferio_client::a_peer_cannot_claim_the_clients_own_transport_classification`
+    /// pins that half).
+    fn transport_failure(phase: crate::inferio_client::TransportPhase) -> anyhow::Error {
+        anyhow::Error::new(crate::inferio_client::InferenceFailure {
+            status: 0,
+            kind: Some(crate::inferio_client::TRANSPORT_KIND.to_string()),
+            message: "error sending request for url (http://inference/predict/group/model-a)"
+                .to_string(),
+            model: None,
+            last_error: Some(
+                "error sending request <- connection closed before message completed".to_string(),
+            ),
+            retry_at: None,
+            failures: None,
+            retry_after_secs: None,
+            transport: Some(crate::inferio_client::TransportFailure {
+                phase,
+                class: "request",
+            }),
         })
     }
 
@@ -4390,6 +4465,37 @@ mod tests {
             InferenceRecovery::Fail,
             "one retry per item, whichever way the request went unattempted"
         );
+        // Run2 S1 open item 1: a client-side transport failure is the
+        // fourth way an item's work is left undone, and the only one no
+        // server can report. Every phase earns the same single retry out of
+        // the same budget — including `Body`, which earns it on the
+        // idempotence of a predict rather than on a claim that nothing ran.
+        for phase in [
+            crate::inferio_client::TransportPhase::Connect,
+            crate::inferio_client::TransportPhase::Send,
+            crate::inferio_client::TransportPhase::Headers,
+            crate::inferio_client::TransportPhase::Body,
+        ] {
+            assert_eq!(
+                classify_item_failure(&transport_failure(phase), false),
+                InferenceRecovery::Requeue,
+                "a predict that ended in the {phase:?} phase left its item's work undone"
+            );
+            assert_eq!(
+                classify_item_failure(&transport_failure(phase), true),
+                InferenceRecovery::Fail,
+                "one retry per item, whichever way the work was left undone ({phase:?})"
+            );
+        }
+        assert!(
+            !inference_failure(&transport_failure(
+                crate::inferio_client::TransportPhase::Body
+            ))
+            .expect("typed")
+            .is_unattempted(),
+            "and the body phase re-queues without ever claiming nothing ran"
+        );
+
         // An untyped failure is every pre-existing predict failure in the
         // world: it must behave exactly as it did before this change.
         assert_eq!(
@@ -4422,6 +4528,31 @@ mod tests {
                 other => panic!("a cooldown must abort the job, got {other:?}"),
             }
         }
+    }
+
+    /// **A transport failure is never isolated unit by unit.**
+    ///
+    /// A socket knows nothing about any work unit, so an isolation pass can
+    /// only repeat the failure — once per unit, each carrying the client's
+    /// own three transport retries, in front of the single re-queue the
+    /// failure is actually owed.
+    #[test]
+    fn a_transport_failure_is_never_isolated_unit_by_unit() {
+        for phase in [
+            crate::inferio_client::TransportPhase::Connect,
+            crate::inferio_client::TransportPhase::Send,
+            crate::inferio_client::TransportPhase::Headers,
+            crate::inferio_client::TransportPhase::Body,
+        ] {
+            assert!(
+                is_unit_agnostic_failure(&transport_failure(phase)),
+                "{phase:?} says nothing about any single unit"
+            );
+        }
+        assert!(
+            !is_unit_agnostic_failure(&untyped_bad_request()),
+            "an untyped 400 may well be about the inputs, so isolation still earns its pass"
+        );
     }
 
     /// The typed failure has to survive the context the job path wraps it in

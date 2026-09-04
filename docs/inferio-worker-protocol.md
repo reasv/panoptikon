@@ -635,6 +635,20 @@ never attempted*, so a caller re-submits it exactly as it re-submits a
 failure against the media. `/health` reports the budget, what is reserved
 right now, and how many requests have ever been refused.
 
+**A fourth classification of the same fact never appears on this wire.** A
+caller's own transport can fail before an answer is read, or read to its end
+— a connection error, a reset, a `REFUSED_STREAM` past its retries, a read
+that times out before the response head, a `GOAWAY` mid-body — and no server
+can report that its answer failed to arrive, so the client types it itself
+(`InferenceFailure`, `kind = "transport"`, carrying the phase the request
+stopped in). It is written down here only so that the three kinds above are
+not read as exhaustive: they are exhaustive *on the wire*, and a caller that
+re-submits on those alone still loses items to its own transport. Nothing
+about the protocol changes for it — no version, no field, no status — and a
+server that answered `{"kind": "transport"}` would carry no phase and buy
+nothing with it, because the phase is an observation this side made and not a
+claim a peer can send.
+
 ### Memory sensing (optional response fields)
 
 Added for batch calibration (`docs/batch-calibration-design.md`): the worker
