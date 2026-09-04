@@ -3476,6 +3476,53 @@ mod tests {
         handle.await.unwrap();
     }
 
+    // A job that ran to the end but left work undone reports `partial`, not
+    // `completed` — run1 finding F7, where one worker death cost 1 542 items
+    // on a job the queue reported as completed. The rest of the completion
+    // path is unchanged: the model is tracked as loaded and the boundary
+    // still gets to decide about it.
+    #[tokio::test]
+    async fn a_partial_extraction_is_not_reported_completed() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("batch-partial");
+        let setter = "group/model-a";
+        let job = enqueue_on(&queue, extraction_job(&db, setter, "10:partial")).await;
+
+        let mut status = status_on(&queue).await;
+        for _ in 0..200 {
+            if status
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.queue_id == job.queue_id)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            status = status_on(&queue).await;
+        }
+        let outcome = status
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.queue_id == job.queue_id)
+            .expect("the job reported an outcome");
+        assert_eq!(
+            outcome.status,
+            JobOutcomeStatus::Partial,
+            "a job with work left undone must not read as completed: {status:?}"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not be processed"),
+            "the summary of what was left undone rides on the outcome: {outcome:?}"
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
     // Shutdown unloads the model of the job it just cancelled. The cancel path
     // defers to the shutdown handler, which waits for the call instead of
     // detaching it into a runtime that is about to stop polling.
