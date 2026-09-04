@@ -140,7 +140,7 @@ use tokio::sync::{
 use tokio::task::JoinHandle;
 
 use super::calibration::CalibrationProfiles;
-use super::cost::CostDimension;
+use super::cost::{CostDimension, CostUnit};
 use super::dispatch::{
     DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, Replica, run_dispatcher,
 };
@@ -2328,7 +2328,29 @@ impl ModelManager {
         let mut workers: Vec<Worker> = Vec::with_capacity(replica_count);
         let mut admissions: Vec<Option<Admission>> = Vec::with_capacity(replica_count);
         let mut first_error: Option<anyhow::Error> = None;
-        for result in futures_util::future::join_all(spawns).await {
+        let results = futures_util::future::join_all(spawns).await;
+        // The one place the loaded model's per-item pixel canvas is settled
+        // (run2 change R7), before anything downstream is told a number: the
+        // ledger's registration below carries it onto every grant, and the
+        // dispatcher context built by the caller prices its windows with it.
+        // A replica that failed reports nothing; the survivors are replicas of
+        // one model, so the first figure any of them resolved is the model's.
+        let reported_canvas = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .find_map(|(_, worker)| {
+                let handle = worker.telemetry();
+                let telemetry = match handle.lock() {
+                    Ok(telemetry) => telemetry,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                telemetry
+                    .load
+                    .as_ref()
+                    .and_then(|stamped| stamped.value.canvas_pixels)
+            });
+        let cost = canvas_in_force(inference_id, cost, reported_canvas);
+        for result in results {
             match result {
                 Ok((replica, worker)) => {
                     tracing::debug!(
@@ -2428,6 +2450,63 @@ impl ModelManager {
             .models
             .get(inference_id)
             .map(|handle| handle.generation)
+    }
+}
+
+/// The per-item pixel canvas the loaded model is priced against (run2 change
+/// R7), folded into its cost dimension once, here, where the registry's
+/// declaration and the workers' load reports are both in hand.
+///
+/// **The registry wins.** A declared figure is a maintainer's statement about
+/// the model's geometry, derived from its source and reviewed; the reported
+/// one is an attribute read off an object graph nobody here controls, and the
+/// worker's introspection is deliberately floored rather than trusted
+/// (`packing.CANVAS_FLOOR_PIXELS`). Letting a reading override a declaration
+/// would also make a *wrong* attribute unfixable from config — the one place
+/// a maintainer can act.
+///
+/// The report is what covers the model the registry cannot state statically:
+/// `doctr/dots_ocr`'s canvas lives in an `AutoProcessor` config downloaded
+/// with the weights, so nothing outside a loaded process can know it. Without
+/// this fold the host would price that model's windows in raw submitted
+/// pixels while the worker priced its batches in capped ones.
+///
+/// Only for a `pixel`-priced model: the cap is an area, and capping a token
+/// count or an item count by an area is meaningless (and inert anyway under
+/// `count`, where `min(1, cap)` is 1). A worker reports what it found without
+/// knowing its own unit — the dimension only reaches it on a grant — so the
+/// gate is here.
+fn canvas_in_force(
+    inference_id: &str,
+    cost: CostDimension,
+    reported: Option<u32>,
+) -> CostDimension {
+    if cost.unit != CostUnit::Pixel {
+        return CostDimension {
+            canvas_pixels: None,
+            ..cost
+        };
+    }
+    let (canvas_pixels, source) = match (cost.canvas_pixels, reported) {
+        (Some(declared), _) => (Some(declared), "the registry"),
+        (None, Some(measured)) => (Some(measured), "the loaded impl, via its load report"),
+        (None, None) => (None, "nothing"),
+    };
+    match canvas_pixels {
+        Some(pixels) => tracing::debug!(
+            model = %inference_id,
+            canvas_pixels = pixels,
+            "pricing each input at min(raw pixels, {pixels}), the canvas {source} states"
+        ),
+        None => tracing::debug!(
+            model = %inference_id,
+            "no per-item pixel canvas declared or reported; pricing raw \
+             submitted pixels, as before run2"
+        ),
+    }
+    CostDimension {
+        canvas_pixels,
+        ..cost
     }
 }
 
@@ -4013,6 +4092,51 @@ config.replicas = 2
     /// A ROCm-shaped inventory whose row indices are the registry's own
     /// device pins (`device/test` pins "3" and "7"), so the pin vocabulary
     /// and the ledger's key vocabulary are guaranteed to differ.
+    /// R7's precedence rule, in the one place it is decided: the registry's
+    /// declaration beats the canvas a worker read off the loaded impl, the
+    /// report fills in for a model the registry cannot state statically
+    /// (`doctr/dots_ocr`, whose ceiling lives in a downloaded processor
+    /// config), and neither means uncapped — what every model did before
+    /// run2.
+    #[test]
+    fn the_registry_canvas_beats_the_one_a_worker_reported() {
+        let pixels = |canvas_pixels| CostDimension {
+            unit: CostUnit::Pixel,
+            aggregation: Some(super::super::cost::CostAggregation::Sum),
+            epoch: 1,
+            seed_units: Some(2_000_000),
+            degraded: false,
+            canvas_pixels,
+        };
+        assert_eq!(
+            canvas_in_force("clip/nemotron", pixels(Some(1_835_008)), Some(11_289_600))
+                .canvas_pixels,
+            Some(1_835_008),
+            "a declaration is reviewed; an attribute read off an object graph \
+             is not, and a reading that overrode config could not be fixed \
+             from config"
+        );
+        assert_eq!(
+            canvas_in_force("doctr/dots_ocr", pixels(None), Some(11_289_600)).canvas_pixels,
+            Some(11_289_600),
+            "the tier that covers a canvas only a loaded process can know"
+        );
+        assert_eq!(
+            canvas_in_force("clip/vit", pixels(None), None).canvas_pixels,
+            None
+        );
+        // An area prices nothing outside pixel pricing, and a worker reports
+        // what it found without knowing its own unit — so the gate is here.
+        let tokens = CostDimension {
+            unit: CostUnit::Token,
+            ..pixels(Some(1_835_008))
+        };
+        assert_eq!(
+            canvas_in_force("clip/tokens", tokens, Some(11_289_600)).canvas_pixels,
+            None
+        );
+    }
+
     fn rocm_test_gpus() -> GpuInventory {
         let board = |index: u32, bdf: &str| GpuInfo {
             index,

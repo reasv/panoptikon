@@ -319,7 +319,12 @@ def test_a_canvas_prices_nothing_outside_pixel_units():
     assert packing.price_inputs(items(3), "item", 1_835_008) == [1, 1, 1]
 
 
-def test_the_registry_canvas_wins_over_the_impls_own():
+def test_the_granted_canvas_wins_over_the_impls_own():
+    """The grant is authoritative: it states the canvas the orchestrator
+    resolved — the registry's declaration, else the figure this worker itself
+    reported at load — and taking it is what makes the host's window and this
+    worker's batches one denomination by construction rather than by two
+    resolutions agreeing."""
     impl = SimpleNamespace(max_pixels=999_999)
     assert (
         packing.resolve_canvas_pixels({"canvas_pixels": 1_835_008}, impl, "pixel")

@@ -502,11 +502,20 @@ def impl_canvas_pixels(instance: Any) -> int | None:
 def resolve_canvas_pixels(grant: dict[str, Any], instance: Any, unit: str) -> int | None:
     """The per-item pixel cap for this window, in the documented order.
 
-    Registry first (`grant.canvas_pixels`, the figure both sides price
+    The grant first (`grant.canvas_pixels`, the figure both sides price
     against), the impl's own known input resolution second, uncapped third.
     Only for `pixel` inputs: the cap describes an area, and capping a token
     count or an item count by an area is meaningless — a `count`-aggregated
     model would in any case be unaffected, since `min(1, cap)` is 1.
+
+    The grant states the canvas the *orchestrator* resolved: the registry's
+    `metadata.cost.canvas_pixels` when one is declared, else the figure this
+    worker itself reported for the loaded impl on its `load` response. Either
+    way it is authoritative — taking it rather than re-deriving one means the
+    number the host priced its window in and the number this batch is packed
+    in are the same number by construction, not by two resolutions happening
+    to agree. Tier 2 below is the fallback for an orchestrator that sent
+    none (a pre-run2 one, or one whose load report this worker predates).
 
     Logged once per process, at the tier that answered, because a slope
     fitted under a cap and one fitted without it are different numbers and a
@@ -516,7 +525,7 @@ def resolve_canvas_pixels(grant: dict[str, Any], instance: Any, unit: str) -> in
         return None
     declared = _positive_int(grant.get("canvas_pixels"))
     if declared is not None:
-        _log_canvas_once("the registry", declared)
+        _log_canvas_once("the orchestrator's grant", declared)
         return declared
     measured = impl_canvas_pixels(instance)
     if measured is not None:

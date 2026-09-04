@@ -265,9 +265,22 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 if pin_problem is not None:
                     raise RuntimeError(pin_problem)
                 loaded = True
-                _send_ok(
-                    proto_out, req_id, **memory.finish_load(before, instance)
-                )
+                report = memory.finish_load(before, instance)
+                # The per-item pixel canvas this process can see and the
+                # orchestrator cannot (run2 R7, protocol doc "Memory
+                # sensing"): a model whose ceiling lives in a processor
+                # config downloaded with the weights — dots.ocr — is only
+                # knowable once something has loaded it. Reported whatever
+                # this model's cost unit is: the unit only reaches a worker
+                # on a grant, so the pixel-only rule is the orchestrator's to
+                # apply. Absent when nothing could be read, exactly like
+                # every other field here; never raises.
+                from inferio_worker import packing
+
+                canvas_pixels = packing.impl_canvas_pixels(instance)
+                if canvas_pixels is not None:
+                    report["canvas_pixels"] = canvas_pixels
+                _send_ok(proto_out, req_id, **report)
             except Exception as e:
                 # The other half of the bracket. `finish_load` is what
                 # normally collects the load-window state; a load that raised

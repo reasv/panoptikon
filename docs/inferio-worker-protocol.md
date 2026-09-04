@@ -38,15 +38,16 @@ answers an unknown `type` with a per-request `error` and stays alive, which
 is exactly how a trim to a worker that cannot do one should behave, so the
 version still stays 2.
 
-2026-09-04 (batch-calibration run2): **five** additive keys, plus two changes
+2026-09-04 (batch-calibration run2): **six** additive keys, plus two changes
 inside the value vocabulary of keys that already existed, all of them
 consequences of what run1 measured
-(`docs/batch-calibration-run1-report.md` §4). Exactly these five keys are new,
+(`docs/batch-calibration-run1-report.md` §4). Exactly these six keys are new,
 and the two vocabulary changes below are the only other change on the wire:
 
 | key | where | run2 item |
 |---|---|---|
-| `canvas_pixels` | `predict` request, inside `grant` | R7 — the per-item pixel cap, from the registry key of the same name |
+| `canvas_pixels` | `predict` request, inside `grant` | R7 — the per-item pixel cap the orchestrator resolved for this model |
+| `canvas_pixels` | `load` `ok` response | R7 — **the second, separate key of that name, and the newer of the two**: the canvas the *worker* resolved by introspecting the impl it just loaded, which is how the orchestrator learns a ceiling that lives in a processor config downloaded with the weights (`doctr/dots_ocr`). One name, two directions, one quantity |
 | `free_mb` | a measurement map | R5 — the pre-batch free reading the defensive clamp already takes |
 | `free_source` | a measurement map | R5 — which driver produced that reading |
 | `clamped` | a measurement map | R5 — `{from_units, to_units, free_mb}`, present only when the clamp shrank this batch |
@@ -60,8 +61,11 @@ The two value changes, on keys that are not new:
 | `base_method` | gains the value `"alloc_delta_measured"` beside the existing `"alloc_delta"`: the same tier with a *measured* accelerator context instead of an assumed one, which is a different formula and so a different name | R8 |
 
 Additive in both directions: an older worker sends none of the response keys
-and ignores `canvas_pixels`, an older orchestrator sends no `canvas_pixels`
-and ignores the response keys, so the version stays 2. `base_method`'s new
+and ignores the `canvas_pixels` on a grant, an older orchestrator sends no
+`canvas_pixels` and ignores the response keys, so the version stays 2. Each
+side's fallback for the other's silence is the behaviour it had before run2 —
+a worker with no granted canvas introspects its own impl, and an orchestrator
+with no reported canvas prices whatever the registry declares, or nothing. `base_method`'s new
 value is additive too — it names a tier that already existed, and a reader
 that does not know the spelling learns only that this base was not measured
 the way it expects. The one **non**-additive line is the sentinel rename,
@@ -159,7 +163,7 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | `unit` | `"item"` \| `"pixel"` \| `"token"` \| `"audio-second"` — the model's declared cost dimension |
 | `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
-| `canvas_pixels` | **new (run2, R7)**: the model's *canvas* — the largest number of decoded pixels one input can actually cost it, whatever resolution the input was submitted at. Integer pixels; optional; meaningful only for a `pixel`-priced model. When present the worker prices every input at `min(raw_pixels, canvas_pixels)` before packing. The orchestrator reads it out of the registry (`metadata.cost.canvas_pixels`) and forwards it verbatim |
+| `canvas_pixels` | **new (run2, R7)**: the model's *canvas* — the largest number of decoded pixels one input can actually cost it, whatever resolution the input was submitted at. Integer pixels; nil when there is none; meaningful only for a `pixel`-priced model. When present the worker prices every input at `min(raw_pixels, canvas_pixels)` before packing. It is the figure the orchestrator resolved for this model — `metadata.cost.canvas_pixels` from the registry, else the canvas the worker itself reported on its `load` response — and it is what the orchestrator's *own* window pricing used, so both sides denominate one quantity |
 
 **The per-item pixel cap (`canvas_pixels`), and why it is a *pricing* field.**
 Every `pixel`-class model shipped resizes or tiles its input onto a fixed
@@ -189,8 +193,11 @@ exactly one unit and `min(1, cap)` is 1.
 
 Resolution order in the worker, and the documented fallback:
 
-1. `grant.canvas_pixels`, when the orchestrator sent one. Authoritative: it is
-   the figure the registry declares, so both sides speak one number.
+1. `grant.canvas_pixels`, when the orchestrator sent one. Authoritative,
+   whichever tier produced it there: taking it rather than re-deriving one is
+   what makes the units the orchestrator sized this window in and the units
+   this batch is packed in the same number by construction, instead of two
+   independent resolutions that happen to agree.
 2. otherwise, for `pixel` inputs only, the loaded impl's own known input
    resolution, if it exposes one: a positive integer `canvas_pixels`,
    `max_pixels` or `image_max_pixels` attribute on the instance, or on
@@ -207,6 +214,18 @@ Resolution order in the worker, and the documented fallback:
    statically because it lives in the downloaded processor's config
    (`doctr/dots_ocr`).
 3. otherwise uncapped, exactly as before this field existed.
+
+Tier 2 runs at **load** as well as at predict time, and its answer is what
+the `load` `ok` response's own `canvas_pixels` reports (see "Memory sensing"):
+the orchestrator has no way to see inside a downloaded processor config, so a
+worker that can read one tells it, and the orchestrator folds that figure into
+the model's cost dimension behind any registry declaration — which stays
+authoritative, being the one statement a maintainer can review and correct.
+That fold is what lets the *host* apply the same `min(raw_pixels,
+canvas_pixels)` when it prices a window, which matters most for a model
+running with `enable_batching = false` (the three `doctr/easyocr_*` ids): such
+a worker takes the grantless compatibility path and applies no cap of its
+own, so the host's is the only cap there is.
 
 The registry declaration the orchestrator reads it from:
 
@@ -557,6 +576,7 @@ running on.
 | `gpu_name` | that board's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), informational. The calibration profile key uses the orchestrator's own inventory name for the board, not this. On MPS torch has no board struct to ask, so the worker derives `"Apple M3 Max (128 GB)"` from the same two sysctls (`machdep.cpu.brand_string`, `hw.memsize`) and the same rounding the orchestrator's probe uses — deliberately identical, so the one field that could silently drift from the profile key does not. On a `"ram"` host it is `"CPU (64 GB)"`, derived the same way from physical RAM and the same round-up-to-4-GiB rule |
 | `gpu_bdf` | the board's PCI address as the worker read it from `get_device_properties(0)`'s `pci_domain_id`/`pci_bus_id`/`pci_device_id`, rendered `"dddd:bb:dd.0"` in lower-case hex. The function digit is always `.0`: the GPU function of an amdgpu device is 0 (the HDMI/DP audio controller is `.1` of the *same device*), which is how the orchestrator's own probe renders it too, so the two sides join. Reported on CUDA hosts as well — additive, and harmless where the UUID already identifies the board. Absent on a torch build that exposes no PCI fields, unless the fdinfo fallback below answered — which today means absent on the shipped CUDA build, whose venv pins torch 2.7.1 (`_CudaDeviceProperties` grew the PCI fields in 2.8, and the fdinfo fallback is HIP-only): this field goes live on CUDA when that pin moves to >= 2.8, and until then the identity chain it feeds is load-bearing on ROCm alone (the `rocm` extra pins torch 2.11) |
 | `gpu_total_mb` | that board's total VRAM per torch (`get_device_properties(0).total_memory`), in MiB. Deliberately a *second* source for a number the orchestrator can also read from the driver: it is what a non-UUID board match is cross-checked against. **On MPS it is `recommended_max_memory()` and it is not a cross-check but the authoritative figure**: the orchestrator seeds that board's total at ≈75 % of RAM (Metal's default) and adopts the reported number on the first load report, sanity-bounded by physical RAM alone — a raised GPU wired limit legitimately puts the real figure 20 % away from the seed (docs/unified-memory-admission.md, DP-4). **On a `"ram"` host it is physical RAM**, and it is a cross-check again — the strictest in the design, since both sides read the same kernel fact and are expected to agree exactly. It is also what makes such a worker identifiable at all: registration's single-board fallback needs a report that claims a board, and RAM is the only thing this one has to claim. It is emphatically not adopted — the orchestrator read that number itself at probe time |
+| `canvas_pixels` | **new in run2 (R7)**: the per-item **pixel canvas** the worker resolved for the loaded impl by introspecting it — tier 2 of the resolution order in "Memory grants" above, run once the impl's own objects exist. This is the orchestrator's only way to learn a ceiling that lives in an `AutoProcessor` config downloaded with the weights (`doctr/dots_ocr`), and it is what the orchestrator prices that model's windows at when the registry declares nothing; a registry declaration always wins. Reported whatever the model's cost unit is — the worker has no unit at load time, since the cost dimension only reaches it on a grant, so the pixel-only rule is applied orchestrator-side. Absent when nothing could be read or the reading fell below the 512x512 floor: absent means "no canvas", never zero and never a guess |
 | `torch_version` | `torch.__version__` (e.g. `"2.7.1+cu128"`), part of the calibration profile key. Only the worker knows which torch its venv holds. Absent when the impl never imported torch |
 | `memory` | a memory sample taken right after load |
 

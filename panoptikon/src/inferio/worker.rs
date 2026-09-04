@@ -298,6 +298,23 @@ pub struct LoadReport {
     /// and diagnostic — nothing keys on it; it is what tells a maintainer
     /// reading the log or the store which kind of evidence a row rests on.
     pub dtype_method: Option<String>,
+    /// The per-item **pixel canvas** the worker resolved for the loaded impl
+    /// by introspecting it (run2 change R7, protocol doc "Memory sensing"):
+    /// the largest number of decoded pixels one input can cost this model,
+    /// whatever resolution it was submitted at.
+    ///
+    /// Absent from the registry's point of view is not absent from the
+    /// model's: `doctr/dots_ocr`'s canvas lives in an `AutoProcessor` config
+    /// that travels with the weights, so it is knowable only *after* a load,
+    /// and only by the process that did it. This is the host's one way to
+    /// learn such a figure, and the manager folds it into the model's cost
+    /// dimension — **behind** any registry declaration, which stays
+    /// authoritative (`ModelManager::spawn_model`).
+    ///
+    /// Reported whatever the model's cost unit is: the worker has no unit at
+    /// load time (the dimension arrives on a grant), so the pixel-only rule
+    /// is applied host-side.
+    pub canvas_pixels: Option<u32>,
     /// The board the worker's CUDA device 0 *actually* resolved to, as the
     /// worker itself read it (`GPU-…`). This — not the spawn pin, which may
     /// be an index, absent, or a UUID CUDA reordered — is the authoritative
@@ -1284,6 +1301,7 @@ impl Worker {
                 base_method = report.base_method.as_deref(),
                 dtype = report.dtype.as_deref(),
                 dtype_method = report.dtype_method.as_deref(),
+                canvas_pixels = report.canvas_pixels,
                 gpu_uuid = report.gpu_uuid.as_deref(),
                 gpu_name = report.gpu_name.as_deref(),
                 gpu_bdf = report.gpu_bdf.as_deref(),
@@ -2233,6 +2251,9 @@ impl LoadReport {
             reserved_at_load_mb: field_u64(payload, "reserved_at_load_mb"),
             dtype: field_string(payload, "dtype"),
             dtype_method: field_string(payload, "dtype_method"),
+            canvas_pixels: field_u64(payload, "canvas_pixels")
+                .and_then(|pixels| u32::try_from(pixels).ok())
+                .filter(|pixels| *pixels >= 1),
             gpu_uuid: field_string(payload, "gpu_uuid"),
             gpu_name: field_string(payload, "gpu_name"),
             gpu_bdf: field_string(payload, "gpu_bdf"),
@@ -2330,6 +2351,18 @@ fn encode_grant(grant: &Grant) -> Value {
             grant
                 .user_cap_items
                 .map(|cap| Value::from(u64::from(cap)))
+                .unwrap_or(Value::Nil),
+        ),
+        // Run2 R7. Nil rather than omitted, for the same reason
+        // `user_cap_items` is: the worker reads a `None` here as "no cap the
+        // orchestrator knows of" and falls back to its own introspection,
+        // which is a decision it must be able to make from a key that is
+        // always present.
+        (
+            Value::from("canvas_pixels"),
+            grant
+                .canvas_pixels
+                .map(|pixels| Value::from(u64::from(pixels)))
                 .unwrap_or(Value::Nil),
         ),
     ])
@@ -2866,6 +2899,7 @@ mod tests {
             unit: super::super::cost::CostUnit::Item,
             aggregation: super::super::cost::CostAggregation::Count,
             user_cap_items: None,
+            canvas_pixels: None,
             squeezed: false,
         };
         let outputs = worker
@@ -2963,6 +2997,7 @@ mod tests {
             unit: super::super::cost::CostUnit::Item,
             aggregation: super::super::cost::CostAggregation::Count,
             user_cap_items: None,
+            canvas_pixels: None,
             squeezed: false,
         };
         let err = worker
@@ -3924,6 +3959,81 @@ mod tests {
             Some(telemetry.recorded_measurements()),
             "the newest sample's seq is the running count"
         );
+    }
+
+    /// The grant states the model's per-item pixel canvas on the wire (run2
+    /// change R7), so the worker prices `min(raw_pixels, canvas_pixels)`
+    /// against the same number the host sized this window with. Nil — never
+    /// omitted — when there is no canvas: the worker reads the key's absence
+    /// as "the orchestrator knows of none" and falls back to introspecting
+    /// the impl, which is a decision it can only make from a key that is
+    /// always there.
+    #[test]
+    fn the_grant_states_the_models_pixel_canvas() {
+        let grant = |canvas_pixels| Grant {
+            unit_budget: 8,
+            mb: 512,
+            unit: super::super::cost::CostUnit::Pixel,
+            aggregation: super::super::cost::CostAggregation::Sum,
+            user_cap_items: None,
+            canvas_pixels,
+            squeezed: false,
+        };
+        let encoded = encode_grant(&grant(Some(1_835_008)));
+        let Value::Map(map) = &encoded else {
+            panic!("a grant encodes as a map, got {encoded:?}");
+        };
+        assert_eq!(
+            map_get(map, "canvas_pixels"),
+            Some(&Value::from(1_835_008u64))
+        );
+        let encoded = encode_grant(&grant(None));
+        let Value::Map(map) = &encoded else {
+            panic!("a grant encodes as a map, got {encoded:?}");
+        };
+        assert_eq!(
+            map_get(map, "canvas_pixels"),
+            Some(&Value::Nil),
+            "present and nil, not absent"
+        );
+    }
+
+    /// The other direction: the canvas a worker resolved for the model it
+    /// just loaded (protocol doc, "Memory sensing"). It is the host's only
+    /// way to learn a canvas that lives in a processor config downloaded
+    /// with the weights, so it is parsed with the same suspicion as every
+    /// other field — a nonsense value reads as unknown, never as a cap.
+    #[test]
+    fn load_report_carries_the_resolved_canvas() {
+        let reported = vec![
+            (Value::from("base_mb"), Value::from(2048u64)),
+            (Value::from("canvas_pixels"), Value::from(11_289_600u64)),
+        ];
+        let report = LoadReport::parse(&reported).expect("a report");
+        assert_eq!(report.canvas_pixels, Some(11_289_600));
+
+        // The canvas alone is a report: an impl that measured no footprint
+        // at all still has a geometry the host can price with.
+        let alone = vec![(Value::from("canvas_pixels"), Value::from(1_843_200u64))];
+        assert_eq!(
+            LoadReport::parse(&alone).and_then(|report| report.canvas_pixels),
+            Some(1_843_200)
+        );
+
+        for value in [
+            Value::from("1843200"),
+            Value::from(0u64),
+            Value::from(-1i64),
+            Value::from(u64::from(u32::MAX) + 1),
+            Value::Nil,
+        ] {
+            let bad = vec![
+                (Value::from("base_mb"), Value::from(2048u64)),
+                (Value::from("canvas_pixels"), value.clone()),
+            ];
+            let report = LoadReport::parse(&bad).expect("the base still parses");
+            assert_eq!(report.canvas_pixels, None, "{value:?}");
+        }
     }
 
     /// The worker is a separate process and its response map is untrusted

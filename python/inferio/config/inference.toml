@@ -264,7 +264,12 @@ metadata.cost.seed_units  = 2000000
 # revisions. The worker's second resolution tier reads it off the loaded
 # processor instead (docs/inferio-worker-protocol.md, "Memory grants"), which
 # is authoritative and version-correct; declaring a guess here would override
-# it with a number nobody measured.
+# it with a number nobody measured. The worker also *reports* what it read on
+# its load response, which is how the host comes to price this model's
+# windows by the same figure.
+# epoch 2: the canvas re-denominates this model's unit exactly as a declared
+# one does, so pre-run2 profiles must stop matching (see easyocr_standard_en).
+metadata.cost.epoch       = 2
 
 [group.doctr.inference_ids.easyocr_standard_en]
 config.impl_class = "easyocr"
@@ -290,6 +295,12 @@ metadata.cost.seed_units  = 2000000
 # the only shape that reaches the bound, which makes this the true supremum
 # rather than a typical value — and a cap that is too *large* only caps less,
 # while one that is too small under-prices and over-admits.
+# epoch 2: run2 R7 declared a canvas below, which changes what one
+# priced unit of this model *is* (raw submitted pixels -> pixels
+# capped at the canvas). A slope fitted under the old denomination
+# applied to the new one under-predicts, which over-admits, so every
+# profile measured before the cap has to stop matching.
+metadata.cost.epoch       = 2
 metadata.cost.canvas_pixels = 6553600
 
 [group.doctr.inference_ids.easyocr_standard_en_ja]
@@ -300,6 +311,9 @@ metadata.description = "(Recommended) EasyOCR - English/Japanese Text, Standard 
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000
+# epoch 2: the canvas below re-denominates this model's unit, so
+# pre-run2 profiles must stop matching (see easyocr_standard_en).
+metadata.cost.epoch       = 2
 metadata.cost.canvas_pixels = 6553600   # the detector's 2560px canvas, as above
 
 [group.doctr.inference_ids.easyocr_standard_en_ch_sim]
@@ -310,6 +324,9 @@ metadata.description = "(Recommended) EasyOCR - English/Chinese Simplified Text,
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000
+# epoch 2: the canvas below re-denominates this model's unit, so
+# pre-run2 profiles must stop matching (see easyocr_standard_en).
+metadata.cost.epoch       = 2
 metadata.cost.canvas_pixels = 6553600   # the detector's 2560px canvas, as above
 
 [group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_small]
@@ -813,6 +830,9 @@ metadata.cost.seed_units  = 2000000
 # MAX_PIXELS = 1800 * IMAGE_FACTOR^2 = 1800 * 32 * 32
 # (impl/deps/qwen_3_vl_embedding.py), i.e. at most 1800 merged vision tokens
 # per image, whatever resolution it arrived at.
+# epoch 2: the canvas below re-denominates this model's unit, so
+# pre-run2 profiles must stop matching (see easyocr_standard_en).
+metadata.cost.epoch       = 2
 metadata.cost.canvas_pixels = 1843200
 
 
@@ -828,6 +848,9 @@ metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
 metadata.cost.seed_units  = 2000000
+# epoch 2: the canvas below re-denominates this model's unit, so
+# pre-run2 profiles must stop matching (see easyocr_standard_en).
+metadata.cost.epoch       = 2
 metadata.cost.canvas_pixels = 1843200   # the same MAX_PIXELS as the 8B id
 
 [group.clip.inference_ids.PE-Core-L-14-336_meta]
@@ -905,6 +928,9 @@ metadata.cost.seed_units  = 2000000
 # (max_input_tiles = 6, plus the thumbnail) * 512^2 = 7 * 262144. This is the
 # model run1 measured fitting 4.33x the probe's slope purely because the
 # corpus was above the ceiling (report §4, Q3/W1).
+# epoch 2: the canvas below re-denominates this model's unit, so
+# pre-run2 profiles must stop matching (see easyocr_standard_en).
+metadata.cost.epoch       = 2
 metadata.cost.canvas_pixels = 1835008
 
 [group.clip.inference_ids.jina-clip-v2-api]

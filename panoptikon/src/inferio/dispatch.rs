@@ -325,8 +325,23 @@ pub(crate) struct DispatcherContext {
 /// heuristic, because the dispatcher has no tokenizer; audio from a flat
 /// per-clip allowance. Whatever this returns, the worker prices the batch
 /// exactly after decode and packs within its grant.
-pub(crate) fn estimate_input_units(input: &WorkerInput, unit: CostUnit) -> u64 {
-    match unit {
+///
+/// **The per-item pixel canvas is applied here too** (run2 change R7). The
+/// worker prices every input at `min(raw_pixels, canvas_pixels)`
+/// (`packing.price_inputs`); if the host did not, the window bound and the
+/// grant it asks the ledger for would be denominated in raw submitted pixels
+/// while the batch that runs inside them is denominated in capped ones — the
+/// two sides pricing different quantities, which is what produced run1's
+/// 23-94 GB easyOCR grants (report §4, F-B). It matters most for the models
+/// that ship `enable_batching = false` (the three `doctr/easyocr_*` ids): a
+/// worker on the grantless compatibility path applies no cap of its own, so
+/// this is the only cap there is.
+///
+/// The unreadable-header fallback is capped for the same reason the reading
+/// is — it stands in for the same quantity — mirroring `price_inputs`, which
+/// caps its own fallback.
+pub(crate) fn estimate_input_units(input: &WorkerInput, cost: &CostDimension) -> u64 {
+    match cost.unit {
         // The `none` class never reaches admission; one unit per item keeps
         // any accidental caller's arithmetic sane.
         CostUnit::None | CostUnit::Item => 1,
@@ -334,7 +349,8 @@ pub(crate) fn estimate_input_units(input: &WorkerInput, unit: CostUnit) -> u64 {
             .file
             .as_deref()
             .and_then(image_pixels)
-            .unwrap_or(PIXEL_FALLBACK_UNITS),
+            .unwrap_or(PIXEL_FALLBACK_UNITS)
+            .min(cost.canvas_pixels.map_or(u64::MAX, u64::from)),
         CostUnit::Token => {
             let bytes = input.file.as_ref().map_or(0, Vec::len) + text_bytes(input);
             (bytes as u64 / BYTES_PER_TOKEN).max(1)
@@ -372,9 +388,7 @@ fn text_bytes(input: &WorkerInput) -> usize {
 /// shape for *depth* (how much material to hand the bucketer) even though it
 /// is not the batch's price.
 fn request_units(inputs: &[WorkerInput], cost: &CostDimension) -> u64 {
-    let per_item = inputs
-        .iter()
-        .map(|input| estimate_input_units(input, cost.unit));
+    let per_item = inputs.iter().map(|input| estimate_input_units(input, cost));
     match cost.aggregation {
         Some(CostAggregation::Count) | None => inputs.len() as u64,
         Some(CostAggregation::Sum) | Some(CostAggregation::MaxTimesCount) => {
@@ -485,14 +499,17 @@ pub(crate) const IN_FLIGHT_SLACK: u64 = 2;
 /// construction, and only the summing aggregations need the per-item unit
 /// estimate. The per-unit figures are the dispatcher's own fallbacks
 /// ([`PIXEL_FALLBACK_UNITS`], [`AUDIO_FALLBACK_SECONDS`],
-/// [`TOKEN_SEED_UNITS`]); the first dispatched window replaces all of this
-/// with a measured ratio.
+/// [`TOKEN_SEED_UNITS`]), the pixel one capped at the model's canvas exactly
+/// as the estimate it seeds is; the first dispatched window replaces all of
+/// this with a measured ratio.
 fn seed_units_per_item(cost: &CostDimension) -> u64 {
     match cost.aggregation {
         Some(CostAggregation::Count) | None => 1,
         Some(CostAggregation::Sum) | Some(CostAggregation::MaxTimesCount) => match cost.unit {
             CostUnit::None | CostUnit::Item => 1,
-            CostUnit::Pixel => PIXEL_FALLBACK_UNITS,
+            CostUnit::Pixel => {
+                PIXEL_FALLBACK_UNITS.min(cost.canvas_pixels.map_or(u64::MAX, u64::from))
+            }
             CostUnit::Token => TOKEN_SEED_UNITS,
             CostUnit::AudioSecond => AUDIO_FALLBACK_SECONDS,
         },
@@ -1511,6 +1528,7 @@ mod tests {
             epoch: 1,
             seed_units: Some(8),
             degraded: false,
+            canvas_pixels: None,
         }
     }
 
@@ -1628,6 +1646,7 @@ mod tests {
             unit: CostUnit::Item,
             aggregation: CostAggregation::Count,
             user_cap_items: None,
+            canvas_pixels: None,
             squeezed,
         };
         let target = 1_024 * WINDOW_DEPTH_MULTIPLIER;
@@ -1701,6 +1720,7 @@ mod tests {
             unit: CostUnit::Item,
             aggregation: CostAggregation::Count,
             user_cap_items: None,
+            canvas_pixels: None,
             squeezed: true,
         };
         let target = 1_024 * WINDOW_DEPTH_MULTIPLIER;
@@ -1958,9 +1978,13 @@ mod tests {
             data: None,
             file: Some(png),
         };
-        assert_eq!(estimate_input_units(&image_input, CostUnit::Item), 1);
+        let unpriced = |unit| cost(unit, Some(CostAggregation::Sum));
         assert_eq!(
-            estimate_input_units(&image_input, CostUnit::Pixel),
+            estimate_input_units(&image_input, &unpriced(CostUnit::Item)),
+            1
+        );
+        assert_eq!(
+            estimate_input_units(&image_input, &unpriced(CostUnit::Pixel)),
             40 * 30,
             "header dimensions, not a decode"
         );
@@ -1969,7 +1993,7 @@ mod tests {
             file: Some(vec![0u8; 16]),
         };
         assert_eq!(
-            estimate_input_units(&garbage, CostUnit::Pixel),
+            estimate_input_units(&garbage, &unpriced(CostUnit::Pixel)),
             PIXEL_FALLBACK_UNITS,
             "an unreadable header is charged conservatively, never zero"
         );
@@ -1977,17 +2001,108 @@ mod tests {
             data: Some(json!("x".repeat(400))),
             file: None,
         };
-        assert_eq!(estimate_input_units(&text, CostUnit::Token), 100);
+        assert_eq!(estimate_input_units(&text, &unpriced(CostUnit::Token)), 100);
         let empty = WorkerInput::default();
         assert_eq!(
-            estimate_input_units(&empty, CostUnit::Token),
+            estimate_input_units(&empty, &unpriced(CostUnit::Token)),
             1,
             "never zero units"
         );
         assert_eq!(
-            estimate_input_units(&empty, CostUnit::AudioSecond),
+            estimate_input_units(&empty, &unpriced(CostUnit::AudioSecond)),
             AUDIO_FALLBACK_SECONDS
         );
+    }
+
+    /// The host prices a pixel item at `min(raw, canvas)` — the same `min`
+    /// the worker applies in `price_inputs` (run2 change R7). Without it the
+    /// window bound and the grant asked for it would be denominated in raw
+    /// submitted pixels while the batch inside them is denominated in capped
+    /// ones: run1's 23-94 GB easyOCR grants (report §4, F-B).
+    #[test]
+    fn a_pixel_item_is_priced_at_the_models_canvas() {
+        // 8000x6000 = 48 MP, a phone panorama; every shipped pixel model
+        // resizes or tiles it onto a canvas one or two orders smaller.
+        use image::ImageEncoder;
+        let png = {
+            // Grey, and encoded through the fast filter: this is a header
+            // test, and a 48 MP RGB round trip costs the suite 20 seconds.
+            let image = image::GrayImage::new(8000, 6000);
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::codecs::png::PngEncoder::new_with_quality(
+                &mut bytes,
+                image::codecs::png::CompressionType::Fast,
+                image::codecs::png::FilterType::NoFilter,
+            )
+            .write_image(
+                image.as_raw(),
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::L8,
+            )
+            .expect("encodes");
+            bytes.into_inner()
+        };
+        let big = WorkerInput {
+            data: None,
+            file: Some(png),
+        };
+        let uncapped = cost(CostUnit::Pixel, Some(CostAggregation::Sum));
+        assert_eq!(
+            estimate_input_units(&big, &uncapped),
+            48_000_000,
+            "no canvas means what every model did before run2"
+        );
+        let capped = CostDimension {
+            canvas_pixels: Some(1_835_008),
+            ..uncapped
+        };
+        assert_eq!(estimate_input_units(&big, &capped), 1_835_008);
+        // Three of them: the window the ledger is asked to fund is priced at
+        // the canvas too, not just each item.
+        let inputs = vec![big.clone(), big.clone(), big];
+        assert_eq!(request_units(&inputs, &capped), 3 * 1_835_008);
+        assert_eq!(request_units(&inputs, &uncapped), 3 * 48_000_000);
+
+        // A small item is untouched: this is a cap, not a price.
+        let small = {
+            let image = image::RgbImage::new(40, 30);
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .expect("encodes");
+            WorkerInput {
+                data: None,
+                file: Some(bytes.into_inner()),
+            }
+        };
+        assert_eq!(estimate_input_units(&small, &capped), 40 * 30);
+
+        // An unreadable header is charged the same capped quantity it stands
+        // in for, exactly as `price_inputs` caps its own fallback.
+        let garbage = WorkerInput {
+            data: None,
+            file: Some(vec![0u8; 16]),
+        };
+        let tight = CostDimension {
+            canvas_pixels: Some(262_144),
+            ..uncapped
+        };
+        assert_eq!(estimate_input_units(&garbage, &tight), 262_144);
+        assert_eq!(
+            seed_units_per_item(&tight),
+            262_144,
+            "and so is the pre-fit seed the same fallback feeds"
+        );
+
+        // The cap is an area: it prices nothing outside pixel pricing, and a
+        // `count` model is inert under it either way.
+        let tokens = CostDimension {
+            unit: CostUnit::Token,
+            canvas_pixels: Some(1_835_008),
+            ..uncapped
+        };
+        assert_eq!(estimate_input_units(&garbage, &tokens), 4, "16 bytes / 4");
     }
 
     /// Aggregation decides how per-input units become a window's priced
@@ -2008,6 +2123,7 @@ mod tests {
             epoch: 1,
             seed_units: Some(4),
             degraded: false,
+            canvas_pixels: None,
         };
         assert_eq!(request_units(&inputs, &counted), 3, "one unit per item");
         let summed = CostDimension {
@@ -2169,6 +2285,7 @@ mod tests {
             unit: CostUnit::Item,
             aggregation: CostAggregation::Count,
             user_cap_items: Some(4),
+            canvas_pixels: None,
             squeezed: false,
         };
         let halved = halved_for_retry(Some(&grant)).expect("some");
@@ -2292,6 +2409,7 @@ mod tests {
             epoch: 1,
             seed_units: Some(seed),
             degraded: false,
+            canvas_pixels: None,
         }
     }
 

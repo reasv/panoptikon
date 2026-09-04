@@ -140,6 +140,18 @@ pub struct CostDimension {
     /// conservative fallback. The ledger widens margins for these, the same
     /// way it does for a profile it has not confirmed locally.
     pub degraded: bool,
+    /// `metadata.cost.canvas_pixels`: the per-item **pixel canvas** this
+    /// model's inputs are priced against, or `None` for uncapped — see
+    /// [`canvas_from_tables`] for what the number means and the two rules
+    /// that govern reading it.
+    ///
+    /// Registry-declared only. A model whose canvas is knowable solely from
+    /// the downloaded weights (`doctr/dots_ocr`) declares nothing here and is
+    /// filled in from its own load report instead
+    /// (`ModelManager::spawn_model`), which is why this field is *not*
+    /// `pub(crate)`-final: the resolved dimension a loaded model runs under
+    /// may carry a canvas the registry never stated.
+    pub canvas_pixels: Option<u32>,
 }
 
 impl CostDimension {
@@ -151,6 +163,7 @@ impl CostDimension {
             epoch: DEFAULT_EPOCH,
             seed_units: Some(FALLBACK_SEED_UNITS),
             degraded: true,
+            canvas_pixels: None,
         }
     }
 
@@ -230,6 +243,7 @@ impl CostDimension {
                 epoch,
                 seed_units: None,
                 degraded: false,
+                canvas_pixels: None,
             };
         }
 
@@ -261,6 +275,7 @@ impl CostDimension {
         };
 
         let seed_units = resolve_seed_units(id_cost, group_cost, unit, full_inference_id);
+        let canvas_pixels = canvas_from_tables(id_cost, group_cost, unit, full_inference_id);
 
         Self {
             unit,
@@ -268,6 +283,7 @@ impl CostDimension {
             epoch,
             seed_units,
             degraded: false,
+            canvas_pixels,
         }
     }
 }
@@ -308,22 +324,11 @@ fn cost_table(metadata: &JsonMap<String, JsonValue>) -> Option<&JsonMap<String, 
 /// `None` = uncapped, which is what every model did before run2 and what an
 /// unparseable value degrades to.
 ///
-/// Not yet called: the consumer is the grant encoder
-/// (`worker.rs::encode_grant`, which forwards it to the worker as
-/// `grant.canvas_pixels`), which is owned by the ledger track of the same
-/// change set. The registry half is here because the registry schema is one
-/// thing and lives in one file.
-#[allow(dead_code)]
-pub fn resolve_canvas_pixels(registry: &Registry, full_inference_id: &str) -> Option<u32> {
-    let (group_name, inference_id) = full_inference_id.split_once('/')?;
-    let group = registry.groups.get(group_name)?;
-    let entry = group.inference_ids.get(inference_id)?;
-    let id_cost = cost_table(&entry.metadata);
-    let group_cost = cost_table(&group.group_metadata);
-    let resolved = CostDimension::from_tables(id_cost, group_cost, full_inference_id);
-    canvas_from_tables(id_cost, group_cost, resolved.unit, full_inference_id)
-}
-
+/// The consumers, all of them reading [`CostDimension::canvas_pixels`]: the
+/// grant encoder (`worker.rs::encode_grant`) forwards it to the worker as
+/// `grant.canvas_pixels`, and the dispatcher's own pricing
+/// (`dispatch::estimate_input_units`) applies the same `min` so the host's
+/// window bound and the worker's batch pricing denominate one quantity.
 fn canvas_from_tables(
     id_cost: Option<&JsonMap<String, JsonValue>>,
     group_cost: Option<&JsonMap<String, JsonValue>>,
@@ -533,12 +538,12 @@ metadata.cost.canvas_pixels = 1843200
 "#,
         );
         assert_eq!(
-            resolve_canvas_pixels(&registry, "doctr/easyocr"),
+            CostDimension::resolve(&registry, "doctr/easyocr").canvas_pixels,
             Some(6_553_600),
             "inherited from a group of the same unit"
         );
         assert_eq!(
-            resolve_canvas_pixels(&registry, "doctr/tighter"),
+            CostDimension::resolve(&registry, "doctr/tighter").canvas_pixels,
             Some(1_843_200),
             "the id's own value wins"
         );
@@ -558,10 +563,19 @@ seed_units  = 2000000
 [group.g.inference_ids.x]
 "#,
         );
-        assert_eq!(resolve_canvas_pixels(&registry, "g/x"), None);
-        assert_eq!(resolve_canvas_pixels(&registry, "g/missing"), None);
-        assert_eq!(resolve_canvas_pixels(&registry, "nogroup/x"), None);
-        assert_eq!(resolve_canvas_pixels(&registry, "unslashed"), None);
+        assert_eq!(CostDimension::resolve(&registry, "g/x").canvas_pixels, None);
+        assert_eq!(
+            CostDimension::resolve(&registry, "g/missing").canvas_pixels,
+            None
+        );
+        assert_eq!(
+            CostDimension::resolve(&registry, "nogroup/x").canvas_pixels,
+            None
+        );
+        assert_eq!(
+            CostDimension::resolve(&registry, "unslashed").canvas_pixels,
+            None
+        );
     }
 
     /// The cap is an area, so it prices nothing on a model whose unit is not
@@ -584,8 +598,14 @@ metadata.cost.aggregation = "max-times-count"
 metadata.cost.canvas_pixels = 1843200
 "#,
         );
-        assert_eq!(resolve_canvas_pixels(&registry, "clip/vit"), None);
-        assert_eq!(resolve_canvas_pixels(&registry, "clip/tokens"), None);
+        assert_eq!(
+            CostDimension::resolve(&registry, "clip/vit").canvas_pixels,
+            None
+        );
+        assert_eq!(
+            CostDimension::resolve(&registry, "clip/tokens").canvas_pixels,
+            None
+        );
     }
 
     /// Scale-bound, exactly as `seed_units` is: an id that redeclares the
@@ -613,12 +633,12 @@ metadata.cost.canvas_pixels = 1835008
 "#,
         );
         assert_eq!(
-            resolve_canvas_pixels(&registry, "clip/nemotron"),
+            CostDimension::resolve(&registry, "clip/nemotron").canvas_pixels,
             None,
             "142884 is the CLIP tower's 378^2, which would under-price a tiled VLM"
         );
         assert_eq!(
-            resolve_canvas_pixels(&registry, "clip/declared"),
+            CostDimension::resolve(&registry, "clip/declared").canvas_pixels,
             Some(1_835_008)
         );
     }
@@ -640,7 +660,11 @@ seed_units  = 2000000
 metadata.cost.canvas_pixels = {value}
 "#
             ));
-            assert_eq!(resolve_canvas_pixels(&registry, "g/x"), None, "{value}");
+            assert_eq!(
+                CostDimension::resolve(&registry, "g/x").canvas_pixels,
+                None,
+                "{value}"
+            );
         }
     }
 

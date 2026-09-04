@@ -165,9 +165,19 @@ build/deploy/API. The plan that uses this is
   floor(share/slope))`, `mb = ceil(units × slope)`; pre-fit `units =
   wanted`, `mb = share`. **On a full board pre-fit grants carry `mb = 0`
   and are memory-blind** (`:2855-2867, 2879-2880`); post-fit affordable
-  = 1 unit. `Grant{unit_budget, mb, unit, aggregation, user_cap_items}`
-  encoded on the predict frame (`worker.rs:1722-1741`); fit snapshot
-  attached when its version changed (`encode_fit`).
+  = 1 unit. `Grant{unit_budget, mb, unit, aggregation, user_cap_items,
+  canvas_pixels}` encoded on the predict frame (`worker.rs:1722-1741`); fit
+  snapshot attached when its version changed (`encode_fit`).
+- Host-side pricing of a window's content (`dispatch::request_units` →
+  `estimate_input_units`, `dispatch.rs:328-400`): `pixel` = `min(image
+  header w × h, canvas_pixels)`, unreadable header → `min(
+  PIXEL_FALLBACK_UNITS = 2 000 000, canvas)`; `token` = bytes/4;
+  `audio-second` = flat 30; `item`/`none` = 1; then `count` = item count,
+  `sum`/`max-times-count` = Σ. This is the number `request_grant` is asked
+  for, so the run2 R7 canvas is applied here as well as in the worker's
+  `price_inputs` — otherwise the window and the batches inside it are
+  denominated differently (F-B), and on the three grantless `easyocr_*` ids
+  it is the only cap that ever applies.
 - Ramp / deflation (`note_clean_window` `:926`, `note_negative_sample`
   `:966`): clean window **with ≥ 1 high-water sample** → `ramp_step + 1`;
   clean without measurement → no growth; while deflated, 3 clean windows
@@ -821,17 +831,24 @@ that lands after any of them is refused rather than reopening the row
   `alloc_delta + 500`. Board-level NVML free/total still works, so
   `free_source` stays `"nvml"`.
 - Load response also carries `reserved_at_load_mb`, `dtype`
-  (`resolved_dtype_name` :2260-2299), `gpu_uuid` (`GPU-<uuid>`,
-  suppressed on HIP), `gpu_name`, `gpu_bdf` (absent on torch 2.7.1),
-  `gpu_total_mb`, `torch_version`, `memory`.
+  (`resolved_dtype_name` :2260-2299), `canvas_pixels` (run2 R7, the
+  worker's own tier-2 reading, `packing.impl_canvas_pixels` via
+  `__main__.py`'s load arm — the host's only way to learn dots_ocr's
+  canvas), `gpu_uuid` (`GPU-<uuid>`, suppressed on HIP), `gpu_name`,
+  `gpu_bdf` (absent on torch 2.7.1), `gpu_total_mb`, `torch_version`,
+  `memory`.
 
 ### 2.2 Protocol (host↔worker)
 
 - Host → worker `predict` frame: `grant = {unit_budget, mb, unit,
   aggregation, user_cap_items|nil, canvas_pixels|nil}` (`canvas_pixels` is
-  run2 R7, from `metadata.cost.canvas_pixels`; `cost::resolve_canvas_pixels`
-  parses it, **`encode_grant` does not forward it yet**) (`ledger.rs:3953-3961`;
-  `worker.rs:1722-1739`), `fit = {slope_mb_per_unit, intercept_mb,
+  run2 R7: `canvas_from_tables` resolves `metadata.cost.canvas_pixels` into
+  `CostDimension.canvas_pixels`, `manager::canvas_in_force` folds the
+  worker's reported canvas in behind it, `WorkerEntry` carries it onto every
+  `Grant` and `encode_grant` forwards it) (`cost.rs:278`, `:332-387`;
+  `manager.rs:2479-2512`; `ledger.rs:2717`, `:3874`, `:3954-3962`,
+  `:5800-5814`; `worker.rs:2355-2367`),
+  `fit = {slope_mb_per_unit, intercept_mb,
   residual_mb, samples}` only when the version changed and only on the
   first chunk of a multi-frame window (`dispatch.rs:1140`). A grant is
   sent only when the replica has an admission; `none`-class models never
@@ -924,16 +941,16 @@ that lands after any of them is refused rather than reopening the row
 | tags/moondream-2b-25-03[-clothing] | moondream_tagger | none | – | 2 | `enable_batching = False` |
 | tagmatch/danbooru[-saucenao] | danbooru_tagger | none | – | 1 | network |
 | doctr/db_resnet50_* (7) | doctr | item / count | 8 | 1 | docTR re-batches internally |
-| doctr/dots_ocr | dotsocr | pixel / sum | 2 000 000 | 1 | min CC 8.0, ~6 GB; no `canvas_pixels` — its cap lives in the downloaded processor, so the worker's tier-2 fallback reads it |
-| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 1 | **`enable_batching = false`** → grantless; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas) |
+| doctr/dots_ocr | dotsocr | pixel / sum | 2 000 000 | 2 | min CC 8.0, ~6 GB; no `canvas_pixels` — its cap lives in the downloaded processor, so the worker's tier-2 fallback reads it and **reports it on the load response**, which is what lets the host price it too |
+| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 2 | **`enable_batching = false`** → grantless, so the **host** cap is the only cap; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas) |
 | florence2/msft_large-* (4) | florence2 | item / count | 4 | 1 | |
 | vlm/moondream-2b-25-03-* (5) | moondream_captioner | none | – | 2 | |
 | textembed/all-mpnet-base-v2, all-MiniLM-L6-v2, stella_* | sentence_transformers | token / max-times-count | 4000 | 1 | no impl-side OOM retry |
 | textembed/jina-embeddings-v3-api | jina-clip-api | none | – | 1 | remote |
 | whisper/* (15) | faster_whisper | none | – | 1 | CT2, no torch allocator |
 | clip/ViT-H-14-*, PE-Core-*, ViT-B-16-SigLIP2-384, apple_MobileCLIP-{B-LT,S2,S1} | openclip | item / count | 8 | 1 | `run_with_oom_retry` ×2 |
-| clip/qwen3-vl-embedding-{8b,2b} | qwen3-vl-embedding | pixel / sum | 2 000 000 | 1 | `canvas_pixels = 1 843 200` (MAX_PIXELS = 1800 × 32²) |
-| clip/nemotron-embed-vl-1b-v2 | nemotron-embed-vl | pixel / sum | 2 000 000 | 1 | ~2.5 GB; `canvas_pixels = 1 835 008` ((6 tiles + thumbnail) × 512²) |
+| clip/qwen3-vl-embedding-{8b,2b} | qwen3-vl-embedding | pixel / sum | 2 000 000 | 2 | `canvas_pixels = 1 843 200` (MAX_PIXELS = 1800 × 32²) |
+| clip/nemotron-embed-vl-1b-v2 | nemotron-embed-vl | pixel / sum | 2 000 000 | 2 | ~2.5 GB; `canvas_pixels = 1 835 008` ((6 tiles + thumbnail) × 512²) |
 | tclip/<openclip ids> | openclip | item / count | 8 | 1 | text tower |
 | tclip/qwen3-vl-embedding-{8b,2b} | qwen3-vl-embedding | token / max-times-count | 4000 | 2 | |
 | clap/clap-htsat-unfused, larger_clap_* | clap | item / count | 8 | 1 | **no `run_with_oom_retry`** |
@@ -1039,8 +1056,9 @@ NVML PID mismatch in containers; `free_delta` contamination; ~~fixed
 resort); reserved-vs-allocated quantisation and
 `expandable_segments` semantics; cuDNN benchmark workspace spikes on new
 shapes; ~~raw-dimension pixel pricing (20 MP charged 10× real cost for
-capped VLMs)~~ (run2 R7 caps each item at the model's canvas, though the host
-does not forward the registry figure yet) and `bytes/4` token pricing (CJK under-priced ~3×, long
+capped VLMs)~~ (run2 R7 caps each item at the model's canvas, on both sides:
+the host applies the same `min` in `dispatch::estimate_input_units`) and
+`bytes/4` token pricing (CJK under-priced ~3×, long
 texts over-priced); measurement brackets CPU decode time (collapse
 detector can trip on slow-decoding inputs); no NVML until torch
 initialises CUDA on a multi-GPU index pin; `touched_gpu` gate misses

@@ -803,6 +803,13 @@ struct WorkerEntry {
     /// unconfirmed profile for margin purposes — and permanently, since a
     /// missing declaration is never confirmed by measurement.
     degraded: bool,
+    /// The per-item pixel canvas this model's inputs are priced against
+    /// (run2 change R7), or `None` for uncapped. Whatever the manager
+    /// resolved for the loaded model — the registry's declaration, else the
+    /// canvas the worker reported for itself at load — carried here purely so
+    /// every grant this replica is issued can state it on the wire
+    /// ([`Grant::canvas_pixels`]).
+    canvas_pixels: Option<u32>,
     /// The rest of the profile key, from the load response. `None` (either
     /// of them) means this replica cannot be keyed and its calibration is
     /// never persisted — an unkeyed entry could not be read back safely.
@@ -2707,6 +2714,7 @@ impl VramLedger {
                 aggregation,
                 epoch: cost.epoch,
                 degraded: cost.degraded,
+                canvas_pixels: cost.canvas_pixels,
                 torch: report.torch_version.clone(),
                 dtype: report.dtype.clone(),
                 dtype_method: report.dtype_method.clone(),
@@ -3794,7 +3802,16 @@ impl VramLedger {
         };
         let headroom = self.headroom_with_margin_locked(&state, &gpu, margin);
         let share = self.share_locked(&state, worker, headroom);
-        let (mut unit_budget, mut mb, unit, aggregation, squeezed, knee_bound, ample_headroom) = {
+        let (
+            mut unit_budget,
+            mut mb,
+            unit,
+            aggregation,
+            canvas_pixels,
+            squeezed,
+            knee_bound,
+            ample_headroom,
+        ) = {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
             let fit = Self::pricing_fit_locked(&state, entry);
@@ -3854,6 +3871,7 @@ impl VramLedger {
                 mb,
                 entry.unit,
                 entry.aggregation,
+                entry.canvas_pixels,
                 squeezed,
                 knee_bound,
                 // A squeezed window never had room to spare, whatever the
@@ -3939,6 +3957,7 @@ impl VramLedger {
                 unit,
                 aggregation,
                 user_cap_items,
+                canvas_pixels,
                 squeezed,
             },
             settled: false,
@@ -5781,6 +5800,18 @@ pub struct Grant {
     /// The user's per-request "max batch size", forwarded as an item-count
     /// constraint. Never converted to units.
     pub user_cap_items: Option<u32>,
+    /// The model's per-item **pixel canvas** (run2 change R7): the largest
+    /// number of decoded pixels one input can actually cost it, whatever
+    /// resolution it was submitted at. `None` = uncapped, which is what every
+    /// model did before run2.
+    ///
+    /// Forwarded to the worker, which prices every input at
+    /// `min(raw_pixels, canvas_pixels)` before packing this budget. The host
+    /// applies the same `min` when it prices the window
+    /// (`dispatch::estimate_input_units`), so the two sides denominate one
+    /// quantity by construction rather than by agreement between two
+    /// independent resolutions.
+    pub canvas_pixels: Option<u32>,
     /// Whether *memory* is what held this window back, as opposed to the ramp,
     /// the ratchet or the amount of work in hand (the same flag that decides
     /// whether an idle neighbour is asked to trim its pool). The dispatcher
@@ -6459,6 +6490,7 @@ mod tests {
             epoch: 1,
             seed_units: Some(seed),
             degraded: false,
+            canvas_pixels: None,
         }
     }
 
@@ -6671,6 +6703,50 @@ mod tests {
             .calibration_state("g/a", BOARD)
             .map(|state| state.samples.len())
             .unwrap_or(0)
+    }
+
+    /// Every grant this replica is issued states the model's per-item pixel
+    /// canvas (run2 change R7), carried from the cost dimension the manager
+    /// resolved at load. It is what the worker prices its inputs at, so a
+    /// grant that dropped it would leave the two sides pricing different
+    /// quantities — the host's window in capped pixels, the worker's batches
+    /// in raw ones.
+    #[test]
+    fn a_grant_states_the_models_pixel_canvas() {
+        let pixel_cost = |canvas_pixels| CostDimension {
+            unit: CostUnit::Pixel,
+            aggregation: Some(CostAggregation::Sum),
+            epoch: 1,
+            seed_units: Some(2_000_000),
+            degraded: false,
+            canvas_pixels,
+        };
+        let ledger = ledger(10_000, VramBudget::default());
+        let handle = loaded(Some(1500), Some(1000));
+        let admission = ledger
+            .register_worker("g/a", pixel_cost(Some(1_835_008)), &handle, None)
+            .expect("registers");
+        let token = admission
+            .request_grant(4_000_000, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().canvas_pixels, Some(1_835_008));
+        assert_eq!(token.grant().unit, CostUnit::Pixel);
+        drop(token);
+        drop(admission);
+
+        // Uncapped stays uncapped: absent is what every model did before run2.
+        let handle = loaded(Some(1500), Some(1000));
+        let admission = ledger
+            .register_worker("g/b", pixel_cost(None), &handle, None)
+            .expect("registers");
+        assert_eq!(
+            admission
+                .request_grant(4_000_000, None, 1, 0)
+                .expect("granted")
+                .grant()
+                .canvas_pixels,
+            None
+        );
     }
 
     /// The whole formula block on one worker and one board.
@@ -8705,6 +8781,7 @@ mod tests {
             epoch: 1,
             seed_units: None,
             degraded: false,
+            canvas_pixels: None,
         };
         assert!(
             ledger
@@ -11155,6 +11232,7 @@ mod tests {
             epoch: 1,
             seed_units: None,
             degraded: false,
+            canvas_pixels: None,
         };
         // A neighbour is resident and hungry while the none-class model loads.
         let handle = loaded(Some(1000), Some(0));

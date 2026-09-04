@@ -779,6 +779,40 @@ def test_load_memory_fields_are_optional(worker: WorkerProcess) -> None:
         assert set(sample) == set(MEMORY_SAMPLE_KEYS)
 
 
+@pytest.mark.parametrize(
+    "tier,expected",
+    [
+        ("one", 1_843_200),
+        ("two", 11_289_600),
+        ("none", None),
+        ("floored", None),
+    ],
+)
+def test_load_reports_the_resolved_pixel_canvas(
+    worker: WorkerProcess, tier: str, expected: int | None
+) -> None:
+    # Expected behavior (run2 R7, protocol doc "Memory sensing"): the `load`
+    # ok response carries `canvas_pixels` — the per-item pixel canvas this
+    # worker could read off the loaded impl. It is the orchestrator's only
+    # way to learn a canvas that lives in a processor config downloaded with
+    # the weights, and it is *absent*, never zero and never a guess, when
+    # nothing could be read or the reading fell below the floor that guards
+    # against a misidentified attribute.
+    worker.send(handshake_msg(req_id=1, impl_class="canvas_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2, config={"canvas_tier": tier}))
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "load", "id": 3})
+    resp = worker.recv()
+    assert resp["type"] == "ok", resp
+    assert resp.get("canvas_pixels") == expected, resp
+
+    worker.send({"type": "unload", "id": 4})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
 def test_predict_reports_one_measurement_per_call(worker: WorkerProcess) -> None:
     # Expected behavior: `measurements` is always reported (the input count
     # and wall time need no torch), one entry per GPU batch — one for the

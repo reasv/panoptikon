@@ -351,16 +351,31 @@ Notes:
   **`metadata.cost.canvas_pixels`** (an area, so the name says what it is —
   the placeholder name `unit_cap_per_item` said only what it did to a price).
   The registry declares it per model; `panoptikon/src/inferio/cost.rs`
-  resolves it, reading it only for a `pixel` unit and never inheriting it
-  across a unit change, the same scale-bound rule `seed_units` has; the
-  orchestrator forwards it on the grant as `canvas_pixels`; and the worker
-  prices every input at `min(raw_pixels, canvas_pixels)` in `price_inputs`.
+  resolves it into the model's `CostDimension`, reading it only for a `pixel`
+  unit and never inheriting it across a unit change, the same scale-bound rule
+  `seed_units` has. **Both sides then price the same quantity**: the
+  dispatcher applies `min(raw_pixels, canvas_pixels)` to the header estimate
+  it sizes windows and asks for grants with (`estimate_input_units`), and the
+  grant carries the figure to the worker, which applies the same `min` after
+  decode in `price_inputs`. Capping only one side would leave the window bound
+  denominated in raw pixels and the batches inside it in capped ones, which is
+  the shape F-B measured; and for a model running with `enable_batching =
+  false` — the three `easyocr_*` ids — the worker takes the grantless path and
+  applies no cap at all, so the host's is the only one there is.
   A model whose canvas lives in a processor downloaded with the weights
   rather than in the registry is covered by a documented fallback — the
   worker reads the loaded impl's own `max_pixels`/`canvas_pixels` attribute,
-  floored at 512^2 so a misidentified attribute cannot *under*-price an item.
-  Absent everywhere = uncapped, exactly as before. Wire and worker details:
-  `docs/inferio-worker-protocol.md`, "Memory grants".
+  floored at 512^2 so a misidentified attribute cannot *under*-price an item —
+  and **reports what it resolved on its `load` response**, so the orchestrator
+  can price that model's windows by it too. A registry declaration always
+  wins: it is the statement a maintainer wrote, reviewed and can correct,
+  where the reading is an attribute off an object graph nobody here controls.
+  Absent everywhere = uncapped, exactly as before. Declaring a canvas changes
+  what one *unit* of that model means, so it bumps `metadata.cost.epoch` like
+  any other change to memory behaviour that moves no key component: a slope
+  fitted against raw pixels would otherwise be applied to capped ones and
+  under-predict, which over-admits. Wire and worker details:
+  `docs/inferio-worker-protocol.md`, "Memory grants" and "Memory sensing".
 - Backends without a free-memory query (MPS, CPU) degrade to no
   admission: seed-sized fixed batches plus the Package-1 backstop, the
   same class as `none`.
