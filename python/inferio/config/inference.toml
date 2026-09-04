@@ -285,6 +285,13 @@ metadata.description = "(Recommended) EasyOCR - English Text, Standard Recog Net
 # pipelining**), because window depth — and therefore how much material the
 # bucketer gets — is what decides whether it holds, and that cannot be
 # asserted from a unit test.
+# Run2 D1-b: "max-size" above is now the *canvas* size, not the raw one. The
+# impl resizes every input onto the detector's 2560px canvas before it pads a
+# batch (`inferio/impl/eocr.py`, `fit_to_canvas`), so the padded tensor is
+# bounded by the `canvas_pixels` declared below and a batch costs what it was
+# charged for. The harness also breaks ties among equally-priced items by raw
+# size, so a bucket stays size-homogeneous even though the cap prices every
+# item at or above the canvas alike.
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000
