@@ -743,13 +743,45 @@ pub struct FitSnapshot {
     pub version: u64,
 }
 
+/// Which host-side tier read an out-of-memory condition out of a window's
+/// **error frame** — the path that carries no measurement, and therefore none
+/// of the worker's own `oom_class` (run2 defect C2).
+///
+/// Both tiers are trusted; the distinction is for the operator's log, so that
+/// "the worker said so in as many words" is never confused with "the host
+/// recognised the prose".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorFrameOom {
+    /// This project's own `INFERENCE_OOM_*` sentinel, which the worker emits
+    /// only after having classified the failure itself — so the host is
+    /// reading a *classification*, not prose. Named `marker` in the log, the
+    /// same tier the measurement path spells that way.
+    Marker,
+    /// The frame's message or traceback matched the host's allocator/driver
+    /// patterns ([`message_oom_tier`]). Named `error_frame`.
+    Prose,
+}
+
+impl ErrorFrameOom {
+    /// The tier's name in the log, alongside the worker's own
+    /// `oom_class.source` spellings.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Marker => OOM_SOURCE_MARKER,
+            Self::Prose => OOM_SOURCE_ERROR_FRAME,
+        }
+    }
+}
+
 /// Outcome of one dispatched window, as the ledger needs to see it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowOutcome {
     /// A response frame landed (success, or a per-request error the worker
     /// survived): ingest the measurements and count the window clean unless
-    /// it — or the error message — reported an out-of-memory condition.
-    Responded { oom: bool },
+    /// it — or the error frame — reported an out-of-memory condition. `Some`
+    /// carries *which* tier read the error frame, for the negative's log line
+    /// (run2 defect C2).
+    Responded { oom: Option<ErrorFrameOom> },
     /// The window was aborted: dispatcher teardown, a dropped task, a
     /// neighbour's death taking the model down. Nothing was measured, so
     /// nothing is learned — no ramp progress and no deflation.
@@ -1278,6 +1310,72 @@ struct Settled {
     /// What this window taught the ledger, for the log. Owns its strings so
     /// the line is formatted after the lock is dropped.
     window: Option<WindowSettled>,
+    /// Which tier classified this window's out-of-memory, when it was one
+    /// (run2 defect C2). Emitted beside [`Self::window`]'s negative WARN.
+    oom: Option<OomNegative>,
+}
+
+/// Which tier classified one window as an out-of-memory negative, and on what
+/// evidence (run2 defect C2).
+///
+/// Before this, only the **vetoed** path said anything: a classification the
+/// ledger trusted outright — `typed_exception`, `marker`, an unrecognised
+/// tier, a pre-run2 worker, the host's own read of an error frame — deflated
+/// the replica and left no trace in the gateway log at all. The negative was
+/// visible ("settled a granted window", `reason="oom"`); *who decided it* was
+/// not, so neither an operator nor the protocol's `analyze.py` could tell a
+/// real allocator failure from prose the host had recognised. One line per
+/// negative window closes that.
+///
+/// Owns its strings so the line is formatted after the lock is dropped, like
+/// every other alarm the settle path raises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OomNegative {
+    inference_id: String,
+    gpu: String,
+    /// The tier: one of the worker's `oom_class.source` spellings
+    /// ([`OOM_SOURCE_TYPED`], [`OOM_SOURCE_MARKER`],
+    /// [`OOM_SOURCE_MESSAGE_PATTERN`], or a tier this host does not
+    /// recognise), [`OOM_SOURCE_ERROR_FRAME`] when the host classified the
+    /// window's error frame, or `unclassified` for a pre-run2 worker's bare
+    /// `oom` flag.
+    source: String,
+    /// The exception type the worker named. `unknown` when the classification
+    /// carried none — the error-frame path, and a pre-run2 worker.
+    exception: String,
+    /// [`OomTrust`], as the log spells it.
+    trust: &'static str,
+    /// The worker's live free reading at the instant of the failure, and
+    /// **-1** when the classification carried none: the error-frame path, or a
+    /// backend that reports no memory statistics. A sentinel rather than an
+    /// absent field so the value is a number in every line.
+    free_mb_at_failure: i64,
+    /// The envelope this window was priced at, which is what the veto weighs a
+    /// message-pattern reading against and what deflation acts on. `0` is a
+    /// memory-blind grant, which states no envelope.
+    grant_mb: u64,
+    /// How many of this window's measurements carried a trusted out-of-memory.
+    /// `0` when the classification came from the error frame instead.
+    oom_samples: usize,
+}
+
+impl OomNegative {
+    fn emit(self) {
+        tracing::info!(
+            model = %self.inference_id,
+            gpu = %self.gpu,
+            source = %self.source,
+            exception = %self.exception,
+            trust = self.trust,
+            free_mb_at_failure = self.free_mb_at_failure,
+            grant_mb = self.grant_mb,
+            oom_samples = self.oom_samples,
+            "classified this window as an out-of-memory negative: naming the \
+             tier that decided it, because a classification the ledger trusts \
+             outright is acted on silently otherwise and the deflation it \
+             causes cannot be attributed from the log (run2 defect C2)"
+        );
+    }
 }
 
 /// One settled window as the log describes it: the outcome, what the ingest
@@ -1402,8 +1500,22 @@ impl DeathNegative {
     }
 }
 
+/// One measurement's out-of-memory classification, as the ingest believed it
+/// (run2 defect C2). Carried out of the ingest so the settle path can name the
+/// tier on the negative it records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OomEvidence {
+    /// The worker's `oom_class.source`, or `unclassified` for a pre-run2
+    /// worker's bare `oom` flag.
+    source: String,
+    /// The worker's `oom_class.exception`, or `unknown` when it sent no class.
+    exception: String,
+    free_mb_at_failure: Option<u64>,
+    trust: OomTrust,
+}
+
 /// What one telemetry ingest found.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Ingested {
     /// At least one measurement reported an OOM or a throughput collapse.
     negative: bool,
@@ -1417,6 +1529,12 @@ struct Ingested {
     /// fold into [`Self::negative`], which is what the accounting reads.
     oom: bool,
     throughput_collapse: bool,
+    /// The **first** trusted out-of-memory classification this window carried,
+    /// and how many of its measurements carried one (run2 defect C2). The
+    /// first, because one line per settled window is what the log wants and a
+    /// window's batches fail the same way; the count says how many there were.
+    oom_evidence: Option<OomEvidence>,
+    oom_samples: usize,
 }
 
 /// Whether this board's free reading is worth a live driver query right now.
@@ -4183,6 +4301,11 @@ impl VramLedger {
         if let Some(expiry) = settled.knee_expiry {
             expiry.emit();
         }
+        // Before the window's own line, so the classification reads as the
+        // reason for the negative that follows it.
+        if let Some(oom) = settled.oom {
+            oom.emit();
+        }
         if let Some(window) = settled.window {
             window.emit();
         }
@@ -4224,7 +4347,7 @@ impl VramLedger {
         // the worker would never see it. Re-sending is free (advisory, and
         // idempotent on the worker side), so the conservative direction is to
         // re-attach whenever delivery is in doubt.
-        if !matches!(outcome, WindowOutcome::Responded { oom: false }) {
+        if !matches!(outcome, WindowOutcome::Responded { oom: None }) {
             entry.fit_version_sent = 0;
         }
         let ingested = Self::ingest_locked(&mut state, worker, granted_units);
@@ -4233,8 +4356,14 @@ impl VramLedger {
         let mut knee_expiry: Option<KneeExpired> = None;
         // Hoisted for the settle log only; the accounting below is unchanged.
         let mut responded_negative = false;
+        // Which tier read the window's own error frame, when that is what
+        // classified it (run2 defect C2).
+        let frame_oom = match outcome {
+            WindowOutcome::Responded { oom } => oom,
+            _ => None,
+        };
         if let WindowOutcome::Responded { oom } = outcome {
-            let negative = ingested.negative || oom;
+            let negative = ingested.negative || oom.is_some();
             responded_negative = negative;
             // Read *after* the ingest: this window's own high-water batches have
             // moved the anchor by now, and the ramp grows from the exponent that
@@ -4278,7 +4407,7 @@ impl VramLedger {
                 WindowOutcome::WorkerDied => "worker_died",
             },
             negative_reason: if responded_negative {
-                if matches!(outcome, WindowOutcome::Responded { oom: true }) || ingested.oom {
+                if frame_oom.is_some() || ingested.oom {
                     Some("oom")
                 } else {
                     Some("throughput_collapse")
@@ -4295,11 +4424,28 @@ impl VramLedger {
             clean_windows: entry.clean_windows,
             max_units_measured: Self::anchor_locked(&state, entry),
         });
+        // Keyed off the very `negative_reason` the window's own WARN prints,
+        // so the tier line and the negative it explains can never disagree
+        // about whether this window was an out-of-memory at all.
+        let oom = window
+            .as_ref()
+            .filter(|window| window.negative_reason == Some("oom"))
+            .and_then(|window| {
+                oom_negative(
+                    &window.inference_id,
+                    &window.gpu,
+                    ingested.oom_evidence.as_ref(),
+                    frame_oom,
+                    charge.map_or(0, |charge| charge.mb),
+                    ingested.oom_samples,
+                )
+            });
         Settled {
             update,
             death,
             knee_expiry,
             window,
+            oom,
         }
     }
 
@@ -4621,6 +4767,11 @@ impl VramLedger {
         // message-pattern OOM this window's own free readings contradicted
         // (run2 change R3, host half).
         let mut contradicted_ooms: Vec<(u64, u64)> = Vec::new();
+        // The out-of-memory classifications this window's measurements carried
+        // and the ledger believed, for the negative's log line (run2 defect
+        // C2). The first is the one named; the count is reported beside it.
+        let mut trusted_oom: Option<OomEvidence> = None;
+        let mut trusted_ooms = 0usize;
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -4692,7 +4843,11 @@ impl VramLedger {
             // negative — it is B11, and B11 deflated a healthy model 15 times.
             let oom = match oom_verdict(measurement, window.as_ref()) {
                 OomVerdict::None => false,
-                OomVerdict::Trusted => true,
+                OomVerdict::Trusted(trust) => {
+                    trusted_ooms += 1;
+                    trusted_oom.get_or_insert_with(|| oom_evidence(measurement, trust));
+                    true
+                }
                 OomVerdict::Contradicted { free_mb, grant_mb } => {
                     contradicted_ooms.push((free_mb, grant_mb));
                     false
@@ -4961,6 +5116,8 @@ impl VramLedger {
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
+            oom_evidence: trusted_oom,
+            oom_samples: trusted_ooms,
         }
     }
 
@@ -6058,6 +6215,22 @@ impl GrantToken {
         self.settled = true;
         self.ledger.settle(self.worker, self.grant_id, outcome);
     }
+
+    /// [`Self::finish`], handing the caller what the settle *produced* rather
+    /// than logging it. This crate asserts on a diagnostic as the decision it
+    /// is rather than by scraping a subscriber (review F8), and the
+    /// out-of-memory tier line (run2 defect C2) is asserted that way too.
+    ///
+    /// The accounting is identical — the same `settle_locked` — but the
+    /// post-lock hand-offs are the caller's: no alarm is emitted and no store
+    /// update is recorded, so a test that needs the store must use
+    /// [`Self::finish`].
+    #[cfg(test)]
+    fn finish_for_test(mut self, outcome: WindowOutcome) -> Settled {
+        self.settled = true;
+        self.ledger
+            .settle_locked(self.worker, self.grant_id, outcome)
+    }
 }
 
 impl Drop for GrantToken {
@@ -6188,6 +6361,46 @@ const OOM_DEVICE_TOKENS: [&str; 6] = ["cuda", "hip", "rocm", "nvml", "xpu", "syc
 pub const OOM_SOURCE_TYPED: &str = "typed_exception";
 pub const OOM_SOURCE_MARKER: &str = "marker";
 pub const OOM_SOURCE_MESSAGE_PATTERN: &str = "message_pattern";
+/// The host's own tier, for a window that failed with no measurement to carry
+/// a class: the error frame's prose matched [`message_oom_tier`]. Not a
+/// value any worker sends — it names the host as the classifier, which is
+/// exactly what the operator needs to know (run2 defect C2).
+pub const OOM_SOURCE_ERROR_FRAME: &str = "error_frame";
+/// A measurement that claimed `oom` and carried no class at all: a pre-run2
+/// worker, whose bare flag is the contract it was written to.
+pub const OOM_SOURCE_UNCLASSIFIED: &str = "unclassified";
+/// What the log prints for an exception type no classification named.
+const OOM_EXCEPTION_UNKNOWN: &str = "unknown";
+
+/// Why the ledger believed an out-of-memory report it acted on (run2 defect
+/// C2). Logged on every negative so the tier that classified it is evidenced
+/// in the gateway log rather than inferable only from the worker's wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OomTrust {
+    /// The tier is structural on its own and there is nothing to corroborate:
+    /// `typed_exception`, `marker`, a tier this host does not recognise, a
+    /// pre-run2 worker's bare `oom` flag, or the host's own error-frame read.
+    Outright,
+    /// `message_pattern`, and the worker's live free reading at the moment of
+    /// the failure was **below** the envelope this window was priced at — the
+    /// board's own arithmetic agrees a batch this size was too big.
+    Corroborated,
+    /// `message_pattern` with nothing to weigh it against: the worker took no
+    /// free reading, or the grant was memory-blind (`mb == 0`) and states no
+    /// envelope. Believed, because the free reading is a **veto** and not a
+    /// requirement ([`oom_verdict`]), but no independent evidence backs it.
+    Unopposed,
+}
+
+impl OomTrust {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Outright => "trusted",
+            Self::Corroborated => "corroborated",
+            Self::Unopposed => "unopposed",
+        }
+    }
+}
 
 /// What the ledger makes of one measurement's out-of-memory claim (run2
 /// change R3, host half).
@@ -6195,8 +6408,9 @@ pub const OOM_SOURCE_MESSAGE_PATTERN: &str = "message_pattern";
 enum OomVerdict {
     /// No out-of-memory condition claimed.
     None,
-    /// Claimed and believed: the window deflates.
-    Trusted,
+    /// Claimed and believed: the window deflates. Carries *why* it was
+    /// believed, for the negative's log line (run2 defect C2).
+    Trusted(OomTrust),
     /// Claimed from a **message pattern** alone, and the worker's own live
     /// free reading at the instant of the failure says the board had at least
     /// the whole envelope this window was priced at. Not a negative.
@@ -6256,10 +6470,10 @@ fn oom_verdict(measurement: &BatchMeasurement, window: Option<&GrantCharge>) -> 
     let Some(class) = measurement.oom_class.as_ref() else {
         // A pre-run2 worker, whose bare `oom` is the contract it was
         // written to.
-        return OomVerdict::Trusted;
+        return OomVerdict::Trusted(OomTrust::Outright);
     };
     match class.source.as_str() {
-        OOM_SOURCE_TYPED | OOM_SOURCE_MARKER => OomVerdict::Trusted,
+        OOM_SOURCE_TYPED | OOM_SOURCE_MARKER => OomVerdict::Trusted(OomTrust::Outright),
         OOM_SOURCE_MESSAGE_PATTERN => {
             let (Some(free_mb), Some(grant_mb)) = (
                 class.free_mb_at_failure,
@@ -6267,18 +6481,86 @@ fn oom_verdict(measurement: &BatchMeasurement, window: Option<&GrantCharge>) -> 
             ) else {
                 // Nothing independent to weigh it against; the veto cannot
                 // fire and the classification stands.
-                return OomVerdict::Trusted;
+                return OomVerdict::Trusted(OomTrust::Unopposed);
             };
             if free_mb >= grant_mb {
                 OomVerdict::Contradicted { free_mb, grant_mb }
             } else {
-                OomVerdict::Trusted
+                OomVerdict::Trusted(OomTrust::Corroborated)
             }
         }
         // A tier a future worker invented. The safe direction for an
         // unknown memory signal is to believe it.
-        _ => OomVerdict::Trusted,
+        _ => OomVerdict::Trusted(OomTrust::Outright),
     }
+}
+
+/// What the log says of a measurement whose out-of-memory the ledger believed
+/// (run2 defect C2).
+fn oom_evidence(measurement: &BatchMeasurement, trust: OomTrust) -> OomEvidence {
+    match measurement.oom_class.as_ref() {
+        Some(class) => OomEvidence {
+            source: class.source.clone(),
+            exception: class.exception.clone(),
+            free_mb_at_failure: class.free_mb_at_failure,
+            trust,
+        },
+        // A pre-run2 worker's bare `oom` flag. Believed as it always was, and
+        // it names neither a tier nor an exception — which is itself worth
+        // seeing in the log, because it dates the worker on the other end.
+        None => OomEvidence {
+            source: OOM_SOURCE_UNCLASSIFIED.to_owned(),
+            exception: OOM_EXCEPTION_UNKNOWN.to_owned(),
+            free_mb_at_failure: None,
+            trust,
+        },
+    }
+}
+
+/// The line one settled window logs when it is recorded as an out-of-memory
+/// negative (run2 defect C2). `None` when it is not one.
+///
+/// A **measurement's** classification is preferred over the host's read of the
+/// error frame whenever the window carried one: it is the more specific
+/// statement, made in the process that raised the failure and with a live free
+/// reading beside it, where the error-frame tier is only what the host could
+/// infer from the text once no measurement survived. Both are trusted, so the
+/// preference changes nothing about the verdict — only about who the log
+/// credits with it.
+fn oom_negative(
+    inference_id: &str,
+    gpu: &str,
+    evidence: Option<&OomEvidence>,
+    frame: Option<ErrorFrameOom>,
+    grant_mb: u64,
+    oom_samples: usize,
+) -> Option<OomNegative> {
+    let (source, exception, free_mb_at_failure, trust) = match (evidence, frame) {
+        (Some(evidence), _) => (
+            evidence.source.clone(),
+            evidence.exception.clone(),
+            evidence.free_mb_at_failure,
+            evidence.trust,
+        ),
+        (None, Some(tier)) => (
+            tier.as_str().to_owned(),
+            OOM_EXCEPTION_UNKNOWN.to_owned(),
+            None,
+            OomTrust::Outright,
+        ),
+        (None, None) => return None,
+    };
+    Some(OomNegative {
+        inference_id: inference_id.to_owned(),
+        gpu: gpu.to_owned(),
+        source,
+        exception,
+        trust: trust.as_str(),
+        free_mb_at_failure: free_mb_at_failure
+            .map_or(-1, |mb| i64::try_from(mb).unwrap_or(i64::MAX)),
+        grant_mb,
+        oom_samples,
+    })
 }
 
 /// Whether `token` occurs in `line` bounded by non-word characters on both
@@ -6298,8 +6580,10 @@ fn contains_word(line: &str, token: &str) -> bool {
     })
 }
 
-/// Whether an error message from a worker names an out-of-memory condition
-/// the ledger should treat as a negative sample.
+/// Which tier of an error message from a worker names an out-of-memory
+/// condition the ledger should treat as a negative sample —
+/// [`ErrorFrameOom::Marker`] for the project's own sentinel,
+/// [`ErrorFrameOom::Prose`] for a recognised wording, `None` for neither.
 ///
 /// Both `INFERENCE_OOM_*` prefixes are contract
 /// (docs/inferio-worker-protocol.md) and are markers this project emits after
@@ -6330,12 +6614,15 @@ fn contains_word(line: &str, token: &str) -> bool {
 /// — a Python traceback names `torch/cuda/__init__.py` in its frames, and `/`
 /// is a word boundary, so a whole-blob test would let any B11-shaped message
 /// in a CUDA stack match on a token from a *file path*.
-pub fn message_reports_oom(message: &str) -> bool {
+///
+/// **Which** tier matched changes no verdict — both deflate — and exists so
+/// the negative's log line can name its classifier (run2 defect C2).
+pub fn message_oom_tier(message: &str) -> Option<ErrorFrameOom> {
     if message.contains("INFERENCE_OOM_BATCH_SIZE_1:") || message.contains("INFERENCE_OOM_WINDOW:")
     {
-        return true;
+        return Some(ErrorFrameOom::Marker);
     }
-    message.lines().any(|line| {
+    let prose = message.lines().any(|line| {
         let lowered = line.to_ascii_lowercase();
         OOM_MESSAGE_PATTERNS
             .iter()
@@ -6347,7 +6634,15 @@ pub fn message_reports_oom(message: &str) -> bool {
                 && OOM_DEVICE_TOKENS
                     .iter()
                     .any(|token| contains_word(&lowered, token)))
-    })
+    });
+    prose.then_some(ErrorFrameOom::Prose)
+}
+
+/// [`message_oom_tier`] as the predicate the worker-protocol parity tests
+/// assert against. The dispatcher takes the tier itself.
+#[cfg(test)]
+pub fn message_reports_oom(message: &str) -> bool {
+    message_oom_tier(message).is_some()
 }
 
 /// Robust two-parameter fit of `delta_mb ≈ intercept + slope × units` over
@@ -7119,7 +7414,7 @@ mod tests {
         admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted")
-            .finish(WindowOutcome::Responded { oom: false });
+            .finish(WindowOutcome::Responded { oom: None });
     }
 
     /// A clean window that reports one pool-growing batch of `units`, and the
@@ -7139,7 +7434,7 @@ mod tests {
             .lock()
             .unwrap()
             .record_measurements(vec![measurement(units, 0, 10 * units + 100)]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         granted
     }
 
@@ -7248,7 +7543,7 @@ mod tests {
             measurement_with_free(4, 10, 20, 10_000, "nvml"),
             measurement_with_free(4, 20, 30, 20_000, "nvml"),
         ]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0].external_mb,
             32_000 - 20_000 - 1_000,
@@ -7279,7 +7574,7 @@ mod tests {
             .lock()
             .unwrap()
             .record_measurements(vec![measurement_with_free(4, 0, 10, 5_000, "torch")]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(ledger.health()[0].external_mb, 1_000, "unmoved");
 
         // An authoritative reading whose response claims a total that does not
@@ -7297,7 +7592,7 @@ mod tests {
             }));
             telemetry.record_measurements(vec![measurement_with_free(4, 0, 10, 6_000, "nvml")]);
         }
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0].external_mb,
             1_000,
@@ -7311,7 +7606,7 @@ mod tests {
             telemetry.memory = None;
             telemetry.record_measurements(vec![measurement_with_free(4, 0, 10, 25_000, "nvml")]);
         }
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(ledger.health()[0].external_mb, 32_000 - 25_000 - 1_000);
     }
 
@@ -7337,7 +7632,9 @@ mod tests {
                 oom: true,
                 ..measurement_with_free(4, 0, 10, 2_000, "nvml")
             }]);
-        token.finish(WindowOutcome::Responded { oom: true });
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        });
         assert_eq!(
             ledger.health()[0].external_mb,
             32_000 - 2_000 - 1_000,
@@ -7746,7 +8043,9 @@ mod tests {
             "seed 4 << 4 measured windows"
         );
         // An OOM-classified window deflates by one halving.
-        token.finish(WindowOutcome::Responded { oom: true });
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 32, "halved");
         // A worker-reported throughput collapse is the same signal — this is
@@ -7762,7 +8061,7 @@ mod tests {
                 throughput_collapse: true,
                 ..measurement(64, 0, 5000)
             }]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(
             token.grant().unit_budget,
@@ -7799,7 +8098,9 @@ mod tests {
             admission
                 .request_grant(u64::MAX, None, 1, 0)
                 .unwrap()
-                .finish(WindowOutcome::Responded { oom: true });
+                .finish(WindowOutcome::Responded {
+                    oom: Some(ErrorFrameOom::Prose),
+                });
         }
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 1, "one unit, and no lower");
@@ -7838,7 +8139,9 @@ mod tests {
             admission
                 .request_grant(u64::MAX, None, 1, 0)
                 .unwrap()
-                .finish(WindowOutcome::Responded { oom: true });
+                .finish(WindowOutcome::Responded {
+                    oom: Some(ErrorFrameOom::Prose),
+                });
         }
         let worker = &ledger.health()[0].workers[0];
         assert_eq!(worker.deflation, deflation_cap(32, 4));
@@ -7871,7 +8174,9 @@ mod tests {
             admission
                 .request_grant(u64::MAX, None, 1, 0)
                 .unwrap()
-                .finish(WindowOutcome::Responded { oom: true });
+                .finish(WindowOutcome::Responded {
+                    oom: Some(ErrorFrameOom::Prose),
+                });
         }
         assert_eq!(ledger.health()[0].workers[0].deflation, 3);
 
@@ -7917,7 +8222,9 @@ mod tests {
             admission
                 .request_grant(u64::MAX, None, 1, 0)
                 .unwrap()
-                .finish(WindowOutcome::Responded { oom: true });
+                .finish(WindowOutcome::Responded {
+                    oom: Some(ErrorFrameOom::Prose),
+                });
         }
         assert_eq!(
             admission.window_target_units(),
@@ -7954,7 +8261,9 @@ mod tests {
             admission
                 .request_grant(u64::MAX, None, 1, 0)
                 .unwrap()
-                .finish(WindowOutcome::Responded { oom: true });
+                .finish(WindowOutcome::Responded {
+                    oom: Some(ErrorFrameOom::Prose),
+                });
         }
         assert_eq!(ledger.health()[0].workers[0].deflation, 3);
         drop(admission);
@@ -8174,13 +8483,15 @@ mod tests {
 
         // A clean response is the one outcome that settles it as delivered.
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert!(admission.fit_to_send().is_none(), "delivered and unchanged");
 
         // A window that responded with an OOM went through the per-request
         // fallback, whose frames carry no snapshot — so it re-arms too.
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        token.finish(WindowOutcome::Responded { oom: true });
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        });
         assert!(admission.fit_to_send().is_some());
     }
 
@@ -10471,7 +10782,7 @@ mod tests {
             .lock()
             .unwrap()
             .record_measurements(vec![measurement(2, 0, 140)]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
 
         let updates = profiles.updates.lock().unwrap();
         assert!(
@@ -11850,7 +12161,7 @@ mod tests {
         // 3 requests in the window, 2 still queued behind it.
         let token = admission.request_grant(u64::MAX, None, 3, 2).unwrap();
         assert_eq!(ledger.health()[0].workers[0].pending_requests, 5);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0].workers[0].pending_requests,
             2,
@@ -12564,7 +12875,7 @@ mod tests {
                 .map(|(units, rate_)| warm_batch(*units, *rate_))
                 .collect(),
         );
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
     }
 
     /// The canonical shape the knee exists to find, run through as windows: a
@@ -13354,7 +13665,7 @@ mod tests {
             // The one that counts.
             warm_batch(8, 500.0),
         ]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
 
         assert_eq!(
             ledger.health()[0].workers[0].throughput_samples,
@@ -13413,7 +13724,7 @@ mod tests {
             .lock()
             .unwrap()
             .record_measurements(vec![warm_batch(8, 500.0), measurement(8, 0, 40)]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
 
         let worker = &ledger.health()[0].workers[0];
         assert_eq!(
@@ -13473,8 +13784,8 @@ mod tests {
                 .map(|(units, rate_)| warm_batch(*units, *rate_))
                 .collect(),
         );
-        token.finish(WindowOutcome::Responded { oom: false });
-        held.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
+        held.finish(WindowOutcome::Responded { oom: None });
     }
 
     /// R1's contention tag: the very curve that fits a knee on a quiet board
@@ -13564,8 +13875,8 @@ mod tests {
                 throughput_collapse: true,
                 ..warm_batch(8, 10.0)
             }]);
-        token.finish(WindowOutcome::Responded { oom: false });
-        held.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
+        held.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0]
                 .workers
@@ -13586,7 +13897,7 @@ mod tests {
                 throughput_collapse: true,
                 ..warm_batch(8, 10.0)
             }]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0]
                 .workers
@@ -13630,8 +13941,8 @@ mod tests {
                 oom: true,
                 ..warm_batch(8, 10.0)
             }]);
-        token.finish(WindowOutcome::Responded { oom: false });
-        held.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
+        held.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0]
                 .workers
@@ -13672,7 +13983,7 @@ mod tests {
                 }),
                 ..measurement(4, 0, 900)
             }]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(ledger.health()[0].workers[0].deflation, 1);
     }
 
@@ -13706,7 +14017,7 @@ mod tests {
                 }),
                 ..measurement(4, 0, 900)
             }]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0].workers[0].deflation,
             0,
@@ -13731,7 +14042,7 @@ mod tests {
                 }),
                 ..measurement(4, 0, 900)
             }]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(ledger.health()[0].workers[0].deflation, 1);
     }
 
@@ -13755,7 +14066,7 @@ mod tests {
         };
         assert_eq!(
             oom_verdict(&honest, Some(&charge)),
-            OomVerdict::Trusted,
+            OomVerdict::Trusted(OomTrust::Outright),
             "no class stated"
         );
         for source in [OOM_SOURCE_TYPED, OOM_SOURCE_MARKER] {
@@ -13772,7 +14083,7 @@ mod tests {
                     },
                     Some(&charge)
                 ),
-                OomVerdict::Trusted,
+                OomVerdict::Trusted(OomTrust::Outright),
                 "{source} is structural; the free reading has no veto over it"
             );
         }
@@ -13789,7 +14100,7 @@ mod tests {
                 },
                 Some(&charge)
             ),
-            OomVerdict::Trusted,
+            OomVerdict::Trusted(OomTrust::Outright),
             "an unrecognised tier is believed, not second-guessed"
         );
         let pattern = BatchMeasurement {
@@ -13803,13 +14114,13 @@ mod tests {
         };
         assert_eq!(
             oom_verdict(&pattern, Some(&charge)),
-            OomVerdict::Trusted,
+            OomVerdict::Trusted(OomTrust::Unopposed),
             "no reading to contradict it: a veto that cannot fire lets the \
-             classification stand"
+             classification stand — and the log says it stood unopposed"
         );
         assert_eq!(
             oom_verdict(&pattern, Some(&GrantCharge { mb: 0, ..charge })),
-            OomVerdict::Trusted,
+            OomVerdict::Trusted(OomTrust::Unopposed),
             "a memory-blind grant states no envelope either"
         );
         assert_eq!(
@@ -13822,6 +14133,208 @@ mod tests {
             ),
             OomVerdict::None
         );
+    }
+
+    /// Run2 defect **C2**. A classification the ledger trusts outright used to
+    /// be acted on in silence: the replica deflated, "settled a granted
+    /// window" said `reason="oom"`, and nothing anywhere named the tier that
+    /// decided it. Only the *vetoed* path printed, so the protocol's
+    /// `analyze.py` could evidence a refusal to deflate and never a
+    /// deflation. Every negative now names its classifier.
+    #[test]
+    fn an_out_of_memory_negative_names_the_tier_that_classified_it() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let granted_mb = token.grant().mb;
+        assert!(granted_mb > 0, "the window has an envelope to be named");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                oom: true,
+                oom_class: Some(OomClass {
+                    source: OOM_SOURCE_TYPED.to_owned(),
+                    exception: "torch.OutOfMemoryError".to_owned(),
+                    free_mb_at_failure: Some(512),
+                    device: "cuda:0".to_owned(),
+                }),
+                ..measurement(4, 0, 900)
+            }]);
+        let settled = token.finish_for_test(WindowOutcome::Responded { oom: None });
+        let window = settled.window.expect("the window settled");
+        assert_eq!(window.negative_reason, Some("oom"));
+        let oom = settled.oom.expect("and the tier line rides with it");
+        assert_eq!(oom.inference_id, "g/a");
+        assert_eq!(oom.gpu, window.gpu);
+        assert_eq!(oom.source, OOM_SOURCE_TYPED);
+        assert_eq!(oom.exception, "torch.OutOfMemoryError");
+        assert_eq!(
+            oom.trust, "trusted",
+            "the interpreter named the condition; there is nothing to \
+             corroborate"
+        );
+        assert_eq!(oom.free_mb_at_failure, 512);
+        assert_eq!(
+            oom.grant_mb, granted_mb,
+            "the envelope the veto weighs a reading against, and what \
+             deflation acts on"
+        );
+        assert_eq!(oom.oom_samples, 1);
+        assert_eq!(ledger.health()[0].workers[0].deflation, 1);
+    }
+
+    /// The tier that *can* be corroborated says whether it was. Three
+    /// outcomes, and the log has to tell them apart: the board's own reading
+    /// agreed, there was no reading to agree, and the reading contradicted it
+    /// (in which case there is no negative to explain at all).
+    #[test]
+    fn a_message_pattern_negative_says_whether_the_board_corroborated_it() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+        let pattern = |free_mb_at_failure: Option<u64>| BatchMeasurement {
+            oom: true,
+            oom_class: Some(OomClass {
+                source: OOM_SOURCE_MESSAGE_PATTERN.to_owned(),
+                exception: "RuntimeError".to_owned(),
+                free_mb_at_failure,
+                device: "cuda:0".to_owned(),
+            }),
+            ..measurement(4, 0, 900)
+        };
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let granted_mb = token.grant().mb;
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![pattern(Some(granted_mb / 2))]);
+        let settled = token.finish_for_test(WindowOutcome::Responded { oom: None });
+        let oom = settled.oom.expect("a negative, and an explained one");
+        assert_eq!(oom.source, OOM_SOURCE_MESSAGE_PATTERN);
+        assert_eq!(
+            oom.trust, "corroborated",
+            "the worker's own reading at the failure was below the envelope"
+        );
+        assert_eq!(oom.free_mb_at_failure, (granted_mb / 2) as i64);
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![pattern(None)]);
+        let settled = token.finish_for_test(WindowOutcome::Responded { oom: None });
+        let oom = settled.oom.expect("believed, so still a negative");
+        assert_eq!(
+            oom.trust, "unopposed",
+            "a veto that cannot fire is not the same as evidence for"
+        );
+        assert_eq!(
+            oom.free_mb_at_failure, -1,
+            "the sentinel for a classification that carried no reading"
+        );
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let granted_mb = token.grant().mb;
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![pattern(Some(granted_mb.saturating_mul(20)))]);
+        let settled = token.finish_for_test(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            settled.window.expect("settled").negative_reason,
+            None,
+            "B11's shape: the reading contradicts the wording"
+        );
+        assert!(
+            settled.oom.is_none(),
+            "and a window that is not a negative has no tier to name; the \
+             veto's own WARN is what speaks there"
+        );
+    }
+
+    /// The error-frame path — a `predict` that failed with no measurement to
+    /// classify — is the host's own reading, and the line credits the host
+    /// rather than inventing a worker classification. Its two tiers are still
+    /// distinguished: our `INFERENCE_OOM_*` sentinel is a classification the
+    /// worker already made and reads as `marker`.
+    #[test]
+    fn an_error_frame_negative_credits_the_tier_that_read_the_frame() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let granted_mb = token.grant().mb;
+        let settled = token.finish_for_test(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        });
+        assert_eq!(
+            settled.window.expect("settled").negative_reason,
+            Some("oom")
+        );
+        let oom = settled.oom.expect("the frame is what classified it");
+        assert_eq!(oom.source, OOM_SOURCE_ERROR_FRAME);
+        assert_eq!(
+            oom.exception, "unknown",
+            "an error frame carries no exception type"
+        );
+        assert_eq!(oom.trust, "trusted");
+        assert_eq!(oom.free_mb_at_failure, -1);
+        assert_eq!(oom.grant_mb, granted_mb);
+        assert_eq!(
+            oom.oom_samples, 0,
+            "no measurement survived to carry a class"
+        );
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let settled = token.finish_for_test(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Marker),
+        });
+        assert_eq!(
+            settled.oom.expect("still a negative").source,
+            OOM_SOURCE_MARKER,
+            "our own sentinel is not the host recognising prose"
+        );
+    }
+
+    /// A pre-run2 worker's bare `oom` flag deflates as it always did, and the
+    /// log says the tier is missing rather than guessing one — which is how an
+    /// operator sees that the worker on the other end is an old one.
+    #[test]
+    fn a_negative_from_a_worker_that_states_no_tier_says_so() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                oom: true,
+                oom_class: None,
+                ..measurement(4, 0, 900)
+            }]);
+        let settled = token.finish_for_test(WindowOutcome::Responded { oom: None });
+        let oom = settled.oom.expect("trusted, as the old contract says");
+        assert_eq!(oom.source, OOM_SOURCE_UNCLASSIFIED);
+        assert_eq!(oom.exception, "unknown");
+        assert_eq!(oom.trust, "trusted");
+        assert_eq!(oom.oom_samples, 1);
     }
 
     /// End to end: warm windows fit a knee, the knee caps the grant, and it
@@ -13915,7 +14428,9 @@ mod tests {
              the safe direction"
         );
         assert_eq!(token.grant().mb, 160, "and the MB side follows the units");
-        token.finish(WindowOutcome::Responded { oom: true });
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        });
 
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(
@@ -13923,7 +14438,9 @@ mod tests {
             8,
             "deflation halves under the knee"
         );
-        token.finish(WindowOutcome::Responded { oom: true });
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 4);
         drop(token);
@@ -14093,7 +14610,7 @@ mod tests {
             warm_batch(12, 90.0),
             warm_batch(1, 20.0),
         ]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0].workers[0].throughput_samples,
             2,
@@ -14110,7 +14627,7 @@ mod tests {
             .lock()
             .unwrap()
             .record_measurements(vec![warm_batch(4, 95.0)]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0].workers[0].throughput_samples,
             2,
@@ -14123,14 +14640,16 @@ mod tests {
         admission
             .request_grant(u64::MAX, None, 1, 0)
             .unwrap()
-            .finish(WindowOutcome::Responded { oom: true });
+            .finish(WindowOutcome::Responded {
+                oom: Some(ErrorFrameOom::Prose),
+            });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 8, "halved by the deflation");
         handle
             .lock()
             .unwrap()
             .record_measurements(vec![warm_batch(8, 70.0)]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0].workers[0].throughput_samples,
             3,
@@ -14187,7 +14706,7 @@ mod tests {
                 warm_batch(granted / 4, 70.0),
                 warm_batch(1, 40.0),
             ]);
-            token.finish(WindowOutcome::Responded { oom: false });
+            token.finish(WindowOutcome::Responded { oom: None });
         }
 
         let worker = &ledger.health()[0].workers[0];
@@ -14239,7 +14758,7 @@ mod tests {
             .lock()
             .unwrap()
             .record_measurements(vec![warm_batch(granted, 100.0)]);
-        token.finish(WindowOutcome::Responded { oom: false });
+        token.finish(WindowOutcome::Responded { oom: None });
         granted
     }
 
@@ -14292,7 +14811,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .record_measurements(vec![warm_batch(4, 100.0)]);
-            token.finish(WindowOutcome::Responded { oom: false });
+            token.finish(WindowOutcome::Responded { oom: None });
         }
         assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).0, 0);
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
@@ -14302,7 +14821,9 @@ mod tests {
         window_at_the_cap(&handle, &admission);
         assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).0, 1);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        token.finish(WindowOutcome::Responded { oom: true });
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        });
         assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).0, 0);
     }
 
@@ -14515,7 +15036,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .record_measurements(vec![warm_batch(1, 100.0)]);
-            token.finish(WindowOutcome::Responded { oom: false });
+            token.finish(WindowOutcome::Responded { oom: None });
         }
         assert_eq!(ledger.health()[0].workers[0].knee_units, None);
 
@@ -14781,7 +15302,7 @@ mod tests {
                     0,
                     1000 * units,
                 )]);
-                token.finish(WindowOutcome::Responded { oom: false });
+                token.finish(WindowOutcome::Responded { oom: None });
             };
             window(&a_handle, &a);
             window(&b_handle, &b);

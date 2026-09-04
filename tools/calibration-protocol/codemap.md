@@ -325,23 +325,30 @@ build/deploy/API. The plan that uses this is
    multi-item OOM is prefixed `INFERENCE_OOM_WINDOW:`; `WindowFailure`
    carries the measurements.
 3. Host classification, **rewritten in run2 (R3 host half)**. Two paths:
-   - **With a measurement**, `oom_verdict` (`ledger.rs:6040`, called from
-     `ingest_locked` `:4535`) reads `oom_class.source`:
+   - **With a measurement**, `oom_verdict` (`ledger.rs:6466`, called from
+     `ingest_locked` `:4844`) reads `oom_class.source`:
      `typed_exception`/`marker` (and an unrecognised tier, and a
      measurement with no class at all — a pre-run2 worker) deflate on
      their own; `message_pattern` is **vetoed** when
      `free_mb_at_failure >=` the window's grant `mb` (`mb = 0` states no
      envelope, so it cannot veto). One WARN per window names the figures.
-   - **Without one** (the error frame), `message_reports_oom`
-     (`ledger.rs:6121`) mirrors the worker's classifier: the two
-     `INFERENCE_OOM_*` prefixes, then per **line** — `OOM_MESSAGE_PATTERNS`
-     (`:5950`, ten allocator/driver spellings), the
+     The verdict also carries **why** it was believed — `trusted` (the
+     tier is structural), `corroborated` (`message_pattern` whose free
+     reading was *below* the envelope) or `unopposed` (`message_pattern`
+     with no reading, or a memory-blind grant) — for the negative's own
+     INFO line (defect C2; §1.8).
+   - **Without one** (the error frame), `message_oom_tier`
+     (`ledger.rs:6620`; `message_reports_oom` is the `cfg(test)` predicate
+     form) mirrors the worker's classifier: the two `INFERENCE_OOM_*`
+     prefixes → tier `marker`, then per **line** — `OOM_MESSAGE_PATTERNS`
+     (`:6335`, ten allocator/driver spellings), the
      `defaultcpuallocator`/"allocate memory" pair, and `out of memory`
      **plus** a whole-word device token (`cuda|hip|rocm|nvml|xpu|sycl`,
-     `contains_word` `:6075`). The bare `out of memory` substring is gone
-     (Q1/B11). Applied by `dispatch::error_reports_oom`
-     (`dispatch.rs:1286`) to message + traceback only, never the stderr
-     tail.
+     `contains_word` `:6569`) → tier `error_frame`. The bare
+     `out of memory` substring is gone (Q1/B11). Applied by
+     `dispatch::error_reports_oom` (`dispatch.rs:1290`) to message +
+     traceback only, never the stderr tail; the tier it returns rides on
+     `WindowOutcome::Responded { oom: Option<ErrorFrameOom> }`.
 4. Dispatcher (`run_batch_inner`, `dispatch.rs:1167-1270`): merged window failure → WARN
    "merged batch of {n} requests failed, falling back to per-request
    prediction" (`:1220`) → **one** sequential per-request retry pass under
@@ -631,6 +638,18 @@ Added by commit `49822c8b` (ledger.rs / calibration.rs):
   throughput_samples, ramp_step, deflation, clean_windows,
   max_units_measured); **WARN** with `reason`
   oom|throughput_collapse|unified_board_death on negatives
+- **INFO** "classified this window as an out-of-memory negative" (model,
+  gpu, `source` typed_exception|marker|message_pattern|error_frame|
+  unclassified|*a tier this host does not recognise*, `exception` (`unknown`
+  when the classification named none), `trust`
+  trusted|corroborated|unopposed, `free_mb_at_failure` (**-1** when the
+  classification carried no live reading), `grant_mb` (the window's
+  envelope; 0 is memory-blind), `oom_samples` (measurements carrying a
+  trusted OOM; 0 on the error-frame path)) — **one per negative window**,
+  emitted immediately before that window's own WARN. Run2 defect **C2**:
+  before this, only the *vetoed* `message_pattern` path printed, so a
+  deflation the ledger trusted outright could not be attributed to a tier
+  from the log at all. `ledger.rs`, `OomNegative::emit`
 - DEBUG "refitted the memory cost model" (slope_mb_per_unit,
   intercept_mb, residual_mb, samples, version)
 - DEBUG "refreshed the board's free memory from the host probe" (gpu,

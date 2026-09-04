@@ -129,8 +129,8 @@ use tokio::time::timeout;
 
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::ledger::{
-    Admission, FitSnapshot, Grant, GrantToken, WINDOW_DEPTH_MULTIPLIER, WindowOutcome,
-    message_reports_oom,
+    Admission, ErrorFrameOom, FitSnapshot, Grant, GrantToken, WINDOW_DEPTH_MULTIPLIER,
+    WindowOutcome, message_oom_tier,
 };
 use super::manager::ModelManager;
 use super::slot_error::Unattempted;
@@ -1205,7 +1205,7 @@ async fn run_batch_inner(
             }
             (
                 BatchOutcome::Continue,
-                WindowOutcome::Responded { oom: false },
+                WindowOutcome::Responded { oom: None },
             )
         }
         Err(err) if err.downcast_ref::<WorkerError>().is_some() => {
@@ -1216,7 +1216,7 @@ async fn run_batch_inner(
             let mut oom = error_reports_oom(&err);
             tracing::warn!(
                 model = %inference_id,
-                oom,
+                oom = oom.is_some(),
                 "merged batch of {} requests failed, falling back to per-request prediction: {err:#}",
                 window.len()
             );
@@ -1225,7 +1225,7 @@ async fn run_batch_inner(
             // batch died of an out-of-memory condition, re-offering the same
             // unit budget invites the worker's packer to rebuild the batch size
             // that just failed.
-            let retry_grant = if oom {
+            let retry_grant = if oom.is_some() {
                 halved_for_retry(grant)
             } else {
                 grant.copied()
@@ -1246,7 +1246,7 @@ async fn run_batch_inner(
                         // window is whether the *worker* went away, not
                         // whether this call failed.
                         let settle = fatal_settlement(worker);
-                        oom = oom || error_reports_oom(&individual_err);
+                        oom = oom.or(error_reports_oom(&individual_err));
                         let message = format!("{individual_err:#}");
                         let _ = request.reply.send(Err(individual_err));
                         if fatal {
@@ -1269,9 +1269,13 @@ async fn run_batch_inner(
     }
 }
 
-/// Whether a dispatch error reports an out-of-memory condition.
+/// Whether a dispatch error reports an out-of-memory condition, and which
+/// tier said so — the project's own `INFERENCE_OOM_*` marker or the host's
+/// reading of the prose (run2 defect C2). The verdict is unchanged; the tier
+/// travels on [`WindowOutcome::Responded`] so the ledger's negative can name
+/// its classifier.
 ///
-/// Deliberately narrower than [`message_reports_oom`] over the error's whole
+/// Deliberately narrower than [`message_oom_tier`] over the error's whole
 /// `Display`. A [`WorkerError`] renders its **stderr tail** as well as its
 /// message and traceback, and that tail is a ring of whatever the worker
 /// logged over its recent life — including an out-of-memory it caught, halved
@@ -1283,12 +1287,12 @@ async fn run_batch_inner(
 /// Anything that is not a `WorkerError` carries no such envelope — it is a
 /// supervision error the orchestrator itself formatted — so its full
 /// rendering is the message.
-fn error_reports_oom(err: &anyhow::Error) -> bool {
+fn error_reports_oom(err: &anyhow::Error) -> Option<ErrorFrameOom> {
     match err.downcast_ref::<WorkerError>() {
         Some(worker) => {
-            message_reports_oom(&worker.message) || message_reports_oom(&worker.traceback)
+            message_oom_tier(&worker.message).or_else(|| message_oom_tier(&worker.traceback))
         }
-        None => message_reports_oom(&format!("{err:#}")),
+        None => message_oom_tier(&format!("{err:#}")),
     }
 }
 
@@ -1351,7 +1355,7 @@ async fn run_single(
             let _ = request.reply.send(Ok(outputs));
             (
                 BatchOutcome::Continue,
-                WindowOutcome::Responded { oom: false },
+                WindowOutcome::Responded { oom: None },
             )
         }
         Err(err) => {
@@ -2340,27 +2344,36 @@ mod tests {
             "the whole rendering does say it — which is exactly the trap"
         );
         assert!(
-            !error_reports_oom(&stale),
+            error_reports_oom(&stale).is_none(),
             "but this failure is a bad input, and deflating for it would be wrong"
         );
 
         // The fields that do describe this failure are still read, in both
         // places the worker can put the text.
-        assert!(error_reports_oom(&worker_error(
-            "INFERENCE_OOM_WINDOW: batch of 32 failed",
-            "",
-            ""
-        )));
-        assert!(error_reports_oom(&worker_error(
-            "RuntimeError",
-            "  File \"impl.py\", line 12\nRuntimeError: MPS backend out of memory",
-            ""
-        )));
+        assert_eq!(
+            error_reports_oom(&worker_error(
+                "INFERENCE_OOM_WINDOW: batch of 32 failed",
+                "",
+                ""
+            )),
+            Some(ErrorFrameOom::Marker),
+            "our own sentinel is a classification the worker already made, \
+             and the log says so rather than crediting the host's prose match"
+        );
+        assert_eq!(
+            error_reports_oom(&worker_error(
+                "RuntimeError",
+                "  File \"impl.py\", line 12\nRuntimeError: MPS backend out of memory",
+                ""
+            )),
+            Some(ErrorFrameOom::Prose)
+        );
         // A supervision error has no envelope to strip: it is all message.
-        assert!(error_reports_oom(&anyhow!(
-            "predict failed: CUDA out of memory"
-        )));
-        assert!(!error_reports_oom(&anyhow!("no response within 30s")));
+        assert_eq!(
+            error_reports_oom(&anyhow!("predict failed: CUDA out of memory")),
+            Some(ErrorFrameOom::Prose)
+        );
+        assert!(error_reports_oom(&anyhow!("no response within 30s")).is_none());
     }
 
     /// The error-frame path is the one the worker's own classifier cannot
@@ -2385,20 +2398,26 @@ mod tests {
             "",
         );
         assert!(
-            !error_reports_oom(&b11),
+            error_reports_oom(&b11).is_none(),
             "this failure names no device, and the batch size is not what it \
              was about"
         );
         // The same path still deflates on a driver-shaped one, which is the
         // half that must not be lost while fixing the other.
-        assert!(error_reports_oom(&worker_error(
-            "RuntimeError: CUDA driver error: out of memory",
-            "",
-            ""
-        )));
-        assert!(error_reports_oom(&anyhow!(
-            "predict failed: CUDA failed with error out of memory"
-        )));
+        assert_eq!(
+            error_reports_oom(&worker_error(
+                "RuntimeError: CUDA driver error: out of memory",
+                "",
+                ""
+            )),
+            Some(ErrorFrameOom::Prose)
+        );
+        assert_eq!(
+            error_reports_oom(&anyhow!(
+                "predict failed: CUDA failed with error out of memory"
+            )),
+            Some(ErrorFrameOom::Prose)
+        );
     }
 
     // ------------------------------------------------------------------
