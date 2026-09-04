@@ -197,13 +197,13 @@ build/deploy/API. The plan that uses this is
   nothing. Then `refit_locked` (Theil–Sen `robust_fit` `:4141-4177`: ≥ 3
   samples, distinct x, slope > 0, else the old fit is kept) and
   `refit_knee_locked`.
-- Knee `fit_knee` (`:6220`): log2 buckets, median per bucket, ≥ 12 samples
+- Knee `fit_knee` (`:6228`): log2 buckets, median per bucket, ≥ 12 samples
   over ≥ 3 buckets, threshold 0.9 × max(ring best, historical `knee_best`),
   knee = first bucket ≥ threshold and < largest bucket, returned as
   `2^(k+1) − 1`. Run2 (R1): only **sole-occupancy** samples are fitted
   (`refit_knee_locked` `:4845`); a bucket with fewer than
   `MIN_KNEE_BUCKET_SAMPLES = 2` observations is dropped; and any retained
-  bucket whose **relative MAD** (`relative_mad` `:6309`) exceeds
+  bucket whose **relative MAD** (`relative_mad` `:6317`) exceeds
   `KNEE_MAX_BUCKET_DISPERSION = 0.20` refuses the whole fit, `knee_best`
   included. Run2 (R1d) also makes it expire: `note_knee_window_locked`
   (`:4188`) counts clean windows run **at** the knee with headroom ≥
@@ -299,12 +299,12 @@ build/deploy/API. The plan that uses this is
      `free_mb_at_failure >=` the window's grant `mb` (`mb = 0` states no
      envelope, so it cannot veto). One WARN per window names the figures.
    - **Without one** (the error frame), `message_reports_oom`
-     (`ledger.rs:6082`) mirrors the worker's classifier: the two
+     (`ledger.rs:6090`) mirrors the worker's classifier: the two
      `INFERENCE_OOM_*` prefixes, then per **line** — `OOM_MESSAGE_PATTERNS`
      (`:5919`, ten allocator/driver spellings), the
      `defaultcpuallocator`/"allocate memory" pair, and `out of memory`
      **plus** a whole-word device token (`cuda|hip|rocm|nvml|xpu|sycl`,
-     `contains_word` `:6036`). The bare `out of memory` substring is gone
+     `contains_word` `:6044`). The bare `out of memory` substring is gone
      (Q1/B11). Applied by `dispatch::error_reports_oom`
      (`dispatch.rs:1268`) to message + traceback only, never the stderr
      tail.
