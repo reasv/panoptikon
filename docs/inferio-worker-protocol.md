@@ -38,10 +38,11 @@ answers an unknown `type` with a per-request `error` and stays alive, which
 is exactly how a trim to a worker that cannot do one should behave, so the
 version still stays 2.
 
-2026-09-04 (batch-calibration run2): six additive fields and one renamed
-sentinel value, all of them consequences of what run1 measured
-(`docs/batch-calibration-run1-report.md` §4). **Exactly these keys are new**,
-and nothing else on the wire changed:
+2026-09-04 (batch-calibration run2): **five** additive keys, plus two changes
+inside the value vocabulary of keys that already existed, all of them
+consequences of what run1 measured
+(`docs/batch-calibration-run1-report.md` §4). Exactly these five keys are new,
+and the two vocabulary changes below are the only other change on the wire:
 
 | key | where | run2 item |
 |---|---|---|
@@ -50,14 +51,22 @@ and nothing else on the wire changed:
 | `free_source` | a measurement map | R5 — which driver produced that reading |
 | `clamped` | a measurement map | R5 — `{from_units, to_units, free_mb}`, present only when the clamp shrank this batch |
 | `oom_class` | a measurement map | R3 — `{source, exception, free_mb_at_failure, device}`, present only beside `oom: true` |
-| `dtype_method` value `"unstated"` | `load` response | R11 — renamed from `"unknown"`, in `dtype` and `dtype_method` alike |
+
+The two value changes, on keys that are not new:
+
+| key | change | run2 item |
+|---|---|---|
+| `dtype`, `dtype_method` | the sentinel `"unknown"` is renamed `"unstated"`, in both | R11 |
+| `base_method` | gains the value `"alloc_delta_measured"` beside the existing `"alloc_delta"`: the same tier with a *measured* accelerator context instead of an assumed one, which is a different formula and so a different name | R8 |
 
 Additive in both directions: an older worker sends none of the response keys
 and ignores `canvas_pixels`, an older orchestrator sends no `canvas_pixels`
-and ignores the response keys, so the version stays 2. The one **non**-additive
-line is the sentinel rename, which moves the calibration profile key for every
-model that states no precision; see `dtype` below for why that is deliberate
-and what it costs.
+and ignores the response keys, so the version stays 2. `base_method`'s new
+value is additive too — it names a tier that already existed, and a reader
+that does not know the spelling learns only that this base was not measured
+the way it expects. The one **non**-additive line is the sentinel rename,
+which moves the calibration profile key for every model that states no
+precision; see `dtype` below for why that is deliberate and what it costs.
 
 Contract between the Rust orchestrator (parent) and a Python inference worker
 (child process). Companion to `inferio-rust-orchestrator-design.md` §4.
