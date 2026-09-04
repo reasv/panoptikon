@@ -630,9 +630,16 @@ build/deploy/API. The plan that uses this is
 ### 1.8 Log lines (targets are module paths; worker stderr is forwarded at INFO as `worker=<impl_class> "{line}"`, `worker.rs:2133`)
 
 Added by commit `49822c8b` (ledger.rs / calibration.rs):
-- DEBUG "issued a memory grant" (model, gpu, unit_budget, mb, share_mb,
-  headroom_mb, external_mb, pre_fit, ramp_step, deflation, squeezed,
-  window_requests)
+- DEBUG "issued a memory grant" (model, gpu, unit_budget, mb,
+  `canvas_pixels` (run2 R7, the per-item pixel canvas this window was
+  *priced* under, from the same `WorkerEntry` field the grant frame is
+  filled from; the literal `none` when uncapped — every non-pixel model,
+  and every pixel model pre-run2 or with no canvas resolved),
+  share_mb, headroom_mb, external_mb, reserve_mb, reserve_rule, pre_fit,
+  ramp_step, deflation, squeezed, window_requests). Before the canvas
+  field a leg could read the canvas only off the grant frame or the load
+  report, never out of the gateway's own log (run2 easyOCR leg).
+  `ledger.rs`, `canvas_log_field`
 - DEBUG "settled a granted window" (model, gpu, outcome
   clean|negative|aborted|worker_died, high_water_samples,
   throughput_samples, ramp_step, deflation, clean_windows,

@@ -932,9 +932,10 @@ struct WorkerEntry {
     /// The per-item pixel canvas this model's inputs are priced against
     /// (run2 change R7), or `None` for uncapped. Whatever the manager
     /// resolved for the loaded model — the registry's declaration, else the
-    /// canvas the worker reported for itself at load — carried here purely so
-    /// every grant this replica is issued can state it on the wire
-    /// ([`Grant::canvas_pixels`]).
+    /// canvas the worker reported for itself at load — carried here so every
+    /// grant this replica is issued can state it on the wire
+    /// ([`Grant::canvas_pixels`]) and name it in the `issued a memory grant`
+    /// log line.
     canvas_pixels: Option<u32>,
     /// The rest of the profile key, from the load response. `None` (either
     /// of them) means this replica cannot be keyed and its calibration is
@@ -4184,11 +4185,13 @@ impl VramLedger {
         });
         drop(state);
         if let Some((model, ramp_step, deflation, pre_fit)) = issued {
+            let canvas = canvas_log_field(canvas_pixels);
             tracing::debug!(
                 model = %model,
                 gpu = %gpu,
                 unit_budget,
                 mb,
+                canvas_pixels = %canvas,
                 share_mb = share.mb,
                 headroom_mb = headroom,
                 external_mb,
@@ -6159,6 +6162,19 @@ pub struct CalibrationState {
     pub fit: Option<FitSnapshot>,
 }
 
+/// How the `issued a memory grant` line names the pixel canvas the window was
+/// priced under (run2 change R7): the canvas in force, or `none` for uncapped
+/// — which is what every model was before run2.
+///
+/// The grant frame and the load report both carry the figure, but neither is
+/// in the gateway's log, so without this field a leg cannot evidence from the
+/// log alone which canvas a window was priced at. Rendered by a function
+/// rather than inline so a test can pin what the line will carry as the
+/// decision it is, rather than by scraping a subscriber (review F8).
+fn canvas_log_field(canvas_pixels: Option<u32>) -> String {
+    canvas_pixels.map_or_else(|| "none".to_owned(), |pixels| pixels.to_string())
+}
+
 /// A window's memory grant: an MB reservation (the ledger currency) and a
 /// unit budget (the packing currency).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -7490,6 +7506,11 @@ mod tests {
             .expect("granted");
         assert_eq!(token.grant().canvas_pixels, Some(1_835_008));
         assert_eq!(token.grant().unit, CostUnit::Pixel);
+        // And the `issued a memory grant` line names that same figure, so a
+        // calibration leg can read which canvas a window was priced under out
+        // of the gateway's log rather than only out of the grant frame the
+        // worker was handed (run2 easyOCR leg).
+        assert_eq!(canvas_log_field(token.grant().canvas_pixels), "1835008");
         drop(token);
         drop(admission);
 
@@ -7498,14 +7519,23 @@ mod tests {
         let admission = ledger
             .register_worker("g/b", pixel_cost(None), &handle, None)
             .expect("registers");
-        assert_eq!(
-            admission
-                .request_grant(4_000_000, None, 1, 0)
-                .expect("granted")
-                .grant()
-                .canvas_pixels,
-            None
-        );
+        let token = admission
+            .request_grant(4_000_000, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().canvas_pixels, None);
+        assert_eq!(canvas_log_field(token.grant().canvas_pixels), "none");
+        drop(token);
+        drop(admission);
+
+        // An item model has no canvas to state at all, and its line says so
+        // in the same word rather than dropping the field.
+        let handle = loaded(Some(1500), Some(1000));
+        let admission = ledger
+            .register_worker("g/c", item_cost(4), &handle, None)
+            .expect("registers");
+        let token = admission.request_grant(64, None, 1, 0).expect("granted");
+        assert_eq!(token.grant().unit, CostUnit::Item);
+        assert_eq!(canvas_log_field(token.grant().canvas_pixels), "none");
     }
 
     /// The whole formula block on one worker and one board.
