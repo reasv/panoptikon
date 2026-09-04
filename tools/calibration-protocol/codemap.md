@@ -577,11 +577,13 @@ reversible.
   else count == 1 → index 0. **An index pin is never mapped to an NVML
   index**, so on multi-GPU with an index pin and no live CUDA the NVML
   paths are skipped.
-- Per batch: `begin_batch()` (:2307-2318) resets peaks and snapshots
+- Per batch: `begin_batch()` resets peaks and snapshots
   `reserved_before_mb`, `allocated_before_mb`, `started`;
-  `measure_batch()` (:2321-2376) emits `items, reserved_before_mb,
+  `measure_batch()` emits `items, reserved_before_mb,
   peak_reserved_mb, allocated_before_mb, peak_allocated_mb, duration_ms`
-  (predict call only), optional `units`, `oom`, `throughput_collapse`;
+  (predict call only), optional `units`, `oom`, `throughput_collapse`,
+  and since run2 `free_mb`/`free_source` (the clamp's pre-batch reading, R5),
+  `clamped` (R5) and `oom_class` (R3);
   the harness adds `trimmed` on a window's first measurement
   (`packing.py:712-721`). **Caches are not emptied between batches**;
   `empty_cache()` only on an orchestrator `trim` (`__main__.py:381-413`),
@@ -592,7 +594,7 @@ reversible.
 
   | Backend | free/total | pool/allocated | base tiers (`_resolve_base` :2084-2198) |
   |---|---|---|---|
-  | CUDA | `nvml` → `torch` | torch allocator | `nvml` own-PID → `free_delta` → `alloc_delta` |
+  | CUDA | `nvml` → `torch` | torch allocator | `nvml` own-PID → `free_delta` → `alloc_delta_measured`/`alloc_delta` |
   | ROCm | `amdgpu-sysfs` (+GTT on a verified unified board) → `torch`; NVML refused when `torch.version.hip` or `HIP_VISIBLE_DEVICES` set | torch allocator | `fdinfo` (DRM `drm-resident-vram`, floored at `reserved − 256 MiB`) → `free_delta` → `alloc_delta` |
   | MPS | `mps` = `min(recommended_max_memory, psutil available)` (:1326-1347) | `driver_allocated_memory` / `current_allocated_memory`; **no peak API**, post-batch values reported as peaks | `mps` (`driver_allocated_memory` at load end) |
   | CPU (`INFERIO_DEVICE=cpu`) | `ram` = psutil available/total (:1519-1543) | pool = OS RSS high-water (`VmHWM` Linux, `peak_wset` Windows, `ru_maxrss` else), allocated = live RSS (:1634-1690) | `rss` = load-window RSS growth |
@@ -601,10 +603,18 @@ reversible.
   = allocated or reserved delta > 0 across the load window, else no base
   at all; CPU → `(alloc_floor, "rss")`; NVML own-PID > 0 → `"nvml"`;
   fdinfo → `"fdinfo"`; MPS → `"mps"`; else `free_delta = before.free −
-  free_after` (same source both sides), ceiling `reserved_delta + 500
-  (CONTEXT_ESTIMATE_MB) + 2048 (IMPLAUSIBLE_SLACK_MB)`; `free_delta`
-  None/≤ 0/> ceiling → `(alloc_floor + 500, "alloc_delta")`; ≥
-  `alloc_floor` → `(free_delta, "free_delta")`; else `alloc_delta`.
+  free_after` (same source both sides), ceiling `reserved_delta + context +
+  2048 (IMPLAUSIBLE_SLACK_MB)`; `free_delta` None/≤ 0/> ceiling →
+  `(alloc_floor + context, alloc_method)`; ≥ `alloc_floor` →
+  `(free_delta, "free_delta")`; else the allocator tier. Since run2 (R8)
+  `context` is `context_allowance_mb()`: what `_ContextProbe` measured across
+  this process's first CUDA initialisation (a daemon thread polling
+  `torch.cuda.is_initialized()` every 5 ms, started by `begin_load` only when
+  the pre-load reading came from `nvml`/`amdgpu-sysfs`, CUDA is not yet live
+  and the host is not RAM-priced; the allocator pool at that instant is
+  subtracted; accepted only within `CONTEXT_MIN_MB`..`CONTEXT_MAX_MB` =
+  64..2048), else the fixed `CONTEXT_ESTIMATE_MB = 500`. `base_method` is
+  `"alloc_delta_measured"` for the first and `"alloc_delta"` for the second.
 - **Docker without `--pid=host`**: NVML reports host PIDs, so
   `os.getpid()` is never listed; one INFO line ("NVML lists no process
   with pid … expected in a container started without --pid=host",
@@ -620,7 +630,9 @@ reversible.
 ### 2.2 Protocol (host↔worker)
 
 - Host → worker `predict` frame: `grant = {unit_budget, mb, unit,
-  aggregation, user_cap_items|nil}` (`ledger.rs:3953-3961`;
+  aggregation, user_cap_items|nil, canvas_pixels|nil}` (`canvas_pixels` is
+  run2 R7, from `metadata.cost.canvas_pixels`; `cost::resolve_canvas_pixels`
+  parses it, **`encode_grant` does not forward it yet**) (`ledger.rs:3953-3961`;
   `worker.rs:1722-1739`), `fit = {slope_mb_per_unit, intercept_mb,
   residual_mb, samples}` only when the version changed and only on the
   first chunk of a multi-frame window (`dispatch.rs:1140`). A grant is
@@ -650,12 +662,20 @@ reversible.
 
 ### 2.3 OOM handling
 
-- Classifiers (three copies, change together): `utils.looks_like_oom`
-  (:390-419: "out of memory" case-insensitive, `INFERENCE_OOM`,
-  `defaultcpuallocator` + `allocate memory`, over `exc`, `__cause__`,
-  `__context__`); `packing._looks_like_oom` (:473-506: same strings plus
-  type names `OutOfMemoryError`, `InferenceOOMError`, `MemoryError`);
-  Rust `message_reports_oom` (Part 1 §1.6).
+- Classifiers, **deliberately different since run2 (R3)**:
+  `utils.looks_like_oom` is unchanged and stays broad ("out of memory"
+  case-insensitive, `INFERENCE_OOM`, `defaultcpuallocator` + `allocate
+  memory`, over `exc`, `__cause__`, `__context__`) because it only decides
+  whether `run_with_oom_retry` halves and retries. `packing.classify_oom`
+  replaced `packing._looks_like_oom` and decides what the *orchestrator* is
+  told: three tiers over the same chain, in strength order — typed
+  (`torch.OutOfMemoryError`, looked up through `sys.modules`; `MemoryError`),
+  marker (`InferenceOOMError`, `INFERENCE_OOM` text, or the halving counter
+  moving), then a closed list of driver-shaped substrings
+  (`OOM_MESSAGE_PATTERNS`/`OOM_MESSAGE_PAIRS`) that deliberately excludes a
+  bare "out of memory" (B11). Returns the `oom_class` map
+  `{source, exception, free_mb_at_failure, device}` or None, and None now
+  means `oom` is absent. Rust `message_reports_oom` (Part 1 §1.6).
 - Harness on any exception (`packing.py:736-765`): unpriced measurement
   with `oom` flag if classified or the halving counter moved; multi-item
   OOM → `INFERENCE_OOM_WINDOW:` prefix; `WindowFailure`. A batch that
@@ -666,18 +686,24 @@ reversible.
 
 ### 2.4 Packing (`packing.py`)
 
-- Pricing (`price_inputs` :333-363): `pixel` = `w × h` from
-  `PIL.Image.open(BytesIO(file)).size` (header only, **raw submitted
-  dimensions**; unreadable → largest priced so far, else
-  `UNREADABLE_PIXEL_UNITS = 2_000_000`); `token` = `max(1, utf8 bytes //
+- Pricing (`price_inputs`): `pixel` = `min(w × h, canvas)` from
+  `PIL.Image.open(BytesIO(file)).size` (header only; unreadable → largest
+  priced so far, else `UNREADABLE_PIXEL_UNITS = 2_000_000`, itself capped).
+  `canvas` is run2 R7 (`resolve_canvas_pixels`): `grant.canvas_pixels` →
+  the impl's own `canvas_pixels`/`max_pixels`/`image_max_pixels` reached
+  through at most two of `processor`/`image_processor`/`embedder`/`model`
+  and floored at `CANVAS_FLOOR_PIXELS = 512²` → uncapped; `token` = `max(1, utf8 bytes //
   4)` (`BYTES_PER_TOKEN = 4`); `audio-second` = flat 30; `item` = 1.
 - Planning (`plan_batches` :384-434): `count` = len; `sum` = greedy FIFO;
   `max-times-count` = sort descending by units then greedy; a single
   over-budget item goes alone; `cap_items` is a separate bound;
   re-planned before every batch.
-- Defensive clamp (`clamp_to_live_memory` :437-465): if `grant_mb > 0`
-  and live free < grant_mb, `budget = max(1, unit_budget × free /
-  grant_mb)`; shrink-only. **No-op when `grant_mb <= 0`.**
+- Defensive clamp (`clamp_to_live_memory`): returns a `LiveBudget(units,
+  free_mb, free_source, clamped)`. It **always** takes the one free reading
+  (run2 R5, including when `grant_mb <= 0`, which is the memory-blind case);
+  if `grant_mb > 0` and live free < grant_mb, `units = max(1, unit_budget ×
+  free / grant_mb)`, shrink-only, and `clamped = {from_units, to_units,
+  free_mb}`. All three extra fields ride every measurement of the batch.
 - Throughput collapse (`_note_throughput` :622-682): `COLLAPSE_RATIO =
   0.4`, `COMPARATOR_MAX_AGE = 8`; comparable only if pool grew, priced,
   `units ≥ previous`; flagged batch does not become the comparator;
@@ -697,16 +723,16 @@ reversible.
 | tags/moondream-2b-25-03[-clothing] | moondream_tagger | none | – | 2 | `enable_batching = False` |
 | tagmatch/danbooru[-saucenao] | danbooru_tagger | none | – | 1 | network |
 | doctr/db_resnet50_* (7) | doctr | item / count | 8 | 1 | docTR re-batches internally |
-| doctr/dots_ocr | dotsocr | pixel / sum | 2 000 000 | 1 | min CC 8.0, ~6 GB |
-| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 1 | **`enable_batching = false`** → grantless |
+| doctr/dots_ocr | dotsocr | pixel / sum | 2 000 000 | 1 | min CC 8.0, ~6 GB; no `canvas_pixels` — its cap lives in the downloaded processor, so the worker's tier-2 fallback reads it |
+| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 1 | **`enable_batching = false`** → grantless; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas) |
 | florence2/msft_large-* (4) | florence2 | item / count | 4 | 1 | |
 | vlm/moondream-2b-25-03-* (5) | moondream_captioner | none | – | 2 | |
 | textembed/all-mpnet-base-v2, all-MiniLM-L6-v2, stella_* | sentence_transformers | token / max-times-count | 4000 | 1 | no impl-side OOM retry |
 | textembed/jina-embeddings-v3-api | jina-clip-api | none | – | 1 | remote |
 | whisper/* (15) | faster_whisper | none | – | 1 | CT2, no torch allocator |
 | clip/ViT-H-14-*, PE-Core-*, ViT-B-16-SigLIP2-384, apple_MobileCLIP-{B-LT,S2,S1} | openclip | item / count | 8 | 1 | `run_with_oom_retry` ×2 |
-| clip/qwen3-vl-embedding-{8b,2b} | qwen3-vl-embedding | pixel / sum | 2 000 000 | 1 | |
-| clip/nemotron-embed-vl-1b-v2 | nemotron-embed-vl | pixel / sum | 2 000 000 | 1 | ~2.5 GB |
+| clip/qwen3-vl-embedding-{8b,2b} | qwen3-vl-embedding | pixel / sum | 2 000 000 | 1 | `canvas_pixels = 1 843 200` (MAX_PIXELS = 1800 × 32²) |
+| clip/nemotron-embed-vl-1b-v2 | nemotron-embed-vl | pixel / sum | 2 000 000 | 1 | ~2.5 GB; `canvas_pixels = 1 835 008` ((6 tiles + thumbnail) × 512²) |
 | tclip/<openclip ids> | openclip | item / count | 8 | 1 | text tower |
 | tclip/qwen3-vl-embedding-{8b,2b} | qwen3-vl-embedding | token / max-times-count | 4000 | 2 | |
 | clap/clap-htsat-unfused, larger_clap_* | clap | item / count | 8 | 1 | **no `run_with_oom_retry`** |
@@ -804,11 +830,13 @@ model `config.env`/`env_remove` applied last.
 
 ### 2.8 Worker-side fragility
 
-NVML PID mismatch in containers; `free_delta` contamination; fixed
-500 MiB context estimate; reserved-vs-allocated quantisation and
+NVML PID mismatch in containers; `free_delta` contamination; ~~fixed
+500 MiB context estimate~~ (run2 R8 measures it; the constant is now the last
+resort); reserved-vs-allocated quantisation and
 `expandable_segments` semantics; cuDNN benchmark workspace spikes on new
-shapes; raw-dimension pixel pricing (20 MP charged 10× real cost for
-capped VLMs) and `bytes/4` token pricing (CJK under-priced ~3×, long
+shapes; ~~raw-dimension pixel pricing (20 MP charged 10× real cost for
+capped VLMs)~~ (run2 R7 caps each item at the model's canvas, though the host
+does not forward the registry figure yet) and `bytes/4` token pricing (CJK under-priced ~3×, long
 texts over-priced); measurement brackets CPU decode time (collapse
 detector can trip on slow-decoding inputs); no NVML until torch
 initialises CUDA on a multi-GPU index pin; `touched_gpu` gate misses
