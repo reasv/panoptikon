@@ -1156,15 +1156,7 @@ async fn run_extraction_job_inner(
                 .await
         };
         if let Err(err) = load_result {
-            // A load refused by the per-model cooldown is not "the load failed":
-            // it is "this model is unavailable until <instant>", and the job says
-            // so with the model, the retry instant and the error that caused it.
-            if let Some(failure) = inference_failure(&err)
-                && failure.is_load_cooldown()
-            {
-                return Err(ApiError::internal(cooldown_reason(failure)));
-            }
-            return Err(ApiError::internal(format!("Failed to load model: {err}")));
+            return Err(ApiError::internal(load_failure_reason(&err)));
         }
 
         // Bounds concurrent input loading (decode processes, file reads). Loaded
@@ -2315,6 +2307,30 @@ fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> Inferen
         return InferenceRecovery::Requeue;
     }
     InferenceRecovery::Fail
+}
+
+/// The `failure_reason` a failed model load leaves on the job record.
+///
+/// Two shapes, and the second is the one run2 finding C4 was about:
+///
+/// - A load refused by the per-model cooldown is not "the load failed": it is
+///   "this model is unavailable until <instant>", and the job says so through
+///   [`cooldown_reason`] — the model, the consecutive-failure count, the retry
+///   instant and the error that armed the window. This path reaches here from
+///   `load_model_all` too, which now keeps the typed cooldown in preference to
+///   a plainer failure from another endpoint.
+/// - Anything else is rendered with `{err:#}`, i.e. the **whole** cause chain.
+///   `{err}` prints only the outermost context, which is how a real 500 from
+///   the inference server reached the user as nothing but
+///   `"Failed to load model: model load failed on all 1 inference endpoints"`
+///   — a sentence that names neither the model's problem nor the model.
+fn load_failure_reason(err: &anyhow::Error) -> String {
+    if let Some(failure) = inference_failure(err)
+        && failure.is_load_cooldown()
+    {
+        return cooldown_reason(failure);
+    }
+    format!("Failed to load model: {err:#}")
 }
 
 /// The abort reason a load-failure cooldown produces, naming the model, the
@@ -4180,6 +4196,54 @@ mod tests {
                 .map(|_| 3),
             retry_after_secs: None,
         })
+    }
+
+    /// **C4: a job aborted by a load cooldown says which model, for how long
+    /// and why — on the `load_model_all` path too.**
+    ///
+    /// Phase C measured the whole of a job's `failure_reason` as
+    /// `"Failed to load model: model load failed on all 1 inference
+    /// endpoints"`: a sentence that names neither the model nor anything about
+    /// its problem. Two causes, both fixed: `{err}` renders only the outermost
+    /// context, and `load_model_all` used to keep the *last* endpoint's error
+    /// rather than the most informative one.
+    #[test]
+    fn a_load_failure_reason_carries_the_cooldown_or_the_whole_chain() {
+        use crate::inferio_client::LOAD_COOLDOWN_KIND;
+
+        // A cooldown reaches the record with everything R9 sends, even when
+        // the pool has wrapped it in its own context — which is what the
+        // `load_model_all` path always does.
+        let wrapped = typed_failure(Some(LOAD_COOLDOWN_KIND))
+            .context("model group/model-a failed to load on all 1 inference endpoints");
+        let reason = load_failure_reason(&wrapped);
+        assert!(reason.contains("group/model-a"), "the model: {reason}");
+        assert!(
+            reason.contains("after 3 consecutive load failures"),
+            "the failure count: {reason}"
+        );
+        assert!(
+            reason.contains("retry at 2026-09-04T12:00:00Z"),
+            "the retry instant: {reason}"
+        );
+        assert!(
+            reason.contains("failed fatally: EOF"),
+            "the error that armed the window: {reason}"
+        );
+
+        // Anything else keeps the whole chain instead of the outermost
+        // sentence. This is the exact string Phase C saw, and what it lost.
+        let plain = anyhow::anyhow!("inference request failed (500): CUDA out of memory")
+            .context("model group/model-a failed to load on all 1 inference endpoints");
+        let reason = load_failure_reason(&plain);
+        assert!(
+            reason.contains("failed to load on all 1 inference endpoints"),
+            "the outer context is still there: {reason}"
+        );
+        assert!(
+            reason.contains("CUDA out of memory"),
+            "and so is the cause it used to swallow: {reason}"
+        );
     }
 
     /// The whole of the F7 policy, on the one function that decides it.

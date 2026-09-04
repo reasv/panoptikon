@@ -4,7 +4,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex;
 
 use crate::config::InferenceEndpointConfig;
-use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictResponse};
+use crate::inferio_client::{
+    InferenceApiClient, InferenceFailure, InferenceInput, PredictResponse, inference_failure,
+};
 
 #[derive(Clone)]
 pub(crate) struct InferencePool {
@@ -163,7 +165,15 @@ impl InferencePool {
         // endpoints that failed the explicit load lazy-load on predict, and
         // predict fails over past endpoints that are down entirely.
         let total = clients.len();
-        let mut last_err = None;
+        // The error kept for the caller is the *most informative* one, not the
+        // last one. A load-failure cooldown is a typed verdict carrying the
+        // model, the failure count, the retry instant and the error that armed
+        // it (R9); a plain 500 from another endpoint carries none of that, and
+        // letting it overwrite the cooldown is how a job ends up telling the
+        // user only that "model load failed on all 1 inference endpoints"
+        // (run2 finding C4). Ties go to the last, which is the old behaviour.
+        let mut kept: Option<anyhow::Error> = None;
+        let mut kept_is_cooldown = false;
         let mut failed = 0usize;
         for (idx, client) in clients.into_iter().enumerate() {
             if let Err(err) = client
@@ -177,14 +187,19 @@ impl InferencePool {
                     "failed to load model on inference endpoint"
                 );
                 failed += 1;
-                last_err = Some(err);
+                let is_cooldown =
+                    inference_failure(&err).is_some_and(InferenceFailure::is_load_cooldown);
+                if is_cooldown || !kept_is_cooldown {
+                    kept_is_cooldown = is_cooldown;
+                    kept = Some(err);
+                }
             }
         }
         if failed == total {
-            return Err(last_err
+            return Err(kept
                 .unwrap_or_else(|| anyhow!("model load failed on all inference endpoints"))
                 .context(format!(
-                    "model load failed on all {total} inference endpoints"
+                    "model {inference_id} failed to load on all {total} inference endpoints"
                 )));
         }
         Ok(())
@@ -264,4 +279,90 @@ pub(crate) fn job_inference_context() -> &'static JobInferenceContext {
 /// endpoint exists).
 pub(crate) fn try_job_inference_context() -> Option<&'static JobInferenceContext> {
     JOB_INFERENCE_CONTEXT.get()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::InferenceEndpointConfig;
+    use axum::http::StatusCode;
+    use axum::routing::put;
+    use axum::{Json, Router};
+
+    /// **C4: when every endpoint fails, the error the job keeps is the most
+    /// informative one, not the last one.**
+    ///
+    /// A load-failure cooldown is a typed verdict carrying the model, the
+    /// consecutive-failure count, the retry instant and the error that armed
+    /// the window (R9). A plain 500 from another endpoint carries none of
+    /// that. Keeping the last error — which is what this did — is how a job
+    /// ends up telling the user nothing but "model load failed on all N
+    /// inference endpoints".
+    ///
+    /// The cooldown is answered by the endpoint asked **first** here, so
+    /// "keep the last" and "keep the most informative" give different answers
+    /// and the test can tell them apart.
+    #[tokio::test]
+    async fn a_cooldown_survives_a_plainer_failure_on_another_endpoint() {
+        async fn spawn(handler: Router) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, handler).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+
+        let cooling = spawn(Router::new().route(
+            "/api/inference/load/{group}/{id}",
+            put(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"detail": {
+                        "kind": "load_cooldown",
+                        "message": "model is in a load-failure cooldown",
+                        "model": "group/model-a",
+                        "failures": 3,
+                        "retry_at": "2026-09-04T12:00:00Z",
+                        "last_error": "CUDA out of memory",
+                    }})),
+                )
+            }),
+        ))
+        .await;
+        let broken = spawn(Router::new().route(
+            "/api/inference/load/{group}/{id}",
+            put(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        ))
+        .await;
+
+        let pool = InferencePool::new(vec![
+            InferenceEndpointConfig {
+                base_url: cooling,
+                weight: 1.0,
+                use_for_jobs: true,
+            },
+            InferenceEndpointConfig {
+                base_url: broken,
+                weight: 1.0,
+                use_for_jobs: true,
+            },
+        ])
+        .expect("pool builds");
+
+        let err = pool
+            .load_model_all("group/model-a", "key", 10, -1, None)
+            .await
+            .expect_err("both endpoints refuse the load");
+        let failure = inference_failure(&err).expect("the typed cooldown survives the pool");
+        assert!(failure.is_load_cooldown());
+        assert_eq!(failure.model.as_deref(), Some("group/model-a"));
+        assert_eq!(failure.failures, Some(3));
+        assert_eq!(failure.retry_at.as_deref(), Some("2026-09-04T12:00:00Z"));
+        assert_eq!(failure.last_error.as_deref(), Some("CUDA out of memory"));
+        assert!(
+            format!("{err}").contains("group/model-a"),
+            "and the context names the model: {err}"
+        );
+    }
 }
