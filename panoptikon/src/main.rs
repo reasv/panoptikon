@@ -819,6 +819,22 @@ pub(crate) async fn serve_with_stream_limit<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    serve_with_streams(listener, app, shutdown, MAX_CONCURRENT_STREAMS).await
+}
+
+/// [`serve_with_stream_limit`] with the limit as a parameter. Production
+/// always passes [`MAX_CONCURRENT_STREAMS`]; the parameter exists so tests can
+/// stand in for a peer — or a proxy in front of one — that advertises less,
+/// which is the case a client cannot detect and must survive.
+pub(crate) async fn serve_with_streams<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: F,
+    max_concurrent_streams: u32,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use hyper_util::server::conn::auto::Builder;
     use tower::ServiceExt as _;
@@ -870,7 +886,7 @@ where
             builder
                 .http2()
                 // The whole reason this function exists.
-                .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+                .max_concurrent_streams(max_concurrent_streams)
                 // CONNECT protocol, needed for HTTP/2 websockets (axum sets
                 // it too; dropping it would be a silent regression).
                 .enable_connect_protocol();

@@ -4222,6 +4222,7 @@ dependencies = [
  "flate2",
  "fs2",
  "futures-util",
+ "h2",
  "hashlink 0.10.0",
  "hex",
  "hmac 0.12.1",

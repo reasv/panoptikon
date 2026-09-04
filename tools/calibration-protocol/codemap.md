@@ -446,15 +446,15 @@ build/deploy/API. The plan that uses this is
     (`extraction.rs:117,170`), which **caps** the other two terms rather
     than joining the max;
   - `Multiplexed` (h2c) has no per-unit socket cost at all
-    (`extraction.rs:134`, `inferio_client.rs:290`), so the window is
-    whatever the byte budget and the loader slots allow. What bounds
-    sockets there is the client's own gate,
-    `INFERENCE_MAX_CONCURRENT_REQUESTS 256`, so the only check left is a
-    WARN when `FD_RESERVE 256 + 2 × 256 = 768` does not fit the soft
-    limit — the worst case, a peer that allows one stream per
-    connection. Against a peer generous with streams the real cost is the
-    pool, 8 descriptors. The clamp stays in both modes as defence in
-    depth.
+    (`extraction.rs:134`), so the window is whatever the byte budget and
+    the loader slots allow. What bounds sockets there is
+    `INFERENCE_CONNECTION_LANES 64` — **S1 corrected this**: a lane is one
+    h2 connection whatever the peer's stream limit is, because
+    hyper-util's pool shares an h2 connection rather than opening another,
+    so every lane at once (`FD_RESERVE 256 + 2 × 64 = 384`) is the worst
+    case and not, as this said before, `2 × the request gate = 768`. The
+    only check left is a WARN when 384 does not fit the soft limit. The
+    clamp stays in both modes as defence in depth.
   The job picks the mode from `InferencePool::requests_are_multiplexed`
   (`jobs/inference_pool.rs:51`), read after the model load (which is what
   resolves each endpoint's transport); an endpoint nothing has reached
@@ -462,17 +462,32 @@ build/deploy/API. The plan that uses this is
   `NOFILE_LIMIT_UNKNOWN` makes the term unconditionally non-binding where
   there is no rlimit to read (Windows). Motivating failure: Phase 6
   finding F6.
-- **Inference transport** (`inferio_client.rs`, R10'): one
+- **Inference transport** (`inferio_client.rs`, R10', reworked by S1): one
   `EndpointRuntime` per base URL, shared by every `InferenceApiClient`
-  for that endpoint (`endpoint_runtime` `inferio_client.rs:373-391`) — a pool that is not
-  shared is not a bound. It holds an h2c-prior-knowledge client and an
-  HTTP/1.1 client, both with `pool_max_idle_per_host =
-  INFERENCE_POOL_CONNECTIONS 4`, plus a semaphore of
-  `INFERENCE_MAX_CONCURRENT_REQUESTS 256`
-  (`INFERENCE_POOL_CONNECTIONS × H2_STREAMS_PER_CONNECTION 64`, `:326`)
-  taken in **both** transports (`active` `:613-626`) — HTTP/1.1 is the one
-  where a request costs a whole socket, and it is reachable after a job
-  has already sized its window for multiplexing. `Transport` (`:264-269`) is
+  for that endpoint (`endpoint_runtime`) — a pool that is not
+  shared is not a bound. It holds `INFERENCE_CONNECTION_LANES 64`
+  **independent** h2c-prior-knowledge clients (one connection each;
+  `pool_max_idle_per_host = 1`) and one HTTP/1.1 client. The old single
+  client with `pool_max_idle_per_host = 4` was **one socket**: hyper-util
+  shares an h2 connection per host (`Reservation::Shared`), which is why
+  run2 could never exceed the peer's per-connection stream limit. Lanes
+  are recruited by load (`pick_lane`): least-loaded within the smallest
+  prefix that holds the traffic at `H2_STREAMS_PER_CONNECTION 64` streams
+  each, so concurrency of 64 costs one socket and 4 096 costs 64.
+  Two gates, taken in **both** transports (`active`): `h1_gate` fixed at
+  `INFERENCE_MAX_CONCURRENT_REQUESTS 256` (there a request *is* a socket,
+  and it is reachable after a job has sized its window for multiplexing),
+  and `h2_gate`, which follows the endpoint's published desired-in-flight
+  figure (`set_in_flight_target`, driven from
+  `jobs::inference_pool::predict`) between that same 256 as a **floor** and
+  `INFERENCE_MAX_CONCURRENT_STREAMS 4 096` as a ceiling. A shrink is
+  repaid on the release path (`release_h2_permit`), because
+  `forget_permits` can never land one on a saturated endpoint.
+  `is_refused_stream` retries an HTTP/2 `REFUSED_STREAM` and keeps the
+  transport memo: hyper opens up to 100 streams on a fresh connection
+  before the peer's SETTINGS arrive, so a peer advertising fewer refuses
+  the surplus, and RFC 9113 §8.7 makes that reset the one that is safe to
+  retry. `Transport` (`:264-269`) is
   resolved once per endpoint by a `GET /cache` probe sent with prior
   knowledge (`transport` `:449-506`): *any* HTTP answer means `H2c`. A
   downgrade is only recorded on **positive evidence** — a failure that

@@ -27,8 +27,8 @@ use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::db::{open_index_db_read, open_index_db_read_no_user_data};
 use crate::inferio::slot_error::{ProtocolViolation, SlotErrorClass};
 use crate::inferio_client::{
-    INFERENCE_MAX_CONCURRENT_REQUESTS, INFERENCE_POOL_CONNECTIONS, InferenceFile, InferenceInput,
-    PredictOutput, PredictResponse, PredictSlotError, inference_failure,
+    INFERENCE_CONNECTION_LANES, InferenceFile, InferenceInput, PredictOutput, PredictResponse,
+    PredictSlotError, inference_failure,
 };
 use crate::jobs::continuous_scan;
 use crate::jobs::files::{FileScanService, is_resync_needed};
@@ -119,8 +119,9 @@ const FDS_PER_IN_FLIGHT_ITEM: usize = 2;
 /// File descriptors one *pooled* inference connection costs, when the client
 /// multiplexes. Two for the same reason as above — local inference is
 /// loopback HTTP inside this process, so both ends of the connection are in
-/// this descriptor table — but the count is now per connection, and the pool
-/// is bounded by [`INFERENCE_POOL_CONNECTIONS`] rather than by the window.
+/// this descriptor table — but the count is now per connection, and the
+/// connections are bounded by [`INFERENCE_CONNECTION_LANES`] rather than by
+/// the window.
 const FDS_PER_POOLED_CONNECTION: usize = 2;
 
 /// How the job's inference requests reach the server, for
@@ -206,16 +207,24 @@ const FD_RESERVE: usize = 256;
 ///   measured.
 ///
 ///   What bounds descriptors in the multiplexed mode is not this function but
-///   `INFERENCE_MAX_CONCURRENT_REQUESTS`, the client's own per-endpoint gate,
-///   which admits at most 256 requests in either transport. That is the
-///   honest statement of the bound: `INFERENCE_POOL_CONNECTIONS` caps *idle*
-///   connections, and hyper opens more when the peer's advertised stream
-///   limit is below the offered concurrency, so "the pool is the whole cost"
-///   holds only against a peer generous with streams. The gate holds against
-///   every peer, and — because it is taken on the HTTP/1.1 path too — it also
-///   covers the case this function cannot: the ceiling is computed once,
-///   before the item loop, so an endpoint that flips to HTTP/1.1 mid-job
-///   keeps a window sized for multiplexing.
+///   `INFERENCE_CONNECTION_LANES`, the client's independent-connection count:
+///   each lane is one h2 connection, hyper-util shares it across every
+///   request on that lane's client, and lanes are recruited by load, so the
+///   cost is `2 x ceil(in_flight / 64)` descriptors and never more than
+///   `2 x 64 = 128`. **This is the correction S1 forced.** The claim that
+///   used to stand here — that hyper opens further connections when the
+///   peer's advertised stream limit is below the offered concurrency, so the
+///   bound was the 256-request gate at up to 512 descriptors — is not what
+///   hyper-util does: for HTTP/2 it hands every caller the same pooled
+///   connection regardless of stream capacity, which is why the old pool of 4
+///   was one socket and why run2's predicts queued invisibly behind the
+///   peer's limit.
+///
+///   The HTTP/1.1 gate (`INFERENCE_MAX_CONCURRENT_REQUESTS`, fixed at 256)
+///   still covers the case this function cannot: the ceiling is computed
+///   once, before the item loop, so an endpoint that flips to HTTP/1.1
+///   mid-job keeps a window sized for multiplexing, and the gate is what
+///   stops that window from becoming sockets.
 ///
 /// Never below [`MIN_IN_FLIGHT_UNITS`], so the clamp in
 /// [`UnitBudget::observe`] is always a valid range — including when the
@@ -236,25 +245,25 @@ fn in_flight_unit_ceiling(
     match transport {
         InFlightTransport::Multiplexed => {
             // The window's width no longer drives the socket count, so the
-            // only question left is whether the host can afford the client's
-            // own concurrency gate. Sized on the *worst* case rather than the
-            // shipped pool size: a peer that advertises one stream per
-            // connection makes hyper open one connection per admitted
-            // request, so the ceiling on connections is the gate, not
-            // `INFERENCE_POOL_CONNECTIONS`. At the shipped numbers that is
-            // 256 + 2 x 256 = 768, which the container default of 1024 still
-            // clears — so this fires on a host that has genuinely too few.
-            let needed = FD_RESERVE
-                .saturating_add(FDS_PER_POOLED_CONNECTION * INFERENCE_MAX_CONCURRENT_REQUESTS);
+            // only question left is whether the host can afford every
+            // connection lane at once. That is the true worst case: a lane is
+            // one h2 connection whatever the peer's stream limit is (hyper's
+            // pool shares a connection rather than opening another), so the
+            // ceiling is the lane count and not the request gate. At the
+            // shipped numbers that is 256 + 2 x 64 = 384, which the container
+            // default of 1024 clears easily — so this fires on a host that
+            // has genuinely too few.
+            let needed =
+                FD_RESERVE.saturating_add(FDS_PER_POOLED_CONNECTION * INFERENCE_CONNECTION_LANES);
             if budget < needed {
                 tracing::warn!(
                     soft_nofile,
                     reserve = FD_RESERVE,
-                    pool_connections = INFERENCE_POOL_CONNECTIONS,
-                    max_concurrent = INFERENCE_MAX_CONCURRENT_REQUESTS,
+                    connection_lanes = INFERENCE_CONNECTION_LANES,
+                    fds_per_connection = FDS_PER_POOLED_CONNECTION,
                     needed,
                     "the open file descriptor limit is below what the inference \
-                     connection pool and the process's other files need in the \
+                     connection lanes and the process's other files need in the \
                      worst case; raise the hard limit (ulimit -Hn, or the \
                      container runtime's nofile setting)"
                 );
@@ -3467,22 +3476,15 @@ mod tests {
         );
 
         // The whole point: the sockets that window costs no longer scale with
-        // it. Against a peer generous with streams that is the pool itself.
-        let pool_sockets = FDS_PER_POOLED_CONNECTION * INFERENCE_POOL_CONNECTIONS;
-        assert_eq!(pool_sockets, 8);
-        assert!(
-            pool_sockets + FD_RESERVE <= 1024,
-            "the pool plus the reserve fits in the limit that could not hold the window"
-        );
-        // And in the worst case — a peer allowing one stream per connection,
-        // or the transport flipping to HTTP/1.1 mid-job — it is the client's
-        // concurrency gate, which must still fit the shipped container's
-        // limit. This is what makes the unclamped window safe.
-        let worst_case = FDS_PER_POOLED_CONNECTION * INFERENCE_MAX_CONCURRENT_REQUESTS;
-        assert_eq!(worst_case, 512);
+        // it. A lane is one h2 connection whatever the peer's stream limit
+        // is — hyper's pool shares a connection rather than opening another —
+        // so every lane at once is the worst case, not a best case.
+        let worst_case = FDS_PER_POOLED_CONNECTION * INFERENCE_CONNECTION_LANES;
+        assert_eq!(worst_case, 128);
         assert!(
             worst_case + FD_RESERVE <= 1024,
-            "the gate's worst case must fit the shipped container's soft limit"
+            "every connection lane plus the reserve must fit the limit that \
+             could not hold the window"
         );
 
         // A pathological limit does not change the window — there is nothing

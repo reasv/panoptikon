@@ -7,6 +7,8 @@ use reqwest_retry::policies::ExponentialBackoff;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -308,57 +310,102 @@ impl Transport {
     }
 }
 
-/// Idle connections the client keeps to one inference endpoint.
+/// Independent HTTP/2 connections ("lanes") this client may hold to one
+/// inference endpoint.
 ///
-/// Four rather than one so a connection being torn down (a server restart, an
-/// idle timeout) does not serialize the requests waiting behind it, and so a
-/// multi-worker inference server can be reached over more than one socket.
+/// **This used to be `pool_max_idle_per_host` on a single `reqwest::Client`,
+/// and it bought exactly one socket.** For HTTP/2, hyper-util's pool hands
+/// every caller the *same* connection — `Reservation::Shared`, with
+/// `can_share() == is_http2()` — and its readiness test is "the dispatch
+/// channel is open", not "there is stream capacity", so it never opens a
+/// second connection under load however wide the window gets. Run2's
+/// `S2-wdvit` leg is the receipt: a pool of 4, one socket, and every predict
+/// on it queueing behind the peer's stream limit. The constant's own doc
+/// comment described behaviour the code did not have.
 ///
-/// It bounds the connections kept *idle*, which is not the same as the
-/// endpoint's socket budget: hyper opens another connection whenever every
-/// pooled one is at the peer's advertised stream limit. The real bound on
-/// sockets in both transports is [`INFERENCE_MAX_CONCURRENT_REQUESTS`] — see
-/// there.
-pub(crate) const INFERENCE_POOL_CONNECTIONS: usize = 4;
+/// So each lane is now its own `reqwest::Client` with its own pool, which is
+/// the only way to make the number real. One lane is one connection —
+/// hyper-util also dedups concurrent h2 connects per pool key, so a burst
+/// cannot fan a lane into several sockets.
+///
+/// **Why 64.** It is the multiplier that makes the client's own gate
+/// (`lanes x` [`H2_STREAMS_PER_CONNECTION`] = 4 096 requests) reach the job's
+/// own in-flight ceiling — `jobs::extraction::in_flight_unit_ceiling` admits
+/// 4 096 units at the shipped defaults, and for an `item`/`count` model
+/// (every image tagger and CLIP embedder) one unit is one request. Below that
+/// the client would be a ceiling nothing else in the system knows about,
+/// which is the entire defect this fixes.
+///
+/// **What it costs.** Lanes are recruited by load, not spread across
+/// ([`EndpointRuntime::pick_lane`]): the concurrency has to exceed
+/// `H2_STREAMS_PER_CONNECTION` before a second socket is opened at all, so
+/// the descriptor cost is `ceil(in_flight / 64)` sockets and never more than
+/// 64. Local inference is loopback inside this process, so the worst case is
+/// `2 x 64 = 128` descriptors, against `jobs::extraction`'s `FD_RESERVE` of
+/// 256 and the shipped container's soft limit of 1 024.
+pub(crate) const INFERENCE_CONNECTION_LANES: usize = 64;
 
-/// Streams one h2 connection is *expected* to carry, for deriving
-/// [`INFERENCE_MAX_CONCURRENT_REQUESTS`].
+/// Streams this client offers **one** h2 connection before recruiting the
+/// next lane.
 ///
-/// Deliberately only an expectation: nothing communicates it to hyper, and
-/// there is no client setting that would. What the peer allows is whatever it
-/// advertises in `SETTINGS_MAX_CONCURRENT_STREAMS` (hyper's own server
-/// advertises 200, nginx defaults to 128, Envoy to 100), and hyper opens a
-/// further connection when the pooled ones are saturated. So 64 is the
-/// pessimistic assumption that makes the concurrency cap below imply a
-/// *small* number of connections against every common peer, not a number
-/// enforced anywhere.
+/// It is now enforced rather than assumed: [`EndpointRuntime::pick_lane`]
+/// recruits lanes by load, so a lane is offered more than this only once
+/// every lane is at it. That matters because a peer's real limit is invisible
+/// to us — `reqwest` exposes no way to read a peer's
+/// `SETTINGS_MAX_CONCURRENT_STREAMS`, and offering more streams than it
+/// allows does not fail, it silently *queues inside h2* where neither the
+/// dispatcher nor `/health` can see it. That invisible queue is precisely
+/// what froze run2's calibration ramp.
+///
+/// 64 is below every common server default (nginx 128, Envoy 100, hyper 200,
+/// and this binary's own [`crate::MAX_CONCURRENT_STREAMS`] of 512), so the
+/// streams we offer one connection are ones a peer will actually run.
 const H2_STREAMS_PER_CONNECTION: usize = 64;
 
-/// Requests this client keeps in flight against one endpoint. Everything past
-/// it queues on a semaphore — which is the point: a queued request holds no
-/// socket, where an admitted one does.
+/// The **floor** of the h2c concurrency gate, and the fixed HTTP/1.1 gate.
 ///
-/// **This is the one number that actually bounds sockets**, in both
-/// transports. Under h2c the connections needed are
-/// `ceil(256 / peer_max_streams)` — four against a peer allowing 64, three
-/// against Envoy, one against hyper's own server — and in the worst case a
-/// peer allowing one stream each it is 256 connections, i.e. 512 descriptors,
-/// which the reserve in `jobs::extraction` still leaves room for. Under
-/// HTTP/1.1 it is one connection per admitted request, so the same 256.
+/// Everything past the gate queues on a semaphore — which is the point: a
+/// queued request holds no socket, where an admitted HTTP/1.1 one does.
 ///
-/// 256 requests is also, by construction, a job's whole default in-flight
-/// unit budget (4096 units at 64 units per request), so the cap bounds
-/// sockets without bounding the work the orchestrator asked for. It is a code
-/// constant rather than something derived from `desired_in_flight`: that
-/// figure is the inference server's opinion about GPU batch shape, and
-/// deriving a *socket* budget from it would let a model's batching advice
-/// move this process's descriptor usage. It is also per endpoint per gateway,
-/// so it is not, and cannot be, a bound on what a shared remote GPU server
-/// sees across several gateways.
-pub(crate) const INFERENCE_MAX_CONCURRENT_REQUESTS: usize =
-    INFERENCE_POOL_CONNECTIONS * H2_STREAMS_PER_CONNECTION;
+/// Under **HTTP/1.1** this is the whole story and it does not move: each
+/// admitted request is a socket, this is the bound run1 blocker F6 needed
+/// (983 sockets, 1 849 items unprocessed), and it must never follow a model's
+/// batching advice. `256 = 4 x 64`, four connections' worth, which is what
+/// this constant meant before lanes existed.
+///
+/// Under **h2c** it is only the floor: see
+/// [`EndpointRuntime::set_in_flight_target`]. A queued request there costs a
+/// *stream*, not a descriptor, and the descriptor cost is bounded by
+/// [`INFERENCE_CONNECTION_LANES`] however high the gate goes — so keeping the
+/// gate at a constant did not protect descriptors, it only capped throughput
+/// at a number the rest of the system could not see.
+pub(crate) const INFERENCE_MAX_CONCURRENT_REQUESTS: usize = 4 * H2_STREAMS_PER_CONNECTION;
 
-/// The two clients and the shared state of one inference endpoint.
+/// The **ceiling** of the h2c gate: the point past which admitting more would
+/// mean offering some lane more streams than [`H2_STREAMS_PER_CONNECTION`],
+/// i.e. handing the peer a queue it never advertised room for.
+pub(crate) const INFERENCE_MAX_CONCURRENT_STREAMS: usize =
+    INFERENCE_CONNECTION_LANES * H2_STREAMS_PER_CONNECTION;
+
+/// One independent HTTP/2 connection to an endpoint, and how much work is on
+/// it right now.
+#[derive(Debug)]
+struct Lane {
+    clients: EndpointClients,
+    in_flight: AtomicUsize,
+}
+
+/// The permits the h2c gate wants to exist, and the shrink it has not been
+/// able to apply yet. Same rule as `jobs::extraction::UnitBudget`: a shrink
+/// never takes a permit away from a request already in flight, it withholds
+/// permits as they come back.
+#[derive(Debug)]
+struct GateState {
+    target: usize,
+    pending_shrink: usize,
+}
+
+/// The clients, the lanes and the shared state of one inference endpoint.
 ///
 /// Shared per base URL across every [`InferenceApiClient`] for that endpoint,
 /// which is load-bearing rather than tidy: a connection pool that is not
@@ -366,13 +413,177 @@ pub(crate) const INFERENCE_MAX_CONCURRENT_REQUESTS: usize =
 /// `reqwest::Client` with its own pool.
 #[derive(Debug)]
 struct EndpointRuntime {
-    h2: EndpointClients,
+    /// [`INFERENCE_CONNECTION_LANES`] independent h2 clients, each its own
+    /// pool and therefore its own connection.
+    h2: Vec<Lane>,
+    /// One client: under HTTP/1.1 a request is a socket regardless, so there
+    /// is nothing for a lane to buy.
     h1: EndpointClients,
     /// The resolved transport, `None` until the first probe and again after a
     /// connection error (a server can be restarted into a different one).
     transport: RwLock<Option<Transport>>,
-    /// The h2c concurrency cap; see [`INFERENCE_MAX_CONCURRENT_REQUESTS`].
-    gate: Arc<tokio::sync::Semaphore>,
+    /// The h2c concurrency gate. Resizable — see
+    /// [`Self::set_in_flight_target`].
+    h2_gate: Arc<tokio::sync::Semaphore>,
+    h2_gate_state: std::sync::Mutex<GateState>,
+    /// The HTTP/1.1 gate, fixed at [`INFERENCE_MAX_CONCURRENT_REQUESTS`]
+    /// forever: there, an admitted request *is* a socket.
+    h1_gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl EndpointRuntime {
+    /// The lane a new request goes on: the least loaded of the lanes the
+    /// current load actually requires.
+    ///
+    /// **Not** the least loaded of all lanes, which is the obvious reading
+    /// and the wrong one: spreading 64 concurrent predicts over 64 lanes
+    /// costs 64 sockets, which is HTTP/1.1's price with extra steps and
+    /// undoes the whole reason this transport was adopted (run1 blocker F6).
+    /// So lanes are *recruited*: the prefix `0..k` is the smallest that can
+    /// hold the load at [`H2_STREAMS_PER_CONNECTION`] streams each, and the
+    /// choice is least-loaded within it. Concurrency of 64 uses one socket,
+    /// 4 096 uses all 64, and the descriptor cost tracks the work instead of
+    /// the lane count.
+    ///
+    /// Least-loaded *within* the prefix rather than "first with room"
+    /// because h2 streams on one connection share a TCP window: a lane
+    /// carrying a slow batch should not also be handed the next one.
+    ///
+    /// Racy by design — loads move under it — and harmlessly so: every
+    /// outcome is a valid lane, and the counters are exact again as soon as
+    /// the burst settles.
+    fn pick_lane(&self) -> usize {
+        let loads: Vec<usize> = self
+            .h2
+            .iter()
+            .map(|lane| lane.in_flight.load(Relaxed))
+            .collect();
+        let total: usize = loads.iter().sum();
+        let needed = total
+            .saturating_add(1)
+            .div_ceil(H2_STREAMS_PER_CONNECTION.max(1));
+        let recruited = needed.clamp(1, loads.len());
+        let mut best = 0usize;
+        for idx in 1..recruited {
+            if loads[idx] < loads[best] {
+                best = idx;
+            }
+        }
+        best
+    }
+
+    /// Follow the desired-in-flight figure the endpoint published, in
+    /// requests.
+    ///
+    /// Track E made the gate a fixed constant for three reasons, and this
+    /// leg falsified one of them: "256 is four times a job's in-flight budget
+    /// (4 096 units at 64 units per request)" is only true for a model whose
+    /// items carry 64 work units each. An image item carries **one**, so the
+    /// job sends one item per request and 4 096 units is 4 096 concurrent
+    /// requests — for every image tagger and CLIP embedder, which are exactly
+    /// the models this feature exists for. 256 was 1/16 of the budget, not
+    /// 4x it. The other two reasons stand, and they are what the clamps here
+    /// preserve:
+    ///
+    /// - **the floor** is [`INFERENCE_MAX_CONCURRENT_REQUESTS`], so this can
+    ///   only ever *raise* the gate above the value every existing deployment
+    ///   already runs at;
+    /// - **the ceiling** is [`INFERENCE_MAX_CONCURRENT_STREAMS`], so a
+    ///   published figure can never make this client offer a lane more
+    ///   streams than it was designed to, and never moves the descriptor cost
+    ///   at all (that is bounded by the lane count, not by the gate);
+    /// - **HTTP/1.1 is untouched.** Its gate is a different semaphore, fixed,
+    ///   because there an admitted request is a socket and a model's batching
+    ///   advice must never move this process's descriptor usage.
+    ///
+    /// The figure is in *items* and the gate counts *requests*. Using it
+    /// directly is deliberate and conservative in the safe direction: for the
+    /// models that matter one item is one request, and for a model that packs
+    /// several units per item it over-provisions a bound whose only cost is
+    /// permits, never sockets. The job's own `UnitBudget` remains the
+    /// throttle; this is a safety bound that had become a throughput cap.
+    ///
+    /// Several models share one endpoint, so this is last-writer-wins. That
+    /// is acceptable exactly because of the floor: the worst a small model
+    /// can do to a large one is put the gate back to the constant this code
+    /// shipped with.
+    fn set_in_flight_target(&self, requests: u64) {
+        let wanted = usize::try_from(requests).unwrap_or(usize::MAX).clamp(
+            INFERENCE_MAX_CONCURRENT_REQUESTS,
+            INFERENCE_MAX_CONCURRENT_STREAMS,
+        );
+        let mut state = self
+            .h2_gate_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match wanted.cmp(&state.target) {
+            std::cmp::Ordering::Greater => {
+                let grow = wanted - state.target;
+                // Growth first cancels a shrink that never landed: those
+                // permits are still in existence.
+                let cancelled = state.pending_shrink.min(grow);
+                state.pending_shrink -= cancelled;
+                if grow > cancelled {
+                    self.h2_gate.add_permits(grow - cancelled);
+                }
+                state.target = wanted;
+            }
+            std::cmp::Ordering::Less => {
+                state.pending_shrink += state.target - wanted;
+                state.target = wanted;
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        // Whatever is free right now can go immediately; the rest is
+        // withheld on release, below.
+        let removed = self.h2_gate.forget_permits(state.pending_shrink);
+        state.pending_shrink -= removed;
+    }
+
+    /// Hand back one gate permit, retiring it instead of re-issuing it while
+    /// a shrink is outstanding.
+    ///
+    /// Dropping the permit would not do: `Semaphore` hands a released permit
+    /// straight to a waiter, and a saturated job always has waiters, so
+    /// `forget_permits` alone can never land a shrink (the same defect S1b
+    /// fixes in `jobs::extraction::UnitBudget`).
+    fn release_h2_permit(&self, permit: tokio::sync::OwnedSemaphorePermit) {
+        let mut state = self
+            .h2_gate_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.pending_shrink > 0 {
+            state.pending_shrink -= 1;
+            permit.forget();
+        } else {
+            drop(permit);
+        }
+    }
+}
+
+/// One admitted request's claim on an endpoint: the gate permit it holds and
+/// the lane it was placed on. Both are returned by `Drop`, so every exit path
+/// — success, error, retry backoff, cancellation — accounts for itself.
+struct EndpointLease {
+    endpoint: Arc<EndpointRuntime>,
+    lane: Option<usize>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    multiplexed: bool,
+}
+
+impl Drop for EndpointLease {
+    fn drop(&mut self) {
+        if let Some(lane) = self.lane.take() {
+            self.endpoint.h2[lane].in_flight.fetch_sub(1, Relaxed);
+        }
+        if let Some(permit) = self.permit.take() {
+            if self.multiplexed {
+                self.endpoint.release_h2_permit(permit);
+            } else {
+                drop(permit);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -384,12 +595,12 @@ struct EndpointClients {
 impl EndpointClients {
     fn build(
         configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+        pool_max_idle_per_host: usize,
     ) -> Result<Self> {
-        let raw = configure(
-            reqwest::Client::builder().pool_max_idle_per_host(INFERENCE_POOL_CONNECTIONS),
-        )
-        .build()
-        .context("failed to build inference API client")?;
+        let raw =
+            configure(reqwest::Client::builder().pool_max_idle_per_host(pool_max_idle_per_host))
+                .build()
+                .context("failed to build inference API client")?;
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
         let middleware = ClientBuilder::new(raw.clone())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
@@ -410,11 +621,30 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
     if let Some(existing) = guard.get(base_url) {
         return Ok(Arc::clone(existing));
     }
+    let mut lanes = Vec::with_capacity(INFERENCE_CONNECTION_LANES);
+    for _ in 0..INFERENCE_CONNECTION_LANES {
+        lanes.push(Lane {
+            // One idle connection per lane: a lane *is* a connection, and
+            // hyper-util shares it across every request on that client.
+            clients: EndpointClients::build(reqwest::ClientBuilder::http2_prior_knowledge, 1)?,
+            in_flight: AtomicUsize::new(0),
+        });
+    }
     let runtime = Arc::new(EndpointRuntime {
-        h2: EndpointClients::build(reqwest::ClientBuilder::http2_prior_knowledge)?,
-        h1: EndpointClients::build(|builder| builder.http1_only())?,
+        h2: lanes,
+        h1: EndpointClients::build(
+            |builder| builder.http1_only(),
+            INFERENCE_MAX_CONCURRENT_REQUESTS,
+        )?,
         transport: RwLock::new(None),
-        gate: Arc::new(tokio::sync::Semaphore::new(
+        h2_gate: Arc::new(tokio::sync::Semaphore::new(
+            INFERENCE_MAX_CONCURRENT_REQUESTS,
+        )),
+        h2_gate_state: std::sync::Mutex::new(GateState {
+            target: INFERENCE_MAX_CONCURRENT_REQUESTS,
+            pending_shrink: 0,
+        }),
+        h1_gate: Arc::new(tokio::sync::Semaphore::new(
             INFERENCE_MAX_CONCURRENT_REQUESTS,
         )),
     });
@@ -527,10 +757,18 @@ impl InferenceApiClient {
         // reach the same peer.
         *self.endpoint.transport.write().await = Some(transport);
         if transport == Transport::H2c {
+            // Every figure here is one this client can actually deliver: the
+            // lanes are independent connections, `max_concurrent` is the
+            // gate's floor and `max_concurrent_ceiling` the most a published
+            // desired-in-flight figure can raise it to. The line this
+            // replaces claimed a concurrency of 256 while the transport was
+            // silently allowing 200.
             tracing::debug!(
                 endpoint = %self.base_url,
-                pool_connections = INFERENCE_POOL_CONNECTIONS,
+                connection_lanes = INFERENCE_CONNECTION_LANES,
+                streams_per_lane = H2_STREAMS_PER_CONNECTION,
                 max_concurrent = INFERENCE_MAX_CONCURRENT_REQUESTS,
+                max_concurrent_ceiling = INFERENCE_MAX_CONCURRENT_STREAMS,
                 "multiplexing inference requests over HTTP/2 cleartext"
             );
         }
@@ -541,8 +779,10 @@ impl InferenceApiClient {
     /// sent with HTTP/2 prior knowledge. The body is never read — a status is
     /// already proof that the frames parsed.
     async fn probe_h2c(&self) -> reqwest::Result<()> {
-        self.endpoint
-            .h2
+        // Lane 0: the probe is one request, and the lane it opens is the one
+        // the first real requests will land on anyway.
+        self.endpoint.h2[0]
+            .clients
             .raw
             .get(format!("{}/cache", self.base_url))
             .send()
@@ -619,6 +859,9 @@ impl InferenceApiClient {
     ) -> Result<reqwest::Response> {
         if let Err(reqwest_middleware::Error::Reqwest(err)) = &result
             && (err.is_connect() || err.is_request())
+            // Same exception as in `predict`: only an HTTP/2 peer can refuse
+            // a stream, so it is evidence *for* the memo, not against it.
+            && !is_refused_stream(err)
         {
             self.forget_transport().await;
         }
@@ -642,19 +885,53 @@ impl InferenceApiClient {
     /// per request), so nothing that fits the descriptor clamp can reach it —
     /// only the case the clamp does *not* cover, a model whose requests carry
     /// very few units each, which is exactly the case that exhausts sockets.
-    async fn active(
-        &self,
-    ) -> (
-        Transport,
-        EndpointClients,
-        Option<tokio::sync::OwnedSemaphorePermit>,
-    ) {
+    async fn active(&self) -> (Transport, EndpointClients, EndpointLease) {
         let transport = self.transport().await;
-        let permit = Arc::clone(&self.endpoint.gate).acquire_owned().await.ok();
         match transport {
-            Transport::H2c => (transport, self.endpoint.h2.clone(), permit),
-            Transport::Http11 => (transport, self.endpoint.h1.clone(), permit),
+            Transport::H2c => {
+                let permit = Arc::clone(&self.endpoint.h2_gate)
+                    .acquire_owned()
+                    .await
+                    .ok();
+                // The lane is chosen *after* the permit, so the load the
+                // choice is made on is the load that will actually run.
+                let lane = self.endpoint.pick_lane();
+                self.endpoint.h2[lane].in_flight.fetch_add(1, Relaxed);
+                let clients = self.endpoint.h2[lane].clients.clone();
+                (
+                    transport,
+                    clients,
+                    EndpointLease {
+                        endpoint: Arc::clone(&self.endpoint),
+                        lane: Some(lane),
+                        permit,
+                        multiplexed: true,
+                    },
+                )
+            }
+            Transport::Http11 => {
+                let permit = Arc::clone(&self.endpoint.h1_gate)
+                    .acquire_owned()
+                    .await
+                    .ok();
+                (
+                    transport,
+                    self.endpoint.h1.clone(),
+                    EndpointLease {
+                        endpoint: Arc::clone(&self.endpoint),
+                        lane: None,
+                        permit,
+                        multiplexed: false,
+                    },
+                )
+            }
         }
+    }
+
+    /// Apply a desired-in-flight figure this endpoint published. h2c only —
+    /// see [`EndpointRuntime::set_in_flight_target`].
+    pub fn observe_desired_in_flight(&self, items: u64) {
+        self.endpoint.set_in_flight_target(items);
     }
 
     pub fn from_settings_with_metadata_cache(
@@ -772,7 +1049,14 @@ impl InferenceApiClient {
                     // the peer may have been restarted into a build that
                     // speaks the other protocol, and a fallback nothing ever
                     // re-examines is a permanent downgrade after one blip.
-                    if err.is_connect() || err.is_request() {
+                    //
+                    // A refused stream is the exception, and the memo has to
+                    // be *kept* for it: it is `Kind::Request` like the rest,
+                    // but it is positive proof the peer speaks HTTP/2 — only
+                    // an h2 peer can send RST_STREAM. Forgetting the memo
+                    // there would make a peer with a small stream limit
+                    // re-probe on every burst.
+                    if !is_refused_stream(&err) && (err.is_connect() || err.is_request()) {
                         self.forget_transport().await;
                     }
                     if should_retry_error(&err)
@@ -958,7 +1242,40 @@ fn should_retry_status(status: reqwest::StatusCode) -> bool {
 }
 
 fn should_retry_error(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout()
+    err.is_connect() || err.is_timeout() || is_refused_stream(err)
+}
+
+/// Whether the peer refused to *open* the stream — HTTP/2 `REFUSED_STREAM`.
+///
+/// RFC 9113 §8.7 makes this the one reset that is unambiguously safe to
+/// retry: it means the request "was not processed", which is the same
+/// assertion `worker_died` and `request_incomplete` make (`7e96de62`). So it
+/// earns the same recovery.
+///
+/// **It is reachable in ordinary operation, not only under abuse.** hyper's
+/// client opens up to `DEFAULT_INITIAL_MAX_SEND_STREAMS` = 100 streams on a
+/// new connection *before* the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` frame
+/// has been read (`hyper::proto::h2::client`), and `reqwest` exposes no way
+/// to lower that. A burst opened the instant a lane connects to a peer — or a
+/// proxy — that advertises fewer than 100 therefore has some of its streams
+/// refused, every time, until the SETTINGS land. This was measured, not
+/// imagined: `a_peer_with_a_small_stream_limit_costs_no_extra_sockets` failed
+/// exactly this way against a stub advertising 16, and the job would have
+/// recorded those items as permanently failed.
+///
+/// The chain is walked rather than matched on a string, so it depends on h2's
+/// types instead of h2's prose.
+fn is_refused_stream(err: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = source {
+        if let Some(h2) = current.downcast_ref::<h2::Error>()
+            && h2.reason() == Some(h2::Reason::REFUSED_STREAM)
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 fn next_retry_delay(attempts: u32) -> Option<std::time::Duration> {
@@ -1329,7 +1646,7 @@ mod tests {
         // The real bound: both ends of at most the pooled connections, plus
         // a little slack for whatever else the runtime opened in the window
         // the sample covers.
-        let pool_cost = 2 * INFERENCE_POOL_CONNECTIONS;
+        let pool_cost = 2 * INFERENCE_CONNECTION_LANES;
         assert!(
             growth <= pool_cost + 8,
             "descriptor growth {growth} exceeds the pool's {pool_cost} plus slack"
@@ -1381,6 +1698,16 @@ mod tests {
     /// stream concurrency the server allowed and the number of connections
     /// the shipped client opened to carry it.
     async fn spawn_blocking_stub(probe: Arc<ConcurrencyProbe>) -> String {
+        spawn_blocking_stub_with_streams(probe, crate::MAX_CONCURRENT_STREAMS).await
+    }
+
+    /// The same stub, advertising a stream limit of the caller's choosing —
+    /// the only way to stand in for a peer (or a proxy) less generous than
+    /// this binary.
+    async fn spawn_blocking_stub_with_streams(
+        probe: Arc<ConcurrencyProbe>,
+        max_streams: u32,
+    ) -> String {
         use std::sync::atomic::Ordering::SeqCst;
 
         let handler_probe = Arc::clone(&probe);
@@ -1413,8 +1740,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             // The product's own serve loop, so the stream limit under test is
-            // the one the gateway advertises.
-            crate::serve_with_stream_limit(listener, app, std::future::pending())
+            // advertised exactly the way the gateway advertises its own.
+            crate::serve_with_streams(listener, app, std::future::pending(), max_streams)
                 .await
                 .unwrap();
         });
@@ -1509,10 +1836,144 @@ mod tests {
              ({HYPER_DEFAULT_MAX_CONCURRENT_STREAMS}) and not what was offered \
              ({OFFERED})"
         );
+        // Before S1-3 this read `sockets == 1`: `INFERENCE_POOL_CONNECTIONS`
+        // was `pool_max_idle_per_host` on a single client, and hyper-util
+        // shares one h2 connection per host, so the pool of four was one
+        // socket. Lanes are independent clients, and they are recruited by
+        // load rather than spread across — so the connection count is the
+        // concurrency divided by the per-lane stream budget, which is the
+        // multiplexing promise stated as an equation.
         assert_eq!(
-            sockets, 1,
-            "hyper-util's pool shares one h2 connection per host, so \
-             INFERENCE_POOL_CONNECTIONS does not multiply the stream limit"
+            sockets,
+            peak.div_ceil(H2_STREAMS_PER_CONNECTION),
+            "lanes must be recruited by load: {peak} concurrent requests at \
+             {H2_STREAMS_PER_CONNECTION} streams each"
+        );
+        assert!(
+            sockets <= INFERENCE_CONNECTION_LANES,
+            "{sockets} connections exceeds the lane count"
+        );
+    }
+
+    /// A peer that advertises **less** than we offer a lane.
+    ///
+    /// This is the deployment the memo warns about and the one no test
+    /// covered: the gateway on a NAS, the inference server on a GPU box, and
+    /// a proxy in between that advertises its own
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS`. The client cannot read that number
+    /// — `reqwest` exposes no way to — so the requirement is not "match it"
+    /// but "survive it": the surplus waits inside h2 rather than failing, and
+    /// it must not turn into sockets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_with_a_small_stream_limit_costs_no_extra_sockets() {
+        const OFFERED: usize = 200;
+        /// Far below `H2_STREAMS_PER_CONNECTION`, so every lane is
+        /// over-offered by design.
+        const PEER_STREAMS: u32 = 16;
+
+        let probe = ConcurrencyProbe::new();
+        let base_url = spawn_blocking_stub_with_streams(Arc::clone(&probe), PEER_STREAMS).await;
+        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+
+        let mut inflight = tokio::task::JoinSet::new();
+        for _ in 0..OFFERED {
+            let client = client.clone();
+            inflight.spawn(async move {
+                client
+                    .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+                    .await
+                    .map(|_| ())
+            });
+        }
+        // Enough for every request the peer will admit to have arrived.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let peak = probe.peak();
+        let sockets = probe.sockets();
+        probe.release.send_replace(true);
+        let mut answered = 0usize;
+        while let Some(result) = inflight.join_next().await {
+            // The whole point: a stream limit below what we offer is a
+            // *wait*, not an error.
+            result.expect("no panic").expect("the stub answers");
+            answered += 1;
+        }
+        assert_eq!(answered, OFFERED);
+        assert_eq!(
+            client.known_transport(),
+            Some(Transport::H2c),
+            "a stingy peer is still an h2c peer"
+        );
+        assert!(
+            peak <= PEER_STREAMS as usize * INFERENCE_CONNECTION_LANES,
+            "the peer's own limit must bound what reaches its handler: {peak}"
+        );
+        assert!(
+            sockets <= INFERENCE_CONNECTION_LANES,
+            "a peer advertising {PEER_STREAMS} streams must not multiply our \
+             connections: {sockets} sockets"
+        );
+    }
+
+    /// The descriptor bound `jobs::extraction::in_flight_unit_ceiling` relies
+    /// on, measured rather than reasoned about.
+    ///
+    /// Its multiplexed arm no longer clamps the window by descriptors at all;
+    /// what makes that safe is that the whole endpoint costs at most
+    /// `FDS_PER_POOLED_CONNECTION x INFERENCE_CONNECTION_LANES` = 128, and
+    /// nothing about the window's width changes it. Run1 blocker F6 was 983
+    /// sockets for a window of the same shape.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_endpoints_whole_socket_cost_is_the_lane_count() {
+        const OFFERED: usize = 400;
+
+        let probe = ConcurrencyProbe::new();
+        let base_url = spawn_blocking_stub(Arc::clone(&probe)).await;
+        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+        // Probe and one round trip first, so every lazy allocation the
+        // runtime makes on first contact is already paid for.
+        probe.release.send_replace(true);
+        client
+            .predict("g/model", "k", 1, 60, None, None, &[text_input("warm")])
+            .await
+            .expect("the stub answers");
+        probe.release.send_replace(false);
+        let baseline = open_fds();
+
+        let mut inflight = tokio::task::JoinSet::new();
+        for _ in 0..OFFERED {
+            let client = client.clone();
+            inflight.spawn(async move {
+                client
+                    .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+                    .await
+                    .map(|_| ())
+            });
+        }
+        let mut peak_fds = baseline;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            peak_fds = peak_fds.max(open_fds());
+        }
+        probe.release.send_replace(true);
+        while let Some(result) = inflight.join_next().await {
+            result.expect("no panic").expect("the stub answers");
+        }
+
+        let growth = peak_fds.saturating_sub(baseline);
+        // Both ends of every lane, because the stub runs in this process
+        // exactly as local inference does, plus slack for whatever else the
+        // runtime opened inside the sampling window.
+        let bound = 2 * INFERENCE_CONNECTION_LANES + 8;
+        assert!(
+            growth <= bound,
+            "{OFFERED} concurrent predicts grew the descriptor table by \
+             {growth}, past the lane budget of {bound}"
+        );
+        assert!(
+            growth < OFFERED,
+            "{growth} descriptors for {OFFERED} requests is not better than \
+             one socket each"
         );
     }
 
@@ -1592,22 +2053,180 @@ mod tests {
             let runtime = Arc::clone(&client.endpoint);
             *runtime.transport.write().await = Some(transport);
 
-            let before = runtime.gate.available_permits();
+            let gate = match transport {
+                Transport::H2c => Arc::clone(&runtime.h2_gate),
+                Transport::Http11 => Arc::clone(&runtime.h1_gate),
+            };
+            let before = gate.available_permits();
             assert_eq!(before, INFERENCE_MAX_CONCURRENT_REQUESTS);
-            let (resolved, _clients, permit) = client.active().await;
+            let (resolved, _clients, lease) = client.active().await;
             assert_eq!(resolved, transport);
             assert!(
-                permit.is_some(),
+                lease.permit.is_some(),
                 "{transport:?} must be admitted through the gate, not around it"
             );
             assert_eq!(
-                runtime.gate.available_permits(),
+                gate.available_permits(),
                 before - 1,
                 "{transport:?} must hold a permit while its request is in flight"
             );
-            drop(permit);
-            assert_eq!(runtime.gate.available_permits(), before);
+            // The lane is claimed on the multiplexed path only; under
+            // HTTP/1.1 there is nothing for a lane to buy.
+            assert_eq!(lease.lane.is_some(), transport.is_multiplexed());
+            drop(lease);
+            assert_eq!(gate.available_permits(), before);
+            assert_eq!(
+                runtime
+                    .h2
+                    .iter()
+                    .all(|lane| lane.in_flight.load(Relaxed) == 0),
+                true
+            );
         }
+    }
+
+    /// The h2c gate follows the figure the endpoint published; the HTTP/1.1
+    /// gate does not move at all.
+    ///
+    /// Track E made the gate a fixed 256 partly on the arithmetic "256 is
+    /// four times a job's in-flight budget (4 096 units at 64 units per
+    /// request)". That premise holds only for a model whose items carry 64
+    /// work units each; an image item carries one, so the job sends one item
+    /// per request and 4 096 units is 4 096 concurrent requests. 256 was a
+    /// sixteenth of the budget, not four times it — which is why this now
+    /// moves, and why the floor is exactly the old constant so that nothing
+    /// existing can be throttled by it.
+    #[tokio::test]
+    async fn the_h2c_gate_follows_the_published_figure_and_http1_does_not() {
+        let client =
+            InferenceApiClient::new_with_metadata_cache("http://gate-target-test", false).unwrap();
+        let runtime = Arc::clone(&client.endpoint);
+
+        assert_eq!(
+            runtime.h2_gate.available_permits(),
+            INFERENCE_MAX_CONCURRENT_REQUESTS
+        );
+
+        // Growth, up to the ceiling and no further: past it we would be
+        // offering some lane more streams than it is designed to carry.
+        client.observe_desired_in_flight(1_632);
+        assert_eq!(runtime.h2_gate.available_permits(), 1_632);
+        client.observe_desired_in_flight(u64::MAX);
+        assert_eq!(
+            runtime.h2_gate.available_permits(),
+            INFERENCE_MAX_CONCURRENT_STREAMS
+        );
+
+        // The floor is the constant every existing deployment already runs
+        // at, so a small figure can never throttle one.
+        client.observe_desired_in_flight(1);
+        assert_eq!(
+            runtime.h2_gate.available_permits(),
+            INFERENCE_MAX_CONCURRENT_REQUESTS
+        );
+
+        // HTTP/1.1 is a different semaphore and never moves: there an
+        // admitted request is a socket, and a model's batching advice must
+        // not move this process's descriptor usage.
+        assert_eq!(
+            runtime.h1_gate.available_permits(),
+            INFERENCE_MAX_CONCURRENT_REQUESTS
+        );
+    }
+
+    /// A shrink of the h2c gate must land even while every permit is out.
+    ///
+    /// `Semaphore::forget_permits` can only take permits that are *available*,
+    /// and a saturated endpoint has none — every release goes straight to a
+    /// waiter. So the shrink is repaid on the release path instead: each
+    /// returning permit is retired until the deficit is gone. Same rule, and
+    /// the same reason, as `jobs::extraction::UnitBudget` (S1b).
+    #[tokio::test]
+    async fn a_gate_shrink_lands_through_releases_not_only_through_free_permits() {
+        let client =
+            InferenceApiClient::new_with_metadata_cache("http://gate-shrink-test", false).unwrap();
+        let runtime = Arc::clone(&client.endpoint);
+        *runtime.transport.write().await = Some(Transport::H2c);
+
+        client.observe_desired_in_flight(512);
+        // Saturate: every permit held by an in-flight request.
+        let mut held = Vec::new();
+        for _ in 0..512 {
+            let (_transport, _clients, lease) = client.active().await;
+            held.push(lease);
+        }
+        assert_eq!(runtime.h2_gate.available_permits(), 0);
+
+        // Shrink to the floor. Nothing is free, so nothing can be forgotten
+        // now — the deficit is 512 - 256 = 256.
+        client.observe_desired_in_flight(u64::from(INFERENCE_MAX_CONCURRENT_REQUESTS as u32));
+        assert_eq!(runtime.h2_gate.available_permits(), 0);
+
+        // Every release repays the deficit before it re-issues anything.
+        for _ in 0..256 {
+            held.pop();
+        }
+        assert_eq!(
+            runtime.h2_gate.available_permits(),
+            0,
+            "the first 256 releases must be retired, not re-issued"
+        );
+        while held.pop().is_some() {}
+        assert_eq!(
+            runtime.h2_gate.available_permits(),
+            INFERENCE_MAX_CONCURRENT_REQUESTS,
+            "and the gate settles at exactly the new target"
+        );
+        assert!(
+            runtime
+                .h2
+                .iter()
+                .all(|lane| lane.in_flight.load(Relaxed) == 0),
+            "every lane claim is returned with its lease"
+        );
+    }
+
+    /// Lanes are recruited by load, not spread across: the socket cost of an
+    /// endpoint tracks the work in flight, which is the whole point of
+    /// multiplexing. Asserted on the chooser directly, where the arithmetic
+    /// is visible.
+    #[tokio::test]
+    async fn lanes_are_recruited_by_load() {
+        let client =
+            InferenceApiClient::new_with_metadata_cache("http://lane-pick-test", false).unwrap();
+        let runtime = Arc::clone(&client.endpoint);
+
+        // Empty: one lane.
+        assert_eq!(runtime.pick_lane(), 0);
+        // Below one lane's stream budget: still that lane.
+        runtime.h2[0]
+            .in_flight
+            .store(H2_STREAMS_PER_CONNECTION - 1, Relaxed);
+        assert_eq!(runtime.pick_lane(), 0);
+        // Full: the next lane is recruited.
+        runtime.h2[0]
+            .in_flight
+            .store(H2_STREAMS_PER_CONNECTION, Relaxed);
+        assert_eq!(runtime.pick_lane(), 1);
+        // Within the recruited prefix the choice is least-loaded, not "the
+        // first with room", so a lane carrying a slow batch is not handed the
+        // next request too. Here lane 0 still has room and is not chosen.
+        runtime.h2[0].in_flight.store(50, Relaxed);
+        runtime.h2[1].in_flight.store(20, Relaxed);
+        assert_eq!(runtime.pick_lane(), 1);
+        // A third lane is recruited only once two are full.
+        runtime.h2[1]
+            .in_flight
+            .store(H2_STREAMS_PER_CONNECTION, Relaxed);
+        runtime.h2[0]
+            .in_flight
+            .store(H2_STREAMS_PER_CONNECTION, Relaxed);
+        assert_eq!(runtime.pick_lane(), 2);
+        // And it never leaves the array.
+        for lane in &runtime.h2 {
+            lane.in_flight.store(H2_STREAMS_PER_CONNECTION, Relaxed);
+        }
+        assert!(runtime.pick_lane() < INFERENCE_CONNECTION_LANES);
     }
 
     /// An endpoint that could not be reached at all must not be recorded as

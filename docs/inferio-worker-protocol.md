@@ -499,9 +499,18 @@ the figure on every response, clamped between a floor of one request's worth
 (64 units, which is also the value the semaphore starts at) and a ceiling
 derived from the job's intermediate byte budget, loader slots and descriptor
 budget (4096 units at the shipped defaults). Growth adds permits; a shrink is
-applied only to permits that are free, and the remainder is withheld as
-outstanding permits come back, so a resize never interrupts work already in
+withheld from permits as they come back rather than taken from work already in
 flight.
+
+The same figure also moves the **client's own transport gate**
+(`inferio_client.rs`) on the multiplexed path, between a floor of 256
+concurrent requests and a ceiling of 4096. That is not a duplicate of the
+work budget: a work budget that admits more requests than the transport will
+carry produces exactly run2's `S2-wdvit` failure, where the surplus waits
+invisibly inside HTTP/2 and the server's own ramp never sees it. On the
+HTTP/1.1 path the gate stays fixed at 256, because there an admitted request
+is a socket and a model's batching advice must never move a process's
+descriptor usage.
 
 **A caller must bound the figure by its own file-descriptor budget.** The
 figure is sized by the *server's* memory picture and the server cannot see the

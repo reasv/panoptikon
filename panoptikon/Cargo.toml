@@ -19,6 +19,12 @@ bundled = []
 bundled-ui = []
 
 [dependencies]
+# Named directly for one reason: `inferio_client::is_refused_stream` has to
+# recognise an HTTP/2 REFUSED_STREAM inside a `reqwest` error chain, and that
+# means downcasting to `h2::Error`. Must stay the same h2 `hyper` resolves to
+# or the downcast silently never matches; both are 0.4.x, which cargo unifies.
+h2 = "0.4"
+
 # `http2` is not one of axum's defaults, and `axum::serve` gates the HTTP/2
 # half of hyper-util's auto (version-sniffing) connection builder on it. The
 # gateway needs it because the inference client speaks HTTP/2 cleartext with

@@ -110,7 +110,22 @@ impl InferencePool {
                 )
                 .await
             {
-                Ok(output) => return Ok(output),
+                Ok(output) => {
+                    // The endpoint that published the figure is the endpoint
+                    // the figure is about, so it is applied here rather than
+                    // across the pool: a second endpoint serving a different
+                    // model has its own opinion and its own gate.
+                    //
+                    // The job's `UnitBudget` reads the same header for the
+                    // *work* budget; this is the client's transport gate,
+                    // which the header must also be able to move or the work
+                    // budget is asking for concurrency the transport will not
+                    // carry (run2 S1: 1 632 items asked for, 200 delivered).
+                    if let Some(items) = output.desired_in_flight_items {
+                        client.observe_desired_in_flight(items);
+                    }
+                    return Ok(output);
+                }
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
