@@ -254,9 +254,11 @@ build/deploy/API. The plan that uses this is
 - Worker death mid-window: `roundtrip` EOF → fatal (`worker.rs:1305-1315,
   1422-1444`); dispatcher `End::Fatal` fails the queue, aborts sibling
   windows, kills all replicas; `handle_worker_death`
-  (`manager.rs:1068-1085`) WARN "worker died fatally; dropping model from
-  all caches". **The next predict respawns immediately, serially under
-  `load_lock`, with no counter, backoff or cap.**
+  (`manager.rs:1547-1567`) WARN "worker died fatally; dropping model from
+  all caches". The next predict respawns — under that **model's own** load
+  lock and its board's admission permit (R6), and bounded by the R9
+  load-failure cooldown when the respawn itself keeps failing (was: no
+  counter, backoff or cap at all).
 - **Death record** `WorkerDeath` (`worker.rs:534-565`), built by
   `Worker::record_death` (`:1600`) on **every** fatal path and logged as
   WARN *"an inferio worker process is gone. Cause: …"* with `worker`,
@@ -327,8 +329,15 @@ build/deploy/API. The plan that uses this is
   load/prewarm 600 s, unload_grace 10 s, terminate_grace 5 s
   (`[inference_local] handshake_secs/load_secs/unload_grace_secs/
   terminate_grace_secs`); `TRIM_DEADLINE` 60 s fixed; **predict has no
-  deadline**; a hung worker holds its grant forever. The manager's
-  `load_lock` is taken at the top of every predict (`manager.rs:1161`).
+  deadline**; a hung worker holds its grant forever. The manager's global
+  `load_lock` is **gone** (R6, finding P5-3/B18): a predict to a resident
+  model takes no load-path lock at all (`ensure_loaded`'s fast path,
+  `manager.rs:1852`), a load takes the shutdown barrier, that model's own
+  lock (`load_locks`, `manager.rs:1171`) and one permit per board from the
+  admission gate (`load_admission`, `acquire_load_admission`
+  `manager.rs:1796`, `[inference_local] max_concurrent_loads`, default 1).
+  Lock order and the no-deadlock argument are in the `manager.rs` module
+  docs.
 - Core request sizing (**changed by the §8 G7 fix; the feedback signal is
   implemented**): `REQUEST_UNIT_BUDGET = 64` (`extraction.rs:66`) is now
   only the per-request chunk. The per-job in-flight total is a resizable
@@ -415,7 +424,13 @@ build/deploy/API. The plan that uses this is
   torch_version, dtype, base_mb, base_method, free_mb, total_mb,
   free_source, allocated_mb, reserved_mb, reserved_at_load_mb,
   memory_age_ms, measurements_recorded, recent_batches[]}]`
-  (`manager.rs:148-179`).
+  (`manager.rs:148-179`), and top-level `load_cooldowns[{inference_id,
+  failures, last_error, retry_at, retry_after_secs, window_secs}]` (R9,
+  `manager.rs:1436-1458`) — the only view of a model whose loads are
+  failing, since such a model is never in `models[]`. A predict or
+  `PUT /load` during a cooldown answers **503** with `Retry-After` and
+  `{"detail": {"kind": "load_cooldown", …}}` (`http.rs`
+  `load_cooldown_response`).
 - `GET /api/inference/metadata` (`http.rs:672-700`,
   `calibration::overlay_metadata` `calibration.rs:1108-1168`): per priced
   id a `calibration` key `{status: "local"|"baseline", gpu, dtype,
@@ -763,12 +778,15 @@ Smallest per class: `tags/wd-vit-tagger-v3` (~350 MB),
   (always `INFERENCE_OOM_BATCH_SIZE_1:`); `failbatch_impl.py` (non-OOM
   `ValueError` for batch > 1); `echo_impl.py`, `batchsize_impl.py`,
   `dying_impl.py`, `die_on_flag_impl.py`, `hang_impl.py`,
-  `slow_impl.py`, `device_impl.py` (echoes `CUDA_VISIBLE_DEVICES`).
+  `slow_impl.py`, `slow_load_impl.py` (`"slow_load_test"`, sleeps
+  `config.load_seconds` — default 3 — inside `load()`; the R6 fixture for
+  proving a load delays no other model's predicts), `device_impl.py`
+  (echoes `CUDA_VISIBLE_DEVICES`).
 - Registering with a real host: copy into `inferio_custom/` (default
   impl dir; `inferio_custom/README.md`) or set `[inference_local]
   impl_dirs`, then a user registry TOML in `config/inference/` (scanned
   after the built-in dir; see `config/inference/example.toml` and the
-  manager's test registry at `manager.rs:1884-1935`), e.g.
+  manager's test registry at `manager.rs:2655-2741`), e.g.
   ```toml
   [group.oomtest]
   config.impl_class = "oom_second_batch_test"
