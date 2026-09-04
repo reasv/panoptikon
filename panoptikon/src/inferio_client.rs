@@ -2187,12 +2187,12 @@ mod tests {
             assert_eq!(lease.lane.is_some(), transport.is_multiplexed());
             drop(lease);
             assert_eq!(gate.available_permits(), before);
-            assert_eq!(
+            assert!(
                 runtime
                     .h2
                     .iter()
                     .all(|lane| lane.in_flight.load(Relaxed) == 0),
-                true
+                "the lane claim is returned with the lease"
             );
         }
     }

@@ -370,7 +370,7 @@ impl UnitBudget {
     /// "retire `retired`, return `held - retired`" and needs no permit
     /// splitting.
     fn release(&self, permit: tokio::sync::OwnedSemaphorePermit) {
-        let held = permit.num_permits() as usize;
+        let held = permit.num_permits();
         let mut state = self.state.lock().expect("unit budget mutex poisoned");
         let retired = state.pending_shrink.min(held);
         state.pending_shrink -= retired;
