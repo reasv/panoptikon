@@ -566,6 +566,29 @@ impl InferenceApiClient {
         *self.endpoint.transport.write().await = None;
     }
 
+    /// Every non-predict call's send result, funnelled through one place so
+    /// that a transport-level failure invalidates the memo here too.
+    ///
+    /// `predict` does this inline (it owns a retry loop and needs the error
+    /// afterwards); without the same rule on the rest, a memo can be stale
+    /// *upward* and stay that way forever. Concretely: a peer remembered as
+    /// h2c that comes back behind an HTTP/1.1-only proxy — the NAS-to-GPU-box
+    /// deployment can grow one — fails `load_model` on every job from then on,
+    /// and a job that fails at load never reaches the predict that would have
+    /// cleared the memo. One gateway restart is the only other way out.
+    async fn checked_send(
+        &self,
+        result: std::result::Result<reqwest::Response, reqwest_middleware::Error>,
+        context: &'static str,
+    ) -> Result<reqwest::Response> {
+        if let Err(reqwest_middleware::Error::Reqwest(err)) = &result
+            && (err.is_connect() || err.is_request())
+        {
+            self.forget_transport().await;
+        }
+        result.context(context)
+    }
+
     /// The clients for the transport in use, plus the concurrency permit that
     /// keeps requests queueing on the pool instead of opening sockets.
     ///
@@ -750,37 +773,36 @@ impl InferenceApiClient {
             query.push(("prewarm", prewarm.to_string()));
         }
         let (_transport, clients, _slot) = self.active().await;
-        let response = clients
-            .middleware
-            .put(url)
-            .query(&query)
-            .send()
-            .await
-            .context("inference load request failed")?;
+        let response = self
+            .checked_send(
+                clients.middleware.put(url).query(&query).send().await,
+                "inference load request failed",
+            )
+            .await?;
         parse_json_response(response).await
     }
 
     pub async fn unload_model(&self, inference_id: &str, cache_key: &str) -> Result<Value> {
         let url = format!("{}/cache/{}/{}", self.base_url, cache_key, inference_id);
         let (_transport, clients, _slot) = self.active().await;
-        let response = clients
-            .middleware
-            .delete(url)
-            .send()
-            .await
-            .context("inference unload request failed")?;
+        let response = self
+            .checked_send(
+                clients.middleware.delete(url).send().await,
+                "inference unload request failed",
+            )
+            .await?;
         parse_json_response(response).await
     }
 
     pub async fn clear_cache(&self, cache_key: &str) -> Result<Value> {
         let url = format!("{}/cache/{}", self.base_url, cache_key);
         let (_transport, clients, _slot) = self.active().await;
-        let response = clients
-            .middleware
-            .delete(url)
-            .send()
-            .await
-            .context("inference clear cache request failed")?;
+        let response = self
+            .checked_send(
+                clients.middleware.delete(url).send().await,
+                "inference clear cache request failed",
+            )
+            .await?;
         parse_json_response(response).await
     }
 
@@ -789,12 +811,12 @@ impl InferenceApiClient {
     pub async fn get_cached_models(&self) -> Result<Value> {
         let url = format!("{}/cache", self.base_url);
         let (_transport, clients, _slot) = self.active().await;
-        let response = clients
-            .middleware
-            .get(url)
-            .send()
-            .await
-            .context("inference cache list request failed")?;
+        let response = self
+            .checked_send(
+                clients.middleware.get(url).send().await,
+                "inference cache list request failed",
+            )
+            .await?;
         parse_json_response(response).await
     }
 
@@ -827,24 +849,24 @@ impl InferenceApiClient {
     async fn fetch_metadata(&self) -> Result<Value> {
         let url = format!("{}/metadata", self.base_url);
         let (_transport, clients, _slot) = self.active().await;
-        let response = clients
-            .middleware
-            .get(url)
-            .send()
-            .await
-            .context("inference metadata request failed")?;
+        let response = self
+            .checked_send(
+                clients.middleware.get(url).send().await,
+                "inference metadata request failed",
+            )
+            .await?;
         parse_json_response(response).await
     }
 
     pub async fn get_external_inputs(&self) -> Result<Value> {
         let url = format!("{}/external-inputs", self.base_url);
         let (_transport, clients, _slot) = self.active().await;
-        let response = clients
-            .middleware
-            .get(url)
-            .send()
-            .await
-            .context("inference external-input request failed")?;
+        let response = self
+            .checked_send(
+                clients.middleware.get(url).send().await,
+                "inference external-input request failed",
+            )
+            .await?;
         parse_json_response(response).await
     }
 
@@ -854,12 +876,12 @@ impl InferenceApiClient {
     pub async fn get_external_inputs_optional(&self) -> Result<Option<Value>> {
         let url = format!("{}/external-inputs", self.base_url);
         let (_transport, clients, _slot) = self.active().await;
-        let response = clients
-            .middleware
-            .get(url)
-            .send()
-            .await
-            .context("inference external-input request failed")?;
+        let response = self
+            .checked_send(
+                clients.middleware.get(url).send().await,
+                "inference external-input request failed",
+            )
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
