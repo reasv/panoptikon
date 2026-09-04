@@ -276,11 +276,11 @@ pub struct LoadReport {
     /// worker sent it.
     pub base_method: Option<String>,
     pub reserved_at_load_mb: Option<u64>,
-    /// Load precision (`"fp16"`/`"bf16"`/`"fp32"`, or `"unknown"`); part of
+    /// Load precision (`"fp16"`/`"bf16"`/`"fp32"`, or `"unstated"`); part of
     /// the profile key. `None` only from a worker that reported no footprint
     /// at all — there is nothing to key then anyway — or an older one.
     ///
-    /// `"unknown"` is a **value**, not a failure: the key needs every
+    /// `"unstated"` is a **value**, not a failure: the key needs every
     /// component or the entry can never be read back, and a model whose impl
     /// negotiates no precision and whose weights could not be inspected is
     /// otherwise unkeyable forever. It is stable for a given impl, so an
@@ -288,7 +288,7 @@ pub struct LoadReport {
     pub dtype: Option<String>,
     /// How the worker arrived at [`Self::dtype`]: `"selected"` (the impl
     /// negotiated it), `"attribute"` (a real `torch.dtype` on the instance),
-    /// `"inferred"` (read off the loaded weights) or `"unknown"`. Additive
+    /// `"inferred"` (read off the loaded weights) or `"unstated"`. Additive
     /// and diagnostic — nothing keys on it; it is what tells a maintainer
     /// reading the log or the store which kind of evidence a row rests on.
     pub dtype_method: Option<String>,
