@@ -242,6 +242,7 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     "load before configure",
                 )
                 continue
+            before: dict = {}
             try:
                 # Memory sensing (docs/batch-calibration-design.md "Base
                 # measurement"): bracket the load so the orchestrator gets
@@ -268,6 +269,12 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     proto_out, req_id, **memory.finish_load(before, instance)
                 )
             except Exception as e:
+                # The other half of the bracket. `finish_load` is what
+                # normally collects the load-window state; a load that raised
+                # never reaches it, and the accelerator-context probe it
+                # started would otherwise poll on for its whole deadline —
+                # once per attempt on a worker whose load is retried.
+                memory.abort_load(before)
                 logger.error(
                     "%s - load failed: %s", inference_id, e, exc_info=True
                 )

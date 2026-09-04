@@ -2064,7 +2064,13 @@ def free_total_mb() -> tuple[int | None, int | None, str | None]:
 # The context this process measured for itself, in MiB, or None if it never
 # could. A dict rather than a bare global so tests can isolate it the way they
 # isolate `_nvml_state`.
-_context_state: dict[str, Any] = {"measured_mb": None, "logged": False}
+_context_state: dict[str, Any] = {
+    "measured_mb": None,
+    "logged": False,
+    # The probe this process has running, so it can be collected from the
+    # load-failure path as well as from `finish_load` ([`abort_load`]).
+    "probe": None,
+}
 
 
 class _ContextProbe:
@@ -2259,7 +2265,13 @@ def _start_context_probe(
       and its creation cannot be observed;
     - this process already measured one, which cannot change: a context is
       created once.
+
+    A probe left over from an earlier load in this process is collected first,
+    so a worker whose load failed and was retried cannot accumulate watcher
+    threads ([`abort_load`] is the ordinary route for that; this is the
+    backstop for any caller that dropped its `begin_load` state).
     """
+    _collect_context_probe(announce=False)
     if free_mb is None or free_source not in ("nvml", "amdgpu-sysfs"):
         return None
     if _ram_currency() or _context_state["measured_mb"] is not None:
@@ -2273,7 +2285,61 @@ def _start_context_probe(
             return None
     probe = _ContextProbe(free_mb, free_source)
     probe.start()
+    _context_state["probe"] = probe
     return probe
+
+
+def _collect_context_probe(
+    probe: "_ContextProbe | None" = None, announce: bool = True
+) -> None:
+    """Stop this process's context probe, if one is running, and keep whatever
+    it measured.
+
+    Both the probe handed through the `begin_load` state and the one this
+    module recorded are collected, so no route can leave a watcher thread
+    polling for its whole 600 s deadline: `finish_load` passes the former,
+    [`abort_load`] and `_start_context_probe` rely on the latter.
+
+    `announce` is False for a collection that is not the end of a successful
+    load: a load that raised without measuring anything must not burn the
+    one-shot INFO line saying the estimate is in use, because the *next* load
+    in this process may still measure one.
+    """
+    running = _context_state.get("probe")
+    _context_state["probe"] = None
+    seen: list[Any] = []
+    for candidate in (probe, running):
+        if candidate is None or any(candidate is other for other in seen):
+            continue
+        seen.append(candidate)
+        try:
+            measured = candidate.result()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("could not collect the context probe: %s", exc)
+            continue
+        if measured is not None or announce:
+            _remember_context_mb(measured)
+
+
+def abort_load(before: dict[str, Any]) -> None:
+    """Release what `begin_load` started, for a load that **raised**.
+
+    `finish_load` is never reached on a failed load, so without this the
+    context probe would go on polling until its own 600 s deadline. It is a
+    daemon thread and cannot keep a worker alive, but a worker whose load the
+    orchestrator retries would accumulate one per attempt.
+
+    Whatever the probe managed to measure is *kept*: a context is a fact about
+    this process, not about the load that happened to create it, so a later
+    successful load in the same process still gets a measured allowance
+    instead of the estimate. Never raises — a failed load must report the
+    error it failed with, not one from the cleanup.
+    """
+    try:
+        probe = before.get("context_probe") if isinstance(before, dict) else None
+        _collect_context_probe(probe, announce=False)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("post-failure memory cleanup failed: %s", exc)
 
 
 def context_allowance_mb() -> tuple[int, str]:
@@ -2367,9 +2433,7 @@ def finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
 def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     # Collect the context probe first: it holds a live thread, and everything
     # below may consult the figure it produced.
-    probe = before.get("context_probe")
-    if probe is not None:
-        _remember_context_mb(probe.result())
+    _collect_context_probe(before.get("context_probe"))
     reserved, allocated, _, peak_allocated = _allocator_stats()
     free_after, _ = _free_mb(before.get("free_source"))
 

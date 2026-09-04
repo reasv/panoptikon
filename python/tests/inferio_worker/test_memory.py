@@ -201,7 +201,7 @@ def isolated(torch_module=None):
             mock.patch.dict(memory._bdf_state, {"bdf": None}, clear=False),
             mock.patch.dict(
                 memory._context_state,
-                {"measured_mb": None, "logged": False},
+                {"measured_mb": None, "logged": False, "probe": None},
                 clear=False,
             ),
             mock.patch.dict(memory._logged, {}, clear=False),
@@ -592,6 +592,66 @@ def test_the_probe_is_only_started_when_a_measurement_is_possible(
         assert memory._start_context_probe(8000, "nvml") is None, (
             "a context that predates this window cannot be measured"
         )
+
+
+def test_a_failed_load_stops_its_context_probe() -> None:
+    # `finish_load` is never reached when `instance.load()` raises, so the
+    # probe it would have collected has to be collected by the failure path
+    # instead. It is a daemon thread and cannot keep the worker alive, but a
+    # worker whose load the orchestrator retries would otherwise accumulate
+    # one 600-second watcher per attempt.
+    with isolated():
+        world = ProbeWorld()
+        probe = world.probe()
+        probe.start()
+        memory._context_state["probe"] = probe
+        memory.abort_load({"context_probe": probe})
+        assert probe._stop.is_set(), "the watcher was told to stop"
+        assert memory._context_state["probe"] is None
+        assert memory._context_state["logged"] is False, (
+            "a failed load must not burn the one-shot line: the next load in "
+            "this process may still measure a context"
+        )
+        assert memory.context_allowance_mb() == (
+            memory.CONTEXT_ESTIMATE_MB,
+            "estimate",
+        )
+
+
+def test_a_failed_loads_measurement_is_still_kept() -> None:
+    # A context is a fact about the *process*, not about the load that
+    # happened to create it: if CUDA came up before the load raised, the
+    # measurement stands for the next load in this worker.
+    with isolated():
+        world = ProbeWorld(free_at_init=8000)
+        probe = world.probe(free_before=8700)
+        world.initialized = True
+        probe.poll()
+        memory.abort_load({"context_probe": probe})
+        assert memory.context_allowance_mb() == (700, "measured")
+
+
+def test_abort_load_survives_a_load_that_never_started_one() -> None:
+    # `begin_load` returns {} when it could measure nothing at all, and the
+    # cleanup path must report the load's own error, never one of its own.
+    with isolated():
+        memory.abort_load({})
+        memory.abort_load(None)  # type: ignore[arg-type]
+
+
+def test_a_stale_probe_is_collected_before_a_new_one_starts(fake_torch) -> None:
+    # The backstop for any caller that dropped its `begin_load` state: two
+    # loads in one process must not leave two watchers polling.
+    with isolated():
+        world = ProbeWorld()
+        stale = world.probe()
+        stale.start()
+        memory._context_state["probe"] = stale
+        started = memory._start_context_probe(8000, "nvml")
+        assert stale._stop.is_set(), "the previous watcher was stopped"
+        assert started is not None and started is not stale
+        assert memory._context_state["probe"] is started
+        started.result()
 
 
 def test_the_measured_context_replaces_the_estimate_in_the_base() -> None:
