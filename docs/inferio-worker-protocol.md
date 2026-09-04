@@ -51,6 +51,7 @@ and the two vocabulary changes below are the only other change on the wire:
 | `free_mb` | a measurement map | R5 — the pre-batch free reading the defensive clamp already takes |
 | `free_source` | a measurement map | R5 — which driver produced that reading |
 | `clamped` | a measurement map | R5 — `{from_units, to_units, free_mb}`, present only when the clamp shrank this batch |
+| `clamped.reason` | a measurement map | S1 — `"index_limit"` when what shrank the batch was an impl's **shape ceiling** rather than the memory clamp. Additive: **absent means the memory clamp**, so a pre-S1 orchestrator reads every `clamped` exactly as before |
 | `oom_class` | a measurement map | R3 — `{source, exception, free_mb_at_failure, device}`, present only beside `oom: true` |
 
 The two value changes, on keys that are not new:
@@ -277,6 +278,50 @@ Two mechanisms in the worker make this visible rather than tacit:
   line per process naming the ratio. Exposing a canvas is what exempts an
   impl, because exposing it *is* the promise above; the warning is for the
   future impl that pads raw and says nothing.
+
+**The shape ceiling: `max_batch_for(shapes)`** (new in run2, S1)
+
+A canvas bounds how much *area* one item costs. It does not bound how many
+items one call can execute, and those are different ceilings with different
+causes. An impl may expose
+
+```python
+def max_batch_for(self, shapes: Sequence[tuple[int, int] | None]) -> int | None
+```
+
+to answer the second. `shapes` are the window's image-header readings for the
+batch the harness has just planned, as `(width, height)` in PIL's order, with
+`None` where a header could not be read; the return is a positive item count,
+or `None` for "no ceiling from me". It is asked once per batch, after
+planning and before anything runs, and never for a batch of one.
+
+**It is a shape statement, never a memory opinion.** Memory is the grant's
+business. What this exists for is the class of failure the grant cannot
+model: a kernel whose 32-bit element index cannot address the tensor a batch
+builds refuses it with the whole board free. `inferio.impl.eocr` is the
+shipped case — CRAFT's first pooling kernel (`vgg16_bn.features[6]`, a
+`MaxPool2d(2, 2)` over the 64-channel block) launches over
+`B × 64 × H//2 × W//2` output elements downcast to a signed 32-bit int, so a
+batch of canvas-bounded A4 pages stops at 28 items and a batch of square ones
+at 20, whatever the board has free. Run2's probes measured exactly that
+boundary with 3 GiB of 96 still available.
+
+When the ceiling trims a batch, the harness reports it as
+`clamped = {from_units, to_units, free_mb, reason: "index_limit"}` on that
+batch's measurement, and the trimmed items go to the next batch of the same
+window. The batch that runs is whole, so it is still a **priced** sample —
+which is the point of asking before rather than discovering after.
+
+An impl that also (or instead) enforces the ceiling inside `predict` reports
+it through `inferio.impl.utils.total_index_limit_events()`, a process total
+the harness diffs across the `predict` call exactly as it diffs
+`total_oom_halvings()`. `run_with_oom_retry` bumps it when it halves on such
+a failure, which it does because the failure is size-dependent — but it does
+**not** bump the halving counter, so the batch never acquires the `oom` flag.
+That separation is the whole fix: before it, easyOCR turned the failure into
+a slower success, the ledger saw no negative and no clamp, and `unit_budget`
+widened past a batch the impl cannot execute, for a measured 3.2× throughput
+loss with no other symptom.
 
 Tier 2 runs at **load** as well as at predict time, and its answer is what
 the `load` `ok` response's own `canvas_pixels` reports (see "Memory sensing"):
@@ -756,7 +801,7 @@ A measurement map describes one GPU batch the worker actually ran:
 | `oom_class` | **new (run2, R3)**: present exactly when `oom` is `true`, as `{source, exception, free_mb_at_failure, device}` — *why* the harness called this an out-of-memory condition, so the orchestrator can trust a structural signal and corroborate a textual one instead of guessing from a message it never sees. Absent when `oom` is absent, and **absent means the worker saw no out-of-memory condition**, including on a batch that failed for some other reason: the orchestrator must not deflate on such a failure |
 | `free_mb` | **new (run2, R5)**: driver-reported free memory on the worker's board, read immediately **before** this batch ran — the very sample the defensive clamp compares against `grant.mb`, reported rather than discarded. Absent when nothing could be read, and absent on the grantless compatibility path, which takes no pre-batch reading |
 | `free_source` | **new (run2, R5)**: which driver produced `free_mb`, from the same vocabulary a memory sample's `free_source` uses (`"nvml"`, `"amdgpu-sysfs"`, `"mps"`, `"ram"`, `"torch"`). Present exactly when `free_mb` is |
-| `clamped` | **new (run2, R5)**: present only when the defensive clamp actually **reduced** this batch's budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading that forced it. Absent on every batch that ran at its granted budget |
+| `clamped` | **new (run2, R5)**: present only when this batch actually ran **smaller** than its granted budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading taken before the batch. Absent on every batch that ran at its granted budget. **Extended in run2 (S1)** with an optional fourth key, `reason`: `"index_limit"` when what shrank the batch was an impl's shape ceiling (`max_batch_for`, or the impl's own equivalent inside `predict` — see "Memory grants") rather than the defensive memory clamp. `reason` is **additive and absent by default**, and absent means the memory clamp, so nothing an older orchestrator reads changes. When both bound the same batch, one map spans them: `from_units` is the granted budget, `to_units` is what ran, and `reason` names the constraint that set `to_units` |
 
 `oom_class` has four keys:
 
@@ -793,6 +838,15 @@ none of this changes what it sends):
   peaks are still honest and still feed the cost fit. The orchestrator reads
   only the *presence* of the map — `from_units`/`to_units`/`free_mb` are
   operator-facing provenance.
+  **`clamped.reason` is not yet read on the orchestrator side** (open item).
+  The worker emits it; `ledger.rs` still treats every `clamped` alike, which
+  is safe — a `reason: "index_limit"` batch is excluded from the knee series,
+  which is what it should be — but it is not yet *sufficient*. A shape
+  ceiling is a permanent property of the model and the corpus, not a
+  transient of a busy board, so the ledger has more it could do with one:
+  stop widening `unit_budget` past a size the impl has said it cannot
+  execute, and refuse to read a run of `index_limit` batches as evidence that
+  the model's throughput has plateaued. Neither is implemented.
 - **`oom_class`** rides alongside the `oom` flag the deflation path already
   keys on. Its absence beside a failure means the worker saw no out-of-memory
   condition, and the orchestrator does not deflate on such a failure. Where
