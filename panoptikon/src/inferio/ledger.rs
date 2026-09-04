@@ -12864,10 +12864,15 @@ mod tests {
         ] {
             ramp_era.push((units, rate_, anchor, window));
         }
+        // `knee_of` re-stamps the series through `stamped`, which puts every
+        // observation at the widest anchor the ring reaches — steady state,
+        // not the climb. So the ramp-era tags are the *only* difference
+        // between this reading and the one below it.
         assert_eq!(
             knee_of(&recorded(&ramp_era)),
             Some(7),
-            "read with no anchor in force, the bend at 4 units is the knee"
+            "with every observation taken in steady state, the bend at 4 \
+             units is the knee"
         );
         assert_eq!(
             fit_knee(&recorded(&ramp_era), 0.0, 136, None).and_then(|fit| fit.knee_units),
