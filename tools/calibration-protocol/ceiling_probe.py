@@ -89,7 +89,8 @@ Output schema (JSON)
                   "oom_class": {"source": str, "exception": str,
                                 "free_mb_at_failure": int|null,
                                 "device": str} | null,
-                  "absorbed_halvings": int, "duration_ms": float,
+                  "absorbed_halvings": int, "index_limit_events": int,
+                  "duration_ms": float,
                   "peak_reserved_mb": int, "peak_allocated_mb": int,
                   "reserved_before_mb": int, "reserved_after_mb": int,
                   "nvml_own_mb": int|null, "board_free_mb": int|null,
@@ -100,9 +101,11 @@ Output schema (JSON)
                 "reserved_at_bisect_start_mb": int|null,
                 "largest_ok_units": int|null,
                 "largest_ok_items": int|null, "first_oom_items": int|null,
+                "first_index_limit_items": int|null,
                 "low_items": int, "high_items": int, "stopped_early": bool,
                 "trace": [{"items": int, "ok": bool, "units": int,
                            "oom": bool, "absorbed_halvings": int,
+                           "index_limit_events": int,
                            "error": str|null}]} | null}
 
 `free_mb_at_start` is the board's free memory when the search begins, which is
@@ -122,6 +125,14 @@ Caveats
   probe reads `inferio.impl.utils.total_oom_halvings()` across every call and
   reports `absorbed_halvings`, and the bisect treats a batch with absorbed
   halvings as an OOM.
+* A batch can also be cut short by a **shape ceiling** rather than by memory:
+  a kernel whose 32-bit element index cannot address the tensor the batch
+  builds refuses it with the whole board free. `index_limit_events` counts
+  those (`inferio.impl.utils.total_index_limit_events()`, diffed the same
+  way); such a batch is **not** `ok` for the sweep or the bisect, and its
+  boundary is recorded as `first_index_limit_items`, not `first_oom_items`.
+  Without this both easyOCR bisects reported 37 against a true 28
+  (`run2-probes-report.md`, S1/S4).
 * `clap` and `sentence_transformers` have no impl-side retry: an OOM there is a
   raised exception.
 * Whisper (`faster_whisper`) uses CTranslate2, not the torch allocator: its
@@ -511,6 +522,41 @@ def parse_batches(text: Optional[str], max_batch: int) -> List[int]:
     return sizes
 
 
+def ran_whole_batch(record: Dict[str, Any]) -> bool:
+    """Did this batch execute as **one** batch of `items`?
+
+    Three ways it did not, and all three disqualify it as a boundary point:
+    it raised; the classifier called it an out-of-memory condition; or the
+    impl absorbed the failure itself. Absorption has two forms now — the
+    halving loop swallowing an OOM (`absorbed_halvings`, reported through
+    `oom`), and a **shape ceiling** the impl either hit or pre-empted
+    (`index_limit_events`). run2's S4: both easyOCR bisects reported
+    `largest_ok_items: 37` against a true 28, because at 29 and above CRAFT's
+    pooling kernel overflowed its 32-bit index, the impl fell back to
+    per-image processing, and the probe saw a slow success. A bisect is only
+    a ground truth if "ok" means the whole batch ran.
+    """
+    return (
+        bool(record["ok"])
+        and not record["oom"]
+        and not record.get("index_limit_events")
+    )
+
+
+def _boundary_key(record: Dict[str, Any]) -> str:
+    """Which boundary a failing bisect probe marks.
+
+    A shape ceiling and an out-of-memory condition are different facts about
+    a model and the ledger acts on them differently, so the bisect records
+    them under different keys rather than calling both "the first OOM".
+    """
+    return (
+        "first_index_limit_items"
+        if record.get("index_limit_events") and not record["oom"]
+        else "first_oom_items"
+    )
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     here = Path(__file__).resolve()
     parser = argparse.ArgumentParser(
@@ -630,6 +676,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             return 0
 
+    def index_limit_events() -> int:
+        """`inferio.impl.utils.total_index_limit_events()`, or 0.
+
+        The *shape* ceiling, which is not a memory event and must never be
+        counted as one: a kernel that cannot address the tensor a batch
+        builds refuses it however much the board has free. run2 measured
+        easyOCR falling off exactly this cliff at batch 29 while both
+        `--bisect-oom` runs reported 37 as fine, because the impl turned the
+        failure into a slower success (`run2-probes-report.md`, S1/S4).
+        """
+        reader = (getattr(impl_utils, "total_index_limit_events", None)
+                  if impl_utils else None)
+        try:
+            return int(reader()) if reader else 0
+        except Exception:
+            return 0
+
     price, canvas_in_force = batch_pricer(packing, resolved["cost"], instance)
 
     def run_batch(count: int, repeat: int) -> Dict[str, Any]:
@@ -639,6 +702,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         reserved_before = int(torch.cuda.memory_reserved() // MIB)
         torch.cuda.reset_peak_memory_stats()
         before_halvings = halvings()
+        before_index_limits = index_limit_events()
         started = time.monotonic()
         error: Optional[str] = None
         failure: Optional[BaseException] = None
@@ -655,6 +719,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         peak_allocated = int(torch.cuda.max_memory_allocated() // MIB)
         reserved_after = int(torch.cuda.memory_reserved() // MIB)
         absorbed = max(0, halvings() - before_halvings)
+        index_limits = max(0, index_limit_events() - before_index_limits)
         # The worker's own classifier, imported rather than reimplemented
         # (run2 R3, `packing.classify_oom`): three tiers over the whole
         # exception chain — a typed `torch.OutOfMemoryError`, our
@@ -675,6 +740,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "oom": bool(oom),
             "oom_class": oom_class,
             "absorbed_halvings": absorbed,
+            "index_limit_events": index_limits,
             "duration_ms": round(duration_ms, 3),
             "peak_reserved_mb": peak_reserved,
             "peak_allocated_mb": peak_allocated,
@@ -704,18 +770,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"nvml {record['nvml_own_mb']} "
                 f"{record['duration_ms']:.0f} ms"
                 + ("  OOM" if record["oom"] else "")
+                + ("  INDEX-LIMIT" if record["index_limit_events"] else "")
                 + (f"  ERROR {record['error']}" if record["error"] else ""),
                 file=sys.stderr,
             )
-            if record["oom"] or not record["ok"]:
+            if not ran_whole_batch(record):
                 break
-        if records and (records[-1]["oom"] or not records[-1]["ok"]):
+        if records and not ran_whole_batch(records[-1]):
             break
 
     clean = [
         (record["units"], record["delta_mb"])
         for record in records
-        if record["ok"] and not record["oom"] and record["delta_mb"] > 0
+        if ran_whole_batch(record) and record["delta_mb"] > 0
     ]
     fit = theil_sen(clean)
 
@@ -739,25 +806,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                   "reserved_at_bisect_start_mb": int(torch.cuda.memory_reserved() // MIB),
                   "trace": [],
                   "largest_ok_items": None, "largest_ok_units": None,
-                  "first_oom_items": None, "stopped_early": False}
+                  "first_oom_items": None,
+                  "first_index_limit_items": None, "stopped_early": False}
         bisect_started = time.monotonic()
         low, high = 1, args.bisect_max
         # Grow first: double until something fails or the ceiling is hit.
         probe = max(1, args.bisect_start)
         while probe <= args.bisect_max:
             record = run_batch(probe, -2)
-            bisect["trace"].append({"items": probe, "ok": record["ok"] and not record["oom"],
+            bisect["trace"].append({"items": probe, "ok": ran_whole_batch(record),
                                     "units": record["units"], "oom": record["oom"],
                                     "absorbed_halvings": record["absorbed_halvings"],
+                                    "index_limit_events": record["index_limit_events"],
                                     "error": record["error"]})
-            if record["ok"] and not record["oom"]:
+            if ran_whole_batch(record):
                 low = probe
                 bisect["largest_ok_items"] = probe
                 bisect["largest_ok_units"] = record["units"]
                 probe *= 2
             else:
                 high = probe
-                bisect["first_oom_items"] = probe
+                bisect[_boundary_key(record)] = probe
                 settle_after_failure()
                 break
         else:
@@ -769,17 +838,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 break
             mid = (low + high) // 2
             record = run_batch(mid, -2)
-            bisect["trace"].append({"items": mid, "ok": record["ok"] and not record["oom"],
+            bisect["trace"].append({"items": mid, "ok": ran_whole_batch(record),
                                     "units": record["units"], "oom": record["oom"],
                                     "absorbed_halvings": record["absorbed_halvings"],
+                                    "index_limit_events": record["index_limit_events"],
                                     "error": record["error"]})
-            if record["ok"] and not record["oom"]:
+            if ran_whole_batch(record):
                 low = mid
                 bisect["largest_ok_items"] = mid
                 bisect["largest_ok_units"] = record["units"]
             else:
                 high = mid
-                bisect["first_oom_items"] = mid
+                bisect[_boundary_key(record)] = mid
                 settle_after_failure()
         bisect["low_items"] = low
         bisect["high_items"] = high
