@@ -361,6 +361,19 @@ impl Transport {
 /// 64. Local inference is loopback inside this process, so the worst case is
 /// `2 x 64 = 128` descriptors, against `jobs::extraction`'s `FD_RESERVE` of
 /// 256 and the shipped container's soft limit of 1 024.
+///
+/// Memory tracks recruitment for the same reason: a lane's `reqwest::Client`
+/// is built when the lane is first used ([`Lane`]), and each one costs about
+/// **620 KiB** of resident memory for its connector and TLS context.
+/// Registering an endpoint therefore costs ~1.4 MiB (the eagerly-built lane 0
+/// and the HTTP/1.1 client), a job at the gate's floor costs one lane, and
+/// the 64-lane worst case — ~43 MiB, only reachable by a job actually running
+/// thousands of concurrent requests — is paid a lane at a time by the work
+/// that needs it. Building them all up front, which is what this shipped as,
+/// cost **~58 MiB per endpoint** on first contact whatever the load.
+/// (Figures measured on this branch by building the clients and reading
+/// `VmRSS`; the first endpoint in a process pays a further ~11 MiB of one-off
+/// TLS-library initialisation that is not per lane.)
 pub(crate) const INFERENCE_CONNECTION_LANES: usize = 64;
 
 /// Streams this client offers **one** h2 connection before recruiting the
@@ -407,9 +420,20 @@ pub(crate) const INFERENCE_MAX_CONCURRENT_STREAMS: usize =
 
 /// One independent HTTP/2 connection to an endpoint, and how much work is on
 /// it right now.
+///
+/// **The client is built when the lane is first recruited, not when the
+/// endpoint is.** A `reqwest::Client` is not free — it carries a connector
+/// with a TLS context, measured here at **~720 KiB of RSS each**, so building
+/// all [`INFERENCE_CONNECTION_LANES`] up front cost **~58 MiB per inference
+/// endpoint**, paid the first time anything touched that endpoint and paid
+/// again per endpoint. That is a real number on the machine this gateway
+/// actually runs on (a NAS), and almost all of it was for lanes a normal job
+/// never recruits: [`EndpointRuntime::pick_lane`] uses
+/// `ceil(in_flight / 64)` of them, which is one lane at the shipped gate's
+/// floor and four at 256 concurrent requests.
 #[derive(Debug)]
 struct Lane {
-    clients: EndpointClients,
+    clients: OnceLock<EndpointClients>,
     in_flight: AtomicUsize,
 }
 
@@ -432,8 +456,16 @@ struct GateState {
 #[derive(Debug)]
 struct EndpointRuntime {
     /// [`INFERENCE_CONNECTION_LANES`] independent h2 clients, each its own
-    /// pool and therefore its own connection.
+    /// pool and therefore its own connection — built as they are recruited
+    /// (see [`Lane`]).
     h2: Vec<Lane>,
+    /// Lane 0's client, built eagerly: it is what makes "can this process
+    /// talk to this endpoint at all" a question answered when the endpoint is
+    /// registered rather than in the middle of a predict, and it is the
+    /// fallback for the (essentially impossible) case of a later lane's build
+    /// failing — a request must not fail because a *second* connection could
+    /// not be prepared.
+    h2_seed: EndpointClients,
     /// One client: under HTTP/1.1 a request is a socket regardless, so there
     /// is nothing for a lane to buy.
     h1: EndpointClients,
@@ -470,6 +502,30 @@ impl EndpointRuntime {
     /// Racy by design — loads move under it — and harmlessly so: every
     /// outcome is a valid lane, and the counters are exact again as soon as
     /// the burst settles.
+    /// The clients for one lane, building that lane's own on first use.
+    ///
+    /// `get_or_init` runs the builder at most once however many requests
+    /// arrive at once, and the build is allocation-only work of about a
+    /// millisecond — paid at most `INFERENCE_CONNECTION_LANES - 1` times for
+    /// the life of the process.
+    fn lane_clients(&self, lane: usize) -> EndpointClients {
+        self.h2[lane]
+            .clients
+            .get_or_init(|| {
+                EndpointClients::build(reqwest::ClientBuilder::http2_prior_knowledge, 1)
+                    .unwrap_or_else(|err| {
+                        warn!(
+                            lane,
+                            error = %err,
+                            "failed to build an additional inference connection lane; \
+                             sharing the first lane's connection instead"
+                        );
+                        self.h2_seed.clone()
+                    })
+            })
+            .clone()
+    }
+
     fn pick_lane(&self) -> usize {
         let loads: Vec<usize> = self
             .h2
@@ -731,17 +787,26 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
     if let Some(existing) = guard.get(base_url) {
         return Ok(Arc::clone(existing));
     }
+    // One idle connection per lane: a lane *is* a connection, and hyper-util
+    // shares it across every request on that client. Only the first is built
+    // here; the rest are built as [`EndpointRuntime::pick_lane`] recruits
+    // them, because a `reqwest::Client` costs ~720 KiB and a normal job
+    // recruits a handful.
+    let seed = EndpointClients::build(reqwest::ClientBuilder::http2_prior_knowledge, 1)?;
     let mut lanes = Vec::with_capacity(INFERENCE_CONNECTION_LANES);
-    for _ in 0..INFERENCE_CONNECTION_LANES {
+    for index in 0..INFERENCE_CONNECTION_LANES {
+        let clients = OnceLock::new();
+        if index == 0 {
+            let _ = clients.set(seed.clone());
+        }
         lanes.push(Lane {
-            // One idle connection per lane: a lane *is* a connection, and
-            // hyper-util shares it across every request on that client.
-            clients: EndpointClients::build(reqwest::ClientBuilder::http2_prior_knowledge, 1)?,
+            clients,
             in_flight: AtomicUsize::new(0),
         });
     }
     let runtime = Arc::new(EndpointRuntime {
         h2: lanes,
+        h2_seed: seed,
         h1: EndpointClients::build(
             |builder| builder.http1_only(),
             INFERENCE_MAX_CONCURRENT_REQUESTS,
@@ -921,9 +986,10 @@ impl InferenceApiClient {
     /// already proof that the frames parsed.
     async fn probe_h2c(&self) -> reqwest::Result<()> {
         // Lane 0: the probe is one request, and the lane it opens is the one
-        // the first real requests will land on anyway.
-        self.endpoint.h2[0]
-            .clients
+        // the first real requests will land on anyway — which is also why it
+        // is the lane whose client is built eagerly.
+        self.endpoint
+            .h2_seed
             .raw
             .get(format!("{}/cache", self.base_url))
             .send()
@@ -1038,7 +1104,7 @@ impl InferenceApiClient {
                 // choice is made on is the load that will actually run.
                 let lane = self.endpoint.pick_lane();
                 self.endpoint.h2[lane].in_flight.fetch_add(1, Relaxed);
-                let clients = self.endpoint.h2[lane].clients.clone();
+                let clients = self.endpoint.lane_clients(lane);
                 (
                     transport,
                     clients,
@@ -2423,6 +2489,49 @@ mod tests {
             .expect("no panic")
             .expect("the second attempt is answered");
         assert_eq!(attempts.load(SeqCst), 2);
+    }
+
+    /// **A lane's client is built when the lane is recruited, not when the
+    /// endpoint is.**
+    ///
+    /// A `reqwest::Client` carries a connector with its own TLS context and
+    /// costs ~720 KiB of resident memory; building all
+    /// `INFERENCE_CONNECTION_LANES` of them up front cost ~58 MiB *per
+    /// inference endpoint*, on first contact, for lanes that a job at the
+    /// gate's floor never uses (`pick_lane` recruits `ceil(in_flight / 64)`,
+    /// which is one). Asserted structurally rather than by measuring RSS: the
+    /// question is how many clients exist, and that is a fact about the
+    /// lanes.
+    #[tokio::test]
+    async fn a_lanes_client_is_built_when_the_lane_is_recruited() {
+        let client =
+            InferenceApiClient::new_with_metadata_cache("http://lane-lazy-test", false).unwrap();
+        let runtime = Arc::clone(&client.endpoint);
+        let built = || {
+            runtime
+                .h2
+                .iter()
+                .filter(|lane| lane.clients.get().is_some())
+                .count()
+        };
+
+        assert_eq!(
+            built(),
+            1,
+            "registering an endpoint builds the one lane it will use, not {INFERENCE_CONNECTION_LANES}"
+        );
+        // Lane 0 is the one that exists, and it is the probe's lane too.
+        assert!(runtime.h2[0].clients.get().is_some());
+
+        // Recruiting a lane builds exactly that lane.
+        let recruited = runtime.lane_clients(7);
+        assert_eq!(built(), 2);
+        assert!(runtime.h2[7].clients.get().is_some());
+        // And asking again re-uses it rather than building a second one: a
+        // lane is one connection, which is the whole descriptor argument.
+        let again = runtime.lane_clients(7);
+        assert_eq!(built(), 2);
+        drop((recruited, again));
     }
 
     /// Lanes are recruited by load, not spread across: the socket cost of an
