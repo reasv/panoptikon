@@ -78,9 +78,14 @@ base_method       = "nvml"             # nvml | fdinfo | mps | rss | free_delta 
 slope_mb_per_unit = 0.79               # marginal cost per unit, MiB
 knee_units        = 512                # optional: the throughput knee. A cap, not
                                        # a ceiling — the orchestrator widens it by
-                                       # one log2 bucket after 12 clean windows run
+                                       # one log2 bucket after clean windows run
                                        # at it with memory to spare, and withdraws
-                                       # it once it can no longer bind (run2, R1d)
+                                       # it once it can no longer bind (run2, R1d).
+                                       # A knee the importing machine did not
+                                       # measure itself is *provisional*: it gets
+                                       # 4 such windows per step rather than 12,
+                                       # so a wrong one is climbed out of in
+                                       # seconds rather than never (run2, R1e)
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence
 measured_at       = "2026-07-30T00:00:00Z"
@@ -154,6 +159,16 @@ editing.
 smaller, which is the one authority a foreign profile has beyond pricing. What
 does not travel with it is the progress towards re-testing it: those windows
 ran on your board, not on the importer's.
+
+A knee you contribute will be treated as **provisional** on every machine that
+imports it (run2, R1e): it caps from the first grant, and it is re-tested after
+`KNEE_SEED_REVALIDATION_WINDOWS` = 4 clean windows run at it rather than the 12
+a locally measured knee gets, widening one log2 bucket at a time until either
+the importer's own observations re-fit it or it stops binding and is withdrawn.
+So a knee that is right for your board costs its importers a probing window
+every five; a knee that is wrong for theirs costs them seconds. Contribute the
+one you measured, and do not hand-tune it downward "to be safe" — a knee too
+low is the failure mode that used to be permanent.
 
 Two things make a baseline worth shipping: it was measured under real load
 (not a single window), and `residual_mb` is small relative to `base_mb` — a

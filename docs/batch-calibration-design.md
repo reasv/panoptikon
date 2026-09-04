@@ -231,11 +231,142 @@ explicit signal, because the merge rule otherwise reads an absent knee as
 exactly what it was when the knee expired, so a refit would hand the same
 number straight back before the model ever ran at the wider size. A widened
 knee therefore records the old cap's bucket as a frontier, and no refit may
-install a knee until a warm batch **above** it has actually been observed.
-Once one has, the refit runs normally — and on a genuinely flat curve it
-re-establishes the same knee, which is the expiry working, not failing: the
-steady-state cost is one probing window in thirteen, at twice the capped size,
-in exchange for a cap that can never again outlive its evidence.
+install a knee at or below it until the model has actually been observed
+running above it. Once it has, the refit runs normally — and on a genuinely
+flat curve it re-establishes the same knee, which is the expiry working, not
+failing: the steady-state cost is one probing window in thirteen, at twice the
+capped size, in exchange for a cap that can never again outlive its evidence.
+(R1e below replaces the "one warm batch above" test with a per-sample sequence
+mark, which is what makes "after the widening" mean what it says.)
+
+### Throughput knee: what run2 changed again (R1e)
+
+Run2 ran R1 and R1d on hardware and measured them working — the expiry fired
+ten times, every one at exactly twelve clean windows and one bucket; the
+variance filter fired 59 times on MiniLM; `knee_clean_windows` survived a
+restart — and it measured the estimator itself producing a knee that no
+filter could have caught, because the evidence behind it was quiet, sole
+occupancy, warm-pool and full-budget throughout. That is finding **F1**:
+
+- **wd-vit**, whose measured curve is flat (35.9 items/s at batch 1, 36.1 at
+  2 048, and no knee at all in run1) fitted `knee_units = 3` at 14
+  observations, oscillated 3 ↔ 7 for the rest of the job as the expiry widened
+  and the next refit put it straight back, and persisted 7. `utilization`
+  0.11 against run1's 0.40.
+- **S3**, seeded with that store, then held a *fresh* 2 000-item job between 7
+  and 31 units for its entire length — 75 windows, `utilization` 0.01 against
+  run1's 0.80. F-A across a restart.
+
+Rebuilding the ring from `S2-wdvit/panoptikon.log` reproduces all five of that
+leg's fits exactly, and the first one shows the mechanism:
+
+| bucket | units | n | median units/s | in the fit? |
+|---|---|---|---|---|
+| 1 | 2 | 2 | **40.77** | yes — and the ring's *best* |
+| 2 | 4 | 2 | 34.96 | yes |
+| 3 | 8 | 2 | 40.31 | yes |
+| 4 | 16 | 1 | — | dropped: a singleton cannot be certified quiet |
+| 6 | 64 | 6 | 39.79 | yes |
+| 7 | 136 | 1 | — | dropped, **and it was the frontier** |
+
+The threshold is `KNEE_RATIO ×` the best bucket median = 36.69, and the
+estimator returns the smallest bucket that clears it. The smallest bucket
+*was* the best bucket, so it cleared its own threshold at the first
+comparison, and the frontier guard passed only because the real frontier
+(136 units, one sample) had been dropped and bucket 6 stood in for it.
+
+The flaw is that the plateau test was **self-referential and one-sided**: it
+compared the candidate to the ring's own maximum and never looked above the
+candidate at all. On a ramp the ring is dense at the bottom — a window at a
+small budget runs many warm batches — and sparse at the top, where a window
+runs one; so the bottom bucket wins on both count and stability for any model
+whose curve is flat, which is exactly the model that has nothing to gain from
+being capped.
+
+Five rules replace the single frontier guard. All five say the same thing: *a
+knee is a claim about the curve above it, and may only be made from honest,
+quiet samples taken in the regime the model is actually in.*
+
+1. **The frontier must be quiet.** The largest bucket the ring *observed* —
+   before the two-sample retain, not merely the largest that survived it —
+   must itself pass the retain and the variance filter, and the knee may not
+   be it. An unknown top end may be climbing. This is the rule that refuses
+   wd-vit's first fit.
+2. **The floor must be interior too.** The knee may not be the *smallest*
+   bucket the ring observed. A plateau that starts at the first size ever
+   measured is not a bend; it is the observation that nothing in the measured
+   range gained anything, which is a statement about the range and not about a
+   size. This is the rule that refuses every later wd-vit fit, including the
+   ones taken entirely from samples the cap itself produced.
+3. **The plateau must be established above the knee** —
+   `KNEE_PLATEAU_BUCKETS = 2` quiet buckets strictly above the candidate, none
+   of them faster than it by `KNEE_RATIO`. One bucket above is a single
+   comparison between two medians: the same "two points are not a curve"
+   objection that `MIN_KNEE_BUCKETS` answers for the fit and
+   `MIN_KNEE_BUCKET_SAMPLES` answers inside a bucket. Two means the flat
+   stretch spans a factor of four in batch size and, with rule 1, that it
+   reaches the largest size the model has been let out to try. Not three,
+   because each bucket is another doubling the ramp has to reach one window at
+   a time before any knee may be fitted.
+4. **No ramp-era knee below the anchor.** If the candidate is below the bucket
+   of `max_units_measured`, its own bucket must hold two observations taken
+   once the ramp had already reached a *larger* bucket. A rate measured at 2
+   units while the ramp was on its way past 2 units is not evidence that the
+   model stops gaining at 2 — the ramp's next step is the standing evidence
+   against it, and it is about to be taken. A rate measured at 2 units after
+   the model has run 136 is a different thing: a steady-state window that
+   happened to be small, and it counts.
+5. **After a widening, the evidence must be newer than the widening.** Every
+   observation carries a sequence number, and a widening records the mark it
+   happened at. A knee at or below the widened-from bucket may only be
+   installed once the smallest quiet bucket *above* that one carries
+   `MIN_KNEE_BUCKET_SAMPLES` observations from after the mark. R1d's version
+   cleared on "the ring now contains something bigger", which the ring already
+   did — it still held the pre-knee ramp — so the widening survived about a
+   second, five times over.
+
+Two more changes carry the same principle outside `fit_knee`:
+
+**A replica's first settled window contributes no throughput observations.**
+cuDNN autotune, first-of-shape kernels, lazy module init and the JIT'd
+preprocessing path all happen exactly once and none of them is a property of
+the batch size; the high-water exclusion catches the pool growth and nothing
+else. (This is *not* what produced F1 — wd-vit's first window contributed
+nothing anyway — but a first window's rates are not on the curve, and one of
+them landing in a bucket of two is enough to move a cap.)
+
+**A knee this process never measured is provisional.** "Never measured here"
+is exactly `!knee_is_local`, which the store and seed paths already set: while
+it holds, the expiry counter is `KNEE_SEED_REVALIDATION_WINDOWS = 4` rather
+than 12. A knee restored from disk is backed by nothing this process has seen
+— the hardware, the driver, the corpus and the neighbours may all have moved
+— so it brakes, because it is still the best evidence there is until this run
+has better, but it goes on trial at once. A local refit installing a knee is
+what makes it this run's measurement and restores the full twelve. S3 is what
+treating the two alike costs.
+
+**What the recorded rings do under these rules.** Every ring is rebuilt from
+its leg's `panoptikon.log` and replayed sample by sample; the wd-vit and S3
+rebuilds reproduce every logged fit of the original run exactly, which is what
+makes them replays rather than models.
+
+| leg | what the run fitted | under R1e |
+|---|---|---|
+| run2 `S2-wdvit` (218 obs) | 3, five times | **no knee at any point** |
+| run2 `S3-wdvit` (205 obs) | 7, four times | **no knee at any point** |
+| run2 `S2-minilm` (993 obs) | none | none (the variance filter, unchanged) |
+| run1 `S6-contend` | 15 / 31 / 16 383 | none — two of the three models have *no* sole-occupancy observations at all |
+| run2 `S2-mobileclip` (23 obs) | 127 | **no knee on this ring** — see below |
+
+MobileCLIP is the one-sided cost, and it is worth stating plainly. Its bend is
+real (31 units/s at 2 units, 94 at 64) and 127 describes its curve correctly.
+R1e declines it because the ring has exactly **one** quiet bucket above the
+bend: the ramp stalled at 136 units for reasons that have nothing to do with
+throughput (run2 observation S1 — queue depth under multiplexed h2c), so
+nothing at 256 units was ever measured. Two observations there and the same
+ring answers 127. This is a knee found late, not a knee lost — and the leg
+that fitted it ran at 0.94x master, where run1's leg on the same model with no
+knee at all ran at 1.00x.
 
 ## Core decision: learn a cost model, not a max batch size
 
