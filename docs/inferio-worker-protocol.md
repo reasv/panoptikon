@@ -862,9 +862,12 @@ window is in flight per worker either way, so a trim never races a batch.
   streaming weights into *one board* at a time, which is what keeps the
   ledger's load reservation for that board covering a single incoming
   footprint. A replica set spanning several boards takes one permit per board
-  in sorted key order; replicas whose board cannot be resolved share one
-  bucket, so a host with no GPU inventory keeps a single host-wide load at a
-  time exactly as before.
+  in sorted key order; a replica whose board cannot be resolved counts as
+  landing on every board — it takes a shared "unresolved" bucket *and* one
+  permit per board in the inventory, because the pin it could not place is
+  still handed to the backend and still lands somewhere. A host with no GPU
+  inventory therefore keeps a single host-wide load at a time exactly as
+  before.
 - **A model that fails to load is not retried immediately** (R9). Each
   consecutive failed load of one model arms a cooldown of
   `load_failure_cooldown_secs × 2^(n−1)`, capped at

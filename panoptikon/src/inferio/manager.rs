@@ -60,9 +60,12 @@
 //!    `load` round trip inside [`ModelManager::spawn_model`], where the
 //!    ledger's load reservations are charged; a replica set spanning several
 //!    boards takes one permit per distinct board, acquired in sorted key
-//!    order. Replicas whose board key does not resolve (no inventory at all,
-//!    an unreadable pin) share one bucket, so a host with no GPUs keeps
-//!    exactly the host-wide serialization it has today.
+//!    order. A replica whose board key does not resolve (no inventory at
+//!    all, a pin the ledger cannot place) counts as landing on *every*
+//!    board: it takes a shared "unresolved" bucket and one permit per board
+//!    in the inventory, so it can neither overlap another such load nor a
+//!    load onto the board it may well have landed on. A host with no GPUs
+//!    therefore keeps exactly the host-wide serialization it has today.
 //! 4. **`state`** (std `Mutex`) — all bookkeeping. Never held across an
 //!    await and never held while 1–3 are acquired, so the sync accessors
 //!    (`cached_models`, `cache_expirations`, `health`) stay cheap.
@@ -1129,8 +1132,14 @@ impl Drop for PinGuard {
 }
 
 /// Board-admission bucket for a replica whose board key does not resolve (a
-/// host with no inventory, an unreadable pin). Never a real board key —
-/// `GpuInventory::resolve_board_key` only ever answers a uuid it probed.
+/// host with no inventory, a pin the ledger cannot place). Never a real board
+/// key — `GpuInventory::resolve_board_key` only ever answers a uuid it
+/// probed — and never taken *instead of* the real boards: such a replica
+/// takes this bucket **and** every board's permit
+/// ([`ModelManager::acquire_load_admission`]).
+///
+/// It sorts before every uuid, which keeps the sorted acquisition order a
+/// total order once it is mixed in with them.
 const UNRESOLVED_BOARD_ADMISSION_KEY: &str = "";
 
 /// What one pass of [`ModelManager::touch_and_check`] decided.
@@ -1830,19 +1839,39 @@ impl ModelManager {
     /// Sorting is the deadlock argument for the multi-board case: every
     /// caller takes the permits of the boards it needs in the same total
     /// order, so two loads that overlap on two boards can never each hold the
-    /// other's. Replicas whose board key did not resolve — no inventory at
-    /// all, a pin the backend could not read — share one bucket keyed by the
-    /// empty string, which is what keeps a GPU-less host serialized exactly
-    /// as it is today.
+    /// other's.
+    ///
+    /// **A replica whose board key did not resolve counts as landing on every
+    /// board.** `resolve_board_key` answers `None` for a handful of strings
+    /// `resolve_pin` still hands to the backend's visibility variable —
+    /// an ambiguous UUID prefix, an index this host cannot see, a device
+    /// *list*, a `MIG-` instance — so such a replica really does spawn and
+    /// really does take memory; the ledger simply cannot say whose. Charging
+    /// it only against a shared "unresolved" bucket would let it stream its
+    /// weights beside an unpinned load onto the very board it landed on,
+    /// which is a guarantee the retired host-wide lock did give. So it takes
+    /// the shared bucket *and* one permit per board in the inventory: at
+    /// `max_concurrent_loads = 1` that is host-wide serialization, exactly as
+    /// before, and it is paid only by a pin nobody could resolve. On a host
+    /// with no inventory there are no boards to add and the shared bucket
+    /// alone is that same serialization.
     async fn acquire_load_admission(
         &self,
         inference_id: &str,
         board_keys: &[Option<String>],
     ) -> Vec<OwnedSemaphorePermit> {
-        let mut wanted: Vec<&str> = board_keys
-            .iter()
-            .map(|key| key.as_deref().unwrap_or(UNRESOLVED_BOARD_ADMISSION_KEY))
-            .collect();
+        let mut wanted: Vec<&str> = board_keys.iter().flatten().map(String::as_str).collect();
+        if board_keys.iter().any(Option::is_none) {
+            wanted.push(UNRESOLVED_BOARD_ADMISSION_KEY);
+            wanted.extend(
+                self.cfg
+                    .gpus
+                    .gpus()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|gpu| gpu.uuid.as_str()),
+            );
+        }
         wanted.sort_unstable();
         wanted.dedup();
         let permits = self.cfg.loads.max_concurrent_loads.max(1);
@@ -4752,6 +4781,86 @@ config.replicas = 2
         )
         .await
         .expect("max_concurrent_loads = 2 admits a second load onto both boards");
+    }
+
+    /// A pin the ledger cannot place still spawns a worker that lands on
+    /// *some* board — `resolve_pin` passes an ambiguous UUID prefix, an
+    /// invisible index or a device list straight to the visibility variable
+    /// even though `resolve_board_key` answers `None` for all three. So an
+    /// unresolved replica must exclude every board's loads, not just other
+    /// unresolved ones: otherwise it streams its weights beside an unpinned
+    /// load onto the board it landed on, which is a collision the retired
+    /// host-wide lock did prevent.
+    #[tokio::test]
+    async fn an_unresolved_board_key_blocks_every_board() {
+        let setup = test_manager_full(
+            Duration::from_secs(60),
+            32,
+            WorkerDeadlines::default(),
+            test_gpus(),
+            None,
+            LoadPolicy {
+                max_concurrent_loads: 1,
+                ..LoadPolicy::default()
+            },
+        );
+        let manager = Arc::clone(&setup.manager);
+        let unresolved = [None];
+        let board_a = [Some("GPU-0000".to_owned())];
+        let board_b = [Some("GPU-3333".to_owned())];
+
+        let held = manager.acquire_load_admission("m/a", &unresolved).await;
+        assert_eq!(
+            held.len(),
+            3,
+            "the shared bucket plus both boards of the inventory"
+        );
+        for (label, keys) in [("A", &board_a), ("B", &board_b)] {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(250),
+                    manager.acquire_load_admission("m/b", keys),
+                )
+                .await
+                .is_err(),
+                "an unresolved load must block board {label}"
+            );
+        }
+        drop(held);
+
+        // And the other way round: one resolved board is enough to make an
+        // unresolved load wait.
+        let held = manager.acquire_load_admission("m/c", &board_a).await;
+        assert_eq!(held.len(), 1);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                manager.acquire_load_admission("m/d", &unresolved),
+            )
+            .await
+            .is_err(),
+            "a load onto a known board must block an unresolved one"
+        );
+        drop(held);
+
+        // A host with no inventory has no boards to add, so the shared
+        // bucket alone is the host-wide serialization it has today.
+        let setup = test_manager_with_loads(LoadPolicy {
+            max_concurrent_loads: 1,
+            ..LoadPolicy::default()
+        });
+        let manager = Arc::clone(&setup.manager);
+        let held = manager.acquire_load_admission("m/e", &unresolved).await;
+        assert_eq!(held.len(), 1, "no inventory: just the shared bucket");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                manager.acquire_load_admission("m/f", &unresolved),
+            )
+            .await
+            .is_err(),
+            "a GPU-less host still serializes every load"
+        );
     }
 
     /// Two callers racing to use a model that is not loaded must produce one
