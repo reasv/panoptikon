@@ -100,10 +100,22 @@ Two equivalent routes; the second leaves the checkout clean.
 
 ## Driving them
 
-The fixtures return `{"batch": n}` / `{"ok": true}`, not tags, so drive them
-through `POST /api/inference/predict/calibfixture/<id>` (that is what
-`loadgen.py` does), not through an extraction job — the job would reject the
-payload against the declared `output_type`.
+The fixtures return `{"batch": n}` / `{"ok": true}`, not tags, so the natural
+way to drive them is `POST /api/inference/predict/calibfixture/<id>` (that is
+what `loadgen.py` does).
+
+**Correction (run2, measured in `results/run2/S5-failbatch-oomtext-job` and
+`results/run2/S5-dying-job`):** an **extraction job also works**. This note
+used to say the job would reject the payload against the declared
+`output_type = "tags"`; on the run2 binary it does not. A 180-item job over
+`calibfixture/failbatch_oomtext_cuda` recorded `outcome: "completed"`,
+`errors: 0`, and a 2 000-item job over `calibfixture/dying_cuda` recorded
+`outcome: "failed"` with 2 000 rows under `/api/jobs/data/failures` →
+`job_failures`. Use the job path whenever the *job-side* run2 behaviour is
+under test (R2a re-queue, R2b failures endpoint, `partial` / `failed`
+outcomes); a job needs the fixture's corpus indexed first (`POST
+/api/jobs/folders/rescan`) and, on run2, C1's `calib_hostless` policy (see
+`../config/server-C1.toml`).
 
 Inference ids: `calibfixture/{oom_second_batch,oom,failbatch,dying}_{cuda,cpu}`,
 plus the two Phase-4 additions `calibfixture/oom_timed_cuda` (batch-1 OOM for

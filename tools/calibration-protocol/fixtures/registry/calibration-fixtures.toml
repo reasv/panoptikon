@@ -38,11 +38,14 @@ description          = """Fault-injection fixtures for the batch-calibration \
 default_batch_size   = 64
 default_inference_id = "oom_second_batch_cuda"
 target_entities      = ["items"]
-# NOTE: the fixtures return {"batch": n} / {"ok": true}, not tags. Drive them
-# through POST /api/inference/predict/<id> (loadgen.py), not through an
-# extraction job -- an extraction job would reject the payload because it does
-# not match the declared output_type. The declaration is here only because the
-# registry expects one.
+# NOTE: the fixtures return {"batch": n} / {"ok": true}, not tags, so the
+# natural driver is POST /api/inference/predict/<id> (loadgen.py). The
+# output_type declaration below is here because the registry expects one.
+# CORRECTION (run2): this note used to claim an extraction job would reject
+# the payload against output_type. It does not -- see ../README.md "Driving
+# them" and results/run2/S5-{failbatch-oomtext-job,dying-job}. Use a job
+# whenever the job-side behaviour (re-queue, partial/failed outcome,
+# /api/jobs/data/failures) is what is under test.
 output_type          = "tags"
 input_mime_types     = ["image/"]
 
