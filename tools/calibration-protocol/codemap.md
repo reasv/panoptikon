@@ -321,7 +321,7 @@ build/deploy/API. The plan that uses this is
    halved, unbounded halvings to 1; single-item OOM →
    `InferenceOOMError("INFERENCE_OOM_BATCH_SIZE_1: …")`. Absorbed
    halvings mark the successful batch `oom = True` → negative sample.
-2. Harness `run_window` (`packing.py:1112-1269`): no in-harness retry; a
+2. Harness `run_window` (`packing.py:1267-1438`): no in-harness retry; a
    multi-item OOM is prefixed `INFERENCE_OOM_WINDOW:`; `WindowFailure`
    carries the measurements.
 3. Host classification, **rewritten in run2 (R3 host half)**. Two paths:
@@ -937,7 +937,7 @@ that lands after any of them is refused rather than reopening the row
 - Grantless impls: `MoondreamTagger`/`MoondreamCaptioner`
   (`enable_batching = False` class attr), `EasyOCRModel` with
   `config.enable_batching = false` (all three shipped easyocr ids,
-  `inference.toml:277,309,322`), `DotsOCRModel`/`Florence2` if configured
+  `inference.toml:277,316,329`), `DotsOCRModel`/`Florence2` if configured
   off (default on), plus every `none`-class id (whisper, tagmatch, jina
   APIs, vlm, moondream taggers).
 - Worker → host: `load` ok carries `base_mb, base_method,
@@ -986,10 +986,26 @@ that lands after any of them is refused rather than reopening the row
   through at most two of `processor`/`image_processor`/`embedder`/`model`
   and floored at `CANVAS_FLOOR_PIXELS = 512²` → uncapped; `token` = `max(1, utf8 bytes //
   4)` (`BYTES_PER_TOKEN = 4`); `audio-second` = flat 30; `item` = 1.
-- Planning (`plan_batches` :384-434): `count` = len; `sum` = greedy FIFO;
+  `price_window` returns `PricedWindow(units, raw)` — the capped price and
+  the same window uncapped, from **one** header read (`_pixel_readings` →
+  `_pixel_units`); `raw` is the packing tiebreaker below and never a price.
+- Planning (`plan_batches`): `count` = len; `sum` = greedy FIFO;
   `max-times-count` = sort descending by units then greedy; a single
   over-budget item goes alone; `cap_items` is a separate bound;
-  re-planned before every batch.
+  re-planned before every batch. Run2 D1-b adds `tiebreak=` — a descending
+  **secondary** key (raw pixels) applied only among equal priced units and
+  only for `max-times-count`, because the R7 cap prices every item at or
+  above the canvas alike and so erases the size information the bucketing
+  sorts on. Never changes a price, an order across prices, or safety;
+  ignored when its length does not match.
+- Mixed-batch guard (run2 D1-b, `_pads_without_a_canvas`,
+  `_warn_mixed_batch_once`): an impl exposing `pads_to_common_size = True`
+  (`PADS_TO_COMMON_SIZE_ATTR`) says it builds one tensor at its largest
+  member's dimensions. If it also states **no** canvas of its own, and a
+  batch under a cap mixes raw areas by more than `MIXED_SIZE_LOG_RATIO = 2`,
+  one WARN per process names the ratio. Exposing a canvas is the impl's
+  promise to bound its own tensor by it, so `inferio.impl.eocr` — which
+  exposes `canvas_pixels = 6 553 600` and enforces it — is exempt.
 - Defensive clamp (`clamp_to_live_memory`): returns a `LiveBudget(units,
   free_mb, free_source, clamped)`. It **always** takes the one free reading
   (run2 R5, including when `grant_mb <= 0`, which is the memory-blind case);
@@ -1016,7 +1032,7 @@ that lands after any of them is refused rather than reopening the row
 | tagmatch/danbooru[-saucenao] | danbooru_tagger | none | – | 1 | network |
 | doctr/db_resnet50_* (7) | doctr | item / count | 8 | 1 | docTR re-batches internally |
 | doctr/dots_ocr | dotsocr | pixel / sum | 2 000 000 | 2 | min CC 8.0, ~6 GB; no `canvas_pixels` — its cap lives in the downloaded processor, so the worker's tier-2 fallback reads it and **reports it on the load response**, which is what lets the host price it too |
-| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 2 | **`enable_batching = false`** → grantless, so the **host** cap is the only cap; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas) |
+| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 2 | **`enable_batching = false`** → grantless, so the **host** cap is the only cap; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas), which the impl now **enforces** before it pads a batch (run2 D1-b, `eocr.py::fit_to_canvas`; boxes mapped back by `scale_boxes_to_original`) |
 | florence2/msft_large-* (4) | florence2 | item / count | 4 | 1 | |
 | vlm/moondream-2b-25-03-* (5) | moondream_captioner | none | – | 2 | |
 | textembed/all-mpnet-base-v2, all-MiniLM-L6-v2, stella_* | sentence_transformers | token / max-times-count | 4000 | 1 | no impl-side OOM retry |

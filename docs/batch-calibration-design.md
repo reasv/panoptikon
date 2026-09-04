@@ -511,6 +511,25 @@ Notes:
   fitted against raw pixels would otherwise be applied to capped ones and
   under-predict, which over-admits. Wire and worker details:
   `docs/inferio-worker-protocol.md`, "Memory grants" and "Memory sensing".
+
+  **A declared canvas obliges the impl** (run2 D1-b). The cap is a statement
+  that the model never processes more than that area per item, and the price
+  is only honest if the impl enforces it before it forms its batch tensor.
+  Most `pixel` impls do so by construction — they resize or tile each input
+  and flatten it to a patch sequence, so no raw per-item dimension survives —
+  but an impl that **pads a batch to a common size** does not, and easyOCR's
+  did not: `pad_images_to_same_size` padded to the largest member's *raw*
+  dimensions, and its recogniser cropped from that array, while the price said
+  2560². The cap makes this worse before it makes it better, because it is the
+  cap that flattens an 8.7 MP scan and a 48 MP sheet to one price and so lets
+  them share a bucket. Two changes close it: `inferio.impl.eocr` resizes every
+  input onto the detector's own canvas before it pads (the boxes are mapped
+  back to the submitted image's coordinates afterwards), and `plan_batches`
+  keeps **raw** pixels as a descending secondary key among equally-priced
+  items, so a bucket stays as size-homogeneous as the corpus allows. A
+  worker-side warning names any future impl that pads to a common size while
+  declaring no canvas of its own and is handed a batch mixing raw sizes by
+  more than 2×.
 - Backends without a free-memory query (MPS, CPU) degrade to no
   admission: seed-sized fixed batches plus the Package-1 backstop, the
   same class as `none`.

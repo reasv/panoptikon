@@ -215,6 +215,43 @@ Resolution order in the worker, and the documented fallback:
    (`doctr/dots_ocr`).
 3. otherwise uncapped, exactly as before this field existed.
 
+**An impl that declares a canvas must bound its own batch tensor by it.**
+The cap is a *statement about the model* — that no input costs it more than
+this area — and the price is only true if the impl makes it true. Where a
+model resizes or tiles each input on the way in, that is automatic (nemotron's
+`dynamic_preprocess` cuts 512² tiles, the qwen3-vl embedder's
+`process_vision_info` smart-resizes to `max_pixels`, and both then flatten to
+patch sequences, so no per-item raw dimension survives into the tensor). Where
+an impl instead **pads a batch to a common size**, it must do the resize
+*itself*, before it pads: padding is priced by the batch's largest member, and
+under the cap every item at or above the canvas prices identically, so the
+bucketing has nothing left to separate an 8.7 MP scan from a 48 MP sheet and
+they can share a batch whose tensor is several times the area the batch was
+charged for. Run2 D1-b measured exactly that on `inferio.impl.eocr`, whose
+`pad_images_to_same_size` padded to the largest member's raw dimensions while
+easyOCR's detector would have resized onto its 2560px canvas a step later —
+and whose recogniser then cropped from the raw-sized array, the half the
+detector's own resize never bounded. It now calls `fit_to_canvas` (the
+detector's own `resize_aspect_ratio` arithmetic) on every input first, so the
+padded tensor is bounded by the canvas the registry declares.
+
+Two mechanisms in the worker make this visible rather than tacit:
+
+- **The packing tiebreaker.** For `max-times-count`, `plan_batches` orders
+  equally-priced items by their **raw** pixel count, descending, so a bucket
+  stays as size-homogeneous as the corpus allows even when the cap has priced
+  its members alike. It is a secondary key only: it never changes a batch's
+  price, never lets a cheaper item overtake a dearer one, and never changes
+  what is safe — padding cost is a function of the raw dimensions *within* the
+  canvas, so raw pixels are what it orders by.
+- **The mixed-batch warning.** An impl may expose `pads_to_common_size = True`
+  to say it builds one tensor at its largest member's dimensions. When such an
+  impl states no canvas of its own (tier 2 above finds nothing) and a batch
+  under a cap mixes raw sizes by more than 2× in area, the worker logs one
+  line per process naming the ratio. Exposing a canvas is what exempts an
+  impl, because exposing it *is* the promise above; the warning is for the
+  future impl that pads raw and says nothing.
+
 Tier 2 runs at **load** as well as at predict time, and its answer is what
 the `load` `ok` response's own `canvas_pixels` reports (see "Memory sensing"):
 the orchestrator has no way to see inside a downloaded processor config, so a
