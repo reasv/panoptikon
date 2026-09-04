@@ -291,7 +291,10 @@ metadata.description = "(Recommended) EasyOCR - English Text, Standard Recog Net
 # bounded by the `canvas_pixels` declared below and a batch costs what it was
 # charged for. The harness also breaks ties among equally-priced items by raw
 # size, so a bucket stays size-homogeneous even though the cap prices every
-# item at or above the canvas alike.
+# item at or above the canvas alike. The bound is on the *detector's* batch
+# only: easyOCR's recogniser resizes every crop to a fixed height before it
+# becomes a tensor, so the impl keeps cropping from the raw image and
+# transcription on a large scan is unchanged.
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000

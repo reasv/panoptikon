@@ -1005,7 +1005,11 @@ that lands after any of them is refused rather than reopening the row
   batch under a cap mixes raw areas by more than `MIXED_SIZE_LOG_RATIO = 2`,
   one WARN per process names the ratio. Exposing a canvas is the impl's
   promise to bound its own tensor by it, so `inferio.impl.eocr` — which
-  exposes `canvas_pixels = 6 553 600` and enforces it — is exempt.
+  exposes `canvas_pixels = 6 553 600` and enforces it — is exempt. The
+  exemption reads `_canvas_on(instance)`, **not** the full
+  `impl_canvas_pixels` walk: a `max_pixels` found two levels down inside a
+  downloaded processor is a fact about that processor, not a promise by the
+  impl that owns the padding.
 - Defensive clamp (`clamp_to_live_memory`): returns a `LiveBudget(units,
   free_mb, free_source, clamped)`. It **always** takes the one free reading
   (run2 R5, including when `grant_mb <= 0`, which is the memory-blind case);
@@ -1032,7 +1036,7 @@ that lands after any of them is refused rather than reopening the row
 | tagmatch/danbooru[-saucenao] | danbooru_tagger | none | – | 1 | network |
 | doctr/db_resnet50_* (7) | doctr | item / count | 8 | 1 | docTR re-batches internally |
 | doctr/dots_ocr | dotsocr | pixel / sum | 2 000 000 | 2 | min CC 8.0, ~6 GB; no `canvas_pixels` — its cap lives in the downloaded processor, so the worker's tier-2 fallback reads it and **reports it on the load response**, which is what lets the host price it too |
-| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 2 | **`enable_batching = false`** → grantless, so the **host** cap is the only cap; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas), which the impl now **enforces** before it pads a batch (run2 D1-b, `eocr.py::fit_to_canvas`; boxes mapped back by `scale_boxes_to_original`) |
+| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 2 | **`enable_batching = false`** → grantless, so the **host** cap is the only cap; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas), which the impl now **enforces** on the batch tensor before it pads (run2 D1-b, `eocr.py::fit_to_canvas`). Batched path = `Reader.detect` on the bounded batch + `Reader.recognize` per image on the **raw** array (`_detect_bounded_recognize_raw`), boxes mapped back by `scale_detections_to_original` and `min_size` applied in raw pixels: the recogniser's tensor is a fixed `imgH x imgW` per crop, so bounding it would cost transcription quality and save no device memory |
 | florence2/msft_large-* (4) | florence2 | item / count | 4 | 1 | |
 | vlm/moondream-2b-25-03-* (5) | moondream_captioner | none | – | 2 | |
 | textembed/all-mpnet-base-v2, all-MiniLM-L6-v2, stella_* | sentence_transformers | token / max-times-count | 4000 | 1 | no impl-side OOM retry |

@@ -229,11 +229,37 @@ bucketing has nothing left to separate an 8.7 MP scan from a 48 MP sheet and
 they can share a batch whose tensor is several times the area the batch was
 charged for. Run2 D1-b measured exactly that on `inferio.impl.eocr`, whose
 `pad_images_to_same_size` padded to the largest member's raw dimensions while
-easyOCR's detector would have resized onto its 2560px canvas a step later —
-and whose recogniser then cropped from the raw-sized array, the half the
-detector's own resize never bounded. It now calls `fit_to_canvas` (the
-detector's own `resize_aspect_ratio` arithmetic) on every input first, so the
-padded tensor is bounded by the canvas the registry declares.
+easyOCR's detector would have resized onto its 2560px canvas a step later.
+It now calls `fit_to_canvas` (the detector's own `resize_aspect_ratio`
+arithmetic) on every input first, so the padded tensor is bounded by the
+canvas the registry declares — and a small image in a mixed batch is no longer
+shrunk into the corner of a huge frame and downscaled a second time by the
+detector, which is what it used to be.
+
+**The obligation is over the tensor, not over every array the impl holds.**
+It says the *batched work* stays inside the canvas; it does not say the impl
+must throw away resolution the batch tensor never sees. Two consequences,
+both live in `inferio.impl.eocr`:
+
+- The raw decoded image is resident either way. `decode_image_inputs` decodes
+  every payload at full size before any impl code runs, so the canvas price
+  was never a claim about the decode buffer — only about what is allocated
+  *per batch* on top of it.
+- Work whose cost does not scale with the input's area must not be bounded
+  just because it is easy to bound. easyOCR's recogniser resizes every crop to
+  a fixed `imgH × imgW` before it becomes a tensor (`utils.get_image_list`
+  then `recognition.AlignCollate`/`NormalizePAD`), so its device memory is
+  `batch_size × 1 × imgH × imgW` whatever the page's resolution was. Cropping
+  from a canvas-bounded array would hand it a 0.32× crop on an 8000px sheet
+  and save nothing measurable — so the impl detects on the bounded, padded
+  batch, maps the boxes back to the submitted image's coordinates, and
+  recognises from the **raw** array (`Reader.detect` + `Reader.recognize`,
+  which is what `readtext_batched` is made of). `min_size` is applied by the
+  impl after that mapping, so it keeps meaning pixels of the submitted image.
+
+An impl in this position states its canvas because the tensor obeys it; the
+right test for a new impl is *"does this allocation grow with the input's
+area?"*, not *"is this array large?"*.
 
 Two mechanisms in the worker make this visible rather than tacit:
 

@@ -513,23 +513,31 @@ Notes:
   `docs/inferio-worker-protocol.md`, "Memory grants" and "Memory sensing".
 
   **A declared canvas obliges the impl** (run2 D1-b). The cap is a statement
-  that the model never processes more than that area per item, and the price
-  is only honest if the impl enforces it before it forms its batch tensor.
+  that the model's *batch tensor* never exceeds that area per item, and the
+  price is only honest if the impl enforces it before it forms that tensor.
   Most `pixel` impls do so by construction — they resize or tile each input
   and flatten it to a patch sequence, so no raw per-item dimension survives —
   but an impl that **pads a batch to a common size** does not, and easyOCR's
   did not: `pad_images_to_same_size` padded to the largest member's *raw*
-  dimensions, and its recogniser cropped from that array, while the price said
-  2560². The cap makes this worse before it makes it better, because it is the
-  cap that flattens an 8.7 MP scan and a 48 MP sheet to one price and so lets
-  them share a bucket. Two changes close it: `inferio.impl.eocr` resizes every
-  input onto the detector's own canvas before it pads (the boxes are mapped
-  back to the submitted image's coordinates afterwards), and `plan_batches`
-  keeps **raw** pixels as a descending secondary key among equally-priced
-  items, so a bucket stays as size-homogeneous as the corpus allows. A
-  worker-side warning names any future impl that pads to a common size while
-  declaring no canvas of its own and is handed a batch mixing raw sizes by
-  more than 2×.
+  dimensions while the price said 2560². The cap makes this worse before it
+  makes it better, because it is the cap that flattens an 8.7 MP scan and a
+  48 MP sheet to one price and so lets them share a bucket. Two changes close
+  it: `inferio.impl.eocr` resizes every input onto the detector's own canvas
+  before it pads, and `plan_batches` keeps **raw** pixels as a descending
+  secondary key among equally-priced items, so a bucket stays as
+  size-homogeneous as the corpus allows. A worker-side warning names any
+  future impl that pads to a common size while declaring no canvas of its own
+  and is handed a batch mixing raw sizes by more than 2×.
+
+  The obligation stops at the tensor. easyOCR's recogniser crops boxes out of
+  the page, but each crop is resized to a fixed `imgH × imgW` before it
+  becomes a tensor, so its device memory does not scale with the page's
+  resolution — and the impl therefore detects on the canvas-bounded batch,
+  maps the boxes back, and recognises from the **raw** image, which is what
+  keeps transcription quality on large scans identical to the unbatched path.
+  The test for a new impl is whether an allocation grows with the input's
+  area, not whether an array is large: bounding work that is already
+  area-independent costs output quality and saves nothing the ledger prices.
 - Backends without a free-memory query (MPS, CPU) degrade to no
   admission: seed-sized fixed batches plus the Package-1 backstop, the
   same class as `none`.
