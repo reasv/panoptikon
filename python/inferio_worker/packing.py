@@ -9,7 +9,10 @@ the mechanism that spends it. Given a `predict` request that carries a
    inputs (or at least their headers);
 2. packs the window into GPU batches within the grant's unit budget,
    *bucketing* `max-times-count` models so one 8000×6000 scan does not tax 63
-   thumbnails;
+   thumbnails — and, since run2's D1-b, breaking ties among equally-priced
+   items by their **raw** size, because the R7 canvas cap deliberately prices
+   every item at or above the canvas alike and that is the information the
+   bucketing was sorting on;
 3. applies the **defensive clamp** before every batch — shrink-only, never
    above the grant — so a window granted seconds ago cannot run past a world
    that moved;
@@ -161,6 +164,25 @@ CANVAS_WALK_DEPTH = 2
 # happens to be named `max_pixels` and holds something else is refused rather
 # than trusted.
 CANVAS_FLOOR_PIXELS = 512 * 512
+
+# The attribute an impl sets to say it builds **one batch tensor at the
+# dimensions of the batch's largest member** — `inferio.impl.eocr`'s
+# `pad_images_to_same_size` is the shipped example. Such an impl's cost is a
+# function of that largest member, not of the batch's mean, so a batch that
+# mixes sizes costs the maximum for every item in it.
+PADS_TO_COMMON_SIZE_ATTR = "pads_to_common_size"
+
+# Raw-area ratio within one batch above which that pairing is worth a line in
+# the log — but only for an impl that pads to a common size *and* states no
+# canvas of its own. Run2 D1-b: under the R7 cap every item at or above the
+# canvas prices identically, so the priced units carry no size information for
+# the bucketing to sort on, and an impl that then pads to raw dimensions
+# builds a tensor several times larger than the batch was charged for. An
+# impl that exposes its own canvas has, by the protocol doc's rule, promised
+# to bound each item by it before the tensor exists — so it is exempt, and
+# the warning is left for the impl that makes no such promise. 2x area is the
+# smallest mix worth naming: below it the padding waste is within the margin.
+MIXED_SIZE_LOG_RATIO = 2.0
 
 # Flat per-input allowance for `audio-second` pricing: reading a clip's real
 # duration needs a decoder, and nothing in the shipped registry is priced
@@ -556,6 +578,128 @@ def _log_canvas_once(source: str | None, pixels: int | None) -> None:
     )
 
 
+def _pixel_readings(inputs: Sequence[Any]) -> list[int | None]:
+    """Raw decoded pixels per input, None where the header could not be read.
+    The one place an image header is opened; every priced figure is derived
+    from this list, so a window is never read twice."""
+    return [_pixels(getattr(entry, "file", None)) for entry in inputs]
+
+
+def _pixel_units(readings: Sequence[int | None], cap: int | None) -> list[int]:
+    """[`_pixel_readings`] turned into prices, capped at `cap` when given.
+
+    The unreadable-input rule is unchanged and applied *after* the cap, on the
+    capped scale: an input whose header could not be read is charged the
+    largest input already priced in this window, falling back to
+    [`UNREADABLE_PIXEL_UNITS`] when there is none.
+    """
+    priced: list[int] = []
+    largest = 0
+    for reading in readings:
+        value = reading
+        if value is not None and cap is not None:
+            value = min(value, cap)
+        priced.append(value if value is not None else 0)
+        if value:
+            largest = max(largest, value)
+    fallback = largest or UNREADABLE_PIXEL_UNITS
+    if cap is not None:
+        fallback = min(fallback, cap)
+    return [value or fallback for value in priced]
+
+
+class PricedWindow(NamedTuple):
+    """What one window's inputs cost, and what they cost uncapped.
+
+    `units` is the price the grant is spent in — `min(raw, canvas)` for a
+    `pixel` model with a canvas in force. `raw` is the same list without the
+    cap: identical to `units` whenever no cap applies, and *strictly the
+    packing's tiebreaker*, never a price. Safety reads `units` only.
+
+    Keeping both is what [`plan_batches`] needs to stay size-homogeneous under
+    the cap (run2 D1-b): the cap deliberately flattens every item at or above
+    the canvas to one number, which is right for pricing and destroys exactly
+    the information the bucketing sorts on.
+    """
+
+    units: list[int]
+    raw: list[int]
+
+
+def price_window(
+    inputs: Sequence[Any], unit: str, canvas_pixels: int | None = None
+) -> PricedWindow:
+    """[`price_inputs`], plus the same window priced without the canvas cap.
+
+    One pass over the inputs: an image header is read once and both figures
+    are derived from that one reading, since they differ only by a `min`.
+    """
+    cap = canvas_pixels if canvas_pixels and canvas_pixels > 0 else None
+    if unit != "pixel" or cap is None:
+        # No cap applies, so the raw prices *are* the prices. Sharing the one
+        # list is safe: neither is mutated anywhere.
+        units = price_inputs(inputs, unit, canvas_pixels)
+        return PricedWindow(units, units)
+    readings = _pixel_readings(inputs)
+    return PricedWindow(_pixel_units(readings, cap), _pixel_units(readings, None))
+
+
+def _pads_without_a_canvas(instance: Any) -> bool:
+    """Does this impl pad a batch to a common size *and* state no canvas?
+
+    The pairing is the whole point. An impl that pads to a common size builds
+    a tensor sized by its largest member; an impl that states a canvas of its
+    own has, by the protocol doc's rule
+    (docs/inferio-worker-protocol.md, "Memory grants"), promised to bound
+    every item by that canvas *before* the tensor exists — which is exactly
+    what `inferio.impl.eocr` was changed to do in run2's D1-b fix. So an impl
+    that pads and states nothing is the one shape whose batches can cost far
+    more than they were priced, and it is the only one worth a warning.
+
+    Never raises: an attribute walk over an object nobody here controls
+    decides a log line, nothing else.
+    """
+    try:
+        if not getattr(instance, PADS_TO_COMMON_SIZE_ATTR, False):
+            return False
+        return impl_canvas_pixels(instance) is None
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+_mixed_batch_logged = False
+
+
+def _warn_mixed_batch_once(batch: Sequence[int], raw: Sequence[int]) -> None:
+    """One line per process when a priced-flat batch mixes raw sizes.
+
+    Diagnostic only — nothing here changes what runs. It makes run2's D1-b
+    visible in a log rather than in a throughput histogram: the batch was
+    charged for the canvas and the impl will build it at raw dimensions.
+    """
+    global _mixed_batch_logged
+    if _mixed_batch_logged or len(batch) < 2:
+        return
+    sizes = [raw[index] for index in batch if raw[index] > 0]
+    if len(sizes) < 2:
+        return
+    biggest, smallest = max(sizes), min(sizes)
+    if biggest < smallest * MIXED_SIZE_LOG_RATIO:
+        return
+    _mixed_batch_logged = True
+    logger.warning(
+        "this impl pads a batch to its largest member and states no canvas of "
+        "its own, and this batch of %d mixes raw inputs from %d to %d pixels "
+        "(%.1fx): it will build a tensor sized by the largest, while the "
+        "canvas cap priced them alike. Bound each input by the canvas before "
+        "padding (docs/inferio-worker-protocol.md, \"Memory grants\")",
+        len(batch),
+        smallest,
+        biggest,
+        biggest / smallest,
+    )
+
+
 def price_inputs(
     inputs: Sequence[Any], unit: str, canvas_pixels: int | None = None
 ) -> list[int]:
@@ -576,20 +720,9 @@ def price_inputs(
     fallback, which is the same quantity by another route.
     """
     units: list[int] = []
-    largest = 0
     if unit == "pixel":
         cap = canvas_pixels if canvas_pixels and canvas_pixels > 0 else None
-        for entry in inputs:
-            priced = _pixels(getattr(entry, "file", None))
-            if priced is not None and cap is not None:
-                priced = min(priced, cap)
-            units.append(priced if priced is not None else 0)
-            if priced:
-                largest = max(largest, priced)
-        fallback = largest or UNREADABLE_PIXEL_UNITS
-        if cap is not None:
-            fallback = min(fallback, cap)
-        return [priced or fallback for priced in units]
+        return _pixel_units(_pixel_readings(inputs), cap)
     if unit == "token":
         for entry in inputs:
             total = _text_bytes(getattr(entry, "file", None)) + _text_bytes(
@@ -628,6 +761,7 @@ def plan_batches(
     aggregation: str,
     unit_budget: int,
     cap_items: int | None = None,
+    tiebreak: Sequence[int] | None = None,
 ) -> list[list[int]]:
     """Split input indices into GPU batches within `unit_budget`.
 
@@ -641,6 +775,19 @@ def plan_batches(
       `max × count` prices a mixed batch conservatively either way — it is
       purely the throughput win.
 
+    `tiebreak` is a **secondary descending key**, applied only among items
+    whose priced units are equal and only for `max-times-count`. It exists
+    because the run2 R7 canvas cap flattens every item at or above the canvas
+    to one price, which is correct pricing and leaves the primary sort with
+    nothing to separate a 2480x3508 scan from an 8000x6000 sheet — so they
+    can land in one batch, and an impl that pads a batch to its largest
+    member's raw dimensions then builds a tensor several times the area the
+    batch was charged for (run2 D1-b). Padding cost is a function of the *raw*
+    dimensions within the canvas, so raw pixels are what the tiebreaker
+    orders by, and a bucket stays as size-homogeneous as the corpus allows.
+    It never changes a batch's price, never changes safety, and cannot make a
+    batch larger: it only decides *which* equally-priced item comes next.
+
     A batch is never smaller than one item: a single item over budget goes
     through alone and the impl's OOM backstop catches it if it truly cannot
     run (Package 1 already decided batch-1 OOM = item fails, job continues).
@@ -650,8 +797,16 @@ def plan_batches(
     cap = cap_items if cap_items and cap_items > 0 else None
     order = list(range(len(units)))
     if aggregation == "max-times-count":
-        # Stable descending sort: the largest item sets each batch's price.
-        order.sort(key=lambda index: units[index], reverse=True)
+        # Stable descending sort: the largest item sets each batch's price,
+        # and among equals the largest raw item goes first. `reverse=True`
+        # keeps input order for items equal on both keys (Python's sort is
+        # stable and reverse does not re-reverse ties).
+        if tiebreak is not None and len(tiebreak) == len(units):
+            order.sort(
+                key=lambda index: (units[index], tiebreak[index]), reverse=True
+            )
+        else:
+            order.sort(key=lambda index: units[index], reverse=True)
 
     batches: list[list[int]] = []
     current: list[int] = []
@@ -1130,7 +1285,12 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
     trimmed = maybe_shrink(grant_mb)
 
     # Pricing happens once, up front, OUTSIDE every timed section.
-    units = price_inputs(inputs, unit, resolve_canvas_pixels(grant, instance, unit))
+    canvas = resolve_canvas_pixels(grant, instance, unit)
+    prices = price_window(inputs, unit, canvas)
+    units, raw_units = prices.units, prices.raw
+    # Decided once per window, not per batch: the object graph does not change
+    # mid-window, and the walk is the only part of the check with a cost.
+    watch_mixing = canvas is not None and _pads_without_a_canvas(instance)
 
     outputs: list[Any] = [None] * len(inputs)
     measurements: list[dict[str, Any]] = []
@@ -1152,8 +1312,17 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
         # mid-window, and the plan for the remaining items must honour that.
         live = clamp_to_live_memory(budget, grant_mb)
         remaining_units = [units[index] for index in pending]
-        plan = plan_batches(remaining_units, aggregation, live.units, cap_items)
+        remaining_raw = [raw_units[index] for index in pending]
+        plan = plan_batches(
+            remaining_units,
+            aggregation,
+            live.units,
+            cap_items,
+            tiebreak=remaining_raw,
+        )
         batch = [pending[position] for position in plan[0]]
+        if watch_mixing:
+            _warn_mixed_batch_once(batch, raw_units)
         priced = batch_units(batch, units, aggregation)
 
         state = memory.begin_batch()

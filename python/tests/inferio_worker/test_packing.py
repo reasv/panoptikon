@@ -10,6 +10,7 @@ dependency), so the pixel pricer is exercised against genuine image headers.
 from __future__ import annotations
 
 import io
+import logging
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -387,6 +388,207 @@ def test_a_granted_canvas_reaches_the_window(fake_torch):
     )
     assert [len(batch) for batch in model.batches] == [2, 2]
     assert payload["measurements"][0]["units"] == 2 * 1_835_008
+
+
+# ---------------------------------------------------------------------------
+# Size homogeneity under the canvas (run2 D1-b)
+# ---------------------------------------------------------------------------
+#
+# The cap prices every item at or above the canvas alike, which is correct
+# pricing and removes exactly the size information the `max-times-count`
+# bucketing sorts on. These describe the two halves of the fix: the raw price
+# survives beside the capped one as a *tiebreaker*, and an impl that pads a
+# batch to its largest member while stating no canvas of its own is named in
+# the log once.
+
+# One canvas, one pair of sizes, used by every test below: both are above the
+# canvas, so both price at exactly it, and their raw areas differ by 2.78x.
+D1B_CANVAS = 1_000_000
+BIG = (2000, 1500)  # 3 000 000 raw pixels
+SMALL = (1200, 900)  # 1 080 000 raw pixels
+
+
+def mixed_window():
+    """Big/small/big/small, interleaved so input order cannot pass by luck."""
+    return [
+        PredictionInput(file=png_bytes(*BIG)),
+        PredictionInput(file=png_bytes(*SMALL)),
+        PredictionInput(file=png_bytes(*BIG)),
+        PredictionInput(file=png_bytes(*SMALL)),
+    ]
+
+
+def test_price_window_keeps_the_uncapped_price_beside_the_capped_one():
+    priced = packing.price_window(mixed_window(), "pixel", D1B_CANVAS)
+    assert priced.units == [D1B_CANVAS] * 4, "the price is the capped one"
+    assert priced.raw == [3_000_000, 1_080_000, 3_000_000, 1_080_000]
+
+
+def test_price_window_is_the_same_list_when_nothing_is_capped():
+    """No cap, no second reading — and `units is raw`, so no caller can drift
+    them apart."""
+    for unit, canvas in (("pixel", None), ("pixel", 0), ("item", D1B_CANVAS)):
+        priced = packing.price_window(mixed_window(), unit, canvas)
+        assert priced.units is priced.raw
+    assert packing.price_window(mixed_window(), "pixel").units == [
+        3_000_000,
+        1_080_000,
+        3_000_000,
+        1_080_000,
+    ]
+
+
+def test_equally_priced_items_are_ordered_by_raw_size():
+    """The tiebreaker: four items priced alike bucket by raw area, so the two
+    3 MP sheets share a batch and the two 1 MP scans share the other. Without
+    it the sort has nothing to separate them and input order interleaves."""
+    units = [D1B_CANVAS] * 4
+    raw = [3_000_000, 1_080_000, 3_000_000, 1_080_000]
+    budget = 2 * D1B_CANVAS
+    assert packing.plan_batches(units, "max-times-count", budget) == [[0, 1], [2, 3]]
+    assert packing.plan_batches(
+        units, "max-times-count", budget, tiebreak=raw
+    ) == [[0, 2], [1, 3]]
+
+
+def test_the_tiebreaker_never_reorders_across_a_price():
+    """Secondary means secondary: a cheaper item never overtakes a dearer one
+    however large it is raw, so the batch a bucket is priced at is unchanged."""
+    units = [10, 100, 10]
+    raw = [999_999, 1, 999_999]
+    plan = packing.plan_batches(units, "max-times-count", 1000, tiebreak=raw)
+    assert plan[0][0] == 1, "the 100-unit item still leads"
+
+
+def test_the_tiebreaker_is_ignored_where_it_cannot_apply():
+    """A mis-sized tiebreaker (a caller bug) and the aggregations that do not
+    sort at all are unaffected — the plan is the one the primary key gives."""
+    units = [5, 5, 5, 5]
+    assert packing.plan_batches(
+        units, "max-times-count", 10, tiebreak=[9, 9]
+    ) == packing.plan_batches(units, "max-times-count", 10)
+    assert packing.plan_batches(units, "sum", 10, tiebreak=[4, 3, 2, 1]) == [
+        [0, 1],
+        [2, 3],
+    ]
+    assert packing.plan_batches(units, "count", 2, tiebreak=[4, 3, 2, 1]) == [
+        [0, 1],
+        [2, 3],
+    ]
+
+
+def test_a_capped_window_buckets_size_homogeneously(fake_torch):
+    """End to end through `run_window`: the batches an impl that pads to a
+    common size is handed hold one raw size each, so its tensor is the size
+    the batch was priced at."""
+    model = Recorder()
+    inputs = mixed_window()
+    packing.run_window(
+        model,
+        inputs,
+        grant(
+            unit_budget=2 * D1B_CANVAS,
+            unit="pixel",
+            aggregation="max-times-count",
+            canvas_pixels=D1B_CANVAS,
+        ),
+    )
+    sizes = [
+        sorted(len(entry.file) for entry in batch) for batch in model.batches
+    ]
+    assert len(sizes) == 2
+    for batch in sizes:
+        assert len(set(batch)) == 1, "every batch holds one raw size"
+
+
+class Padding:
+    """An impl that pads a batch to its largest member. `canvas` is what it
+    tells the worker about its own ceiling — `None` is the impl that makes no
+    statement, which is the one the guard is for."""
+
+    def __init__(self, canvas=None):
+        self.pads_to_common_size = True
+        self.batches: list[list] = []
+        if canvas is not None:
+            self.canvas_pixels = canvas
+
+    def predict(self, inputs):
+        self.batches.append(list(inputs))
+        return [None] * len(inputs)
+
+
+@pytest.fixture
+def unlogged_guard():
+    """The guard logs once per process; each test needs it unfired."""
+    packing._mixed_batch_logged = False
+    yield
+    packing._mixed_batch_logged = False
+
+
+def run_padding_window(model, inputs, canvas=D1B_CANVAS):
+    return packing.run_window(
+        model,
+        inputs,
+        grant(
+            unit_budget=4 * D1B_CANVAS,
+            unit="pixel",
+            aggregation="max-times-count",
+            canvas_pixels=canvas,
+        ),
+    )
+
+
+def test_an_impl_that_pads_and_states_no_canvas_is_named_once(
+    fake_torch, unlogged_guard, caplog
+):
+    """The whole batch fits one budget here, so the plan *has* to mix sizes —
+    which is the shape D1-b measured, and the shape the log line describes."""
+    with caplog.at_level(logging.WARNING, logger="inferio_worker.packing"):
+        run_padding_window(Padding(), mixed_window())
+        run_padding_window(Padding(), mixed_window())
+    warnings = [
+        record
+        for record in caplog.records
+        if "pads a batch to its largest member" in record.getMessage()
+    ]
+    assert len(warnings) == 1, "once per process, not once per batch"
+    message = warnings[0].getMessage()
+    assert "1080000 to 3000000 pixels" in message
+    assert "2.8x" in message
+
+
+def test_an_impl_that_states_its_canvas_is_not_named(
+    fake_torch, unlogged_guard, caplog
+):
+    """`inferio.impl.eocr`'s shape after the D1-b fix: it pads, and it states
+    a canvas — which the protocol doc makes a promise to bound every input by
+    before the tensor exists. A promise is what exempts it."""
+    with caplog.at_level(logging.WARNING, logger="inferio_worker.packing"):
+        run_padding_window(Padding(canvas=D1B_CANVAS), mixed_window())
+    assert not [
+        record
+        for record in caplog.records
+        if "pads a batch to its largest member" in record.getMessage()
+    ]
+
+
+def test_the_guard_is_silent_without_a_cap_or_a_mix(
+    fake_torch, unlogged_guard, caplog
+):
+    """Two more ways to be uninteresting: no canvas in force at all (nothing
+    was priced flat, so nothing is under-priced), and a batch whose raw sizes
+    are within the 2x ratio."""
+    with caplog.at_level(logging.WARNING, logger="inferio_worker.packing"):
+        run_padding_window(Padding(), mixed_window(), canvas=None)
+        run_padding_window(
+            Padding(),
+            [PredictionInput(file=png_bytes(*BIG)) for _ in range(4)],
+        )
+    assert not [
+        record
+        for record in caplog.records
+        if "pads a batch to its largest member" in record.getMessage()
+    ]
 
 
 def test_token_and_item_and_audio_pricing():
