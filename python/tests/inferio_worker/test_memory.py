@@ -1215,6 +1215,36 @@ def test_batch_measurement_is_per_call(fake_torch) -> None:
     assert measurement["peak_allocated_mb"] == 550
 
 
+def test_an_unreadable_allocator_keeps_what_the_caller_already_knew(
+    fake_torch, monkeypatch
+) -> None:
+    # Only the *peaks* come from the allocator. The flags and the pre-batch
+    # driver reading were decided by the packing harness before the batch ran,
+    # and dropping them because an allocator query raised would silently
+    # discard an out-of-memory sample, or the live free reading the
+    # orchestrator's external-usage term refreshes from (run2 R3/R5).
+    def exploding():
+        raise RuntimeError("the allocator query failed")
+
+    monkeypatch.setattr(memory, "_allocator_stats", exploding)
+    measurement = memory.measure_batch(
+        memory.begin_batch(),
+        items=4,
+        oom=True,
+        oom_class={"source": "typed_exception", "exception": "torch.OutOfMemoryError"},
+        free_mb=1234,
+        free_source="nvml",
+        clamped={"from_units": 8, "to_units": 3, "free_mb": 1234},
+    )
+    assert measurement["items"] == 4
+    assert measurement["oom"] is True
+    assert measurement["oom_class"]["source"] == "typed_exception"
+    assert measurement["free_mb"] == 1234
+    assert measurement["free_source"] == "nvml"
+    assert measurement["clamped"] == {"from_units": 8, "to_units": 3, "free_mb": 1234}
+    assert "peak_reserved_mb" not in measurement, "the peaks are what failed"
+
+
 def test_helpers_never_raise_on_hostile_torch() -> None:
     class Exploding:
         def __getattr__(self, name):

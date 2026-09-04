@@ -3044,11 +3044,18 @@ def measure_batch(
         return measurement
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("batch measurement failed: %s", exc)
-        # The peaks are what failed to read; the flags were already decided by
-        # the caller and are the negative samples the orchestrator's deflation
-        # path runs on. Dropping them here would silently discard an OOM
-        # because an allocator query happened to raise.
+        # The peaks are what failed to read; everything else here was already
+        # decided by the caller — the negative-sample flags the orchestrator's
+        # deflation path runs on, and the pre-batch driver reading its
+        # external-usage term refreshes from. Dropping them would silently
+        # discard an OOM, or a live memory reading, because an allocator query
+        # happened to raise.
         minimal: dict[str, Any] = {"items": items}
+        if free_mb is not None:
+            minimal["free_mb"] = free_mb
+            minimal["free_source"] = free_source
+        if clamped:
+            minimal["clamped"] = clamped
         if oom:
             minimal["oom"] = True
             if oom_class:
