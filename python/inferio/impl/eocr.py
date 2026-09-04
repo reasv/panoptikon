@@ -57,10 +57,13 @@ DETECTOR_SIZE_MULTIPLE = 32
 #
 # * `at::native::safe_downcast<int32_t, int64_t>` (`ATen/native/Pool.h:49-57`,
 #   whose `TORCH_CHECK` message *is* "integer out of range") is applied by
-#   CUDA's `max_pool2d_with_indices` forward to its **output element count**,
-#   because the kernel is launched over that count as a signed 32-bit int.
-#   The ceiling is therefore `2**31 - 1` **elements of one pooling output**,
-#   not bytes, and no amount of free memory moves it.
+#   CUDA's `max_pool2d_with_indices` forward to its **output element count**:
+#   `const int count = safe_downcast<int, int64_t>(output.numel())`,
+#   `ATen/native/cuda/DilatedMaxPool2d.cu:344`, which runs before the
+#   memory-format switch and so binds on both the contiguous and the
+#   channels-last launcher. The ceiling is therefore `2**31 - 1` **elements of
+#   one pooling output** — the output, not the input, and elements, not bytes
+#   — and no amount of free memory moves it.
 # * The binding pool is the **first** one in `vgg16_bn`
 #   (`torchvision.models.vgg16_bn().features[6]`, inside easyOCR's
 #   `vgg16_bn.slice1 = features[0:12]`, `easyocr/model/modules.py:38-39`,
@@ -87,6 +90,21 @@ DETECTOR_SIZE_MULTIPLE = 32
 # 1240x1754 page (below the canvas, padded to 1248x1760) gives 61 — smaller
 # pages really do allow more, which is why the cap is computed per batch from
 # that batch's own padded dimensions and never fixed at a constant.
+#
+# **The ceiling belongs to the CUDA kernel, and only to it.** CPU torch runs
+# a different implementation: `max_pool2d_with_indices_out_cpu`
+# (`ATen/native/DilatedMaxPool2d.cpp:173-192`) downcasts only the kernel,
+# stride, padding and dilation *scalars* and then hands the tensors to
+# `max_pool2d_kernel` (`ATen/native/cpu/MaxPoolKernel.cpp`), which indexes in
+# `int64_t` throughout and contains no `safe_downcast` at all. So a
+# CPU-budgeted worker has no such ceiling, and capping it there would make
+# this impl report a `clamped.reason = "index_limit"` — which the ledger is
+# meant to read as a *permanent* property of the model — about a limit that
+# does not exist on that host. [`EasyOCRModel._index_ceiling_applies`] is
+# therefore the gate on both enforcement points. ROCm/HIP compiles the same
+# `.cu` and torch spells a HIP device `cuda`, so one test covers both.
+# `run_with_oom_retry`'s reactive halving stays unconditional: it needs no
+# formula and so makes no claim about which kernel a device runs.
 KERNEL_INDEX_ELEMENT_LIMIT = 2**31 - 1
 DETECTOR_POOL_CHANNELS = 64
 
@@ -350,6 +368,41 @@ class EasyOCRModel(InferenceModel):
         
         self._model_loaded = True
 
+    def _index_ceiling_applies(self) -> bool:
+        """Whether CRAFT will run where the pooling kernel has the ceiling.
+
+        The formula in the module header is derived from
+        `ATen/native/cuda/DilatedMaxPool2d.cu`; CPU torch's pooling kernel
+        indexes in 64 bits and has no such limit. Applying the cap on a
+        CPU-budgeted host would cost nothing in correctness but would make
+        this impl assert a permanent execution ceiling that host does not
+        have — and `clamped.reason = "index_limit"` is exactly the signal the
+        ledger is meant to treat as permanent.
+
+        Answers **True unless it can positively establish otherwise**: a
+        missing cap on a board that does have the ceiling is a failed batch
+        (recoverable only by the reactive halving, at the price of one wasted
+        attempt and an unpriced sample), while a needless cap on one that does
+        not costs at most a smaller batch. So:
+
+        * `gpu = False` is the operator saying this model runs on the CPU, and
+          easyOCR honours it literally (`easyocr.Reader(gpu=False)`) — no
+          ceiling;
+        * a **loaded** model additionally knows the device `load` resolved,
+          and this is the same `devices[0].type == "cuda"` test `load` makes
+          to decide `use_gpu`. Torch spells a ROCm/HIP device `cuda` too,
+          which is right: HIP compiles the same kernel;
+        * an unloaded model configured for the GPU is charged the ceiling.
+          The harness may ask before the first `load`, and the pre-cap has to
+          be the conservative one.
+        """
+        if not self.gpu:
+            return False
+        devices = getattr(self, "devices", None)
+        if not devices:
+            return True
+        return getattr(devices[0], "type", "cuda") == "cuda"
+
     def max_batch_for(
         self, shapes: Sequence[tuple[int, int] | None]
     ) -> int | None:
@@ -371,11 +424,23 @@ class EasyOCRModel(InferenceModel):
         principle as the harness's own unreadable-input pricing: a shape we
         cannot see must not be assumed small.
 
-        None means "no ceiling from me" — which is the honest answer when
-        batching is disabled, since the unbatched path builds no batch tensor
-        at all and easyOCR bounds each `readtext` call by itself.
+        None means "no ceiling from me" — the honest answer in two cases:
+        batching is disabled, so the unbatched path builds no batch tensor at
+        all and easyOCR bounds each `readtext` call by itself; or the detector
+        will not run on a device whose pooling kernel has the ceiling
+        ([`_index_ceiling_applies`]).
+
+        **What this cannot see, and who catches it.** The harness asks before
+        `predict`, so it knows neither the per-request `canvas_size` nor the
+        per-request `mag_ratio` that ride each input's config — both of which
+        move the padded tensor. It answers for this model's *configured*
+        canvas at `mag_ratio = 1`, which is what the shipped and the
+        calibration configs use; a request that raises either one makes this
+        answer optimistic, and the impl's own cap inside
+        [`_detect_bounded_recognize_raw`] — computed from the arrays that
+        exist, so exact — is what binds then.
         """
-        if not self.enable_batching:
+        if not self.enable_batching or not self._index_ceiling_applies():
             return None
         sizes: List[tuple[int, int] | None] = []
         for shape in shapes:
@@ -598,6 +663,9 @@ class EasyOCRModel(InferenceModel):
         signed 32-bit int, so the batch is chunked at
         [`max_detector_batch`] of the padded dimensions this batch actually
         builds — 28 items for canvas-bounded A4 pages, 20 for square ones.
+        That kernel is the CUDA one, so the chunking is gated on
+        [`_index_ceiling_applies`]; on a CPU-budgeted host the batch runs
+        whole, which is what that host's pooling kernel can do.
         """
         canvas_size = self._batch_canvas_size(batch_params)
         detect_params = {
@@ -640,13 +708,17 @@ class EasyOCRModel(InferenceModel):
             canvas_size,
             self._batch_mag_ratio(batch_params),
         )
-        chunk_cap = max_detector_batch(
-            [
-                (int(array.shape[0]), int(array.shape[1]))
-                for array in bounded
-            ],
-            canvas_size,
-            self._batch_mag_ratio(batch_params),
+        chunk_cap = (
+            max_detector_batch(
+                [
+                    (int(array.shape[0]), int(array.shape[1]))
+                    for array in bounded
+                ],
+                canvas_size,
+                self._batch_mag_ratio(batch_params),
+            )
+            if self._index_ceiling_applies()
+            else None
         )
         if chunk_cap is not None and chunk_cap < len(bounded):
             # Reported, not swallowed: `note_index_limit_event` is what lets

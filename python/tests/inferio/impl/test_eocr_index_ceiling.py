@@ -246,9 +246,14 @@ def test_an_unbatched_impl_states_no_ceiling():
     assert model.max_batch_for([SCAN] * 64) is None
 
 
-def test_a_per_request_canvas_moves_the_ceiling_with_it():
-    """The C7nc control raises `canvas_size` to free the pricing; the ceiling
-    is a fact about the tensor, so it has to follow."""
+def test_a_configured_canvas_moves_the_ceiling_with_it():
+    """The C7nc control raises this model's `config.canvas_size` to free the
+    pricing; the ceiling is a fact about the tensor, so it has to follow.
+
+    The model's canvas is the one the hook can see. A `canvas_size` (or
+    `mag_ratio`) riding an individual request arrives after the harness has
+    already asked, and is caught by the impl's own cap inside
+    `_detect_bounded_recognize_raw` instead — see `max_batch_for`."""
     uncapped = stubbed(IndexLimitedReader(), canvas_size=40000)
     assert uncapped.canvas_pixels == 40000 * 40000
     assert uncapped.max_batch_for([SCAN] * 4) == 15, (
@@ -402,3 +407,81 @@ def test_the_ceiling_never_shrinks_a_batch_the_canvas_already_bounded(small_limi
     # above, and therefore the same ceiling of 2.
     model.predict(inputs(4, (512, 384)))
     assert reader.detected == [2, 2]
+
+
+# ---------------------------------------------------------------------------
+# Which device the ceiling belongs to
+# ---------------------------------------------------------------------------
+#
+# The formula is derived from `ATen/native/cuda/DilatedMaxPool2d.cu:344`.
+# CPU torch runs `ATen/native/cpu/MaxPoolKernel.cpp`, which indexes in
+# `int64_t` throughout and contains no `safe_downcast` at all, so a
+# CPU-budgeted worker has no such ceiling — and must not be told it has one,
+# because `clamped.reason = "index_limit"` is the signal the ledger is meant
+# to read as a permanent property of the model.
+
+
+class _Device:
+    """A stand-in for `torch.device`, so these tests need no torch."""
+
+    def __init__(self, type_: str):
+        self.type = type_
+
+
+def test_a_cpu_model_states_no_ceiling():
+    model = stubbed(IndexLimitedReader(), gpu=False)
+    assert model.max_batch_for([SCAN] * 64) is None
+
+
+def test_a_cpu_model_does_not_cap_its_own_batch(small_limit):
+    """The whole batch reaches `detect` in one call: on this host it fits."""
+    reader = IndexLimitedReader()
+    model = stubbed(reader, gpu=False)
+    counters = Counters()
+
+    outputs = model.predict(inputs(5, (128, 96)))
+
+    assert len(outputs) == 5
+    assert reader.detected == [5], "one call, no chunking"
+    assert (counters.index_events, counters.oom_halvings) == (0, 0)
+
+
+def test_a_loaded_model_that_resolved_to_a_non_cuda_device_states_no_ceiling():
+    """`gpu = True` but the host has no CUDA board: `load` resolved MPS, and
+    the ceiling is a fact about CUDA's kernel."""
+    model = stubbed(IndexLimitedReader())
+    model.devices = [_Device("mps")]
+    assert model.max_batch_for([SCAN] * 64) is None
+
+
+def test_an_unloaded_gpu_model_is_charged_the_ceiling():
+    """The harness may ask before the first `load`. Unknown means charged:
+    a missing cap on a board that has the ceiling costs a failed batch, a
+    needless one costs a smaller batch."""
+    model = EasyOCRModel()
+    assert not hasattr(model, "devices")
+    assert model.max_batch_for([SCAN] * 64) == MEASURED_CEILING
+
+
+def test_a_loaded_cuda_model_is_charged_the_ceiling():
+    model = stubbed(IndexLimitedReader())
+    model.devices = [_Device("cuda")]
+    assert model.max_batch_for([SCAN] * 64) == MEASURED_CEILING
+
+
+def test_the_reactive_halving_is_not_gated_on_the_device(caplog):
+    """The gate is on the *formula*, which is CUDA-specific. The retry
+    helper's branch needs no formula and makes no claim about the kernel, so
+    a CPU model that meets an index limit anyway still halves rather than
+    falling back per image."""
+    caplog.set_level(logging.WARNING)
+    reader = IndexLimitedReader(ceiling=3)
+    model = stubbed(reader, gpu=False)
+    counters = Counters()
+
+    outputs = model.predict(inputs(6, (128, 96)))
+
+    assert len(outputs) == 6
+    assert reader.detected == [6, 3, 3]
+    assert reader.single == []
+    assert (counters.index_events, counters.oom_halvings) == (1, 0)
