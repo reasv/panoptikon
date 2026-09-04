@@ -801,7 +801,7 @@ A measurement map describes one GPU batch the worker actually ran:
 | `oom_class` | **new (run2, R3)**: present exactly when `oom` is `true`, as `{source, exception, free_mb_at_failure, device}` — *why* the harness called this an out-of-memory condition, so the orchestrator can trust a structural signal and corroborate a textual one instead of guessing from a message it never sees. Absent when `oom` is absent, and **absent means the worker saw no out-of-memory condition**, including on a batch that failed for some other reason: the orchestrator must not deflate on such a failure |
 | `free_mb` | **new (run2, R5)**: driver-reported free memory on the worker's board, read immediately **before** this batch ran — the very sample the defensive clamp compares against `grant.mb`, reported rather than discarded. Absent when nothing could be read, and absent on the grantless compatibility path, which takes no pre-batch reading |
 | `free_source` | **new (run2, R5)**: which driver produced `free_mb`, from the same vocabulary a memory sample's `free_source` uses (`"nvml"`, `"amdgpu-sysfs"`, `"mps"`, `"ram"`, `"torch"`). Present exactly when `free_mb` is |
-| `clamped` | **new (run2, R5)**: present only when this batch actually ran **smaller** than its granted budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading taken before the batch. Absent on every batch that ran at its granted budget. **Extended in run2 (S1)** with an optional fourth key, `reason`: `"index_limit"` when what shrank the batch was an impl's shape ceiling (`max_batch_for`, or the impl's own equivalent inside `predict` — see "Memory grants") rather than the defensive memory clamp. `reason` is **additive and absent by default**, and absent means the memory clamp, so nothing an older orchestrator reads changes. When both bound the same batch, one map spans them: `from_units` is the granted budget, `to_units` is what ran, and `reason` names the constraint that set `to_units` |
+| `clamped` | **new (run2, R5)**: present only when this batch actually ran **smaller** than its granted budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading taken before the batch. Absent on every batch that ran at its granted budget. **Extended in run2 (S1)** with an optional fourth key, `reason`: `"index_limit"` when what shrank the batch was an impl's shape ceiling (`max_batch_for`, or the impl's own equivalent inside `predict` — see "Memory grants") rather than the defensive memory clamp. `reason` is **additive and absent by default**, and absent means the memory clamp, so nothing an older orchestrator reads changes. When both bound the same batch, one map spans them: `from_units` is the granted budget, `to_units` is what ran, and `reason` names the constraint that set `to_units`. `free_mb` is **optional**: the memory clamp always has the reading that decided it, but a shape ceiling is decided by the batch's shapes and carries one only when the worker happened to have taken it |
 
 `oom_class` has four keys:
 
@@ -832,15 +832,23 @@ none of this changes what it sends):
   166.9 s). A window that ended in an OOM contributes its readings too — the
   reading describes the board, not the batch's outcome.
 - **`clamped`** excludes that batch from the **throughput-knee** series and
-  from nothing else. A clamped batch ran at the size live free memory allowed
-  rather than the size the model was free to reach, so its rate is not
-  evidence about where this model's throughput curve bends; its allocator
-  peaks are still honest and still feed the cost fit. The orchestrator reads
-  only the *presence* of the map — `from_units`/`to_units`/`free_mb` are
-  operator-facing provenance.
-  **`clamped.reason` is not yet read on the orchestrator side** (open item).
-  The worker emits it; `ledger.rs` still treats every `clamped` alike, which
-  is safe — a `reason: "index_limit"` batch is excluded from the knee series,
+  from nothing else. A clamped batch ran at a size that was not the model's
+  choice — live free memory allowed less, or the impl's shape ceiling did —
+  so its rate is not evidence about where this model's throughput curve
+  bends; its allocator peaks are still honest and still feed the cost fit.
+  The *decision* reads only the **presence** of the map.
+  The map is read from `from_units`/`to_units`: they are the pair that says
+  what was clamped from what, and a map carrying neither is not a clamp.
+  `free_mb` is provenance and is **optional on the wire** — a shape ceiling
+  is decided by the batch's shapes and carries a free reading only when the
+  worker happened to have one — so an orchestrator that requires it drops
+  exactly the clamp that will bind again on every similar batch.
+  **`clamped.reason` reaches the settle log and nothing else.** `ledger.rs`
+  puts `clamped_samples` and `clamped=<reason>` (`none` | `memory` |
+  the reason the worker named | `a+b`) on the `settled a granted window`
+  line, so a window whose batches were shortened says so and says by what.
+  It still *acts* on every `clamped` alike, which is safe — a
+  `reason: "index_limit"` batch is excluded from the knee series,
   which is what it should be — but it is not yet *sufficient*. A shape
   ceiling is a permanent property of the model and the corpus, not a
   transient of a busy board, so the ledger has more it could do with one:

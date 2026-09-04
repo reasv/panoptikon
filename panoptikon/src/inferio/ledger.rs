@@ -1395,6 +1395,16 @@ struct WindowSettled {
     deflation: u32,
     clean_windows: u32,
     max_units_measured: u64,
+    /// Measurements in this window that ran under the budget they were
+    /// granted, and [`clamp_log_field`]'s word for why.
+    ///
+    /// Both are on the line because a clamped batch is excluded from the
+    /// throughput ring: without them, `throughput_samples = 0` on a window
+    /// that ran perfectly well is indistinguishable from a window that
+    /// produced nothing — and, since run2 S1, from a model that is being
+    /// held at a size by its own shape ceiling rather than by the board.
+    clamped_samples: usize,
+    clamped_reason: String,
 }
 
 impl WindowSettled {
@@ -1407,6 +1417,8 @@ impl WindowSettled {
                 reason,
                 high_water_samples = self.high_water_samples,
                 throughput_samples = self.throughput_samples,
+                clamped_samples = self.clamped_samples,
+                clamped = %self.clamped_reason,
                 ramp_step = self.ramp_step,
                 deflation = self.deflation,
                 clean_windows = self.clean_windows,
@@ -1419,6 +1431,8 @@ impl WindowSettled {
                 outcome = self.outcome,
                 high_water_samples = self.high_water_samples,
                 throughput_samples = self.throughput_samples,
+                clamped_samples = self.clamped_samples,
+                clamped = %self.clamped_reason,
                 ramp_step = self.ramp_step,
                 deflation = self.deflation,
                 clean_windows = self.clean_windows,
@@ -1428,6 +1442,41 @@ impl WindowSettled {
         }
     }
 }
+
+/// The `clamped` field of the settle line: what shrank this window's batches
+/// below the budget they were granted.
+///
+/// * `"none"` — nothing was clamped.
+/// * `"memory"` — the defensive clamp, which is what a clamp that names no
+///   reason is (the protocol pins absence to it, so the host never infers a
+///   reason it was not told).
+/// * the reason the worker named, verbatim — `"index_limit"` today, and
+///   whatever a future worker names, because a reason this host does not
+///   recognise is still the most useful thing it can print.
+/// * `"a+b"` for a window that carried more than one kind, in first-seen
+///   order and deduplicated.
+///
+/// A free function so the rendering is assertable as the decision it is,
+/// rather than by scraping a subscriber (the same reason
+/// [`canvas_log_field`] is one).
+fn clamp_log_field(clamps: &[Option<String>]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for clamp in clamps {
+        let reason = clamp.as_deref().unwrap_or(CLAMP_REASON_MEMORY);
+        if !seen.contains(&reason) {
+            seen.push(reason);
+        }
+    }
+    if seen.is_empty() {
+        return "none".to_owned();
+    }
+    seen.join("+")
+}
+
+/// How the settle line spells a clamp that named no reason. The wire's
+/// absence means the defensive memory clamp
+/// (docs/inferio-worker-protocol.md, measurement fields).
+const CLAMP_REASON_MEMORY: &str = "memory";
 
 /// The throughput knee reached its expiry and was re-widened (or withdrawn)
 /// (run2 change R1d). Owns its strings so the line is formatted after the lock
@@ -1537,6 +1586,15 @@ struct Ingested {
     /// window's batches fail the same way; the count says how many there were.
     oom_evidence: Option<OomEvidence>,
     oom_samples: usize,
+    /// One entry per measurement that ran **smaller than the budget it was
+    /// granted**, carrying that clamp's `reason` (`None` = the defensive
+    /// memory clamp, which is what a worker that names no reason means).
+    ///
+    /// The reasons and not just the count, because a clamp's count alone
+    /// cannot say whether the size will come back: a memory clamp is a
+    /// transient of a busy board, a shape ceiling is permanent for these
+    /// shapes. Rendered for the settle line by [`clamp_log_field`].
+    clamps: Vec<Option<String>>,
 }
 
 /// Whether this board's free reading is worth a live driver query right now.
@@ -4427,6 +4485,8 @@ impl VramLedger {
             deflation: entry.deflation,
             clean_windows: entry.clean_windows,
             max_units_measured: Self::anchor_locked(&state, entry),
+            clamped_samples: ingested.clamps.len(),
+            clamped_reason: clamp_log_field(&ingested.clamps),
         });
         // Keyed off the very `negative_reason` the window's own WARN prints,
         // so the tier line and the negative it explains can never disagree
@@ -4776,6 +4836,12 @@ impl VramLedger {
         // C2). The first is the one named; the count is reported beside it.
         let mut trusted_oom: Option<OomEvidence> = None;
         let mut trusted_ooms = 0usize;
+        // Every clamp this window's measurements reported, for the settle
+        // line. Collected rather than counted because the *reason* is the new
+        // half: two clamps that shrink a batch by the same amount mean
+        // opposite things about whether the size will come back
+        // ([`clamp_log_field`]).
+        let mut clamps: Vec<Option<String>> = Vec::new();
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -4919,14 +4985,21 @@ impl VramLedger {
             //   ([`FULL_BATCH_RATIO`]): a tail, a capped batch, a squeezed
             //   one. It ran at a small size because there was nothing more to
             //   run, which is not evidence about the size;
-            // - a batch the worker's **defensive clamp** shrank. The clamp is
-            //   the last of the three ways a batch runs small for a reason
-            //   that has nothing to do with this model's curve, and it is the
-            //   one the ledger cannot infer: the grant's budget was honest,
-            //   the batch simply could not use it because live free memory had
-            //   moved since (run2 change R1a, finding N1/T1). Its allocator
-            //   peaks still feed the cost fit, which is a statement about
-            //   memory and is true at whatever size ran.
+            // - a batch the worker **clamped**, for either of the two reasons
+            //   it clamps for. The clamp is the last of the three ways a
+            //   batch runs small for a reason that has nothing to do with
+            //   this model's curve, and it is the one the ledger cannot
+            //   infer: the grant's budget was honest, the batch simply could
+            //   not use it — because live free memory had moved since (run2
+            //   change R1a, finding N1/T1), or because the impl's own shape
+            //   ceiling bound first (`clamped.reason = "index_limit"`, run2
+            //   S1). Both are excluded, and by the same test: neither says
+            //   where *this model's* throughput bends. Its allocator peaks
+            //   still feed the cost fit, which is a statement about memory
+            //   and is true at whatever size ran.
+            if let Some(clamp) = &measurement.clamped {
+                clamps.push(clamp.reason.clone());
+            }
             if warm
                 && measurement.clamped.is_none()
                 && let (Some(units), Some(duration_ms), Some(full_batch)) =
@@ -5122,6 +5195,7 @@ impl VramLedger {
             throughput_collapse: saw_collapse,
             oom_evidence: trusted_oom,
             oom_samples: trusted_ooms,
+            clamps,
         }
     }
 
@@ -13707,7 +13781,8 @@ mod tests {
                 clamped: Some(ClampReport {
                     from_units: 8,
                     to_units: 8,
-                    free_mb: 900,
+                    free_mb: Some(900),
+                    reason: None,
                 }),
                 ..warm_batch(8, 500.0)
             },
@@ -13720,6 +13795,85 @@ mod tests {
             ledger.health()[0].workers[0].throughput_samples,
             1,
             "eight of the nine measurements are excluded, each for its own reason"
+        );
+    }
+
+    /// **S1: a batch cut short by a *shape* ceiling is excluded exactly like
+    /// one cut short by memory — and it arrives without a free reading.**
+    ///
+    /// Both clamps mean the same thing to the knee ring: the size this batch
+    /// ran at was not this model's choice, so its rate says nothing about
+    /// where the model's curve bends. What is new is the shape the second one
+    /// arrives in — a shape ceiling is decided by the batch's shapes, so the
+    /// worker emits `free_mb` on it only when it happens to have a reading —
+    /// and the host used to require that key, which silently returned every
+    /// index-limited batch to the ring.
+    #[test]
+    fn an_index_limited_batch_is_excluded_from_the_knee_and_says_so() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle.lock().unwrap().record_measurements(vec![
+            // The impl's shape ceiling, with no live free reading at hand.
+            BatchMeasurement {
+                clamped: Some(ClampReport {
+                    from_units: 8,
+                    to_units: 8,
+                    free_mb: None,
+                    reason: Some("index_limit".to_owned()),
+                }),
+                ..warm_batch(8, 500.0)
+            },
+            // The one that counts.
+            warm_batch(8, 500.0),
+        ]);
+        token.finish(WindowOutcome::Responded { oom: None });
+
+        assert_eq!(
+            ledger.health()[0].workers[0].throughput_samples,
+            1,
+            "an index-limited batch does not describe this model's curve, \
+             whether or not it carried a free reading"
+        );
+    }
+
+    /// The settle line's `clamped` field: the count alone cannot say whether
+    /// the size will come back, so the line names the constraint.
+    ///
+    /// Asserted on the rendering rather than by scraping a subscriber, for
+    /// the same reason [`canvas_log_field`] is (review F8).
+    #[test]
+    fn the_settle_line_names_what_shortened_a_window() {
+        assert_eq!(clamp_log_field(&[]), "none");
+        // Absence is the memory clamp — the protocol pins it, so the host
+        // never infers a reason it was not told.
+        assert_eq!(clamp_log_field(&[None]), "memory");
+        assert_eq!(
+            clamp_log_field(&[Some("index_limit".to_owned())]),
+            "index_limit"
+        );
+        // Deduplicated, so a window of twenty identical clamps is one word,
+        // and first-seen order, so the line is stable.
+        assert_eq!(
+            clamp_log_field(&[
+                Some("index_limit".to_owned()),
+                Some("index_limit".to_owned()),
+                None,
+            ]),
+            "index_limit+memory"
+        );
+        // A reason this host has never heard of is still what it prints: the
+        // whole point of the field is to stop a size being shortened for a
+        // reason nobody can name.
+        assert_eq!(
+            clamp_log_field(&[Some("thermal".to_owned())]),
+            "thermal",
+            "an unrecognised reason is reported, not swallowed"
         );
     }
 

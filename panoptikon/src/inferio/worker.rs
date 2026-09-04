@@ -359,20 +359,48 @@ pub struct LoadReport {
     pub memory: Option<MemorySample>,
 }
 
-/// The worker's defensive clamp, as reported on the batch it shrank.
+/// A batch the worker ran **smaller than its granted budget**, as reported on
+/// the batch it shrank.
 ///
-/// The clamp is shrink-only and runs before every batch: it re-reads live
-/// free memory and packs smaller if the world moved since the grant was
-/// priced. The report is what makes that visible to the ledger, which
-/// otherwise sees a small batch and cannot tell it from a window tail.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Two constraints produce one: the defensive **memory** clamp, which is
+/// shrink-only, runs before every batch, re-reads live free memory and packs
+/// smaller if the world moved since the grant was priced; and an impl's
+/// **shape ceiling** (run2 S1: easyOCR's CRAFT pooling index limit), which is
+/// a permanent property of the model and the shapes in the batch and has
+/// nothing to do with memory. [`Self::reason`] is what tells them apart.
+///
+/// The report is what makes either visible to the ledger, which otherwise
+/// sees a small batch and cannot tell it from a window tail.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClampReport {
     /// The unit count the batch would have carried on the grant alone.
     pub from_units: u64,
     /// What it actually carried after the clamp.
     pub to_units: u64,
-    /// The live free reading that decided it.
-    pub free_mb: u64,
+    /// The live free reading the clamp compared against, when the worker had
+    /// one.
+    ///
+    /// **Optional, and that is not cosmetic.** A memory clamp always has a
+    /// reading — it is the thing that decided — but a shape ceiling is
+    /// decided by the batch's shapes, and the worker emits `free_mb` there
+    /// only when a reading happened to be at hand
+    /// (`inferio_worker/packing.py`: `if free_mb is not None`). Requiring it
+    /// made the host drop the whole report for exactly the clamp that binds
+    /// on every similar batch forever, which silently returned those batches
+    /// to the throughput-knee ring.
+    pub free_mb: Option<u64>,
+    /// What set `to_units`, when the worker named it: `"index_limit"` for an
+    /// impl's shape ceiling. **Absent means the memory clamp** — that is what
+    /// every pre-S1 worker emitted and what the protocol pins
+    /// (docs/inferio-worker-protocol.md, measurement fields), so the value is
+    /// read as reported and never inferred.
+    ///
+    /// Read for the settle log, and deliberately for nothing else yet: both
+    /// clamps mean "this batch's size was not this model's choice", which is
+    /// the whole of what the knee exclusion needs. Acting on the *difference*
+    /// — a shape ceiling is permanent, a memory clamp is a transient of a busy
+    /// board — is the open item recorded in the protocol doc.
+    pub reason: Option<String>,
 }
 
 /// The worker's structural classification of an out-of-memory failure
@@ -2302,10 +2330,15 @@ impl BatchMeasurement {
 }
 
 impl ClampReport {
-    /// `None` unless the map is there and carries all three numbers: a
-    /// partial report cannot say what was clamped from what, and the ledger
+    /// `None` unless the map is there and carries **both unit counts**: they
+    /// are the pair that says what was clamped from what, and the ledger
     /// reads the presence of this map as "exclude this batch", which is too
     /// consequential to infer from a fragment.
+    ///
+    /// `free_mb` is provenance rather than that statement, and the worker
+    /// legitimately omits it on a shape ceiling (see
+    /// [`Self::free_mb`]) — so requiring it would drop a whole class of
+    /// clamp on the floor instead of reading it.
     fn parse(value: Option<&Value>) -> Option<Self> {
         let Value::Map(map) = value? else {
             return None;
@@ -2313,7 +2346,8 @@ impl ClampReport {
         Some(Self {
             from_units: field_u64(map, "from_units")?,
             to_units: field_u64(map, "to_units")?,
-            free_mb: field_u64(map, "free_mb")?,
+            free_mb: field_u64(map, "free_mb"),
+            reason: field_string(map, "reason").filter(|reason| !reason.is_empty()),
         })
     }
 }
@@ -4166,5 +4200,75 @@ mod tests {
             BatchMeasurement::parse_list(Some(&Value::from("measurements"))).is_empty(),
             "a non-array field is no measurements, not a panic"
         );
+    }
+
+    /// **The two clamps, and the one that arrives without a free reading.**
+    ///
+    /// `clamped` says "this batch ran under the budget it was granted", which
+    /// is what excludes it from the throughput-knee ring. Run2 S1 added a
+    /// second producer of it — an impl's shape ceiling — and that one is
+    /// decided by the batch's shapes, so the worker emits `free_mb` on it
+    /// only when a reading happened to be at hand
+    /// (`inferio_worker/packing.py`: `if free_mb is not None`). Requiring all
+    /// three numbers therefore dropped the whole report for exactly the clamp
+    /// that binds again on every similar batch, and returned those batches to
+    /// the knee ring as if nothing had shortened them.
+    #[test]
+    fn a_clamp_is_read_from_its_unit_counts_and_keeps_the_reason_it_names() {
+        let clamp = |fields: Vec<(Value, Value)>| ClampReport::parse(Some(&Value::Map(fields)));
+
+        // The memory clamp: all three numbers, no reason. Absence of a reason
+        // is the protocol's spelling of "the defensive memory clamp", so it
+        // stays absent rather than being filled in here.
+        let memory = clamp(vec![
+            (Value::from("from_units"), Value::from(64u64)),
+            (Value::from("to_units"), Value::from(16u64)),
+            (Value::from("free_mb"), Value::from(900u64)),
+        ])
+        .expect("a whole memory clamp is a clamp");
+        assert_eq!(memory.free_mb, Some(900));
+        assert_eq!(memory.reason, None);
+
+        // The shape ceiling with no live free reading — the shape that used
+        // to parse as `None`, i.e. as no clamp at all.
+        let shape = clamp(vec![
+            (Value::from("from_units"), Value::from(6u64)),
+            (Value::from("to_units"), Value::from(2u64)),
+            (Value::from("reason"), Value::from("index_limit")),
+        ])
+        .expect("a shape ceiling is a clamp even with no free reading");
+        assert_eq!(shape.from_units, 6);
+        assert_eq!(shape.to_units, 2);
+        assert_eq!(shape.free_mb, None);
+        assert_eq!(shape.reason.as_deref(), Some("index_limit"));
+
+        // Both bound the same batch: one map spans them, and `reason` names
+        // the constraint that set `to_units`.
+        let both = clamp(vec![
+            (Value::from("from_units"), Value::from(64u64)),
+            (Value::from("to_units"), Value::from(2u64)),
+            (Value::from("free_mb"), Value::from(8_000u64)),
+            (Value::from("reason"), Value::from("index_limit")),
+        ])
+        .expect("a merged clamp is a clamp");
+        assert_eq!(both.free_mb, Some(8_000));
+        assert_eq!(both.reason.as_deref(), Some("index_limit"));
+
+        // The unit counts are the statement, so a fragment missing either of
+        // them is still not one: the ledger reads this map's presence as
+        // "exclude this batch", which is too consequential to infer.
+        assert!(clamp(vec![(Value::from("to_units"), Value::from(2u64))]).is_none());
+        assert!(clamp(vec![(Value::from("from_units"), Value::from(6u64))]).is_none());
+        assert!(ClampReport::parse(None).is_none());
+        assert!(ClampReport::parse(Some(&Value::from("clamped"))).is_none());
+
+        // An empty reason is no reason, not a reason spelled "".
+        let empty = clamp(vec![
+            (Value::from("from_units"), Value::from(6u64)),
+            (Value::from("to_units"), Value::from(2u64)),
+            (Value::from("reason"), Value::from("")),
+        ])
+        .expect("a clamp with an empty reason is still a clamp");
+        assert_eq!(empty.reason, None);
     }
 }
