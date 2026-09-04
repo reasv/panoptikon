@@ -1338,10 +1338,11 @@ struct OomNegative {
     /// [`OOM_SOURCE_MESSAGE_PATTERN`], or a tier this host does not
     /// recognise), [`OOM_SOURCE_ERROR_FRAME`] when the host classified the
     /// window's error frame, or `unclassified` for a pre-run2 worker's bare
-    /// `oom` flag.
+    /// `oom` flag — and for a worker that sent an empty one ([`named`]).
     source: String,
     /// The exception type the worker named. `unknown` when the classification
-    /// carried none — the error-frame path, and a pre-run2 worker.
+    /// carried none — the error-frame path, a pre-run2 worker, and a worker
+    /// that left the key empty ([`named`]).
     exception: String,
     /// [`OomTrust`], as the log spells it.
     trust: &'static str,
@@ -6495,13 +6496,31 @@ fn oom_verdict(measurement: &BatchMeasurement, window: Option<&GrantCharge>) -> 
     }
 }
 
+/// A wire string as the log may print it, or `fallback` when it is empty.
+///
+/// `oom_class.source` and `oom_class.exception` are required keys
+/// (docs/inferio-worker-protocol.md), but the msgpack decode reads an absent
+/// `exception` as `""` and a present-but-empty `source` stays `""` — and a
+/// `tracing` field with an empty value renders as a bare `source=` that the
+/// protocol's `analyze.py` drops on the floor when it splits the line into
+/// fields. The line whose whole job is to name the tier must not lose the tier
+/// to a worker that under-fills the map, so an empty string is reported as the
+/// same "nothing was stated" sentinel the absent case uses.
+fn named(value: &str, fallback: &'static str) -> String {
+    if value.is_empty() {
+        fallback.to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
 /// What the log says of a measurement whose out-of-memory the ledger believed
 /// (run2 defect C2).
 fn oom_evidence(measurement: &BatchMeasurement, trust: OomTrust) -> OomEvidence {
     match measurement.oom_class.as_ref() {
         Some(class) => OomEvidence {
-            source: class.source.clone(),
-            exception: class.exception.clone(),
+            source: named(&class.source, OOM_SOURCE_UNCLASSIFIED),
+            exception: named(&class.exception, OOM_EXCEPTION_UNKNOWN),
             free_mb_at_failure: class.free_mb_at_failure,
             trust,
         },
@@ -14335,6 +14354,48 @@ mod tests {
         assert_eq!(oom.exception, "unknown");
         assert_eq!(oom.trust, "trusted");
         assert_eq!(oom.oom_samples, 1);
+    }
+
+    /// A worker that sends the `oom_class` map with its two required strings
+    /// left empty. `tracing` renders an empty field as a bare `source=`, and
+    /// the protocol's `analyze.py` splits a line into fields by looking for a
+    /// non-space value — so an empty tier does not read as "empty", it
+    /// **vanishes** from the parsed line, which is the one thing this line
+    /// exists to prevent. Report the same sentinel the absent case uses.
+    #[test]
+    fn a_tier_stated_as_an_empty_string_still_names_something() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                oom: true,
+                oom_class: Some(OomClass {
+                    source: String::new(),
+                    exception: String::new(),
+                    free_mb_at_failure: None,
+                    device: String::new(),
+                }),
+                ..measurement(4, 0, 900)
+            }]);
+        let settled = token.finish_for_test(WindowOutcome::Responded { oom: None });
+        let oom = settled.oom.expect("an unrecognised tier is still believed");
+        assert_eq!(
+            oom.source, OOM_SOURCE_UNCLASSIFIED,
+            "never the empty string"
+        );
+        assert_eq!(oom.exception, "unknown");
+        assert_eq!(
+            oom.trust, "trusted",
+            "an unrecognised tier is trusted, and the empty one is one of those"
+        );
+        assert_eq!(ledger.health()[0].workers[0].deflation, 1);
     }
 
     /// End to end: warm windows fit a knee, the knee caps the grant, and it
