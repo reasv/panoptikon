@@ -227,6 +227,20 @@ pub struct LoadPolicy {
     pub cooldown_max: Duration,
 }
 
+/// Ceiling on the configured cooldown seconds ([`LoadPolicy::cooldown_base`]
+/// and [`LoadPolicy::cooldown_max`]).
+///
+/// `Instant + Duration` **panics** on overflow, and the cooldown does that
+/// twice over: once to turn a window into a deadline
+/// ([`LoadCooldowns::note_failure`]) and once to decide when to forget the
+/// history ([`LoadCooldowns::prune`], which adds `cooldown_max` on top of a
+/// deadline). Both run under the state mutex — on the sweeper tick, among
+/// other places — so an unrepresentable configured value would not merely
+/// misbehave, it would poison the manager. A cooldown longer than a year
+/// outlives any process it could apply to, so clamping there is a distinction
+/// no operator can observe.
+const MAX_COOLDOWN_SECS: u64 = 366 * 24 * 60 * 60;
+
 impl Default for LoadPolicy {
     fn default() -> Self {
         Self {
@@ -241,8 +255,12 @@ impl From<&crate::config::InferenceLocalConfig> for LoadPolicy {
     fn from(local: &crate::config::InferenceLocalConfig) -> Self {
         Self {
             max_concurrent_loads: local.max_concurrent_loads,
-            cooldown_base: Duration::from_secs(local.load_failure_cooldown_secs),
-            cooldown_max: Duration::from_secs(local.load_failure_cooldown_max_secs),
+            cooldown_base: Duration::from_secs(
+                local.load_failure_cooldown_secs.min(MAX_COOLDOWN_SECS),
+            ),
+            cooldown_max: Duration::from_secs(
+                local.load_failure_cooldown_max_secs.min(MAX_COOLDOWN_SECS),
+            ),
         }
     }
 }
@@ -398,14 +416,26 @@ impl LoadCooldowns {
             });
         entry.failures = entry.failures.saturating_add(1);
         entry.last_error = clamp_cooldown_error(error);
-        // `failures - 1` doublings, clamped well below the point where the
-        // multiplication could overflow — the cap bites long before.
-        let doublings = (entry.failures - 1).min(32);
+        // `failures - 1` doublings, clamped at the widest shift a `u32` can
+        // represent. 32 would not be one: `1u32 << 32` is an overflowing
+        // shift, which panics where overflow checks are on and *wraps to 1*
+        // where they are not — silently dropping the window back to
+        // `cooldown_base` from the 33rd consecutive failure onwards, i.e.
+        // handing finding B15 its hammering back after a couple of hours of
+        // a model that will not load. 31 doublings already put every
+        // realistic base far past any realistic cap, and `checked_mul`
+        // catches the rest.
+        let doublings = (entry.failures - 1).min(31);
         let window = policy
             .cooldown_base
             .checked_mul(1u32 << doublings)
             .unwrap_or(policy.cooldown_max)
-            .min(policy.cooldown_max);
+            .min(policy.cooldown_max)
+            // Same reason as [`MAX_COOLDOWN_SECS`], applied to the window
+            // itself so this holds for a hand-built [`LoadPolicy`] too: the
+            // deadline below is an `Instant + Duration`, which panics rather
+            // than saturates.
+            .min(Duration::from_secs(MAX_COOLDOWN_SECS));
         entry.window = window;
         entry.until = now + window;
         Some(window)
@@ -431,9 +461,20 @@ impl LoadCooldowns {
     /// again), and the keys come off the URL, so a map that only ever grew
     /// would be an unbounded allocation any client could drive with one
     /// failing load per made-up id.
+    ///
+    /// `checked_add` rather than `+`: `Instant + Duration` panics on
+    /// overflow, this runs under the state mutex on every sweeper tick, and a
+    /// forget-time too far away to represent means "not yet" — the direction
+    /// that keeps the counter rather than the one that loses it.
+    /// [`MAX_COOLDOWN_SECS`] already makes that unreachable from config; this
+    /// keeps the function total for any [`LoadPolicy`] at all.
     fn prune(&mut self, policy: &LoadPolicy, now: Instant) {
-        self.entries
-            .retain(|_, entry| entry.until + policy.cooldown_max > now);
+        self.entries.retain(|_, entry| {
+            entry
+                .until
+                .checked_add(policy.cooldown_max)
+                .is_none_or(|forget_at| forget_at > now)
+        });
     }
 }
 
@@ -4807,6 +4848,66 @@ config.replicas = 2
             cooldowns.active("g/b", now).is_none(),
             "other models untouched"
         );
+    }
+
+    /// The cap is a *floor* on the wait once it is reached: the window must
+    /// never come back down, however long the model stays broken.
+    ///
+    /// The regression this pins: `1u32 << doublings` with `doublings` clamped
+    /// at 32 is an overflowing shift, so the 33rd consecutive failure dropped
+    /// the window from 300 s straight back to the 2 s base — and every
+    /// failure after it. At the shipped ladder a model that keeps failing
+    /// reaches 33 in under three hours, which is exactly how a run long
+    /// enough to matter got finding B15's hammering back.
+    #[test]
+    fn the_cooldown_window_never_falls_back_off_the_cap() {
+        let policy = LoadPolicy::default();
+        let mut cooldowns = LoadCooldowns::default();
+        let now = Instant::now();
+        // Well past both the cap (9 failures) and the shift width (33).
+        for failure in 1..=64u32 {
+            let window = cooldowns
+                .note_failure("g/a", "boom", &policy, now)
+                .expect("cooldowns are enabled");
+            assert!(
+                window >= policy.cooldown_base && window <= policy.cooldown_max,
+                "failure {failure} armed a {window:?} window, outside [base, max]"
+            );
+            if failure >= 9 {
+                assert_eq!(
+                    window, policy.cooldown_max,
+                    "failure {failure} must still be at the cap"
+                );
+            }
+        }
+        assert_eq!(cooldowns.entries["g/a"].failures, 64);
+    }
+
+    /// Neither the deadline nor the pruning may overflow the monotonic clock,
+    /// whatever the operator wrote in the TOML. `Instant + Duration` panics,
+    /// and both additions run under the state mutex — a panic there would
+    /// poison the manager, not just lose a cooldown.
+    #[test]
+    fn an_absurd_configured_cooldown_is_clamped_rather_than_overflowing() {
+        let local = crate::config::InferenceLocalConfig {
+            load_failure_cooldown_secs: u64::MAX,
+            load_failure_cooldown_max_secs: u64::MAX,
+            ..Default::default()
+        };
+        let policy = LoadPolicy::from(&local);
+        assert_eq!(policy.cooldown_base.as_secs(), MAX_COOLDOWN_SECS);
+        assert_eq!(policy.cooldown_max.as_secs(), MAX_COOLDOWN_SECS);
+
+        let mut cooldowns = LoadCooldowns::default();
+        let now = Instant::now();
+        let window = cooldowns
+            .note_failure("g/a", "boom", &policy, now)
+            .expect("cooldowns are enabled");
+        assert_eq!(window.as_secs(), MAX_COOLDOWN_SECS);
+        assert!(cooldowns.active("g/a", now).is_some());
+        // The `until + cooldown_max` a year past a deadline a year out.
+        cooldowns.prune(&policy, now);
+        assert_eq!(cooldowns.entries.len(), 1, "nowhere near forgettable yet");
     }
 
     /// A successful load clears the ladder, and a zero base disables it.
