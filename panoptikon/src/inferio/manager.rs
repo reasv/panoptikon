@@ -515,6 +515,15 @@ pub struct HealthReport {
     /// is pruned; `retry_after_secs` is 0 for one that has cooled down but is
     /// still counting (the next failure waits twice as long).
     pub load_cooldowns: Vec<LoadCooldownHealth>,
+    /// The inference **client** side: one entry per endpoint this process
+    /// holds a client for, sorted by base URL. Empty on a node that only
+    /// serves inference (`panoptikon inferio`), which has no client — and on a
+    /// gateway that has not yet talked to its endpoints.
+    ///
+    /// The models above describe what the orchestrator wants; this describes
+    /// what the transport under it will actually carry. Run2's S1 was
+    /// precisely a disagreement between the two that neither half could see.
+    pub inference_clients: Vec<crate::inferio_client::InferenceTransportHealth>,
 }
 
 /// One model's load-failure cooldown in the [`HealthReport`] (R9). This is
@@ -559,10 +568,27 @@ pub struct ModelHealth {
     /// Inputs in the most recently dispatched window; `null` until the first
     /// window dispatches. This is what a user cap bounds on the unpriced path.
     pub last_window_items: Option<u32>,
+    /// Items the orchestrator is asking callers to keep inside their
+    /// in-flight predict requests for this model — the same figure the
+    /// `x-panoptikon-desired-in-flight-items` response header carries
+    /// (`dispatch.rs`, `desired_in_flight_items`). `null` until a window has
+    /// been formed.
+    ///
+    /// It is here because it was *not*: run2's S1 had to reconstruct this
+    /// column arithmetically from `ramp_step`, `unit_budget` and
+    /// `max_units_measured` in the logs, because the one number that crosses
+    /// the core/orchestrator boundary was visible on neither side. With it,
+    /// "the server asked for 1 632 and the job delivered 200" is a two-field
+    /// comparison instead of a phase of analysis.
+    pub desired_in_flight_items: Option<u64>,
     /// Predict requests ever queued on this model's dispatcher.
     pub total_predict_requests: u64,
     /// Windows ever dispatched to a replica.
     pub total_batches: u64,
+    /// Of those, the ones formed short of the unit budget the ledger allowed:
+    /// the queue, not the board, decided their size. A ramp that is not
+    /// advancing while this climbs is being starved, not squeezed.
+    pub queue_bound_windows: u64,
     /// Cost dimension resolved from registry metadata at load time
     /// (batch-calibration step 1a).
     pub cost: CostHealth,
@@ -592,6 +618,18 @@ pub struct CostHealth {
     /// True when the registry declared nothing usable and the conservative
     /// `(item, count)` fallback is in force.
     pub degraded: bool,
+    /// The per-item **pixel canvas** this model's inputs are priced against
+    /// (`metadata.cost.canvas_pixels`, or a canvas filled in from the model's
+    /// own load report), or `null` for uncapped. Only `pixel`-priced models
+    /// ever carry one.
+    ///
+    /// It is the difference between a grant that means what the operator
+    /// thinks it means and one that does not: under a canvas the worker
+    /// prices every input at `min(raw_pixels, canvas_pixels)`, so the same
+    /// `last_grant_units` describes a very different batch depending on
+    /// whether a canvas is in force — and the *effective* canvas may be one
+    /// the registry never stated.
+    pub canvas_pixels: Option<u32>,
 }
 
 impl From<CostDimension> for CostHealth {
@@ -602,6 +640,7 @@ impl From<CostDimension> for CostHealth {
             epoch: cost.epoch,
             seed_units: cost.seed_units,
             degraded: cost.degraded,
+            canvas_pixels: cost.canvas_pixels,
         }
     }
 }
@@ -1477,8 +1516,14 @@ impl ModelManager {
                         0 => None,
                         items => Some(items),
                     },
+                    desired_in_flight_items: match stats.desired_in_flight_items.load(Relaxed) {
+                        // 0 = not computed yet (nothing dispatched).
+                        0 => None,
+                        items => Some(items),
+                    },
                     total_predict_requests: stats.total_predict_requests.load(Relaxed),
                     total_batches: stats.total_batches.load(Relaxed),
+                    queue_bound_windows: stats.queue_bound_windows.load(Relaxed),
                     cost: handle.cost.into(),
                     replicas_detail: handle
                         .telemetry
@@ -1533,6 +1578,7 @@ impl ModelManager {
                 .unwrap_or_default(),
             vram,
             load_cooldowns,
+            inference_clients: crate::inferio_client::endpoint_health(),
         }
     }
 

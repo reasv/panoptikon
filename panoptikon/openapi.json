@@ -6586,6 +6586,15 @@
             ],
             "description": "`count` | `sum` | `max-times-count`; absent for the `none` class."
           },
+          "canvas_pixels": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The per-item **pixel canvas** this model's inputs are priced against\n(`metadata.cost.canvas_pixels`, or a canvas filled in from the model's\nown load report), or `null` for uncapped. Only `pixel`-priced models\never carry one.\n\nIt is the difference between a grant that means what the operator\nthinks it means and one that does not: under a canvas the worker\nprices every input at `min(raw_pixels, canvas_pixels)`, so the same\n`last_grant_units` describes a very different batch depending on\nwhether a canvas is in force — and the *effective* canvas may be one\nthe registry never stated.",
+            "minimum": 0
+          },
           "degraded": {
             "type": "boolean",
             "description": "True when the registry declared nothing usable and the conservative\n`(item, count)` fallback is in force."
@@ -7962,7 +7971,8 @@
           "prewarm",
           "gpus",
           "vram",
-          "load_cooldowns"
+          "load_cooldowns",
+          "inference_clients"
         ],
         "properties": {
           "gpus": {
@@ -7971,6 +7981,13 @@
               "$ref": "#/components/schemas/GpuInfo"
             },
             "description": "Visible GPUs by board UUID (batch-calibration step 1a); empty when\nthe host has no GPU inventory, in which case workers are not pinned."
+          },
+          "inference_clients": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InferenceTransportHealth"
+            },
+            "description": "The inference **client** side: one entry per endpoint this process\nholds a client for, sorted by base URL. Empty on a node that only\nserves inference (`panoptikon inferio`), which has no client — and on a\ngateway that has not yet talked to its endpoints.\n\nThe models above describe what the orchestrator wants; this describes\nwhat the transport under it will actually carry. Run2's S1 was\nprecisely a disagreement between the two that neither half could see."
           },
           "load_cooldowns": {
             "type": "array",
@@ -8201,6 +8218,52 @@
               "$ref": "#/components/schemas/BinaryBlob"
             },
             "description": "Binary batch inputs. Each part's *filename* must be the integer\nindex of the `inputs` entry it attaches to."
+          }
+        }
+      },
+      "InferenceTransportHealth": {
+        "type": "object",
+        "description": "What one inference endpoint's client is doing right now, for `/health`.\n\nIt exists because run2's S1 could not be diagnosed from `/health` at all:\nthe transport in force, the connections it was really using and the\nconcurrency it was really allowing were each either absent or, in the one\nlog line that mentioned them, wrong. Everything here is a *measured*\nquantity, not a constant restated.",
+        "required": [
+          "base_url",
+          "transport",
+          "max_concurrent_requests",
+          "in_flight_requests"
+        ],
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "description": "The endpoint this describes."
+          },
+          "connections_in_use": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Of those, how many are carrying at least one request right now — the\nsockets actually in use. `null` under HTTP/1.1.",
+            "minimum": 0
+          },
+          "in_flight_requests": {
+            "type": "integer",
+            "description": "Of those, how many are in flight right now.",
+            "minimum": 0
+          },
+          "max_concurrent_requests": {
+            "type": "integer",
+            "description": "Requests the gate currently admits. Under h2c this follows the\nendpoint's own published desired-in-flight figure between a floor and\na ceiling; under HTTP/1.1 it is fixed.",
+            "minimum": 0
+          },
+          "pool_connections": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Independent connections this client may hold to the endpoint; `null`\nunder HTTP/1.1, where a connection is a request rather than a pool\nslot.",
+            "minimum": 0
+          },
+          "transport": {
+            "type": "string",
+            "description": "`h2c` | `http/1.1` | `unknown` (nothing has talked to it yet, so the\njob-side descriptor budget reads it as the conservative HTTP/1.1\ncase)."
           }
         }
       },
@@ -9960,6 +10023,7 @@
           "in_flight_windows",
           "total_predict_requests",
           "total_batches",
+          "queue_bound_windows",
           "cost",
           "replicas_detail"
         ],
@@ -9974,6 +10038,15 @@
           "cost": {
             "$ref": "#/components/schemas/CostHealth",
             "description": "Cost dimension resolved from registry metadata at load time\n(batch-calibration step 1a)."
+          },
+          "desired_in_flight_items": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Items the orchestrator is asking callers to keep inside their\nin-flight predict requests for this model — the same figure the\n`x-panoptikon-desired-in-flight-items` response header carries\n(`dispatch.rs`, `desired_in_flight_items`). `null` until a window has\nbeen formed.\n\nIt is here because it was *not*: run2's S1 had to reconstruct this\ncolumn arithmetically from `ramp_step`, `unit_budget` and\n`max_units_measured` in the logs, because the one number that crosses\nthe core/orchestrator boundary was visible on neither side. With it,\n\"the server asked for 1 632 and the job delivered 200\" is a two-field\ncomparison instead of a phase of analysis.",
+            "minimum": 0
           },
           "generation": {
             "type": "integer",
@@ -10005,6 +10078,12 @@
             ],
             "format": "int32",
             "description": "Inputs in the most recently dispatched window; `null` until the first\nwindow dispatches. This is what a user cap bounds on the unpriced path.",
+            "minimum": 0
+          },
+          "queue_bound_windows": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Of those, the ones formed short of the unit budget the ledger allowed:\nthe queue, not the board, decided their size. A ramp that is not\nadvancing while this climbs is being starved, not squeezed.",
             "minimum": 0
           },
           "queue_depth": {

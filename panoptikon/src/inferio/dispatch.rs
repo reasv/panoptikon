@@ -206,6 +206,20 @@ pub(crate) struct ModelStats {
     /// worker `predict` frames: per-request fallback retries and
     /// oversized-request sub-batches stay within their window's count.
     pub total_batches: AtomicU64,
+    /// Of those, the ones formed **short of the unit budget the ledger
+    /// allowed** — the queue, not the board, decided their size.
+    ///
+    /// It is the one number that separates "this model is memory-bound" from
+    /// "this model is starved", and its absence is why run2's S1 took a phase
+    /// to diagnose rather than a log read: the ledger already computed the
+    /// comparison (`wanted < capped` in `request_grant`) and threw it away.
+    /// A ramp that is not advancing while this keeps climbing is being
+    /// starved by its caller or its transport, and no amount of freed VRAM
+    /// will move it.
+    ///
+    /// Priced windows only; the unpriced path has no unit budget to fall
+    /// short of.
+    pub queue_bound_windows: AtomicU64,
 }
 
 /// One queued predict: the request's inputs, its optional user cap, and the
@@ -984,6 +998,13 @@ pub(crate) async fn run_dispatcher(
                 .store(u32::try_from(window_items).unwrap_or(u32::MAX), Relaxed);
             ctx.stats.desired_in_flight_items.store(desired, Relaxed);
             ctx.stats.total_batches.fetch_add(1, Relaxed);
+            // Queue-bound: the window carries less than the ledger would have
+            // admitted, so what limited it was the work in hand. After the
+            // settle above this is a real signal rather than an artefact of
+            // looking too early.
+            if window_target.is_some() && window_units < bounds.units {
+                ctx.stats.queue_bound_windows.fetch_add(1, Relaxed);
+            }
             ctx.stats.in_flight_windows.fetch_add(1, Relaxed);
             let inference_id = ctx.inference_id.clone();
             in_flight.spawn(async move { run_batch(&inference_id, replica, window, plan).await });
@@ -2828,6 +2849,14 @@ mod tests {
         let requests = stats.total_predict_requests.load(Relaxed);
         let batches = stats.total_batches.load(Relaxed);
         let mean = requests as f64 / batches as f64;
+        // The `/health` diagnostic, on the case it exists for: a caller of
+        // depth 16 against a window target of at least 24 units is *starved*,
+        // not squeezed, on every single window — and now says so.
+        assert_eq!(
+            stats.queue_bound_windows.load(Relaxed),
+            batches,
+            "every window here is short of the budget the ledger allowed"
+        );
         assert!(
             mean >= 0.8 * DEPTH as f64,
             "mean window of {mean:.1} requests over {batches} windows for a \

@@ -559,6 +559,87 @@ impl EndpointRuntime {
             drop(permit);
         }
     }
+
+    /// The gate's current target and how many of it are in use, for
+    /// `/health`.
+    fn gate_snapshot(&self, transport: Option<Transport>) -> (usize, usize) {
+        match transport {
+            Some(Transport::Http11) => (
+                INFERENCE_MAX_CONCURRENT_REQUESTS,
+                INFERENCE_MAX_CONCURRENT_REQUESTS.saturating_sub(self.h1_gate.available_permits()),
+            ),
+            _ => {
+                let target = self
+                    .h2_gate_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .target;
+                (
+                    target,
+                    target.saturating_sub(self.h2_gate.available_permits()),
+                )
+            }
+        }
+    }
+
+    /// What this endpoint is doing right now, for `/health`.
+    fn health(&self, base_url: &str) -> InferenceTransportHealth {
+        let transport = self.transport.try_read().ok().and_then(|guard| *guard);
+        let (target, in_flight) = self.gate_snapshot(transport);
+        let multiplexed = !matches!(transport, Some(Transport::Http11));
+        InferenceTransportHealth {
+            base_url: base_url.to_owned(),
+            transport: match transport {
+                Some(Transport::H2c) => "h2c",
+                Some(Transport::Http11) => "http/1.1",
+                None => "unknown",
+            }
+            .to_owned(),
+            pool_connections: multiplexed.then_some(INFERENCE_CONNECTION_LANES),
+            connections_in_use: multiplexed.then(|| self.lanes_in_use()),
+            max_concurrent_requests: target,
+            in_flight_requests: in_flight,
+        }
+    }
+
+    /// Lanes currently carrying at least one request — the number of sockets
+    /// this endpoint is actually using, for `/health`.
+    fn lanes_in_use(&self) -> usize {
+        self.h2
+            .iter()
+            .filter(|lane| lane.in_flight.load(Relaxed) > 0)
+            .count()
+    }
+}
+
+/// What one inference endpoint's client is doing right now, for `/health`.
+///
+/// It exists because run2's S1 could not be diagnosed from `/health` at all:
+/// the transport in force, the connections it was really using and the
+/// concurrency it was really allowing were each either absent or, in the one
+/// log line that mentioned them, wrong. Everything here is a *measured*
+/// quantity, not a constant restated.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct InferenceTransportHealth {
+    /// The endpoint this describes.
+    pub base_url: String,
+    /// `h2c` | `http/1.1` | `unknown` (nothing has talked to it yet, so the
+    /// job-side descriptor budget reads it as the conservative HTTP/1.1
+    /// case).
+    pub transport: String,
+    /// Independent connections this client may hold to the endpoint; `null`
+    /// under HTTP/1.1, where a connection is a request rather than a pool
+    /// slot.
+    pub pool_connections: Option<usize>,
+    /// Of those, how many are carrying at least one request right now — the
+    /// sockets actually in use. `null` under HTTP/1.1.
+    pub connections_in_use: Option<usize>,
+    /// Requests the gate currently admits. Under h2c this follows the
+    /// endpoint's own published desired-in-flight figure between a floor and
+    /// a ceiling; under HTTP/1.1 it is fixed.
+    pub max_concurrent_requests: usize,
+    /// Of those, how many are in flight right now.
+    pub in_flight_requests: usize,
 }
 
 /// One admitted request's claim on an endpoint: the gate permit it holds and
@@ -650,6 +731,37 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
     });
     guard.insert(base_url.to_string(), Arc::clone(&runtime));
     Ok(runtime)
+}
+
+/// Every inference endpoint this process holds a client for, for `/health`.
+///
+/// Read off the shared endpoint registry rather than off any one pool, so the
+/// report covers the job pool, the PQL path and the preload loop alike — they
+/// are all the same runtime per base URL, which is the whole point of the
+/// registry. Empty on a node that only *serves* inference (`panoptikon
+/// inferio`), which is correct: it has no client.
+///
+/// The registry mutex is taken normally — it is a `std::sync::Mutex` held for
+/// the few instructions it takes to look up or insert a runtime, never across
+/// an await — but each endpoint's *transport* is read with `try_read`: a
+/// health probe must never wait on a transport probe that is mid-flight, so an
+/// endpoint being resolved right now reports `unknown` rather than delaying
+/// the report. (`try_lock` on the registry was tried first and is wrong: under
+/// any concurrent client construction it reports an empty client section,
+/// which is exactly the kind of silently-absent number S1 was about.)
+pub(crate) fn endpoint_health() -> Vec<InferenceTransportHealth> {
+    let Some(registry) = ENDPOINTS.get() else {
+        return Vec::new();
+    };
+    let guard = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut endpoints: Vec<InferenceTransportHealth> = guard
+        .iter()
+        .map(|(base_url, runtime)| runtime.health(base_url))
+        .collect();
+    endpoints.sort_by(|a, b| a.base_url.cmp(&b.base_url));
+    endpoints
 }
 
 #[derive(Debug, Clone)]

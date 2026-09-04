@@ -2602,10 +2602,44 @@ metadata.description = "batch size reporter"
             "no window dispatched yet -> null on the wire"
         );
         assert_eq!(model.last_window_items, None);
+        assert_eq!(
+            model.desired_in_flight_items, None,
+            "no window dispatched yet -> no figure published yet"
+        );
+        assert_eq!(model.queue_bound_windows, 0);
         assert!(
             health.vram.is_empty(),
             "an unknown GPU inventory means an empty ledger and no admission"
         );
+
+        // **S1: the client side is reported too.** The endpoint the real
+        // client above just used is in the registry, with the transport it
+        // resolved, the connections it may hold and the concurrency its gate
+        // currently admits. Every one of these was invisible during run2's S1,
+        // and the one log line that named any of them named the wrong number.
+        let endpoint = health
+            .inference_clients
+            .iter()
+            .find(|entry| entry.base_url.starts_with(&base_url))
+            .expect("the endpoint the test client used is reported");
+        assert_eq!(
+            endpoint.transport, "h2c",
+            "the serve loop speaks HTTP/2 cleartext with prior knowledge"
+        );
+        assert_eq!(
+            endpoint.pool_connections,
+            Some(crate::inferio_client::INFERENCE_CONNECTION_LANES)
+        );
+        assert_eq!(
+            endpoint.max_concurrent_requests,
+            crate::inferio_client::INFERENCE_MAX_CONCURRENT_REQUESTS,
+            "no figure published yet, so the gate sits at its floor"
+        );
+        assert_eq!(
+            endpoint.in_flight_requests, 0,
+            "nothing is in flight while the health probe is being answered"
+        );
+        assert_eq!(endpoint.connections_in_use, Some(0));
 
         // Standalone (subcommand) mounting: bare /health, same handler.
         let standalone = standalone_router(Arc::clone(&state));
@@ -3048,6 +3082,43 @@ metadata.cost.unit = "none"
     /// detail must carry the cause out of the source chain, or the next one
     /// is as undiagnosable as this one was.
     ///
+    /// `/health` names the **effective** pixel canvas a model's grants are
+    /// priced under.
+    ///
+    /// Without it `last_grant_units` is ambiguous: under a canvas the worker
+    /// prices every input at `min(raw_pixels, canvas_pixels)`, so the same
+    /// unit budget describes a very different batch depending on whether one
+    /// is in force — and the canvas that *is* in force may be one the registry
+    /// never stated (a model whose canvas is knowable only from its own load
+    /// report has it filled in at spawn).
+    #[test]
+    fn the_health_cost_section_names_the_effective_canvas() {
+        use super::super::cost::{CostAggregation, CostDimension, CostUnit};
+        use super::super::manager::CostHealth;
+
+        let uncapped = CostDimension {
+            unit: CostUnit::Item,
+            aggregation: Some(CostAggregation::Count),
+            epoch: 1,
+            seed_units: Some(8),
+            degraded: false,
+            canvas_pixels: None,
+        };
+        assert_eq!(CostHealth::from(uncapped).canvas_pixels, None);
+
+        let canvassed = CostDimension {
+            unit: CostUnit::Pixel,
+            aggregation: Some(CostAggregation::Sum),
+            canvas_pixels: Some(1_835_008),
+            ..uncapped
+        };
+        assert_eq!(
+            CostHealth::from(canvassed).canvas_pixels,
+            Some(1_835_008),
+            "the canvas the grants are actually priced under"
+        );
+    }
+
     /// The predict route's body ceiling: a whole body that is too big is
     /// neither "malformed" nor "never arrived" but its own answer — `413`,
     /// naming the limit — so a caller learns to send a smaller batch instead
