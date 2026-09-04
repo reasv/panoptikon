@@ -477,6 +477,38 @@ def test_the_tiebreaker_is_ignored_where_it_cannot_apply():
     ]
 
 
+def test_the_tiebreak_only_ever_changes_the_order():
+    """The property the tiebreaker has to have, checked by exhaustion rather
+    than by example: over randomised windows it never changes how many
+    batches there are, what each one costs, or which prices each one holds —
+    only *which* of the equally-priced items land together. And it never
+    reorders across a price: the plan is still descending by units end to
+    end, which is what the budget arithmetic depends on."""
+    random = __import__("random").Random(7)
+    for _ in range(2000):
+        count = random.randint(1, 12)
+        units = [random.choice([10, 10, 10, 25, 25, 40]) for _ in range(count)]
+        tiebreak = [random.randint(1, 1000) for _ in range(count)]
+        budget = random.randint(10, 200)
+        cap = random.choice([None, 2, 3, 5])
+        plain = packing.plan_batches(units, "max-times-count", budget, cap)
+        broken = packing.plan_batches(
+            units, "max-times-count", budget, cap, tiebreak=tiebreak
+        )
+        assert [len(batch) for batch in plain] == [
+            len(batch) for batch in broken
+        ]
+        for before, after in zip(plain, broken):
+            assert packing.batch_units(
+                before, units, "max-times-count"
+            ) == packing.batch_units(after, units, "max-times-count")
+            assert sorted(units[i] for i in before) == sorted(
+                units[i] for i in after
+            )
+        flat = [units[i] for batch in broken for i in batch]
+        assert flat == sorted(flat, reverse=True)
+
+
 def test_a_capped_window_buckets_size_homogeneously(fake_torch):
     """End to end through `run_window`: the batches an impl that pads to a
     common size is handed hold one raw size each, so its tensor is the size
