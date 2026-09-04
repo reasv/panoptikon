@@ -649,6 +649,36 @@ A measurement map describes one GPU batch the worker actually ran:
 | `free_mb_at_failure` | free memory on the worker's board, read at the moment of the failure. `null` when nothing could be read. This is the corroboration a `message_pattern` classification needs before the orchestrator deflates on it: an out-of-memory claim made while the board has tens of GB free is a wording, not a condition |
 | `device` | which device the two memory figures describe, as `"<backend>"` or `"<backend>:<board uuid>"` (`"cuda:GPU-1234…"`, `"rocm"`, `"mps"`, `"cpu"`, `"unknown"`). It exists so a reading can never be attributed to the wrong board on a multi-GPU host |
 
+**What the orchestrator does with the three run2 measurement fields**
+(`panoptikon/src/inferio/ledger.rs`; the worker's side of each is above and
+none of this changes what it sends):
+
+- **`free_mb` / `free_source`** are folded into the board's freshest free
+  reading exactly as a memory sample's are, and under exactly the same rules:
+  a source that is not the board's own authoritative one is dropped (NVML and
+  `mem_get_info` disagree by gigabytes, and alternating them swings the
+  external term for no physical reason), a reading captured before a resident
+  left the board is refused rather than allowed to undo that departure's
+  credit, and the response's own `total_mb` is the currency check on all of
+  them together. Within one response the readings are applied in measurement
+  order and the response-level `memory` sample last, because that is the
+  order the worker took them: each `free_mb` is a *pre*-batch reading and
+  `memory` is taken after the final batch. The effect is that `external_mb`
+  and every grant priced against it now follow the world at response cadence
+  rather than at the window boundary (run1 finding T3 measured it ageing to
+  166.9 s). A window that ended in an OOM contributes its readings too — the
+  reading describes the board, not the batch's outcome.
+- **`clamped`** excludes that batch from the **throughput-knee** series and
+  from nothing else. A clamped batch ran at the size live free memory allowed
+  rather than the size the model was free to reach, so its rate is not
+  evidence about where this model's throughput curve bends; its allocator
+  peaks are still honest and still feed the cost fit. The orchestrator reads
+  only the *presence* of the map — `from_units`/`to_units`/`free_mb` are
+  operator-facing provenance.
+- **`oom_class`** rides alongside the `oom` flag the deflation path already
+  keys on. Its absence beside a failure means the worker saw no out-of-memory
+  condition, and the orchestrator does not deflate on such a failure.
+
 **`units` is reported only when the batch ran to completion and the executed
 GPU batch matches the planned batch.** The number exists so the orchestrator can
 regress allocator peaks against batch size, which requires the peaks and the size

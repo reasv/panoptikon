@@ -97,7 +97,38 @@ use super::worker::{LoadReport, TelemetryHandle};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
 /// `usable = total − other_used × (1 + margin)`.
+///
+/// This is what applies when the user has set **no** margin, and in that case
+/// the reserve it produces is additionally capped at
+/// [`DEFAULT_RESERVE_CAP_MB`] (run2 change R5). A margin the user *did* set is
+/// honoured verbatim, uncapped: they are describing their own machine.
 pub const DEFAULT_MARGIN: f64 = 0.10;
+
+/// Ceiling on the VRAM the **default** margin may withhold from the admission
+/// budget (run2 change R5; findings P5-2 / T4).
+///
+/// The margin exists so a desktop user's own variable VRAM use does not spill
+/// into ours. As a pure fraction of external usage that intent inverts on a
+/// busy board: run1 measured `limit_mb` of 2 813 at 10 GB free and **0** at
+/// 4 GB free, because `external × 1.1` reaches `total` once external passes
+/// `total / 1.1` — the last ~9.8 GB of a 97 GB board was unusable, and below
+/// it grants went memory-blind (`mb = 0`), which is the state that admits
+/// batches priced against nothing.
+///
+/// So the default rule reserves `min(external × margin, this)` and the budget
+/// is `total − external − reserve`. 1 GiB is the size of the thing being
+/// protected against: a desktop's own churn between two of our windows is a
+/// browser tab compositing, a game loading a shader cache, a second CUDA
+/// process's context — hundreds of MiB, not tens of gigabytes, and the
+/// worker's own per-batch defensive clamp (which re-reads live free memory
+/// before every batch, measured at 0.60–2.81 s of freshness in run1) is what
+/// actually catches a bigger move. A whole gigabyte of standing reserve is
+/// generous against that, and it is bounded, which the fraction was not.
+///
+/// It does **not** apply to a margin the user configured. That number is a
+/// statement about their machine, and silently capping it would be the
+/// ledger overruling the one person who knows.
+pub const DEFAULT_RESERVE_CAP_MB: u64 = 1024;
 
 /// Expected base charged for a load whose footprint nobody has measured yet
 /// and no profile knows (a fresh install, or a first load whose negotiated
@@ -437,7 +468,15 @@ const MAX_RAMP_STEP: u32 = 32;
 pub struct VramBudget {
     /// Margin over genuinely external usage. Our own workers are never
     /// margin-inflated — their footprints are measured, not guessed.
-    pub margin: f64,
+    ///
+    /// `None` means the user set nothing, which is **not** the same as setting
+    /// [`DEFAULT_MARGIN`] (run2 change R5): an unset margin gets the default
+    /// fraction *and* the [`DEFAULT_RESERVE_CAP_MB`] ceiling on what it may
+    /// withhold, while a margin the user wrote down is honoured exactly as
+    /// written, however much of the board it costs. The two have to be
+    /// distinguishable or there is no way to change the default's behaviour
+    /// without overriding somebody's deliberate 0.10.
+    pub margin: Option<f64>,
     /// Hard ceiling as a fraction of total VRAM; the server lever, off by
     /// default (`None`).
     pub cap_fraction: Option<f64>,
@@ -446,11 +485,37 @@ pub struct VramBudget {
 impl Default for VramBudget {
     fn default() -> Self {
         Self {
-            margin: DEFAULT_MARGIN,
+            margin: None,
             cap_fraction: None,
         }
     }
 }
+
+impl VramBudget {
+    /// The margin fraction actually applied: the configured one, or
+    /// [`DEFAULT_MARGIN`]. A garbage configured value (negative, NaN) lands on
+    /// 0.0 here rather than propagating — `Settings::validate` rejects such a
+    /// value at config load, so this is defence in depth for an embedder that
+    /// builds a ledger without going through it.
+    pub fn margin_in_force(&self) -> f64 {
+        match self.margin {
+            Some(margin) if margin.is_finite() && margin >= 0.0 => margin,
+            Some(_) => 0.0,
+            None => DEFAULT_MARGIN,
+        }
+    }
+
+    /// Whether the reserve this board's margin produces is subject to
+    /// [`DEFAULT_RESERVE_CAP_MB`]: only when the user configured nothing.
+    fn reserve_is_capped(&self) -> bool {
+        self.margin.is_none()
+    }
+}
+
+/// Which rule produced the reserve a board's budget was computed with — the
+/// `reserve_rule` on `/health` and in the grant log (run2 change R5).
+pub const RESERVE_RULE_USER_MARGIN: &str = "user_margin";
+pub const RESERVE_RULE_CAPPED_DEFAULT: &str = "capped_default";
 
 /// The server's budget settings: a default plus **per-GPU-instance**
 /// overrides.
@@ -3283,7 +3348,39 @@ impl VramLedger {
     }
 
     fn limit_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
-        self.limit_with_margin_locked(state, gpu, self.budgets.for_board(gpu).margin.max(0.0))
+        self.limit_with_margin_locked(state, gpu, self.budgets.for_board(gpu).margin_in_force())
+    }
+
+    /// The VRAM withheld from the budget on top of what other processes are
+    /// actually holding, and which rule produced it (run2 change R5).
+    ///
+    /// Two rules, and which one applies is decided by whether the *user* set a
+    /// margin for this board, never by what its value happens to be:
+    ///
+    /// - `user_margin`: `ceil(external × margin)`, uncapped. Identical to the
+    ///   pre-run2 arithmetic — `total − ceil(external × (1 + margin))` is
+    ///   `total − external − ceil(external × margin)` exactly, for integer
+    ///   `external`;
+    /// - `capped_default`: the same figure, clamped to
+    ///   [`DEFAULT_RESERVE_CAP_MB`], so at most 1 GiB is ever withheld from a
+    ///   board nobody configured. This is what stops `limit` reaching 0 on a
+    ///   nearly full board (P5-2 / T4).
+    ///
+    /// `margin` is the *effective* margin — the configured (or default)
+    /// fraction plus any confidence widening — so an unconfirmed profile
+    /// widens the reserve under both rules, and under the default rule the cap
+    /// bounds the widened figure too. That is deliberate: the widening
+    /// multiplies `external` exactly as the base margin does, so it inherits
+    /// the same failure mode on a full board, and the widening's real
+    /// protection is the ramp and the ratchet, neither of which this touches.
+    fn reserve_locked(&self, gpu: &str, external: u64, margin: f64) -> (u64, &'static str) {
+        let budget = self.budgets.for_board(gpu);
+        let raw = ((external as f64) * margin.max(0.0)).ceil().max(0.0) as u64;
+        if budget.reserve_is_capped() {
+            (raw.min(DEFAULT_RESERVE_CAP_MB), RESERVE_RULE_CAPPED_DEFAULT)
+        } else {
+            (raw, RESERVE_RULE_USER_MARGIN)
+        }
     }
 
     /// `limit` under a specific margin — the board's configured one for the
@@ -3298,8 +3395,8 @@ impl VramLedger {
         let external = Self::external_locked(state, gpu).unwrap_or(0);
         // The desktop lever, on by default: only genuinely external usage is
         // margin-inflated. Our own residents are measured, not guessed.
-        let inflated = ((external as f64) * (1.0 + margin)).ceil().max(0.0) as u64;
-        let mut limit = total.saturating_sub(inflated);
+        let (reserve, _) = self.reserve_locked(gpu, external, margin);
+        let mut limit = total.saturating_sub(external).saturating_sub(reserve);
         // A non-finite fraction is treated as *unset*, not as a cap: `clamp` on
         // a NaN returns the NaN, `as u64` on it saturates to 0, and the board
         // would silently admit nothing at all. `Settings::validate` rejects such
@@ -3317,7 +3414,7 @@ impl VramLedger {
     }
 
     fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
-        self.headroom_with_margin_locked(state, gpu, self.budgets.for_board(gpu).margin.max(0.0))
+        self.headroom_with_margin_locked(state, gpu, self.budgets.for_board(gpu).margin_in_force())
     }
 
     fn headroom_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
@@ -3363,7 +3460,7 @@ impl VramLedger {
         // margin lands on 0.0 here exactly as it does in `limit_locked`
         // rather than turning every number below into a NaN. The margin is
         // this *board's* — budgets are per instance.
-        let base = self.budgets.for_board(&entry.gpu).margin.max(0.0);
+        let base = self.budgets.for_board(&entry.gpu).margin_in_force();
         let cal = state
             .calibration
             .get(&(entry.inference_id.clone(), entry.gpu.clone()));
@@ -3754,6 +3851,7 @@ impl VramLedger {
         // under the ledger mutex puts every concurrent grant request behind a
         // log write (review F8).
         let external_mb = Self::external_locked(&state, &gpu).unwrap_or(0);
+        let (reserve_mb, reserve_rule) = self.reserve_locked(&gpu, external_mb, margin);
         let issued = state.workers.get(&worker).map(|entry| {
             let anchor = Self::anchor_locked(&state, entry);
             (
@@ -3773,6 +3871,8 @@ impl VramLedger {
                 share_mb = share.mb,
                 headroom_mb = headroom,
                 external_mb,
+                reserve_mb,
+                reserve_rule,
                 pre_fit,
                 ramp_step,
                 deflation,
@@ -4235,33 +4335,16 @@ impl VramLedger {
             }
         }
 
-        // The freshest device sample updates both our own pool size and the
-        // board's free reading, which the external term is derived from.
-        if let Some(stamped) = memory {
-            if let Some(reserved) = stamped.value.reserved_mb
-                && let Some(entry) = state.workers.get_mut(&worker)
-            {
-                entry.reserved_mb = Some(reserved);
-                entry.reserved_seen_at = Some(stamped.captured_at);
-            }
-            if let (Some(free), Some(source)) =
-                (stamped.value.free_mb, stamped.value.free_source.clone())
-            {
-                let model = state
-                    .workers
-                    .get(&worker)
-                    .map(|entry| entry.inference_id.clone());
-                Self::record_free_locked(
-                    state,
-                    &gpu,
-                    free,
-                    source,
-                    stamped.captured_at,
-                    stamped.value.total_mb,
-                    model.as_deref(),
-                );
-            }
-        }
+        // The board total this response claims, reused as the currency check
+        // for the per-batch readings below: they come from the same worker in
+        // the same response, so a total that does not describe the board
+        // condemns those readings exactly as it condemns the response-level
+        // one (`record_free_locked`, and the ROCm case it exists for).
+        let reported_total_mb = memory.as_ref().and_then(|stamped| stamped.value.total_mb);
+        let model = state
+            .workers
+            .get(&worker)
+            .map(|entry| entry.inference_id.clone());
 
         let mut negative = false;
         let mut saw_oom = false;
@@ -4292,6 +4375,36 @@ impl VramLedger {
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
+            // Per-batch free (run2 change R5; finding T3). The worker's
+            // defensive clamp already reads live free memory before every
+            // batch; reporting it turns `external_mb` from a window-boundary
+            // quantity — run1 measured it ageing to 166.9 s, and a +30 GB step
+            // taking 31.5 s to reach `/health` — into one that refreshes at
+            // response cadence. Ingested **before** the negative check below,
+            // because a window that just OOMed is exactly when the freshest
+            // reading is worth most; the reading describes the board, not the
+            // batch's outcome.
+            //
+            // Ordering is by sequence number, and `record_free_locked` keeps
+            // the freshest by capture instant, so within one response the last
+            // measurement wins and the response-level sample (applied after
+            // this loop, and stamped later) wins over all of them. Source
+            // precedence and the departed-worker credit rule apply unchanged:
+            // a reading whose `free_source` is not the board's own is dropped
+            // there, exactly as a sample-map reading is.
+            if let (Some(free), Some(source)) =
+                (measurement.free_mb, measurement.free_source.clone())
+            {
+                Self::record_free_locked(
+                    state,
+                    &gpu,
+                    free,
+                    source,
+                    sample.captured_at,
+                    reported_total_mb,
+                    model.as_deref(),
+                );
+            }
             // A throughput collapse is a *comparison* between two of this
             // window's batches, and a comparison is only meaningful inside one
             // occupancy regime. Run1 measured three negatives on MiniLM
@@ -4428,6 +4541,32 @@ impl VramLedger {
                 measurement.allocated_before_mb,
             ) {
                 transients.push((units, peak.saturating_sub(before)));
+            }
+        }
+        // The response-level sample last, because it is the freshest reading
+        // the response carries: the worker takes it after the final batch,
+        // while every `free_mb` above was taken *before* the batch it rides
+        // on. It updates our own pool size as well as the board's free
+        // reading, which the external term is derived from.
+        if let Some(stamped) = memory {
+            if let Some(reserved) = stamped.value.reserved_mb
+                && let Some(entry) = state.workers.get_mut(&worker)
+            {
+                entry.reserved_mb = Some(reserved);
+                entry.reserved_seen_at = Some(stamped.captured_at);
+            }
+            if let (Some(free), Some(source)) =
+                (stamped.value.free_mb, stamped.value.free_source.clone())
+            {
+                Self::record_free_locked(
+                    state,
+                    &gpu,
+                    free,
+                    source,
+                    stamped.captured_at,
+                    stamped.value.total_mb,
+                    model.as_deref(),
+                );
             }
         }
         if suppressed_collapses > 0 {
@@ -5133,6 +5272,11 @@ impl VramLedger {
             .iter()
             .map(|(uuid, board)| {
                 let external = Self::external_locked(&state, uuid);
+                let (reserve, reserve_rule) = self.reserve_locked(
+                    uuid,
+                    external.unwrap_or(0),
+                    self.budgets.for_board(uuid).margin_in_force(),
+                );
                 let mut workers: Vec<LedgerWorkerHealth> = state
                     .workers
                     .values()
@@ -5187,6 +5331,8 @@ impl VramLedger {
                         .as_ref()
                         .map(|sample| sample.at.elapsed().as_millis() as u64),
                     limit_mb: self.limit_locked(&state, uuid),
+                    reserve_mb: reserve,
+                    reserve_rule: reserve_rule.to_owned(),
                     headroom_mb: self.headroom_locked(&state, uuid),
                     charges_mb: Self::charges_locked(&state, uuid),
                     footprints_mb: Self::footprints_locked(&state, uuid),
@@ -5196,7 +5342,7 @@ impl VramLedger {
                         .iter()
                         .map(|worker| worker.grants_outstanding)
                         .sum(),
-                    margin: self.budgets.for_board(uuid).margin,
+                    margin: self.budgets.for_board(uuid).margin_in_force(),
                     cap_fraction: self.budgets.for_board(uuid).cap_fraction,
                     workers,
                 }
@@ -5912,9 +6058,17 @@ pub struct GpuBudgetHealth {
     /// refresh, and `"amdgpu-sysfs"` on ROCm hosts, where it is both.
     pub external_source: Option<String>,
     pub external_sample_age_ms: Option<u64>,
-    /// The admission budget: `min(total × cap_fraction, total − external ×
-    /// (1 + margin))`.
+    /// The admission budget: `min(total × cap_fraction,
+    /// total − external − reserve_mb)`.
     pub limit_mb: u64,
+    /// The VRAM withheld from the budget on top of `external_mb` itself: the
+    /// reserve **actually applied** to this board, in MiB (run2 change R5).
+    pub reserve_mb: u64,
+    /// Which rule produced `reserve_mb`: `"user_margin"` (the board's
+    /// configured margin, honoured verbatim and uncapped) or
+    /// `"capped_default"` (nobody configured this board, so the default
+    /// fraction applies and is clamped to 1 GiB).
+    pub reserve_rule: String,
     pub headroom_mb: u64,
     /// What the residents actually cost the board: `Σ` per-worker
     /// `footprint + max(0, grants − pool growth)`. This — not
@@ -6115,8 +6269,16 @@ mod tests {
     }
 
     fn no_margin() -> VramBudget {
+        user_margin(0.0)
+    }
+
+    /// A margin the *user* configured, which is honoured verbatim and
+    /// uncapped — as opposed to `VramBudget::default()`, which states none and
+    /// therefore takes the default fraction plus
+    /// [`DEFAULT_RESERVE_CAP_MB`] (run2 change R5).
+    fn user_margin(margin: f64) -> VramBudget {
         VramBudget {
-            margin: 0.0,
+            margin: Some(margin),
             cap_fraction: None,
         }
     }
@@ -6148,6 +6310,22 @@ mod tests {
             reserved_mb: Some(reserved_mb),
             allocated_mb: Some(reserved_mb),
         }));
+    }
+
+    /// A batch measurement carrying the pre-batch free reading the worker's
+    /// defensive clamp takes (run2 change R5, per-batch free).
+    fn measurement_with_free(
+        units: u64,
+        before: u64,
+        peak: u64,
+        free_mb: u64,
+        free_source: &str,
+    ) -> BatchMeasurement {
+        BatchMeasurement {
+            free_mb: Some(free_mb),
+            free_source: Some(free_source.to_owned()),
+            ..measurement(units, before, peak)
+        }
     }
 
     fn measurement(units: u64, before: u64, peak: u64) -> BatchMeasurement {
@@ -6226,6 +6404,130 @@ mod tests {
         );
     }
 
+    /// R5, per-batch free (finding T3): every measurement's `free_mb`
+    /// refreshes the board, so `external_mb` follows the world at **response**
+    /// cadence instead of at the window boundary. Run1 measured the old
+    /// behaviour ageing to 166.9 s, with a +30 GB step taking 31.5 s to reach
+    /// `/health`.
+    #[test]
+    fn every_batchs_free_reading_refreshes_the_boards_external_usage() {
+        let ledger = ledger(32_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory_with_total(&handle, 30_000, 0, Some(32_000), "nvml");
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].external_mb, 1_000);
+
+        // One window of three batches, during which something else takes 20 GB
+        // and then gives half of it back. No response-level sample at all —
+        // this is the per-batch path on its own.
+        handle.lock().unwrap().memory = None;
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle.lock().unwrap().record_measurements(vec![
+            measurement_with_free(4, 0, 10, 30_000, "nvml"),
+            measurement_with_free(4, 10, 20, 10_000, "nvml"),
+            measurement_with_free(4, 20, 30, 20_000, "nvml"),
+        ]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(
+            ledger.health()[0].external_mb,
+            32_000 - 20_000 - 1_000,
+            "the last measurement of the response is the freshest reading in it"
+        );
+    }
+
+    /// The rules the per-batch readings inherit, each shown binding: source
+    /// precedence, the sample's own total as a currency check, and the
+    /// departed-replica credit.
+    #[test]
+    fn per_batch_free_readings_obey_the_sample_map_rules() {
+        let ledger = ledger(32_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory_with_total(&handle, 30_000, 0, Some(32_000), "nvml");
+        ledger.ingest_all_for_test();
+        handle.lock().unwrap().memory = None;
+
+        // A `torch` reading on a board that has seen NVML: dropped, exactly as
+        // a torch sample-map reading is. The two sources see different things
+        // and alternating them swings `external` by gigabytes for no physical
+        // reason.
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement_with_free(4, 0, 10, 5_000, "torch")]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(ledger.health()[0].external_mb, 1_000, "unmoved");
+
+        // An authoritative reading whose response claims a total that does not
+        // describe this board is in a different currency, and is refused with
+        // the response-level sample it arrived beside.
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        {
+            let mut telemetry = handle.lock().unwrap();
+            telemetry.memory = Some(Timestamped::now(MemorySample {
+                free_mb: Some(6_000),
+                total_mb: Some(8_192),
+                free_source: Some("nvml".to_owned()),
+                reserved_mb: Some(0),
+                allocated_mb: Some(0),
+            }));
+            telemetry.record_measurements(vec![measurement_with_free(4, 0, 10, 6_000, "nvml")]);
+        }
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(
+            ledger.health()[0].external_mb,
+            1_000,
+            "a reading of some other board is not a reading of this one"
+        );
+
+        // And an honest one lands.
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        {
+            let mut telemetry = handle.lock().unwrap();
+            telemetry.memory = None;
+            telemetry.record_measurements(vec![measurement_with_free(4, 0, 10, 25_000, "nvml")]);
+        }
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(ledger.health()[0].external_mb, 32_000 - 25_000 - 1_000);
+    }
+
+    /// A window that ended in an OOM still refreshes the board: the reading
+    /// describes the board, not the batch's outcome, and it is precisely the
+    /// moment the freshest picture is worth most.
+    #[test]
+    fn a_negative_windows_free_readings_still_reach_the_board() {
+        let ledger = ledger(32_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory_with_total(&handle, 30_000, 0, Some(32_000), "nvml");
+        ledger.ingest_all_for_test();
+        handle.lock().unwrap().memory = None;
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                oom: true,
+                ..measurement_with_free(4, 0, 10, 2_000, "nvml")
+            }]);
+        token.finish(WindowOutcome::Responded { oom: true });
+        assert_eq!(
+            ledger.health()[0].external_mb,
+            32_000 - 2_000 - 1_000,
+            "the board is nearly full, which is what the OOM was about"
+        );
+        assert_eq!(ledger.health()[0].workers[0].deflation, 1);
+    }
+
     /// `external` is clamped at 0: `free` and the per-worker samples come
     /// from different moments, so skew must never manufacture phantom
     /// headroom (an unclamped subtraction would go negative here).
@@ -6267,7 +6569,7 @@ mod tests {
         let capped = ledger(
             10_000,
             VramBudget {
-                margin: DEFAULT_MARGIN,
+                margin: Some(DEFAULT_MARGIN),
                 cap_fraction: Some(0.5),
             },
         );
@@ -6282,7 +6584,7 @@ mod tests {
         let tight = ledger(
             10_000,
             VramBudget {
-                margin: 0.0,
+                margin: Some(0.0),
                 cap_fraction: Some(0.5),
             },
         );
@@ -7373,7 +7675,14 @@ mod tests {
                 }),
                 ..FakeProfiles::default()
             });
-            let ledger = ledger_with(100_000, VramBudget::default(), &profiles);
+            // A **configured** margin, so this test is about the widening
+            // rather than about the default rule's reserve cap (run2 change
+            // R5): with no margin in the config the reserve is
+            // `min(external × margin, DEFAULT_RESERVE_CAP_MB)`, which on a
+            // board holding 49 GB of external usage is 1 GiB whatever the
+            // margin is, and the widening has nothing to bite on. The user's
+            // own number is honoured uncapped, which is where it does.
+            let ledger = ledger_with(100_000, user_margin(DEFAULT_MARGIN), &profiles);
             let handle = loaded(Some(1000), Some(0));
             let admission = ledger
                 .register_worker("g/a", item_cost(4), &handle, None)
@@ -7402,7 +7711,7 @@ mod tests {
 
         // And confirmation is earned by local evidence alone: five clean
         // high-water windows drop the widening.
-        let ledger = ledger(100_000, VramBudget::default());
+        let ledger = ledger(100_000, user_margin(DEFAULT_MARGIN));
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
@@ -7423,6 +7732,108 @@ mod tests {
             worker.effective_margin, DEFAULT_MARGIN,
             "confirmed by local evidence, so the widening drops"
         );
+    }
+
+    /// R5: an **unset** margin gets the default fraction *and* a 1 GiB cap on
+    /// what it may withhold, so the last gigabytes of a busy board stay
+    /// usable. Run1 measured `limit_mb` 2 813 at 10 GB free and 0 at 4 GB
+    /// free on a 97 GB board (findings P5-2 / T4).
+    #[test]
+    fn an_unset_margin_never_withholds_more_than_the_reserve_cap() {
+        // 97 887 MiB of board, 1 000 of it ours, and only 8 000 free: the
+        // regime where `external × 1.1` used to reach the total.
+        let ledger = ledger(97_887, VramBudget::default());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        push_memory(&handle, 8_000, 0);
+        ledger.ingest_all_for_test();
+
+        let board = &ledger.health()[0];
+        assert_eq!(board.external_mb, 88_887);
+        assert_eq!(
+            board.reserve_mb, DEFAULT_RESERVE_CAP_MB,
+            "the fraction would have withheld 8 889 MiB"
+        );
+        assert_eq!(board.reserve_rule, RESERVE_RULE_CAPPED_DEFAULT);
+        assert_eq!(board.limit_mb, 97_887 - 88_887 - 1024);
+        assert_eq!(board.limit_mb, 7_976, "and not 0, which is what T4 saw");
+        assert!(board.headroom_mb > 0);
+
+        // A grant on that board is priced, not memory-blind.
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert!(
+            token.grant().mb > 0,
+            "an `mb = 0` grant is priced against nothing"
+        );
+    }
+
+    /// The same board with a margin the user wrote down: honoured verbatim,
+    /// uncapped, exactly as before run2. The two rules have to be
+    /// distinguishable or there is no way to change the default without
+    /// overriding a deliberate setting.
+    #[test]
+    fn a_configured_margin_is_honoured_verbatim_and_uncapped() {
+        let ledger = ledger(97_887, user_margin(DEFAULT_MARGIN));
+        let handle = loaded(Some(1000), Some(0));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        push_memory(&handle, 8_000, 0);
+        ledger.ingest_all_for_test();
+
+        let board = &ledger.health()[0];
+        assert_eq!(board.external_mb, 88_887);
+        assert_eq!(board.reserve_mb, 8_889, "ceil(88 887 × 0.10)");
+        assert_eq!(board.reserve_rule, RESERVE_RULE_USER_MARGIN);
+        assert_eq!(
+            board.limit_mb,
+            97_887 - 88_887 - 8_889,
+            "the pre-run2 arithmetic, to the MiB: total − ceil(external × 1.1)"
+        );
+        assert_eq!(board.margin, DEFAULT_MARGIN);
+
+        // Setting the same number the default uses is a *different* state
+        // from setting nothing, which is the whole point of the Option.
+        let unset_ledger =
+            VramLedger::for_test(&[(BOARD, "TEST 9000", 97_887)], VramBudget::default());
+        let unset_handle = loaded(Some(1000), Some(0));
+        let _unset_admission = unset_ledger
+            .register_worker("g/a", item_cost(64), &unset_handle, None)
+            .unwrap();
+        push_memory(&unset_handle, 8_000, 0);
+        unset_ledger.ingest_all_for_test();
+        assert_eq!(
+            unset_ledger.health()[0].margin,
+            DEFAULT_MARGIN,
+            "same fraction"
+        );
+        assert_ne!(
+            unset_ledger.health()[0].reserve_mb,
+            ledger.health()[0].reserve_mb,
+            "different rule"
+        );
+    }
+
+    /// The cap only binds where the fraction exceeds it: on a quiet board the
+    /// default rule is arithmetically identical to the old one.
+    #[test]
+    fn the_reserve_cap_does_not_bind_on_a_board_with_little_external_usage() {
+        let ledger = ledger(97_887, VramBudget::default());
+        let handle = loaded(Some(1000), Some(0));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        // 4 000 MiB of external usage: ceil(4 000 × 0.10) = 400, well under
+        // the cap.
+        push_memory(&handle, 92_887, 0);
+        ledger.ingest_all_for_test();
+        let board = &ledger.health()[0];
+        assert_eq!(board.external_mb, 4_000);
+        assert_eq!(board.reserve_mb, 400);
+        assert_eq!(board.reserve_rule, RESERVE_RULE_CAPPED_DEFAULT);
+        assert_eq!(board.limit_mb, 97_887 - 4_000 - 400);
     }
 
     /// A degraded cost dimension — no parseable `metadata.cost` — widens the
@@ -7502,7 +7913,7 @@ mod tests {
         let ledger = ledger(
             100_000,
             VramBudget {
-                margin: 0.9,
+                margin: Some(0.9),
                 cap_fraction: None,
             },
         );
@@ -9367,13 +9778,13 @@ mod tests {
     fn a_configured_ceiling_overrides_the_cpu_default() {
         let per_board = cpu_ledger(
             VramBudgets::uniform(VramBudget {
-                margin: 0.0,
+                margin: Some(0.0),
                 cap_fraction: None,
             })
             .with_board(
                 "CPU",
                 VramBudget {
-                    margin: 0.0,
+                    margin: Some(0.0),
                     cap_fraction: Some(0.5),
                 },
             ),
@@ -9381,7 +9792,7 @@ mod tests {
         assert_eq!(per_board.health()[0].cap_fraction, Some(0.5));
 
         let section_wide = cpu_ledger(VramBudget {
-            margin: 0.0,
+            margin: Some(0.0),
             cap_fraction: Some(1.0),
         });
         assert_eq!(
@@ -10596,13 +11007,13 @@ mod tests {
         const A: &str = "GPU-aaaa";
         const B: &str = "GPU-bbbb";
         let budgets = VramBudgets::uniform(VramBudget {
-            margin: 0.0,
+            margin: Some(0.0),
             cap_fraction: None,
         })
         .with_board(
             B,
             VramBudget {
-                margin: 0.0,
+                margin: Some(0.0),
                 cap_fraction: Some(0.5),
             },
         );
@@ -10643,13 +11054,13 @@ mod tests {
         const A: &str = "GPU-aaaa";
         const B: &str = "GPU-bbbb";
         let budgets = VramBudgets::uniform(VramBudget {
-            margin: 0.0,
+            margin: Some(0.0),
             cap_fraction: None,
         })
         .with_board(
             B,
             VramBudget {
-                margin: 0.5,
+                margin: Some(0.5),
                 cap_fraction: None,
             },
         );

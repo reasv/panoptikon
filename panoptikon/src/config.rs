@@ -332,9 +332,20 @@ pub struct PrewarmSettings {
 pub struct VramConfig {
     /// Margin over *other processes'* usage — the desktop lever, on by
     /// default. Our own workers are never margin-inflated; their footprints
-    /// are measured. Default: 0.10.
-    #[serde(default = "default_vram_margin")]
-    pub margin: f64,
+    /// are measured.
+    ///
+    /// **Absent is not the same as `0.10`** (run2 change R5). Absent means the
+    /// user has expressed no opinion, and the ledger then applies its own
+    /// default fraction *and* caps the resulting reserve at 1 GiB, so the
+    /// margin cannot make the last several gigabytes of a busy board
+    /// unusable (findings P5-2 / T4). A margin written in the file is honoured
+    /// verbatim and uncapped — it is a statement about this machine, and the
+    /// ledger has no standing to overrule it. Keeping the two distinguishable
+    /// is what lets the default's *behaviour* change later without overriding
+    /// somebody's deliberate `margin = 0.10`; see the config-authoring rules
+    /// in `CLAUDE.md`.
+    #[serde(default)]
+    pub margin: Option<f64>,
     /// Hard ceiling as a fraction of total VRAM — the server lever, off by
     /// default. Server operators partitioning one card between services set
     /// this and are encouraged to leave `margin` alone.
@@ -359,14 +370,10 @@ pub struct VramOverride {
     pub cap_fraction: Option<f64>,
 }
 
-fn default_vram_margin() -> f64 {
-    0.10
-}
-
 impl Default for VramConfig {
     fn default() -> Self {
         Self {
-            margin: default_vram_margin(),
+            margin: None,
             cap_fraction: None,
             gpu: BTreeMap::new(),
         }
@@ -388,7 +395,7 @@ impl VramConfig {
     /// the abbreviations CUDA itself accepts in `CUDA_VISIBLE_DEVICES`: a
     /// prefix that matched two boards would have to pick one, and applying the
     /// wrong board's margin is a memory decision made on a typo.
-    pub fn for_board(&self, uuid: &str) -> (f64, Option<f64>) {
+    pub fn for_board(&self, uuid: &str) -> (Option<f64>, Option<f64>) {
         let over = self.gpu.get(uuid).or_else(|| {
             self.gpu
                 .iter()
@@ -397,7 +404,7 @@ impl VramConfig {
         });
         match over {
             Some(over) => (
-                over.margin.unwrap_or(self.margin),
+                over.margin.or(self.margin),
                 over.cap_fraction.or(self.cap_fraction),
             ),
             None => (self.margin, self.cap_fraction),
@@ -1413,8 +1420,10 @@ impl Settings {
     /// arithmetic, where it is defended against but never intended.
     fn validate_inference_vram(&self) -> Result<()> {
         let vram = &self.inference_local.vram;
-        let check = |where_: &str, margin: f64, cap: Option<f64>| -> Result<()> {
-            if !margin.is_finite() || margin < 0.0 {
+        let check = |where_: &str, margin: Option<f64>, cap: Option<f64>| -> Result<()> {
+            if let Some(margin) = margin
+                && (!margin.is_finite() || margin < 0.0)
+            {
                 anyhow::bail!(
                     "{where_} margin must be a finite number >= 0 (got {margin}); it is a \
                      fraction of other processes' VRAM usage, e.g. 0.10 for 10%"
@@ -1444,7 +1453,7 @@ impl Settings {
             }
             check(
                 &format!("inference_local.vram.gpu.\"{uuid}\""),
-                over.margin.unwrap_or(vram.margin),
+                over.margin.or(vram.margin),
                 over.cap_fraction.or(vram.cap_fraction),
             )?;
         }
@@ -2308,14 +2317,16 @@ base_url = "http://127.0.0.1:6342"
 "#
     }
 
-    /// `[inference_local.vram]` parsing: absent = the code defaults (margin
-    /// on at 0.10, `cap_fraction` off), live values override, and per-board
-    /// entries inherit whatever they do not state.
+    /// `[inference_local.vram]` parsing: absent stays absent (run2 change R5
+    /// — the ledger's default fraction *and* its 1 GiB reserve cap then
+    /// apply), live values override, and per-board entries inherit whatever
+    /// they do not state.
     ///
-    /// The defaults matter as much as the overrides here: the shipped TOMLs
-    /// carry these keys as *comments only* precisely so a future change to
-    /// `default_vram_margin` reaches existing users, which only works while
-    /// absence resolves to the serde default rather than to zero.
+    /// The distinction matters as much as the overrides here: the shipped
+    /// TOMLs carry these keys as *comments only* precisely so a future change
+    /// to the default reaches existing users, which only works while absence
+    /// resolves to `None` rather than to a number indistinguishable from one
+    /// the user wrote.
     #[test]
     fn vram_config_defaults_live_values_and_per_board_inheritance() {
         let dir = tempfile::tempdir().unwrap();
@@ -2327,13 +2338,13 @@ base_url = "http://127.0.0.1:6342"
             .unwrap()
             .inference_local
             .vram;
-        assert_eq!(vram.margin, 0.10, "absent section tracks the code default");
+        assert_eq!(vram.margin, None, "absent section states no opinion");
         assert_eq!(
             vram.cap_fraction, None,
             "the server lever is off by default"
         );
         assert!(vram.gpu.is_empty());
-        assert_eq!(vram.for_board("GPU-anything"), (0.10, None));
+        assert_eq!(vram.for_board("GPU-anything"), (None, None));
 
         std::fs::write(
             &path,
@@ -2350,22 +2361,22 @@ base_url = "http://127.0.0.1:6342"
             .vram;
         assert_eq!(
             vram.for_board("GPU-cccc"),
-            (0.25, Some(0.90)),
+            (Some(0.25), Some(0.90)),
             "no override"
         );
         assert_eq!(
             vram.for_board("GPU-aaaa"),
-            (0.5, Some(0.90)),
+            (Some(0.5), Some(0.90)),
             "margin overridden, cap_fraction inherited"
         );
         assert_eq!(
             vram.for_board("GPU-bbbb"),
-            (0.25, Some(0.5)),
+            (Some(0.25), Some(0.5)),
             "cap_fraction overridden, margin inherited"
         );
         assert_eq!(
             vram.for_board("gpu-AAAA"),
-            (0.5, Some(0.90)),
+            (Some(0.5), Some(0.90)),
             "UUID matching is case-insensitive: NVML prints lower-case hex and a \
              user pasting an upper-case copy must not silently get the default"
         );
@@ -2384,7 +2395,9 @@ base_url = "http://127.0.0.1:6342"
                 .inference_local
                 .vram
                 .for_board("GPU-aaaa"),
-            (0.0, None)
+            (Some(0.0), None),
+            "and a written 0 is a written 0, not an absent margin: it takes the \
+             uncapped user-margin rule, which reserves nothing at all"
         );
     }
 
@@ -2506,9 +2519,9 @@ base_url = "http://127.0.0.1:6342"
 
             let shipped = vram_of(&text, name);
             assert_eq!(
-                shipped.margin,
-                default_vram_margin(),
-                "{name}.toml as shipped must track the code default"
+                shipped.margin, None,
+                "{name}.toml as shipped must state no margin, so the code's \
+                 default fraction and its reserve cap both apply"
             );
             assert_eq!(shipped.cap_fraction, None, "{name}.toml: cap is off");
             assert!(
@@ -2547,7 +2560,7 @@ base_url = "http://127.0.0.1:6342"
                 })
                 .collect();
             let vram = vram_of(&uncommented.join("\n"), name);
-            assert_eq!(vram.margin, 0.10, "{name}.toml: the margin example");
+            assert_eq!(vram.margin, Some(0.10), "{name}.toml: the margin example");
             assert_eq!(
                 vram.cap_fraction,
                 Some(0.90),
@@ -2571,7 +2584,7 @@ base_url = "http://127.0.0.1:6342"
             );
             assert_eq!(
                 vram.for_board(uuid),
-                (0.25, Some(0.90)),
+                (Some(0.25), Some(0.90)),
                 "{name}.toml: the override inherits the section's cap_fraction"
             );
         }

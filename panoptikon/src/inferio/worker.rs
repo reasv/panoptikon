@@ -1284,10 +1284,18 @@ impl Worker {
             return;
         }
         if let Ok(mut telemetry) = self.telemetry.lock() {
+            // Measurements first, **then** the response-level sample, so the
+            // host-side capture stamps run in the order the worker actually
+            // took the readings: each measurement's `free_mb` is a pre-batch
+            // reading and the response's `memory` is taken after the last
+            // batch. The ledger's free-reading rule is freshest-wins by
+            // timestamp (run2 change R5, per-batch free), so stamping the
+            // later reading earlier would make the whole window's worth of
+            // per-batch readings supersede it.
+            telemetry.record_measurements(measurements);
             if let Some(sample) = sample {
                 telemetry.memory = Some(Timestamped::now(sample));
             }
-            telemetry.record_measurements(measurements);
         }
     }
 

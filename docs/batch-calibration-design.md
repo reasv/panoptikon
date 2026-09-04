@@ -602,6 +602,20 @@ on a model that has not been fitted yet.
   preferred over stitched per-frame samples whenever it is fresh. In
   scope for v1, since the probe machinery already exists; an accuracy
   measure, not a safety requirement.
+- **Free memory is reported per batch, not per window** (run2 change R5;
+  finding T3). Samples arriving only on response frames made `external` a
+  window-boundary quantity: run1 measured 0 host probes in 2.5 h, a freshest
+  reading ageing to 166.9 s, a +30 GB external step taking 31.5 s to reach
+  `/health`, and a 53 GB ten-second spike moving it by 2 MiB. The worker's
+  defensive clamp already reads live free memory before **every** batch, so it
+  reports that reading on the measurement (`free_mb`/`free_source`), and the
+  orchestrator folds each one into the board under the same source-precedence,
+  departed-worker-credit and currency rules a memory sample obeys. Within one
+  response the readings apply in measurement order and the response-level
+  sample last, matching the order the worker took them. `external_mb` then
+  refreshes at response cadence rather than at the staleness timer, and a
+  window that OOMed contributes its readings too — the reading describes the
+  board, not the outcome.
 - **Contention policy** when several models are hungry at once: demand
   first (queue depth; an idle model consumes no new grants, though it
   holds its pool until trimmed — see Reactive shrink), then split by
@@ -884,6 +898,52 @@ ships commented examples only. `margin` defaults on (0.10) everywhere —
 on a headless server other-usage is ~0 so it costs nothing; server
 operators who partition VRAM among services set `cap_fraction` and are
 encouraged to leave `margin` alone.
+
+### The reserve, and why an unset margin is not the same as `margin = 0.10`
+
+Run2 change R5 (findings P5-2 / T4). As a pure fraction of external usage the
+margin inverts its own intent on a busy board: `limit = total − external ×
+(1 + margin)` reaches 0 once external passes `total / (1 + margin)`, and run1
+measured `limit_mb` of 2 813 at 10 GB free and **0** at 4 GB free on a 97 GB
+card. The last ~9.8 GB of every board was unusable, and below that grants went
+memory-blind (`mb = 0`), which is the state that admits batches priced against
+nothing. The margin exists so a desktop user's own variable VRAM use does not
+spill into ours; withholding ten gigabytes is not that.
+
+So the config's `margin` is an **option**, and absence is a distinct state:
+
+```
+reserve = ceil(external × margin)                          # margin configured
+reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
+limit   = min(total × cap_fraction, total − external − reserve)
+```
+
+- A margin the user wrote down is honoured **verbatim and uncapped**, exactly
+  as before — `total − external − ceil(external × margin)` is
+  `total − ceil(external × (1 + margin))` to the MiB, for integer `external`.
+  It is a statement about their machine and the ledger has no standing to
+  overrule it.
+- An **unset** margin takes the default fraction *and* a 1 GiB ceiling on what
+  it may withhold. 1 GiB is the size of the thing being protected against — a
+  browser tab compositing, a game loading a shader cache, a second CUDA
+  process's context — and the worker's own per-batch defensive clamp, which
+  re-reads live free memory before every batch, is what actually catches a
+  bigger move.
+
+Keeping the two distinguishable is also what makes the default *changeable*
+later without overriding somebody's deliberate `margin = 0.10`, per the
+config-authoring rules.
+
+Two consequences worth stating. The confidence widening (unconfirmed profile,
+fit scatter) multiplies `external` the same way the base margin does, so under
+the default rule it is capped along with it: on a board with tens of GB of
+external usage an unconfirmed profile buys no *extra* reserve. That is the
+user's stated rule ("at most 1 GB is ever withheld") and the widening was
+never the main protection — the ramp and the extrapolation ratchet both count
+local samples only, and neither is affected. And `/health` reports the reserve
+actually applied (`reserve_mb`) and which rule produced it (`reserve_rule`:
+`user_margin` | `capped_default`), as does every `issued a memory grant` log
+line, so which arithmetic a board is under is never a guess.
 
 ## Calibration store
 

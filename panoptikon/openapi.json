@@ -7753,6 +7753,8 @@
           "external_mb",
           "external_known",
           "limit_mb",
+          "reserve_mb",
+          "reserve_rule",
           "headroom_mb",
           "charges_mb",
           "footprints_mb",
@@ -7829,7 +7831,7 @@
           "limit_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "The admission budget: `min(total × cap_fraction, total − external ×\n(1 + margin))`.",
+            "description": "The admission budget: `min(total × cap_fraction,\ntotal − external − reserve_mb)`.",
             "minimum": 0
           },
           "load_reservations_mb": {
@@ -7840,6 +7842,16 @@
           "margin": {
             "type": "number",
             "format": "double"
+          },
+          "reserve_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The VRAM withheld from the budget on top of `external_mb` itself: the\nreserve **actually applied** to this board, in MiB (run2 change R5).",
+            "minimum": 0
+          },
+          "reserve_rule": {
+            "type": "string",
+            "description": "Which rule produced `reserve_mb`: `\"user_margin\"` (the board's\nconfigured margin, honoured verbatim and uncapped) or\n`\"capped_default\"` (nobody configured this board, so the default\nfraction applies and is clamped to 1 GiB)."
           },
           "total_mb": {
             "type": "integer",

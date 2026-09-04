@@ -2349,7 +2349,7 @@ mod tests {
             let ledger = VramLedger::for_test(
                 &[(TEST_BOARD, "TEST 9000", total_mb)],
                 VramBudget {
-                    margin: 0.0,
+                    margin: Some(0.0),
                     cap_fraction: None,
                 },
             );
@@ -2415,7 +2415,7 @@ mod tests {
         let ledger = VramLedger::for_test(
             &[(TEST_BOARD, "TEST 9000", 32_768)],
             VramBudget {
-                margin: 0.0,
+                margin: Some(0.0),
                 cap_fraction: None,
             },
         );
@@ -2492,7 +2492,7 @@ mod tests {
         let ledger = VramLedger::for_test(
             &[(TEST_BOARD, "TEST 9000", 32_768)],
             VramBudget {
-                margin: 0.0,
+                margin: Some(0.0),
                 cap_fraction: None,
             },
         );
@@ -2551,7 +2551,7 @@ mod tests {
         let ledger = VramLedger::for_test(
             &[(TEST_BOARD, "TEST 9000", 32_768)],
             VramBudget {
-                margin: 0.0,
+                margin: Some(0.0),
                 cap_fraction: None,
             },
         );
@@ -2621,7 +2621,7 @@ mod tests {
         let ledger = VramLedger::for_test(
             &[(TEST_BOARD, "TEST 9000", 32_768)],
             VramBudget {
-                margin: 0.0,
+                margin: Some(0.0),
                 cap_fraction: None,
             },
         );
@@ -2671,7 +2671,7 @@ mod tests {
         let ledger = VramLedger::for_test(
             &[(TEST_BOARD, "TEST 9000", 32_768)],
             VramBudget {
-                margin: 0.0,
+                margin: Some(0.0),
                 cap_fraction: None,
             },
         );
