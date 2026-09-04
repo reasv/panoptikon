@@ -87,6 +87,14 @@ CONTEXT_MAX_MB = 2048
 _CONTEXT_POLL_SECONDS = 0.005
 _CONTEXT_PROBE_MAX_SECONDS = 600
 
+# How often the probe re-reads its pre-initialisation baseline while it waits.
+# The flag poll has to be fast (it decides *when* the measurement is taken);
+# the baseline only has to be recent, and each refresh costs a driver query.
+# A quarter of a second bounds the window in which an external process can
+# move memory into our delta to a quarter of a second, at four queries a
+# second for the duration of one load — negligible beside the load itself.
+_CONTEXT_BASELINE_SECONDS = 0.25
+
 # Extra allowance, on top of the context estimate, for memory our process
 # legitimately holds outside the caching allocator: cuDNN/cuBLAS workspaces,
 # NCCL buffers, driver-side bookkeeping. A free-memory delta beyond
@@ -2076,16 +2084,32 @@ class _ContextProbe:
     flips. On a process that never initialises CUDA the probe reads nothing at
     all and costs a sleeping thread.
 
-    Why the allocator pool is subtracted. The flag flips at the end of torch's
-    `_lazy_init`, before the weights are copied, but a few milliseconds is
-    enough for a small allocation to land. Whatever did land is visible in
-    `memory_reserved()` at the same instant, so subtracting it makes the
-    figure "everything we took from the driver that is not in the allocator" —
-    which is exactly what the context allowance stands for in `_resolve_base`
-    — rather than "everything we took", and removes the race instead of
-    tolerating it.
+    Why the allocator pool is subtracted, and why it is read **first**. The
+    flag flips at the end of torch's `_lazy_init`, before the weights are
+    copied, but a few milliseconds is enough for a small allocation to land.
+    Whatever did land is visible in `memory_reserved()` at the same instant,
+    so subtracting it makes the figure "everything we took from the driver
+    that is not in the allocator" — which is exactly what the context
+    allowance stands for in `_resolve_base` — rather than "everything we
+    took", and removes the race instead of tolerating it. The pool is read
+    before the free memory so that an allocation landing *between* the two
+    reads is missing from the pool figure rather than counted twice: it then
+    over-states the context, which over-states the base, which is the safe
+    direction. The other order would under-state it.
 
-    Both readings come from the **same source** as `begin_load`'s, because a
+    Why the baseline is re-read while it waits. `begin_load`'s reading can be
+    minutes old by the time an impl initialises CUDA — weights are downloaded
+    and deserialized first — and everything the rest of the board did in that
+    window lands in the delta. An external process *releasing* memory there
+    would make the measured context too **small**, and a context that is too
+    small under-states the base, which over-admits. So while the flag is still
+    clear the probe refreshes its baseline every
+    [`_CONTEXT_BASELINE_SECONDS`], which bounds that exposure to one refresh
+    interval instead of the whole load. A refresh that races the flip (CUDA
+    came up while the reading was in flight, so the reading already contains
+    the context) is discarded rather than used.
+
+    Every reading comes from the **same source** as `begin_load`'s, because a
     delta between two different sources is not a delta (NVML and
     `mem_get_info` measured 3.4 GB apart on the dev box); and the probe only
     runs when that source is a driver-level one, which pre-CUDA it always is.
@@ -2108,6 +2132,7 @@ class _ContextProbe:
         self._read_reserved = reserved_reader or _reserved_mb_unguarded
         self._free_at_init: int | None = None
         self._reserved_at_init: int = 0
+        self._baseline_at = time.monotonic()
         self._done = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -2121,19 +2146,46 @@ class _ContextProbe:
         if torch is None:
             return False
         try:
-            if not torch.cuda.is_initialized():
-                return False
+            live = torch.cuda.is_initialized()
         except Exception:
             # A torch that cannot answer will not answer later either.
             self._done = True
             return True
+        if not live:
+            self._refresh_baseline(torch)
+            return False
         try:
-            self._free_at_init = self._read_free()
+            # The pool first, the free memory second: see the class docstring
+            # — an allocation landing between the two reads must over-state
+            # the context, never under-state it.
             self._reserved_at_init = self._read_reserved() or 0
+            self._free_at_init = self._read_free()
         except Exception:  # pragma: no cover - defensive
             self._free_at_init = None
         self._done = True
         return True
+
+    def _refresh_baseline(self, torch: Any) -> None:
+        """Re-read the pre-initialisation baseline, at most once per
+        [`_CONTEXT_BASELINE_SECONDS`], so an external process moving memory
+        during a long load cannot land in the measured delta.
+
+        The reading is accepted only if CUDA was still not live *after* it
+        came back: one that raced the flip already contains the context, and
+        using it would measure a context of nothing.
+        """
+        now = time.monotonic()
+        if now - self._baseline_at < _CONTEXT_BASELINE_SECONDS:
+            return
+        self._baseline_at = now
+        try:
+            candidate = self._read_free()
+            if torch.cuda.is_initialized():
+                return
+        except Exception:  # pragma: no cover - defensive
+            return
+        if candidate is not None:
+            self._free_before = candidate
 
     def start(self) -> None:
         self._thread = threading.Thread(

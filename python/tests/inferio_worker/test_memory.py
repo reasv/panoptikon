@@ -453,6 +453,96 @@ def test_the_probe_subtracts_whatever_was_already_allocated() -> None:
     assert probe.result() == 800, "900 MiB of driver memory, 100 of it allocated"
 
 
+def test_the_flip_reads_the_pool_before_the_free_memory() -> None:
+    # Order, not just subtraction: an allocation that lands *between* the two
+    # reads is missing from the pool figure, which over-states the context —
+    # a bigger base, less admission, the safe direction. Reading free first
+    # would count that allocation twice and under-state it.
+    order: list[str] = []
+    probe = memory._ContextProbe(
+        8700,
+        "nvml",
+        torch_reader=lambda: SimpleNamespace(
+            cuda=SimpleNamespace(is_initialized=lambda: True)
+        ),
+        free_reader=lambda: (order.append("free"), 8000)[1],
+        reserved_reader=lambda: (order.append("reserved"), 0)[1],
+    )
+    probe.poll()
+    assert order == ["reserved", "free"]
+    assert probe.result() == 700
+
+
+def _waiting_probe(free_before, readings, live):
+    """A probe over a controllable clock-free world: `readings` are handed out
+    in order and `live` says whether CUDA has come up."""
+    return memory._ContextProbe(
+        free_before,
+        "nvml",
+        torch_reader=lambda: SimpleNamespace(
+            cuda=SimpleNamespace(is_initialized=lambda: live["on"])
+        ),
+        free_reader=lambda: readings.pop(0),
+        reserved_reader=lambda: 0,
+    )
+
+
+def test_the_baseline_is_refreshed_while_the_probe_waits() -> None:
+    # `begin_load`'s reading can be minutes old by the time an impl finally
+    # initialises CUDA — weights download and deserialize first — and anything
+    # the rest of the board did in between lands in the delta. A neighbour
+    # *releasing* memory there would make the context look smaller than it is,
+    # which under-states the base and over-admits. So the baseline is re-read
+    # while the probe waits, bounding that exposure to one refresh interval.
+    live = {"on": False}
+    probe = _waiting_probe(9500, [9000, 8700, 8000], live)
+    for expected in (9000, 8700):
+        probe._baseline_at -= memory._CONTEXT_BASELINE_SECONDS
+        assert probe.poll() is False
+        assert probe._free_before == expected
+    live["on"] = True
+    assert probe.poll() is True
+    assert probe.result() == 700, "measured against the freshest baseline, not 9500"
+
+
+def test_a_baseline_read_that_races_the_initialisation_is_discarded() -> None:
+    # If CUDA comes up while a baseline reading is in flight, that reading
+    # already contains the context: using it as the baseline would measure a
+    # context of nothing. The previous baseline stands and the next poll
+    # closes the measurement against it.
+    live = {"on": False}
+    readings = [8000, 8000]
+
+    def racing_read():
+        live["on"] = True
+        return readings.pop(0)
+
+    probe = memory._ContextProbe(
+        8700,
+        "nvml",
+        torch_reader=lambda: SimpleNamespace(
+            cuda=SimpleNamespace(is_initialized=lambda: live["on"])
+        ),
+        free_reader=racing_read,
+        reserved_reader=lambda: 0,
+    )
+    probe._baseline_at -= memory._CONTEXT_BASELINE_SECONDS
+    assert probe.poll() is False
+    assert probe._free_before == 8700, "the racing reading is not a baseline"
+    assert probe.poll() is True
+    assert probe.result() == 700
+
+
+def test_the_baseline_refresh_is_rate_limited() -> None:
+    # The flag poll runs at 5 ms; the baseline must not, or a load spends its
+    # life querying the driver.
+    live = {"on": False}
+    probe = _waiting_probe(9500, [9000], live)
+    for _ in range(20):
+        assert probe.poll() is False
+    assert probe._free_before == 9500, "no refresh inside one interval"
+
+
 def test_an_implausible_context_measurement_is_discarded() -> None:
     # A window a few milliseconds wide can still catch another process
     # starting or stopping. Outside the band it is not a context.
