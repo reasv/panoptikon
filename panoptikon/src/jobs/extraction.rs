@@ -301,15 +301,28 @@ fn in_flight_unit_ceiling(
 /// ramp at 64 items no matter how much headroom a board had (test protocol
 /// §8 G7).
 ///
-/// **Shrinking never takes a permit away from work already in flight.**
-/// `Semaphore::forget_permits` only removes permits that are currently
-/// *available*; whatever it could not remove is remembered in
-/// `pending_shrink` and retried every time this budget is touched, so the
-/// permits still held by in-flight requests are simply not re-issued when
-/// they come back. The invariant is
-/// `permits in existence == target + pending_shrink`, and `target` never
-/// drops below [`MIN_IN_FLIGHT_UNITS`], so the count can neither go negative
-/// nor fall under one request's worth and deadlock.
+/// **Shrinking never takes a permit away from work already in flight, and it
+/// always lands.** The invariant is
+/// `permits in existence == target + pending_shrink`, and `target` never drops
+/// below [`MIN_IN_FLIGHT_UNITS`], so the count can neither go negative nor
+/// fall under one request's worth and deadlock. Two mechanisms keep it, and
+/// the second is the one that matters:
+///
+/// - `Semaphore::forget_permits` removes whatever is *available* at the moment
+///   of the resize;
+/// - and [`Self::release`] retires each returning permit against the remaining
+///   deficit **instead of handing it back to the semaphore**.
+///
+/// The second is not an optimisation. `forget_permits` alone cannot shrink a
+/// *saturated* budget at all: there are no available permits, and a permit
+/// released by `drop` goes straight to one of the waiting item tasks — of
+/// which a saturated job has hundreds. Run2's `S2-wdvit` leg is the receipt:
+/// after the knee the published figure fell to core's floor of 64, `observe`
+/// set `pending_shrink = 136`, and the job's in-flight count stayed at 200 for
+/// the entire post-knee phase. The doc that used to stand here described
+/// shrinking as *deferred*; in a saturated job it was never applied. That is
+/// exactly the case the whole feature exists for — reducing pressure on a
+/// squeezed board.
 struct UnitBudget {
     slots: Arc<Semaphore>,
     ceiling: usize,
@@ -344,6 +357,30 @@ impl UnitBudget {
             .acquire_many_owned(units)
             .await
             .map_err(|_| anyhow::anyhow!("inference unit semaphore closed"))
+    }
+
+    /// Hand one request's permits back, retiring as many of them as an
+    /// outstanding shrink still owes.
+    ///
+    /// This is the *only* way a shrink can land on a saturated budget: a
+    /// dropped permit is given to a waiter before any resize can see it, so
+    /// the permit has to be retired at the moment it comes back rather than
+    /// looked for afterwards. `forget()` takes all of them out of circulation
+    /// and the surplus is re-issued, which is the same arithmetic as
+    /// "retire `retired`, return `held - retired`" and needs no permit
+    /// splitting.
+    fn release(&self, permit: tokio::sync::OwnedSemaphorePermit) {
+        let held = permit.num_permits() as usize;
+        let mut state = self.state.lock().expect("unit budget mutex poisoned");
+        let retired = state.pending_shrink.min(held);
+        state.pending_shrink -= retired;
+        permit.forget();
+        if held > retired {
+            self.slots.add_permits(held - retired);
+        }
+        // Anything the resize path could not take at the time may be takeable
+        // now (permits freed by requests that are not going through here).
+        Self::drain_shrink(&self.slots, &mut state);
     }
 
     /// Apply one predict response's desired in-flight figure.
@@ -392,9 +429,9 @@ impl UnitBudget {
         Self::drain_shrink(&self.slots, &mut state);
     }
 
-    /// Retry a shrink that could not be satisfied earlier. Called whenever a
-    /// request's permits come back, which is when previously-outstanding
-    /// permits become withdrawable.
+    /// Retry a shrink out of whatever is free right now. The failure path's
+    /// counterpart to [`Self::release`], for when a request came back with no
+    /// figure to apply.
     fn settle(&self) {
         let mut state = self.state.lock().expect("unit budget mutex poisoned");
         Self::drain_shrink(&self.slots, &mut state);
@@ -2444,11 +2481,11 @@ async fn predict_units(
         )
         .await;
     drop(inference_span);
-    // Release this request's permits *before* resizing, so a shrink can take
-    // them out of circulation immediately instead of waiting for the next
-    // response; `settle` covers the failure path, where there is no figure to
-    // apply but permits still came back.
-    drop(permits);
+    // Release this request's permits *before* resizing, so a shrink already
+    // outstanding retires them instead of handing them to one of the waiting
+    // item tasks; `settle` covers the failure path, where there is no figure
+    // to apply but permits still came back.
+    unit_slots.release(permits);
     match &response {
         Ok(response) => unit_slots.observe(response.desired_in_flight_items),
         Err(_) => unit_slots.settle(),
@@ -3596,6 +3633,101 @@ mod tests {
             "the target, reached once the outstanding permits returned"
         );
         assert_eq!(budget.state.lock().unwrap().target, 96);
+    }
+
+    /// **S1b: a shrink must land even while the budget is saturated and
+    /// hundreds of item tasks are queued for permits.**
+    ///
+    /// This is the case `forget_permits` cannot reach: there is nothing
+    /// available to forget, and a permit released by `drop` is handed to a
+    /// waiter before any resize can see it. Run2's `S2-wdvit` leg measured the
+    /// consequence — after the knee the published figure fell to core's floor
+    /// of 64, `pending_shrink` became 136, and the job's in-flight count stayed
+    /// at 200 for the whole post-knee phase. Harmless there only because the
+    /// transport was the real bound; live the moment the header is used to
+    /// *reduce* pressure on a squeezed board, which is what T5 added it for.
+    #[tokio::test]
+    async fn a_shrink_lands_through_releases_even_with_waiters_queued() {
+        const SATURATED: usize = 200;
+        const TARGET: usize = 64;
+        /// 200 - 64. The brief's figure, and the arithmetic is exact: each
+        /// release retires one permit until the deficit is repaid.
+        const DEFICIT: usize = SATURATED - TARGET;
+
+        let budget = Arc::new(UnitBudget::new(1_000));
+        budget.observe(Some(SATURATED as u64));
+        // Saturated: every permit is held by an in-flight request.
+        let mut held = Vec::new();
+        for _ in 0..SATURATED {
+            held.push(budget.acquire(1).await.expect("permits"));
+        }
+        assert_eq!(budget.slots.available_permits(), 0);
+
+        // And a queue of item tasks waiting for one, as a real job has.
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut waiters = tokio::task::JoinSet::new();
+        for _ in 0..SATURATED {
+            let budget = Arc::clone(&budget);
+            let admitted = Arc::clone(&admitted);
+            waiters.spawn(async move {
+                let permit = budget.acquire(1).await.expect("permits");
+                admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Held, so an admitted waiter stays counted as in flight.
+                std::mem::forget(permit);
+            });
+        }
+        tokio::task::yield_now().await;
+
+        budget.observe(Some(TARGET as u64));
+        assert_eq!(
+            budget.state.lock().unwrap().pending_shrink,
+            DEFICIT,
+            "nothing is free, so the whole shrink is owed"
+        );
+
+        // Each release repays the deficit before it re-issues anything.
+        for _ in 0..DEFICIT {
+            budget.release(held.pop().expect("held"));
+        }
+        // Let every woken waiter run, if any were woken.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert_eq!(
+            admitted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "not one of the {DEFICIT} released permits may reach a waiter \
+             while the shrink is owed"
+        );
+        assert_eq!(
+            budget.state.lock().unwrap().pending_shrink,
+            0,
+            "and the deficit is exactly repaid by {DEFICIT} releases"
+        );
+        assert_eq!(
+            held.len(),
+            TARGET,
+            "in-flight is the new target after {DEFICIT} releases"
+        );
+        assert_eq!(budget.slots.available_permits(), 0);
+
+        // Past the deficit the budget behaves normally again: releases go to
+        // the waiters, and never more than the target at once.
+        for _ in 0..TARGET {
+            budget.release(held.pop().expect("held"));
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            admitted.load(std::sync::atomic::Ordering::SeqCst),
+            TARGET,
+            "the budget still admits exactly its target"
+        );
+        waiters.abort_all();
     }
 
     /// A shrink that never landed is cancelled by a later growth instead of
