@@ -587,14 +587,25 @@ impl EndpointRuntime {
                 INFERENCE_MAX_CONCURRENT_REQUESTS.saturating_sub(self.h1_gate.available_permits()),
             ),
             _ => {
-                let target = self
-                    .h2_gate_state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .target;
+                // In flight is *permits in existence* minus what is free, and
+                // the invariant says permits in existence are
+                // `target + pending_shrink` — a shrink that has not landed
+                // yet is permits somebody is still holding. Subtracting from
+                // `target` alone reports a saturated, shrinking endpoint as
+                // idle, which is the one moment the number is worth reading
+                // (run2 S1b is exactly a shrink that did not land).
+                let (target, pending) = {
+                    let state = self
+                        .h2_gate_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    (state.target, state.pending_shrink)
+                };
                 (
                     target,
-                    target.saturating_sub(self.h2_gate.available_permits()),
+                    target
+                        .saturating_add(pending)
+                        .saturating_sub(self.h2_gate.available_permits()),
                 )
             }
         }
@@ -2297,6 +2308,16 @@ mod tests {
         // now — the deficit is 512 - 256 = 256.
         client.observe_desired_in_flight(u64::from(INFERENCE_MAX_CONCURRENT_REQUESTS as u32));
         assert_eq!(runtime.h2_gate.available_permits(), 0);
+        // And `/health` says what is really in flight while the shrink is
+        // outstanding: 512 requests are still holding permits, even though
+        // the target is now 256. Reporting `target - available` here — which
+        // is what it used to do — renders a saturated, shrinking endpoint as
+        // idle, at the one moment the number is worth reading.
+        assert_eq!(
+            runtime.gate_snapshot(Some(Transport::H2c)),
+            (INFERENCE_MAX_CONCURRENT_REQUESTS, 512),
+            "in flight is permits in existence minus what is free"
+        );
 
         // Every release repays the deficit before it re-issues anything.
         for _ in 0..256 {
@@ -2319,6 +2340,11 @@ mod tests {
                 .iter()
                 .all(|lane| lane.in_flight.load(Relaxed) == 0),
             "every lane claim is returned with its lease"
+        );
+        assert_eq!(
+            runtime.gate_snapshot(Some(Transport::H2c)),
+            (INFERENCE_MAX_CONCURRENT_REQUESTS, 0),
+            "and once the deficit is repaid the two expressions agree again"
         );
     }
 
