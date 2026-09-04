@@ -15,7 +15,9 @@ the mechanism that spends it. Given a `predict` request that carries a
    bucketing was sorting on;
 3. applies the **defensive clamp** before every batch — shrink-only, never
    above the grant — so a window granted seconds ago cannot run past a world
-   that moved;
+   that moved, and, since run2's S1, asks the impl for its **shape ceiling**
+   ([`MAX_BATCH_ATTR`]) as well, because a kernel that cannot index the
+   tensor a batch builds refuses it with any amount of memory free;
 4. measures every batch (`memory.measure_batch`) and flags out-of-memory and
    throughput-collapse batches, which is what the orchestrator's deflation
    path consumes — and, since run2's R3, says *why* it called a failure an
@@ -183,6 +185,24 @@ PADS_TO_COMMON_SIZE_ATTR = "pads_to_common_size"
 # the warning is left for the impl that makes no such promise. 2x area is the
 # smallest mix worth naming: below it the padding waste is within the margin.
 MIXED_SIZE_LOG_RATIO = 2.0
+
+# Optional method an impl may expose to answer one question the grant cannot:
+# *how many of these particular inputs can one call execute at all?* It is a
+# **shape** ceiling, never a memory opinion — the kernel-index case run2
+# measured (`inferio.impl.eocr.max_batch_for`: CRAFT's first pooling kernel
+# addresses its output with a signed 32-bit int, so 2560-bounded A4 pages
+# stop at 28 items whatever the board has free). Called with the window's
+# `(width, height)` header readings for the planned batch, in PIL's order,
+# `None` where a header could not be read; it returns a positive item count,
+# or None for "no ceiling from me".
+MAX_BATCH_ATTR = "max_batch_for"
+
+# `clamped.reason` for a batch shrunk by [`MAX_BATCH_ATTR`] (or by the impl's
+# own equivalent inside `predict`) rather than by the defensive memory clamp.
+# The key is additive on the wire: its **absence** means the memory clamp,
+# which is what every pre-run2 worker emitted and what the orchestrator
+# already understands (docs/inferio-worker-protocol.md, measurement fields).
+INDEX_LIMIT_REASON = "index_limit"
 
 # Flat per-input allowance for `audio-second` pricing: reading a clip's real
 # duration needs a decoder, and nothing in the shipped registry is priced
@@ -414,12 +434,18 @@ def _image_source(value: Any) -> Any | None:
     return None
 
 
-def _pixels(value: Any) -> int | None:
-    """Decoded pixel count from an image header, or None.
+def _shape(value: Any) -> tuple[int, int] | None:
+    """`(width, height)` from an image header, or None.
 
     `Image.open` is lazy — it parses the header and reads `size` without
     decoding pixel data, which is the whole point: pricing must not cost what
     the batch itself will cost.
+
+    The *shape* rather than only its product, because two things want this
+    one reading and they want different halves of it: pricing multiplies it
+    ([`_areas`]), and an impl's batch ceiling ([`impl_max_batch`]) is a
+    function of the padded height and width separately — a portrait and a
+    landscape page of equal area build differently sized tensors.
     """
     source = _image_source(value)
     if source is None:
@@ -434,7 +460,7 @@ def _pixels(value: Any) -> int | None:
         return None
     if width <= 0 or height <= 0:
         return None
-    return int(width) * int(height)
+    return (int(width), int(height))
 
 
 def _text_bytes(data: Any) -> int:
@@ -578,11 +604,17 @@ def _log_canvas_once(source: str | None, pixels: int | None) -> None:
     )
 
 
-def _pixel_readings(inputs: Sequence[Any]) -> list[int | None]:
-    """Raw decoded pixels per input, None where the header could not be read.
-    The one place an image header is opened; every priced figure is derived
-    from this list, so a window is never read twice."""
-    return [_pixels(getattr(entry, "file", None)) for entry in inputs]
+def _shape_readings(inputs: Sequence[Any]) -> list[tuple[int, int] | None]:
+    """Raw `(width, height)` per input, None where the header was unreadable.
+    The one place an image header is opened; every priced figure and every
+    batch-ceiling question is derived from this list, so a window is never
+    read twice."""
+    return [_shape(getattr(entry, "file", None)) for entry in inputs]
+
+
+def _areas(shapes: Sequence[tuple[int, int] | None]) -> list[int | None]:
+    """[`_shape_readings`] as raw pixel counts, preserving the None holes."""
+    return [None if shape is None else shape[0] * shape[1] for shape in shapes]
 
 
 def _pixel_units(readings: Sequence[int | None], cap: int | None) -> list[int]:
@@ -624,6 +656,7 @@ class PricedWindow(NamedTuple):
 
     units: list[int]
     raw: list[int]
+    shapes: list[tuple[int, int] | None] | None = None
 
 
 def price_window(
@@ -631,17 +664,28 @@ def price_window(
 ) -> PricedWindow:
     """[`price_inputs`], plus the same window priced without the canvas cap.
 
-    One pass over the inputs: an image header is read once and both figures
-    are derived from that one reading, since they differ only by a `min`.
+    One pass over the inputs: an image header is read once and every figure
+    below is derived from that one reading. `shapes` is the reading itself,
+    carried out of here so [`impl_max_batch`] can ask its question without
+    opening a single header twice; it is None for a non-`pixel` window, where
+    no header is read at all.
     """
     cap = canvas_pixels if canvas_pixels and canvas_pixels > 0 else None
-    if unit != "pixel" or cap is None:
+    if unit != "pixel":
+        # No image headers on this path at all — a token or item price knows
+        # nothing about shapes.
+        units = price_inputs(inputs, unit, canvas_pixels)
+        return PricedWindow(units, units, None)
+    shapes = _shape_readings(inputs)
+    readings = _areas(shapes)
+    if cap is None:
         # No cap applies, so the raw prices *are* the prices. Sharing the one
         # list is safe: neither is mutated anywhere.
-        units = price_inputs(inputs, unit, canvas_pixels)
-        return PricedWindow(units, units)
-    readings = _pixel_readings(inputs)
-    return PricedWindow(_pixel_units(readings, cap), _pixel_units(readings, None))
+        units = _pixel_units(readings, None)
+        return PricedWindow(units, units, shapes)
+    return PricedWindow(
+        _pixel_units(readings, cap), _pixel_units(readings, None), shapes
+    )
 
 
 def _pads_without_a_canvas(instance: Any) -> bool:
@@ -708,6 +752,145 @@ def _warn_mixed_batch_once(batch: Sequence[int], raw: Sequence[int]) -> None:
     )
 
 
+def impl_max_batch(
+    instance: Any, shapes: Sequence[tuple[int, int] | None]
+) -> int | None:
+    """What the impl says it can execute for a batch of these shapes, or None.
+
+    Passive and total, like every other question this module asks a loaded
+    impl: an absent method, a method that raises, and a nonsensical answer
+    are all "no ceiling from me", which is what every impl said before the
+    hook existed. Only a positive `int` is an answer — a `bool` is not, and
+    neither is a float, because a ceiling is a count of items.
+    """
+    hook = getattr(instance, MAX_BATCH_ATTR, None)
+    if not callable(hook):
+        return None
+    try:
+        answer = hook(list(shapes))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("%s raised; ignoring its ceiling: %s", MAX_BATCH_ATTR, exc)
+        return None
+    if isinstance(answer, bool) or not isinstance(answer, int):
+        return None
+    return answer if answer > 0 else None
+
+
+def cap_batch_to_impl_ceiling(
+    instance: Any,
+    batch: Sequence[int],
+    shapes: Sequence[tuple[int, int] | None] | None,
+    units: Sequence[int],
+    aggregation: str,
+    free_mb: int | None,
+) -> tuple[list[int], dict[str, Any] | None]:
+    """Trim `batch` to what the impl can execute, and report the trim.
+
+    Returns `(batch, clamped)` — `clamped` present only when something was
+    actually removed, carrying the same `{from_units, to_units, free_mb}` the
+    memory clamp emits plus `reason = "index_limit"`, so the orchestrator can
+    tell the two apart without a new field
+    (docs/inferio-worker-protocol.md, measurement fields).
+
+    **Why one pass is enough.** `plan_batches` orders a batch by descending
+    price, so the items dropped here are its smallest; the member that sets
+    the padded tensor's dimensions stays, and the ceiling computed for the
+    full batch is therefore still valid — and never *too small* — for the
+    trimmed one. Re-asking after the trim could only ever grant more items,
+    and deliberately is not done: one question per batch, no fixpoint loop
+    around an impl's method.
+
+    The dropped items are not lost. They stay in `pending` and are planned
+    into the next batch of the same window.
+    """
+    if shapes is None or len(batch) < 2:
+        return list(batch), None
+    ceiling = impl_max_batch(instance, [shapes[index] for index in batch])
+    if ceiling is None or ceiling >= len(batch):
+        return list(batch), None
+    kept = list(batch[:ceiling])
+    before = batch_units(batch, units, aggregation)
+    after = batch_units(kept, units, aggregation)
+    logger.warning(
+        "the impl can execute at most %d of the %d inputs this batch was "
+        "planned with (%d units down to %d); trimming it. This is a shape "
+        "ceiling, not a memory condition — the remaining inputs go to the "
+        "next batch of this window",
+        ceiling,
+        len(batch),
+        before,
+        after,
+    )
+    clamped: dict[str, Any] = {
+        "from_units": before,
+        "to_units": after,
+        "reason": INDEX_LIMIT_REASON,
+    }
+    if free_mb is not None:
+        clamped["free_mb"] = free_mb
+    return kept, clamped
+
+
+def merge_clamps(
+    memory_clamp: dict[str, Any] | None, shape_clamp: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """One `clamped` map for a batch both clamps touched.
+
+    A measurement carries at most one. When the defensive memory clamp shrank
+    the *budget* and the impl's ceiling then shrank the *batch*, the honest
+    single statement spans both: `from_units` is what the grant started at,
+    `to_units` is what actually ran, and `reason` names the constraint that
+    set `to_units` — the shape ceiling, since it applied last and is the one
+    that bound. Nothing is lost that the orchestrator reads: it keys on the
+    map's presence, and the three figures are operator-facing provenance.
+    """
+    if shape_clamp is None:
+        return memory_clamp
+    if memory_clamp is None:
+        return shape_clamp
+    merged = dict(shape_clamp)
+    merged["from_units"] = memory_clamp["from_units"]
+    return merged
+
+
+def executed_clamp(
+    existing: dict[str, Any] | None,
+    batch: Sequence[int],
+    executed: int | None,
+    units: Sequence[int],
+    aggregation: str,
+    priced: int,
+    free_mb: int | None,
+) -> dict[str, Any]:
+    """`clamped` for a batch the *impl* cut short on a shape ceiling.
+
+    The backstop to [`cap_batch_to_impl_ceiling`], for the cases the harness
+    could not pre-empt: an impl that computes a ceiling the harness cannot
+    (a per-request parameter it never sees), or a kernel that raised and
+    `run_with_oom_retry` halved through. Either way the impl told us so
+    through `inferio.impl.utils.total_index_limit_events`, and the batch's
+    measurement must say the size it ran at was not the size it was granted —
+    without the `oom` flag, which is the whole point (run2 probes report, S1).
+
+    `to_units` is the largest chunk the impl reports executing, priced from
+    the front of the batch: `plan_batches` ordered it by descending price, so
+    that is the most expensive `executed` items in it and therefore never an
+    under-statement.
+    """
+    ran = (
+        list(batch[:executed])
+        if isinstance(executed, int) and 0 < executed < len(batch)
+        else list(batch)
+    )
+    clamped = dict(existing) if existing else {}
+    clamped.setdefault("from_units", priced)
+    clamped["to_units"] = batch_units(ran, units, aggregation)
+    clamped["reason"] = INDEX_LIMIT_REASON
+    if free_mb is not None:
+        clamped.setdefault("free_mb", free_mb)
+    return clamped
+
+
 def price_inputs(
     inputs: Sequence[Any], unit: str, canvas_pixels: int | None = None
 ) -> list[int]:
@@ -730,7 +913,7 @@ def price_inputs(
     units: list[int] = []
     if unit == "pixel":
         cap = canvas_pixels if canvas_pixels and canvas_pixels > 0 else None
-        return _pixel_units(_pixel_readings(inputs), cap)
+        return _pixel_units(_areas(_shape_readings(inputs)), cap)
     if unit == "token":
         for entry in inputs:
             total = _text_bytes(getattr(entry, "file", None)) + _text_bytes(
@@ -854,7 +1037,7 @@ class LiveBudget(NamedTuple):
     units: int
     free_mb: int | None
     free_source: str | None
-    clamped: dict[str, int] | None
+    clamped: dict[str, Any] | None
 
 
 def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
@@ -1164,6 +1347,34 @@ def _oom_halvings_total() -> int:
         return 0
 
 
+def _index_limit_total() -> int:
+    """`inferio.impl.utils.total_index_limit_events()`, or 0 when unavailable.
+
+    The shape-ceiling twin of [`_oom_halvings_total`], and deliberately a
+    separate counter rather than a share of that one: a kernel index ceiling
+    halves a batch exactly as an out-of-memory condition does, but it is not
+    one, and folding it into `oom` would deflate a model on a board with tens
+    of GB free — which is the whole reason run2's S1 needed a fix rather than
+    a wider OOM classifier.
+
+    Diffed across the whole `predict` call for the same reason the OOM total
+    is: an impl may consult the retry helper more than once, and may also cap
+    its own batch up front without any exception being raised at all.
+    """
+    utils = sys.modules.get("inferio.impl.utils")
+    reader = (
+        getattr(utils, "total_index_limit_events", None)
+        if utils is not None
+        else None
+    )
+    if reader is None:
+        return 0
+    try:
+        return int(reader())
+    except Exception:  # pragma: no cover - defensive
+        return 0
+
+
 def _executed_shape(
     before: tuple[int, int, int] | None, planned: int
 ) -> tuple[int | None, int]:
@@ -1299,6 +1510,13 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
     # Decided once per window, not per batch: the object graph does not change
     # mid-window, and the walk is the only part of the check with a cost.
     watch_mixing = canvas is not None and _pads_without_a_canvas(instance)
+    # The impl's shape ceiling needs `(width, height)`, which the pixel pricer
+    # already read. A non-`pixel` window read no headers at all, so if the
+    # impl exposes the hook we read them here — once, before the timed
+    # sections, exactly as pricing does.
+    shapes = prices.shapes
+    if shapes is None and callable(getattr(instance, MAX_BATCH_ATTR, None)):
+        shapes = _shape_readings(inputs)
 
     outputs: list[Any] = [None] * len(inputs)
     measurements: list[dict[str, Any]] = []
@@ -1329,6 +1547,15 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
             tiebreak=remaining_raw,
         )
         batch = [pending[position] for position in plan[0]]
+        # The second, non-memory bound on this batch: what the impl can
+        # actually execute for these shapes. Asked after planning and before
+        # anything runs, so a batch the impl would have chunked internally —
+        # and reported unpriceable — instead runs whole and is a clean priced
+        # sample, with `clamped.reason` saying why it was not the full budget.
+        batch, shape_clamp = cap_batch_to_impl_ceiling(
+            instance, batch, shapes, units, aggregation, live.free_mb
+        )
+        clamped = merge_clamps(live.clamped, shape_clamp)
         if watch_mixing:
             _warn_mixed_batch_once(batch, raw_units)
         priced = batch_units(batch, units, aggregation)
@@ -1336,6 +1563,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
         state = memory.begin_batch()
         retry_before = _oom_retry_record()
         halvings_before = _oom_halvings_total()
+        index_limits_before = _index_limit_total()
         started = time.perf_counter()
         try:
             produced = list(instance.predict([inputs[index] for index in batch]))
@@ -1348,7 +1576,9 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
             # under-stated peak, dragging the slope low: over-admission produced
             # by a failure. The `oom` flag still rides the measurement, and that
             # is what deflation consumes.
-            _, absorbed = _batch_shape(retry_before, len(batch), halvings_before)
+            executed, absorbed = _batch_shape(
+                retry_before, len(batch), halvings_before
+            )
             oom_class = classify_oom(exc, absorbed)
             oom = oom_class is not None
             if not oom:
@@ -1358,6 +1588,11 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
                     len(batch),
                     type(exc).__name__,
                 )
+            if _index_limit_total() > index_limits_before:
+                clamped = executed_clamp(
+                    clamped, batch, executed, units, aggregation, priced,
+                    live.free_mb,
+                )
             record(
                 memory.measure_batch(
                     state,
@@ -1366,7 +1601,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
                     oom_class=oom_class,
                     free_mb=live.free_mb,
                     free_source=live.free_source,
-                    clamped=live.clamped,
+                    clamped=clamped,
                 )
             )
             message = str(exc)
@@ -1392,7 +1627,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
                     items=len(batch),
                     free_mb=live.free_mb,
                     free_source=live.free_source,
-                    clamped=live.clamped,
+                    clamped=clamped,
                 ))
             raise WindowFailure(str(exc), measurements, exc) from exc
 
@@ -1411,6 +1646,16 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
                 executed,
                 len(batch),
             )
+        if _index_limit_total() > index_limits_before:
+            # The impl hit its own shape ceiling inside `predict` — the
+            # harness's pre-cap did not see it (an older impl, an unreadable
+            # header, a per-request parameter only the impl knows). The batch
+            # is already unpriceable by `executed`; this says *why*, and says
+            # it is not a memory event.
+            clamped = executed_clamp(
+                clamped, batch, executed, units, aggregation, priced,
+                live.free_mb,
+            )
         measurement = memory.measure_batch(
             state,
             items=len(batch),
@@ -1419,7 +1664,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
             oom_class=classify_oom(None, absorbed_ooms) if absorbed_ooms else None,
             free_mb=live.free_mb,
             free_source=live.free_source,
-            clamped=live.clamped,
+            clamped=clamped,
         )
         if absorbed_ooms:
             logger.warning(

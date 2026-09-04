@@ -2981,7 +2981,7 @@ def measure_batch(
     oom_class: dict[str, Any] | None = None,
     free_mb: int | None = None,
     free_source: str | None = None,
-    clamped: dict[str, int] | None = None,
+    clamped: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One measurement map for the batch bracketed by `state` (never raises).
 
@@ -3010,7 +3010,9 @@ def measure_batch(
     describe a different world from the one the clamp decided against. They
     are what lets the orchestrator's external-usage term refresh once per
     batch instead of once per staleness timer (run2 R5). `clamped` is that
-    clamp's report, present only when it actually shrank the batch.
+    clamp's report, present only when something actually shrank the batch —
+    carrying `reason` when what shrank it was not the memory clamp
+    (docs/inferio-worker-protocol.md, measurement fields).
     """
     try:
         _, _, peak_reserved, peak_allocated = _allocator_stats()
