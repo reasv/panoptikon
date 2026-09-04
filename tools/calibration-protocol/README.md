@@ -188,7 +188,9 @@ with `torch.cuda.max_memory_reserved` / `max_memory_allocated` plus NVML's
 per-process figure. Units are priced with the worker's own
 `packing.price_inputs`/`batch_units`, and the slope is fitted with the same
 Theil–Sen estimator as `ledger.rs: robust_fit`, so probe and ledger numbers are
-directly comparable. `--dry-run` resolves and prints the plan without touching
+directly comparable. A batch counts as an OOM by the worker's own
+`packing.classify_oom` — the same three tiers the ledger acts on, imported
+rather than copied — and each row carries the `oom_class` that decided it. `--dry-run` resolves and prints the plan without touching
 a GPU. `--bisect-oom` pairs with `hog.py leave-free N` to find the true OOM
 boundary at N MiB free.
 

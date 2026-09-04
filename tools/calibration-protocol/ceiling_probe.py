@@ -78,6 +78,9 @@ Output schema (JSON)
               "free_after_mb": int},
      "batches": [{"batch": int, "repeat": int, "units": int,
                   "items": int, "ok": bool, "oom": bool,
+                  "oom_class": {"source": str, "exception": str,
+                                "free_mb_at_failure": int|null,
+                                "device": str} | null,
                   "absorbed_halvings": int, "duration_ms": float,
                   "peak_reserved_mb": int, "peak_allocated_mb": int,
                   "reserved_before_mb": int, "reserved_after_mb": int,
@@ -102,6 +105,10 @@ that sum, not against `free_mb_at_start` alone.
 
 Caveats
 -------
+* `oom` is decided by the worker's own classifier (`packing.classify_oom`),
+  imported rather than copied, so the boundary this tool draws is the boundary
+  the ledger acts on; `oom_class` says which tier decided (`typed_exception`,
+  `marker`, `message_pattern`) and what the board had free at the time.
 * Impls with their own `run_with_oom_retry` (wd taggers, openclip) absorb OOMs
   by halving internally, so a "successful" batch can still have hit one; the
   probe reads `inferio.impl.utils.total_oom_halvings()` across every call and
@@ -523,19 +530,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         before_halvings = halvings()
         started = time.monotonic()
         error: Optional[str] = None
+        failure: Optional[BaseException] = None
         ok = True
         try:
             instance.predict(inputs)
             torch.cuda.synchronize()
         except Exception as exc:
             ok = False
+            failure = exc
             error = f"{type(exc).__name__}: {exc}"[:600]
         duration_ms = (time.monotonic() - started) * 1000.0
         peak_reserved = int(torch.cuda.max_memory_reserved() // MIB)
         peak_allocated = int(torch.cuda.max_memory_allocated() // MIB)
         reserved_after = int(torch.cuda.memory_reserved() // MIB)
         absorbed = max(0, halvings() - before_halvings)
-        oom = (not ok and _looks_like_oom(error)) or absorbed > 0
+        # The worker's own classifier, imported rather than reimplemented
+        # (run2 R3, `packing.classify_oom`): three tiers over the whole
+        # exception chain — a typed `torch.OutOfMemoryError`, our
+        # `INFERENCE_OOM_*` markers, then a closed list of allocator spellings
+        # plus "out of memory" scoped to a whole-word device token. This tool
+        # used to match a bare `"out of memory"` substring, which is precisely
+        # what run1's B11 showed to be wrong (a caption cache "out of memory
+        # slots" is not a board out of memory), and a probe that draws the OOM
+        # boundary somewhere the ledger does not is not a ground truth for it.
+        oom_class = packing.classify_oom(failure, absorbed)
+        oom = oom_class is not None
         return {
             "batch": count,
             "repeat": repeat,
@@ -543,6 +562,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "items": count,
             "ok": ok,
             "oom": bool(oom),
+            "oom_class": oom_class,
             "absorbed_halvings": absorbed,
             "duration_ms": round(duration_ms, 3),
             "peak_reserved_mb": peak_reserved,
@@ -701,19 +721,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr,
         )
     return 0
-
-
-_OOM_MARKERS = (
-    "out of memory", "inference_oom", "outofmemoryerror", "memoryerror",
-    "hip out of memory",
-)
-
-
-def _looks_like_oom(message: Optional[str]) -> bool:
-    if not message:
-        return False
-    lowered = message.lower()
-    return any(marker in lowered for marker in _OOM_MARKERS)
 
 
 def _resolve_dtype(instance: Any) -> Optional[str]:
