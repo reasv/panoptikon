@@ -796,6 +796,36 @@ Worker, per batch within its window:
   - **Cleared on respawn**, which holds by construction: the counter lives on
     the ledger's per-replica entry and the manager builds a fresh one. The
     (model, board) ratchet anchor, which is not per replica, survives.
+- **What counts as an out-of-memory condition at all** (run2 change R3, host
+  half; finding Q1/B11). Before run2 the host deflated on any error text
+  containing the words "out of memory", and run1 measured that firing 15 times
+  on a board with 96 GB free, from a shipped impl that worded an unrelated
+  failure as "the caption cache is out of memory slots". Two paths reach the
+  deflation gate and each has its own rule:
+  - **With a measurement**, the worker states *how* it classified the failure
+    (`oom_class.source`, protocol doc "Memory sensing"). `typed_exception` and
+    `marker` are structural — the interpreter named the condition, or our own
+    marker did after naming it — and deflate on their own. `message_pattern`
+    is a reading of prose, and it is **vetoed** by `free_mb_at_failure`: if
+    the worker's live reading at the instant of the failure showed at least
+    the whole MB envelope the grant priced that window at, then no batch size
+    the host could have chosen was the problem and halving the budget would
+    cost throughput and fix nothing. The veto only ever refuses a deflation —
+    an absent reading, or a memory-blind grant, leaves the classification
+    standing, because a *missed* out-of-memory leaves the ledger
+    over-admitting against a model that has just proved it cannot take the
+    size.
+  - **Without one** (the error frame: a `predict` that failed with nothing
+    measured), the host mirrors the worker's classifier exactly: the
+    `INFERENCE_OOM_*` markers, the closed list of allocator and driver
+    spellings that never say "out of memory", the `defaultcpuallocator` pair,
+    and the words `out of memory` **plus a device-API token as a whole word**
+    (`cuda`, `hip`, `rocm`, `nvml`, `xpu`, `sycl`). The bare substring is
+    gone; the scoped rule is what keeps `CUDA driver error: out of memory` and
+    CTranslate2's `CUDA failed with error out of memory` from being lost to a
+    closed list. Every rule is matched per **line** of the failure's own
+    message and traceback — never its stderr tail — because a traceback names
+    `torch/cuda/__init__.py` in its frames and `/` is a word boundary.
 - **A negative sample deflates and is then discarded.** It never enters the fit
   and never advances the ratchet anchor. Its `peak_reserved` is whatever the
   allocator managed before it gave up — an *under*-statement of the batch's real

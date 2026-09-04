@@ -93,7 +93,7 @@ use serde::{Deserialize, Serialize};
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
-use super::worker::{LoadReport, TelemetryHandle};
+use super::worker::{BatchMeasurement, LoadReport, TelemetryHandle};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
 /// `usable = total − other_used × (1 + margin)`.
@@ -4435,6 +4435,10 @@ impl VramLedger {
             .unwrap_or(u32::MAX);
         let sole_occupancy = occupants == 0;
         let mut suppressed_collapses = 0usize;
+        // `(free at failure, the window's granted envelope)` for every
+        // message-pattern OOM this window's own free readings contradicted
+        // (run2 change R3, host half).
+        let mut contradicted_ooms: Vec<(u64, u64)> = Vec::new();
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -4500,7 +4504,19 @@ impl VramLedger {
                 suppressed_collapses += 1;
             }
             let collapse = measurement.throughput_collapse && !collapse_suppressed;
-            if measurement.oom || collapse {
+            // The worker's structural OOM classification, read for what it is
+            // (run2 change R3, host half; see [`oom_verdict`]). A message-only
+            // classification the board's own free reading contradicts is not a
+            // negative — it is B11, and B11 deflated a healthy model 15 times.
+            let oom = match oom_verdict(measurement, window.as_ref()) {
+                OomVerdict::None => false,
+                OomVerdict::Trusted => true,
+                OomVerdict::Contradicted { free_mb, grant_mb } => {
+                    contradicted_ooms.push((free_mb, grant_mb));
+                    false
+                }
+            };
+            if oom || collapse {
                 // A negative sample is evidence that a batch this size did NOT
                 // work — an OOM, or a WDDM spill that silently ran out of a
                 // system-RAM fallback. Its `peak_reserved` is whatever the
@@ -4513,7 +4529,7 @@ impl VramLedger {
                 // could never actually take hold. The sample deflates and is
                 // then discarded; only the watermark moves.
                 negative = true;
-                saw_oom |= measurement.oom;
+                saw_oom |= oom;
                 saw_collapse |= collapse;
                 continue;
             }
@@ -4646,6 +4662,22 @@ impl VramLedger {
                     model.as_deref(),
                 );
             }
+        }
+        if let Some((free_mb, grant_mb)) = contradicted_ooms.first().copied() {
+            tracing::warn!(
+                model = %key.0,
+                gpu = %gpu,
+                contradicted = contradicted_ooms.len(),
+                free_mb_at_failure = free_mb,
+                grant_mb,
+                "not deflating on this window's out-of-memory report: the \
+                 worker classified it from the failure's *wording* alone, and \
+                 its own live reading at that instant had at least the whole \
+                 envelope this window was priced at still free. A batch this \
+                 size was not what the board ran out of, so halving the budget \
+                 would cost throughput and fix nothing (run2 change R3, \
+                 finding Q1/B11)"
+            );
         }
         if suppressed_collapses > 0 {
             tracing::debug!(
@@ -5876,43 +5908,189 @@ impl Drop for Admission {
     }
 }
 
+/// Allocator and driver failures that never say "out of memory" at all, so
+/// each spelling has to be listed. The mirror of the worker's
+/// `packing.OOM_MESSAGE_PATTERNS` (run2 change R3), lower-cased.
+const OOM_MESSAGE_PATTERNS: [&str; 10] = [
+    "mps backend out of memory",
+    "enforce fail at alloc_cpu.cpp",
+    "cublas_status_alloc_failed",
+    "cudnn_status_alloc_failed",
+    "cusolver_status_alloc_failed",
+    "cusparse_status_alloc_failed",
+    "cufft_alloc_failed",
+    "cudaerrormemoryallocation",
+    "hiperroroutofmemory",
+    "hiperrormemoryallocation",
+];
+
+/// Two fragments that must appear in the same line. CPU torch's classic
+/// allocator failure is one string in practice, but its middle varies by torch
+/// version and neither half alone is specific enough to match on
+/// (`packing.OOM_MESSAGE_PAIRS`).
+const OOM_MESSAGE_PAIRS: [(&str, &str); 1] = [("defaultcpuallocator", "allocate memory")];
+
+/// The device-scoped form of "out of memory": the words **plus** a device-API
+/// token as a whole word in the same line (`packing.OOM_DEVICE_TOKENS`).
+const OOM_DEVICE_PHRASE: &str = "out of memory";
+const OOM_DEVICE_TOKENS: [&str; 6] = ["cuda", "hip", "rocm", "nvml", "xpu", "sycl"];
+
+/// The three `oom_class.source` values the protocol defines, as the worker
+/// spells them (docs/inferio-worker-protocol.md; `packing.OOM_SOURCE_*`).
+pub const OOM_SOURCE_TYPED: &str = "typed_exception";
+pub const OOM_SOURCE_MARKER: &str = "marker";
+pub const OOM_SOURCE_MESSAGE_PATTERN: &str = "message_pattern";
+
+/// What the ledger makes of one measurement's out-of-memory claim (run2
+/// change R3, host half).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OomVerdict {
+    /// No out-of-memory condition claimed.
+    None,
+    /// Claimed and believed: the window deflates.
+    Trusted,
+    /// Claimed from a **message pattern** alone, and the worker's own live
+    /// free reading at the instant of the failure says the board had at least
+    /// the whole envelope this window was priced at. Not a negative.
+    Contradicted { free_mb: u64, grant_mb: u64 },
+}
+
+/// Whether a measurement's `oom` flag is evidence to deflate on.
+///
+/// Three tiers, exactly as the worker classified them (run2 change R3):
+///
+/// - **`typed_exception`** — a real `torch.OutOfMemoryError`, MPS or CPU
+///   allocator type. The interpreter itself named the condition; there is
+///   nothing to corroborate;
+/// - **`marker`** — this project's own `INFERENCE_OOM_*` sentinel, which we
+///   emit only after having already classified the failure as one of the
+///   above. Structural for the same reason;
+/// - **`message_pattern`** — the tier that reads prose. Trusted, but
+///   **vetoed** by the one piece of independent evidence the wire carries:
+///   `free_mb_at_failure`, the worker's live free reading taken at the moment
+///   the batch failed. If the board had at least `grant.mb` free right then —
+///   the whole envelope the ledger itself priced this window at — no batch
+///   size we could have chosen was the problem, and halving the budget cannot
+///   be the remedy. That is B11's exact shape: 15 negatives against a board
+///   with 96 GB free, from an impl that worded an unrelated failure as "out of
+///   memory slots".
+///
+/// **A veto, not a requirement, and that direction is deliberate.** After
+/// Track P's classifier `message_pattern` is already narrow — a closed
+/// allocator list plus "out of memory" scoped to a device-API token — so a
+/// classification reaching the host is strong evidence on its own. Demanding
+/// *positive* corroboration instead would refuse a real out-of-memory
+/// condition every time the worker could not take a free reading
+/// (`free_mb_at_failure` is `null` on any host whose backend reports no
+/// memory statistics) and every time a genuine allocator failure happens with
+/// memory free but **fragmented**, which is a routine shape for a caching
+/// allocator. Missing an OOM leaves the ledger over-admitting against a model
+/// that has just proved it cannot take the size — the failure R3 must not
+/// introduce while fixing the opposite one.
+///
+/// The comparand is the window's grant `mb` rather than the model's
+/// contention appetite because the grant is what *this window* was promised
+/// and what deflation acts on; the appetite is a share-of-board weight and
+/// says nothing about this batch. A memory-blind grant (`mb == 0`, priced
+/// against nothing) states no envelope, so it cannot contradict anything and
+/// the classification stands — the same reading of `mb == 0` that
+/// [`knee_admits_window`] takes.
+///
+/// A measurement with no `oom_class` at all is a **pre-run2 worker**, whose
+/// bare `oom` is the contract it was written to; it is trusted as it always
+/// was. An unrecognised `source` is trusted too: a future worker's new tier
+/// is more likely to be structural than not, and the safe direction for an
+/// unknown memory signal is to believe it.
+fn oom_verdict(measurement: &BatchMeasurement, window: Option<&GrantCharge>) -> OomVerdict {
+    if !measurement.oom {
+        return OomVerdict::None;
+    }
+    let Some(class) = measurement
+        .oom_class
+        .as_ref()
+        .filter(|class| class.source == OOM_SOURCE_MESSAGE_PATTERN)
+    else {
+        return OomVerdict::Trusted;
+    };
+    let (Some(free_mb), Some(grant_mb)) = (
+        class.free_mb_at_failure,
+        window.map(|charge| charge.mb).filter(|mb| *mb > 0),
+    ) else {
+        return OomVerdict::Trusted;
+    };
+    if free_mb >= grant_mb {
+        OomVerdict::Contradicted { free_mb, grant_mb }
+    } else {
+        OomVerdict::Trusted
+    }
+}
+
+/// Whether `token` occurs in `line` bounded by non-word characters on both
+/// sides — the host's `\b…\b`, so "chip", "ship" and "relationship" cannot
+/// stand in for "hip".
+fn contains_word(line: &str, token: &str) -> bool {
+    fn is_word(character: char) -> bool {
+        character.is_alphanumeric() || character == '_'
+    }
+    line.match_indices(token).any(|(start, _)| {
+        let end = start + token.len();
+        line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word(c))
+            && line[end..].chars().next().is_none_or(|c| !is_word(c))
+    })
+}
+
 /// Whether an error message from a worker names an out-of-memory condition
 /// the ledger should treat as a negative sample.
 ///
-/// Both prefixes are contract (docs/inferio-worker-protocol.md); the bare
-/// substrings catch a torch OOM that reached the error frame unwrapped, which
-/// is a real path for impls that do not route through `run_with_oom_retry`.
+/// Both `INFERENCE_OOM_*` prefixes are contract
+/// (docs/inferio-worker-protocol.md) and are markers this project emits after
+/// making the classification itself, so they are structural evidence rather
+/// than prose. Everything below them is the **error-frame** path: a `predict`
+/// that failed with no measurement to classify, which is the one path Track
+/// P's worker-side classifier cannot reach. It therefore mirrors that
+/// classifier exactly (`packing._pattern_oom`), and the mirror is the point —
+/// the worker classifies the exception it caught, this classifies the message
+/// that reached the error frame, and a wording only one of them recognises
+/// produces a deflation on one side of the wire and not the other.
 ///
-/// Kept in step with the worker's own `packing._looks_like_oom`, which is the
-/// classifier every unified backend's negative signal goes through
-/// (docs/unified-memory-admission.md, "Negative signals"): a case-insensitive
-/// `out of memory` covers MPS's `RuntimeError("MPS backend out of memory
-/// (…)")` and whatever spelling an APU's HSA layer turns out to use, and the
-/// `DefaultCPUAllocator` pair covers CPU torch, whose text never says "out of
-/// memory" at all. The two must agree — the worker classifies the exception it
-/// caught, this classifies the message that reached the error frame, and a
-/// message only one of them recognises produces a deflation on one side of the
-/// wire and not the other.
+/// **The bare `out of memory` substring is deliberately gone** (run2 change
+/// R3, finding Q1/B11). Run1 measured it deflating a healthy model 15 times
+/// on a board with 96 GB free, because a shipped impl worded an unrelated
+/// failure as "the caption cache is out of memory slots". What replaces it is
+/// not the closed list alone — that lost real conditions, as
+/// `CUDA driver error: out of memory` (torch's expandable-segments path) and
+/// `CUDA failed with error out of memory` (CTranslate2, a shipped dependency)
+/// both attest — but the closed list **plus** the words scoped to a device-API
+/// token. B11's wording names no device and is still refused.
 ///
 /// **What is handed to this matters as much as what it matches.** A `message`
 /// is one failure's own text, never a log excerpt: the dispatcher reads a
 /// `WorkerError`'s message and traceback and deliberately *not* its stderr
-/// tail (`dispatch::error_reports_oom`). The two-substring CPU form is tested
-/// **per line** for the same reason — across a multi-line blob its two halves
-/// could land in unrelated lines and match something that is not an allocator
-/// failure at all.
+/// tail (`dispatch::error_reports_oom`). Every rule is tested **per line**,
+/// the device-token rule included and for a sharper reason than the CPU pair's
+/// — a Python traceback names `torch/cuda/__init__.py` in its frames, and `/`
+/// is a word boundary, so a whole-blob test would let any B11-shaped message
+/// in a CUDA stack match on a token from a *file path*.
 pub fn message_reports_oom(message: &str) -> bool {
-    if message.contains("INFERENCE_OOM_BATCH_SIZE_1:")
-        || message.contains("INFERENCE_OOM_WINDOW:")
-        || message.contains("CUDA out of memory")
-        || message.contains("HIP out of memory")
+    if message.contains("INFERENCE_OOM_BATCH_SIZE_1:") || message.contains("INFERENCE_OOM_WINDOW:")
     {
         return true;
     }
     message.lines().any(|line| {
         let lowered = line.to_ascii_lowercase();
-        lowered.contains("out of memory")
-            || (lowered.contains("defaultcpuallocator") && lowered.contains("allocate memory"))
+        OOM_MESSAGE_PATTERNS
+            .iter()
+            .any(|pattern| lowered.contains(pattern))
+            || OOM_MESSAGE_PAIRS
+                .iter()
+                .any(|(first, second)| lowered.contains(first) && lowered.contains(second))
+            || (lowered.contains(OOM_DEVICE_PHRASE)
+                && OOM_DEVICE_TOKENS
+                    .iter()
+                    .any(|token| contains_word(&lowered, token)))
     })
 }
 
@@ -6256,10 +6434,8 @@ pub struct FitHealth {
 mod tests {
     use super::*;
     use crate::inferio::calibration::{CalibrationStore, StoreEnv, StorePaths};
-    use crate::inferio::worker::ClampReport;
-    use crate::inferio::worker::{
-        BatchMeasurement, LoadReport, MemorySample, Timestamped, WorkerTelemetry,
-    };
+    use crate::inferio::worker::{ClampReport, OomClass};
+    use crate::inferio::worker::{LoadReport, MemorySample, Timestamped, WorkerTelemetry};
 
     const BOARD: &str = "GPU-aaaa";
 
@@ -12320,6 +12496,167 @@ mod tests {
         );
     }
 
+    /// R3's host half, the tier that needs no corroboration: a typed
+    /// exception is the interpreter naming the condition, and it deflates
+    /// whatever the board's free reading says — a caching allocator can fail
+    /// with gigabytes free and fragmented.
+    #[test]
+    fn a_typed_out_of_memory_class_deflates_without_corroboration() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let granted_mb = token.grant().mb;
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                oom: true,
+                oom_class: Some(OomClass {
+                    source: OOM_SOURCE_TYPED.to_owned(),
+                    exception: "torch.OutOfMemoryError".to_owned(),
+                    free_mb_at_failure: Some(granted_mb * 10),
+                    device: "cuda:0".to_owned(),
+                }),
+                ..measurement(4, 0, 900)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(ledger.health()[0].workers[0].deflation, 1);
+    }
+
+    /// R3's host half, the tier that does: a classification read out of the
+    /// failure's *wording*, against a board whose own live reading at that
+    /// instant still held the whole envelope this window was priced at. That
+    /// is B11 — 15 negatives on a board with 96 GB free — and it must not
+    /// deflate. The same class with the board genuinely tight must.
+    #[test]
+    fn a_message_pattern_class_deflates_only_when_the_board_was_tight() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let granted_mb = token.grant().mb;
+        assert!(granted_mb > 0, "the window has an envelope to be judged on");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                oom: true,
+                oom_class: Some(OomClass {
+                    source: OOM_SOURCE_MESSAGE_PATTERN.to_owned(),
+                    exception: "RuntimeError".to_owned(),
+                    free_mb_at_failure: Some(granted_mb.saturating_mul(20)),
+                    device: "cuda:0".to_owned(),
+                }),
+                ..measurement(4, 0, 900)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(
+            ledger.health()[0].workers[0].deflation,
+            0,
+            "the board had twenty times this window's envelope free; a batch \
+             this size is not what it ran out of"
+        );
+
+        // The identical classification, with the board actually short of what
+        // the window was promised.
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let granted_mb = token.grant().mb;
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                oom: true,
+                oom_class: Some(OomClass {
+                    source: OOM_SOURCE_MESSAGE_PATTERN.to_owned(),
+                    exception: "RuntimeError".to_owned(),
+                    free_mb_at_failure: Some(granted_mb / 2),
+                    device: "cuda:0".to_owned(),
+                }),
+                ..measurement(4, 0, 900)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(ledger.health()[0].workers[0].deflation, 1);
+    }
+
+    /// A worker that states no class at all is a **pre-run2** one, and its
+    /// bare `oom` is the contract it was built against. Nothing about R3 may
+    /// make an older worker's out-of-memory conditions invisible.
+    #[test]
+    fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
+        let honest = BatchMeasurement {
+            oom: true,
+            ..BatchMeasurement::default()
+        };
+        let charge = GrantCharge {
+            mb: 4_000,
+            requests: 1,
+            unit_budget: 8,
+            squeezed: false,
+            peak_occupants: 0,
+            knee_bound: false,
+            ample_headroom: true,
+        };
+        assert_eq!(
+            oom_verdict(&honest, Some(&charge)),
+            OomVerdict::Trusted,
+            "no class stated"
+        );
+        assert_eq!(
+            oom_verdict(
+                &BatchMeasurement {
+                    oom_class: Some(OomClass {
+                        source: "some_future_tier".to_owned(),
+                        exception: "X".to_owned(),
+                        free_mb_at_failure: Some(90_000),
+                        device: "cuda:0".to_owned(),
+                    }),
+                    ..honest.clone()
+                },
+                Some(&charge)
+            ),
+            OomVerdict::Trusted,
+            "an unrecognised tier is believed, not second-guessed"
+        );
+        let pattern = BatchMeasurement {
+            oom_class: Some(OomClass {
+                source: OOM_SOURCE_MESSAGE_PATTERN.to_owned(),
+                exception: "RuntimeError".to_owned(),
+                free_mb_at_failure: None,
+                device: "cuda:0".to_owned(),
+            }),
+            ..honest.clone()
+        };
+        assert_eq!(
+            oom_verdict(&pattern, Some(&charge)),
+            OomVerdict::Trusted,
+            "no reading to contradict it: a veto that cannot fire lets the \
+             classification stand"
+        );
+        assert_eq!(
+            oom_verdict(&pattern, Some(&GrantCharge { mb: 0, ..charge })),
+            OomVerdict::Trusted,
+            "a memory-blind grant states no envelope either"
+        );
+        assert_eq!(
+            oom_verdict(
+                &BatchMeasurement {
+                    oom: false,
+                    ..honest
+                },
+                Some(&charge)
+            ),
+            OomVerdict::None
+        );
+    }
+
     /// End to end: warm windows fit a knee, the knee caps the grant, and it
     /// travels to the store as local evidence.
     #[test]
@@ -13392,5 +13729,60 @@ mod tests {
         assert!(!message_reports_oom(
             "DefaultCPUAllocator: reset\nfailed to allocate memory for the log buffer"
         ));
+    }
+
+    /// R3's host half on the **error-frame** path (run2 change R3; finding
+    /// Q1/B11). The bare `out of memory` substring is gone, and what replaces
+    /// it has to do two jobs at once: refuse a message that merely contains
+    /// the words, and keep every real device wording — the closed list alone
+    /// lost four of them, which is a missed out-of-memory condition and an
+    /// over-admitting ledger.
+    #[test]
+    fn out_of_memory_needs_a_device_to_be_a_device_out_of_memory() {
+        // B11's exact shape, from run1's `failbatch_oomtext` leg: an impl
+        // wording an unrelated failure with the words. 15 negatives on a
+        // board with 96 GB free came out of this one substring.
+        assert!(!message_reports_oom(
+            "RuntimeError: refusing merged batch of 32: the caption cache is \
+             out of memory slots"
+        ));
+        // Every one of these is a real wording from a shipped dependency, and
+        // every one of them was lost by a closed spelling list.
+        for message in [
+            "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB",
+            "RuntimeError: CUDA error: out of memory",
+            "RuntimeError: CUDA driver error: out of memory",
+            "RuntimeError: cuda runtime error (2) : out of memory",
+            "RuntimeError: CUDA failed with error out of memory",
+            "RuntimeError: HIP out of memory. Tried to allocate 2.00 GiB",
+        ] {
+            assert!(message_reports_oom(message), "{message}");
+        }
+        // The token is a whole word, so the words plus a coincidence are
+        // still nothing.
+        for message in [
+            "RuntimeError: the relationship cache is out of memory slots",
+            "RuntimeError: the chip's queue is out of memory slots",
+            "RuntimeError: hipster mode ran out of memory slots",
+        ] {
+            assert!(!message_reports_oom(message), "{message}");
+        }
+        // And it is per line, which on this path matters more than for the
+        // CPU pair: a Python traceback names `torch/cuda/__init__.py` in its
+        // frames, and `/` is a word boundary.
+        assert!(!message_reports_oom(
+            "Traceback (most recent call last):\n  File \
+             \"/venv/lib/python3.12/site-packages/torch/cuda/__init__.py\", line 1, in x\n\
+             RuntimeError: the caption cache is out of memory slots"
+        ));
+        // The allocator spellings that never say the words at all are still
+        // matched, driver vocabulary included.
+        for message in [
+            "RuntimeError: CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate",
+            "RuntimeError: cusolver_status_alloc_failed",
+            "RuntimeError: hipErrorOutOfMemory",
+        ] {
+            assert!(message_reports_oom(message), "{message}");
+        }
     }
 }

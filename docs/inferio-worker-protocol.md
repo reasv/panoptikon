@@ -677,7 +677,29 @@ none of this changes what it sends):
   operator-facing provenance.
 - **`oom_class`** rides alongside the `oom` flag the deflation path already
   keys on. Its absence beside a failure means the worker saw no out-of-memory
-  condition, and the orchestrator does not deflate on such a failure.
+  condition, and the orchestrator does not deflate on such a failure. Where
+  it *is* present the orchestrator reads its `source` in three tiers
+  (`ledger::oom_verdict`): `typed_exception` and `marker` are structural and
+  deflate on their own, while `message_pattern` is a reading of prose and is
+  **vetoed** by `free_mb_at_failure` — if the worker's own live reading at the
+  instant of the failure showed at least the whole MB envelope the grant had
+  priced that window at, no batch size the orchestrator could have chosen was
+  the problem, and the window does not deflate (one `warn!` names the figures).
+  The veto only ever *refuses* a deflation: a `null` `free_mb_at_failure`, or a
+  memory-blind grant (`mb = 0`), leaves the classification standing, because a
+  missed out-of-memory condition leaves the ledger over-admitting against a
+  model that has just proved it cannot take the size. A measurement carrying
+  no `oom_class` at all is a pre-run2 worker and its bare `oom` is trusted as
+  before.
+- **The error-frame path** — a `predict` that failed with no measurement to
+  classify — is the one path the worker's classifier cannot reach, so the
+  orchestrator mirrors it there (`ledger::message_reports_oom`): the two
+  `INFERENCE_OOM_*` markers, then the same closed allocator list, the same
+  `defaultcpuallocator` pair, and the same "`out of memory` **plus** a
+  device-API token as a whole word" rule, each matched **per line** of the
+  failure's message and traceback (never its stderr tail). Per line matters
+  more here than on the worker: a Python traceback names
+  `torch/cuda/__init__.py` in its frames, and `/` is a word boundary.
 
 **`units` is reported only when the batch ran to completion and the executed
 GPU batch matches the planned batch.** The number exists so the orchestrator can

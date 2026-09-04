@@ -2238,6 +2238,44 @@ mod tests {
         assert!(!error_reports_oom(&anyhow!("no response within 30s")));
     }
 
+    /// The error-frame path is the one the worker's own classifier cannot
+    /// reach: a `predict` that failed with no measurement to classify. R3's
+    /// host half is what stands there instead, and the leg it has to pass is
+    /// run1's `failbatch_oomtext` — an impl wording an unrelated failure with
+    /// the words "out of memory", which used to deflate a healthy model 15
+    /// times on a board with 96 GB free (finding Q1/B11).
+    #[test]
+    fn a_failure_that_merely_says_out_of_memory_is_not_a_negative() {
+        let worker_error = |message: &str, traceback: &str, stderr_tail: &str| {
+            anyhow::Error::new(WorkerError {
+                message: message.to_owned(),
+                traceback: traceback.to_owned(),
+                stderr_tail: stderr_tail.to_owned(),
+            })
+        };
+        let b11 = worker_error(
+            "RuntimeError: refusing merged batch of 32: the caption cache is \
+             out of memory slots",
+            "Traceback (most recent call last):\n  File \"impl.py\", line 12",
+            "",
+        );
+        assert!(
+            !error_reports_oom(&b11),
+            "this failure names no device, and the batch size is not what it \
+             was about"
+        );
+        // The same path still deflates on a driver-shaped one, which is the
+        // half that must not be lost while fixing the other.
+        assert!(error_reports_oom(&worker_error(
+            "RuntimeError: CUDA driver error: out of memory",
+            "",
+            ""
+        )));
+        assert!(error_reports_oom(&anyhow!(
+            "predict failed: CUDA failed with error out of memory"
+        )));
+    }
+
     // ------------------------------------------------------------------
     // Integration: the dispatcher, a live ledger, and a real worker
     // ------------------------------------------------------------------
