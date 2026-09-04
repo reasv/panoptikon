@@ -95,6 +95,15 @@ invalidation lever — bumped in the model's registry metadata when an impl's
 memory behaviour changes without moving any other key component. Stale entries
 are ignored, never deleted.
 
+The per-item **pixel canvas** (`metadata.cost.canvas_pixels`, run2 R7) is one
+of those changes and is deliberately *not* part of the key: it does not
+change the unit's name, it changes what one unit **is** (raw submitted pixels
+become pixels capped at the canvas). A slope fitted before a canvas was
+declared, applied after, under-predicts — which over-admits, the one
+direction the ledger cannot absorb — so declaring one, changing one, or a
+model that starts reporting one for itself must come with an `epoch` bump.
+Every shipped `pixel` model carries `epoch = 2` for exactly this reason.
+
 ## ROCm baselines
 
 Same file, same fields, but three of them are spelled differently and `gpu` is
