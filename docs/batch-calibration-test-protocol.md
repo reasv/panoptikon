@@ -395,6 +395,14 @@ user's decision, never a leg's):
    already happened, by the user's own hand; the run has no host step left to
    perform.
 
+### Deslopping phase (2026-09-04), before the remaining legs
+
+The user reviewed the PR size (+86 051 lines, ~19 000 of them product
+code) and asked for a comment/test/doc concision pass, a "board" → "GPU"
+rename, and an assess-first approach to code bloat before the blocked
+legs run. The plan, the rules and the remaining product steps are in
+`docs/batch-calibration-deslop-plan.md`.
+
 ### Decisions taken during run1 by the orchestrator (2026-09-03)
 
 Decision 5 above splits every problem into "fix it now, with a separate
