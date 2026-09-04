@@ -180,6 +180,21 @@ pub struct InferenceLocalConfig {
     /// TTL sweeper period in seconds (Python: 10).
     #[serde(default = "default_inference_sweep_interval_secs")]
     pub sweep_interval_secs: u64,
+    /// How many models may be spawning and streaming their weights into
+    /// **one board** at the same time (R6). Loads of one model are always
+    /// serialized by that model's own lock, and since R6 no load blocks
+    /// predicts to other models at all — this bounds the only thing left,
+    /// how much VRAM can be in flight into a board at once. Default: 1,
+    /// which is what the retired host-wide load lock gave every board that
+    /// had a load in flight (and, since every unpinned model resolves to the
+    /// same default board, is the same thing on the shipped configuration).
+    /// Raising it shortens a cold start that touches several models on one
+    /// board, at the cost of several sets of weights landing against one
+    /// headroom reading — safe, because each load charges its expected base
+    /// as a reservation inside the same ledger critical section that prices
+    /// it. 0 is read as 1.
+    #[serde(default = "default_max_concurrent_loads")]
+    pub max_concurrent_loads: usize,
     /// Optional worker lifecycle deadline overrides (protocol doc defaults:
     /// handshake 30 s, load 600 s, unload grace 10 s, terminate grace 5 s).
     /// The unload grace also bounds how long an unload waits for in-flight
@@ -395,6 +410,10 @@ fn default_inference_sweep_interval_secs() -> u64 {
     10
 }
 
+fn default_max_concurrent_loads() -> usize {
+    1
+}
+
 impl Default for InferenceLocalConfig {
     fn default() -> Self {
         Self {
@@ -405,6 +424,7 @@ impl Default for InferenceLocalConfig {
             pythonpath: Vec::new(),
             default_max_batch: default_inference_max_batch(),
             sweep_interval_secs: default_inference_sweep_interval_secs(),
+            max_concurrent_loads: default_max_concurrent_loads(),
             handshake_secs: None,
             load_secs: None,
             unload_grace_secs: None,

@@ -840,6 +840,22 @@ window is in flight per worker either way, so a trim never races a batch.
   on it. The user-visible death contract is unchanged: worker processes
   still die with the gateway.
 - `load` deadline is long (weights + dep imports; config, default 600 s).
+- **A load blocks nothing but itself** (R6). The orchestrator holds one load
+  lock *per model*, not per host: a predict to a model that is already
+  resident takes no load-path lock at all, so it is never delayed by another
+  model's load. It used to be — a single manager-wide lock was taken at the
+  top of every predict, and run1 measured an 11.865 s load stalling every
+  in-flight predict on the host for 11.885–11.894 s, 100.2 % of the load and
+  28× the p50, with the 600 s deadline above as the worst case (finding
+  P5-3/B18). What is still serialized, and why: two callers must not spawn the
+  same model twice (that model's own lock), and only
+  `[inference_local] max_concurrent_loads` models — default **1** — may be
+  streaming weights into *one board* at a time, which is what keeps the
+  ledger's load reservation for that board covering a single incoming
+  footprint. A replica set spanning several boards takes one permit per board
+  in sorted key order; replicas whose board cannot be resolved share one
+  bucket, so a host with no GPU inventory keeps a single host-wide load at a
+  time exactly as before.
 - `predict` has no fixed deadline in v1 (arbitrary models); cancellation =
   kill the worker (it is the model — there is nothing softer to cancel).
 - `trim` has a fixed 60 s deadline, and timing out is fatal. The operation is a

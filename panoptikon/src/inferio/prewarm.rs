@@ -677,6 +677,7 @@ config.devices = ["3"]
             spawn: test_spawn_config(),
             default_max_batch: 32,
             sweep_interval: Duration::from_secs(60),
+            loads: crate::inferio::manager::LoadPolicy::default(),
             prewarm,
             gpus,
             vram: crate::inferio::ledger::VramBudgets::default(),

@@ -25,15 +25,84 @@
 //!   fixes Python's latent same-key race where the first predict to finish
 //!   could let the second expire mid-inference.
 //!
-//! Locking: Python holds one manager-wide lock for the entire `load_model`
-//! call, including the slow process spawn. Here the slow phase (spawn +
-//! `load`) is serialized by a dedicated async `load_lock` — same observable
-//! ordering (loads are serialized; nothing else observes intermediate
-//! state), but the bookkeeping mutex is never held across await so sync
-//! accessors (`cached_models`, `cache_expirations`) stay cheap. Models are
-//! additionally pinned while they spawn so the sweeper cannot expire an
-//! entry mid-load (a real race in Python, whose sweeper uses a *different*
-//! lock than `load_model`).
+//! # Locking (R6)
+//!
+//! Python holds one manager-wide lock for the entire `load_model` call,
+//! including the slow process spawn, and this port used to mirror that with
+//! a single async `load_lock` taken at the top of every load **and every
+//! predict**. That is finding P5-3/B18 of the batch-calibration run1 report:
+//! an 11.865 s load of one model stalled every in-flight predict to every
+//! *other* resident model for 11.885–11.894 s — 100.2 % of the load, 28× the
+//! p50 — and the load deadline is 600 s. Change R6 retires that lock. What
+//! replaces it, in **the one order every path takes them in**:
+//!
+//! 0. **Nothing at all** for a predict or a load whose model is already
+//!    resident. The fast path of [`ModelManager::ensure_loaded`] is one
+//!    `state` critical section (touch the LRU, check `models`, take the
+//!    predict pin) and returns without ever awaiting a lock, so no load
+//!    anywhere on the host can delay it. This is the fix for B18.
+//! 1. **`load_barrier`** (async `RwLock`) — read-guarded by the *slow* path
+//!    of `ensure_loaded` for as long as a spawn may be in flight,
+//!    write-guarded once by [`ModelManager::shutdown`]. This is the one job
+//!    the global lock did that was not serialization: shutdown must not
+//!    drain `state.draining` before a load still in flight has decided what
+//!    to do with the workers it is spawning, or those workers are abandoned
+//!    mid-stop. Read guards do not exclude each other, so it costs
+//!    concurrent loads nothing.
+//! 2. **`load_locks[inference_id]`** (async `Mutex`, one per model, created
+//!    on demand and dropped when the last holder lets go) — the one piece of
+//!    serialization the global lock is kept for: two callers must not spawn
+//!    the same model twice. A load of model A and a predict to resident
+//!    model B share no lock at all.
+//! 3. **`load_admission[board]`** (`Semaphore`, `max_concurrent_loads`
+//!    permits per board) — the board-admission gate: how many models may be
+//!    streaming weights into *one board* at once. Held around the spawn +
+//!    `load` round trip inside [`ModelManager::spawn_model`], where the
+//!    ledger's load reservations are charged; a replica set spanning several
+//!    boards takes one permit per distinct board, acquired in sorted key
+//!    order. Replicas whose board key does not resolve (no inventory at all,
+//!    an unreadable pin) share one bucket, so a host with no GPUs keeps
+//!    exactly the host-wide serialization it has today.
+//! 4. **`state`** (std `Mutex`) — all bookkeeping. Never held across an
+//!    await and never held while 1–3 are acquired, so the sync accessors
+//!    (`cached_models`, `cache_expirations`, `health`) stay cheap.
+//!
+//! The `load_locks` table's own std mutex, the `load_admission` table's, and
+//! the `prewarm`, `ledger` and `registry` mutexes are **leaves**: each is
+//! taken and released without acquiring anything else.
+//!
+//! **No deadlock.** A cycle needs two tasks holding these in opposite
+//! orders. The acquisition sites are exactly: `ensure_loaded` (4, released;
+//! then 1 → 2 → 4 → [3 inside `spawn_model`, released] → 4), `shutdown`
+//! (4, released; then 1; then 4 again) and every other manager method (4
+//! alone). No site ever waits for a lower-numbered lock while holding a
+//! higher-numbered one, so the numbering is a total order over every held
+//! set and no cycle can form. Within 3, the several permits of a multi-board
+//! set are acquired in sorted board-key order, which is a total order over
+//! the permits themselves. `shutdown` taking 4 before 1 is worth spelling
+//! out: it *releases* 4 before acquiring 1, so the pair is never held
+//! together. Leaves cannot participate in a cycle because nothing is
+//! acquired while one is held. Every lock is released on cancellation too
+//! (RAII guards throughout), so a client that disconnects mid-load strands
+//! none of them.
+//!
+//! What the retired global lock protected, and where each invariant lives
+//! now: **no double load of one model** — lock 2 plus the `state.models`
+//! re-check taken under lock 4 *inside* it (the fast path's check is the
+//! first half of a double-checked load); **unload/expiry vs. a load in
+//! flight** — unchanged, the spawn-phase pin and the post-spawn
+//! `refs_non_empty` re-check, both under lock 4; **the TTL sweeper** —
+//! unchanged, models are pinned while they spawn so an entry cannot expire
+//! mid-load (a real race in Python, whose sweeper uses a *different* lock
+//! than `load_model`); **generation bumps on death** — unchanged, lock 4
+//! alone; **prewarm claims** — the pool's own mutex, which was never the
+//! load lock's job (`claim` removes the slot atomically, so two loads of the
+//! same impl class cannot both take the parked worker); **`/health`** —
+//! lock 4 alone, and it never saw intermediate load state anyway (a model
+//! appears in `models` only once its whole set has loaded); **concurrent
+//! VRAM accounting** — the ledger's load reservations, which are charged and
+//! priced inside one ledger critical section (so a second concurrent
+//! reserver sees the first's charge), plus lock 3.
 //!
 //! Deliberate deviations from Python (each also noted inline):
 //! - Failed loads never leave a phantom id in `/cache`: Python's
@@ -61,7 +130,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, Timelike};
 use hashlink::LinkedHashMap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
+use tokio::sync::{
+    Mutex as TokioMutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock as TokioRwLock, Semaphore,
+    mpsc, oneshot,
+};
 use tokio::task::JoinHandle;
 
 use super::calibration::CalibrationProfiles;
@@ -92,6 +164,11 @@ pub struct ManagerConfig {
     pub default_max_batch: u32,
     /// TTL sweeper period (Python: 10 s).
     pub sweep_interval: Duration,
+    /// Load-path policy: the board-admission gate's width
+    /// (`[inference_local] max_concurrent_loads`, R6). Its own struct so the
+    /// R9 cooldown levers can join it without touching every construction
+    /// site.
+    pub loads: LoadPolicy,
     /// Prewarm pool policy (design §8; `[inference_local.prewarm]`).
     pub prewarm: PrewarmConfig,
     /// Visible GPUs, probed once at startup. Universal worker→GPU pinning
@@ -111,6 +188,50 @@ pub struct ManagerConfig {
     /// which is exactly the pre-store behaviour (tests, and any embedder
     /// that does not want a file).
     pub calibration: Option<Arc<dyn CalibrationProfiles>>,
+}
+
+/// Load-path policy (`[inference_local]`, R6). The defaults here are the
+/// shipped ones; [`From<&crate::config::InferenceLocalConfig>`] is the
+/// bridge the HTTP layer uses, so config knowledge stays out of the manager
+/// proper.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadPolicy {
+    /// How many models may be spawning and streaming weights into **one
+    /// board** at the same time (module docs, lock 3).
+    ///
+    /// Default 1, which is what the retired global load lock enforced: one
+    /// set of weights in flight per board, so the ledger's load reservation
+    /// for that board covers exactly one incoming footprint. Every unpinned
+    /// model resolves to the same default board, so on the shipped
+    /// configuration this *is* the old host-wide serialization; what it stops
+    /// doing is serializing loads that cannot collide because they land on
+    /// different boards (or on none at all, where the bucket is shared and
+    /// the behaviour is again the old one).
+    ///
+    /// Raising it shortens a cold start that touches several models on one
+    /// board, at the cost of several sets of weights landing against one
+    /// headroom reading. That is safe rather than merely tolerable: each load
+    /// charges its expected base as a `LoadReservation` inside the same
+    /// ledger critical section that reads the headroom, so the second
+    /// concurrent reserver prices itself against the first's charge. 0 is
+    /// read as 1.
+    pub max_concurrent_loads: usize,
+}
+
+impl Default for LoadPolicy {
+    fn default() -> Self {
+        Self {
+            max_concurrent_loads: 1,
+        }
+    }
+}
+
+impl From<&crate::config::InferenceLocalConfig> for LoadPolicy {
+    fn from(local: &crate::config::InferenceLocalConfig) -> Self {
+        Self {
+            max_concurrent_loads: local.max_concurrent_loads,
+        }
+    }
 }
 
 /// `GET /health` response (design §7, additive — Python has no such
@@ -734,6 +855,64 @@ impl Drop for PinGuard {
     }
 }
 
+/// Board-admission bucket for a replica whose board key does not resolve (a
+/// host with no inventory, an unreadable pin). Never a real board key —
+/// `GpuInventory::resolve_board_key` only ever answers a uuid it probed.
+const UNRESOLVED_BOARD_ADMISSION_KEY: &str = "";
+
+/// What one pass of [`ModelManager::touch_and_check`] decided.
+enum TouchOutcome {
+    /// The model is loaded and the caller is done: `Some` carries the
+    /// dispatcher sender and the predict pin, `None` is a plain `PUT /load`.
+    Ready(Option<(mpsc::UnboundedSender<DispatchMsg>, PinGuard)>),
+    /// The model is not loaded. `Some` is the spawn-phase pin, taken in the
+    /// same critical section that found it missing (second pass only).
+    NeedsSpawn(Option<PinGuard>),
+}
+
+/// RAII handle for one model's load lock (R6, module docs lock 2).
+///
+/// It owns the lock guard *and* the table entry's lifetime: on drop it
+/// releases the mutex and then removes the entry when nobody else is holding
+/// or waiting on it, so `load_locks` never accumulates one entry per model id
+/// this process has ever been asked for. The guard is an `Option` so the
+/// handle can be built *before* the (possibly long) wait for the mutex: a
+/// caller cancelled while queued behind another load of the same model still
+/// runs this Drop and still tidies the table.
+///
+/// Drop is sync and takes only the leaf `load_locks` mutex, so it can run
+/// from any context, cancellation included.
+struct ModelLoadGuard<'a> {
+    manager: &'a ModelManager,
+    inference_id: &'a str,
+    /// The same `Arc` the table holds. Counting strong references against
+    /// this one is what decides whether the entry may go.
+    lock: Arc<TokioMutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for ModelLoadGuard<'_> {
+    fn drop(&mut self) {
+        // Release the mutex first: the owned guard holds a strong reference
+        // of its own, so the count below only means what it says once it is
+        // gone.
+        drop(self.guard.take());
+        // A poisoned table is not worth aborting a Drop over; what it holds
+        // is a mutex, not state.
+        let mut locks = match self.manager.load_locks.lock() {
+            Ok(locks) => locks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Exactly two strong references *under the table lock* — the table's
+        // and this handle's — proves nobody else can be waiting: every other
+        // holder took its clone from the table, which requires this lock, and
+        // `Mutex::lock_owned` cannot be awaited without holding a clone.
+        if Arc::strong_count(&self.lock) == 2 {
+            locks.remove(self.inference_id);
+        }
+    }
+}
+
 /// The model manager. Construct with [`ModelManager::new`] (requires a
 /// running tokio runtime — it spawns the sweeper task).
 pub struct ModelManager {
@@ -748,9 +927,28 @@ pub struct ModelManager {
     /// synchronous bounded arithmetic, so it is safe to touch from the
     /// dispatcher's hot path.
     ledger: Arc<VramLedger>,
-    /// Serializes the slow spawn+load phase, mirroring Python's manager-wide
-    /// lock held for the whole `load_model` (see module docs).
-    load_lock: TokioMutex<()>,
+    /// One load lock per model id (module docs, lock 2): the serialization
+    /// that stops two callers spawning the same model twice, and *only*
+    /// that. Entries are created on demand and removed again by
+    /// [`ModelLoadGuard`] as soon as the last holder lets go, so the table's
+    /// size tracks the models being loaded right now rather than every id
+    /// this process was ever asked for — the id comes straight off the URL,
+    /// so a table that only grew would be an unbounded allocation any client
+    /// could drive. The std mutex around it is a leaf: held for a lookup, an
+    /// insert or a removal, never across anything.
+    load_locks: StdMutex<HashMap<String, Arc<TokioMutex<()>>>>,
+    /// The board-admission gate (module docs, lock 3): one semaphore of
+    /// `max_concurrent_loads` permits per board key, plus one shared bucket
+    /// for replicas whose board key does not resolve. Created on demand; the
+    /// keyspace is closed (`GpuInventory::resolve_board_key` only ever
+    /// answers a uuid from the one-shot inventory probe, or `None`), so
+    /// unlike `load_locks` this table needs no pruning.
+    load_admission: StdMutex<HashMap<String, Arc<Semaphore>>>,
+    /// Shutdown barrier (module docs, lock 1): read-guarded by every load
+    /// that may spawn, write-guarded once by [`ModelManager::shutdown`],
+    /// which therefore waits for every in-flight load to have decided what
+    /// to do with the workers it spawned.
+    load_barrier: TokioRwLock<()>,
     /// Self-reference handed to dispatcher tasks for death cleanup.
     weak: OnceLock<Weak<ModelManager>>,
     sweeper: StdMutex<Option<JoinHandle<()>>>,
@@ -775,7 +973,9 @@ impl ModelManager {
             state: StdMutex::new(ManagerState::default()),
             prewarm,
             ledger,
-            load_lock: TokioMutex::new(()),
+            load_locks: StdMutex::new(HashMap::new()),
+            load_admission: StdMutex::new(HashMap::new()),
+            load_barrier: TokioRwLock::new(()),
             weak: OnceLock::new(),
             sweeper: StdMutex::new(None),
         });
@@ -1036,8 +1236,12 @@ impl ModelManager {
     /// queued requests, and run every worker's graceful stop ladder. A load
     /// still in flight when the flag flips finishes its spawn, observes
     /// `shutting_down`, and parks a worker-discard task in `draining` —
-    /// taking `load_lock` below waits for that decision so the second drain
-    /// awaits the discard instead of abandoning the worker mid-stop.
+    /// write-locking `load_barrier` below waits for that decision (every
+    /// load that may spawn holds a read guard for its whole slow phase) so
+    /// the second drain awaits the discard instead of abandoning the worker
+    /// mid-stop. A load that has not reached its slow phase yet queues
+    /// behind the write lock — tokio's `RwLock` is write-preferring — and
+    /// then bails on the `shutting_down` check without spawning anything.
     pub async fn shutdown(&self) {
         if let Some(handle) = self.sweeper.lock().unwrap().take() {
             handle.abort();
@@ -1054,7 +1258,7 @@ impl ModelManager {
             state.cache = CacheState::default();
         }
         {
-            let _load_guard = self.load_lock.lock().await;
+            let _drain_guard = self.load_barrier.write().await;
             let mut state = self.state.lock().unwrap();
             handles.append(&mut state.draining);
         }
@@ -1172,13 +1376,164 @@ impl ModelManager {
         }
     }
 
-    /// The shared load path. Bookkeeping runs under the state mutex; the
-    /// slow spawn+load runs under `load_lock` only. With `pin_for_predict`
-    /// the model is pinned *atomically* with the loaded-check and the
-    /// dispatcher sender is returned (paired with the RAII [`PinGuard`]
-    /// that owns the pin), so a predict can never observe its model
-    /// expiring between load and enqueue — and a cancelled caller can never
-    /// leak the pin.
+    /// One pass of the load bookkeeping, entirely under the state mutex
+    /// (module docs, lock 4): renew the LRU entry and its TTL, run the
+    /// evictions that causes, and decide whether this caller is done.
+    ///
+    /// Called twice per load — once on the fast path, once again under the
+    /// model's load lock — because every step of it has to be atomic with
+    /// the loaded-check that follows: `touch_load` is what puts the
+    /// reference back that stops the sweeper expiring the model between the
+    /// check and the pin, and the pin is what stops it expiring the model
+    /// between the check and the enqueue. Running it twice is harmless
+    /// (`touch_load` is a remove+insert plus a resize) and is what makes the
+    /// slow path a proper double-checked load.
+    ///
+    /// `take_spawn_pin` is set by the second call only: the spawn-phase pin
+    /// has to be taken in the same critical section that found the model
+    /// missing.
+    fn touch_and_check(
+        &self,
+        inference_id: &str,
+        cache_key: &str,
+        lru_size: i64,
+        ttl_seconds: i64,
+        pin_for_predict: bool,
+        take_spawn_pin: bool,
+    ) -> Result<TouchOutcome> {
+        let mut state = self.state.lock().unwrap();
+        if state.shutting_down {
+            bail!("the model manager is shutting down");
+        }
+        let unloads =
+            state
+                .cache
+                .touch_load(inference_id, cache_key, lru_size, ttl_seconds, Local::now());
+        for id in &unloads {
+            Self::begin_unload(&mut state, id);
+        }
+        if !state.cache.refs_non_empty(inference_id) {
+            // The just-inserted entry was evicted by its own resize
+            // (lru_size <= 0). Python loads anyway and leaks the
+            // process forever; we refuse (see module docs).
+            bail!(
+                "lru_size {lru_size} evicted {inference_id} from cache '{cache_key}' immediately; refusing to load"
+            );
+        }
+        if let Some(handle) = state.models.get(inference_id) {
+            if pin_for_predict {
+                let tx = handle.tx.clone();
+                state.cache.pin(inference_id);
+                let guard = PinGuard::adopt(
+                    self,
+                    inference_id,
+                    Some((cache_key.to_owned(), ttl_seconds)),
+                );
+                return Ok(TouchOutcome::Ready(Some((tx, guard))));
+            }
+            return Ok(TouchOutcome::Ready(None));
+        }
+        // Pin across the spawn so the sweeper cannot expire the entry
+        // mid-load (Python has this race: its sweeper uses a separate
+        // lock from load_model). The guard releases the pin even when
+        // the calling future is cancelled mid-spawn.
+        let spawn_pin = take_spawn_pin.then(|| {
+            state.cache.pin(inference_id);
+            PinGuard::adopt(self, inference_id, None)
+        });
+        Ok(TouchOutcome::NeedsSpawn(spawn_pin))
+    }
+
+    /// This model's load lock (module docs, lock 2), created on demand.
+    ///
+    /// The handle is built *before* the wait so that a caller cancelled while
+    /// queued behind another load of the same model still runs the table
+    /// cleanup in [`ModelLoadGuard::drop`].
+    async fn lock_model_load<'a>(&'a self, inference_id: &'a str) -> ModelLoadGuard<'a> {
+        let lock = {
+            let mut locks = self.load_locks.lock().unwrap();
+            Arc::clone(
+                locks
+                    .entry(inference_id.to_owned())
+                    .or_insert_with(|| Arc::new(TokioMutex::new(()))),
+            )
+        };
+        let mut handle = ModelLoadGuard {
+            manager: self,
+            inference_id,
+            lock,
+            guard: None,
+        };
+        handle.guard = Some(Arc::clone(&handle.lock).lock_owned().await);
+        handle
+    }
+
+    /// One admission permit per **distinct board** this replica set will land
+    /// on (module docs, lock 3), acquired in sorted key order.
+    ///
+    /// Sorting is the deadlock argument for the multi-board case: every
+    /// caller takes the permits of the boards it needs in the same total
+    /// order, so two loads that overlap on two boards can never each hold the
+    /// other's. Replicas whose board key did not resolve — no inventory at
+    /// all, a pin the backend could not read — share one bucket keyed by the
+    /// empty string, which is what keeps a GPU-less host serialized exactly
+    /// as it is today.
+    async fn acquire_load_admission(
+        &self,
+        inference_id: &str,
+        board_keys: &[Option<String>],
+    ) -> Vec<OwnedSemaphorePermit> {
+        let mut wanted: Vec<&str> = board_keys
+            .iter()
+            .map(|key| key.as_deref().unwrap_or(UNRESOLVED_BOARD_ADMISSION_KEY))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let permits = self.cfg.loads.max_concurrent_loads.max(1);
+        let mut held = Vec::with_capacity(wanted.len());
+        for board in wanted {
+            let gate = {
+                let mut gates = self.load_admission.lock().unwrap();
+                Arc::clone(
+                    gates
+                        .entry(board.to_owned())
+                        .or_insert_with(|| Arc::new(Semaphore::new(permits))),
+                )
+            };
+            if gate.available_permits() == 0 {
+                tracing::debug!(
+                    model = %inference_id,
+                    gpu = %board,
+                    max_concurrent_loads = permits,
+                    "waiting for the board's load-admission gate"
+                );
+            }
+            held.push(
+                gate.acquire_owned()
+                    .await
+                    .expect("the load admission semaphores are never closed"),
+            );
+        }
+        held
+    }
+
+    /// The shared load path, in two phases (module docs, "Locking").
+    ///
+    /// **Fast path**: one `state` critical section. A model that is already
+    /// resident is served from it without awaiting a single lock, which is
+    /// what makes a predict immune to any load happening elsewhere on the
+    /// host (finding P5-3/B18).
+    ///
+    /// **Slow path**: the shutdown barrier, then this model's own load lock,
+    /// then the same bookkeeping again (the second half of the double-checked
+    /// load: another caller may have loaded the model while we queued), then
+    /// the spawn under the board-admission gate.
+    ///
+    /// With `pin_for_predict` the model is pinned *atomically* with the
+    /// loaded-check and the dispatcher sender is returned (paired with the
+    /// RAII [`PinGuard`] that owns the pin), so a predict can never observe
+    /// its model expiring between load and enqueue — and a cancelled caller
+    /// can never leak the pin.
     async fn ensure_loaded(
         &self,
         inference_id: &str,
@@ -1188,50 +1543,33 @@ impl ModelManager {
         pin_for_predict: bool,
         prewarm_hint: bool,
     ) -> Result<Option<(mpsc::UnboundedSender<DispatchMsg>, PinGuard)>> {
-        let _load_guard = self.load_lock.lock().await;
+        if let TouchOutcome::Ready(sender) = self.touch_and_check(
+            inference_id,
+            cache_key,
+            lru_size,
+            ttl_seconds,
+            pin_for_predict,
+            false,
+        )? {
+            return Ok(sender);
+        }
 
-        let spawn_pin = {
-            let mut state = self.state.lock().unwrap();
-            if state.shutting_down {
-                bail!("the model manager is shutting down");
-            }
-            let unloads = state.cache.touch_load(
-                inference_id,
-                cache_key,
-                lru_size,
-                ttl_seconds,
-                Local::now(),
-            );
-            for id in &unloads {
-                Self::begin_unload(&mut state, id);
-            }
-            if !state.cache.refs_non_empty(inference_id) {
-                // The just-inserted entry was evicted by its own resize
-                // (lru_size <= 0). Python loads anyway and leaks the
-                // process forever; we refuse (see module docs).
-                bail!(
-                    "lru_size {lru_size} evicted {inference_id} from cache '{cache_key}' immediately; refusing to load"
-                );
-            }
-            if let Some(handle) = state.models.get(inference_id) {
-                if pin_for_predict {
-                    let tx = handle.tx.clone();
-                    state.cache.pin(inference_id);
-                    let guard = PinGuard::adopt(
-                        self,
-                        inference_id,
-                        Some((cache_key.to_owned(), ttl_seconds)),
-                    );
-                    return Ok(Some((tx, guard)));
-                }
-                return Ok(None);
-            }
-            // Pin across the spawn so the sweeper cannot expire the entry
-            // mid-load (Python has this race: its sweeper uses a separate
-            // lock from load_model). The guard releases the pin even when
-            // the calling future is cancelled mid-spawn.
-            state.cache.pin(inference_id);
-            PinGuard::adopt(self, inference_id, None)
+        // Lock order (module docs): barrier, then this model's load lock,
+        // then state, then — inside `spawn_model` — the admission gate.
+        let _drain_guard = self.load_barrier.read().await;
+        let _model_guard = self.lock_model_load(inference_id).await;
+
+        let spawn_pin = match self.touch_and_check(
+            inference_id,
+            cache_key,
+            lru_size,
+            ttl_seconds,
+            pin_for_predict,
+            true,
+        )? {
+            // Another caller loaded it while we waited for the model lock.
+            TouchOutcome::Ready(sender) => return Ok(sender),
+            TouchOutcome::NeedsSpawn(pin) => pin.expect("the second pass takes the spawn pin"),
         };
 
         let spawn_result = self.spawn_model(inference_id).await;
@@ -1263,9 +1601,9 @@ impl ModelManager {
             // Explicitly unloaded (or the manager shut down) while the
             // workers were spawning: discard the whole set instead of
             // registering it. The discard task is parked in `draining` so
-            // shutdown() (which re-checks after taking load_lock) awaits
-            // the graceful stops instead of abandoning them on a detached
-            // task.
+            // shutdown() (which re-checks after write-locking the barrier
+            // this load holds a read guard on) awaits the graceful stops
+            // instead of abandoning them on a detached task.
             // Dropping `admissions` here is what un-charges the replicas in
             // the ledger — a set that was never registered as a model must
             // not keep holding its footprint.
@@ -1417,6 +1755,19 @@ impl ModelManager {
             .iter()
             .map(|pin| self.cfg.gpus.resolve_board_key(pin.as_deref()))
             .collect();
+        // The board-admission gate (R6, module docs lock 3). Everything from
+        // here to the end of the function is the phase the retired global
+        // load lock existed for: a prewarm claim, a process spawn, the
+        // ledger's load reservations and the multi-second `load` round trip
+        // that streams the weights those reservations cover. Bounding it per
+        // board rather than per host is the whole point — a load onto board 1
+        // cannot collide with the weights landing on board 0 — and one permit
+        // per board (the default) is exactly the serialization the global
+        // lock gave every board that had a load in flight.
+        //
+        // Held for the rest of the function via the RAII permits; a cancelled
+        // caller releases them like every other guard here.
+        let _admission = self.acquire_load_admission(inference_id, &board_keys).await;
         // And into the third thing one registry entry decides: the address of
         // the board it names, when that board is a unified one whose worker
         // has to count GTT as its own (DP-5). Resolved from the same entries
@@ -1939,6 +2290,15 @@ config.impl_class = "echo_test"
 config.impl_class = "slow_test"
 [group.slow.inference_ids.test]
 
+# Slow *load* (R6): the phase the retired global load lock was held across.
+# Two ids so a test can load two different models concurrently and watch the
+# board-admission gate decide whether they overlap.
+[group.slowload]
+config.impl_class = "slow_load_test"
+config.load_seconds = 3.0
+[group.slowload.inference_ids.test]
+[group.slowload.inference_ids.second]
+
 [group.hang]
 config.impl_class = "hang_test"
 [group.hang.inference_ids.test]
@@ -2028,6 +2388,19 @@ config.replicas = 2
             deadlines,
             GpuInventory::unknown(),
             None,
+            LoadPolicy::default(),
+        )
+    }
+
+    /// A manager whose load-path policy is not the shipped default (R6/R9).
+    fn test_manager_with_loads(loads: LoadPolicy) -> TestSetup {
+        test_manager_full(
+            Duration::from_secs(60),
+            32,
+            WorkerDeadlines::default(),
+            GpuInventory::unknown(),
+            None,
+            loads,
         )
     }
 
@@ -2038,6 +2411,7 @@ config.replicas = 2
             WorkerDeadlines::default(),
             gpus,
             None,
+            LoadPolicy::default(),
         )
     }
 
@@ -2048,6 +2422,7 @@ config.replicas = 2
             WorkerDeadlines::default(),
             GpuInventory::unknown(),
             Some(calibration),
+            LoadPolicy::default(),
         )
     }
 
@@ -2061,6 +2436,7 @@ config.replicas = 2
             WorkerDeadlines::default(),
             gpus,
             Some(calibration),
+            LoadPolicy::default(),
         )
     }
 
@@ -2070,6 +2446,7 @@ config.replicas = 2
         deadlines: WorkerDeadlines,
         gpus: GpuInventory,
         calibration: Option<Arc<dyn CalibrationProfiles>>,
+        loads: LoadPolicy,
     ) -> TestSetup {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("registry.toml"), TEST_REGISTRY_TOML).unwrap();
@@ -2083,6 +2460,7 @@ config.replicas = 2
             },
             default_max_batch,
             sweep_interval,
+            loads,
             // Pool disabled: these tests cover the manager's Python-parity
             // semantics; the prewarm pool has its own suite (prewarm.rs).
             prewarm: PrewarmConfig {
@@ -3811,4 +4189,194 @@ config.replicas = 2
 
         manager.shutdown().await;
     }
+
+    // ------------------------------------------------------------------
+    // R6: per-model load locks and the board-admission gate.
+    // ------------------------------------------------------------------
+
+    /// The B18/P5-3 regression test. A load of one model must not delay a
+    /// predict to a *different*, already resident model: under the retired
+    /// global load lock the predict below waited out the whole 3 s load (run1
+    /// measured 11.885 s of stall for an 11.865 s load, 28x the p50, with a
+    /// 600 s load deadline behind it).
+    ///
+    /// Two assertions, deliberately: the wall-clock bound, and the fact that
+    /// the slow load was *still in flight* when the predict came back — the
+    /// second one cannot be satisfied by a fast machine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_load_does_not_delay_predicts_to_a_resident_model() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = Arc::clone(&setup.manager);
+        manager
+            .predict(
+                "echo/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("the resident model loads");
+
+        let loader = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .load_model("slowload/test", "k2", 10, -1, None)
+                    .await
+            })
+        };
+        // Let the load get past its bookkeeping and into the fixture's 3 s
+        // `load()`; a spawn + handshake is well under this on any host.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !loader.is_finished(),
+            "the slow-load fixture sleeps 3 s in load(); it cannot be done yet"
+        );
+
+        let started = Instant::now();
+        manager
+            .predict(
+                "echo/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(2))],
+            )
+            .await
+            .expect("predict to the resident model");
+        let elapsed = started.elapsed();
+        assert!(
+            !loader.is_finished(),
+            "the predict must return while the other model is still loading"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a predict to a resident model waited {elapsed:?} on another model's load"
+        );
+
+        loader
+            .await
+            .expect("load task")
+            .expect("the slow load lands");
+        manager.shutdown().await;
+    }
+
+    /// The gate is keyed by **board** and is `max_concurrent_loads` permits
+    /// wide. Asserted on the gate itself rather than through two real loads:
+    /// the alternative is a wall-clock race whose failure mode is a flaky
+    /// test on a busy host, and the thing under test here is the keying.
+    #[tokio::test]
+    async fn the_load_admission_gate_is_per_board() {
+        let setup = test_manager_with_loads(LoadPolicy {
+            max_concurrent_loads: 1,
+        });
+        let manager = Arc::clone(&setup.manager);
+        let board_a = [Some("GPU-0000".to_owned())];
+        let board_b = [Some("GPU-3333".to_owned())];
+        let unresolved = [None];
+
+        let held = manager.acquire_load_admission("m/a", &board_a).await;
+        assert_eq!(held.len(), 1, "one distinct board, one permit");
+
+        // Another board, and the unresolved bucket, are not blocked by it.
+        let other = tokio::time::timeout(
+            Duration::from_millis(250),
+            manager.acquire_load_admission("m/b", &board_b),
+        )
+        .await
+        .expect("a load onto another board must not wait for this one");
+        let none_board = tokio::time::timeout(
+            Duration::from_millis(250),
+            manager.acquire_load_admission("m/c", &unresolved),
+        )
+        .await
+        .expect("the unresolved bucket is its own gate");
+
+        // The same board is.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                manager.acquire_load_admission("m/d", &board_a),
+            )
+            .await
+            .is_err(),
+            "a second load onto board A must wait at max_concurrent_loads = 1"
+        );
+        drop((held, other, none_board));
+
+        // A multi-board set takes one permit per distinct board, deduped.
+        let setup = test_manager_with_loads(LoadPolicy {
+            max_concurrent_loads: 2,
+        });
+        let manager = Arc::clone(&setup.manager);
+        let spread = [
+            Some("GPU-3333".to_owned()),
+            Some("GPU-0000".to_owned()),
+            Some("GPU-0000".to_owned()),
+        ];
+        let held = manager.acquire_load_admission("m/e", &spread).await;
+        assert_eq!(held.len(), 2, "two distinct boards out of three replicas");
+        // Two permits per board: a second load of the same spread still fits.
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            manager.acquire_load_admission("m/f", &spread),
+        )
+        .await
+        .expect("max_concurrent_loads = 2 admits a second load onto both boards");
+    }
+
+    /// Two callers racing to use a model that is not loaded must produce one
+    /// worker set, not two: that is the invariant the global lock existed for
+    /// and the per-model lock now carries. The lock table must also be empty
+    /// again afterwards — its keys come off the URL, so an entry that
+    /// outlived its load would be an unbounded allocation any client can
+    /// drive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_predicts_load_one_model_once() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = Arc::clone(&setup.manager);
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for i in 0..3 {
+            let manager = Arc::clone(&manager);
+            tasks.push(tokio::spawn(async move {
+                manager
+                    .predict(
+                        "slowload/test",
+                        "k",
+                        10,
+                        -1,
+                        None,
+                        None,
+                        vec![data_input(json!(i))],
+                    )
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().expect("predict");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "three racing predicts paid {elapsed:?}, i.e. more than one 3 s load"
+        );
+        assert_eq!(
+            manager.loaded_generation("slowload/test"),
+            Some(0),
+            "exactly one load generation was ever created"
+        );
+        assert!(
+            manager.load_locks.lock().unwrap().is_empty(),
+            "the per-model load lock table is emptied when the last holder lets go"
+        );
+
+        manager.shutdown().await;
+    }
+
 }

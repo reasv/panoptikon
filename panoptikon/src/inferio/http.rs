@@ -305,6 +305,7 @@ impl InferioState {
                 spawn,
                 default_max_batch: local.default_max_batch,
                 sweep_interval: Duration::from_secs(local.sweep_interval_secs.max(1)),
+                loads: local.into(),
                 prewarm: PrewarmConfig {
                     enabled: local.prewarm.enabled,
                     lazy: local.prewarm.lazy,
@@ -1456,6 +1457,7 @@ metadata.description = "echo fixture"
                 spawn: test_spawn_config(),
                 default_max_batch: 32,
                 sweep_interval: Duration::from_secs(60),
+                loads: super::super::manager::LoadPolicy::default(),
                 prewarm,
                 // Tests must not depend on the host's GPUs.
                 gpus: super::super::gpu::GpuInventory::unknown(),
