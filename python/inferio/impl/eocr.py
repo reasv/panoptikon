@@ -442,7 +442,7 @@ def fit_to_canvas(
 
     Returns `(array, scale)`, `scale` being what the original was multiplied
     by (1.0 when nothing was resized), which is what
-    [`scale_boxes_to_original`] needs to undo it.
+    [`scale_detections_to_original`] needs to undo it.
 
     Falls back to Pillow's bilinear resize if OpenCV is not importable —
     easyOCR depends on it, so that path is unreachable wherever this model can
