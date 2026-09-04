@@ -355,8 +355,7 @@ pub(crate) struct FailedJobRecord {
     ///
     /// It is derived from the job's own counters, which are exact, and is
     /// therefore the authority. The `job_failures` list can be *shorter*: it
-    /// is capped per job ([`crate::jobs::extraction`]'s
-    /// `MAX_RECORDED_JOB_FAILURES`), and its rows are pruned once the job's
+    /// is capped at 10 000 rows per job, and its rows are pruned once the job's
     /// `data_jobs` row is gone — which under `atomic_extraction_jobs` (off by
     /// default) is at the start of the next extraction job for every job that
     /// did not finish, because that mode deletes unfinished job rows outright.
