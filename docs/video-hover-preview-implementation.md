@@ -35,6 +35,30 @@ replaced it. §1 records what did not change.
 | V11 | Feedback while a job is pending | the play badge STAYS VISIBLE while a preview job is pending (its `group-hover` fade suppressed for that cell) and its circular edge becomes a progress ring that fills with the job's progress; while queued, an indeterminate sweep, with a caption from the existing `transcodeBadge` formatter ("Transcoding…" / "Queued #2"). Both disappear when the video starts playing. Only the previewing cell subscribes to the job state (`useTranscodeState`), so no other cell re-renders. Rung 0 shows no ring: the poster holds until the first decoded frame. A sticky failure shows nothing and never retries in the session. |
 | V12 | The frame swap (replaces D9 whenever previews are on) | With previews on for the cell (rung ≠ none): a SMALL cell (1x1 base) never swaps to the 2x2; the video fades in over the 1x1 after the dwell. A LARGE cell (2x2 base) swaps to the 1x1 frame in the same moment as the hover zoom-out, and the video fades in over that 1x1 when it plays — the 1x1 is the waiting placeholder. Because the dwell alone is 200 ms the video is never earlier than the swap, so hover is one change and playback one fade-in, never three. With previews OFF today's behaviour is unchanged. On leave everything reverts in one commit. |
 
+## 1b. The trigger setting (amended 2026-09-04, after user QA)
+
+Resting the pointer anywhere on a card was the wrong trigger for a *video*.
+An animated image already has a thumbnail-like loop, so playing it costs
+nothing visible and reverses instantly; it can behave like a hover highlight.
+A video preview is a process with a name on screen, and a cursor rests on a
+card for a dozen reasons that are not "show me this" — a corner button, a
+pause in scrolling, an item the user is not even looking at. The trigger
+must ask for the same intent a process deserves, and the target for that
+intent already exists: the play badge.
+
+| # | decision | value |
+|---|---|---|
+| T1 | The setting | a browser preference, `localStorage` key `panoptikon.hoverPreviewTrigger`, values `"card"` \| `"button"`, absent = `"button"` (the default). Same box/`useSyncExternalStore`/cross-tab pattern as the other preferences. Never in the URL, never in client-config: the server has no say in where a pointer must rest. Applies to the result grid and the gallery filmstrip alike (they share `VideoHoverPicture`). The large viewer is unchanged. |
+| T2 | `"card"` | today's behaviour, V1–V12 unamended: the arm fires after 200 ms of real pointer rest anywhere on the card. |
+| T3 | `"button"` — the arm | the play badge is the target. The existing 200 ms arm applies to the badge (real pointermove onto it, then rest), and is followed by a **countdown**: the badge's ring — the same ring V11 uses for job progress — fills over ~700 ms. When it completes, the preview starts exactly as the card arm would have (rung ladder, requests, job). A **click** on the badge starts it at once, countdown skipped. |
+| T4 | Leaving the badge BEFORE the start | aborts: the countdown stops, the ring drains back, nothing was requested. The badge stays a badge. |
+| T5 | Leaving the badge AFTER the start | changes nothing: from the start onward the preview is committed to the **card**, exactly as under `"card"`. Leaving the card is what cancels or stops it (V4). Rationale: the user just spent most of a second aiming at a small target, or clicked; cancelling because the pointer drifted a few pixels would be the UI changing its mind. Once the video plays the badge is gone and the two modes are indistinguishable. |
+| T6 | Badge visibility under `"button"` | the badge is the target, so it must not fade on card hover (V10's `group-hover` fade is off for video cells in this mode). On card hover it gains a touch of contrast and a pointer cursor; it disappears at the first playing frame, as V11 already says. Under `"card"` the fade is unchanged. |
+| T7 | The frame swap under `"button"` (amends V12) | a LARGE cell (2x2 base) keeps its 2x2 on card hover and gets today's zoom-out (`object-contain`) like any image card; it swaps to the 1x1 frame **when the badge arm fires** (the start of the countdown), so the swap is the first feedback that a preview is coming, and the video fades over that 1x1 when it plays. Aborting the countdown (T4) reverts the swap. A SMALL cell (1x1 base) stays 1x1 throughout — no 2x2 swap in either mode, as V12 already says. |
+| T8 | The popover | a "Start on: Card / Play button" segmented setting beside "Video previews", laid out like its neighbours (name, one sentence, full-width control, one sentence under it). The sentence above "Video previews" follows the trigger: "Play a video by resting the pointer on its card." vs "Play a video by resting on its play button, or clicking it." |
+| T9 | Mixed policy per rung | rejected: rung 0 costs no server work but the byte cap exists for a reason, and a user cannot predict which rung a file takes. One rule per setting. |
+| T10 | Cost when idle | as before: nothing is subscribed or requested per cell until an arm fires. The badge's hover contrast is a stylesheet rule, not state. |
+
 ## 2. The ladder, and the measurement that produced it
 
 The plan's rung 0 carried no size bound, on the reasoning that
