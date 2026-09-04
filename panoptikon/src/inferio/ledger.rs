@@ -6496,8 +6496,10 @@ struct KneeFit {
 ///    the candidate, and they coincide only by today's choice of reference.)
 ///
 /// 4. **No ramp-era knee below the anchor.** If the candidate sits below the
-///    bucket of `anchor` — [`ModelCalibration::max_units_measured`], the
-///    largest batch this model has run cleanly at full budget — then the
+///    bucket of the largest batch this model has been *seen* to run cleanly at
+///    full budget — `anchor` ([`ModelCalibration::max_units_measured`]) or the
+///    largest [`ThroughputSample::anchor`] in the ring, whichever is greater,
+///    because a DP-2 halving lowers the first and unmeasures nothing — the
 ///    candidate's own bucket must hold [`MIN_KNEE_BUCKET_SAMPLES`]
 ///    observations taken when the anchor was already there
 ///    ([`ThroughputSample::anchor`]). A rate measured at 2 units while the
@@ -6626,7 +6628,27 @@ fn fit_knee(
         return None;
     }
     let threshold = reference * KNEE_RATIO;
-    let anchor_bucket = size_bucket(anchor.max(1));
+    // Rule 4's gate is a *historical* question — had the ramp already gone
+    // past this size when these rates were taken — so it is held up by the
+    // largest anchor the ring's own observations were taken under, not only by
+    // the anchor in force now. The live figure can be lower: DP-2 halves
+    // `max_units_measured` when a replica dies mid-window on a unified board
+    // ([`VramLedger::note_unified_death_locked`]), which is a correction about
+    // what to run next and not a claim that those windows never happened —
+    // [`VramLedger::pending_update_locked`] already refuses to persist it for
+    // the same reason. Rules 1 and 3 hold the candidate at least two buckets
+    // below the frontier and the frontier is at most the anchor's bucket, so
+    // one halving still leaves this gate closed; a second one would open it on
+    // exactly the ring rule 4 exists to refuse.
+    let anchor_bucket = size_bucket(
+        samples
+            .iter()
+            .map(|sample| sample.anchor)
+            .max()
+            .unwrap_or(0)
+            .max(anchor)
+            .max(1),
+    );
     // The knee is, by definition, the **smallest** quiet bucket already on the
     // plateau. That is the candidate; there is exactly one, and the rules
     // below are vetoes on it rather than a search for a bucket that survives
@@ -12862,6 +12884,72 @@ mod tests {
         assert_eq!(
             fit_knee(&recorded(&steady), 0.0, 136, None).and_then(|fit| fit.knee_units),
             Some(7)
+        );
+    }
+
+    /// Rule 4's gate is held up by the ring, not by the live anchor.
+    ///
+    /// [`Self::note_unified_death_locked`] (DP-2) **halves**
+    /// `max_units_measured` when a replica dies mid-window on a unified board.
+    /// That is a runtime correction about what this machine should be trusted
+    /// to run next — `Self::pending_update_locked` already refuses to persist
+    /// it for exactly that reason — and it is not a statement that the ramp
+    /// never went past those sizes. Rule 4 asks the historical question, so it
+    /// reads the largest anchor the ring's own observations were *taken*
+    /// under. Reading the halved figure instead switched the rule off for the
+    /// highest candidate rules 1 and 3 allow: those two force the candidate at
+    /// least two buckets below the frontier, and the frontier is at most the
+    /// anchor's bucket, so one halving still leaves the gate closed — but the
+    /// second one opens it, on the ring the rule exists to refuse.
+    #[test]
+    fn a_halved_anchor_does_not_excuse_a_knee_from_the_ramp_era_rule() {
+        // A bend at 16 units, whose only observations date from the window
+        // that was itself the ramp's step past 16; everything above it is
+        // steady state at an anchor of 64.
+        let ramp_era: &[Recorded] = &[
+            (8, 40.0, 8, 3),
+            (8, 40.0, 8, 3),
+            (8, 40.0, 8, 3),
+            (16, 100.0, 16, 4),
+            (16, 100.0, 16, 4),
+            (16, 100.0, 16, 4),
+            (32, 100.0, 64, 6),
+            (32, 100.0, 64, 6),
+            (32, 100.0, 64, 6),
+            (64, 98.0, 64, 7),
+            (64, 98.0, 64, 7),
+            (64, 98.0, 64, 7),
+        ];
+        assert_eq!(
+            fit_knee(&recorded(ramp_era), 0.0, 64, None).and_then(|fit| fit.knee_units),
+            None,
+            "the control: with the anchor as measured, rule 4 refuses"
+        );
+        // Two unified-board deaths later the live anchor reads 16 — the same
+        // bucket as the candidate, which is what used to skip the gate.
+        assert_eq!(
+            fit_knee(&recorded(ramp_era), 0.0, 16, None).and_then(|fit| fit.knee_units),
+            None,
+            "a halved anchor is not evidence that the ramp never went past 16"
+        );
+        // And the rule still lets an honest knee through at the same anchor:
+        // the same curve with the 16-unit observations taken after the ramp
+        // had reached 64 is a steady-state window that happened to be small.
+        let steady: Vec<Recorded> = ramp_era
+            .iter()
+            .map(|(units, rate_, anchor, window)| {
+                (
+                    *units,
+                    *rate_,
+                    if *units == 16 { 64 } else { *anchor },
+                    *window,
+                )
+            })
+            .collect();
+        assert_eq!(
+            fit_knee(&recorded(&steady), 0.0, 16, None).and_then(|fit| fit.knee_units),
+            Some(31),
+            "honest evidence at 16 units still knees there"
         );
     }
 

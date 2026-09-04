@@ -309,7 +309,11 @@ quiet samples taken in the regime the model is actually in.*
    because each bucket is another doubling the ramp has to reach one window at
    a time before any knee may be fitted.
 4. **No ramp-era knee below the anchor.** If the candidate is below the bucket
-   of `max_units_measured`, its own bucket must hold two observations taken
+   of the largest batch the model has been *seen* to run cleanly at full
+   budget — `max_units_measured` or the largest anchor the ring's own
+   observations were taken under, whichever is greater, since DP-2's halving
+   of the former unmeasures none of them — its own bucket must hold two
+   observations taken
    once the ramp had already reached a *larger* bucket. A rate measured at 2
    units while the ramp was on its way past 2 units is not evidence that the
    model stops gaining at 2 — the ramp's next step is the standing evidence

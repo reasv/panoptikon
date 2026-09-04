@@ -230,9 +230,10 @@ build/deploy/API. The plan that uses this is
   two-sample retain) must itself be quiet and must not be the knee; (2) the
   knee may not be the smallest bucket observed either; (3)
   `KNEE_PLATEAU_BUCKETS = 2` quiet buckets must lie above it, none faster by
-  `KNEE_RATIO`; (4) a knee below `size_bucket(max_units_measured)` needs two
-  observations in its own bucket taken once the anchor's bucket had already
-  passed it (`ThroughputSample::anchor`); (5) after a widening, the smallest
+  `KNEE_RATIO`; (4) a knee below `size_bucket(max(max_units_measured, largest
+  ThroughputSample::anchor in the ring))` — the max because DP-2's halving of
+  the anchor unmeasures nothing — needs two observations in its own bucket
+  taken once the anchor's bucket had already passed it; (5) after a widening, the smallest
   quiet bucket above `knee_widened.bucket` needs two observations with `seq ≥
   from_seq`. R1e also marks a replica's **first settled window**
   (`WorkerEntry::settled_windows`) as `ThroughputSample::warmup` and drops
