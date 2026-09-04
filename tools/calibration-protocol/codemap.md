@@ -270,7 +270,7 @@ build/deploy/API. The plan that uses this is
 - Worker death mid-window: `roundtrip` EOF → fatal (`worker.rs:1305-1315,
   1422-1444`); dispatcher `End::Fatal` fails the queue, aborts sibling
   windows, kills all replicas; `handle_worker_death`
-  (`manager.rs:1547-1567`) WARN "worker died fatally; dropping model from
+  (`manager.rs:1597-1616`) WARN "worker died fatally; dropping model from
   all caches". The next predict respawns — under that **model's own** load
   lock and its board's admission permit (R6), and bounded by the R9
   load-failure cooldown when the respawn itself keeps failing (was: no
@@ -379,10 +379,12 @@ build/deploy/API. The plan that uses this is
   deadline**; a hung worker holds its grant forever. The manager's global
   `load_lock` is **gone** (R6, finding P5-3/B18): a predict to a resident
   model takes no load-path lock at all (`ensure_loaded`'s fast path,
-  `manager.rs:1852`), a load takes the shutdown barrier, that model's own
-  lock (`load_locks`, `manager.rs:1171`) and one permit per board from the
+  `manager.rs:1922`), a load takes the shutdown barrier, that model's own
+  lock (`load_locks`, `manager.rs:1221`) and one permit per board from the
   admission gate (`load_admission`, `acquire_load_admission`
-  `manager.rs:1796`, `[inference_local] max_concurrent_loads`, default 1).
+  `manager.rs:1858`, `[inference_local] max_concurrent_loads`, default 1;
+  a replica whose board key does not resolve takes a shared bucket *and*
+  every board's permit, since the pin still reaches the backend).
   Lock order and the no-deadlock argument are in the `manager.rs` module
   docs.
 - Core request sizing (**changed by the §8 G7 fix; the feedback signal is
@@ -472,9 +474,9 @@ build/deploy/API. The plan that uses this is
   torch_version, dtype, base_mb, base_method, free_mb, total_mb,
   free_source, allocated_mb, reserved_mb, reserved_at_load_mb,
   memory_age_ms, measurements_recorded, recent_batches[]}]`
-  (`manager.rs:148-179`), and top-level `load_cooldowns[{inference_id,
+  (`manager.rs:614-653`), and top-level `load_cooldowns[{inference_id,
   failures, last_error, retry_at, retry_after_secs, window_secs}]` (R9,
-  `manager.rs:1436-1458`) — the only view of a model whose loads are
+  `manager.rs:1484-1507`) — the only view of a model whose loads are
   failing, since such a model is never in `models[]`. A predict or
   `PUT /load` during a cooldown answers **503** with `Retry-After` and
   `{"detail": {"kind": "load_cooldown", …}}` (`http.rs`
@@ -867,7 +869,7 @@ Smallest per class: `tags/wd-vit-tagger-v3` (~350 MB),
   impl dir; `inferio_custom/README.md`) or set `[inference_local]
   impl_dirs`, then a user registry TOML in `config/inference/` (scanned
   after the built-in dir; see `config/inference/example.toml` and the
-  manager's test registry at `manager.rs:2655-2741`), e.g.
+  manager's test registry at `manager.rs:2725-2811`), e.g.
   ```toml
   [group.oomtest]
   config.impl_class = "oom_second_batch_test"
