@@ -126,6 +126,16 @@ def _positive_int(value) -> int | None:
     return number if number > 0 else None
 
 
+def _dims_label(dims: tuple[int, int] | None) -> str:
+    """A padded tensor's dimensions for a log line, as `"width x height"`.
+
+    The order every run2 report states them in (`1824x2560` for a 300 dpi A4
+    scan under the 2560 canvas), which is the transpose of the `(height,
+    width)` the arithmetic works in — so it is done in exactly one place.
+    """
+    return "unknown" if dims is None else f"{dims[1]}x{dims[0]}"
+
+
 def _shape_as_height_width(shape) -> tuple[int, int] | None:
     """A harness `(width, height)` pair as `(height, width)`, or None.
 
@@ -451,7 +461,7 @@ class EasyOCRModel(InferenceModel):
                     "detector tensor of %s (%s); falling back to per-image "
                     "processing",
                     len(raw_images),
-                    "x".join(str(value) for value in dims) if dims else "unknown",
+                    _dims_label(dims),
                     "a kernel index ceiling"
                     if looks_like_index_limit(error)
                     else type(error).__name__,
@@ -651,9 +661,7 @@ class EasyOCRModel(InferenceModel):
                 "the kernel indexes at most %d",
                 chunk_cap,
                 len(bounded),
-                "x".join(str(value) for value in tensor_dims)
-                if tensor_dims
-                else "unknown",
+                _dims_label(tensor_dims),
                 detector_pool_elements(*tensor_dims) if tensor_dims else 0,
                 KERNEL_INDEX_ELEMENT_LIMIT,
             )
