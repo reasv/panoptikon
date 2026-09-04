@@ -125,7 +125,10 @@ build/deploy/API. The plan that uses this is
   `local_samples`, throughput ring 128 `KNEE_RING`, `knee_best`,
   `knee_units`, `knee_is_local`, run2 `knee_clean_windows` +
   `knee_widened: Option<KneeWidening{bucket, from_seq}>` (`:1691`, R1e —
-  was `knee_re_explore_above`), `knee_withdrawn`, `throughput_seq`,
+  was `knee_re_explore_above`), `knee_withdrawn`, run2 S1
+  `shape_ceiling: Option<ShapeCeiling{units, canvas_pixels, epoch,
+  observed_at}>` (`ledger.rs:1940`, type at `:1990`) — **runtime-only, in no
+  `ProfileUpdate` and no `ProfileSeed`**, `throughput_seq`,
   `persisted`; `ledger.rs:1549`),
   `remembered_bases`,
   `remembered_dtypes`, `pending_trims` (cap 32).
@@ -157,11 +160,29 @@ build/deploy/API. The plan that uses this is
   `pending_requests > 0 && no grant`; appetite = `slope × min(anchor,
   knee)` post-fit else `base` (or 256); floor = `slope × seed` or
   `SEED_BATCH_FLOOR_MB = 256`; pro-rata when floors oversubscribe.
-- Unit budget `admitted_units` (`:1104-1116`): `max(seed <<
+- Unit budget `admitted_units` (`ledger.rs:1277`): `max(seed <<
   effective_ramp_step, anchor)`, `min(2×anchor)` if anchor > 0
-  (`RATCHET_FACTOR`), `min(knee)`, `>> deflation`, `≥ 1`.
+  (`RATCHET_FACTOR`), `min(knee)`, run2 S1 `min(shape_ceiling)`,
+  `>> deflation`, `≥ 1`.
   `effective_ramp_step = max(ramp_step, ramp_floor_step(seed, anchor))`
   (`ramp_floor_step` `:1058-1065`, cap 32).
+- **Shape ceiling** (run2 S1, `ledger.rs`): learned from a measurement whose
+  `clamped.reason == "index_limit"` (`CLAMP_REASON_INDEX_LIMIT` `:1539`,
+  `clamp_reason_is` `:1547`) — a size-dependent, **non-memory** kernel
+  ceiling (easyOCR: CRAFT's `vgg16_bn.features[6]` pool, `2^31 − 1`
+  output elements). `update_shape_ceiling` (`:2092`) is the whole state
+  machine: **smallest** `to_units` wins, a wider report is ignored, a batch
+  larger than it that ran **uncut** clears it (never raises — a cap at the
+  demonstrated size would lock itself in), and a canvas or `epoch` mismatch
+  clears it. Read through `shape_ceiling_for` (`:2200`) /
+  `shape_ceiling_locked` (`:4199`), which re-check the identity so a replica
+  loaded under another canvas is never priced against it. Three effects
+  beyond the budget: no ramp step past it (`note_clean_window` `:1086`), the
+  `knee_bound` comparand keeps it applied so a clipped window earns the
+  knee's expiry nothing (`request_grant`), and an `index_limit` clamp's
+  **throughput-collapse verdict is suppressed** so it is never a negative
+  sample (`ingest_locked`, `clipped_collapses` `:5235`). `/health` reports it
+  as `shape_ceiling_units`. Test hook `shape_ceiling_for_test`.
 - Window = `admitted_units × 3` (`WINDOW_DEPTH_MULTIPLIER` `:407`).
   Dispatcher bounds (`dispatch.rs:703-724`): priced `{units:
   window_target, items: cap×3 if capped, bytes: MAX_WINDOW_BYTES}`;
@@ -185,9 +206,11 @@ build/deploy/API. The plan that uses this is
   `price_inputs` — otherwise the window and the batches inside it are
   denominated differently (F-B), and on the three grantless `easyocr_*` ids
   it is the only cap that ever applies.
-- Ramp / deflation (`ledger.rs`: `note_clean_window` `:933`,
+- Ramp / deflation (`ledger.rs`: `note_clean_window` `:1086`,
   `note_negative_sample` `:973`): clean window **with ≥ 1 high-water sample** → `ramp_step + 1`;
-  clean without measurement → no growth; while deflated, 3 clean windows
+  clean without measurement → no growth; run2 S1: **no step at all once
+  `uncapped_units ≥ shape_ceiling`** (deflation repayment is not gated on it —
+  a shape ceiling is not a memory condition); while deflated, 3 clean windows
   (`CLEAN_WINDOWS_TO_RESTORE`) restore one halving; negative →
   `deflation + 1`, `clean_windows = 0`. Run2 (R4): the counter is **capped**
   at `deflation_cap(anchor, seed) = ceil(log2(max(anchor,seed))) + 1`
@@ -626,7 +649,9 @@ build/deploy/API. The plan that uses this is
   footprint_mb, charge_mb, base_mb?, reserved_at_load_mb?, reserved_mb?,
   grants_outstanding, grants_mb, pending_requests, seed_units, ramp_step,
   deflation, clean_windows, unit_budget, max_units_measured, knee_units?,
-  knee_is_local, throughput_samples, local_samples, effective_margin,
+  knee_is_local, `shape_ceiling_units?` (run2 S1 — runtime-only, absent
+  until an `index_limit` clamp reports one), throughput_samples,
+  local_samples, effective_margin,
   fit?{slope_mb_per_unit, intercept_mb, residual_mb, samples,
   transient_samples}}]}]` (`VramLedger::health` `ledger.rs:5394-5487`); `models[]`
   has `last_grant_units` (renamed from `last_effective_cap`),
@@ -664,9 +689,20 @@ Added by commit `49822c8b` (ledger.rs / calibration.rs):
   `ledger.rs`, `canvas_log_field`
 - DEBUG "settled a granted window" (model, gpu, outcome
   clean|negative|aborted|worker_died, high_water_samples,
-  throughput_samples, ramp_step, deflation, clean_windows,
+  throughput_samples, `clamped_samples`, `clamped`
+  none|memory|index_limit|`a+b` (run2 S1, `clamp_log_field` — absence on the
+  wire is the defensive **memory** clamp, and an unrecognised reason is
+  printed verbatim), ramp_step, deflation, clean_windows,
   max_units_measured); **WARN** with `reason`
   oom|throughput_collapse|unified_board_death on negatives
+- **INFO** "this model's own kernels named a batch size they cannot execute"
+  (model, gpu, `action` set|lowered|cleared, `shape_ceiling_units` (**-1** on
+  `cleared`), `previous_units` (**-1** when nothing was displaced), `cause`
+  index_limit_clamp|canvas_or_epoch_changed|ran_wider_uncut, `canvas_pixels`
+  (**-1** when uncapped), `epoch`, `previous_age_secs` (**-1** on a first
+  set)) — **once per (model, board) change**, never per window, emitted just
+  before that window's own settle line. Run2 **S1**: `ledger.rs`,
+  `ShapeCeilingEvent::emit`
 - **INFO** "classified this window as an out-of-memory negative" (model,
   gpu, `source` typed_exception|marker|message_pattern|error_frame|
   unclassified|*a tier this host does not recognise*, `exception` (`unknown`

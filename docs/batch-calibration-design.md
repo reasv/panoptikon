@@ -372,6 +372,80 @@ ring answers 127. This is a knee found late, not a knee lost — and the leg
 that fitted it ran at 0.94x master, where run1's leg on the same model with no
 knee at all ran at 1.00x.
 
+### Shape ceiling: the third brake (run2 S1)
+
+The knee and the extrapolation ratchet are both statements the *ledger* makes
+about a model. Run2's easyOCR leg found a third constraint that the ledger
+cannot derive at all, because it is a property of the impl's kernels: CRAFT's
+first `MaxPool2d` (`vgg16_bn.features[6]`) launches over its output element
+count as a signed `int32`, so `64 × ⌊H/2⌋ × ⌊W/2⌋ × B` may not exceed
+`2^31 − 1` — 28 items at the 1824×2560 padded tensor the shipped 2560 canvas
+produces — whatever the board has free. The worker reports the trim as
+`clamped: {from_units, to_units, free_mb?, reason: "index_limit"}`, and
+`to_units` is denominated in the canvas and cost epoch the window was priced
+under.
+
+The ledger keeps that as a per-(model, board) **shape ceiling** and does five
+things with it:
+
+1. **`admitted_units` is min'd with it** — a second pure `min` beside the
+   knee. Every unit admitted above it is admission the model cannot spend: the
+   worker plans a bigger batch, trims it back to the same size, and the grant
+   reserved memory for a batch that never existed. That is the over-admission
+   S1 measured, invisible then because the trim was silent.
+2. **The ramp takes no step past it.** The knee and the ratchet cap the budget
+   and leave the exponent free to climb; this one stops the exponent too,
+   because a window trimmed back to the ceiling is no evidence that a bigger
+   batch would work and never can be — every window from here on is trimmed to
+   the same size. Otherwise the ramp walks to `MAX_RAMP_STEP` against a wall
+   and the budget jumps straight to the ratchet ceiling the moment the ceiling
+   clears, with nothing measured in between.
+3. **A clipped run is never read as a plateau.** A clamped batch is already
+   out of the throughput ring, so no bucket, frontier or `observed_top` is
+   built from one; additionally, a window the *ceiling* held down is not
+   credited to the knee's expiry (the `knee_bound` comparand keeps the ceiling
+   applied and drops only the knee), or a run of clipped windows would widen a
+   knee on evidence the knee had nothing to do with.
+4. **It never deflates anything.** An `index_limit` clamp carries no `oom` —
+   the impl said "not this shape", not "not this much memory". The trap is the
+   throughput-collapse flag: a batch trimmed from 200 units to 28 runs a
+   fraction of the work at a fraction of the amortization and the worker's
+   rate comparison sees a collapse, which used to be a negative sample. That
+   verdict is now suppressed for an `index_limit` clamp, and only that verdict
+   — a genuine allocator failure on the same measurement is read as usual.
+5. **It is reported** on `/health` per replica as `shape_ceiling_units`, and
+   logged at INFO once per (model, board) when it is set, lowered or cleared.
+
+**Runtime-only, deliberately.** Two of its three inputs are not properties of
+the machine: the padded dims come from *this corpus*, and the units figure is
+denominated in the pixel canvas (R7) and cost epoch the clamped window was
+priced under. It appears in no `ProfileUpdate` and no `ProfileSeed`; a restart
+re-learns it from the first clamped window. It is stamped with the canvas and
+epoch it was observed under, applied only to a replica whose own canvas and
+epoch match, and cleared outright when they move.
+
+**How it moves.** The smallest report wins — the binding padded frame is the
+element-wise max over a batch, so a report from a batch of smaller pages fits
+more of them under the same element limit and does not describe the frame that
+bound. A batch *larger* than the ceiling that the impl did **not** cut retires
+it: the dims moved. It is cleared rather than raised to the size just
+demonstrated, and that is the only non-deadlocking choice — a ceiling caps
+admission, so raising it to the largest batch seen would pin the budget at
+exactly that size and make the next, larger demonstration impossible.
+
+**Known limitation, stated rather than hidden.** Within one process the
+ceiling only ever ratchets *downward*: while it caps admission no batch above
+it can be granted, so the contradiction rule is reachable only from a window
+granted before the ceiling existed, or from a canvas/epoch change. A
+pessimistic report — a mixed batch whose one oversized page sets the padded
+frame for the rest — therefore holds until the model is reloaded. The cost is
+throughput, never a failure, and for a `sum` model it is small: the ceiling in
+*units* is close to shape-invariant (`B × 16·H·W ≤ 2^31` means
+`units ≈ B·H·W ≤ 2^31/16`), which is exactly why it is denominated in units
+rather than in items. Letting a model climb back out would need a knee-style
+expiry probe — one deliberately over-wide window every N, which the impl
+trims, prices and reports harmlessly. That is not implemented.
+
 ## Core decision: learn a cost model, not a max batch size
 
 Calibration does **not** learn "the batch size that fits". It learns a
@@ -686,6 +760,7 @@ limit     = min(total × cap_fraction,           # server lever, default off
                 total − external × (1 + margin)) # desktop lever, default on
 headroom  = limit − Σ charge(residents) − Σ load_reservations
 grant     = min(headroom share, ramp step, slope × knee_units,
+                slope × shape_ceiling_units,
                 priced content of the window itself)
 ```
 
@@ -693,7 +768,10 @@ The `slope × knee_units` term is written on the MB side here and enforced
 on the **unit** side in the implementation (`admitted_units`): post-fit the
 two are the same constraint, since a grant's MB figure is `units × slope`,
 and the unit-side form needs no fit to be in force — so a knee still binds
-on a model that has not been fitted yet.
+on a model that has not been fitted yet. The `shape_ceiling_units` term is
+the same shape and is enforced in the same place (run2 S1, "Shape ceiling:
+the third brake"): the size the impl's own kernels have said they cannot
+execute at this corpus's shapes.
 
 - **The ledger runs in one currency: driver MB.** A worker's charge is
   its `footprint` — process-level `base` (context + workspaces +
@@ -859,6 +937,15 @@ on a model that has not been fitted yet.
   earned doublings had to walk back up to the anchor first they never
   would — the budget would pin at the anchor and the ratchet's own 2×
   ceiling would be unreachable.
+- **Shape ceiling** (run2 S1): a batch size the impl's own kernels have said
+  they cannot execute at this corpus's shapes, learned from a
+  `clamped.reason = "index_limit"` report. A pure `min` on the unit budget
+  beside the knee, and the one brake that also stops the ramp **exponent** —
+  a window trimmed back to the ceiling is no evidence about a bigger batch and
+  never can be. It is not a memory condition and never deflates anything, and
+  it is runtime-only: it depends on this corpus's padded dims and on the canvas
+  the window was priced under, so it travels in no profile and a restart
+  re-learns it. See "Shape ceiling: the third brake".
 
 Worker, per batch within its window:
 

@@ -160,6 +160,25 @@ smaller, which is the one authority a foreign profile has beyond pricing. What
 does not travel with it is the progress towards re-testing it: those windows
 ran on your board, not on the importer's.
 
+There is one cap the store deliberately cannot express, and it is worth
+knowing about when a model's `/health` reports a `unit_budget` far below its
+`max_units_measured`: the **shape ceiling** (run2 S1). Some impls have a hard,
+size-dependent kernel limit that is not a memory condition at all — easyOCR's
+detector hits a 32-bit index limit in CRAFT's first pooling kernel at 28 items
+of a 1824×2560 padded tensor, whatever the board has free — and the worker
+reports the trim as `clamped.reason = "index_limit"`. The orchestrator caps the
+budget and the ramp at the reported size and shows it as `shape_ceiling_units`.
+
+It is **runtime-only** and appears in no profile, here or in a local store, and
+that is deliberate rather than an omission: it depends on *your corpus's*
+padded dimensions and on the pixel canvas the clamped window was priced under,
+so the same physical kernel limit is a different number for a library of A4
+scans and one of thumbnails, and a different number again after a canvas or
+`epoch` change. A restart re-learns it from the first clamped window, which
+costs one window. Contributing one would hand every importer a cap measured
+against a corpus they will never see. Do not add the field, and do not
+hand-write one.
+
 A knee you contribute will be treated as **provisional** on every machine that
 imports it (run2, R1e): it caps from the first grant, and it is re-tested after
 `KNEE_SEED_REVALIDATION_WINDOWS` = 4 clean windows run at it rather than the 12
