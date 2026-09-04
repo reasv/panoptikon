@@ -13106,13 +13106,22 @@ mod tests {
 
     /// Run1's `S6-contend`, the tainted series: three models sharing one
     /// board, and the run1 binary fitted `knee_units` 15 / 31 / 16 383 out of
-    /// it. Rebuilt per model with each window tagged by how many *other*
-    /// models held an overlapping window, MobileCLIP and MiniLM have **no**
-    /// sole-occupancy observations at all and wd-vit's 7 045 span one bucket.
-    /// R1's contention tag already answers the first two; this pins that the
-    /// refit reads none of them.
+    /// it. Rebuilding each model's windows from `panoptikon.log` and tagging
+    /// every one with how many *other* models held an overlapping window gives
+    /// the census this test stands on: MobileCLIP 1 466 observations of which
+    /// **0** are sole occupancy, MiniLM 1 806 of which **0** are, and wd-vit
+    /// 7 966 of which 7 045 are — those 7 045 falling in three size buckets,
+    /// 7 040 of them at one unit, 4 at eight and a single one at 32.
+    ///
+    /// So the series reaches no knee twice over, and the two halves fail for
+    /// different reasons. R1's contention tag answers MobileCLIP and MiniLM
+    /// before the fit sees anything; wd-vit's survivors reach the fit and stop
+    /// at the gates, because the lone 32-unit observation cannot be certified
+    /// quiet and two buckets are fewer than [`MIN_KNEE_BUCKETS`].
     #[test]
     fn a_contended_series_reaches_no_knee_at_all() {
+        // The contention half: every observation carries a neighbour, so
+        // `refit_knee_locked`'s filter hands the fit an empty ring.
         let contended: Vec<ThroughputSample> = recorded(MOBILECLIP_RING_AT_ITS_KNEE)
             .into_iter()
             .map(|sample| ThroughputSample {
@@ -13127,6 +13136,20 @@ mod tests {
             .collect();
         assert!(sole.is_empty(), "nothing this series holds may fit a knee");
         assert_eq!(fit_knee(&sole, 0.0, 136, None), None);
+
+        // The gate half: wd-vit's sole-occupancy census, in the proportions
+        // above and scaled to what [`KNEE_RING`] can actually hold. Rates are
+        // beside the point — the fit never reaches them.
+        let mut survivors = curve(&[(1, 36.0)], KNEE_RING - 5);
+        survivors.extend(curve(&[(8, 36.0)], 4));
+        survivors.extend(curve(&[(32, 36.0)], 1));
+        assert_eq!(survivors.len(), KNEE_RING);
+        assert_eq!(
+            knee_of(&survivors),
+            None,
+            "a singleton at the frontier and two quiet buckets below it is \
+             fewer buckets than a curve needs"
+        );
     }
 
     /// The warm-up rule (run2 change R1e): a replica's first settled window
