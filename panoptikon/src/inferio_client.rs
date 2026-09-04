@@ -426,38 +426,29 @@ impl InferenceApiClient {
     /// *Any* answer proves the peer speaks it — a 404 or a 500 is as good as
     /// a 200, because reading the status at all means the frames parsed.
     ///
-    /// A failure only means HTTP/1.1 if it is the peer's *answer*. See
-    /// [`Self::probe_says_http11`]: a probe that never reached the peer is not
-    /// evidence about the peer's protocol, and memoizing HTTP/1.1 on one is
-    /// how a single blip at first contact silently costs an endpoint its
-    /// multiplexing for the lifetime of the process. That matters most in the
-    /// deployment this exists for — the gateway and the inference server on
-    /// different machines — where first contact crosses a network, and where
-    /// the downgrade would then also halve the job's in-flight window through
-    /// `requests_are_multiplexed`.
+    /// **A downgrade is only ever recorded on positive evidence**, because it
+    /// is recorded once and nothing but a predict-time connection error clears
+    /// it: one wrong memo costs the endpoint its multiplexing for the lifetime
+    /// of the process, and halves every job's in-flight window with it through
+    /// `requests_are_multiplexed`. That matters most in the deployment this
+    /// exists for — the gateway and the inference server on different machines
+    /// — where first contact crosses a network and blips are ordinary.
+    ///
+    /// So a failed probe is not evidence on its own. `reqwest` cannot tell
+    /// "the peer rejected the h2 preface" from "the connection died mid-stream"
+    /// — both are `Kind::Request` — so the ambiguous class
+    /// ([`Self::could_be_an_http2_refusal`]) is resolved by asking twice more:
+    /// the h2 probe is repeated (a reset that happens twice in a row is not a
+    /// blip), and then the peer must *answer over HTTP/1.1*, which proves it is
+    /// alive and therefore that its refusal was about the protocol. Anything
+    /// short of that records nothing and re-probes on the next call.
     async fn transport(&self) -> Transport {
         if let Some(transport) = *self.endpoint.transport.read().await {
             return transport;
         }
-        let probe = self
-            .endpoint
-            .h2
-            .raw
-            .get(format!("{}/cache", self.base_url))
-            .send()
-            .await;
-        let transport = match probe {
-            Ok(_) => Transport::H2c,
-            Err(err) if Self::probe_says_http11(&err) => {
-                warn!(
-                    endpoint = %self.base_url,
-                    error = %err,
-                    "the inference endpoint did not answer HTTP/2 cleartext; \
-                     falling back to HTTP/1.1 for this endpoint"
-                );
-                Transport::Http11
-            }
-            Err(err) => {
+        let transport = match self.probe_h2c().await {
+            Ok(()) => Transport::H2c,
+            Err(err) if !Self::could_be_an_http2_refusal(&err) => {
                 // Unreachable, not un-multiplexed. Nothing is remembered, so
                 // the next call probes again; this attempt uses HTTP/1.1
                 // because it is the half of the guess that also works against
@@ -471,6 +462,30 @@ impl InferenceApiClient {
                 );
                 return Transport::Http11;
             }
+            Err(first) => match self.probe_h2c().await {
+                // The first failure was the blip, not the peer.
+                Ok(()) => Transport::H2c,
+                Err(second) if self.peer_answers_http11().await => {
+                    warn!(
+                        endpoint = %self.base_url,
+                        error = %second,
+                        first_error = %first,
+                        "the inference endpoint answers HTTP/1.1 but not HTTP/2 \
+                         cleartext; falling back to HTTP/1.1 for this endpoint"
+                    );
+                    Transport::Http11
+                }
+                Err(second) => {
+                    warn!(
+                        endpoint = %self.base_url,
+                        error = %second,
+                        first_error = %first,
+                        "the inference endpoint answered neither HTTP/2 cleartext \
+                         nor HTTP/1.1; not recording a fallback"
+                    );
+                    return Transport::Http11;
+                }
+            },
         };
         // Last writer wins, and both writers agree: two concurrent probes
         // reach the same peer.
@@ -486,8 +501,35 @@ impl InferenceApiClient {
         transport
     }
 
-    /// Whether a failed probe is the peer *refusing HTTP/2*, as opposed to the
-    /// peer not being reachable at all.
+    /// One h2c probe: `GET /cache`, the cheapest thing this surface serves,
+    /// sent with HTTP/2 prior knowledge. The body is never read — a status is
+    /// already proof that the frames parsed.
+    async fn probe_h2c(&self) -> reqwest::Result<()> {
+        self.endpoint
+            .h2
+            .raw
+            .get(format!("{}/cache", self.base_url))
+            .send()
+            .await
+            .map(|_| ())
+    }
+
+    /// Whether the peer answers the same request over HTTP/1.1 — the proof
+    /// that it is alive, and therefore that its refusal of the h2 preface was
+    /// about the protocol rather than about the network. Any status counts,
+    /// for the same reason the h2c probe accepts any status.
+    async fn peer_answers_http11(&self) -> bool {
+        self.endpoint
+            .h1
+            .raw
+            .get(format!("{}/cache", self.base_url))
+            .send()
+            .await
+            .is_ok()
+    }
+
+    /// Whether a failed probe *could* be the peer refusing HTTP/2, as opposed
+    /// to the peer not being reachable at all.
     ///
     /// An HTTP/1.1-only server accepts the TCP connection and then rejects the
     /// h2 preface, so the failure happens after connect: it is neither
@@ -496,7 +538,12 @@ impl InferenceApiClient {
     /// never be recorded as a protocol fact — reqwest classifies a timeout as
     /// `Kind::Request` too, so without this check a slow endpoint would
     /// permanently downgrade itself.
-    fn probe_says_http11(err: &reqwest::Error) -> bool {
+    ///
+    /// Only "could": the same `Kind::Request` also covers a connection that
+    /// died mid-stream, which says nothing about the protocol either. That is
+    /// why a true answer is the *start* of the decision in [`Self::transport`],
+    /// never the whole of it.
+    fn could_be_an_http2_refusal(err: &reqwest::Error) -> bool {
         !err.is_connect() && !err.is_timeout()
     }
 
@@ -1365,8 +1412,46 @@ mod tests {
             .expect_err("the port is closed");
         assert!(connect_err.is_connect());
         assert!(
-            !InferenceApiClient::probe_says_http11(&connect_err),
+            !InferenceApiClient::could_be_an_http2_refusal(&connect_err),
             "a connect failure is a network fact, not a protocol one"
+        );
+    }
+
+    /// A peer that accepts the connection and then drops it must not be
+    /// remembered as HTTP/1.1 either.
+    ///
+    /// This is the shape the connect/timeout check alone cannot catch: a
+    /// mid-stream reset, a peer restarting, a proxy closing an idle socket.
+    /// `reqwest` reports it exactly as it reports an HTTP/1.1-only server's
+    /// refusal of the h2 preface — neither `is_connect` nor `is_timeout` — so
+    /// the only thing that separates the two is whether the peer will answer
+    /// *anything* over HTTP/1.1. This one will not, so nothing is recorded and
+    /// the endpoint is free to multiplex again the moment it is healthy.
+    #[tokio::test]
+    async fn a_peer_that_answers_nothing_is_not_remembered_as_http11() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                // Accept, then drop: the TCP connection succeeds and the
+                // request dies on it, which is the ambiguous class.
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                drop(socket);
+            }
+        });
+
+        let client =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{addr}"), false).unwrap();
+        assert!(
+            client.get_cached_models().await.is_err(),
+            "the peer answers nothing, so the call itself must fail"
+        );
+        assert_eq!(
+            client.known_transport(),
+            None,
+            "a peer that answers neither protocol is not evidence for either"
         );
     }
 
