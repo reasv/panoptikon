@@ -274,6 +274,23 @@ The orchestrator replaces it with **queue-and-drain at dispatch time**:
   drain-the-pipe, but with an explicit, observable cap. (A wait-window can be
   added later if profiling ever shows first-batch sparsity matters; the user's
   read is that it's fine, and the streaming pipeline keeps the queue fed.)
+
+  **Amended by run2 S1-4, and the amendment keeps the rule.** "The queue is
+  never empty when a worker frees" is true, but *how much* is in it is not
+  independent of when the dispatcher looks: a replica returns to the free pool
+  the instant `run_batch` hands its replies to the waiting oneshots — before
+  the caller has released its permits, read the desired-in-flight header and
+  re-submitted. A closed-loop caller of depth `C` therefore always leaves
+  `C - W` queued behind window `W`, and the next window is exactly that, so
+  `W -> C - W`: an involution whose every orbit has period 2 and whose mean is
+  `C/2`. Run2's `S2-wdvit` leg ran `136 -> 64 -> 136` for seventy windows, and
+  the ramp advanced a step only on the large phase. The fix is a **settle**,
+  not a timer: `WINDOW_SETTLE_QUIET` (2 ms of no arrivals) bounded by
+  `WINDOW_SETTLE_MAX` (20 ms from the moment the last window's replies went
+  out), applied **only** when a window has just completed, on the priced path,
+  and only while the queue is short of the budget the ledger already granted.
+  An idle model still dispatches with zero added latency — that is asserted,
+  not assumed — and so does a queue that already fills the window.
 - Requests larger than `effective_max_batch` are split into sequential
   sub-batches by the orchestrator (worker never sees an oversized batch).
 - Batch failure → fall back to per-request prediction (port of the existing

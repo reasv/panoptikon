@@ -490,6 +490,55 @@ fn priced_item_bound(cap: Option<u32>) -> usize {
 /// windows can never merge and the window target can never be reached. Two
 /// windows' worth is the smallest value that lets the next window be formed
 /// out of requests that were already queued while the current one runs.
+/// How long a freed replica waits for the caller's refills to land before it
+/// forms a window that is short of the budget it is allowed.
+///
+/// **The 2-cycle this removes.** `run_dispatcher` forms a window out of
+/// whatever is queued at the instant a replica frees — and a replica frees as
+/// soon as `run_batch` hands the replies to the waiting oneshots, *before* the
+/// caller's item tasks have released their permits, read the header and
+/// re-submitted. A closed-loop caller of depth `C` therefore leaves `C - W_k`
+/// queued behind window `W_k`, and the next window is exactly that:
+///
+/// ```text
+/// W_{k+1} = C - W_k
+/// ```
+///
+/// which is an involution: every value sits on a period-2 orbit and none of
+/// them is attracting. Run2's `S2-wdvit` leg entered it at 136 and ran
+/// `136 -> 64 -> 136 -> ...` for seventy windows. The consequences are
+/// structural, not incidental: the largest window the system can ever form is
+/// `C - W_min` rather than `C`, the mean is `C/2`, and half of all windows are
+/// the small phase — which is also why `high_water_samples` alternated 1, 0,
+/// 1, 0 and the ramp advanced a step every *two* windows.
+///
+/// **Why a wait is the right shape of fix.** `IN_FLIGHT_SLACK = 2` exists so
+/// that "consecutive windows can merge"; merging requires the arrivals to be
+/// *visible* when the window forms, and the dispatcher was outrunning the
+/// responses it had itself just sent. This is not a batching timer (design §6
+/// forbids one): it never applies to a model that is idle, it never applies
+/// when the queue already carries the budget, and it ends the moment arrivals
+/// stop.
+///
+/// **The numbers.** A refill is a caller task that is already parked on its
+/// unit semaphore with its item's bytes already loaded (`jobs::extraction`
+/// takes the byte budget *before* a unit permit), so its latency is a wake, a
+/// multipart build and a send — sub-millisecond on the loopback self-call,
+/// one RTT more from a gateway on another machine. [`WINDOW_SETTLE_QUIET`] of
+/// 2 ms covers that with margin while still ending promptly when the caller
+/// genuinely has nothing more to send.
+const WINDOW_SETTLE_QUIET: Duration = Duration::from_millis(2);
+
+/// The absolute bound on one settle, however the arrivals are spaced.
+///
+/// 20 ms against the 2-4 s windows the `S2-wdvit` leg measured is under 1 % of
+/// a window, and it is only ever paid when the dispatcher would otherwise have
+/// formed a window *below the budget it was granted* — i.e. exactly when the
+/// replica was about to run an under-sized batch anyway. It also bounds the
+/// pathological case a quiet-gap rule alone would not: a caller trickling
+/// arrivals every 1 ms forever.
+const WINDOW_SETTLE_MAX: Duration = Duration::from_millis(20);
+
 pub(crate) const IN_FLIGHT_SLACK: u64 = 2;
 
 /// Estimated units one item costs before any window of this model has been
@@ -656,6 +705,74 @@ struct WindowPlan {
     item_bound: Option<usize>,
 }
 
+/// Why [`settle_refills`] returned.
+enum SettleOutcome {
+    /// Form the window.
+    Continue,
+    /// The dispatcher must stop; the caller hands its replica back first.
+    End(End),
+}
+
+/// Wait, briefly and conditionally, for the arrivals the window that just
+/// finished will provoke.
+///
+/// Ends on the first of: the queue reaching `bounds.units` (there is nothing
+/// left to wait for), [`WINDOW_SETTLE_QUIET`] with no arrival (the caller has
+/// nothing more to send), or `deadline` — which the caller sets to
+/// [`WINDOW_SETTLE_MAX`] past the moment the last window finished, so the wait
+/// is bounded from the *reply* rather than from each entry here, and a model
+/// nothing has answered recently is not waited on at all. Every message kind
+/// is handled exactly as the main loop's drain handles it, so a `Trim`, a
+/// `ReapIdle` or a shutdown arriving inside the settle is not delayed by it.
+async fn settle_refills(
+    ctx: &DispatcherContext,
+    queue: &mut VecDeque<Queued>,
+    rx: &mut mpsc::UnboundedReceiver<DispatchMsg>,
+    free: &mut Vec<Replica>,
+    in_flight: &mut JoinSet<(Replica, BatchOutcome)>,
+    bounds: WindowBounds,
+    deadline: tokio::time::Instant,
+) -> SettleOutcome {
+    let mut queued_units: u64 = queue
+        .iter()
+        .map(|queued| queued.shape.units)
+        .fold(0u64, u64::saturating_add);
+    if queued_units >= bounds.units {
+        return SettleOutcome::Continue;
+    }
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return SettleOutcome::Continue;
+        }
+        let quiet_until = (now + WINDOW_SETTLE_QUIET).min(deadline);
+        tokio::select! {
+            _ = tokio::time::sleep_until(quiet_until) => return SettleOutcome::Continue,
+            msg = rx.recv() => match msg {
+                None | Some(DispatchMsg::Shutdown) => return SettleOutcome::End(End::Graceful),
+                Some(DispatchMsg::Predict(request)) => {
+                    let queued = enqueue(request, &ctx.cost);
+                    queued_units = queued_units.saturating_add(queued.shape.units);
+                    queue.push_back(queued);
+                    ctx.stats.queue_len.store(queue.len(), Relaxed);
+                    ctx.stats.total_predict_requests.fetch_add(1, Relaxed);
+                    if queued_units >= bounds.units {
+                        return SettleOutcome::Continue;
+                    }
+                }
+                Some(DispatchMsg::Trim(worker_id)) => {
+                    try_trim(ctx, free, in_flight, worker_id, queue.len());
+                }
+                Some(DispatchMsg::ReapIdle) => {
+                    if let Some(message) = reap_idle_replicas(ctx, free).await {
+                        return SettleOutcome::End(End::Fatal(message));
+                    }
+                }
+            },
+        }
+    }
+}
+
 /// Per-model dispatcher task body. Owns the WorkerSet (all replicas of this
 /// model entry); exits after graceful shutdown or fatal worker death.
 ///
@@ -683,6 +800,12 @@ pub(crate) async fn run_dispatcher(
     // window's batches will be sized by.
     let mut last_grant: Option<Grant> = None;
     let seed_ratio = seed_units_per_item(&ctx.cost);
+    // When the refills of the window that just finished stop being expected.
+    // Set on every completed window and consulted by the settle below; a model
+    // that has been quiet for longer than that has `None` (or a deadline in
+    // the past), so a request arriving at an idle model is dispatched with no
+    // added latency whatsoever.
+    let mut refill_deadline: Option<tokio::time::Instant> = None;
 
     let end = 'main: loop {
         // Dispatch: while any replica is free and requests are queued, that
@@ -691,8 +814,10 @@ pub(crate) async fn run_dispatcher(
         // with different headroom.
         while !queue.is_empty() && !free.is_empty() {
             let replica = free.pop().expect("checked non-empty");
-            let shapes: Vec<WindowItem> = queue.iter().map(|queued| queued.shape).collect();
-            let cap = shapes[0].cap;
+            // Read before the settle below, which can only append to the
+            // queue: windows never mix cap values, and the head is what fixes
+            // the cap for this one.
+            let cap = queue.front().expect("checked non-empty").shape.cap;
             // The anchor-derived target, read once so window formation and the
             // published figure below cannot see two different values of it (it
             // is a ledger read, and a neighbour's window can move it).
@@ -722,6 +847,43 @@ pub(crate) async fn run_dispatcher(
                     bytes: MAX_WINDOW_BYTES,
                 },
             };
+            // Let the refills the *previous* window provoked land before this
+            // one is formed. See [`WINDOW_SETTLE_QUIET`]: without it a
+            // closed-loop caller of depth C yields windows of mean C/2
+            // forever. Three guards, in the order they matter:
+            //
+            // - `refill_expected` is set only when a window has just
+            //   completed, so a model that has been idle dispatches its next
+            //   request with no added latency at all;
+            // - the priced path only, because `bounds.units` is `u64::MAX` on
+            //   the unpriced one and "short of the budget" has no meaning
+            //   there;
+            // - and only while the queue is genuinely short of the budget —
+            //   a queue that already fills the window is dispatched at once.
+            if let Some(deadline) = refill_deadline.take()
+                && replica.admission.is_some()
+            {
+                match settle_refills(
+                    &ctx,
+                    &mut queue,
+                    &mut rx,
+                    &mut free,
+                    &mut in_flight,
+                    bounds,
+                    deadline,
+                )
+                .await
+                {
+                    SettleOutcome::Continue => {}
+                    SettleOutcome::End(end) => {
+                        // The replica is still ours; hand it back so the
+                        // teardown below shuts it down with the rest.
+                        free.push(replica);
+                        break 'main end;
+                    }
+                }
+            }
+            let shapes: Vec<WindowItem> = queue.iter().map(|queued| queued.shape).collect();
             let take = window_take_count(&shapes, bounds);
             let window: Vec<Queued> = queue.drain(..take).collect();
             let window_units: u64 = window
@@ -861,6 +1023,9 @@ pub(crate) async fn run_dispatcher(
                         free.push(replica);
                         ctx.stats.in_flight_windows.fetch_sub(1, Relaxed);
                         ctx.stats.replicas_free.store(free.len(), Relaxed);
+                        // Replies have just gone out, so refills are coming —
+                        // but only for as long as it takes them to arrive.
+                        refill_deadline = Some(tokio::time::Instant::now() + WINDOW_SETTLE_MAX);
                     }
                     Ok((replica, BatchOutcome::Trimmed)) => {
                         // No window ran, so `in_flight_windows` was never
@@ -2512,6 +2677,164 @@ mod tests {
             "the fixture must be on the priced path for this test to mean anything"
         );
         Replica { worker, admission }
+    }
+
+    /// **S1-4, the decision itself.** `settle_refills` waits only in the one
+    /// situation that produces the 2-cycle, and returns immediately in every
+    /// other. Asserted on the function rather than through a worker, so the
+    /// timings are the function's own.
+    #[tokio::test]
+    async fn the_settle_waits_only_for_a_window_that_is_short_of_its_budget() {
+        let cost = item_cost(8);
+        let ctx = dispatcher_ctx(cost, Arc::new(ModelStats::default()));
+        let bounds = WindowBounds {
+            units: 16,
+            items: usize::MAX,
+            bytes: MAX_WINDOW_BYTES,
+        };
+        let queued = |units: usize| -> VecDeque<Queued> {
+            (0..units)
+                .map(|index| {
+                    let (reply, _answer) = oneshot::channel();
+                    enqueue(
+                        DispatchRequest {
+                            inputs: vec![WorkerInput {
+                                data: Some(json!(index)),
+                                file: None,
+                            }],
+                            max_batch: None,
+                            reply,
+                        },
+                        &cost,
+                    )
+                })
+                .collect()
+        };
+        let run = async |mut queue: VecDeque<Queued>, deadline| {
+            let (_tx, mut rx) = mpsc::unbounded_channel();
+            let mut free = Vec::new();
+            let mut in_flight = JoinSet::new();
+            let started = std::time::Instant::now();
+            let outcome = settle_refills(
+                &ctx,
+                &mut queue,
+                &mut rx,
+                &mut free,
+                &mut in_flight,
+                bounds,
+                deadline,
+            )
+            .await;
+            assert!(matches!(outcome, SettleOutcome::Continue));
+            (started.elapsed(), queue.len())
+        };
+
+        // A queue that already fills the window: nothing to wait for.
+        let (elapsed, _) = run(queued(16), tokio::time::Instant::now() + WINDOW_SETTLE_MAX).await;
+        assert!(
+            elapsed < WINDOW_SETTLE_QUIET,
+            "a full window must not wait: {elapsed:?}"
+        );
+
+        // A model nothing has answered recently — the deadline is in the past
+        // — is not waited on either. **This is the idle-model guarantee: a
+        // lone request arriving at a quiet model pays nothing at all.**
+        let (elapsed, _) = run(queued(1), tokio::time::Instant::now()).await;
+        assert!(
+            elapsed < WINDOW_SETTLE_QUIET,
+            "an idle model must not wait: {elapsed:?}"
+        );
+
+        // Short of the budget, right after a window: wait, and no longer than
+        // the quiet gap when nothing arrives.
+        let (elapsed, _) = run(queued(1), tokio::time::Instant::now() + WINDOW_SETTLE_MAX).await;
+        assert!(
+            elapsed >= WINDOW_SETTLE_QUIET,
+            "a short window right after a reply must let refills land: {elapsed:?}"
+        );
+        assert!(
+            elapsed < WINDOW_SETTLE_MAX,
+            "and must end on the quiet gap, not on the deadline: {elapsed:?}"
+        );
+    }
+
+    /// **S1-4, end to end: a closed-loop caller of depth C must yield windows
+    /// of C, not C/2.**
+    ///
+    /// This is run2's 136/64 alternation as an assertion. A replica returns to
+    /// the free pool the moment `run_batch` hands its replies to the waiting
+    /// oneshots — before the caller has re-submitted — so a dispatcher that
+    /// forms a window out of "whatever is queued right now" turns a caller of
+    /// depth C into the involution `W -> C - W`: every window is on a
+    /// period-2 orbit and the mean is C/2. The measurable consequence is the
+    /// mean window size, which is exactly what this asserts.
+    ///
+    /// The caller here is the shape the extraction job has: C tasks, each
+    /// re-submitting the instant its own reply lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_closed_loop_caller_gets_windows_of_its_full_depth() {
+        /// Deep enough that C/2 and C are unmistakably different, small
+        /// enough that the ramp's window target (>= 24 units from the first
+        /// grant) never binds instead.
+        const DEPTH: usize = 16;
+        const REQUESTS: usize = 320;
+
+        let cost = item_cost(8);
+        let ledger = VramLedger::for_test(
+            &[(TEST_BOARD, "TEST 9000", 32_768)],
+            VramBudget {
+                margin: Some(0.0),
+                cap_fraction: None,
+            },
+        );
+        let replica = priced_replica(&ledger, "batchsize_test", cost).await;
+        let stats = Arc::new(ModelStats::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dispatcher = tokio::spawn(run_dispatcher(
+            dispatcher_ctx(cost, Arc::clone(&stats)),
+            vec![replica],
+            rx,
+        ));
+
+        let sent = Arc::new(AtomicUsize::new(0));
+        let mut callers = JoinSet::new();
+        for _ in 0..DEPTH {
+            let tx = tx.clone();
+            let sent = Arc::clone(&sent);
+            callers.spawn(async move {
+                while sent.fetch_add(1, Relaxed) < REQUESTS {
+                    let (reply, answer) = oneshot::channel();
+                    if tx
+                        .send(DispatchMsg::Predict(DispatchRequest {
+                            inputs: vec![WorkerInput {
+                                data: Some(json!(1)),
+                                file: None,
+                            }],
+                            max_batch: None,
+                            reply,
+                        }))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    answer.await.expect("replied").expect("succeeded");
+                }
+            });
+        }
+        while callers.join_next().await.is_some() {}
+        tx.send(DispatchMsg::Shutdown).expect("shutdown");
+        dispatcher.await.expect("dispatcher exits");
+
+        let requests = stats.total_predict_requests.load(Relaxed);
+        let batches = stats.total_batches.load(Relaxed);
+        let mean = requests as f64 / batches as f64;
+        assert!(
+            mean >= 0.8 * DEPTH as f64,
+            "mean window of {mean:.1} requests over {batches} windows for a \
+             caller of depth {DEPTH}: the dispatcher is still forming windows \
+             before the refills of the previous one have landed (the 2-cycle \
+             puts this at DEPTH/2)"
+        );
     }
 
     /// T5, end to end: the figure the caller reads off the response follows
