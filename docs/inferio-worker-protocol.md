@@ -611,6 +611,14 @@ largest figure it publishes divided by the items it expects per request, and
 a client must not treat a published figure as evidence that the transport
 will carry it.
 
+**A published figure is published to *each* caller.** It is a per-model
+statement about what the server would like in flight, and every gateway that
+holds a client for that endpoint applies it to its own transport gate — so
+`N` gateways against one inference server can deliver up to `N` times it. That
+is not a starvation risk (the surplus queues in the server's dispatcher, and
+the window the ledger grants is what actually reaches the GPU) but it is a
+memory one, which is why the bound below exists and is aggregate.
+
 **A stream limit is not a memory limit, and this implementation does not
 pretend otherwise.** The predict handler buffers each request body before
 parsing it, so an admitted stream holds bytes; but the number of connections
