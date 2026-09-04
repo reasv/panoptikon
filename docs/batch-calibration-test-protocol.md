@@ -99,9 +99,76 @@ report gains a run2 section.
 | R7 | Pixel pricing (W1/Q3/F-B) | Implement the design's deferred per-item cap: price each item at min(raw pixels, canvas pixels), canvas declared per model in the registry (fallback: the model's known input resolution); makes the slope corpus-independent and lets large images pack. |
 | R8 | Degraded base tier (W4/F9) | Measure the CUDA context (board free before/after first CUDA init) instead of the 500 MiB constant; record `base_method` in every platform pass. |
 | R9 | Load-failure backoff (B15/Q5) | Per-model cooldown after consecutive load failures, exponential and capped; predicts fail fast with "unavailable until"; jobs abort on the first one. |
-| R10 | Socket cost (F6 option 4) | In-process dispatch for local inference (no loopback HTTP per item); the HTTP client stays for remote servers. Largest change; last in the queue. |
+| R10 | Socket cost (F6 option 4) | **Withdrawn 2026-09-04 and replaced by R10'.** In-process dispatch only helps the co-located case and creates a second path; real deployments run the gateway and the inference server on different machines (the user's NAS talks to this GPU server). **R10':** keep the single HTTP client path and multiplex requests over a small bounded connection pool using HTTP/2 cleartext (h2c) between gateway and inference server, with automatic fallback to HTTP/1.1 for a server that does not speak it; the descriptor clamp then bounds by pool size (HTTP/1.1 fallback keeps the per-item term). Uniform for local and remote; the existing clamp stays as defence in depth. |
 | R11 | Small choices (orchestrator's calls, delegated) | Store `dtype_method` in the profile; rename the dtype sentinel to `unstated`; do not add `pid: host`; regenerate the UI types from `openapi.json`. |
 | R12 | Verification | Nemotron's 4.5× base at admission (F-C) is checked as an analysis artefact (oracle sampled while weights streamed) before any change. |
+
+### Run2 handoff (written 2026-09-04 before a context compaction)
+
+**Corrections from the user after the R-table above.**
+- R1: external loads (a desktop's own VRAM churn) can taint the knee and
+  cannot be detected; acceptable if the damage is bounded. Bounding comes
+  from (a) exclusion, (d) expiry, the own-worker contention tag, and one
+  addition: **refuse to fit a knee while throughput within a bucket is
+  noisy** (a bucket-variance filter). No permanent and no persisted knee
+  without honest, quiet samples.
+- F-C (nemotron base 3788 MiB): it loads in bf16 (about 2 GB weights, 666
+  MiB context, vision tower and workspace); the 848 MiB oracle reading was
+  sampled mid-load. Note only; not this task's problem.
+- R10 withdrawn, replaced by R10' (see the table row).
+
+**Track allocation and file ownership** (four Opus agents in parallel in
+the one checkout, each with a separate verifier afterwards; the
+orchestrator cannot message a running agent in this session, so each
+brief must be self-contained):
+
+| Track | Changes | Owns |
+|---|---|---|
+| L | R1 (a, d, contention tag, variance filter), R4, R5 ledger half + per-batch free ingest, R11 `dtype_method` store + `unstated` docs | `inferio/ledger.rs`, `calibration.rs`, `dispatch.rs`, `worker.rs` (wire parsing), `gpu.rs`/`mps.rs`/`cpu.rs`, `config.rs` (vram), ledger sections of the protocol and design docs, `python/inferio/config/calibration/README.md` |
+| M | R6 per-model locks + board-admission gate + `max_concurrent_loads`, R9 load-failure cooldown (503 + `Retry-After`, distinguishable error kind) | `inferio/manager.rs`, `prewarm.rs`, `config.rs` (new settings), `http.rs` only for the cooldown error shape |
+| E | R2a re-queue on worker death + `partial` job status, R2b failures endpoint + job record fields, R10' h2c pool + fallback + clamp rework, R11 UI types regen (submodule commit must be pushed to `reasv/panoptikon-ui`) | `jobs/**`, `api/**`, `inferio_client.rs`, `inferio/http.rs`, `main.rs` (h2c), `Cargo.toml`, `openapi.json`, `db/**` where needed, `ui` submodule |
+| P | Protocol doc first (wire names), R3 structural OOM (typed exceptions; driver-shaped patterns only as fallback; live free at failure), R5 worker half (per-batch `free_mb`/`free_source`), R7 pixel canvas cap (`metadata.cost` key; canvas per shipped model), R8 measured CUDA context, R11 sentinel `unstated` | `python/**`, `inferio/cost.rs`, shipped registry TOMLs (canvas declarations), batch/OOM/pricing sections of the protocol doc and design doc |
+
+**Status at handoff:** the four tracks were started and then stopped for
+the compaction before any of them committed. Their partial diffs (about
+470 lines, Track M's lock plumbing and Track P's protocol-doc draft) are
+saved as patches under the session scratchpad
+(`run2-partial-patches/`) for reference only; the working tree was
+restored to `910378ff` (clean). Tracks restart from scratch with the
+briefs above.
+
+**Sequence after restart.** (1) Four tracks in parallel, each committing
+per change by explicit path. (2) One verifier per track, then an
+integration pass: full `cargo test -p panoptikon` (the one known host
+artefact failure is `db::batch_auto::tests::an_unwritable_config_warns_stamps_and_is_left_intact`;
+the two `media_tools::transcode` ffmpeg-budget tests also fail on master),
+pytest `tests/inferio_worker tests/inferio/impl`, clippy/fmt. (3)
+`cargo build --release -p panoptikon`; rebuild `panoptikon:calib-cuda`
+from a clean worktree at the tip. (4) Stop SGLang
+(`docker compose -f /home/admin/docker/dsv4flash/docker-compose.yml down`).
+(5) Run2 legs, each with a runlog under `results/run2/`: S2 (wd-vit,
+MobileCLIP, MiniLM; check knee expiry and the `dtype_method`/`unstated`
+store fields), S4a and S4d (default reserve cap: expect batches of ~200
+at 12 GB free and no `mb = 0` grants at 8 GB free), S4b (per-batch free:
+expect the shrink within a few seconds, not 31 s), S5 `failbatch_oomtext`
+(expect zero negatives), `oom_timed` (expect capped deflation and time
+repayment), `dies_on_load` (expect the cooldown), S6 contend (knee under
+contention; B18 stall gone with per-model locks), S8 pixmix (canvas cap:
+slope near the probe's, no single-item batches for 20 MP items) and
+ocr-C7, S11-C4 job (h2c: sockets bounded by the pool), a worker-death
+leg with `dying_cuda` inside an extraction job (expect re-queue and a
+`partial` outcome, items listed by the failures endpoint), and a 4 h
+soak. (6) Add a run2 section to
+`docs/batch-calibration-run1-report.md` (or a `run2` report), update
+§4/§5 status columns here, commit. (7) Restart SGLang
+(`docker compose -f /home/admin/docker/dsv4flash/docker-compose.yml up -d`).
+
+**Host state at handoff:** SGLang up on both boards (restarted 03:55 UTC
+2026-09-04); release binary at `1f1a69c2` (code `6a5e6799`); images
+`panoptikon:calib-{cuda,cpu,master-cuda,master-cpu}`; master worktree
+`/home/admin/projects/panoptikon-master`; results 5.4 GB under
+`tools/calibration-protocol/results/` (git-ignored; `run1/README.md`
+lists poisoned stores and safe seeds); nothing pushed.
 
 ### Decisions taken during run1 by the orchestrator (2026-09-03)
 
