@@ -12614,6 +12614,24 @@ mod tests {
             OomVerdict::Trusted,
             "no class stated"
         );
+        for source in [OOM_SOURCE_TYPED, OOM_SOURCE_MARKER] {
+            assert_eq!(
+                oom_verdict(
+                    &BatchMeasurement {
+                        oom_class: Some(OomClass {
+                            source: source.to_owned(),
+                            exception: "torch.OutOfMemoryError".to_owned(),
+                            free_mb_at_failure: Some(90_000),
+                            device: "cuda:0".to_owned(),
+                        }),
+                        ..honest.clone()
+                    },
+                    Some(&charge)
+                ),
+                OomVerdict::Trusted,
+                "{source} is structural; the free reading has no veto over it"
+            );
+        }
         assert_eq!(
             oom_verdict(
                 &BatchMeasurement {
