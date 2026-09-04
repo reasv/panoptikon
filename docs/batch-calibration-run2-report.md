@@ -15,11 +15,13 @@ orchestrator's scratchpad, or from a runlog under `results/run2/`. Non-obvious
 numbers carry their source in a trailing parenthesis.
 
 **This report is written while the run is still going.** Sections whose legs
-have not run carry a `<!-- PENDING: … -->` marker and state the expectation the
-legs plan sets for them, so they can be filled in without re-deriving anything.
-As of this revision that is Phase B, Phase A′, Phase D and Phase E; everything
-else — the implementation, Phases A, C and D1, the ground-truth probes and the
-whole fix round — is measured.
+have not run carry a `<!-- BLOCKED: … -->` marker, state the expectation the
+legs plan sets for them and give the runbook to run them cold, so they can be
+filled in without re-deriving anything. As of this revision that is **the rest
+of Phase B (S4b, S4d, S4g), Phase D and Phase E** — all three **blocked, not
+failed**: the boards are no longer free (§1, §12). Everything else — the
+implementation, Phases A, C and D1, the ground-truth probes, the whole fix
+round, **Phase A′ and S4a** — is measured.
 
 Acronyms expanded once, beyond run1's: h2c = HTTP/2 cleartext (prior
 knowledge); MAD = median absolute deviation; RFC = the IETF standard of that
@@ -30,21 +32,81 @@ number; VLM = vision-language model.
 ## 1. Verdict and state
 
 **The run2 change set is implemented, verified and integrated — and so is the
-fix round the first legs forced: 153 commits, `0d6b36c5` → the tip, four tracks
+fix round the first legs forced: 157 commits, `0d6b36c5` → the tip, four tracks
 each reviewed by a separate verifier, a cross-track follow-up, two integration
 passes with the full suites green, a release binary at `34a591aa`
 and a `panoptikon:calib-cuda` image (`0b2261f94c8f`) rebuilt from a clean
-worktree. Four leg groups have run: Phase A, Phase C, the Phase D1 easyOCR leg
-(eleven legs) and the ground-truth ceiling probes. Between them they found
+worktree. Six leg groups have run: Phase A, Phase C, the Phase D1 easyOCR leg
+(eleven legs), the ground-truth ceiling probes, **Phase A′ and S4a**. Between them they found
 eleven defects — P1, P2, F1, S1/S1b, C2, C4, C5, D1-b, easyOCR's int32 detector
 ceiling, the ledger's missing shape ceiling and an untyped client-side
 transport failure — and **every one is fixed and signed off by a separate
 verifier** (§5). Phase C met every stated expectation and closed five run1
 findings outright; Phase D1 met every stated expectation for its leg; the
 probes retracted run1's two headline slope disagreements as measurement
-artefacts. Phases B, A′ (the S2/S3 wd-vit re-run), D and E are running or
-pending **on the rebuilt binary and image**, and without the `calib_hostless`
-workaround, which the P1 fix retired (`ea59a63b`).**
+artefacts. **Phase A′ (the S2/S3 wd-vit re-run) and Phase B's S4a have now run
+on the rebuilt binary `34a591aa`, without the `calib_hostless` workaround, and
+they PASS on every check** — P1, P2, F1, S1 and R5 are confirmed on the wire by
+a job rather than by a test. The remaining GPU legs — S4b, S4d, S4g, Phase D
+and Phase E — are **blocked, not failed**: the boards were taken back at
+21:59 UTC (below).**
+
+### Phase A′ and S4a on `34a591aa`, and why the rest stopped
+
+**Phase A′ is a clean pass on every check** (§4.6), on the unmodified
+`server-C1.toml`:
+
+- **No knee is ever fitted** on wd-vit — `fitted a throughput knee` appears
+  **0** times in either leg, the store carries no `knee_units` and
+  `/api/inference/metadata` answers `"knee_units": null` — with the estimator
+  stating its refusal in words (*"the plateau starts at the smallest batch size
+  measured, so no bend was observed"*). **F1 closed by measurement.**
+- **The ramp is free again**: anchor **136 → 439** in 12 windows, monotone
+  (1, 2, 4, 8, 16, 17, 34, 68, 136, 272, 439), budget published **878**, and the
+  bound at the end is the 2 000-item corpus, not the transport. The gate
+  **follows the published figure** (256 → 3 264, tracking
+  `desired_in_flight_items` 48 → 3 264) instead of a hidden 200, peak in-flight
+  **1 382**, and the sockets stay bounded: **44 established = 2 × 22 lanes** in
+  use, of a 64-lane pool. **S1 closed by measurement.**
+- **P1 and P2 are confirmed fixed on the unmodified config**: three job-driven
+  legs created their jobs on the shipped policy shape (`EXTRACTION_POST_RC=0`,
+  **zero** `reason="no_policy"` lines in 6 300 log events) and lost **0 of
+  6 000** predicts — `invalid multipart` and `request_incomplete` are 0 each,
+  every job `completed`, `failures.json` empty.
+- **S3 utilization 0.01 → 0.69** across the restart: the seeded profile resumes
+  at `ramp_step=6`, three grants (1, 63, 878) carry the whole job, and no
+  spurious knee comes back with the seed.
+- **S4a confirms R5's capped reserve** under an 85.8 GB neighbour:
+  `reserve_rule = "capped_default"`, `reserve_mb` **exactly 1 024** where run1
+  withheld **8 579**, `limit_mb` **11 071** where run1 had **3 517**, and the
+  executed batch is **83 items where run1 ran 11**.
+
+Two findings came out of it, neither a regression and neither a product defect:
+
+1. **The worker's live clamp now double-counts our own allocator pool.** On the
+   pressured board the clamp — not the ledger's margin — is the binding
+   constraint, and it compares NVML's free reading *after* our caching allocator
+   took its pool against a grant the ledger already charged us for: `free memory
+   fell to 4371 MiB against a 7729 MiB grant; shrinking this batch's budget from
+   147 to 83 units`, twenty-two times, **44 % of the grant left unused with
+   nothing external moving**. This is run1's T10 with a number. Safe, known, and
+   a decision rather than a fix (§6).
+2. **S3 throughput is 0.88× master, at exact run1 parity** (run1: 0.89×, the
+   same FAIL for the same reason — wd-vit's curve is flat, so one 1 936-item
+   window pipelines slightly worse than many small ones). The old binary's
+   1.09× was *caused by* the spurious knee holding it to 7–31-unit windows.
+
+**Why the rest is blocked.** At **21:59 UTC on 2026-09-04**, between the S4a
+leg and the S4d leg, **the user recreated SGLang** (`dsv4-flash-sglang`,
+**77 702 MiB on both boards**; the user has been logged in since 20:09 UTC and
+the SGLang bench directory was modified at 22:02; there is no timer or cron
+behind it). It was not the run: both boards read 2 MiB before every leg and
+after S4a. The orchestrator therefore **did not stop it again** — it is the
+user's service and the user's decision — so S4b (whose defining +30 GB step is
+arithmetically impossible with ~20 GB free), S4d (whose criterion is the
+recovery to a 95 GB-free board), S4g, Phase D and Phase E are **blocked until
+the boards are idle, not failed**. §4.5, §4.7 and §4.8 carry the exact commands, configs
+and checks to finish each of them cold.
 
 ### What the legs have closed
 
@@ -106,7 +168,8 @@ re-derived its evidence and signed it off; §5 gives each one in full.
 
 | Open item | Why it can still block | Worst measured number |
 |---|---|---|
-| **Four leg groups are unrun on the shipped binary** | Phases B, A′, D and E have no measurement on `34a591aa` at all. Everything the fix round changed — the ramp, the transport, the shape ceiling, the re-queue of a lost request — is verified by tests and not yet by a job | 0 legs on the rebuilt binary |
+| **Three leg groups are blocked on an idle board** | Phase A′ and S4a ran on `34a591aa` and pass; **S4b, S4d, S4g, Phase D and Phase E have no measurement on it at all**, so the shape ceiling, the Docker socket count, pixmix's slope, the moving-board `external_mb` latency and the soak's `partial`-free claim are still verified by tests only. SGLang holds both boards | 3 of 8 planned legs on the rebuilt binary; 77 702 MiB per board |
+| **The worker's live clamp double-counts our own pool** | On a pressured board the clamp is now the binding constraint and prices our own allocator pool twice — once as `charge_mb` in the grant, once as memory missing from the live free reading. It is safe by construction, and it costs throughput exactly where R5 was meant to buy it | **44 %** of the grant unused with nothing external moving (147 → 83 units, 22 times, S4a) |
 | **C6** throughput under a hard squeeze | R5's win in *admission* is a loss in *throughput* in the same regime, and nothing in the ledger notices | wd-vit **0.56×** run1 at 4 GB free (21.85 vs 38.98 items/s), p50 5 323 vs 3 199 ms |
 | **F1's residue** — MobileCLIP's knee is not restored | Under `KNEE_PLATEAU_BUCKETS = 2` the recorded MobileCLIP ring fits **no** knee where run2 fitted the correct 127. The knee is found late rather than lost, and it was worth nothing measurable (0.94× with it, 1.00× without in run1) — but the stated acceptance criterion is not met literally | one quiet bucket above the bend where the rule wants two |
 | **nemotron's price spans 8.35× across one corpus** | Its memory is a function of the **tile grid the aspect ratio picks**, not of pixel count: 1 MP and 4 MP square images allocate byte-identically, and so do 0.3 MP and 20 MP 4:3 images. The canvas closed the top of the range (66× → 8.35× in capped units); nothing closes the bottom | 0.000153 … 0.001280 MiB/unit on the pixmix corpus |
@@ -114,41 +177,47 @@ re-derived its evidence and signed it off; §5 gives each one in full.
 | **The shape ceiling only ratchets downward inside one process** | A pessimistic report — a mixed batch whose one oversized page sets the padded frame — holds until the model is reloaded or the canvas/epoch moves. The cost is throughput, never a failure; climbing back out needs a knee-style expiry probe that does not exist | one over-wide window per reload is the only way back up |
 | **The easyOCR fidelity trade was decided by the orchestrator** | A quality regression is a user-facing design change. The trade was taken on the user's behalf and then **reversed**, so the shipped behaviour is run1's; it is flagged here for confirmation rather than left implicit | at 30 px text on an 8000 px sheet the bounded arm returned garbage where the raw arm reads cleanly |
 | **`unstated` has no producer** | R11's sentinel rename cannot be verified on this host: all four shipped models and every fixture resolve a dtype by inference | the string appears **0** times in five Phase A legs and ten Phase C legs, and the D1 legs' easyOCR replica reports `dtype fp32` |
-| **`codemap.md` drift** | A mechanical check at the tip flags **68** references whose target text has changed since `65fd2f82`; the map's whole value is that its references resolve | 68 refs, in `http.rs`, `worker.rs`, `dispatch.rs`, `manager.rs`, `calibration.rs`, `packing.py`, `utils.py` |
+| **`codemap.md` drift** | A mechanical check at the tip flagged **68** references whose target text had changed since `65fd2f82`; the map's whole value is that its references resolve. **A full re-resolution sweep landed as `4898d0a8`** while the A′/B legs ran, so this row is closed unless a later leg moves code again | 68 refs before the sweep, in `http.rs`, `worker.rs`, `dispatch.rs`, `manager.rs`, `calibration.rs`, `packing.py`, `utils.py` |
 | **`ui` submodule commits unpushed** | `9b28044` **and** `8abf631` on `batch-calibration-ui` exist only in this host's clone, so the gitlink does not resolve for anyone else and every clean-worktree image build needs a local remote | 2 commits |
 
 ### Recommendation
 
-1. **Run Phases B, A′, D and E on `34a591aa` and nothing else.** The fix round
-   changed what every one of them measures; a number from `65fd2f82` is a
-   number about a binary that will not ship.
-2. **Treat Phase A′ as the S1 acceptance test.** `queue_depth +
-   last_window_items` must stop summing to 200, the 136/64 alternation must be
-   gone, `max_units_measured` must move past 136, and `/health`'s
-   `desired_in_flight_items` against `inference_clients[].in_flight_requests`
-   must agree.
+1. **Finish S4b, S4d, S4g, Phase D and Phase E on `34a591aa` and nothing
+   else**, once the boards are idle again — SGLang is the user's and is not to
+   be stopped by the run. The fix round changed what every one of them
+   measures; a number from `65fd2f82` is a number about a binary that will not
+   ship. §4.5, §4.7 and §4.8 hold the commands.
+2. **Phase A′ has answered the S1 acceptance test.** `queue_depth +
+   last_window_items` no longer sums to 200, the 136/64 alternation is gone,
+   `max_units_measured` reached **439**, and `/health`'s
+   `desired_in_flight_items` and `inference_clients[].in_flight_requests`
+   agree — 3 264 desired against a 1 382 peak in flight over 22 lanes.
 3. **Treat Phase E as the P2 acceptance test.** No fixture is involved, so any
    `partial` job is P2 or its successor; a `request_incomplete` or `transport`
    failure must be re-queued once and reach `job_failures` only if it fails
-   twice.
-4. **Decide C6.** It is the first measured cost of the R5 decision the user
+   twice. P2 has already survived 6 000 predicts in Phase A′ / S4a.
+4. **Decide the clamp's pool accounting** (§6): the worker knows its own
+   `memory_reserved − memory_allocated` and can add it back before comparing
+   against the grant, or the grant can be priced net of the pool. One of the
+   two, and it is a user call.
+5. **Decide C6.** It is the first measured cost of the R5 decision the user
    approved, and it is a throughput regression in exactly the regime R5 was
    aimed at. Options in §6.
-5. **Decide `KNEE_PLATEAU_BUCKETS`.** 2 refuses wd-vit's spurious knee *and*
+6. **Decide `KNEE_PLATEAU_BUCKETS`.** 2 refuses wd-vit's spurious knee *and*
    MobileCLIP's real one; 1 restores MobileCLIP and still refuses wd-vit (by
    rules 1 and 2). One named constant, one line.
-6. **Confirm the easyOCR fidelity call**, which the orchestrator took on the
+7. **Confirm the easyOCR fidelity call**, which the orchestrator took on the
    user's behalf: the canvas bounds the *detector's batch tensor* only, and
    recognition still reads crops from the raw image, so OCR quality above
    2560 px is unchanged from run1. The cheaper alternative — bounding
    everything — was measured to destroy fine print for no memory saving.
-7. **Decide nemotron's pricing.** Tile-based pricing (`tiles × 512²` rather
+8. **Decide nemotron's pricing.** Tile-based pricing (`tiles × 512²` rather
    than `min(raw, canvas)`) would be exact for the VLM class and is a design
    change; capped pixels are a 8.35× approximation of it.
-8. **Push the `ui` submodule commits** `9b28044` and `8abf631` on
+9. **Push the `ui` submodule commits** `9b28044` and `8abf631` on
    `batch-calibration-ui` to `reasv/panoptikon-ui`.
-9. **Re-resolve `codemap.md`** at the settled tip (a sweep is running) — the
-   fix round moved a great deal of code.
+10. **`codemap.md` is re-resolved** at the settled tip (`4898d0a8`); re-run the
+   check if the blocked legs force any further code change.
 
 ---
 
@@ -164,10 +233,10 @@ re-derived its evidence and signed it off; §5 gives each one in full.
 | D1 S8 ocr-C7 | easyOCR host-side pricing at the 2560² canvas, eleven legs including a C7nc uncapped control, two master baselines and the shipped grantless registry | **`65fd2f82`** (master baselines on `7aa92b20`) | `S8-ocr-C7(-repeat,-cold,-calm,-calm-b)`, `S8-ocr-C7nc(-b,-aborted-registry)`, `S8-ocr-C1-grantless(-b)`, `S8-ocr-C0(-cold)` |
 | Probes Ground truth | `ceiling_probe.py` against the impls directly: easyOCR under C7 and C7nc, nemotron on four image groups | no gateway — the probe drives the Python impl in-process | `probes/easyocr-C7`, `probes/easyocr-C7nc`, `probes/nemotron` |
 | Fix round | Eleven defects fixed, each with a separate verifier; second integration pass; binary and image rebuilt | n/a (debug `cargo test`, `pytest`) | n/a |
-| B External pressure | S4a, S4d, S4b (+ S4g if time) | **`34a591aa`** / image `0b2261f94c8f` | `<!-- PENDING: phase B -->` |
-| A′ Re-run | S2 wd-vit, S3 wd-vit on the fixed estimator and transport | **`34a591aa`** | `<!-- PENDING: phase A re-run -->` |
-| D Packing, docker | S8 pixmix, S11-C4, the easyOCR shape-ceiling leg | **`34a591aa`** / image `0b2261f94c8f` | `<!-- PENDING: phase D -->` |
-| E Soak | 4 h S9 recipe | **`34a591aa`** | `<!-- PENDING: phase E -->` |
+| A′ Re-run | S2 wd-vit, S3 wd-vit on the fixed estimator and transport | **`34a591aa`** | `S2-wdvit-v2`, `S3-wdvit-v2` — **done, PASS** |
+| B External pressure | S4a done; S4d, S4b, S4g stopped by the host state | **`34a591aa`** | `S4a-v2` — **done, PASS**; `<!-- BLOCKED: S4d, S4b, S4g — SGLang holds both boards -->` |
+| D Packing, docker | S8 pixmix, S11-C4, the easyOCR shape-ceiling leg | **`34a591aa`** / image `0b2261f94c8f` | `<!-- BLOCKED: phase D — needs idle boards; ~93 GB free for the shape-ceiling leg -->` |
+| E Soak | 4 h S9 recipe | **`34a591aa`** | `<!-- BLOCKED: phase E — needs both boards for 4 h -->` |
 
 Phase A, Phase C and Phase D1 all ran on `65fd2f82`, which contains the whole
 R1–R12 change set and **none** of the eleven fixes. Phase C's report re-read
@@ -227,6 +296,9 @@ no configuration deviation left in the run.
 | Ledger shape ceiling done | ~20:52 |
 | Typed transport failure done | ~21:14 |
 | Second integration pass; binary `34a591aa`, image `0b2261f94c8f` | 21:28 / 21:34 |
+| Phase A′: `S2-wdvit-v2` 21:44:26→21:46:38, `S3-wdvit-v2` 21:50:29→21:53:07 | 21:44–21:53 |
+| Phase B: `S4a-v2` 21:55:36→21:57:57 | 21:56–21:58 |
+| **SGLang recreated by the user** (77 702 MiB on both boards); S4d/S4b/S4g, Phase D and Phase E blocked | **21:59** |
 
 (Times are when each agent's report landed in the orchestrator's scratchpad.)
 
@@ -258,13 +330,13 @@ named there.
 | **R3** structural OOM | Worker: `packing.classify_oom` — three tiers in **strength order over the exception chain**: `typed_exception` (`torch.OutOfMemoryError` via `sys.modules`, `MemoryError`), `marker` (`InferenceOOMError`, `INFERENCE_OOM*`), `message_pattern` (a **closed** list of nine driver-shaped strings plus one two-part CPU-allocator pattern; a bare `out of memory` is deliberately absent). Every classification stamps `free_mb_at_failure` and `device`. Host: trust typed/marker, **veto `message_pattern` when the worker's own live free reading at the failure was at least the whole envelope the window was priced at** | `fffbc947` (worker), `6afed305`, `1031504c`, `5ecba825` (host + device wordings) | six defects in P (the closed list had lost real device wordings); the host half was added in L's verifier pass | **B11 closed**: 0 negatives from prose. **The veto fires** (`S5-oom2nd`, `contradicted=1 free_mb_at_failure=96518 grant_mb=96356`) — see finding **C3** |
 | **R4** deflation | `deflation_cap(anchor, seed) = ceil(log2(max(anchor, seed, 1))) + 1`; time repayment `DEFLATION_REPAY_SECS = TRIM_DEBOUNCE = 30 s`, one level per whole interval, advancing the stamp by the intervals consumed; repayment runs where the counter is *read*, not on a timer; clear-on-respawn holds by construction and is now pinned by a test | `83acdbdc` | the ladder's 33rd-consecutive-failure shift overflow fixed by M's verifier (`d8721f90`) | **cap 4, time repayment 4 → 0 over 120 s idle, one DEBUG line per 30.0 s** |
 | **R5** margin | `reserve = min(ceil(external × margin), 1024)` when the margin is unset, `ceil(external × margin)` when the user set one; `limit = min(total × cap_fraction, total − external − reserve)`. `margin` became `Option<f64>` so absence tracks the code default. `/health` gains `reserve_mb`, `reserve_rule` (`user_margin` \| `capped_default`); the grant line carries both | `9a10bfe5`, config examples `391b66cb`, `6e515174` | approved; **the widening stays capped** (reasoned, §7) | `/health`: `"reserve_mb": 67, "reserve_rule": "capped_default"`. **On a 4 GB-free board: `unit_budget=60 mb=3040 reserve_mb=1024`** where run1 gave `unit_budget=1 mb=0`; **3** memory-blind grants of 2 610 against run1's 113; **0** samples at `limit_mb = 0` against run1's 367. Cost: finding **C6** |
-| **R5** per-batch free (T3) | Every measurement carries `free_mb`/`free_source` (the reading the worker's defensive clamp already takes before that batch) and the host ingests them in sequence order **before** the negative/collapse checks; the response-level sample is applied after, and `record_telemetry` was reordered so capture instants follow the order the worker took the readings | `786fd3b1` (worker), `9a10bfe5` (host) | approved; P's verifier fixed a stale baseline and a load that left the probe polling | `<!-- PENDING: phase B --> S4b will decide it: expect `external_mb` to track a hog step within a few seconds, not run1's 31.5 s` |
+| **R5** per-batch free (T3) | Every measurement carries `free_mb`/`free_source` (the reading the worker's defensive clamp already takes before that batch) and the host ingests them in sequence order **before** the negative/collapse checks; the response-level sample is applied after, and `record_telemetry` was reordered so capture instants follow the order the worker took the readings | `786fd3b1` (worker), `9a10bfe5` (host) | approved; P's verifier fixed a stale baseline and a load that left the probe polling | `<!-- BLOCKED: phase B --> S4b still decides it — blocked on an idle board: expect `external_mb` to track a hog step within a few seconds, not run1's 31.5 s` |
 | **R6** load locks | Per-model load lock + a **per-board** admission gate; the global lock retired. Four-lock order (barrier > per-model > per-board admission > state) with a no-deadlock proof in the module docs. `max_concurrent_loads` default 1; every unpinned model resolves to the same default board, so the shipped configuration behaves exactly as before | `e6e510d0`, `3ad22c92` | two holes closed: the `""` unresolvable-pin bucket now waits on **every** board's permit (`702ea8ac`); the ladder no longer panics (`d8721f90`) | **B18 closed**: 1.86× p50, 7.1 % of a 13.388 s load (run1: 28.3×, 100.2 %) |
 | **R9** load cooldown | `window(n) = min(base × 2^(n−1), max)`, shipped 2 s → 300 s; only `costed_worker` failures arm it (spawn/handshake/configure/load/death-while-streaming), never registry-phase rejections; `Retry-After` never below 1; `/health.load_cooldowns[]` top-level (a cooling model is by construction not in `models[]`); refusal checked **before** the `failed to load model` and `worker_died` arms | `e2679f62` | approved; scope line ("a death *after* a successful load is not counted") judged correct | **7 attempts / ladder 2,4,8,16,32,64,128 / 13 145 × 503 / job aborts in 9.5 s after 2 attempts** (run1: 93 attempts, 500s, 259 s). Residue: finding **C4** |
-| **R7** pixel canvas | `metadata.cost.canvas_pixels` on the registry, resolved into `CostDimension` under the same two rules as `seed_units` (pixel-only, never inherited across a unit change); the worker prices `min(raw_pixels, canvas)` including its unreadable-input fallback; three resolution tiers (grant > impl introspection, floored at 512² > uncapped) | `84663c27` (+ follow-up `ee014235`) | approved; the follow-up was needed because **R7 was inert without it** | **`canvas_pixels=1835008` in force on nemotron** with `epoch=2 seed_units=2000000` (`S6-b18-loadstall`), and **proven from the stored windows on easyOCR**: `S8-ocr-C7-calm-b`'s `sample_units` hold 5 ×, 9 × and 11 × 6 553 600 where the uncapped control's hold none. Cost: **D1-b** (§5), and the canvas is only true if the impl honours it. `<!-- PENDING: phase D --> S8 pixmix decides the slope` |
+| **R7** pixel canvas | `metadata.cost.canvas_pixels` on the registry, resolved into `CostDimension` under the same two rules as `seed_units` (pixel-only, never inherited across a unit change); the worker prices `min(raw_pixels, canvas)` including its unreadable-input fallback; three resolution tiers (grant > impl introspection, floored at 512² > uncapped) | `84663c27` (+ follow-up `ee014235`) | approved; the follow-up was needed because **R7 was inert without it** | **`canvas_pixels=1835008` in force on nemotron** with `epoch=2 seed_units=2000000` (`S6-b18-loadstall`), and **proven from the stored windows on easyOCR**: `S8-ocr-C7-calm-b`'s `sample_units` hold 5 ×, 9 × and 11 × 6 553 600 where the uncapped control's hold none. Cost: **D1-b** (§5), and the canvas is only true if the impl honours it. `<!-- BLOCKED: phase D --> S8 pixmix still decides the slope` |
 | **R7** wiring (follow-up) | One resolution site (`manager::canvas_in_force`, **registry wins**, load report fills in only where the registry declares nothing), `Grant.canvas_pixels` on the wire as `u32 \| nil`, `dispatch::estimate_input_units` capping the **host's** window pricing at the same figure — which for the three grantless `easyocr_*` ids is the only cap there is — and a new `canvas_pixels` key on the `load ok` response | `ee014235`, probe `893e8a7d`, `9be09e5e`, `18cc2e77` | integration review found two defects, both fixed (`18cc2e77`, `56aec556`) | as above |
 | **R8** measured context | `_ContextProbe` measures the board free-memory delta across this process's **first CUDA initialisation** and subtracts the allocator pool at that instant. A **watcher, not a call**: a daemon thread polls `torch.cuda.is_initialized()` every 5 ms rather than initialising CUDA in a process that was never going to touch a board | `daacf07d` | three defects fixed (`f37afe62`, `b34c9ec5`, `344178eb`, `5dedc5e4`) | **not reached on this host**: `base_method = "nvml"` everywhere, exactly as run1's W4 predicted. Exercised by unit tests only |
-| **R10′** h2c pool | `Transport::{H2c, Http11}`; **one `EndpointRuntime` per base URL shared by every client** (a pool that is not shared is not a bound); `INFERENCE_POOL_CONNECTIONS = 4`, `H2_STREAMS_PER_CONNECTION = 64`, gate `INFERENCE_MAX_CONCURRENT_REQUESTS = 256`, h2c arm only; probe by `GET /cache` with prior knowledge where **any** HTTP status proves h2c; re-probe on connect/request errors. Descriptor clamp reworked: `Multiplexed` costs a constant 8 descriptors, `PerRequest` unchanged | `ddd44e4a`, `b2723f16` | a mid-stream reset permanently downgrading an endpoint to HTTP/1.1 fixed (`8d352b33`); `c6a7a9ef` never records an unreachable endpoint as HTTP/1.1; gate constant approved in both transports (`6dcd82e4`) | **the three defects of the run**: **P1** (403 on every self-call), **P2** (a handler that answered with the request stream open) and **S1** (an unnamed 200-stream ceiling). All three fixed in the fix round (§5): 64 real connection lanes built on recruitment, a server stream limit this process chooses, a gate that follows the published figure, and a typed transport failure that costs no item. Sockets themselves behaved: `<!-- PENDING: phase D --> S11-C4 measures the descriptor count` |
+| **R10′** h2c pool | `Transport::{H2c, Http11}`; **one `EndpointRuntime` per base URL shared by every client** (a pool that is not shared is not a bound); `INFERENCE_POOL_CONNECTIONS = 4`, `H2_STREAMS_PER_CONNECTION = 64`, gate `INFERENCE_MAX_CONCURRENT_REQUESTS = 256`, h2c arm only; probe by `GET /cache` with prior knowledge where **any** HTTP status proves h2c; re-probe on connect/request errors. Descriptor clamp reworked: `Multiplexed` costs a constant 8 descriptors, `PerRequest` unchanged | `ddd44e4a`, `b2723f16` | a mid-stream reset permanently downgrading an endpoint to HTTP/1.1 fixed (`8d352b33`); `c6a7a9ef` never records an unreachable endpoint as HTTP/1.1; gate constant approved in both transports (`6dcd82e4`) | **the three defects of the run**: **P1** (403 on every self-call), **P2** (a handler that answered with the request stream open) and **S1** (an unnamed 200-stream ceiling). All three fixed in the fix round (§5): 64 real connection lanes built on recruitment, a server stream limit this process chooses, a gate that follows the published figure, and a typed transport failure that costs no item. Sockets themselves behaved: **Phase A′ measured them on the bare host**: peak **44 established sockets = 2 × 22 lanes** on S2, 65 = 2 × 32 + 1 on S3, at 90–111 fds of a 524 288 limit. `<!-- BLOCKED: phase D --> S11-C4 still measures the in-container descriptor count` |
 | **R11** small choices | `dtype_method` stored in the profile; sentinel `unknown` → **`unstated`** (constants renamed too, no back-compat alias, so the profile key moves and rows re-measure); no `pid: host`; UI types regenerated | `a1fb91a9`, `649125b9`, `f506dc2b`, `049d271c` | approved; `b0cc2c95` spells the sentinel in the load-report doc comments | **`dtype_method = "inferred"` in all three S2 stores** (`dtype` fp32/fp16/fp32). **`unstated` has no producer on this host** — the string appears 0 times in 15 legs |
 | **R12** nemotron base | F-C is an **analysis artefact**: `vramrec.py` had memoised `[panoptikon-spaw]`/empty env for the nemotron pid, so `analyze.py` compared it against the **MiniLM** worker's 848 MiB. Real base 3 788 = 3 201 MiB bf16 weights + allocator slack + ~550 MiB context. Recorder and `analyze.py` fixed; F-C retracted in run1's report; the **S2-base** plateau leg added to the protocol | `03bb8a4d`, `90409b41`, `7b3ea31e`, `0643942c`, `e31fbd4f`, `7a4d38fe` | `6665b931`, `832474b0`, `71cb0827`, `e9e44549` — the identity retry rebounded by wall clock, `base_accuracy` now picks the replica's own pid and closes its window | **0.0 % on nemotron over 373 samples**; `grep -c panoptikon-spaw vramrec.jsonl` = **0** |
 
@@ -535,98 +607,255 @@ The measurements themselves are §8; what the leg *decided*:
 - `clip/qwen3-vl-embedding-2b` was **not probed**: the weights are absent from
   the local Hugging Face cache and nothing was downloaded.
 
-### 4.5 Phase B — external pressure
+### 4.5 Phase B — external pressure (`run2-phaseAB-report.md`)
 
-<!-- PENDING: phase B -->
+Binary `34a591aa`, unmodified `server-C1.toml`. **S4a ran and passed; S4d, S4b
+and S4g are blocked.**
 
-Runs on the rebuilt binary `34a591aa`. Expectations from the legs plan:
+#### S4a — `results/run2/S4a-v2/` — PASS on all three stated expectations
 
-- **S4a** (hog steps, 12 GB free): batches ≈ **200 items** at 12 GB free (run1:
-  single digits, because the fraction reserve ate the headroom);
-  `reserve_rule = "capped_default"`, `reserve_mb ≤ 1024`, `limit_mb > 0`.
-- **S4d** (8 GB free): **no `mb = 0`** (memory-blind) grants; `limit_mb > 0`.
-- **S4b** (hog step mid-window): `external_mb` on the grant line tracks the hog
-  step **within a few seconds** (the per-batch `free_mb` ingest), not run1's
-  ≥ 31 s; `oracle_agreement` breaches bounded; the worker clamp still fires as
-  backstop.
-- **S4g** if time allows: the load guard still refuses; not a run2 change.
-- Watch **C6**: if S4a's ≈200 lands and throughput is below run1's, the cause
-  is likely the same — bigger admitted batches on a tight board are slower for
-  models whose curve is flat.
-- It is also the first leg to exercise the new transport under a **moving**
-  board, and the first job-driven leg to run on the shipped policy shape with
-  no `calib_hostless` block — which it must record.
+`hog.py --reeval 999999 leave-free 12288` (filled to **12 228 MiB free**,
+byte-for-byte run1's figure, held flat at 84 352 MiB for all 281 samples),
+store seeded from `S2-wdvit-v2` (anchor 439, no knee), `ramp` corpus.
+2026-09-04 21:55:36Z–21:57:57Z. Job: 2 000/2 000, `completed`, 0 errors.
+**Three grants: 1, 63, 147.**
 
-### 4.6 Phase A′ re-run — S2 wd-vit, S3 wd-vit
+| Expectation (run2) | Run1 | Measured on `34a591aa` | Verdict |
+|---|---|---|---|
+| **`reserve_rule = "capped_default"`** | rule did not exist (fraction reserve) | **`capped_default`** on all 3 grants and in all 285 `/health` board samples | **PASS** |
+| **`reserve_mb ≤ 1024`** | 8 579 MiB withheld | **exactly 1 024** while the hog is up (the cap binds: `min(85 792 × 0.10, 1024)`); 0 on the idle board | **PASS** |
+| **`limit_mb > 0`** | 3 517 | **11 071** throughout (`97 887 − 85 792 − 1 024`), minimum over the run 11 071 | **PASS** |
+| **Batches ≈ 200 at 12 GB free** | **47 granted, 11 executed** (5.0 % of the 220-item boundary) | **147 granted (66.8 %), 83 executed (37.7 %)** for the 21 batches carrying 87 % of the job — **3.1× run1's grant, 7.5× run1's executed batch** | **PASS in direction and magnitude; short of the literal 200, and the shortfall is fully explained (below)** |
+| Every grant ≤ headroom; batch ≤ the 12 GB boundary | 3/3, 47 ≤ 220 | **3/3** (53 ≤ 10 235, 3 319 ≤ 10 069, 7 729 ≤ 7 741); largest batch **147 ≤ 220** | **PASS** |
+| No OOM / deaths / negatives | 0/0/0 | **0/0/0** (22 worker clamps, none an OOM) | **PASS** |
+| No knee under pressure | no knee | **0 `fitted a throughput knee` lines**, `knee_units` null in all samples | **PASS** |
+| Throughput | 0.97× of run1 S2 | **0.90×** of this run's S2 (27.397 vs 30.303 items/s) | **PASS (at the floor)** |
+| `oracle_agreement` (run1's N4 phantom) | **FAIL, 83 of 210** | **PASS, worst 134 MiB, 0 of 456** | **PASS** |
+| transport / sockets | n/a | `h2c`, peak lanes 32, gate 256→4 096, peak in-flight 1 999, `queue_bound_windows` 3; peak fds **110** / 70 sockets / **65 established** | **PASS** |
+| P1 / P2 | n/a | `invalid multipart` / `no_policy` / `request_incomplete` / `out of memory` = **0 each** | **PASS** |
 
-<!-- PENDING: phase A re-run -->
+`analyze.py`'s printed `utilization FAIL (0.34, floor 0.50)` uses the
+*full-board* boundary (2 560) and the anchor-derived budget (878) — the same
+artefact run1 called out; the scenario's criterion is against the boundary at
+12 GB free and is recomputed by hand above.
 
-On the rebuilt binary, without the `calib_hostless` block. This is the
-acceptance test for the fix round's two largest items; expectations, amended
-after it (`run2-legs-plan.md`, "Amendments after the fix round"):
+**Why 147 and not 220** (no defect): the probe's 220 is priced against the
+board's *whole* free memory, the ledger against `limit − our charge`:
+`limit 11 071 − charge 3 330 = headroom 7 741`, `7 741 / 51.61 = 149 → 147`.
+~20 units are the 1 024 MiB reserve; ~50 are memory the worker already holds.
 
-- **Ramp**: wd-vit reaches **512** again (run1: 10 windows); **no `W → 200 − W`
-  cycle**; `max_units_measured` moves past 136; `high_water_samples` stops
-  alternating 1, 0 and `ramp_step` advances on consecutive windows.
-- **Transport**: `/health` shows the published `desired_in_flight_items`,
-  transport `h2c`, **few lanes in use** (`connections_in_use ≈ ceil(in_flight /
-  64)`), a low `queue_bound_windows`, and sockets **≤ 2 × lanes-in-use +
-  reserve**.
-- **Knee**: **no knee on wd-vit at any point** (the five vetoes); MobileCLIP
-  may fit none (accepted); a seeded knee is provisional and re-validated within
-  **4** windows; `knee_withdrawn` may fire.
-- **Budget**: a `unit_budget` shrink **lands within one window** when the
-  target falls (S1b), instead of in-flight sitting at 200 against a target
-  of 64.
-- **P2**: no `partial` job from an `invalid multipart body`; a
-  `request_incomplete` or `transport` failure is re-queued once and reaches
-  `job_failures` only if it fails twice.
+**Finding S4a-A2 (MEDIUM, not a regression) — the worker's live clamp is now
+the binding constraint, and it double-counts our own pool.** Twenty-two
+identical clamps, one per batch of the big window:
 
-### 4.7 Phase D — packing, docker
+```
+21:56:12.864 [INFO] inferio_worker.packing: free memory fell to 4371 MiB against a
+             7729 MiB grant; shrinking this batch's budget from 147 to 83 units
+```
 
-<!-- PENDING: phase D -->
+4 371 MiB is NVML's free reading *after* our caching allocator took its pool —
+the same pool the ledger already charged us for and which the allocator would
+reuse rather than grow. Our footprint is charged twice: once as `charge_mb` in
+the grant, once as memory missing from the live free reading, and **44 % of the
+grant is left on the table with nothing external moving**. Safe (that is the
+clamp's job, and it is what kept every run1 profile safe) and not a run2
+regression — but in run1 the ledger's margin was the binding constraint and now
+the clamp is. Recorded as a user decision in §6.
 
-Runs on the rebuilt binary and image (the S8 ocr-C7 leg ran separately on
-`65fd2f82`; §4.3).
+#### S4d, S4b, S4g — BLOCKED
 
-- **S8 pixmix**: `canvas_pixels` on nemotron's grants and load report, **no
-  single-item batches** for 20 MP items (they pack at the canvas),
-  `utilization > 0.3`, the epoch-2 profile written fresh. The slope is compared
-  against the probe **of the same image group** (`results/run2/probes/`), not
-  against a single number: a 0.3 MP-dominated fit should land within ~10 % of
-  **0.00128**, and against the `img-20mp` probe the same fit reads ≈ 6.0×,
-  which would mean nothing — exactly as run1's 4.33× meant nothing.
-- **S11-C4** (Docker, 2 000-item job): 2 000/2 000; inference sockets bounded
-  by the lanes actually recruited (`ls /proc/<pid>/fd | wc -l` inside the
-  container ≈ 2 × lanes-in-use + reserve, not hundreds); `known transport h2c`
-  in the log; the job's in-flight ceiling at the byte budget, not the
-  descriptor clamp (now **384**, `FD_RESERVE + 2 × 64`). The image contains the
-  P1 fix, so the shipped `docker.toml` policy works over h2c — **this leg is
-  the real test of it**.
-- **The shape ceiling on easyOCR under C7**: it must appear at **28 items ≈
-  183 500 800 units** — `/health` `shape_ceiling_units`, the INFO line naming
-  `action`/`cause`, `clamped.reason = "index_limit"` on the measurement — with
-  **no deflation** from it, and recognition text on > 2560 px scans unchanged
-  from run1.
-- **`ceiling_probe.py` against the C7 registry** has now been run (§4.4), so
-  `slope_accuracy` and `utilization` finally have a ground truth for easyOCR —
-  but both run2 bisect boundaries (37 against a true 28) must be treated as
-  **invalid**, not merely noisy.
+<!-- BLOCKED: S4d, S4b, S4g — SGLang holds both boards -->
 
-### 4.8 Phase E — soak
+Not run, and **not attempted against a live SGLang**. At 21:59 UTC the user
+recreated `dsv4-flash-sglang`, which holds **77 702 MiB on each board**:
 
-<!-- PENDING: phase E -->
+- **S4b** (`hold 0`, then **+30 GB** at t = 60 s) is arithmetically impossible
+  with ~20 GB free — the step the leg is defined by cannot be taken.
+- **S4d** (`leave-free 8192`, release everything at t = 120 s) could be forced
+  to its starting free level, but its criterion is the **recovery** when the hog
+  releases: here the board would recover to ~20 GB free, not 95 GB, and
+  `external_mb` would be tracking a live inference server instead of a hog whose
+  schedule the run controls.
+- Beyond validity there is a **risk to the user's service**: the worker
+  allocates into whatever headroom is left, and on a board SGLang is serving
+  from that can starve it.
 
-4 h (run1's S9 recipe, 4 h instead of 8), on the rebuilt binary. Expectations:
-all jobs completed — no fixture is involved, so **any `partial` is P2 or its
-successor**, and a re-queued `transport`/`request_incomplete` failure should
-appear in `job_failures` only if it failed twice — 0 deaths, **no persisted
-knee below the ramp's plateau bucket**, deflation returning to 0, store
-bounded, no cooldowns, `oracle_agreement` breaches lower than run1's (the
-attribution fix), RSS bounded, and `predict_body_budget.refused_requests` at 0.
-Then SGLang restart.
+**To finish them**, wait until both boards are idle (SGLang is the user's to
+stop and start — the run must not stop it), then run, in order, with the seed
+store named:
 
----
+```bash
+S=<session scratchpad>/bin
+R=/home/admin/projects/panoptikon/tools/calibration-protocol/results
+
+SEED_CAL=$R/run2/S2-wdvit-v2/calibration.after.toml \
+HEALTH_EXTRA=--full HOG_SCHED="leave-free 8192" HOG_EXTRA="--reeval 999999" \
+HOG_WAIT=180 DRIVE=$S/drive-d.sh JOB_CAP=1800 \
+  $S/runjob2.sh S4d-v2 tags/wd-vit-tagger-v3 $R/corpus/ramp8
+
+SEED_CAL=$R/run2/S2-wdvit-v2/calibration.after.toml \
+HEALTH_EXTRA=--full HOG_SCHED="hold 0" DRIVE=$S/drive-b.sh JOB_CAP=1800 \
+  $S/runjob2.sh S4b-v2 tags/wd-vit-tagger-v3 $R/corpus/ramp8
+```
+
+`drive-d.sh` releases the hog at t = 120 s; `drive-b.sh` steps it to
+30 720 MiB at t = 60 s; both are run1's, copied verbatim. `runjob2.sh` is
+run1's `p2b/runjob.sh` with `--run-id run2`, an optional hog and the descriptor
+recorder added. The **`ramp8` corpus (16 000 items)** is what run1 used for
+S4b–S4e — the 2 000-item `ramp` is exhausted before either event fires.
+S4g (`leave-free 1024`, then a job for the unloaded nemotron) is run1's leg
+unchanged; nothing in run2 changed its expectation (the load guard still
+refuses), and it is the cheapest of the three to run.
+
+What each still has to answer: **S4d** — no `mb = 0` (memory-blind) grants,
+`limit_mb > 0`, and the budget recovering to the S2 level within 3 windows of
+the release; **S4b** — `external_mb` on the grant line tracking the hog step
+**within a few seconds** (the per-batch `free_mb` ingest, R5/T3) rather than
+run1's 31.5 s, bounded `oracle_agreement` breaches, and the worker clamp still
+firing as backstop; **S4g** — a clear per-model error, a healthy server and no
+respawn loop. Watch **C6** throughout: bigger admitted batches on a tight board
+are slower for a model whose curve is flat, and S4a already reads 0.90×.
+
+### 4.6 Phase A′ re-run — S2 wd-vit, S3 wd-vit (`run2-phaseAB-report.md`)
+
+Binary `34a591aa`, **unmodified** `server-C1.toml` (no `calib_hostless`), both
+boards at 2 MiB before every leg. This is the acceptance test for the fix
+round's two largest items, and it passes on every check.
+
+#### S2 wd-vit — `results/run2/S2-wdvit-v2/` — PASS, no defects
+
+Cold ramp, empty store. 2026-09-04 21:44:26Z–21:46:38Z. Job: 2 000/2 000,
+`outcome: "completed"`, 0 errors, 0 failed items, `inference_time` 57.89 s.
+`analyze.py --learning`: every check that can pass, passes.
+
+| Expectation (run2) | Run1 | Run2 on the OLD binary `65fd2f82` | Measured on `34a591aa` | Verdict |
+|---|---|---|---|---|
+| Job creation works on the shipped policy shape (P1) | n/a | **500; needed the `calib_hostless` policy** | `EXTRACTION_POST_RC=0` on unmodified C1; **zero `reason="no_policy"` lines** in 2 123 log events | **PASS** |
+| Ramp reaches ~512 in ~10 windows, no `W → 200 − W` cycle (S1) | anchor 512, 10 windows | **anchor froze at 136**, 88 grants, budget cycling 3/7 | **anchor 439 in 12 windows**, budget published **878**; monotone 1,2,4,8,16,17,34,68,136,272,439; the bound is the corpus (last window asked 439 with 439 items left), not the transport | **PASS** |
+| **No knee on wd-vit at any point** (F1) | no knee (correct) | **`knee_units = 3` fitted, persisted as 7** | **`fitted a throughput knee` appears 0 times.** Two refusals, F1 rule 1: `declining to fit a throughput knee: the plateau starts at the smallest batch size measured, so no bend was observed bucket=1 observed_floor=1 observed_top=8 anchor=272 observations=14`. Store carries **no `knee_units`**; `/api/inference/metadata` → `"knee_units": null` | **PASS — F1 fixed** |
+| No `partial` from `invalid multipart body` (P2) | completed | **`partial`, 1 of 2 000 lost to a 400** | `grep -c "invalid multipart"` = **0**, `request_incomplete` = 0, `failures.json` empty on every list, job `completed` | **PASS — P2 fixed** |
+| `/health.inference_clients` shows `h2c` | n/a | n/a | `{"transport":"h2c","pool_connections":64,"connections_in_use":1,"max_concurrent_requests":256,"in_flight_requests":64}`; only pre-probe samples read `"unknown"` (the documented `try_read` fallback) | **PASS** |
+| lanes in use small | n/a | n/a | peak `connections_in_use` = **22** of a 64-lane pool | **PASS** |
+| gate follows the published figure | pinned 200 | pinned 200 | gate **256 → 3 264**, tracking `desired_in_flight_items` 48→192→408→816→1 632→3 264; peak `in_flight_requests` **1 382** | **PASS** |
+| `queue_bound` low | n/a | n/a | **6** over the whole job, each one a ramp-step window the job could not yet fill or the final corpus-exhausting window; the desired figure climbed across every one | **PASS** |
+| sockets ≤ 2 × lanes-in-use + reserve | n/a | n/a | peak fds **90**, of which **50 sockets**; `ss -tnH state established '( sport = :6342 or dport = :6342 )'` peaked at **44 = 2 × 22 lanes** (loopback: each lane is a client and a server socket in one process). 0 % of the 524 288 soft limit | **PASS** |
+| `grant_safety`, OOM, deaths | PASS/0/0 (10 grants) | PASS/0/0 (88 grants) | **PASS on 12 grants**, 0 over headroom, 0 over live free, 0 memory-blind; 0 OOM, 0 deaths | **PASS** |
+| Slope vs probe | 50.5625 (+0.04 %) | 50.6 (+0.12 %) | **52.6818 (+4.24 %)**, ratio 1.0424 — band a little wider because two anchors are not powers of two (17, 439) | **PASS** |
+| `base_mb` vs probe | 964 (0 %) | 964 (0 %) | **964 (0 %)**, `base_method="nvml"` | **PASS** |
+| `dtype_method` in the store | absent | `"inferred"` | **`dtype_method = "inferred"`**, `dtype = "fp32"` | **PASS** |
+| `dtype = "unstated"` | n/a | no producer | **still no producer on this host** (`unstated` appears 0 times) | **not exercised** |
+| `reserve_rule` / `reserve_mb` / `limit_mb` | n/a | `capped_default`, 79–197 | **`capped_default` on all 12 grants, `reserve_mb` 79–197**; `/health` `limit_mb` never below **97 034** | **PASS** |
+| `canvas_pixels` on the grant line | n/a | n/a | **`canvas_pixels=none`** — correct for an `item`/`count` model | **PASS** |
+| `load_cooldowns[]` | n/a | `[]` | **`[]` in all 262 health samples** | **PASS** |
+| `utilization` | 0.40 | **0.11 (knee-pinned)** | **0.34** (peak budget 878 / boundary 2 560) | **PASS** |
+| Throughput vs master C0 | 0.94x | 1.02x | **0.95x** (30.303 vs 31.746 items/s) | **PASS** |
+| `oracle_agreement` | FAIL (81 of 205) | PASS (0 of 410) | **PASS**, worst 137 MiB, 0 of 432 | **PASS** |
+| `unit_budget` shrink lands within one window | n/a | could not land | **not exercised** — idle board, no shrink called for; exercised in S4b/S4d | **not reached** |
+
+No product defect, no deviation, no unexpected log line on this leg.
+
+#### S3 wd-vit restart — `results/run2/S3-wdvit-v2/` — PASS on the leg's own question; one accepted FAIL at run1 parity
+
+Fresh root seeded with `S2-wdvit-v2/calibration.after.toml` (anchor 439, slope
+52.68, **no knee**). 2026-09-04 21:50:29Z–21:53:07Z. Job: 2 000/2 000,
+`completed`, 0 errors, `inference_time` 56.27 s. **Three grants for the whole
+job: 1, 63, 878.**
+
+| Expectation (run2) | Run1 | Run2 on the OLD binary | Measured on `34a591aa` | Verdict |
+|---|---|---|---|---|
+| Seeded profile resumes, no re-ramp | `seeded_from_store=true`, 3 windows | `seeded_from_store=true`, `ramp_step=5` | **`seeded_from_store=true`**, first grant already `ramp_step=6`, then 63, then 878 (= 2 × the seeded anchor); no 1,2,4,8… | **PASS** |
+| **No knee caps the fresh job** | no knee | **stored knee 7 pinned the whole job at 7–31 units** | **0 `fitted a throughput knee` lines; `knee_units` is `null` in all 275 health samples and absent from the store** — the seed carried none to restore | **PASS — F1 fixed across a restart** |
+| **utilization ≈ run1's 0.80** | 0.80 (peak budget 2 048) | **0.01 (peak budget 31)** | **0.69** (peak budget 1 756 / boundary 2 560). The gap to run1 is exactly the seeded anchor: run1 resumed from 512 → 1 024, this leg from 439 → 878 | **PASS** |
+| `calibration.status = "local"`, `local_samples` continues, anchor only rises | local, 10→13, 512→1 024 | local, 20→32, 136→136 | `status: "local"`, `local_samples` **11 → 15**, anchor **439 → 878** | **PASS** |
+| `knee_clean_windows` restored / `knee_withdrawn` | n/a | not exercised | **not exercised, correctly** — no knee exists to count or withdraw. The restoration path itself was proved on the old binary in `S3-wdvit-kcw` | **not exercised** |
+| `/health` clients, lanes, gate, `queue_bound` | n/a | n/a | `h2c`, pool 64, peak lanes **32**, gate **256 → 4 096** (the ceiling; `desired_in_flight_items` reached 5 268), peak in-flight **1 999**, `queue_bound_windows` **3** (one per window, all corpus-bounded) | **PASS** |
+| sockets ≤ 2 × lanes + reserve | n/a | n/a | peak fds **111**, sockets **70**, `ss` established on :6342 peak **65 = 2 × 32 + 1** | **PASS** |
+| `reserve_rule` / `reserve_mb` / `limit_mb` | n/a | `capped_default` | **`capped_default`** on all 3 grants, `reserve_mb` 78–103, `limit_mb` never below **97 034** | **PASS** |
+| P1 / P2 do not recur | n/a | both fired | `invalid multipart` / `no_policy` / `request_incomplete` = **0 each** | **PASS** |
+| No OOM, 0 deaths, `grant_safety` | 0/0 PASS | 0/0 PASS | **0/0, PASS on 3 grants** | **PASS** |
+| Throughput ≥ 0.9× C0 | **0.89× (FAIL)** | 1.09× | **0.88×** (27.778 vs 31.746 items/s) | **FAIL, accepted — run1 parity** |
+
+**Adjudication of the one FAIL.** Run1's own S3 read 0.89× and failed the same
+floor for the same reason (finding N2: wd-vit's curve is flat, so one
+1 936-item window pipelines slightly worse than many small ones, and the whole
+job is three windows). The old binary's 1.09× was *caused by* the spurious knee
+holding it to 7–31-unit windows; restoring the big windows necessarily gives
+that back. Utilization is the number this leg exists to measure, and it moved
+0.01 → 0.69.
+
+### 4.7 Phase D — packing, docker — BLOCKED
+
+<!-- BLOCKED: phase D — needs idle boards; the shape-ceiling leg needs ~93 GB free -->
+
+Not run: SGLang holds 77 702 MiB on both boards from 21:59 UTC (§1). Nothing
+about the expectations has changed — they are restated below together with the
+runbook to execute each leg cold. Everything runs on the rebuilt binary
+`34a591aa` and, for S11-C4, the rebuilt image `0b2261f94c8f`; the S8 ocr-C7 leg
+of §4.3 was a *different*, already-completed leg on `65fd2f82`.
+
+**S8 pixmix.** Config **C1** (`tools/calibration-protocol/config/server-C1.toml`
++ `env.C1`, `run-gateway.sh`), model `clip/nemotron-embed-vl-1b-v2`, corpus
+`results/corpus/pixmix`, **empty store** (the epoch-2 bump means every run1
+nemotron row is ignored anyway); run1's verbatim commands are in
+`results/run1/S8-pixmix/runlog.md`. Check: `canvas_pixels` on nemotron's grant
+lines **and** on the load report and in `/health.models[].cost.canvas_pixels`;
+**no single-item batches** for the 20 MP items (they must pack at the canvas);
+`utilization > 0.3`; the epoch-2 profile written fresh. Judge the fitted slope
+against the probe **of the image group the corpus is dominated by**
+(`results/run2/probes/summary.md`), never against a single number: a
+0.3 MP-dominated fit should land within ~10 % of **0.00128**, and against the
+`img-20mp` probe the same fit reads ≈ 6.0×, which would mean nothing — exactly
+as run1's 4.33× meant nothing. Remember the canvas-capped price is ~1.40×
+conservative for a 1:1.414 page by construction.
+
+**S11-C4 (Docker).** The C4 compose overlay under
+`tools/calibration-protocol/config/compose/`, image **`0b2261f94c8f`** tagged
+`panoptikon:calib-cuda`, the shipped `docker.toml` policy (the image carries
+the P1 fix, so **this leg is the real test of it**), a 2 000-item job on the
+`ramp` corpus; run1's commands are in `results/run1/S11-C4-fixed/runlog.md`.
+Check: **2 000/2 000**; `known transport h2c` in the log; the gateway's
+inference sockets bounded by the lanes actually recruited — sample
+`ls /proc/<pid>/fd | wc -l` *inside* the container during the job, expect
+≈ 2 × lanes-in-use + reserve, not hundreds; the job's in-flight ceiling at the
+**byte budget**, not the descriptor clamp (now **384** = `FD_RESERVE + 2 × 64`);
+`/proc/1/limits` still showing the raised `nofile` (run1's F6).
+
+**The easyOCR shape-ceiling leg.** Config **C7**
+(`server-C7.toml` + `registry-C7.toml`, which restates easyOCR's canvas and
+`epoch = 2`), `doctr/easyocr_*` on the `ocr` corpus of >2560 px scans; run1's
+S8-ocr-C7 runlog is the recipe. It needs a **large idle board — ~93 GB free,
+because the ceiling only appears once a batch of 28 items of 1824×2560 can be
+granted**. Check: the ceiling at **28 items ≈ 183 500 800 units** in
+`/health.models[].shape_ceiling_units` and in the INFO line naming
+`action`/`cause`; `clamped.reason = "index_limit"` on the measurement; **no
+deflation** from it; and recognition text on >2560 px scans **unchanged from
+run1** (the D1-b verifier reverted the quality half: the detector runs bounded,
+the recogniser still crops from the raw image). Note that both run2 bisect
+boundaries from `ceiling_probe.py` (37 against a true 28) must be treated as
+**invalid**, not merely noisy — §4.4.
+
+### 4.8 Phase E — soak — BLOCKED
+
+<!-- BLOCKED: phase E — needs both boards for 4 h -->
+
+Not run, for the same reason, and it is the leg that needs the host most: the
+S9 recipe drives **both boards** for its whole length with a hog and a
+concurrent loadgen, so it cannot share a board with SGLang at all.
+
+**Runbook.** Run1's `results/run1/S9/runlog.md` verbatim, on binary
+`34a591aa`, config **C1**, the `soak` corpus, **4 h instead of 8** — jobs
+cycling over the four shipped models with `hog.py` and `loadgen.py` alongside,
+`vramrec.py`/`healthrec.py --full`/`fdrec` running throughout, then
+`analyze.py`. Expect: **all jobs completed** — no fixture is involved, so **any
+`partial` is P2 or its successor**, and a re-queued `transport` /
+`request_incomplete` failure should reach `job_failures` only if it failed
+twice; **0 deaths**; **no persisted knee below the ramp's plateau bucket**
+(run1's S9 fitted `knee_units = 1` on wd-vit and never refitted for 7 h 55 m);
+deflation returning to 0; the store bounded; no cooldowns
+(`/health.load_cooldowns[]` empty at every sample); `oracle_agreement` breaches
+**lower than run1's** (the R12 attribution fix); RSS bounded; and
+`predict_body_budget.refused_requests` at **0**. Then, and only then, SGLang is
+the user's to restart — in this session the user has already done it.
 
 ## 5. The fix round
 
@@ -1039,6 +1268,8 @@ policy, default or design decision and is written up with options.
 | **Transport failures cost the item** | MED | A connection error surviving the client's three retries returned an untyped `reqwest` error, so `classify_item_failure` — which acts only on typed failures — recorded an item that was never attempted as a media failure. 456 such in P2's 300 k pre-fix run | **Fixed and verified** (`bfd2018b`): `kind = "transport"` with a phase the client types itself and no peer can forge; `warrants_resubmission()` buys the same single re-queue as a worker death |
 | **The h2 constants, and why** | INFO | The fix round chose four numbers that will outlive this run: server **`MAX_CONCURRENT_STREAMS = 512`** = 8 × the 64 streams our own client offers one connection, chosen above every common server default (nginx 128, Envoy 100, hyper 200) so this server is never the tightest limit in a chain, with the 8× for a proxy fanning several clients onto one upstream; **`INFERENCE_CONNECTION_LANES = 64`**, the multiplier that makes the gate ceiling (`lanes × 64 = 4 096` requests) reach the job's own `in_flight_unit_ceiling`, since for an image tagger one unit is one request; the **gate `[256, 4096]`**, floored at the constant every existing deployment already runs at so the change can only ever raise it; and **`PREDICT_BODY_LIMIT = 2 GiB`** (the largest legitimate *single-input* request, since `check_frame_budget` already refuses anything above it) beside a process-wide **4 GiB** aggregate — one gateway job's item bytes are bounded by `intermediate_data_budget_mb` at 1 GiB, four gateways against one GPU box is the deployment this exists for, and `4 = 2 × 2` so a maximal body can always be admitted beside another | **Recorded**; all four are named constants with their derivations in doc comments, and three are on `/health` |
 | **C6** | MED/HIGH | Under a hard squeeze (4 GB free) the R5 reserve cap admits **60× bigger batches** and wd-vit runs at **0.56×** run1's throughput (21.85 vs 38.98 items/s, p50 5 323 vs 3 199 ms) with nothing in the ledger noticing — and nothing could: the knee compares log2 buckets *within one run*, and this run never ran wd-vit small on a squeezed board to compare against. Safe (0 OOM, 0 negatives, 0 unsafe grants); the grant is 3 040 MiB against 3 085 MiB of headroom, so the allocator has nothing to spare | **User.** Expected behaviour of an approved change, not a regression of correctness (run1 issued a *blind* grant in the same place). Options below |
+| **S4a-A2** the live clamp double-counts our own pool | MED | On a pressured board the **worker's live clamp**, not the ledger's margin, is the binding constraint — and it compares NVML's free reading *after* our own caching allocator took its pool against a grant the ledger already charged us for. Our footprint is priced twice: `free memory fell to 4371 MiB against a 7729 MiB grant; shrinking this batch's budget from 147 to 83 units`, twenty-two identical clamps in one window, **44 % of the grant unused with nothing external moving**. It is run1's **T10** ("the clamp has no margin of its own and ran at 98.2 % of free nine times") with a number, and run1's S4d pool-accounting clamps at 36 GB free are the same shape | **Open, user decision.** Not a regression and not unsafe — the clamp is what kept every run1 profile safe — but in run1 the ledger was the binding constraint and now the clamp is, so the cost is paid on every pressured window. Options below |
+| **SGLang restarted mid-run** | INFO | At **21:59 UTC on 2026-09-04**, between the S4a leg and the S4d leg, the user recreated `dsv4-flash-sglang` on this host; it took **77 702 MiB on each board**. Evidence that it was the user and not the run: the user has been logged in since 20:09 UTC, the SGLang bench directory was modified at 22:02, there is no timer or cron behind the container, and both boards read 2 MiB before every leg the run started and after S4a. The run **did not stop it again** — SGLang is the user's service, and the brief makes stopping and starting it the orchestrator's, not a leg's | **Not a fault.** Consequence: S4b, S4d, S4g, Phase D and Phase E are **blocked, not failed**, and §4.5/§4.7/§4.8 carry their runbooks |
 | **F1 residue** | MED | **MobileCLIP's `knee_units = 127` is not restored** under `KNEE_PLATEAU_BUCKETS = 2`: the recorded ring has exactly one quiet bucket above the bend, because the ramp stalled at 136 units for S1's reasons and nothing at 256 was ever measured. Two observations there and the same ring answers 127 (pinned by a test). The knee was worth nothing measurable either way: 0.94× master with it in run2, 1.00× without it in run1 | **User** — a one-line constant. Options below |
 | **C2** | MED | A **trusted** `oom_class` leaves no trace: `oom_verdict` returns `Trusted` for `typed_exception` and `marker` and logs nothing, and `oom_class` never reaches `panoptikon.log`, `/health` or `analyze.py`. So the plan's clause "`oom_class.source` present on the OOM measurements" is only verifiable for the *vetoed* case (5 954 marker-classified OOMs in `S5-oomtimed` with zero mentions of `oom_class`, against one mention in `S5-oom2nd`) | **Fixed and verified** (`672aa85a`, `18f2aa1b`, `62a092c9`): one INFO line per OOM negative naming `source`, `exception`, `trust`, `free_mb_at_failure`, `grant_mb` and `oom_samples`, and `analyze.py`'s `failures` row tallies `source/trust` pairs. Both options were taken |
 | **C3** | MED | The `message_pattern` veto fired on a **genuine** OOM. Both rules are individually right (the measurement was vetoed at `free_mb_at_failure 96 518 ≥ grant.mb 96 356`; the error frame's `INFERENCE_OOM_WINDOW` marker deflated 61 µs later), but on an **idle board the veto will fire on essentially every `message_pattern` OOM**, because `grant.mb` is the whole board. The tier is load-bearing only on a tight board — which is where real OOMs happen, so it is defensible — but a model raising bare driver text *without* an `INFERENCE_OOM_*` prefix (a batch-1 failure inside `run_single`) would then not deflate at all | **User / watch.** A fixture artefact on an idle board; worth a look before the soak |
@@ -1066,6 +1297,7 @@ policy, default or design decision and is written up with options.
 | Id | Options | Orchestrator's recommendation |
 |---|---|---|
 | **C6** (throughput under a hard squeeze) | (a) accept and document: the reserve cap trades throughput on a tight board for admission that is priced rather than blind, which is strictly safer; (b) make the ledger *notice* — compare a squeezed board's throughput against the same model's own unsqueezed buckets rather than only within one run, so the knee/comparator can see it; (c) bound the admitted batch on a board whose headroom is within a small multiple of the grant, i.e. treat "grant ≈ headroom" as its own regime; (d) re-tune the 1 024 MiB cap | (a) for this release, with (b) recorded as follow-up work. The failure the cap prevents (memory-blind grants at `limit_mb = 0`) is worse than a slower batch, and run1's 38.98 items/s was bought with grants the ledger could not price at all |
+| **S4a-A2** (the clamp double-counts our own allocator pool) | (a) **subtract our own pool in the worker**: add `torch.cuda.memory_reserved − torch.cuda.memory_allocated` back to the live free reading before comparing it against the grant — the worker knows its own pool exactly, and the ledger has already charged for it; (b) **price the grant net of the pool** on the host, so the clamp's comparison is apples to apples from the other side; (c) accept the 44 % and document that a pressured board runs at the clamp, not at the grant | (a) is the smaller change and is local to the process that owns the number; (b) is the more principled one if the ledger should always describe *new* memory. **User's call** — either changes how much a squeezed board admits, which is exactly the regime R5 was approved for |
 | **F1 residue** (`KNEE_PLATEAU_BUCKETS`) | (a) keep **2**: a plateau resting on one comparison between two medians is not a plateau, and MobileCLIP's knee is found late rather than lost (two observations at 256 units restore it); (b) set **1**: restores MobileCLIP's 127 on its recorded ring, and wd-vit is *still* refused, by rules 1 and 2 | (a). The asymmetry the whole design rests on points this way: a false negative is a knee found late, a false positive is F-A. The constant is named and its derivation is in the doc comment, so (b) is one line if the user prefers the literal acceptance criterion |
 | **C2** (trusted `oom_class` invisible) | (a) one `debug!` on the trusted arm naming source, exception and `free_mb_at_failure`; (b) an `oom_class` column in `analyze.py`; (c) both | (c) — **done**: the INFO line and the `analyze.py` tally both shipped in the fix round |
 | **C3** (the veto's real reach) | (a) corroborate against the *board's* free memory rather than the grant's envelope, so an empty board does not auto-veto; (b) keep the rule and require impls to prefix driver text with `INFERENCE_OOM_*` (which `packing` already does on the window path); (c) accept: the tier is load-bearing exactly where it matters | n/a — the outcome was right on every measured leg; the risk is a batch-1 failure inside `run_single` |
@@ -1259,12 +1491,21 @@ its own boundary is inside it.
 | `6d074f3d` | `ceiling_probe.py::load_registries` **deep-merged** registry documents key by key, where `registry.rs::load_file` **replaces** an inference id wholesale. So `registry-C7nc.toml`, whose entire purpose is to omit the canvas, still resolved to the shipped 6 553 600 — probe 2 would have measured the capped configuration and reported it as the uncapped control. Caught on the dry run |
 | `0438a3c6` | The probe scored an index-limited batch as "ok", which is how both easyOCR bisects reported 37 against a true 28. `ran_whole_batch()` now replaces `ok and not oom` at all four decision points, and a failing probe is recorded under `first_index_limit_items` |
 | `62a092c9` | `analyze.py`'s `failures` check tallies the OOM tier lines by `source/trust` and names any unattributed negative rather than rounding it away |
+| `362ec437` | `healthrec.py`'s `flatten_health` dropped every section the run2 legs are judged on — `inference_clients[]` (transport, pool, lanes in use, gate), `load_cooldowns[]`, `predict_body_budget`, the boards' `reserve_mb`/`reserve_rule`, the workers' `shape_ceiling_units` and the models' `desired_in_flight_items`, `queue_bound_windows` and `cost.canvas_pixels`. Without it Phase A′ could only read them out of `--full`'s raw payload |
 
 ### Instrument gaps still open
 
 - **`analyze.py` has no `reserve_rule`/`reserve_mb` or `knee_expired` column.**
-  Every Phase C measurement of those fields came from `grep`. (`oom_class` is
-  closed: the tier line and its tally shipped with C2.)
+  Every Phase C measurement of those fields came from `grep`, and so did Phase
+  A′'s and S4a's — `healthrec` now *records* them (`362ec437`), but nothing
+  judges them. (`oom_class` is closed: the tier line and its tally shipped with
+  C2.)
+- **`utilization` has no way to know which boundary it is against.** S4a's
+  printed `utilization FAIL (0.34, floor 0.50)` divides the anchor-derived
+  budget by the *full-board* boundary while the scenario's criterion is the
+  boundary at the hog's free level, against which the same leg reads **0.67
+  granted / 0.38 executed**. Run1 called this out and run2 had to recompute it
+  by hand again; the check could take the boundary as an input.
 - **No `host_pressure` row.** `vramrec.jsonl` already records `mem_available`
   and swap at 4 Hz and `gpuclk.txt` records GPU utilization, but `analyze.py`
   surfaces neither, so a leg that reports a throughput regression may be
@@ -1507,25 +1748,34 @@ by a number nothing reported.
 
 ## 12. Host restore checklist
 
-**The run is not over.** SGLang is **stopped**. Phases B, A′, D and E are still
-to come, so nothing below is done yet. The fix round is complete, the binary
-and image are rebuilt, and the one configuration deviation of the run has been
-removed.
+**The run is not over, and the host is no longer the run's.** Phase A′ and S4a
+are done; **S4b, S4d, S4g, Phase D and Phase E are blocked** on idle boards.
+The fix round is complete, the binary and image are rebuilt, and the one
+configuration deviation of the run has been removed.
 
-### 1. Restart SGLang — the one mandatory step, **still outstanding**
+### 1. Restart SGLang — **done, by the user**
 
 ```
 docker compose -f /home/admin/docker/dsv4flash/docker-compose.yml up -d
 ```
 
 Stopped at ~12:50 UTC on 2026-09-04 for the legs, after run1 restarted it at
-03:55. Both boards read **2 MiB** at the end of Phase A, of Phase C, of the
-D1 legs and of the probes. Nothing under `~/docker` was read or edited;
-`~/docker/inferio/.env` was never read.
+03:55 — and **recreated by the user at 21:59 UTC**, between the S4a leg and the
+S4d leg, holding **77 702 MiB on each board** (`dsv4-flash-sglang`, image
+`dsv4flash-sglang:dev-fi3989`). It was not the run: both boards read **2 MiB**
+at the end of Phase A, of Phase C, of the D1 legs, of the probes, of Phase A′
+and of S4a, and the run's own processes were all stopped between legs. Nothing
+under `~/docker` was read or edited; `~/docker/inferio/.env` was never read.
+
+**The mandatory step is therefore satisfied, and it inverts the remaining
+work**: the blocked legs need both boards idle, and stopping SGLang again is
+the user's decision, not the run's.
 
 ### 2. Current host state
 
-- **GPUs**: board 0 and board 1 both **2 MiB / 97 887**, idle, no compute apps.
+- **GPUs**: board 0 and board 1 both **77 702 MiB / 97 887** — the user's
+  SGLang (`sglang::scheduler_TP0` and `_TP1`, 77 692 MiB each). Nothing of the
+  run's is on either board.
 - **Processes**: no gateway, no `inferio_worker`, no `vramrec`/`healthrec`/
   `loadgen`/`hog`/`ceiling_probe`. Four recorder processes orphaned by two
   aborted S2-wdvit attempts were found and killed at the end of Phase A; the
@@ -1533,8 +1783,9 @@ D1 legs and of the probes. Nothing under `~/docker` was read or edited;
   unparsable lines, monotonic timestamps spanning only that leg). One leg the
   D1 agent had to kill by hand (`S8-ocr-C7nc-aborted-registry`) was verified
   dead with its boards at 2 MiB before the re-run.
-- **Docker**: only the user's `sglang-grafana` and `sglang-prometheus` (up
-  7 days, untouched). No container was started by the image rebuild.
+- **Docker**: the user's `dsv4-flash-sglang` (up since 21:59 UTC),
+  `sglang-grafana` and `sglang-prometheus` (up 7 days, untouched). No container
+  was started by the run or by the image rebuild.
 - **Binary**: `target/release/panoptikon` at **`34a591aa`**, 86 313 672 B,
   built 21:28:07 UTC, reports `panoptikon 0.1.8`. `34a591aa` is the last
   commit on the branch that touches code — everything after it is
@@ -1549,15 +1800,21 @@ D1 legs and of the probes. Nothing under `~/docker` was read or edited;
   clean-worktree image build therefore needs this host's clone added as a
   remote (`origin` answers `upload-pack: not our ref 8abf631b…`).
 - **Results**: `tools/calibration-protocol/results/run2/` — Phase A's seven
-  directories, Phase C's ten, Phase D1's twelve and the probes' three;
-  ~700 MB for run2 so far, git-ignored (the probes' 201 MB apparent is 19 MB on
-  disk — the filesystem compresses them).
+  directories, Phase C's ten, Phase D1's twelve, the probes' three and Phase
+  A′/B's three (`S2-wdvit-v2`, `S3-wdvit-v2`, `S4a-v2`); **682 MB** on disk for
+  run2, git-ignored, indexed by `results/run2/README.md`.
+- **Tree**: clean; the run's commits are `ba03a570` (plan), `92102301` (this
+  report), `362ec437` (the `healthrec.py` flattening fix the A′/B legs needed)
+  and this session's documentation commits. Nothing pushed.
 
 ### 3. Stores this run has produced — which are safe to seed from
 
 | Store | Safe? |
 |---|---|
-| `run2/S2-minilm/calibration.after.toml` | **Yes** — anchor 19 684, slope 0.032248, **no knee**. The only clean store of the run so far |
+| `run2/S2-wdvit-v2/calibration.after.toml` | **Yes — the seed to use.** Binary `34a591aa`, anchor **439**, slope 52.6818, `local_samples` 11, **no knee**. This is what S3-v2 and S4a-v2 were seeded from |
+| `run2/S3-wdvit-v2/calibration.after.toml` | **Yes** — the same profile resumed: anchor **878**, `local_samples` 15, **no knee** |
+| `run2/S4a-v2/calibration.after.toml` | **No** — learned under an 85.8 GB hog, so its samples describe a 12 GB-free board |
+| `run2/S2-minilm/calibration.after.toml` | **Yes** — anchor 19 684, slope 0.032248, **no knee**. The only clean store of the `65fd2f82` legs |
 | `run2/S2-wdvit/calibration.after.toml` | **No** — `knee_units = 7` on a flat-curve model (F1). Used deliberately to seed S3 and nothing else |
 | `run2/S3-wdvit/calibration.after.toml` | **No** — `knee_units = 15`, anchor stuck at 136 |
 | `run2/S3-wdvit-kcw/calibration.after.toml` | **No** — descended from a hand-edited seed |
@@ -1589,8 +1846,9 @@ ids** every run1 row is ignored by key, because `metadata.cost.epoch` is now 2.
 
 ## Appendix: the commits of this run
 
-**153 commits**, `0d6b36c5..HEAD`, grouped by the agent that made them; within
-a group, oldest first. Product commits **P**, tooling/fixtures/configs **T**,
+**157 commits**, `0d6b36c5` → `362ec437` (plus this revision's own
+documentation commits), grouped by the agent that made them; within a group,
+oldest first. Product commits **P**, tooling/fixtures/configs **T**,
 documentation **D**. Nothing pushed.
 
 ### Track L — R1(a, d, contention tag, variance filter), R4, R5 ledger half, R11 store
@@ -1829,6 +2087,27 @@ item's verifier rather than by its implementer.
 | `f7396cc7` | D | Add the run2 report: implementation, Phases A and C, what is pending |
 | `ea62aecf` | D | Record run2's Phase A and C outcomes in the scenarios and the probes |
 | `fee92ffc` | D | Plan: record the fix round, the rebuilt binary and image, and the legs left |
+| `92102301` | D | Fold the fix round, the D1 leg and the probes into the run2 report |
+| `ba03a570` | D | Record the D1 leg, the probes and the fix round in the scenarios |
 
-`<!-- PENDING: the commits of Phases B, A′, D and E, and of the final codemap
-sweep -->`
+### The Phase A′ and B legs
+
+| Commit | Kind | Subject |
+|---|---|---|
+| `362ec437` | T | healthrec: record the run2 health sections the legs are judged on |
+| `4898d0a8` | T | codemap: re-resolve every reference at the tip and add the run2 fix symbols |
+
+`flatten_health` was dropping every section the run2 legs are judged on —
+`inference_clients[]` (transport, pool, lanes in use, the gate),
+`load_cooldowns[]`, `predict_body_budget`, the boards' `reserve_mb` /
+`reserve_rule`, the workers' `shape_ceiling_units`, and the models'
+`desired_in_flight_items`, `queue_bound_windows` and `cost.canvas_pixels`.
+Without it a leg could only read those numbers out of `--full`'s raw payload.
+`analyze.py` reads the flattened keys it already knew, so existing recordings
+and checks are unaffected. The legs themselves produced **no product commits**:
+nothing they measured was a defect. `4898d0a8` is the final `codemap.md` sweep,
+made by a separate session in the same checkout and landed while the A′/B legs
+ran; it is listed here only because it is a commit of this run.
+
+`<!-- BLOCKED: the commits of S4b/S4d/S4g, Phase D and Phase E, and of the
+final codemap sweep -->`
