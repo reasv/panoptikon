@@ -247,6 +247,89 @@ container started; nothing pushed.
    `reasv/panoptikon-ui`; until then the gitlink resolves only from this
    host's clone, and a clean-worktree image build needs the local remote.
 
+### Status after the Phase A/C/D1 fixes (2026-09-04)
+
+Phase A, Phase C and the Phase D1 (S8-ocr-C7) leg ran on `65fd2f82` and
+found eleven defects between them. All eleven are fixed, verified and
+integrated: the branch is now **70 commits** further on, `65fd2f82` →
+`34a591aa`, nothing pushed, and the run2 legs (step 5 of the sequence
+above) are **still to run** — on the rebuilt binary and image named below,
+never on `65fd2f82`.
+
+| Defect | Fix commits | Verifier outcome |
+|---|---|---|
+| **P1** every h2c request is hostless (`:authority`, no `Host`), matches no policy and is refused 403 `no_policy` — the gateway's own inference call included, so no extraction job could be created at all | `74ca202c`, `4c2e00b6` | Approved (`run2-p1-verify.md`): the effective host now comes from the request authority, and the Desktop same-origin guard is judged the same way; policy 42 tests, desktop 11. |
+| **F1** the knee estimator read the ring's own smallest bucket as a plateau and fitted `knee_units = 1` | `9cbd6304`, `d230d5ba`, `19e2bf9f` | Approved with six fixes (`run2-f1-verify.md`: `ce03bd0d`, `36a8cb77`, `846806f0`, `9a507c82`, `493c7f0b`, `f0c74915`) — rule 4's gate is now keyed on the largest anchor the ring's samples were taken under; `inferio` 479. |
+| **P2** a streamed multipart predict body returned before END_STREAM → hyper reset → `GOAWAY(ENHANCE_YOUR_CALM)` on the one shared connection; 381 `invalid multipart body` 400s in 300 k | `7e96de62` | Approved with fixes (`run2-s1p2-verify.md`): bodies are buffered, the refusal is typed `request_incomplete`, and the *process-wide* 4 GiB predict-body budget (503 + `Retry-After`, kind `body_budget_exhausted`) bounds what buffering costs; 381/300 k → 0/300 k. |
+| **S1 / S1b** hyper's default 200 streams on the one socket hyper-util shares per host pinned the job's in-flight at 200, froze the anchor at 136, and a `UnitBudget` shrink could never land in a saturated job | `4e587635`, `75ada20a`, `bc483729`, `44bdd895`, `fae83107`, `feb0a5a9`, `20bd1536`, `f153a739`, `085e9cd7` | Approved with fixes (`run2-s1p2-verify.md`: `79488c92`, `e3deabcf`, `9924044c`, `a90856f9`, `e6378f78`, `6aa2c171`, `8d8ed09c`) — lanes are built on recruitment (58.6 → 1.4 MiB per endpoint), a retry waits out its backoff holding neither permit nor lane, and `/health` reports the endpoint's real in-flight count; `inferio` 501, `jobs` 264, client 20. |
+| **C2** the OOM tier that classified a negative was not logged | `672aa85a` | Approved (`run2-c2-verify.md`) with `18f2aa1b` (never print a tier the worker stated as an empty string) and `62a092c9` (`analyze.py` tallies tiers). |
+| **C4** a cooldown-aborted job's `failure_reason` named neither the model nor the retry instant on the `load_model_all` path | `20bd1536` | Approved in the combined verify (`run2-s1p2-verify.md`). |
+| **C5** a systemically failed job still logged "re-queued … and then completed" | `f153a739` | Approved in the combined verify (`run2-s1p2-verify.md`). |
+| **D1-b** the canvas cap broke bucket homogeneity because easyOCR padded to raw dims | `2b8499ce`, `44a7babf`, `e3b6cacc` | Approved after a **revert of the quality half** (`run2-d1b-verify.md`: `22845fdb`, `ccd14ad6`, `0f8d04d7`, `96338378`, `3bc4c751`, `238a0601`) — the detector runs on the bounded batch, the recogniser reads crops from the **raw** image and the boxes are mapped back, so OCR fidelity above 2560 px is unchanged; C7nc raises the impl's own canvas; pytest 328. |
+| **easyOCR int32 ceiling** CRAFT's first `MaxPool2d` overflows a signed int32 at batch ≥ 29, silently killing the detector | `99e6c39b`, `ea6c8409`, `8f5e0a97`, `0438a3c6`, `d4089ce7`, `09cfede2`, `bab05a7d`, `26a0ccd9` | Approved (`run2-eocr-int32-verify.md`) with `1d47384e` (charge the ceiling only where the CUDA/HIP kernel has one), `ca4cfbcb`, `56a5bf81`, `8f8893d5`; pytest 366. The trim is reported as `clamped.reason = "index_limit"`, never as an OOM. |
+| **Shape ceiling (ledger half)** an `index_limit` clamp was invisible to admission, and its throughput-collapse flag deflated a healthy model on an empty board | `37f5c764`, `535dfc66` (`07356690` for the settle-log half) | Approved, no defects (`run2-integration2-report.md`): identity-checked on read *and* write, a pure `min` beside the knee, the ramp takes no step at it, an `index_limit` collapse no longer deflates while a real `oom` on the same measurement still does, runtime-only and unrepresentable in a profile, `/health` `shape_ceiling_units`. |
+| **Transport retry** a connection error surviving the client's three retries returned an untyped error, so an item that was never attempted was recorded as a media failure (456 in P2's 300 k run) | `bfd2018b` | Approved, no defects (`run2-integration2-report.md`): `kind = "transport"` with a phase the client types itself and no peer can forge, `warrants_resubmission()` (the three before-any-answer phases plus a lost body) drives the one-per-item re-queue, and no status ever buys a retry. |
+
+**Integration at `34a591aa`** (`run2-integration2-report.md`):
+`cargo test -p panoptikon` **1648 passed, 1 failed, 10 ignored** — the one
+is the known host artefact
+(`db::batch_auto::tests::an_unwritable_config_warns_stamps_and_is_left_intact`;
+the `media_tools::transcode` ffmpeg-budget tests passed this run);
+`pytest tests` **366 passed, 14 skipped**; `cargo fmt --check` clean;
+`cargo clippy --all-targets` 8 warnings, the same pre-existing set and none
+in a file run2 touched; `cargo test --bin panoptikon openapi` **5 passed**.
+The `ui` types were regenerated against the moved spec (submodule
+`8abf631`, `tsc --noEmit` clean) and the gitlink bumped (`0998e6ca`); the
+`calib_hostless` workaround is removed from every calibration config
+(`ea59a63b`); `codemap.md` had the client and job references the fixes
+moved re-resolved (`34a591aa`).
+
+**Host state after the pass:** release binary at `34a591aa` — the last
+commit that touches code; everything after it on this branch is
+documentation, so the binary is the tip's code —
+(`target/release/panoptikon`, 86 313 672 B, built 21:28:07 UTC, reports
+`panoptikon 0.1.8`); `panoptikon:calib-cuda` rebuilt from a clean detached
+worktree at the tip — image **`0b2261f94c8f`**
+(`sha256:0b2261f94c8f…1109`), 9.43 GB, 353 s — with the previous image kept
+as **`panoptikon:calib-cuda-run2a`** (`6fe5d86e3a1e`) beside run1's
+`panoptikon:calib-cuda-run1` (`2a2c93ad6375`). The CPU and master images
+are still run1's. No container was started; nothing pushed. The `ui`
+submodule commits `9b28044` **and `8abf631`** are unpushed, so a
+clean-worktree image build still needs this host's clone as a remote
+(open item 4 above).
+
+**The legs still to run**, all on the binary and image above, with the
+expectations the fix reports changed (the full list is in
+`run2-legs-plan.md` §"Amendments after the fix round"):
+
+- **Phase B** (external pressure: hog grow/shrink/spike/oscillate) — as
+  written in §4; nothing in the fix round changed its expectations, but it
+  is the first leg to exercise the new transport under a moving board.
+- **Phase A′**, the re-run of **S2 wd-vit** and **S3** on the fixed
+  estimator and transport: the ramp reaches **512** (run1: 10 windows) with
+  no `W → 200 − W` cycle; **no knee on wd-vit at any point** (the five
+  vetoes), a seeded knee is provisional and re-validated within 4 windows;
+  `/health` shows the published desired-in-flight figure, transport `h2c`,
+  few lanes in use and a low `queue_bound`, and **sockets stay ≤ 2 ×
+  lanes-in-use + reserve**; a `unit_budget` shrink lands within one window.
+- **Phase D** (**pixmix** and **S11-C4**): pixmix's fit is compared against
+  the probe of the *same* image group (`results/run2/probes/summary.md`),
+  within ~10 %, remembering that the canvas-capped price is ~1.40×
+  conservative for a 1:1.414 page by construction; S11-C4 runs the shipped
+  `docker.toml` policy over h2c (P1 is in the image) and counts the
+  gateway's sockets during the job. The **shape ceiling** must be visible on
+  easyOCR under C7 at **28 items ≈ 183 500 800 units** (`/health`
+  `shape_ceiling_units`, the INFO line, `clamped.reason = "index_limit"` on
+  the measurement) with **no** deflation from it.
+- **Phase E** (4 h soak): every job completed, **no `partial` from P2's
+  400s**, a `request_incomplete` or `transport` failure re-queued once and
+  reaching `job_failures` only if it fails twice; 0 deaths, deflation
+  returning to 0, no persisted knee below the ramp's plateau bucket, store
+  bounded, no cooldowns, `oracle_agreement` breaches below run1's.
+
+Every job-driven leg now runs **without** the `calib_hostless` policy and
+must record that job creation works on the shipped policy shape.
+
 ### Decisions taken during run1 by the orchestrator (2026-09-03)
 
 Decision 5 above splits every problem into "fix it now, with a separate
