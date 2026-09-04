@@ -403,9 +403,17 @@ impl InferenceApiClient {
     /// The probe is a real request to a real endpoint (`GET /cache`, the
     /// cheapest thing this surface serves) sent with HTTP/2 prior knowledge.
     /// *Any* answer proves the peer speaks it — a 404 or a 500 is as good as
-    /// a 200, because reading the status at all means the frames parsed. Only
-    /// a transport-level failure means HTTP/1.1, and that is remembered
-    /// per endpoint until a connection error clears it.
+    /// a 200, because reading the status at all means the frames parsed.
+    ///
+    /// A failure only means HTTP/1.1 if it is the peer's *answer*. See
+    /// [`Self::probe_says_http11`]: a probe that never reached the peer is not
+    /// evidence about the peer's protocol, and memoizing HTTP/1.1 on one is
+    /// how a single blip at first contact silently costs an endpoint its
+    /// multiplexing for the lifetime of the process. That matters most in the
+    /// deployment this exists for — the gateway and the inference server on
+    /// different machines — where first contact crosses a network, and where
+    /// the downgrade would then also halve the job's in-flight window through
+    /// `requests_are_multiplexed`.
     async fn transport(&self) -> Transport {
         if let Some(transport) = *self.endpoint.transport.read().await {
             return transport;
@@ -419,7 +427,7 @@ impl InferenceApiClient {
             .await;
         let transport = match probe {
             Ok(_) => Transport::H2c,
-            Err(err) => {
+            Err(err) if Self::probe_says_http11(&err) => {
                 warn!(
                     endpoint = %self.base_url,
                     error = %err,
@@ -427,6 +435,20 @@ impl InferenceApiClient {
                      falling back to HTTP/1.1 for this endpoint"
                 );
                 Transport::Http11
+            }
+            Err(err) => {
+                // Unreachable, not un-multiplexed. Nothing is remembered, so
+                // the next call probes again; this attempt uses HTTP/1.1
+                // because it is the half of the guess that also works against
+                // an h2c server (the auto builder serves both), so a peer that
+                // comes back healthy is never stuck on a wrong memo.
+                warn!(
+                    endpoint = %self.base_url,
+                    error = %err,
+                    "could not reach the inference endpoint to establish which \
+                     HTTP version it speaks; not recording a fallback"
+                );
+                return Transport::Http11;
             }
         };
         // Last writer wins, and both writers agree: two concurrent probes
@@ -441,6 +463,20 @@ impl InferenceApiClient {
             );
         }
         transport
+    }
+
+    /// Whether a failed probe is the peer *refusing HTTP/2*, as opposed to the
+    /// peer not being reachable at all.
+    ///
+    /// An HTTP/1.1-only server accepts the TCP connection and then rejects the
+    /// h2 preface, so the failure happens after connect: it is neither
+    /// `is_connect` nor `is_timeout`. Connection-refused, DNS failure and a
+    /// timeout all say something about the *network*, and a network fact must
+    /// never be recorded as a protocol fact — reqwest classifies a timeout as
+    /// `Kind::Request` too, so without this check a slow endpoint would
+    /// permanently downgrade itself.
+    fn probe_says_http11(err: &reqwest::Error) -> bool {
+        !err.is_connect() && !err.is_timeout()
     }
 
     /// The transport already resolved for this endpoint, without probing.
@@ -1215,6 +1251,52 @@ mod tests {
         // Remembered: a second call answers without another probe.
         assert!(client.get_cached_models().await.is_ok());
         assert_eq!(client.known_transport(), Some(Transport::Http11));
+    }
+
+    /// An endpoint that could not be reached at all must not be recorded as
+    /// HTTP/1.1.
+    ///
+    /// A transport memo is written once and only cleared by a *predict*
+    /// failure, so a blip during the first contact — which in the deployment
+    /// this exists for crosses a network — would otherwise cost the endpoint
+    /// its multiplexing for the life of the process, and halve every job's
+    /// in-flight window with it through `requests_are_multiplexed`. The
+    /// endpoint here is a closed port, which is the cheapest honest version of
+    /// "not reachable".
+    #[tokio::test]
+    async fn an_unreachable_endpoint_is_not_remembered_as_http11() {
+        // Bind and drop, so the port is almost certainly closed and is not
+        // one another test is using.
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let client =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{addr}"), false).unwrap();
+
+        assert!(
+            client.get_cached_models().await.is_err(),
+            "nothing is listening, so the call itself must fail"
+        );
+        assert_eq!(
+            client.known_transport(),
+            None,
+            "an unreachable peer says nothing about which HTTP version it speaks"
+        );
+
+        // The classifier that decides it, on the two error shapes directly.
+        let connect_err = reqwest::Client::builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/cache"))
+            .send()
+            .await
+            .expect_err("the port is closed");
+        assert!(connect_err.is_connect());
+        assert!(
+            !InferenceApiClient::probe_says_http11(&connect_err),
+            "a connect failure is a network fact, not a protocol one"
+        );
     }
 
     /// Two clients for the same endpoint share one connection pool and one
