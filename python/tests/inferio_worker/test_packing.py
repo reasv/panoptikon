@@ -572,6 +572,27 @@ def test_an_impl_that_states_its_canvas_is_not_named(
     ]
 
 
+def test_a_canvas_found_inside_someone_elses_object_does_not_exempt(
+    fake_torch, unlogged_guard, caplog
+):
+    """The exemption is the impl's own statement, not anything the pricing
+    walk can reach. `impl_canvas_pixels` deliberately descends into a
+    processor to *price* a model whose ceiling lives in a downloaded config —
+    but that ceiling is a fact about the processor, and an impl that pads a
+    batch to a common size has made no promise by holding one."""
+    model = Padding()
+    model.processor = SimpleNamespace(max_pixels=D1B_CANVAS)
+    assert packing.impl_canvas_pixels(model) == D1B_CANVAS
+    assert packing._pads_without_a_canvas(model) is True
+    with caplog.at_level(logging.WARNING, logger="inferio_worker.packing"):
+        run_padding_window(model, mixed_window())
+    assert [
+        record
+        for record in caplog.records
+        if "pads a batch to its largest member" in record.getMessage()
+    ]
+
+
 def test_the_guard_is_silent_without_a_cap_or_a_mix(
     fake_torch, unlogged_guard, caplog
 ):

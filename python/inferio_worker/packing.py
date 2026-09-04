@@ -656,13 +656,21 @@ def _pads_without_a_canvas(instance: Any) -> bool:
     that pads and states nothing is the one shape whose batches can cost far
     more than they were priced, and it is the only one worth a warning.
 
+    Only a canvas held **directly on the impl** exempts it — [`_canvas_on`],
+    not the full [`impl_canvas_pixels`] walk. The walk exists to *price* a
+    model whose ceiling lives in a downloaded processor config, and finding a
+    `max_pixels` two levels down inside somebody else's object is a fact
+    about that object, not a promise by the impl that owns the padding. An
+    impl that pads to a common size and happens to hold a processor with a
+    canvas is precisely the case this guard must not fall silent on.
+
     Never raises: an attribute walk over an object nobody here controls
     decides a log line, nothing else.
     """
     try:
         if not getattr(instance, PADS_TO_COMMON_SIZE_ATTR, False):
             return False
-        return impl_canvas_pixels(instance) is None
+        return _canvas_on(instance) is None
     except Exception:  # pragma: no cover - defensive
         return False
 
