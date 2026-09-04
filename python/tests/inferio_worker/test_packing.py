@@ -792,6 +792,34 @@ def test_the_message_tier_only_matches_driver_shaped_text(fake_torch):
         assert classified["source"] == packing.OOM_SOURCE_PATTERN, text
 
 
+def test_every_device_wording_of_out_of_memory_is_still_an_oom(fake_torch):
+    """The spellings a fixed substring list loses.
+
+    Each of these is emitted by something that ships in this project's own
+    venv, and each is a real out-of-memory condition: a missed one leaves the
+    orchestrator over-admitting against a model that cannot take it, which is
+    the failure R3 is *not* allowed to introduce while fixing B11.
+    """
+    wordings = (
+        # torch's driver-API path (expandable_segments allocates through
+        # cuMemCreate, which reports in the driver's own vocabulary)
+        "CUDA driver error: out of memory",
+        # torch before 2.0
+        "cuda runtime error (2) : out of memory",
+        # CTranslate2 (faster-whisper): "CUDA failed with error " + the
+        # runtime's error string
+        "CUDA failed with error out of memory",
+        "HIP failed with error out of memory",
+        # the HIP enum spellings, which say nothing else
+        "hipErrorOutOfMemory",
+        "ROCm: hipMalloc returned out of memory",
+    )
+    for text in wordings:
+        classified = packing.classify_oom(RuntimeError(text))
+        assert classified is not None, text
+        assert classified["source"] == packing.OOM_SOURCE_PATTERN, text
+
+
 def test_a_bare_out_of_memory_substring_is_not_an_oom(fake_torch):
     """B11, verbatim: run1 measured this exact wording deflating a healthy
     model 15 times on a board with 96 GB free (run1 report §4, Q1)."""
@@ -799,6 +827,18 @@ def test_a_bare_out_of_memory_substring_is_not_an_oom(fake_torch):
         "refusing merged batch of 8: the caption cache is out of memory slots"
     )
     assert packing.classify_oom(healthy) is None
+
+
+def test_a_device_token_must_be_a_whole_word(fake_torch):
+    """The device-scoped rule is what keeps "out of memory" usable at all, so
+    the scope has to be a real token: an English word that merely *contains*
+    one ("chip", "ship", "relationship") is not a device, and B11's message
+    with any of them in it must stay a non-OOM."""
+    for word in ("chip", "ship", "relationship", "hipster"):
+        healthy = ValueError(
+            f"refusing merged batch: the {word} cache is out of memory slots"
+        )
+        assert packing.classify_oom(healthy) is None, word
 
 
 def test_an_absorbed_halving_is_a_marker_with_no_exception(fake_torch):

@@ -38,6 +38,7 @@ text-only or CPU-only worker never pays for it.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 from typing import Any, Iterable, NamedTuple, Sequence
@@ -73,20 +74,22 @@ OOM_SOURCE_PATTERN = "message_pattern"
 
 # Driver-shaped message fragments, lower-cased, for the fallback tier of the
 # classifier. Every entry names an allocator, a driver or a CUDA/HIP API that
-# only ever emits it for an allocation failure. A bare `out of memory` is
-# deliberately absent: run1 measured it deflating a healthy model 15 times on
-# a board with 96 GB free, from an impl that worded an unrelated failure as
-# "out of memory slots" (batch-calibration run1 report §4, Q1/B11).
+# only ever emits it for an allocation failure — and none of them contains the
+# words "out of memory", which is why each has to be spelled out. A bare
+# `out of memory` is deliberately absent: run1 measured it deflating a healthy
+# model 15 times on a board with 96 GB free, from an impl that worded an
+# unrelated failure as "out of memory slots" (run1 report §4, Q1/B11).
 OOM_MESSAGE_PATTERNS = (
-    "cuda out of memory",
-    "cuda error: out of memory",
-    "hip out of memory",
-    "hip error: out of memory",
     "mps backend out of memory",
     "enforce fail at alloc_cpu.cpp",
     "cublas_status_alloc_failed",
     "cudnn_status_alloc_failed",
+    "cusolver_status_alloc_failed",
+    "cusparse_status_alloc_failed",
+    "cufft_alloc_failed",
     "cudaerrormemoryallocation",
+    "hiperroroutofmemory",
+    "hiperrormemoryallocation",
 )
 
 # Two-part patterns: both fragments must appear in the same message. CPU
@@ -95,6 +98,31 @@ OOM_MESSAGE_PATTERNS = (
 # of it varies by torch version, and neither half alone is specific enough to
 # match on.
 OOM_MESSAGE_PAIRS = (("defaultcpuallocator", "allocate memory"),)
+
+# The device-scoped form of "out of memory": the words, **and** a device-API
+# token as a whole word in the same message. B11 is the reason the words alone
+# are not enough; this rule is the reason they are not thrown away either.
+# Every library that allocates on an accelerator words its allocation failure
+# differently around those three words, and enumerating the spellings loses
+# real out-of-memory conditions to a wording nobody predicted — all of these
+# exist today and none matches a fixed substring list:
+#
+#   torch      "CUDA out of memory. Tried to allocate 2.00 GiB"
+#   torch      "CUDA error: out of memory"
+#   torch      "CUDA driver error: out of memory"   (the expandable-segments
+#              path allocates through the driver API, not the runtime)
+#   torch <2.0 "cuda runtime error (2) : out of memory"
+#   CTranslate2 "CUDA failed with error out of memory"  (faster-whisper, a
+#              shipped dependency whose VRAM never passes through torch)
+#   ROCm       the same set with HIP in place of CUDA
+#
+# The token is matched on a word boundary, so "chip"/"ship"/"relationship"
+# cannot stand in for "hip", and it must be a device API: a message about a
+# *host* allocator saying "out of memory" is left to `MemoryError` and to the
+# CPU-allocator patterns above. B11's wording ("the caption cache is out of
+# memory slots") names no device and is still refused.
+OOM_DEVICE_TOKENS = re.compile(r"\b(cuda|hip|rocm|nvml|xpu|sycl)\b")
+OOM_DEVICE_PHRASE = "out of memory"
 
 # Units/sec ratio below which a pool-growing batch is judged to have spilled
 # to system RAM rather than run. On Windows' WDDM the driver's sysmem
@@ -777,24 +805,33 @@ def _marker_oom(error: BaseException) -> str | None:
 def _pattern_oom(error: BaseException) -> str | None:
     """The exception's name when its text is **driver-shaped**.
 
-    The last resort, and the only tier that reads prose. Every entry names an
-    allocator or a driver explicitly, because run1 measured what happens when
-    the test is looser: a bare `out of memory` substring deflated a healthy
-    model 15 times on a board with 96 GB free, purely because an impl worded
-    an unrelated failure as "out of memory slots" (report §4, Q1/B11). That
-    substring is deliberately **not** here.
+    The last resort, and the only tier that reads prose. Every rule here names
+    an allocator or a device API explicitly, because run1 measured what
+    happens when the test is looser: a bare `out of memory` substring deflated
+    a healthy model 15 times on a board with 96 GB free, purely because an
+    impl worded an unrelated failure as "out of memory slots" (report §4,
+    Q1/B11). That substring alone is deliberately **not** a match.
 
-    MPS is why the tier exists at all: an MPS allocation failure is a plain
-    `RuntimeError("MPS backend out of memory (…)")` and there is no typed
-    form of it to catch (docs/unified-memory-admission.md, "Negative
-    signals"). CPU torch's `DefaultCPUAllocator` message is the same shape —
-    it does not even contain the words "out of memory" — and the
-    `alloc_cpu.cpp` enforce-fail is the newer spelling of it. The CUBLAS,
-    CUDNN and cudaError entries are allocation failures the driver reports
-    without ever saying "out of memory".
+    Three rules, in the order they are tried:
 
-    Extending this tuple is how a new backend's spelling is learned; widening
-    it into a generic substring is how a healthy model gets deflated.
+    - [`OOM_MESSAGE_PATTERNS`] — allocator and driver failures that never say
+      "out of memory" at all, so each spelling has to be listed. MPS is why
+      the tier exists in the first place: an MPS allocation failure is a plain
+      `RuntimeError("MPS backend out of memory (…)")` and there is no typed
+      form of it to catch (docs/unified-memory-admission.md, "Negative
+      signals"). CPU torch's `DefaultCPUAllocator` / `alloc_cpu.cpp` message
+      is the same shape, and the CUBLAS/cuDNN/cuSOLVER/cuFFT/cudaError entries
+      are allocation failures a driver reports in its own vocabulary;
+    - [`OOM_MESSAGE_PAIRS`] — two fragments that must appear together;
+    - [`OOM_DEVICE_TOKENS`] — the words "out of memory" **plus** a device-API
+      token as a whole word. This is the open half, and it is what keeps the
+      tier from losing a real out-of-memory condition to a wording nobody
+      enumerated: torch alone emits at least four spellings and CTranslate2
+      (faster-whisper) emits a fifth. It is scoped rather than bare, which is
+      exactly the distinction B11 turns on.
+
+    Adding a spelling here is how a new backend is learned; dropping the
+    device-token scope is how a healthy model gets deflated.
     """
     lowered = str(error).lower()
     for pattern in OOM_MESSAGE_PATTERNS:
@@ -803,6 +840,8 @@ def _pattern_oom(error: BaseException) -> str | None:
     for first, second in OOM_MESSAGE_PAIRS:
         if first in lowered and second in lowered:
             return _qualified_name(type(error))
+    if OOM_DEVICE_PHRASE in lowered and OOM_DEVICE_TOKENS.search(lowered):
+        return _qualified_name(type(error))
     return None
 
 
