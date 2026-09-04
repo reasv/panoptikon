@@ -2630,7 +2630,7 @@
           "jobs"
         ],
         "summary": "List recorded data extraction failures",
-        "description": "The extraction failure ledger: media a setter has already rejected, which the work query therefore skips. Read-only by design — a row is cleared when the file's content changes, when a missing dependency appears, or by a shipped retry directive, never by an API call. Newest first, paginated with limit/offset against `total`.",
+        "description": "Everything a data extraction has failed on, in three lists. `failures` is the extraction failure ledger: media a setter has already rejected, which the work query therefore skips. Read-only by design — a row is cleared when the file's content changes, when a missing dependency appears, or by a shipped retry directive, never by an API call. `job_failures` is the opposite: items a job attempted and could not finish, with nothing on record explaining why (the inference worker died mid-request, the server was down, a write failed); those items are untouched and the next run selects them again. `failed_jobs` is the jobs behind them, `partial` included — a partial job ran to the end with some of its items left undone. All three are newest first and share the limit/offset window, each against its own total.",
         "operationId": "get_extraction_failures",
         "parameters": [
           {
@@ -7312,19 +7312,48 @@
         "type": "object",
         "required": [
           "total",
-          "failures"
+          "failures",
+          "job_failures_total",
+          "job_failures",
+          "failed_jobs_total",
+          "failed_jobs"
         ],
         "properties": {
+          "failed_jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FailedJobRecord"
+            },
+            "description": "The jobs those failures belong to, newest first, paged by the same\n`limit`/`offset`. Empty (with a total of 0) when any filter that only\ndescribes an individual failure is present."
+          },
+          "failed_jobs_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many jobs ended `partial`, `failed` or `cancelled`, ignoring the\npage window."
+          },
           "failures": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ExtractionFailure"
-            }
+            },
+            "description": "The retry ledger: media a setter has already rejected."
+          },
+          "job_failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobItemFailure"
+            },
+            "description": "Items a job could not process and has no verdict for. Paged by the\nsame `limit`/`offset` as `failures`, and filtered by `setter` and\n`stage` only: `error_class` and `mime_prefix` describe a recorded\nverdict, which a row here is by definition not, so either of them\npresent answers with an empty list and a total of 0."
+          },
+          "job_failures_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many per-job item failures match the filters, ignoring the page\nwindow."
           },
           "total": {
             "type": "integer",
             "format": "int64",
-            "description": "How many failures match the filters, ignoring the page window — the\ndenominator for `limit`/`offset` paging."
+            "description": "How many recorded media verdicts match the filters, ignoring the page\nwindow — the denominator for `limit`/`offset` paging of `failures`."
           }
         }
       },
@@ -7337,6 +7366,86 @@
           "failed_for": {
             "type": "string",
             "description": "This Item has an active extraction-failure record for this setter name\n(the pipeline rejected its media, or a dependency it needs is missing)"
+          }
+        }
+      },
+      "FailedJobRecord": {
+        "type": "object",
+        "description": "A job that did not complete cleanly, as the failures surface serves it.\n\nEvery field run1 found missing on such a record is here: a real `end_time`\n(T8 measured `end_time == start_time`), the count of items left unprocessed\nand unexplained, the segment count, and the reason.",
+        "required": [
+          "log_id",
+          "setter",
+          "type",
+          "outcome",
+          "start_time",
+          "end_time",
+          "failed_items",
+          "errors",
+          "input_errors",
+          "total_segments",
+          "total_remaining"
+        ],
+        "properties": {
+          "end_time": {
+            "type": "string",
+            "description": "When the job actually stopped. A job that never reached its own\nfinalization is stamped by the cleanup instead, so this is never the\ncreation timestamp the row was inserted with."
+          },
+          "errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Every item failure the job counted, verdicts included."
+          },
+          "failed_items": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Items attempted whose failure nothing explains — `errors` minus the\nsubset backed by a retry-ledger verdict. This is the count that makes\na job partial, and the count of rows this job has in\n`data_job_failures`."
+          },
+          "failure_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why, when the job knew. Null for a job whose process went away."
+          },
+          "input_errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The subset of `errors` that is a recorded verdict about the media."
+          },
+          "job_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`data_jobs.id`, which is what a failure row carries. Null once the job\nrow has been deleted."
+          },
+          "log_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`data_log.id`, the id the job history and the job-data deletion\nendpoint use."
+          },
+          "outcome": {
+            "type": "string",
+            "description": "`partial`, `failed` or `cancelled`."
+          },
+          "setter": {
+            "type": "string"
+          },
+          "start_time": {
+            "type": "string"
+          },
+          "total_remaining": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Items still matching the job's work query when it stopped."
+          },
+          "total_segments": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "type": {
+            "type": "string"
           }
         }
       },
@@ -7840,7 +7949,8 @@
           "models",
           "prewarm",
           "gpus",
-          "vram"
+          "vram",
+          "load_cooldowns"
         ],
         "properties": {
           "gpus": {
@@ -7849,6 +7959,13 @@
               "$ref": "#/components/schemas/GpuInfo"
             },
             "description": "Visible GPUs by board UUID (batch-calibration step 1a); empty when\nthe host has no GPU inventory, in which case workers are not pinned."
+          },
+          "load_cooldowns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoadCooldownHealth"
+            },
+            "description": "Models whose loads are failing (R9), sorted by inference_id. An entry\nexists from the first failed load until a load succeeds or the history\nis pruned; `retry_after_secs` is 0 for one that has cooled down but is\nstill counting (the next failure waits twice as long)."
           },
           "model_count": {
             "type": "integer",
@@ -8361,6 +8478,67 @@
           }
         }
       },
+      "JobItemFailure": {
+        "type": "object",
+        "description": "One item a job could not process and has no verdict for.\n\nThe counterpart of [`ExtractionFailure`], and the difference matters: an\n`ExtractionFailure` is a *verdict* about the media, recorded so the work\nquery skips the item. This is the opposite — work that simply did not\nhappen (the inference server went away, a worker process died with the\nrequest in flight, a write failed). The item is untouched and the next run\nselects it again, so nothing here suppresses anything.\n\nBefore run2 these failures were invisible: they were counted in\n`data_log.errors` and nowhere else, so a job that lost 1 542 items to one\nworker death reported *completed* and this endpoint answered\n`{\"total\": 0}` (run1 findings F7 and Q8/T8).",
+        "required": [
+          "id",
+          "job_id",
+          "sha256",
+          "mime_type",
+          "setter_name",
+          "stage",
+          "error",
+          "requeued",
+          "occurred_at"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "The error text, clamped when it was recorded."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Row id, stable for as long as the row lives."
+          },
+          "job_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The `data_jobs` id of the job that failed the item. Matches\n`FailedJob.job_id`, and the `data_log` history's `job_id`."
+          },
+          "mime_type": {
+            "type": "string",
+            "description": "The item's mime type."
+          },
+          "occurred_at": {
+            "type": "string",
+            "description": "When the job recorded the failure."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One of the paths this item is stored under, chosen deterministically\n(an available file first, then the lexicographically smallest path).\nNull when every file of the item has gone away."
+          },
+          "requeued": {
+            "type": "boolean",
+            "description": "Whether the item's inference was re-submitted once after the worker\ndied and then failed again — its one retry was already spent."
+          },
+          "setter_name": {
+            "type": "string",
+            "description": "The model whose job failed the item."
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "string",
+            "description": "`prepare`, `inference` or `output`."
+          }
+        }
+      },
       "JobModel": {
         "type": "object",
         "required": [
@@ -8648,6 +8826,49 @@
           }
         }
       },
+      "LoadCooldownHealth": {
+        "type": "object",
+        "description": "One model's load-failure cooldown in the [`HealthReport`] (R9). This is\nthe only place the state is visible when the model is *not* loaded — and\nit never is, which is why it cannot live in `models[]`.",
+        "required": [
+          "inference_id",
+          "failures",
+          "last_error",
+          "retry_at",
+          "retry_after_secs",
+          "window_secs"
+        ],
+        "properties": {
+          "failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive failed loads.",
+            "minimum": 0
+          },
+          "inference_id": {
+            "type": "string"
+          },
+          "last_error": {
+            "type": "string",
+            "description": "The failure that armed the current window (clamped to 2000 bytes)."
+          },
+          "retry_after_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Whole seconds until then; 0 once the window has passed.",
+            "minimum": 0
+          },
+          "retry_at": {
+            "type": "string",
+            "description": "RFC 3339 wall-clock instant the model may be retried at, rendered from\nthe monotonic deadline when this report was built."
+          },
+          "window_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The window this failure count earned, in seconds — `base × 2^(n−1)`\ncapped at the configured maximum.",
+            "minimum": 0
+          }
+        }
+      },
       "LogRecord": {
         "type": "object",
         "required": [
@@ -8668,7 +8889,9 @@
           "data_load_time",
           "inference_time",
           "failed",
-          "completed"
+          "completed",
+          "outcome",
+          "failed_items"
         ],
         "properties": {
           "batch_size": {
@@ -8692,7 +8915,20 @@
           },
           "failed": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Legacy \"this job did not complete\" flag, 0 or 1. Kept exactly as it\nwas for every client that reads it, and *corrected*: it now also reads\n1 for a job whose [`Self::outcome`] says it failed or was cancelled,\nwhich is the case run1 measured reading 0 (finding T8)."
+          },
+          "failed_items": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Items this job attempted, could not finish, and has no verdict for —\n`errors` minus `input_errors`. These are the rows the failures\nendpoint lists, and the count that makes a job `partial`."
+          },
+          "failure_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the job ended the way it did, for `partial`, `failed` and\n`cancelled`."
           },
           "id": {
             "type": "integer",
@@ -8718,6 +8954,10 @@
           "other_files": {
             "type": "integer",
             "format": "int64"
+          },
+          "outcome": {
+            "type": "string",
+            "description": "How the job ended: `completed`, `partial`, `failed`, `cancelled`, or\n`running` for a job still in flight (and for every row written before\nthe column existed, which is the same thing as far as a reader is\nconcerned: nothing recorded an ending).\n\n`partial` is the value that did not exist before run1 finding F7: a\njob that lost a whole in-flight window of items to one worker death\nreported `completed`."
           },
           "setter": {
             "type": "string"

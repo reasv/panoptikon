@@ -16,6 +16,9 @@ use crate::db::extraction_log::{LogRecord, get_all_data_logs, get_setters_total_
 use crate::db::file_scans::get_all_file_scans;
 use crate::db::folders::get_folders_from_database;
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
+use crate::db::job_failures::{
+    JobFailureFilters, count_failed_jobs, count_job_failures, list_failed_jobs, list_job_failures,
+};
 use crate::db::ledger::ERROR_CLASSES;
 use crate::db::scan_errors::{ScanErrorFilters, count_scan_errors, list_scan_errors};
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
@@ -785,12 +788,69 @@ pub(crate) struct ScanFailure {
     last_seen: String,
 }
 
+/// One item a job could not process and has no verdict for.
+///
+/// The counterpart of [`ExtractionFailure`], and the difference matters: an
+/// `ExtractionFailure` is a *verdict* about the media, recorded so the work
+/// query skips the item. This is the opposite — work that simply did not
+/// happen (the inference server went away, a worker process died with the
+/// request in flight, a write failed). The item is untouched and the next run
+/// selects it again, so nothing here suppresses anything.
+///
+/// Before run2 these failures were invisible: they were counted in
+/// `data_log.errors` and nowhere else, so a job that lost 1 542 items to one
+/// worker death reported *completed* and this endpoint answered
+/// `{"total": 0}` (run1 findings F7 and Q8/T8).
+#[derive(serde::Serialize, ToSchema)]
+pub(crate) struct JobItemFailure {
+    /// Row id, stable for as long as the row lives.
+    id: i64,
+    /// The `data_jobs` id of the job that failed the item. Matches
+    /// `FailedJob.job_id`, and the `data_log` history's `job_id`.
+    job_id: i64,
+    sha256: String,
+    /// One of the paths this item is stored under, chosen deterministically
+    /// (an available file first, then the lexicographically smallest path).
+    /// Null when every file of the item has gone away.
+    path: Option<String>,
+    /// The item's mime type.
+    mime_type: String,
+    /// The model whose job failed the item.
+    setter_name: String,
+    /// `prepare`, `inference` or `output`.
+    stage: String,
+    /// The error text, clamped when it was recorded.
+    error: String,
+    /// Whether the item's inference was re-submitted once after the worker
+    /// died and then failed again — its one retry was already spent.
+    requeued: bool,
+    /// When the job recorded the failure.
+    occurred_at: String,
+}
+
 #[derive(serde::Serialize, ToSchema)]
 pub(crate) struct ExtractionFailuresResponse {
-    /// How many failures match the filters, ignoring the page window — the
-    /// denominator for `limit`/`offset` paging.
+    /// How many recorded media verdicts match the filters, ignoring the page
+    /// window — the denominator for `limit`/`offset` paging of `failures`.
     total: i64,
+    /// The retry ledger: media a setter has already rejected.
     failures: Vec<ExtractionFailure>,
+    /// How many per-job item failures match the filters, ignoring the page
+    /// window.
+    job_failures_total: i64,
+    /// Items a job could not process and has no verdict for. Paged by the
+    /// same `limit`/`offset` as `failures`, and filtered by `setter` and
+    /// `stage` only: `error_class` and `mime_prefix` describe a recorded
+    /// verdict, which a row here is by definition not, so either of them
+    /// present answers with an empty list and a total of 0.
+    job_failures: Vec<JobItemFailure>,
+    /// How many jobs ended `partial`, `failed` or `cancelled`, ignoring the
+    /// page window.
+    failed_jobs_total: i64,
+    /// The jobs those failures belong to, newest first, paged by the same
+    /// `limit`/`offset`. Empty (with a total of 0) when any filter that only
+    /// describes an individual failure is present.
+    failed_jobs: Vec<crate::db::job_failures::FailedJobRecord>,
 }
 
 #[derive(serde::Serialize, ToSchema)]
@@ -823,10 +883,16 @@ fn validate_error_class(error_class: Option<String>) -> Result<Option<String>, A
     path = "/api/jobs/data/failures",
     tag = "jobs",
     summary = "List recorded data extraction failures",
-    description = "The extraction failure ledger: media a setter has already rejected, which the \
-        work query therefore skips. Read-only by design — a row is cleared when the file's \
-        content changes, when a missing dependency appears, or by a shipped retry directive, \
-        never by an API call. Newest first, paginated with limit/offset against `total`.",
+    description = "Everything a data extraction has failed on, in three lists. `failures` is \
+        the extraction failure ledger: media a setter has already rejected, which the work \
+        query therefore skips. Read-only by design — a row is cleared when the file's content \
+        changes, when a missing dependency appears, or by a shipped retry directive, never by \
+        an API call. `job_failures` is the opposite: items a job attempted and could not \
+        finish, with nothing on record explaining why (the inference worker died mid-request, \
+        the server was down, a write failed); those items are untouched and the next run \
+        selects them again. `failed_jobs` is the jobs behind them, `partial` included — a \
+        partial job ran to the end with some of its items left undone. All three are newest \
+        first and share the limit/offset window, each against its own total.",
     params(DbQueryParams, ExtractionFailuresQuery),
     responses(
         (status = 200, description = "Recorded extraction failures", body = ExtractionFailuresResponse)
@@ -836,10 +902,18 @@ pub(crate) async fn get_extraction_failures(
     Query(query): Query<ExtractionFailuresQuery>,
     mut conn: DbConnection<ReadOnly>,
 ) -> Result<Json<ExtractionFailuresResponse>, ApiError> {
+    let error_class = validate_error_class(query.error_class)?;
+    // A filter that can only describe a *verdict* cannot describe a failure
+    // nothing explains, and answering an `error_class=input` request with
+    // unfiltered job failures would be a lie about what was asked for. So the
+    // two job-side lists are omitted for those filters rather than
+    // approximated — stated in the schema docs, so an empty list is never
+    // mistaken for "no such failures".
+    let verdict_only = error_class.is_some() || query.mime_prefix.is_some();
     let filters = ExtractionErrorFilters {
-        setter: query.setter,
-        error_class: validate_error_class(query.error_class)?,
-        stage: query.stage,
+        setter: query.setter.clone(),
+        error_class,
+        stage: query.stage.clone(),
         mime_prefix: query.mime_prefix,
         limit: query.limit,
         offset: query.offset.unwrap_or(0),
@@ -849,8 +923,51 @@ pub(crate) async fn get_extraction_failures(
     // direction. The reverse would page past a total that no longer covers it.
     let total = count_extraction_errors(&mut conn.conn, &filters).await?;
     let rows = list_extraction_errors(&mut conn.conn, &filters).await?;
+
+    let (job_failures_total, job_failure_rows, failed_jobs_total, failed_jobs) = if verdict_only {
+        (0, Vec::new(), 0, Vec::new())
+    } else {
+        let job_filters = JobFailureFilters {
+            setter: query.setter,
+            stage: query.stage,
+            limit: query.limit,
+            offset: filters.offset,
+        };
+        let job_failures_total = count_job_failures(&mut conn.conn, &job_filters).await?;
+        let job_failure_rows = list_job_failures(&mut conn.conn, &job_filters).await?;
+        // The job list is not setter-filtered: `setter` names a model, and a
+        // job record already carries its setter, so filtering here would only
+        // hide the context of the rows above it.
+        let failed_jobs_total = count_failed_jobs(&mut conn.conn).await?;
+        let failed_jobs = list_failed_jobs(&mut conn.conn, query.limit, filters.offset).await?;
+        (
+            job_failures_total,
+            job_failure_rows,
+            failed_jobs_total,
+            failed_jobs,
+        )
+    };
+
     Ok(Json(ExtractionFailuresResponse {
         total,
+        job_failures_total,
+        job_failures: job_failure_rows
+            .into_iter()
+            .map(|row| JobItemFailure {
+                id: row.id,
+                job_id: row.job_id,
+                sha256: row.item_sha256,
+                path: row.path,
+                mime_type: row.mime_type,
+                setter_name: row.setter_name,
+                stage: row.stage,
+                error: row.error,
+                requeued: row.requeued,
+                occurred_at: row.occurred_at,
+            })
+            .collect(),
+        failed_jobs_total,
+        failed_jobs,
         failures: rows
             .into_iter()
             .map(|row| ExtractionFailure {
@@ -1465,6 +1582,169 @@ mod tests {
         assert_eq!(q.stage.as_deref(), Some("decode"));
         assert_eq!(q.mime_prefix.as_deref(), Some("video/"));
         assert_eq!((q.limit, q.offset), (Some(10), None));
+    }
+
+    /// The failures endpoint end to end, on a database holding one of each:
+    /// a recorded media verdict, an item a job could not process and has no
+    /// verdict for, and the partial job behind it.
+    ///
+    /// This is run1's Q8/T8 and F7 in one assertion: before run2 the second
+    /// and third lists did not exist and this endpoint answered
+    /// `{"total": 0}` in every leg of the run, while the job that lost the
+    /// items reported *completed*.
+    #[tokio::test]
+    async fn the_failures_endpoint_lists_items_verdicts_and_the_jobs_behind_them() {
+        use crate::db::migrations::setup_test_databases;
+
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, time_added)
+            VALUES (1, 'sha_one', 'md5_one', 'image/png', '2026-09-04T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO setters (id, name) VALUES (1, 'clip/model-a')")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO file_scans (id, start_time, path) \
+             VALUES (1, '2026-09-04T00:00:00', '/media')",
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES (1, 'sha_one', 1, '/media/one.png', 'one.png', '2026-09-04T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO data_jobs (id, completed) VALUES (5, 1)")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO data_log (
+                id, job_id, start_time, end_time, type, setter, batch_size,
+                total_segments, errors, input_errors, total_remaining,
+                completed, outcome, failure_reason
+            )
+            VALUES (1, 5, '2026-09-04T10:00:00', '2026-09-04T10:11:00', 'clip',
+                    'clip/model-a', 0, 320, 4, 1, 3, 1, 'partial',
+                    '3 of 100 attempted items could not be processed and are still owed')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        // A recorded verdict about the media...
+        crate::db::extraction_errors::upsert_extraction_error(
+            &mut dbs.index_conn,
+            &crate::db::extraction_errors::ExtractionErrorRecord {
+                item_sha256: "sha_one".to_string(),
+                setter_name: "clip/model-a".to_string(),
+                stage: crate::db::extraction_errors::STAGE_PREPARE.to_string(),
+                kind: crate::api_error::ApiErrorKind::Input,
+                error: "truncated png".to_string(),
+                skip_after: 1,
+                job_id: Some(5),
+            },
+        )
+        .await
+        .unwrap();
+        // ...and work that simply did not happen.
+        crate::db::job_failures::record_job_failures(
+            &mut dbs.index_conn,
+            5,
+            &[crate::db::job_failures::JobItemFailureRecord {
+                item_sha256: "sha_one".to_string(),
+                setter_name: "clip/model-a".to_string(),
+                stage: crate::db::extraction_errors::STAGE_INFERENCE.to_string(),
+                error: "inferio worker clip/model-a failed fatally: early eof".to_string(),
+                requeued: true,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        let _attached = (storage_conn, user_data_conn);
+        let db = DbConnection::<ReadOnly>::for_tests(index_conn, "test", "test");
+
+        let uri: Uri = "/api/jobs/data/failures".parse().unwrap();
+        let query = Query::<ExtractionFailuresQuery>::try_from_uri(&uri).unwrap();
+        let Json(response) = get_extraction_failures(query, db).await.expect("failures");
+
+        assert_eq!(response.total, 1, "the retry ledger's verdict");
+        assert_eq!(response.failures[0].error_class, "input");
+
+        assert_eq!(response.job_failures_total, 1);
+        let failure = &response.job_failures[0];
+        assert_eq!(failure.job_id, 5);
+        assert_eq!(failure.sha256, "sha_one");
+        assert_eq!(failure.path.as_deref(), Some("/media/one.png"));
+        assert_eq!(failure.setter_name, "clip/model-a");
+        assert_eq!(failure.stage, "inference");
+        assert!(failure.error.contains("failed fatally"));
+        assert!(failure.requeued, "the spent re-queue is visible");
+        assert!(!failure.occurred_at.is_empty());
+
+        assert_eq!(response.failed_jobs_total, 1);
+        let job = &response.failed_jobs[0];
+        assert_eq!(job.outcome, "partial");
+        assert_eq!(job.job_id, Some(5));
+        assert_eq!(job.failed_items, 3, "errors minus recorded verdicts");
+        assert_eq!(job.total_segments, 320);
+        assert_ne!(
+            job.end_time, job.start_time,
+            "a job that did not complete carries a real end_time (T8)"
+        );
+        assert!(
+            job.failure_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("still owed")
+        );
+    }
+
+    /// A filter that can only describe a recorded verdict must not be
+    /// answered with unfiltered job failures. The two job-side lists are
+    /// omitted instead — documented on the schema, so an empty list is never
+    /// read as "there are none".
+    #[tokio::test]
+    async fn a_verdict_only_filter_omits_the_job_side_lists() {
+        use crate::db::migrations::setup_test_databases;
+
+        let dbs = setup_test_databases().await;
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        let _attached = (storage_conn, user_data_conn);
+        let db = DbConnection::<ReadOnly>::for_tests(index_conn, "test", "test");
+
+        let uri: Uri = "/api/jobs/data/failures?error_class=input".parse().unwrap();
+        let query = Query::<ExtractionFailuresQuery>::try_from_uri(&uri).unwrap();
+        let Json(response) = get_extraction_failures(query, db).await.expect("failures");
+        assert_eq!(response.job_failures_total, 0);
+        assert!(response.job_failures.is_empty());
+        assert_eq!(response.failed_jobs_total, 0);
+        assert!(response.failed_jobs.is_empty());
     }
 
     /// A mistyped class must not answer "no recorded failures" — on an audit

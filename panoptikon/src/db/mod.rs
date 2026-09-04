@@ -13,6 +13,7 @@ pub(crate) mod index_writer;
 pub(crate) mod info;
 pub(crate) mod instance_id;
 pub(crate) mod items;
+pub(crate) mod job_failures;
 pub(crate) mod ledger;
 pub(crate) mod local_dbs;
 pub(crate) mod maintenance_state;

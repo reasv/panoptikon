@@ -171,6 +171,8 @@ impl Modify for JsonValueSchema {
             crate::api::jobs::ContinuousScanStatusResponse,
             crate::api::jobs::ExtractionFailure,
             crate::api::jobs::ExtractionFailuresResponse,
+            crate::api::jobs::JobItemFailure,
+            crate::db::job_failures::FailedJobRecord,
             crate::api::jobs::ScanFailure,
             crate::api::jobs::ScanFailuresResponse,
             crate::jobs::queue::JobModel,

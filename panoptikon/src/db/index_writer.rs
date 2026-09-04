@@ -296,6 +296,24 @@ pub(crate) enum IndexDbWriterMessage {
         update: DataLogUpdate,
         reply: Reply<()>,
     },
+    /// Stamps a job that was cancelled (or whose process is going away) with
+    /// a real `end_time` and the `cancelled` outcome, from the job's own drop
+    /// guard. Guarded on an unset outcome, so a job that already recorded how
+    /// it ended is untouched.
+    FinalizeCancelledJob {
+        job_id: i64,
+        reply: Reply<u64>,
+    },
+    /// The audit record of the items a job could not process and has no
+    /// verdict for (`docs/failed-media-retry-design.md`'s ledger is the
+    /// *other* store — see `crate::db::job_failures`). Written once, at the
+    /// end of the job, because one worker death fails a whole in-flight
+    /// window at a time.
+    RecordJobFailures {
+        job_id: i64,
+        records: Vec<crate::db::job_failures::JobItemFailureRecord>,
+        reply: Reply<u64>,
+    },
     UpsertSetter {
         setter_name: String,
         reply: Reply<i64>,
@@ -1052,6 +1070,31 @@ impl Actor for IndexDbWriter {
                 let result = state
                     .with_transaction(move |conn| {
                         Box::pin(async move { update_data_log(conn, job_id, &update).await })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::FinalizeCancelledJob { job_id, reply } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            crate::db::extraction_write::finalize_cancelled_job(conn, job_id).await
+                        })
+                    })
+                    .await;
+                let _ = reply.send(result);
+            }
+            IndexDbWriterMessage::RecordJobFailures {
+                job_id,
+                records,
+                reply,
+            } => {
+                let result = state
+                    .with_transaction(move |conn| {
+                        Box::pin(async move {
+                            crate::db::job_failures::record_job_failures(conn, job_id, &records)
+                                .await
+                        })
                     })
                     .await;
                 let _ = reply.send(result);

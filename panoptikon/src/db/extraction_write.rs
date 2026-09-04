@@ -21,7 +21,20 @@ pub(crate) struct DataLogUpdate {
     pub data_load_time: f64,
     pub inference_time: f64,
     pub finished: bool,
+    /// How the job ended, in the `data_log.outcome` vocabulary
+    /// (`crate::db::job_failures`). [`OUTCOME_RUNNING`] on the per-item
+    /// progress updates, which must not claim an ending.
+    pub outcome: &'static str,
+    /// Why, for the outcomes that have a reason. `None` leaves the stored
+    /// value alone on a progress update and clears it on a clean completion.
+    pub failure_reason: Option<String>,
 }
+
+/// The `outcome` a job that is still running writes: the empty string, which
+/// is also what every row written before the column existed carries. The
+/// reader renders it from `completed` exactly as it always did, so no
+/// backfill is needed.
+pub(crate) const OUTCOME_RUNNING: &str = "";
 
 #[derive(Debug, Clone)]
 pub(crate) struct TagEntry {
@@ -61,6 +74,38 @@ pub(crate) struct EmbeddingEntry {
 pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
     let atomic_enabled = crate::config::runtime().atomic_extraction_jobs;
 
+    // Any unfinished row reaching this point belongs to a job that is over —
+    // cancelled, or killed with its process — and nothing will ever finalize
+    // it. Say so, once: `outcome = ''` is the guard, so a row this process
+    // already stamped `failed` (with its reason) is left exactly as it is.
+    //
+    // `end_time` is deliberately *not* touched here: for a row left behind by
+    // a process that died, "now" is when we noticed, not when the job stopped.
+    // The in-process cancel path stamps its own row through
+    // [`finalize_cancelled_job`], where "now" is right.
+    sqlx::query(
+        r#"
+        UPDATE data_log
+        SET outcome = ?,
+            failure_reason = COALESCE(
+                failure_reason,
+                'The job did not finish: it was cancelled, or its process stopped'
+            )
+        WHERE completed = 0 AND outcome = ''
+        "#,
+    )
+    .bind(crate::db::job_failures::OUTCOME_CANCELLED)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to stamp incomplete jobs");
+        ApiError::internal("Failed to update incomplete jobs")
+    })?;
+
+    // Retention for the per-job failure audit: a job whose history is gone
+    // has no rows to explain. Runs at the start of every extraction job.
+    crate::db::job_failures::prune_orphan_job_failures(&mut *conn).await?;
+
     if !atomic_enabled {
         sqlx::query(
             r#"
@@ -89,6 +134,41 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
     .map_err(|err| {
         tracing::error!(error = %err, "failed to delete incomplete jobs");
         ApiError::internal("Failed to delete incomplete jobs")
+    })?;
+    Ok(result.rows_affected())
+}
+
+/// The in-process cancel path's stamp for one job: a real `end_time` (the
+/// moment the job actually stopped, which only this side knows) plus the
+/// `cancelled` outcome.
+///
+/// Guarded on an outcome that is unset *or already cancelled*, so it can never
+/// overwrite a job that recorded how it ended, and so it still supplies the
+/// real `end_time` when the generic cleanup pass — which cannot know when a
+/// job stopped and therefore leaves `end_time` alone — has already stamped the
+/// word. Both run on the cancel path, and either order is correct.
+pub(crate) async fn finalize_cancelled_job(
+    conn: &mut sqlx::SqliteConnection,
+    job_id: i64,
+) -> ApiResult<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE data_log
+        SET end_time = ?,
+            outcome = ?,
+            failure_reason = COALESCE(failure_reason, 'The job was cancelled')
+        WHERE job_id = ? AND completed = 0 AND outcome IN ('', ?)
+        "#,
+    )
+    .bind(current_iso_timestamp())
+    .bind(crate::db::job_failures::OUTCOME_CANCELLED)
+    .bind(job_id)
+    .bind(crate::db::job_failures::OUTCOME_CANCELLED)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to stamp a cancelled job");
+        ApiError::internal("Failed to update extraction log")
     })?;
     Ok(result.rows_affected())
 }
@@ -172,7 +252,9 @@ pub(crate) async fn update_data_log(
             total_remaining = ?,
             data_load_time = ?,
             inference_time = ?,
-            completed = ?
+            completed = ?,
+            outcome = ?,
+            failure_reason = ?
         WHERE job_id = ?
         "#,
     )
@@ -187,6 +269,8 @@ pub(crate) async fn update_data_log(
     .bind(update.data_load_time)
     .bind(update.inference_time)
     .bind(completed_value)
+    .bind(update.outcome)
+    .bind(update.failure_reason.as_deref())
     .bind(job_id)
     .execute(&mut *conn)
     .await

@@ -16,9 +16,12 @@ use crate::api_error::{ApiError, Blocker};
 use crate::db::extraction_errors::{
     ExtractionErrorRecord, list_distinct_blockers, list_error_sha256s_for_setter,
 };
-use crate::db::extraction_write::{DataLogUpdate, get_setter_data_types};
+use crate::db::extraction_write::{DataLogUpdate, OUTCOME_RUNNING, get_setter_data_types};
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
 use crate::db::items::get_existing_file_for_item_id;
+use crate::db::job_failures::{
+    JobItemFailureRecord, OUTCOME_COMPLETED, OUTCOME_FAILED, OUTCOME_PARTIAL, STAGE_OUTPUT,
+};
 use crate::db::pql::run_compiled_count;
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::db::{open_index_db_read, open_index_db_read_no_user_data};
@@ -480,8 +483,56 @@ struct JobCounters {
     /// summary can say *why* a job that looks healthy took a second pass over
     /// part of its work.
     requeued_items: i64,
+    /// The audit rows this job owes: one per item it attempted, could not
+    /// finish, and has no verdict for. Held in memory and written once at the
+    /// end — a worker death fails a whole in-flight window at a time (1 542
+    /// items in run1), and a writer round trip each would put that burst on
+    /// the critical path of a failure the job is still recovering from.
+    failures: Vec<JobItemFailureRecord>,
+    /// Failures past [`MAX_RECORDED_JOB_FAILURES`], counted but not listed.
+    failures_dropped: i64,
     data_load_time: PhaseTimer,
     inference_time: PhaseTimer,
+}
+
+/// How many of a job's unexplained item failures are recorded individually.
+///
+/// The count in `data_log` is always exact; this bounds only the *listing*.
+/// A job whose inference server is down fails every item it selects, and a
+/// 1.2 M-item library would otherwise buffer 1.2 M records in memory and
+/// write them all into an audit table nobody will page through. 10 000 is
+/// well past the largest real blast radius measured (1 542 items from one
+/// worker death) and is ~2 MB of buffered strings at the clamped message
+/// size.
+const MAX_RECORDED_JOB_FAILURES: usize = 10_000;
+
+/// Notes one item the job could not process, for the failures endpoint.
+///
+/// Deliberately infallible and deliberately *not* the retry ledger: a row
+/// here explains nothing about the media and must never suppress the item,
+/// which is exactly why it could not be recorded in
+/// `item_extraction_errors` and why run1 found these failures invisible
+/// (finding Q8/T8).
+async fn note_job_failure(
+    counters: &Arc<Mutex<JobCounters>>,
+    setter_name: &str,
+    stage: &str,
+    sha256: &str,
+    requeued: bool,
+    error: String,
+) {
+    let mut guard = counters.lock().await;
+    if guard.failures.len() >= MAX_RECORDED_JOB_FAILURES {
+        guard.failures_dropped += 1;
+        return;
+    }
+    guard.failures.push(JobItemFailureRecord {
+        item_sha256: sha256.to_string(),
+        setter_name: setter_name.to_string(),
+        stage: stage.to_string(),
+        error,
+        requeued,
+    });
 }
 
 /// What an item task concluded, for the counters.
@@ -658,6 +709,119 @@ impl Drop for IncompleteJobCleanup {
     }
 }
 
+/// Stamps this job's `data_log` row `cancelled`, with a real `end_time`, if
+/// the job task is aborted.
+///
+/// The cancellation path cannot run code in the job function at all — the
+/// task is aborted, so only a `Drop` runs — and the generic cleanup pass that
+/// covers it cannot know *when* the job stopped, so it deliberately leaves
+/// `end_time` alone. This guard is the one place that does know.
+///
+/// Deliberately never disarmed: the statement is guarded on an outcome that
+/// is unset or already `cancelled`, so on every path where the job recorded
+/// its own ending this is one no-op UPDATE, and there is no way to arm it
+/// wrongly.
+struct CancelledJobStamp {
+    index_db: String,
+    job_id: i64,
+}
+
+impl Drop for CancelledJobStamp {
+    fn drop(&mut self) {
+        let index_db = self.index_db.clone();
+        let job_id = self.job_id;
+        tokio::spawn(async move {
+            let result = call_index_db_writer(&index_db, |reply| {
+                IndexDbWriterMessage::FinalizeCancelledJob { job_id, reply }
+            })
+            .await;
+            if let Err(err) = result {
+                tracing::warn!(job_id, error = ?err, "failed to stamp a cancelled extraction job");
+            }
+        });
+    }
+}
+
+/// Writes the audit rows for the items a job could not process, and warns
+/// when the job hit [`MAX_RECORDED_JOB_FAILURES`] so the listing's shortfall
+/// against the counter is explicable.
+async fn write_job_failures(
+    index_db: &str,
+    job_id: i64,
+    records: Vec<JobItemFailureRecord>,
+    dropped: i64,
+) {
+    if dropped > 0 {
+        tracing::warn!(
+            job_id,
+            recorded = records.len(),
+            dropped,
+            cap = MAX_RECORDED_JOB_FAILURES,
+            "more items failed than the per-job failure audit lists individually; \
+             the job's counts are still exact"
+        );
+    }
+    if records.is_empty() {
+        return;
+    }
+    let result = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::RecordJobFailures {
+        job_id,
+        records: records.clone(),
+        reply,
+    })
+    .await;
+    if let Err(err) = result {
+        // Advisory by construction: this is the record of work that did not
+        // happen, and losing it must never turn a recoverable job into a
+        // failed one. The counts in `data_log` are unaffected.
+        tracing::warn!(job_id, error = ?err, "failed to record this job's item failures");
+    }
+}
+
+/// The record a job that stopped early owes: the counters it reached, a real
+/// `end_time`, the `failed` outcome and the reason — the four things run1
+/// found missing (finding T8: `end_time == start_time`, `failed = 0`).
+async fn finalize_unfinished_job(
+    index_db: &str,
+    job_id: i64,
+    counters: &Arc<Mutex<JobCounters>>,
+    total_remaining: i64,
+    reason: &str,
+) {
+    let (update, failures, dropped) = {
+        let mut guard = counters.lock().await;
+        let failures = std::mem::take(&mut guard.failures);
+        let dropped = guard.failures_dropped;
+        let update = DataLogUpdate {
+            image_files: guard.image_files,
+            video_files: guard.video_files,
+            other_files: guard.other_files,
+            total_segments: guard.total_segments,
+            errors: guard.errors,
+            input_errors: guard.input_errors,
+            // Best available: the job stopped before it could re-run its own
+            // work query, so what is left is what it never got to.
+            total_remaining: total_remaining.saturating_sub(guard.processed),
+            data_load_time: guard.data_load_time.busy_secs(),
+            inference_time: guard.inference_time.busy_secs(),
+            // Not finished: the items it never reached are still owed, and
+            // `data_jobs.completed` must stay 0 so the atomic cleanup can do
+            // its work.
+            finished: false,
+            outcome: OUTCOME_FAILED,
+            failure_reason: Some(reason.to_string()),
+        };
+        (update, failures, dropped)
+    };
+    write_job_failures(index_db, job_id, failures, dropped).await;
+    let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
+        job_id,
+        update: update.clone(),
+        reply,
+    })
+    .await;
+}
+
 async fn cleanup_incomplete_jobs(index_db: &str) {
     let result = call_index_db_writer(index_db, |reply| {
         IndexDbWriterMessage::RemoveIncompleteJobs { reply }
@@ -793,175 +957,208 @@ async fn run_extraction_job_inner(
     })
     .await?;
 
-    let load_result = {
-        // Under the batch slot, with the generation bumped first: a boundary
-        // unload spawned before this load either already ran (and this load
-        // undoes it) or finds a newer generation and aborts. It can never land
-        // on the model this job is about to use.
-        let _slot = lock_batch_slot().await;
-        begin_batch_load();
-        context
-            .pool
-            .load_model_all(
-                &model.setter_name,
-                CACHE_KEY,
-                CACHE_LRU_SIZE,
-                CACHE_TTL_SECS,
-                // Batch jobs opt out of lazy prewarming (design doc §8):
-                // batch-only model families must not hold a warm worker's RAM
-                // after the job ends.
-                Some(false),
-            )
-            .await
-    };
-    if let Err(err) = load_result {
-        // A load refused by the per-model cooldown is not "the load failed":
-        // it is "this model is unavailable until <instant>", and the job says
-        // so with the model, the retry instant and the error that caused it.
-        if let Some(failure) = inference_failure(&err)
-            && failure.is_load_cooldown()
-        {
-            return Err(ApiError::internal(cooldown_reason(failure)));
-        }
-        return Err(ApiError::internal(format!("Failed to load model: {err}")));
-    }
-
+    // Created before the block below so a failure *inside* it can still record
+    // what the job had done and how far it got.
     let counters = Arc::new(Mutex::new(JobCounters::default()));
-    // Bounds concurrent input loading (decode processes, file reads). Loaded
-    // items park on the byte budget below, so loading pipelines ahead of
-    // inference instead of running in lockstep with it.
-    let loader_slots = Arc::new(Semaphore::new(context.loader_concurrency.max(1)));
-    // Bounds loaded-but-unfinished intermediate data across in-flight items
-    // (KiB permits). An item larger than the whole budget clamps to capacity
-    // and runs alone; worst-case memory is roughly
-    // budget + loader_concurrency × item size.
-    let budget_capacity = context.intermediate_budget_kib.max(1);
-    let budget_slots = Arc::new(Semaphore::new(budget_capacity as usize));
-    // Bounds the total number of work units inside in-flight inference
-    // requests across all items. This is core-side request sizing, and it is
-    // deliberately independent of the user's batch cap: the cap constrains the
-    // GPU batches inferio forms, while this constrains how much work core
-    // keeps in flight (design doc "Batch size UX", split #2). A capped job
-    // still chunks no larger than its cap, so no single request outruns what
-    // the far side may process in one batch.
-    //
-    // It starts at the floor and then follows the desired in-flight figure
-    // the inference server publishes on each response — the one number that
-    // crosses the boundary, in items, so core never learns about VRAM.
-    let unit_slots = Arc::new(UnitBudget::new(in_flight_unit_ceiling(
-        context.intermediate_budget_kib,
-        context.loader_concurrency,
-        crate::rlimit::soft_nofile_limit(),
-    )));
-    let unit_capacity = request_unit_capacity(defaults.batch_size);
-    // The cap travels with each request; `None` = auto.
-    let batch_cap = gpu_batch_cap(defaults.batch_size);
-    // Item tasks live in a JoinSet owned by this task: when the job is
-    // cancelled (task aborted), dropping the set aborts every in-flight item
-    // instead of leaving detached tasks writing to the DB.
-    let mut tasks = tokio::task::JoinSet::new();
     // Cooperative stop for the whole run; see [`JobAbort`].
     let abort = Arc::new(JobAbort::default());
-
-    let (cursor_column, partition_column) = work_query_keys(&model);
-    let chunk_sql = chunked_work_query_sql(&compiled.sql, cursor_column, WORK_CHUNK_ROWS);
-    let mut cursor = i64::MIN;
-    // Partition keys already dispatched this job. The keyset cursor alone
-    // makes one monotonic pass, but the GROUP BY representative row for an
-    // item can in principle differ between chunk queries (bare-column GROUP
-    // BY picks an arbitrary file), which could move an in-flight item ahead
-    // of the cursor; and models with skip_processed_items=false never drop
-    // processed rows from the predicate at all. This set is what guarantees
-    // each work unit is dispatched at most once per job in both cases.
-    let mut dispatched: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    loop {
-        if abort.is_set() {
-            break;
-        }
-        // The connection lives only for this fetch: the read snapshot it
-        // holds is released before any processing below awaits, so WAL
-        // checkpoints advance throughout the job instead of stalling behind
-        // a job-long cursor.
-        let rows = {
-            let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
-            let mut query = sqlx::query(sqlx::AssertSqlSafe(chunk_sql.as_str()));
-            query = bind_params(query, &compiled.params)?;
-            query
-                .bind(cursor)
-                .fetch_all(&mut conn)
+    // From here on the job owns a `data_log` row, so every way out of it must
+    // finalize that row: run1 finding T8 measured a failed job with
+    // `end_time == start_time` and `failed = 0`, because the early returns
+    // between here and the end simply left the row unfinished. The work is
+    // therefore one block whose result is finalized on both paths, and the
+    // cancellation path (which cannot run code here at all) is the drop
+    // guard's.
+    let _cancel_stamp = CancelledJobStamp {
+        index_db: job.index_db.clone(),
+        job_id,
+    };
+    let items_result: ApiResult<i64> = async {
+        let load_result = {
+            // Under the batch slot, with the generation bumped first: a boundary
+            // unload spawned before this load either already ran (and this load
+            // undoes it) or finds a newer generation and aborts. It can never land
+            // on the model this job is about to use.
+            let _slot = lock_batch_slot().await;
+            begin_batch_load();
+            context
+                .pool
+                .load_model_all(
+                    &model.setter_name,
+                    CACHE_KEY,
+                    CACHE_LRU_SIZE,
+                    CACHE_TTL_SECS,
+                    // Batch jobs opt out of lazy prewarming (design doc §8):
+                    // batch-only model families must not hold a warm worker's RAM
+                    // after the job ends.
+                    Some(false),
+                )
                 .await
-                .map_err(|err| {
-                    tracing::error!(error = %err, "failed to fetch extraction rows");
-                    ApiError::internal("Failed to execute extraction query")
-                })?
         };
-        let fetched = rows.len();
-        for row in &rows {
+        if let Err(err) = load_result {
+            // A load refused by the per-model cooldown is not "the load failed":
+            // it is "this model is unavailable until <instant>", and the job says
+            // so with the model, the retry instant and the error that caused it.
+            if let Some(failure) = inference_failure(&err)
+                && failure.is_load_cooldown()
+            {
+                return Err(ApiError::internal(cooldown_reason(failure)));
+            }
+            return Err(ApiError::internal(format!("Failed to load model: {err}")));
+        }
+
+        // Bounds concurrent input loading (decode processes, file reads). Loaded
+        // items park on the byte budget below, so loading pipelines ahead of
+        // inference instead of running in lockstep with it.
+        let loader_slots = Arc::new(Semaphore::new(context.loader_concurrency.max(1)));
+        // Bounds loaded-but-unfinished intermediate data across in-flight items
+        // (KiB permits). An item larger than the whole budget clamps to capacity
+        // and runs alone; worst-case memory is roughly
+        // budget + loader_concurrency × item size.
+        let budget_capacity = context.intermediate_budget_kib.max(1);
+        let budget_slots = Arc::new(Semaphore::new(budget_capacity as usize));
+        // Bounds the total number of work units inside in-flight inference
+        // requests across all items. This is core-side request sizing, and it is
+        // deliberately independent of the user's batch cap: the cap constrains the
+        // GPU batches inferio forms, while this constrains how much work core
+        // keeps in flight (design doc "Batch size UX", split #2). A capped job
+        // still chunks no larger than its cap, so no single request outruns what
+        // the far side may process in one batch.
+        //
+        // It starts at the floor and then follows the desired in-flight figure
+        // the inference server publishes on each response — the one number that
+        // crosses the boundary, in items, so core never learns about VRAM.
+        let unit_slots = Arc::new(UnitBudget::new(in_flight_unit_ceiling(
+            context.intermediate_budget_kib,
+            context.loader_concurrency,
+            crate::rlimit::soft_nofile_limit(),
+        )));
+        let unit_capacity = request_unit_capacity(defaults.batch_size);
+        // The cap travels with each request; `None` = auto.
+        let batch_cap = gpu_batch_cap(defaults.batch_size);
+        // Item tasks live in a JoinSet owned by this task: when the job is
+        // cancelled (task aborted), dropping the set aborts every in-flight item
+        // instead of leaving detached tasks writing to the DB.
+        let mut tasks = tokio::task::JoinSet::new();
+
+        let (cursor_column, partition_column) = work_query_keys(&model);
+        let chunk_sql = chunked_work_query_sql(&compiled.sql, cursor_column, WORK_CHUNK_ROWS);
+        let mut cursor = i64::MIN;
+        // Partition keys already dispatched this job. The keyset cursor alone
+        // makes one monotonic pass, but the GROUP BY representative row for an
+        // item can in principle differ between chunk queries (bare-column GROUP
+        // BY picks an arbitrary file), which could move an in-flight item ahead
+        // of the cursor; and models with skip_processed_items=false never drop
+        // processed rows from the predicate at all. This set is what guarantees
+        // each work unit is dispatched at most once per job in both cases.
+        let mut dispatched: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        loop {
             if abort.is_set() {
                 break;
             }
-            // Rows are ordered by the cursor key, so every row advances the
-            // cursor — including rows that are skipped or fail to map, which
-            // must not be re-fetched by the next chunk.
-            cursor = row.try_get(cursor_column).map_err(map_row_err)?;
-            let partition_key: i64 = row.try_get(partition_column).map_err(map_row_err)?;
-            if !dispatched.insert(partition_key) {
-                continue;
-            }
-            let Some(item) = map_job_input(&job.index_db, &job.user_data_db, row).await? else {
-                continue;
+            // The connection lives only for this fetch: the read snapshot it
+            // holds is released before any processing below awaits, so WAL
+            // checkpoints advance throughout the job instead of stalling behind
+            // a job-long cursor.
+            let rows = {
+                let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
+                let mut query = sqlx::query(sqlx::AssertSqlSafe(chunk_sql.as_str()));
+                query = bind_params(query, &compiled.params)?;
+                query
+                    .bind(cursor)
+                    .fetch_all(&mut conn)
+                    .await
+                    .map_err(|err| {
+                        tracing::error!(error = %err, "failed to fetch extraction rows");
+                        ApiError::internal("Failed to execute extraction query")
+                    })?
             };
-            let loader_permit = loader_slots
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| ApiError::internal("Extraction job semaphore closed"))?;
-            let model = model.clone();
-            let pool = context.pool.clone();
-            let counters = Arc::clone(&counters);
-            let index_db = job.index_db.clone();
-            let threshold = defaults.threshold;
-            let unit_slots = Arc::clone(&unit_slots);
-            let budget_slots = Arc::clone(&budget_slots);
-            let ledger_shas = Arc::clone(&ledger_shas);
-            let abort = Arc::clone(&abort);
-            tasks.spawn(async move {
-                let result = process_item(
-                    &index_db,
-                    &model,
-                    job_id,
-                    item,
-                    threshold,
-                    &pool,
-                    loader_permit,
-                    &budget_slots,
-                    budget_capacity,
-                    &unit_slots,
-                    unit_capacity,
-                    batch_cap,
-                    counters,
-                    total_remaining,
-                    &ledger_shas,
-                    detect_outros,
-                    &abort,
-                )
-                .await;
-                if let Err(err) = result {
-                    tracing::error!(error = ?err, "extraction item failed");
+            let fetched = rows.len();
+            for row in &rows {
+                if abort.is_set() {
+                    break;
                 }
-            });
+                // Rows are ordered by the cursor key, so every row advances the
+                // cursor — including rows that are skipped or fail to map, which
+                // must not be re-fetched by the next chunk.
+                cursor = row.try_get(cursor_column).map_err(map_row_err)?;
+                let partition_key: i64 = row.try_get(partition_column).map_err(map_row_err)?;
+                if !dispatched.insert(partition_key) {
+                    continue;
+                }
+                let Some(item) = map_job_input(&job.index_db, &job.user_data_db, row).await? else {
+                    continue;
+                };
+                let loader_permit = loader_slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ApiError::internal("Extraction job semaphore closed"))?;
+                let model = model.clone();
+                let pool = context.pool.clone();
+                let counters = Arc::clone(&counters);
+                let index_db = job.index_db.clone();
+                let threshold = defaults.threshold;
+                let unit_slots = Arc::clone(&unit_slots);
+                let budget_slots = Arc::clone(&budget_slots);
+                let ledger_shas = Arc::clone(&ledger_shas);
+                let abort = Arc::clone(&abort);
+                tasks.spawn(async move {
+                    let result = process_item(
+                        &index_db,
+                        &model,
+                        job_id,
+                        item,
+                        threshold,
+                        &pool,
+                        loader_permit,
+                        &budget_slots,
+                        budget_capacity,
+                        &unit_slots,
+                        unit_capacity,
+                        batch_cap,
+                        counters,
+                        total_remaining,
+                        &ledger_shas,
+                        detect_outros,
+                        &abort,
+                    )
+                    .await;
+                    if let Err(err) = result {
+                        tracing::error!(error = ?err, "extraction item failed");
+                    }
+                });
+            }
+            if fetched < WORK_CHUNK_ROWS {
+                break;
+            }
         }
-        if fetched < WORK_CHUNK_ROWS {
-            break;
-        }
-    }
-    drop(dispatched);
+        drop(dispatched);
 
-    while tasks.join_next().await.is_some() {}
+        while tasks.join_next().await.is_some() {}
 
-    let remaining_after = {
         let mut count_conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
-        run_compiled_count(&mut count_conn, &compiled_count.sql, &compiled_count.params).await?
+        run_compiled_count(&mut count_conn, &compiled_count.sql, &compiled_count.params).await
+    }
+    .await;
+
+    let remaining_after = match items_result {
+        Ok(remaining) => remaining,
+        Err(err) => {
+            // The job stopped early. Its record says so — with a real
+            // end_time, the counters it reached, and the reason — and the
+            // items it had already lost are recorded so the failures endpoint
+            // can name them.
+            finalize_unfinished_job(
+                &job.index_db,
+                job_id,
+                &counters,
+                total_remaining,
+                err.detail(),
+            )
+            .await;
+            return Err(err);
+        }
     };
 
     let (final_update, failure, processed_data, partial_reason) = {
@@ -1037,6 +1234,25 @@ async fn run_extraction_job_inner(
                 guard.requeued_items
             );
         }
+        // The one place the job's own word for how it ended is chosen. It is
+        // written into the record, so "did this job finish everything?" stops
+        // being an inference over `completed`, a null `job_id` and a count —
+        // which is what answered *completed* for a job that lost 1 542 items.
+        let (outcome, failure_reason) = if let Some(reason) = abort.reason() {
+            (OUTCOME_FAILED, Some(reason.to_string()))
+        } else if failure == JobFailure::Systemic {
+            (
+                OUTCOME_FAILED,
+                Some(format!(
+                    "All {} attempted items failed; check the inference server",
+                    guard.errors
+                )),
+            )
+        } else if let Some(reason) = &partial_reason {
+            (OUTCOME_PARTIAL, Some(reason.clone()))
+        } else {
+            (OUTCOME_COMPLETED, None)
+        };
         let update = DataLogUpdate {
             image_files: guard.image_files,
             video_files: guard.video_files,
@@ -1048,6 +1264,8 @@ async fn run_extraction_job_inner(
             data_load_time: guard.data_load_time.busy_secs(),
             inference_time: guard.inference_time.busy_secs(),
             finished: failure != JobFailure::Systemic && !abort.is_set(),
+            outcome,
+            failure_reason,
         };
         // The stored times are phase wall-clock (busy); aggregate worker time
         // only goes to the log, where work / busy reads as average parallelism.
@@ -1065,6 +1283,15 @@ async fn run_extraction_job_inner(
             partial_reason,
         )
     };
+    {
+        // Written before the record is stamped, so a reader that sees the
+        // outcome can already list the items behind it.
+        let (failures, dropped) = {
+            let mut guard = counters.lock().await;
+            (std::mem::take(&mut guard.failures), guard.failures_dropped)
+        };
+        write_job_failures(&job.index_db, job_id, failures, dropped).await;
+    }
     let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
         job_id,
         update: final_update.clone(),
@@ -1231,6 +1458,7 @@ async fn process_item(
                 crate::db::extraction_errors::STAGE_PREPARE,
                 &sha256,
                 &path,
+                &counters,
                 err,
             )
             .await;
@@ -1259,6 +1487,16 @@ async fn process_item(
             output_handlers::write_placeholder(index_db, model, job_id, &prepared.item).await;
         if result.is_ok() {
             clear_ledger_row(index_db, model, &prepared.item.sha256, ledger_shas).await;
+        } else if let Err(err) = &result {
+            note_job_failure(
+                &counters,
+                &model.setter_name,
+                STAGE_OUTPUT,
+                &prepared.item.sha256,
+                false,
+                err.detail().to_string(),
+            )
+            .await;
         }
         finalize_item(
             index_db,
@@ -1306,6 +1544,7 @@ async fn process_item(
     if abort.is_set() {
         return Ok(());
     }
+    let mut requeued = false;
     let inference = match run_item_inference(
         &model.setter_name,
         pool,
@@ -1315,6 +1554,7 @@ async fn process_item(
         &inference_inputs,
         &counters,
         abort,
+        &mut requeued,
     )
     .await
     {
@@ -1338,6 +1578,15 @@ async fn process_item(
                 "extraction item failed"
             );
             let api_err = ApiError::internal(format!("Inference failed: {err}"));
+            note_job_failure(
+                &counters,
+                &model.setter_name,
+                crate::db::extraction_errors::STAGE_INFERENCE,
+                &prepared.item.sha256,
+                requeued,
+                format!("{err:#}"),
+            )
+            .await;
             finalize_item(
                 index_db,
                 job_id,
@@ -1394,6 +1643,15 @@ async fn process_item(
                 error = %detail,
                 "extraction item failed"
             );
+            note_job_failure(
+                &counters,
+                &model.setter_name,
+                crate::db::extraction_errors::STAGE_INFERENCE,
+                &prepared.item.sha256,
+                requeued,
+                detail.clone(),
+            )
+            .await;
             finalize_item(
                 index_db,
                 job_id,
@@ -1418,6 +1676,7 @@ async fn process_item(
                 crate::db::extraction_errors::STAGE_INFERENCE,
                 &prepared.item.sha256,
                 &prepared.item.path,
+                &counters,
                 ApiError::input(detail),
             )
             .await;
@@ -1453,11 +1712,20 @@ async fn process_item(
         tracing::error!(
             path = %prepared.item.path,
             sha256 = %prepared.item.sha256,
-            stage = "output",
+            stage = STAGE_OUTPUT,
             error_class = "transient",
             error = %err.detail(),
             "extraction item failed"
         );
+        note_job_failure(
+            &counters,
+            &model.setter_name,
+            STAGE_OUTPUT,
+            &prepared.item.sha256,
+            requeued,
+            err.detail().to_string(),
+        )
+        .await;
     }
     if result.is_ok() {
         clear_ledger_row(index_db, model, &prepared.item.sha256, ledger_shas).await;
@@ -1604,6 +1872,7 @@ fn targets_text_entity(model: &ModelMetadata) -> bool {
 ///
 /// A failed *ledger write* is counted systemic and returned as an error: a DB
 /// outage must never soft-complete a job as "all corrupt media".
+#[allow(clippy::too_many_arguments)]
 async fn record_item_failure(
     index_db: &str,
     model: &ModelMetadata,
@@ -1611,6 +1880,7 @@ async fn record_item_failure(
     stage: &str,
     sha256: &str,
     path: &str,
+    counters: &Arc<Mutex<JobCounters>>,
     err: ApiError,
 ) -> (ItemOutcome, Option<ApiError>) {
     let class = err.persisted_class();
@@ -1625,6 +1895,17 @@ async fn record_item_failure(
         "extraction item failed"
     );
     if class.is_none() {
+        // Transient: no verdict, so no ledger row — and, before the per-job
+        // audit existed, no record of any kind (run1 finding Q8/T8).
+        note_job_failure(
+            counters,
+            &model.setter_name,
+            stage,
+            sha256,
+            false,
+            err.detail().to_string(),
+        )
+        .await;
         return (ItemOutcome::Failed, Some(err));
     }
 
@@ -1650,6 +1931,15 @@ async fn record_item_failure(
                 error = ?write_err,
                 "failed to record an extraction failure; counting it as systemic"
             );
+            note_job_failure(
+                counters,
+                &model.setter_name,
+                stage,
+                sha256,
+                false,
+                write_err.detail().to_string(),
+            )
+            .await;
             (ItemOutcome::Failed, Some(write_err))
         }
     }
@@ -1774,6 +2064,9 @@ async fn run_item_inference(
     inputs: &[InferenceInput],
     counters: &Arc<Mutex<JobCounters>>,
     abort: &JobAbort,
+    // Set when this item's work was re-submitted, so a failure that follows
+    // can say in the audit that its one retry was already spent.
+    requeued_out: &mut bool,
 ) -> anyhow::Result<Option<ItemInference>> {
     let mut requeued = false;
     loop {
@@ -1799,6 +2092,7 @@ async fn run_item_inference(
             }
             InferenceRecovery::Requeue => {
                 requeued = true;
+                *requeued_out = true;
                 counters.lock().await.requeued_items += 1;
                 tracing::warn!(
                     setter = setter_name,
@@ -2173,6 +2467,8 @@ async fn finalize_item(
             data_load_time: guard.data_load_time.busy_secs(),
             inference_time: guard.inference_time.busy_secs(),
             finished: false,
+            outcome: OUTCOME_RUNNING,
+            failure_reason: None,
         }
     };
     let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
@@ -4025,6 +4321,7 @@ mod tests {
             STAGE_PREPARE,
             "sha_one",
             "C:/data/1.png",
+            &Arc::new(Mutex::new(JobCounters::default())),
             ApiError::input("corrupt"),
         )
         .await;
@@ -4072,6 +4369,7 @@ mod tests {
             STAGE_PREPARE,
             "sha_one",
             "C:/data/1.pdf",
+            &Arc::new(Mutex::new(JobCounters::default())),
             ApiError::blocked(Blocker::Pdfium, "pdfium is not available"),
         )
         .await;
@@ -4385,6 +4683,7 @@ mod tests {
             crate::db::extraction_errors::STAGE_INFERENCE,
             "sha_one",
             "C:/data/1.png",
+            &Arc::new(Mutex::new(JobCounters::default())),
             ApiError::input(detail),
         )
         .await;
