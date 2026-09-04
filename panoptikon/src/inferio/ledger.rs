@@ -2071,12 +2071,17 @@ impl VramLedger {
 
     /// Charge a load's *expected* base against the board from load-start.
     ///
-    /// Loads are serialized by the manager's load lock, but dispatch is not:
-    /// without this charge, windows granted to *other* models during a
-    /// multi-second load collide with the incoming weights. The expected base
-    /// is the **larger** of what this run already measured for this (model,
-    /// board) and what the calibration store knows, falling back to
-    /// [`CONSERVATIVE_BASE_MB`] when neither answers.
+    /// Concurrent loads on one board are bounded by that board's admission
+    /// gate (`[inference_local] max_concurrent_loads`, default 1), but
+    /// dispatch is not gated at all: without this charge, windows granted to
+    /// *other* models during a multi-second load collide with the incoming
+    /// weights. The charge is correct however many reservers the gate admits
+    /// — reservations are keyed per load and summed, so two concurrent loads
+    /// hold two bases against the board rather than overwriting one another.
+    ///
+    /// The expected base is the **larger** of what this run already measured
+    /// for this (model, board) and what the calibration store knows, falling
+    /// back to [`CONSERVATIVE_BASE_MB`] when neither answers.
     ///
     /// Taking the max rather than ranking the two sources is deliberate. They
     /// are measurements of the same thing (a local profile *is* a persisted
