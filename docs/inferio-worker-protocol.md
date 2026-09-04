@@ -38,6 +38,27 @@ answers an unknown `type` with a per-request `error` and stays alive, which
 is exactly how a trim to a worker that cannot do one should behave, so the
 version still stays 2.
 
+2026-09-04 (batch-calibration run2): six additive fields and one renamed
+sentinel value, all of them consequences of what run1 measured
+(`docs/batch-calibration-run1-report.md` §4). **Exactly these keys are new**,
+and nothing else on the wire changed:
+
+| key | where | run2 item |
+|---|---|---|
+| `canvas_pixels` | `predict` request, inside `grant` | R7 — the per-item pixel cap, from the registry key of the same name |
+| `free_mb` | a measurement map | R5 — the pre-batch free reading the defensive clamp already takes |
+| `free_source` | a measurement map | R5 — which driver produced that reading |
+| `clamped` | a measurement map | R5 — `{from_units, to_units, free_mb}`, present only when the clamp shrank this batch |
+| `oom_class` | a measurement map | R3 — `{source, exception, free_mb_at_failure, device}`, present only beside `oom: true` |
+| `dtype_method` value `"unstated"` | `load` response | R11 — renamed from `"unknown"`, in `dtype` and `dtype_method` alike |
+
+Additive in both directions: an older worker sends none of the response keys
+and ignores `canvas_pixels`, an older orchestrator sends no `canvas_pixels`
+and ignores the response keys, so the version stays 2. The one **non**-additive
+line is the sentinel rename, which moves the calibration profile key for every
+model that states no precision; see `dtype` below for why that is deliberate
+and what it costs.
+
 Contract between the Rust orchestrator (parent) and a Python inference worker
 (child process). Companion to `inferio-rust-orchestrator-design.md` §4.
 Both implementations MUST follow this document exactly; change the document
@@ -129,6 +150,63 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | `unit` | `"item"` \| `"pixel"` \| `"token"` \| `"audio-second"` — the model's declared cost dimension |
 | `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
+| `canvas_pixels` | **new (run2, R7)**: the model's *canvas* — the largest number of decoded pixels one input can actually cost it, whatever resolution the input was submitted at. Integer pixels; optional; meaningful only for a `pixel`-priced model. When present the worker prices every input at `min(raw_pixels, canvas_pixels)` before packing. The orchestrator reads it out of the registry (`metadata.cost.canvas_pixels`) and forwards it verbatim |
+
+**The per-item pixel cap (`canvas_pixels`), and why it is a *pricing* field.**
+Every `pixel`-class model shipped resizes or tiles its input onto a fixed
+canvas before the first convolution — a tile grid, a `max_pixels` bound, a
+detector's `canvas_size` — so its real cost stops rising at that canvas while
+the worker's raw header-derived price keeps rising with whatever the user
+submitted. Run1 measured both halves of what that costs (report §4, Q3/W1 and
+F-B): a *fitted slope* that is a function of the corpus rather than of the
+model (nemotron fitted 4.33x the probe's), 58 of 110 batches holding a single
+item, and grants of 23-94 GB issued against a real footprint three orders of
+magnitude smaller. Capping the price at the canvas makes the slope
+corpus-independent and lets large images pack, and it errs in the one
+direction that is safe to be wrong about: it *lowers* the priced units of a
+big item, so the same grant buys a batch whose real footprint is the one the
+fit was measured on rather than a batch of one.
+
+The cap is denominated in **decoded pixels**, always, whatever the model's
+declared `unit` — it describes the model's input geometry, not its pricing
+scale. Two consequences the registry side enforces
+(`panoptikon/src/inferio/cost.rs`): it is read only for a `pixel`-unit model
+(capping a token count or an item count by an area is meaningless), and it is
+never inherited from a group whose `unit` differs from the id's, the same
+scale-bound rule `seed_units` already has — `[group.clip]` is `item`-priced
+and its `qwen3-vl` / `nemotron` ids are not. A cap on a `count`-aggregated
+model would in any case be inert by construction: every item already prices at
+exactly one unit and `min(1, cap)` is 1.
+
+Resolution order in the worker, and the documented fallback:
+
+1. `grant.canvas_pixels`, when the orchestrator sent one. Authoritative: it is
+   the figure the registry declares, so both sides speak one number.
+2. otherwise, for `pixel` inputs only, the loaded impl's own known input
+   resolution, if it exposes one: a positive integer `canvas_pixels`,
+   `max_pixels` or `image_max_pixels` attribute on the instance or on one of
+   its processor-shaped attributes (`processor`, `image_processor`,
+   `embedder`, `model`, one level deep). Read passively — the worker never
+   constructs anything and never imports anything to ask — and floored at
+   512x512 pixels, below which a reading is treated as a misidentified
+   attribute rather than a canvas. Too *small* a cap is the one direction that
+   hurts (it under-prices an item, which over-admits), so the floor is the
+   guard, and the resolved source is logged once per process. This tier is
+   what covers a model whose canvas the registry cannot state statically
+   because it lives in the downloaded processor's config (`doctr/dots_ocr`).
+3. otherwise uncapped, exactly as before this field existed.
+
+The registry declaration the orchestrator reads it from:
+
+```toml
+[group.clip.inference_ids.nemotron-embed-vl-1b-v2]
+metadata.cost.unit          = "pixel"
+metadata.cost.aggregation   = "sum"
+metadata.cost.seed_units    = 2000000
+metadata.cost.canvas_pixels = 1835008   # (6 tiles + thumbnail) x 512^2
+```
+
+Absent = uncapped, which is what every model did before run2.
 
 `fit` — a snapshot of the orchestrator's fitted cost model, sent only when it
 changed since the last frame this worker is known to have **received** (it is
@@ -459,10 +537,10 @@ running on.
 | field | meaning |
 |---|---|
 | `base_mb` | the worker's whole-**process** device footprint after load (CUDA context + workspaces + weights), not just its allocator footprint; on a `"ram"` host, the growth of the process's resident set across the load window. Absent — never zero — when the process demonstrably put nothing on the device it is priced against (no torch, a remote API, or a torch-importing engine like CTranslate2 whose VRAM the allocator never sees) |
-| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own board per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"mps"` (`torch.mps.driver_allocated_memory()` at load end — per-process *by construction*, since each process owns its Metal heap, so it is the same rank as the other two and needs neither a PID lookup nor a plausibility floor), `"rss"` (the growth of this process's resident set across the load window, on a `"ram"` host — see below), `"free_delta"` (driver free-memory delta across the load), or `"alloc_delta"` (allocator peak delta plus a fixed context allowance — the floor). Always names the term that actually produced the reported number |
+| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own board per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"mps"` (`torch.mps.driver_allocated_memory()` at load end — per-process *by construction*, since each process owns its Metal heap, so it is the same rank as the other two and needs neither a PID lookup nor a plausibility floor), `"rss"` (the growth of this process's resident set across the load window, on a `"ram"` host — see below), `"free_delta"` (driver free-memory delta across the load), `"alloc_delta_measured"` (**new in run2, R8**: allocator peak delta plus the accelerator context this process *measured* itself, as the board free-memory delta across the first CUDA initialisation, taken before the impl allocated anything) or `"alloc_delta"` (allocator peak delta plus the fixed context allowance — the same formula with an assumed context instead of a measured one, and the last resort when no free reading was available to measure with). Always names the term that actually produced the reported number, and the two `alloc_delta*` spellings are two different formulas precisely so a stored profile cannot claim a measured context it never had |
 | `reserved_at_load_mb` | allocator pool size right after load; the orchestrator prices later pool growth against this |
-| `dtype` | the load precision in use, one of `"fp16"`, `"bf16"`, `"fp32"`, or `"unknown"` (part of the calibration profile key). **`"unknown"` is a value, not a failure**: the key needs every component or the entry can never be read back, and only four shipped impls negotiate a precision through `select_dtype`, so an omission here silently costs every other model its whole stored profile. It is stable for a given impl, so an entry written under it is found again by the next run; the day that impl does negotiate one, the key moves and the old row is ignored exactly as a dtype *change* is. Absent only when the report carries no `base_mb` either — nothing to key, nothing to persist, and a worker that measured nothing answers exactly as it did before any of this existed |
-| `dtype_method` | how `dtype` was arrived at: `"selected"` (the impl negotiated it — `inferio.impl.utils.select_dtype`, or an instance `resolved_dtype`), `"attribute"` (a real `torch.dtype` held on the instance), `"inferred"` (read off the loaded weights: the first floating-point parameter, else buffer, of the first `torch.nn.Module` found on the instance or one level inside it) or `"unknown"` (nothing answered — a CTranslate2/ONNX engine, a remote API). Additive and **diagnostic only**: nothing keys on it, and the profile is keyed on `dtype` whichever method produced it. Reported whenever `dtype` is |
+| `dtype` | the load precision in use, one of `"fp16"`, `"bf16"`, `"fp32"`, or `"unstated"` (part of the calibration profile key). **`"unstated"` is a value, not a failure**: the key needs every component or the entry can never be read back, and only four shipped impls negotiate a precision through `select_dtype`, so an omission here silently costs every other model its whole stored profile. It is stable for a given impl, so an entry written under it is found again by the next run; the day that impl does negotiate one, the key moves and the old row is ignored exactly as a dtype *change* is. Absent only when the report carries no `base_mb` either — nothing to key, nothing to persist, and a worker that measured nothing answers exactly as it did before any of this existed. **Renamed in run2 (R11): the sentinel used to be spelled `"unknown"`.** It says the impl stated no precision, which is not the same fact as the worker having failed to look, and a key component that reads as a failure invites a consumer to treat it as one. The rename moves the profile key, so every profile stored under the old spelling stops matching and is ignored exactly as a stale epoch is — deliberate, and cheap, because the sentinel was introduced during run1 and nothing has been released under it |
+| `dtype_method` | how `dtype` was arrived at: `"selected"` (the impl negotiated it — `inferio.impl.utils.select_dtype`, or an instance `resolved_dtype`), `"attribute"` (a real `torch.dtype` held on the instance), `"inferred"` (read off the loaded weights: the first floating-point parameter, else buffer, of the first `torch.nn.Module` found on the instance or one level inside it) or `"unstated"` (nothing answered — a CTranslate2/ONNX engine, a remote API). Additive and **diagnostic only**: nothing keys on it, and the profile is keyed on `dtype` whichever method produced it. Reported whenever `dtype` is. **Renamed in run2 (R11) with the `dtype` sentinel above, from `"unknown"`**: one vocabulary, one rename — a `dtype` of `"unstated"` and a `dtype_method` of `"unstated"` are the same fact stated twice, and leaving the method spelled the old way would have made them look like different ones |
 | `gpu_uuid` | the board the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the device-visibility variable the orchestrator spawned it with (`CUDA_VISIBLE_DEVICES`, or a bare device index in `HIP_VISIBLE_DEVICES` on ROCm) — is the authoritative GPU identity for the calibration ledger. Absent when the worker has no initialized CUDA device, **and always absent on a ROCm (HIP) build** — see below |
 | `gpu_name` | that board's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), informational. The calibration profile key uses the orchestrator's own inventory name for the board, not this. On MPS torch has no board struct to ask, so the worker derives `"Apple M3 Max (128 GB)"` from the same two sysctls (`machdep.cpu.brand_string`, `hw.memsize`) and the same rounding the orchestrator's probe uses — deliberately identical, so the one field that could silently drift from the profile key does not. On a `"ram"` host it is `"CPU (64 GB)"`, derived the same way from physical RAM and the same round-up-to-4-GiB rule |
 | `gpu_bdf` | the board's PCI address as the worker read it from `get_device_properties(0)`'s `pci_domain_id`/`pci_bus_id`/`pci_device_id`, rendered `"dddd:bb:dd.0"` in lower-case hex. The function digit is always `.0`: the GPU function of an amdgpu device is 0 (the HDMI/DP audio controller is `.1` of the *same device*), which is how the orchestrator's own probe renders it too, so the two sides join. Reported on CUDA hosts as well — additive, and harmless where the UUID already identifies the board. Absent on a torch build that exposes no PCI fields, unless the fdinfo fallback below answered — which today means absent on the shipped CUDA build, whose venv pins torch 2.7.1 (`_CudaDeviceProperties` grew the PCI fields in 2.8, and the fdinfo fallback is HIP-only): this field goes live on CUDA when that pin moves to >= 2.8, and until then the identity chain it feeds is load-bearing on ROCm alone (the `rocm` extra pins torch 2.11) |
@@ -542,9 +620,22 @@ A measurement map describes one GPU batch the worker actually ran:
 | `reserved_before_mb` / `peak_reserved_mb` | allocator pool size before the batch and its high-water mark during it |
 | `allocated_before_mb` / `peak_allocated_mb` | live-tensor bytes before the batch and their high-water mark during it |
 | `duration_ms` | wall time of `instance.predict(batch)` |
-| `oom` | `true` when this batch raised an out-of-memory condition the harness observed, **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally |
+| `oom` | `true` when this batch raised an out-of-memory condition the harness **classified** as one (see `oom_class`), **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally. **Changed in run2 (R3):** a failure the classifier does not recognise now leaves this absent, where before any error text containing the words "out of memory" set it — run1 measured 15 spurious negatives on a board with 96 GB free from one impl's wording (finding Q1/B11) |
 | `throughput_collapse` | `true` when this *pool-growing* batch was an upward-or-equal step in `units` against the previous pool-growing batch **and** its units/sec fell below the collapse ratio times that batch's. On Windows' WDDM the driver's sysmem fallback turns over-admission into a silent throughput collapse rather than an OOM, so this is the synthetic negative sample that stands in for the missing exception. A smaller (e.g. tail) batch or a non-growing one is not comparable and is never flagged; a flagged batch does not become the new comparator, so a persistent spill cannot normalise itself |
 | `trimmed` | `true` on the **first** measurement of a window the worker's reactive shrink released the allocator pool before (see "Reactive shrink and trim"). Advisory: it explains why this batch grew the pool from (near) nothing and why its throughput is not comparable to the previous window's. Absent/false normally |
+| `oom_class` | **new (run2, R3)**: present exactly when `oom` is `true`, as `{source, exception, free_mb_at_failure, device}` — *why* the harness called this an out-of-memory condition, so the orchestrator can trust a structural signal and corroborate a textual one instead of guessing from a message it never sees. Absent when `oom` is absent, and **absent means the worker saw no out-of-memory condition**, including on a batch that failed for some other reason: the orchestrator must not deflate on such a failure |
+| `free_mb` | **new (run2, R5)**: driver-reported free memory on the worker's board, read immediately **before** this batch ran — the very sample the defensive clamp compares against `grant.mb`, reported rather than discarded. Absent when nothing could be read, and absent on the grantless compatibility path, which takes no pre-batch reading |
+| `free_source` | **new (run2, R5)**: which driver produced `free_mb`, from the same vocabulary a memory sample's `free_source` uses (`"nvml"`, `"amdgpu-sysfs"`, `"mps"`, `"ram"`, `"torch"`). Present exactly when `free_mb` is |
+| `clamped` | **new (run2, R5)**: present only when the defensive clamp actually **reduced** this batch's budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading that forced it. Absent on every batch that ran at its granted budget |
+
+`oom_class` has four keys:
+
+| key | meaning |
+|---|---|
+| `source` | `"typed_exception"` — the failure *was* an allocator exception the worker could name by type (`torch.OutOfMemoryError`, which is the same class on CUDA and on HIP builds, or the interpreter's own `MemoryError` for host RAM). Structural: no text was consulted, and the orchestrator can act on it alone. `"marker"` — an `INFERENCE_OOM_*` marker raised by the impl helper (`inferio.impl.utils.run_with_oom_retry` gives up at a single item), or that helper's halving counter moving inside the call. Also structural: the marker is our own code stating a classification it made from a typed exception one frame lower. `"message_pattern"` — none of the above matched and the text carried one of a closed list of **driver-shaped** strings (`cuda out of memory`, `hip out of memory`, `hip error: out of memory`, `cuda error: out of memory`, `mps backend out of memory`, `defaultcpuallocator` + `allocate memory`, `enforce fail at alloc_cpu.cpp`, `cublas_status_alloc_failed`, `cudnn_status_alloc_failed`, `cudaerrormemoryallocation`, all matched case-insensitively). A bare `out of memory` substring is deliberately **not** on that list: it is the one match run1 found firing on a healthy model. MPS is the reason the list exists at all — an MPS allocation failure is a plain `RuntimeError` whose message is its only signal, and there is no other form of it |
+| `exception` | the failing exception's type name, qualified when the type is not a builtin (`"torch.OutOfMemoryError"`, `"RuntimeError"`, `"MemoryError"`). The literal string `"run_with_oom_retry"` when the classification came from the halving counter rather than from an exception — a batch that *succeeded* after the impl absorbed an out-of-memory condition internally has no exception to name |
+| `free_mb_at_failure` | free memory on the worker's board, read at the moment of the failure. `null` when nothing could be read. This is the corroboration a `message_pattern` classification needs before the orchestrator deflates on it: an out-of-memory claim made while the board has tens of GB free is a wording, not a condition |
+| `device` | which device the two memory figures describe, as `"<backend>"` or `"<backend>:<board uuid>"` (`"cuda:GPU-1234…"`, `"rocm"`, `"mps"`, `"cpu"`, `"unknown"`). It exists so a reading can never be attributed to the wrong board on a multi-GPU host |
 
 **`units` is reported only when the batch ran to completion and the executed
 GPU batch matches the planned batch.** The number exists so the orchestrator can
