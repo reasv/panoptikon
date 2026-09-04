@@ -401,11 +401,20 @@ def looks_like_oom(exc: BaseException) -> bool:
     when one of these forms matches, so an assertion or a bad input still
     propagates untouched instead of being retried at half the batch size.
 
-    A near-twin of the worker harness's own `_looks_like_oom`
-    (`inferio_worker/packing.py`) — the two cannot share code, because the
-    harness must never import this package (it only observes it when an impl
-    already has) and this module must not import the harness. They classify
-    the same strings and must be changed together.
+    **This is the retry backstop, not the calibration signal, and since
+    run2's R3 the two are deliberately different classifiers.** The worker
+    harness's `packing.classify_oom` decides whether the orchestrator is told
+    a batch hit an out-of-memory condition, and a false positive there
+    deflates a healthy model's batch size for minutes (run1 report §4,
+    Q1/B11), so it refuses a bare `out of memory` substring and reports which
+    tier matched. This function decides whether *we* retry the same work at
+    half the size; a false positive costs one wasted attempt and a false
+    negative costs the backstop entirely, so it stays deliberately broad. The
+    two must **not** be kept in sync: they answer different questions, in
+    opposite error directions. Anything this one recognises that
+    `classify_oom` does not is, by construction, a batch we retried without
+    telling the orchestrator it was a memory event — which is the safe half of
+    the asymmetry.
     """
     for error in (exc, exc.__cause__, exc.__context__):
         if error is None:

@@ -15,7 +15,9 @@ the mechanism that spends it. Given a `predict` request that carries a
    that moved;
 4. measures every batch (`memory.measure_batch`) and flags out-of-memory and
    throughput-collapse batches, which is what the orchestrator's deflation
-   path consumes;
+   path consumes — and, since run2's R3, says *why* it called a failure an
+   out-of-memory condition ([`classify_oom`]), so the orchestrator never has
+   to re-derive that from a message it can only pattern-match;
 5. restores the original input order before replying, since bucketed packing
    reorders items and the dispatcher splits outputs back by position.
 
@@ -50,6 +52,49 @@ logger = logging.getLogger("inferio_worker.packing")
 # `INFERENCE_OOM_BATCH_SIZE_1:` (from inferio.impl.utils) already covers the
 # single-item case.
 OOM_WINDOW_PREFIX = "INFERENCE_OOM_WINDOW:"
+
+# The substring every one of our own out-of-memory markers contains
+# (`INFERENCE_OOM_BATCH_SIZE_1:` from inferio.impl.utils, and
+# [`OOM_WINDOW_PREFIX`] above). Case-sensitive on purpose: it is a token we
+# emit, not prose a driver wrote.
+OOM_MARKER = "INFERENCE_OOM"
+
+# `oom_class.exception` when the classification came from the impl helper's
+# halving counter rather than from an exception — a batch that *succeeded*
+# after the impl absorbed an out-of-memory condition internally has no
+# exception to name (docs/inferio-worker-protocol.md, "Memory sensing").
+OOM_HALVING_WITNESS = "run_with_oom_retry"
+
+# `oom_class.source` values, in descending order of how much the orchestrator
+# can conclude from one. The wire vocabulary is fixed by the protocol doc.
+OOM_SOURCE_TYPED = "typed_exception"
+OOM_SOURCE_MARKER = "marker"
+OOM_SOURCE_PATTERN = "message_pattern"
+
+# Driver-shaped message fragments, lower-cased, for the fallback tier of the
+# classifier. Every entry names an allocator, a driver or a CUDA/HIP API that
+# only ever emits it for an allocation failure. A bare `out of memory` is
+# deliberately absent: run1 measured it deflating a healthy model 15 times on
+# a board with 96 GB free, from an impl that worded an unrelated failure as
+# "out of memory slots" (batch-calibration run1 report §4, Q1/B11).
+OOM_MESSAGE_PATTERNS = (
+    "cuda out of memory",
+    "cuda error: out of memory",
+    "hip out of memory",
+    "hip error: out of memory",
+    "mps backend out of memory",
+    "enforce fail at alloc_cpu.cpp",
+    "cublas_status_alloc_failed",
+    "cudnn_status_alloc_failed",
+    "cudaerrormemoryallocation",
+)
+
+# Two-part patterns: both fragments must appear in the same message. CPU
+# torch's classic allocator failure ("DefaultCPUAllocator: can't allocate
+# memory: you tried to allocate …") is one string in practice, but the middle
+# of it varies by torch version, and neither half alone is specific enough to
+# match on.
+OOM_MESSAGE_PAIRS = (("defaultcpuallocator", "allocate memory"),)
 
 # Units/sec ratio below which a pool-growing batch is judged to have spilled
 # to system RAM rather than run. On Windows' WDDM the driver's sysmem
@@ -470,40 +515,180 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _looks_like_oom(exc: BaseException) -> bool:
-    """Whether an exception from `instance.predict` is an out-of-memory one.
+def _qualified_name(cls: type) -> str:
+    """`"torch.OutOfMemoryError"` for a library type, `"MemoryError"` for a
+    builtin. The name the orchestrator sees in `oom_class.exception`, and the
+    reason it is qualified: `OutOfMemoryError` alone is a name three
+    libraries could plausibly have used."""
+    module = getattr(cls, "__module__", "") or ""
+    # `__name__`, not `__qualname__`: every type this can name is defined at
+    # module level, and a qualname would only add an enclosing-scope prefix
+    # for something defined inside a function — noise on a wire field a human
+    # reads out of a log.
+    name = getattr(cls, "__name__", None) or repr(cls)
+    if not module or module in ("builtins", "__main__"):
+        return name
+    return f"{module}.{name}"
 
-    Covers the impl's own `InferenceOOMError` (batch-1, already prefixed),
-    torch's `OutOfMemoryError` and the interpreter's own `MemoryError` by
-    class name (no torch import here), and the bare allocator message for
-    anything that re-raised untyped.
 
-    Two of those messages are the only signal their backend has
-    (docs/unified-memory-admission.md, "Negative signals"). MPS raises
-    `RuntimeError("MPS backend out of memory (…)")`, which the generic
-    substring already catches; CPU torch raises
-    `RuntimeError("… DefaultCPUAllocator: can't allocate memory …")`, whose
-    text says nothing about being out of memory, hence the explicit form.
-    The classifier is data — extending it is how a new backend's spelling is
-    learned — and it is deliberately the *only* way an untyped exception is
-    treated as an out-of-memory condition.
+def _typed_oom(error: BaseException) -> str | None:
+    """The exception's name when it is an allocator failure by **type**.
+
+    Two types, and only two. `torch.OutOfMemoryError` is the one CUDA raises
+    and — the same class object — the one a HIP build raises, so ROCm needs no
+    entry of its own; it is looked up through `sys.modules` rather than
+    imported, because this module must never import torch (module docstring),
+    and an exception that *is* one guarantees torch is already there. The
+    interpreter's own `MemoryError` is host-RAM exhaustion, a builtin no
+    library could hand us, and the only form the CPU allocator's hard failure
+    takes.
+
+    The name-on-the-MRO fallback exists for the case where torch is absent
+    from `sys.modules` but an `OutOfMemoryError` still arrives (a fake in a
+    test, an exception rebuilt across a process boundary). It is a *type*
+    test, not a message test: nothing about it depends on what the exception
+    says.
     """
-    for error in (exc, exc.__cause__, exc.__context__):
-        if error is None:
-            continue
-        if type(error).__name__ in (
-            "OutOfMemoryError",
-            "InferenceOOMError",
-            "MemoryError",
+    if isinstance(error, MemoryError):
+        return _qualified_name(type(error))
+    torch = sys.modules.get("torch")
+    oom_type = getattr(torch, "OutOfMemoryError", None) if torch is not None else None
+    if isinstance(oom_type, type) and isinstance(error, oom_type):
+        return _qualified_name(type(error))
+    for cls in type(error).__mro__:
+        if cls.__name__ == "OutOfMemoryError":
+            return _qualified_name(type(error))
+    return None
+
+
+def _marker_oom(error: BaseException) -> str | None:
+    """The exception's name when it carries one of *our own* OOM markers.
+
+    `inferio.impl.utils.run_with_oom_retry` classifies a device failure one
+    frame below the impl and re-raises it as `InferenceOOMError`, whose text
+    starts `INFERENCE_OOM_BATCH_SIZE_1:`; the harness's own whole-window
+    wrapper uses `INFERENCE_OOM_WINDOW:`. Both are our code stating a
+    classification it already made from a typed exception, so they are
+    structural evidence and not a message pattern — the string is a marker we
+    emit, not a driver's prose. Matched by type name as well as by text, so a
+    marker whose message an impl reworded is still recognised.
+    """
+    if type(error).__name__ == "InferenceOOMError":
+        return _qualified_name(type(error))
+    if OOM_MARKER in str(error):
+        return _qualified_name(type(error))
+    return None
+
+
+def _pattern_oom(error: BaseException) -> str | None:
+    """The exception's name when its text is **driver-shaped**.
+
+    The last resort, and the only tier that reads prose. Every entry names an
+    allocator or a driver explicitly, because run1 measured what happens when
+    the test is looser: a bare `out of memory` substring deflated a healthy
+    model 15 times on a board with 96 GB free, purely because an impl worded
+    an unrelated failure as "out of memory slots" (report §4, Q1/B11). That
+    substring is deliberately **not** here.
+
+    MPS is why the tier exists at all: an MPS allocation failure is a plain
+    `RuntimeError("MPS backend out of memory (…)")` and there is no typed
+    form of it to catch (docs/unified-memory-admission.md, "Negative
+    signals"). CPU torch's `DefaultCPUAllocator` message is the same shape —
+    it does not even contain the words "out of memory" — and the
+    `alloc_cpu.cpp` enforce-fail is the newer spelling of it. The CUBLAS,
+    CUDNN and cudaError entries are allocation failures the driver reports
+    without ever saying "out of memory".
+
+    Extending this tuple is how a new backend's spelling is learned; widening
+    it into a generic substring is how a healthy model gets deflated.
+    """
+    lowered = str(error).lower()
+    for pattern in OOM_MESSAGE_PATTERNS:
+        if pattern in lowered:
+            return _qualified_name(type(error))
+    for first, second in OOM_MESSAGE_PAIRS:
+        if first in lowered and second in lowered:
+            return _qualified_name(type(error))
+    return None
+
+
+def _chain(exc: BaseException | None) -> tuple[BaseException, ...]:
+    """The exception and the two links Python attaches to it.
+
+    `__cause__` and `__context__` are scanned because an out-of-memory error
+    re-raised inside an `except` block — which is exactly what
+    `run_with_oom_retry` does — would otherwise be invisible.
+    """
+    return tuple(
+        error
+        for error in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None))
+        if error is not None
+    )
+
+
+def classify_oom(
+    exc: BaseException | None, absorbed: int = 0
+) -> dict[str, Any] | None:
+    """`oom_class` for a batch, or `None` when nothing says out of memory.
+
+    The structural signal run2's R3 asks for
+    (docs/inferio-worker-protocol.md, "Memory sensing"): the worker decides
+    *and says how it decided*, so the orchestrator can act on a typed
+    exception outright and corroborate a textual one against
+    `free_mb_at_failure` before it deflates anything.
+
+    The three tiers are tried over the whole exception chain in strength
+    order, not in chain order, so the strongest available evidence wins
+    wherever it sits: an `InferenceOOMError` raised `from` a
+    `torch.OutOfMemoryError` classifies as `typed_exception`, because that is
+    what it actually is. A batch that *succeeded* while the impl's halving
+    loop absorbed an out-of-memory condition has no exception at all and is
+    classified from the halving counter (`absorbed`), as a `marker`.
+
+    Returning `None` is a positive statement, not an absence of information:
+    this batch's failure was **not** an out-of-memory condition, and the
+    orchestrator must not deflate on it.
+
+    Never raises: a classifier that threw would turn a failed batch into a
+    dead worker.
+    """
+    try:
+        chain = _chain(exc)
+        found: tuple[str, str] | None = None
+        for source, probe in (
+            (OOM_SOURCE_TYPED, _typed_oom),
+            (OOM_SOURCE_MARKER, _marker_oom),
+            (OOM_SOURCE_PATTERN, _pattern_oom),
         ):
-            return True
-        text = str(error)
-        lowered = text.lower()
-        if "out of memory" in lowered or "INFERENCE_OOM" in text:
-            return True
-        if "defaultcpuallocator" in lowered and "allocate memory" in lowered:
-            return True
-    return False
+            for error in chain:
+                name = probe(error)
+                if name is not None:
+                    found = (source, name)
+                    break
+            if found is not None:
+                break
+        if found is None and absorbed > 0:
+            # No exception to name: the batch ran, and the only witness is the
+            # impl helper's halving counter. Naming the helper rather than
+            # inventing an exception keeps `exception` honest about what was
+            # actually observed.
+            found = (OOM_SOURCE_MARKER, OOM_HALVING_WITNESS)
+        if found is None:
+            return None
+        # One live reading, taken now, on the failure path only. It is the
+        # corroboration a `message_pattern` verdict needs: an out-of-memory
+        # claim made while the board has tens of GB free is a wording, not a
+        # condition.
+        free_mb, _, _ = memory.free_total_mb()
+        return {
+            "source": found[0],
+            "exception": found[1],
+            "free_mb_at_failure": free_mb,
+            "device": memory.device_label(),
+        }
+    except Exception as exc_inner:  # pragma: no cover - defensive
+        logger.debug("out-of-memory classification failed: %s", exc_inner)
+        return None
 
 
 def batching_disabled(instance: Any) -> bool:
@@ -736,7 +921,6 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
         try:
             produced = list(instance.predict([inputs[index] for index in batch]))
         except Exception as exc:
-            oom = _looks_like_oom(exc)
             # A failed batch is NEVER priceable, whatever it failed of. Its
             # peaks describe however far the call got before it gave up, which
             # understates the cost of the batch we packed — and a non-OOM
@@ -746,11 +930,21 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
             # by a failure. The `oom` flag still rides the measurement, and that
             # is what deflation consumes.
             _, absorbed = _batch_shape(retry_before, len(batch), halvings_before)
+            oom_class = classify_oom(exc, absorbed)
+            oom = oom_class is not None
+            if not oom:
+                logger.debug(
+                    "a batch of %d inputs failed with %s, which is not an "
+                    "out-of-memory condition; reporting it without the oom flag",
+                    len(batch),
+                    type(exc).__name__,
+                )
             record(
                 memory.measure_batch(
                     state,
                     items=len(batch),
-                    oom=oom or absorbed > 0,
+                    oom=oom,
+                    oom_class=oom_class,
                 )
             )
             message = str(exc)
@@ -794,6 +988,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
             items=len(batch),
             units=priced if priceable else None,
             oom=absorbed_ooms > 0,
+            oom_class=classify_oom(None, absorbed_ooms) if absorbed_ooms else None,
         )
         if absorbed_ooms:
             logger.warning(

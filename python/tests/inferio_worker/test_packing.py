@@ -488,6 +488,190 @@ def test_the_oom_classifier_covers_the_non_cuda_backends(fake_torch):
     assert packing.OOM_WINDOW_PREFIX not in str(caught.value)
 
 
+# ---------------------------------------------------------------------------
+# Structural out-of-memory classification (run2 R3)
+# ---------------------------------------------------------------------------
+
+
+class FakeTorchOom(RuntimeError):
+    """A stand-in for `torch.OutOfMemoryError`.
+
+    The real one is a `RuntimeError` subclass exported as `torch.OutOfMemoryError`
+    and aliased as `torch.cuda.OutOfMemoryError` — the same class object on a
+    CUDA build and on a HIP one, which is why the classifier needs no ROCm
+    entry of its own.
+    """
+
+    __module__ = "torch"
+
+
+@pytest.fixture
+def fake_torch_with_oom_type(fake_torch):
+    """`fake_torch` whose module also exports the typed OOM class."""
+    sys.modules["torch"].OutOfMemoryError = FakeTorchOom
+    sys.modules["torch"].cuda.OutOfMemoryError = FakeTorchOom
+    yield fake_torch
+
+
+def test_a_typed_allocator_exception_classifies_structurally(fake_torch_with_oom_type):
+    """The tier that needs no text at all: the exception *is* the answer."""
+    fake_torch_with_oom_type.free = 137 * MIB
+    classified = packing.classify_oom(FakeTorchOom("anything at all"))
+    assert classified["source"] == packing.OOM_SOURCE_TYPED
+    assert classified["exception"] == "torch.FakeTorchOom"
+    assert classified["free_mb_at_failure"] == 137, "the live reading at failure"
+    assert classified["device"] == "cuda"
+
+
+def test_the_typed_tier_holds_on_a_hip_build(fake_rocm_torch):
+    """ROCm raises the same class, so one entry covers both backends."""
+    sys.modules["torch"].OutOfMemoryError = FakeTorchOom
+    classified = packing.classify_oom(FakeTorchOom("HIP out of memory"))
+    assert classified["source"] == packing.OOM_SOURCE_TYPED
+    assert classified["device"] == "rocm"
+
+
+def test_host_ram_exhaustion_is_typed(fake_torch):
+    """`MemoryError` is a builtin no library could hand us, so it is a type
+    test even though the CPU allocator's other form is a message one."""
+    classified = packing.classify_oom(MemoryError())
+    assert classified["source"] == packing.OOM_SOURCE_TYPED
+    assert classified["exception"] == "MemoryError"
+
+
+def test_our_own_markers_classify_as_markers(fake_torch):
+    """`INFERENCE_OOM_*` is our code restating a classification it already
+    made one frame lower, so it is structural rather than prose."""
+
+    class InferenceOOMError(RuntimeError):
+        __module__ = "inferio.impl.utils"
+
+    by_type = packing.classify_oom(InferenceOOMError("reworded by an impl"))
+    assert by_type["source"] == packing.OOM_SOURCE_MARKER
+    assert by_type["exception"] == "inferio.impl.utils.InferenceOOMError"
+
+    by_text = packing.classify_oom(
+        RuntimeError(f"{packing.OOM_WINDOW_PREFIX} out of GPU memory on 8 inputs")
+    )
+    assert by_text["source"] == packing.OOM_SOURCE_MARKER
+
+
+def test_a_marker_raised_from_a_typed_exception_reports_the_type(
+    fake_torch_with_oom_type,
+):
+    """Strength order, not chain order: `run_with_oom_retry` raises its marker
+    `from` the driver's own exception, and the driver's exception is the
+    stronger statement of the two."""
+
+    class InferenceOOMError(RuntimeError):
+        pass
+
+    try:
+        try:
+            raise FakeTorchOom("CUDA out of memory")
+        except FakeTorchOom as driver:
+            raise InferenceOOMError("INFERENCE_OOM_BATCH_SIZE_1: …") from driver
+    except InferenceOOMError as marker:
+        classified = packing.classify_oom(marker)
+    assert classified["source"] == packing.OOM_SOURCE_TYPED
+
+
+def test_the_message_tier_only_matches_driver_shaped_text(fake_torch):
+    """Every form a backend with no typed exception actually emits."""
+    driver_shaped = (
+        "CUDA out of memory. Tried to allocate 2.00 GiB",
+        "CUDA error: out of memory",
+        "HIP out of memory. Tried to allocate 512.00 MiB",
+        "HIP error: out of memory",
+        "MPS backend out of memory (MPS allocated: 18.09 GB)",
+        "[enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: can't "
+        "allocate memory: you tried to allocate 12884901888 bytes.",
+        "cublas runtime error: CUBLAS_STATUS_ALLOC_FAILED",
+        "cuDNN error: CUDNN_STATUS_ALLOC_FAILED",
+        "cudaErrorMemoryAllocation",
+    )
+    for text in driver_shaped:
+        classified = packing.classify_oom(RuntimeError(text))
+        assert classified is not None, text
+        assert classified["source"] == packing.OOM_SOURCE_PATTERN, text
+
+
+def test_a_bare_out_of_memory_substring_is_not_an_oom(fake_torch):
+    """B11, verbatim: run1 measured this exact wording deflating a healthy
+    model 15 times on a board with 96 GB free (run1 report §4, Q1)."""
+    healthy = ValueError(
+        "refusing merged batch of 8: the caption cache is out of memory slots"
+    )
+    assert packing.classify_oom(healthy) is None
+
+
+def test_an_absorbed_halving_is_a_marker_with_no_exception(fake_torch):
+    """A batch that *succeeded* while the impl halved internally has nothing
+    to name, so the witness is named instead of an exception being invented."""
+    classified = packing.classify_oom(None, absorbed=2)
+    assert classified["source"] == packing.OOM_SOURCE_MARKER
+    assert classified["exception"] == packing.OOM_HALVING_WITNESS
+    assert packing.classify_oom(None, absorbed=0) is None
+
+
+def test_a_failed_batch_carries_its_class_on_the_measurement(
+    fake_torch_with_oom_type,
+):
+    fake_torch_with_oom_type.free = 64 * MIB
+
+    class Failing:
+        def predict(self, inputs):
+            raise FakeTorchOom("CUDA out of memory")
+
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(Failing(), items(2), grant(unit_budget=2))
+    measurement = caught.value.measurements[0]
+    assert measurement["oom"] is True
+    assert measurement["oom_class"]["source"] == packing.OOM_SOURCE_TYPED
+    assert measurement["oom_class"]["free_mb_at_failure"] == 64
+
+
+def test_a_non_memory_failure_carries_no_class_at_all(fake_torch):
+    """The half of R3 the orchestrator acts on: no class and no flag means
+    *this was not a memory event*, so nothing may deflate on it."""
+
+    class Failing:
+        def predict(self, inputs):
+            raise ValueError("the caption cache is out of memory slots")
+
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(Failing(), items(2), grant(unit_budget=2))
+    measurement = caught.value.measurements[0]
+    assert measurement.get("oom") is None
+    assert "oom_class" not in measurement
+    assert packing.OOM_WINDOW_PREFIX not in str(caught.value)
+
+
+def test_an_internally_absorbed_oom_carries_the_marker_class(
+    fake_torch, fake_oom_retry
+):
+    class Halving:
+        def predict(self, inputs):
+            fake_oom_retry.record(largest=len(inputs), halvings=1)
+            return [None] * len(inputs)
+
+    payload = packing.run_window(Halving(), items(2), grant(unit_budget=2))
+    measurement = payload["measurements"][0]
+    assert measurement["oom"] is True
+    assert measurement["oom_class"]["source"] == packing.OOM_SOURCE_MARKER
+    assert measurement["oom_class"]["exception"] == packing.OOM_HALVING_WITNESS
+
+
+def test_the_classifier_never_raises(fake_torch):
+    """A classifier that threw would turn a failed batch into a dead worker."""
+
+    class Hostile(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("no string for you")
+
+    assert packing.classify_oom(Hostile()) is None
+
+
 def test_a_wrong_output_count_fails_the_window(fake_torch):
     with pytest.raises(packing.WindowFailure) as caught:
         packing.run_window(Recorder(wrong_count=True), items(2), grant(unit_budget=2))

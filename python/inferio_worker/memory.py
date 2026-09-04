@@ -667,6 +667,48 @@ def device_identity() -> tuple[str | None, str | None]:
     )
 
 
+def device_label() -> str:
+    """Which device the memory figures reported beside this label describe.
+
+    `"<backend>"`, or `"<backend>:<board uuid>"` when the board's identity is
+    known. It exists for `oom_class.device`
+    (docs/inferio-worker-protocol.md, "Memory sensing"): a free-memory reading
+    taken at a failure is only interpretable against the board it was taken
+    on, and a multi-GPU host has more than one board to be wrong about.
+
+    The backend is resolved in the same precedence the rest of this module
+    uses, and for the same reasons. A host priced against system RAM is
+    `"cpu"` whatever hardware it has ([`_ram_currency`]) — the same statement
+    [`device_identity`] makes before it consults torch at all. A ROCm build is
+    `"rocm"`, tested first, because its `torch.cuda` namespace is hipified and
+    would otherwise read as CUDA; the pre-import half of that test
+    ([`_hip_pinned`]) answers for a worker whose impl has not imported torch
+    yet. Then live CUDA, then MPS. `"unknown"` when torch was never imported
+    or never initialised a device, which is the honest answer and the same one
+    `device_identity` gives.
+
+    Never raises and never initializes anything: every tier here is one this
+    module already reads for other purposes.
+    """
+    try:
+        if _ram_currency():
+            return "cpu"
+        torch = _torch()
+        if (torch is not None and _is_hip(torch)) or _hip_pinned():
+            kind = "rocm"
+        elif _torch_cuda() is not None:
+            kind = "cuda"
+        elif _torch_mps() is not None:
+            kind = "mps"
+        else:
+            kind = "unknown"
+        uuid, _ = device_identity()
+        return f"{kind}:{uuid}" if uuid else kind
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("device label unavailable: %s", exc)
+        return "unknown"
+
+
 def device_bdf() -> str | None:
     """This worker's board as a PCI address (`dddd:bb:dd.0`), or None.
 
@@ -2529,6 +2571,7 @@ def measure_batch(
     units: int | None = None,
     oom: bool = False,
     throughput_collapse: bool = False,
+    oom_class: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One measurement map for the batch bracketed by `state` (never raises).
 
@@ -2543,6 +2586,13 @@ def measure_batch(
     `instance.predict(batch)` alone, deliberately: unit pricing (image-header
     reads, byte counts) happens before the bracket so the throughput-collapse
     comparator sees GPU throughput rather than CPU decode noise.
+
+    `oom_class` says *why* the caller called this an out-of-memory condition
+    (`packing.classify_oom`). It rides the measurement only when `oom` is set,
+    because that is the contract the orchestrator reads it under: absent
+    `oom_class` beside an absent `oom` is "this worker saw no out-of-memory
+    condition", including on a batch that failed for some other reason
+    (docs/inferio-worker-protocol.md, "Memory sensing").
     """
     try:
         _, _, peak_reserved, peak_allocated = _allocator_stats()
@@ -2564,6 +2614,8 @@ def measure_batch(
             measurement["units"] = units
         if oom:
             measurement["oom"] = True
+            if oom_class:
+                measurement["oom_class"] = oom_class
         if throughput_collapse:
             measurement["throughput_collapse"] = True
         return measurement
@@ -2576,6 +2628,8 @@ def measure_batch(
         minimal: dict[str, Any] = {"items": items}
         if oom:
             minimal["oom"] = True
+            if oom_class:
+                minimal["oom_class"] = oom_class
         if throughput_collapse:
             minimal["throughput_collapse"] = True
         return minimal
