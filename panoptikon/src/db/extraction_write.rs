@@ -901,3 +901,161 @@ mod tests {
         assert_eq!(logged, (0, None), "auto logs as the 0 sentinel");
     }
 }
+
+#[cfg(test)]
+mod terminal_path_tests {
+    use super::*;
+    use crate::db::job_failures::{OUTCOME_CANCELLED, OUTCOME_FAILED};
+    use crate::db::migrations::setup_test_databases;
+
+    /// A `data_log` row as the reader sees the four fields that say how the
+    /// job ended.
+    async fn ending(
+        conn: &mut sqlx::SqliteConnection,
+        job_id: i64,
+    ) -> (String, String, String, Option<String>) {
+        let row = sqlx::query(
+            "SELECT start_time, end_time, outcome, failure_reason \
+             FROM data_log WHERE job_id = ?",
+        )
+        .bind(job_id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        (
+            row.try_get("start_time").unwrap(),
+            row.try_get("end_time").unwrap(),
+            row.try_get("outcome").unwrap(),
+            row.try_get("failure_reason").unwrap(),
+        )
+    }
+
+    /// The timestamp both columns are backdated to, so "did this path write a
+    /// *fresh* `end_time`?" is answerable at all.
+    const LONG_AGO: &str = "2020-01-01T00:00:00";
+
+    /// Inserts a job and backdates it into exactly the shape run1 finding T8
+    /// measured: `end_time == start_time`, `outcome` claiming no ending.
+    ///
+    /// The backdating is what makes the assertions deterministic.
+    /// `current_iso_timestamp` has one-second resolution, so in real time
+    /// `end_time == start_time` is also a *legitimate* reading for any job
+    /// that ends within a second of starting — which is precisely why T8's
+    /// real fix is `outcome` recording the ending explicitly, and why these
+    /// tests check both.
+    async fn old_job(conn: &mut sqlx::SqliteConnection) -> i64 {
+        let job_id = add_data_log(conn, LONG_AGO, None, &["tags".to_string()], "test/clip", 1)
+            .await
+            .unwrap();
+        // `add_data_log` stamps `end_time` with the insert time; a running job
+        // carries start == end until something records its ending.
+        sqlx::query("UPDATE data_log SET start_time = ?, end_time = ? WHERE job_id = ?")
+            .bind(LONG_AGO)
+            .bind(LONG_AGO)
+            .bind(job_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        job_id
+    }
+
+    fn unfinished_update(reason: &str) -> DataLogUpdate {
+        DataLogUpdate {
+            image_files: 1,
+            video_files: 0,
+            other_files: 0,
+            total_segments: 3,
+            errors: 2,
+            input_errors: 0,
+            total_remaining: 5,
+            data_load_time: 0.5,
+            inference_time: 1.5,
+            finished: false,
+            outcome: OUTCOME_FAILED,
+            failure_reason: Some(reason.to_string()),
+        }
+    }
+
+    /// The early-return path (`jobs::extraction::finalize_unfinished_job`)
+    /// records the ending: a fresh `end_time`, `failed`, the reason, and the
+    /// counters it reached — none of which run1 found on the row it measured.
+    #[tokio::test]
+    async fn a_job_that_stops_early_records_a_real_ending() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let job_id = old_job(conn).await;
+
+        let (start, end, outcome, reason) = ending(conn, job_id).await;
+        assert_eq!(start, LONG_AGO);
+        assert_eq!(end, start, "a running row's end_time is its start_time");
+        assert_eq!(outcome, OUTCOME_RUNNING, "and it claims no ending");
+        assert_eq!(reason, None);
+
+        update_data_log(conn, job_id, &unfinished_update("the writer went away"))
+            .await
+            .unwrap();
+
+        let (start, end, outcome, reason) = ending(conn, job_id).await;
+        assert_ne!(end, start, "the early return must stamp a real end_time");
+        assert_eq!(outcome, OUTCOME_FAILED);
+        assert_eq!(reason.as_deref(), Some("the writer went away"));
+        let completed: i64 = sqlx::query("SELECT completed FROM data_log WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+            .try_get("completed")
+            .unwrap();
+        assert_eq!(completed, 0, "the items it never reached are still owed");
+    }
+
+    /// The cancellation drop guard stamps a row that recorded nothing, and is
+    /// a no-op on one that recorded its own ending — the property that lets it
+    /// be armed once and never disarmed.
+    #[tokio::test]
+    async fn the_cancel_stamp_fills_a_blank_ending_and_never_overwrites_one() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+
+        let cancelled = old_job(conn).await;
+        assert_eq!(finalize_cancelled_job(conn, cancelled).await.unwrap(), 1);
+        let (start, end, outcome, reason) = ending(conn, cancelled).await;
+        assert_ne!(end, start, "only this guard knows when the job stopped");
+        assert_eq!(outcome, OUTCOME_CANCELLED);
+        assert_eq!(reason.as_deref(), Some("The job was cancelled"));
+
+        // A job that already said how it ended is left exactly as it was, so
+        // the guard is safe to run on every path.
+        let failed = old_job(conn).await;
+        update_data_log(conn, failed, &unfinished_update("inference is down"))
+            .await
+            .unwrap();
+        let before = ending(conn, failed).await;
+        assert_eq!(
+            finalize_cancelled_job(conn, failed).await.unwrap(),
+            0,
+            "the guard must not touch a row that recorded its own ending"
+        );
+        assert_eq!(ending(conn, failed).await, before);
+    }
+
+    /// The path a job's *process* death leaves behind: a later run finds the
+    /// row, stamps it `cancelled` and deliberately leaves `end_time` alone,
+    /// because for a row left by a dead process "now" is when we noticed.
+    #[tokio::test]
+    async fn a_row_left_by_a_dead_process_is_stamped_without_inventing_an_end_time() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let job_id = old_job(conn).await;
+
+        remove_incomplete_jobs(conn).await.unwrap();
+
+        let (start, end, outcome, reason) = ending(conn, job_id).await;
+        assert_eq!(end, start, "the sweep must not claim to know when it died");
+        assert_eq!(outcome, OUTCOME_CANCELLED);
+        assert!(
+            reason.is_some_and(|text| text.contains("did not finish")),
+            "and it must say why the row is there"
+        );
+    }
+}

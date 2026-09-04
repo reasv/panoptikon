@@ -1020,11 +1020,6 @@ async fn run_extraction_job_inner(
         reply,
     })
     .await?;
-    let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpsertSetter {
-        setter_name: model.setter_name.clone(),
-        reply,
-    })
-    .await?;
 
     // Created before the block below so a failure *inside* it can still record
     // what the job had done and how far it got.
@@ -1043,6 +1038,17 @@ async fn run_extraction_job_inner(
         job_id,
     };
     let items_result: ApiResult<i64> = async {
+        // The setter row has to exist before any output references it. It is
+        // written *inside* the block rather than above it because it is a
+        // writer round trip like every other, and one that failed above would
+        // have been the last uncovered early return between the `data_log`
+        // insert and the guard — leaving exactly the row run1 finding T8
+        // measured: `end_time == start_time`, `outcome = ''`, no reason.
+        let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpsertSetter {
+            setter_name: model.setter_name.clone(),
+            reply,
+        })
+        .await?;
         let load_result = {
             // Under the batch slot, with the generation bumped first: a boundary
             // unload spawned before this load either already ran (and this load
