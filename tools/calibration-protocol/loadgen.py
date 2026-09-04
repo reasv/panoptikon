@@ -41,6 +41,14 @@ Other options: --duration S, --requests N (per model, overridden by the spec),
 --timeout S, --seed N, --warmup-load/--no-warmup-load (PUT /api/inference/load
 once per model first), --quiet.
 
+`--prewarm-only [--hold S]` is the S2-base plateau leg: PUT the load for every
+`--model`, hold them resident and idle for S seconds (default 60), and exit
+without issuing a single predict, so `analyze.py`'s `base_accuracy` has a
+window of samples in which each worker holds its base and nothing else. It
+needs no corpus, and it writes a `{"kind": "hold", ...}` record. Give the
+models room to co-reside -- `lru_size=<number of models>`, or a distinct
+`cache_key=` each -- or the second load evicts the first from the slot.
+
 Wire format
 -----------
 `multipart/form-data` with a `data` field holding
@@ -192,10 +200,18 @@ class ModelSpec:
         self.order = fields.get("order", "sequential")
         self.interval = float(fields.get("interval", 0.0))
         self.data = json.loads(fields["data"]) if "data" in fields else {}
-        if not self.corpus:
-            raise SystemExit(f"loadgen: model {self.id} has no corpus= and no --corpus")
-        self.manifest = load_manifest(self.corpus)
-        self.pool = select_items(self.manifest, self.group, self.kind)
+        if getattr(defaults, "prewarm_only", False):
+            # No predict is ever issued, so a corpus is not just unnecessary,
+            # requiring one would mean building images for a leg whose whole
+            # point is that nothing is inferred (`--prewarm-only`).
+            self.manifest = {}
+            self.pool = []
+        else:
+            if not self.corpus:
+                raise SystemExit(
+                    f"loadgen: model {self.id} has no corpus= and no --corpus")
+            self.manifest = load_manifest(self.corpus)
+            self.pool = select_items(self.manifest, self.group, self.kind)
         self.cursor = 0
         self.lock = threading.Lock()
         self.sent = 0
@@ -386,6 +402,57 @@ def warmup_load(base: str, spec: ModelSpec, timeout: float) -> Dict[str, Any]:
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
+def prewarm_hold(args: argparse.Namespace, warmups: List[Dict[str, Any]],
+                 emit: Any) -> int:
+    """Hold the loaded models resident and idle, then leave (`--prewarm-only`).
+
+    The point of the leg is the *absence* of work. `base_accuracy` compares a
+    replica's reported `base_mb` against the oracle's per-process reading, and
+    the only samples that measure the same quantity are the ones between the
+    load and the replica's first grant or predict -- after that the process
+    also holds the batch's cuBLAS/cuDNN workspace. A demand-driven load starts
+    its first batch tens of milliseconds later, so at 1-4 Hz that window is
+    normally empty and every row is reported unjudged. Loading and then doing
+    nothing for a minute turns it into hundreds of samples of flat plateau
+    (run1/S6-b18-loadstall got 714 of them and reads 0.0%).
+
+    Nothing here talks to the gateway: the loads already happened, and holding
+    is exactly what an idle client does. The hold is interruptible, so a
+    SIGINT ends the leg cleanly rather than leaving the recorders running.
+    """
+    failed = [row for row in warmups if not row.get("ok")]
+    if len(failed) == len(warmups):
+        print("loadgen: nothing loaded, so there is no plateau to hold: " +
+              ", ".join(f"{row['model']} {row.get('error') or row.get('status')}"
+                        for row in failed), file=sys.stderr)
+        return 1
+    started = time.monotonic()
+    t_start = time.time()
+    if not args.quiet:
+        print(f"loadgen: {len(warmups) - len(failed)} model(s) loaded; holding "
+              f"idle for {args.hold:.0f}s", file=sys.stderr)
+    _stop.wait(args.hold)
+    held = time.monotonic() - started
+    emit({
+        "schema": "loadgen/1", "kind": "hold",
+        "iso": datetime.now(timezone.utc).isoformat(),
+        "t_start_wall": round(t_start, 6), "t_end_wall": round(time.time(), 6),
+        "requested_s": args.hold, "held_s": round(held, 3),
+        "interrupted": _stop.is_set(),
+        "models_loaded": [row["model"] for row in warmups if row.get("ok")],
+        "models_failed": [row["model"] for row in failed],
+    })
+    emit({
+        "schema": "loadgen/1", "kind": "summary", "elapsed_s": round(held, 3),
+        "prewarm_only": True, "models": {},
+    })
+    if failed:
+        print("loadgen: load failed for " +
+              ", ".join(row["model"] for row in failed), file=sys.stderr)
+        return 1
+    return 0 if held >= args.hold - 1.0 else 1
+
+
 def percentile(values: List[float], fraction: float) -> Optional[float]:
     if not values:
         return None
@@ -413,6 +480,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--seed", type=int, default=20260903)
     parser.add_argument("--warmup-load", action="store_true",
                         help="PUT /api/inference/load once per model before driving")
+    parser.add_argument("--prewarm-only", action="store_true",
+                        help="load every model, hold them resident and idle for "
+                             "--hold seconds, and exit without a single predict "
+                             "(the S2-base plateau leg). Implies --warmup-load "
+                             "and needs no corpus.")
+    parser.add_argument("--hold", type=float, default=60.0,
+                        help="seconds to hold the models resident and idle under "
+                             "--prewarm-only")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -438,11 +513,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         "models": [spec.describe() for spec in specs],
     })
 
-    if args.warmup_load:
+    warmups: List[Dict[str, Any]] = []
+    if args.warmup_load or args.prewarm_only:
         for spec in specs:
+            result = warmup_load(base, spec, args.timeout)
+            warmups.append(result)
             emit({"schema": "loadgen/1", "kind": "warmup",
-                  "iso": datetime.now(timezone.utc).isoformat(),
-                  **warmup_load(base, spec, args.timeout)})
+                  "iso": datetime.now(timezone.utc).isoformat(), **result})
+
+    if args.prewarm_only:
+        return prewarm_hold(args, warmups, emit)
 
     started = time.monotonic()
     deadline = None if args.duration is None else started + args.duration
