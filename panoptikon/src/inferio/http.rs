@@ -3475,7 +3475,7 @@ metadata.cost.unit = "none"
         // is sized for the largest legitimate *single-input* request, which
         // `check_frame_budget` admits up to 8 MiB below it.
         assert_eq!(PREDICT_BODY_LIMIT, MAX_FRAME_BYTES);
-        assert!(crate::inferio::worker::FRAME_INPUT_BYTES_BUDGET < PREDICT_BODY_LIMIT);
+        const { assert!(crate::inferio::worker::FRAME_INPUT_BYTES_BUDGET < PREDICT_BODY_LIMIT) };
     }
 
     /// **The bound `PREDICT_BODY_LIMIT` cannot be: what this process holds in
@@ -3499,7 +3499,7 @@ metadata.cost.unit = "none"
     async fn the_predict_body_budget_is_a_process_wide_ceiling_that_answers_503() {
         // Two maximal bodies fit, so a maximal request is never refused for
         // as long as another maximal one is in flight.
-        assert!(PREDICT_INFLIGHT_BODY_BYTES >= 2 * PREDICT_BODY_LIMIT);
+        const { assert!(PREDICT_INFLIGHT_BODY_BYTES >= 2 * PREDICT_BODY_LIMIT) };
 
         // A tiny stand-in for the real budget, leaked so it has the `'static`
         // lifetime a reservation outlives its request with.
