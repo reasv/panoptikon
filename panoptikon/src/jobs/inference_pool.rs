@@ -38,6 +38,32 @@ impl InferencePool {
         })
     }
 
+    /// Whether every endpoint this pool would use is known to multiplex its
+    /// requests over a shared connection pool (HTTP/2 cleartext).
+    ///
+    /// Conservative by construction: an endpoint nothing has talked to yet
+    /// has no known transport, and unknown reads as "not multiplexed". The
+    /// answer sizes a *descriptor* budget, and being wrong in the optimistic
+    /// direction is what run1 blocker F6 measured — `EMFILE`, a job that
+    /// could not finish, and SQLite unable to open its own files.
+    ///
+    /// A pool with no enabled endpoint answers `false` for the same reason.
+    pub async fn requests_are_multiplexed(&self) -> bool {
+        let guard = self.state.lock().await;
+        let mut enabled = 0usize;
+        for endpoint in guard.endpoints.iter().filter(|e| e.weight > 0.0) {
+            enabled += 1;
+            match endpoint.client.known_transport() {
+                Some(transport) if transport.is_multiplexed() => {}
+                // One HTTP/1.1 endpoint is enough to put the per-request
+                // socket cost back: the window is one budget across all of
+                // them, so it has to be sized for the most expensive.
+                _ => return false,
+            }
+        }
+        enabled > 0
+    }
+
     pub async fn is_empty(&self) -> bool {
         let guard = self.state.lock().await;
         guard

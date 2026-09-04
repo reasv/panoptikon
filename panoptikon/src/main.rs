@@ -710,6 +710,14 @@ async fn async_main() -> anyhow::Result<()> {
     });
     // One server task per listener, all serving the same router; the only
     // difference is the ListenerEndpoint extension the policy layer reads.
+    //
+    // `axum::serve` builds hyper-util's *auto* connection builder, which
+    // sniffs the HTTP/2 client preface and serves either version on the same
+    // port — so h2c with prior knowledge needs no upgrade handshake and no
+    // second listener. It is gated on axum's `http2` feature, which
+    // `Cargo.toml` therefore names explicitly; the inference client
+    // (`inferio_client.rs`) probes for exactly this and falls back to
+    // HTTP/1.1 against a server without it.
     let mut servers = Vec::new();
     for (name, listener) in listeners {
         let app = app

@@ -27,8 +27,8 @@ use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::db::{open_index_db_read, open_index_db_read_no_user_data};
 use crate::inferio::slot_error::{ProtocolViolation, SlotErrorClass};
 use crate::inferio_client::{
-    InferenceFile, InferenceInput, PredictOutput, PredictResponse, PredictSlotError,
-    inference_failure,
+    INFERENCE_POOL_CONNECTIONS, InferenceFile, InferenceInput, PredictOutput, PredictResponse,
+    PredictSlotError, inference_failure,
 };
 use crate::jobs::continuous_scan;
 use crate::jobs::files::{FileScanService, is_resync_needed};
@@ -99,7 +99,8 @@ const MIN_IN_FLIGHT_UNITS: usize = REQUEST_UNIT_BUDGET;
 /// bounds memory.
 const NOMINAL_UNIT_KIB: u32 = 256;
 
-/// File descriptors one in-flight work unit costs the gateway process.
+/// File descriptors one in-flight work unit costs the gateway process **when
+/// the inference client is not multiplexing** (the HTTP/1.1 fallback).
 ///
 /// An in-flight unit sits inside a predict request, and with local inference
 /// enabled that request is HTTP over loopback to a listener **in this same
@@ -110,7 +111,41 @@ const NOMINAL_UNIT_KIB: u32 = 256;
 /// in and one unit per item is the common case; an item worth several units
 /// costs the same two sockets, so counting units over-estimates, which is the
 /// safe direction for a cap.
+///
+/// Over HTTP/2 cleartext this term does not exist at all: a request is a
+/// stream on a pooled connection, so see [`FDS_PER_POOLED_CONNECTION`].
 const FDS_PER_IN_FLIGHT_ITEM: usize = 2;
+
+/// File descriptors one *pooled* inference connection costs, when the client
+/// multiplexes. Two for the same reason as above — local inference is
+/// loopback HTTP inside this process, so both ends of the connection are in
+/// this descriptor table — but the count is now per connection, and the pool
+/// is bounded by [`INFERENCE_POOL_CONNECTIONS`] rather than by the window.
+const FDS_PER_POOLED_CONNECTION: usize = 2;
+
+/// How the job's inference requests reach the server, for
+/// [`in_flight_unit_ceiling`]. The descriptor cost of an in-flight window is
+/// a completely different quantity in the two modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlightTransport {
+    /// HTTP/2 cleartext: requests share a bounded connection pool, so the
+    /// window's socket cost is `2 x pool connections` no matter how wide it
+    /// gets.
+    Multiplexed,
+    /// HTTP/1.1: one connection per concurrent request, which is the cost
+    /// run1 blocker F6 measured.
+    PerRequest,
+}
+
+impl InFlightTransport {
+    fn from_multiplexed(multiplexed: bool) -> Self {
+        if multiplexed {
+            Self::Multiplexed
+        } else {
+            Self::PerRequest
+        }
+    }
+}
 
 /// Descriptors held back from the in-flight window for everything else the
 /// process has open.
@@ -163,6 +198,16 @@ const FD_RESERVE: usize = 256;
 ///   process-wide rather than merely oversubscribe. See
 ///   [`FDS_PER_IN_FLIGHT_ITEM`] and [`FD_RESERVE`].
 ///
+///   **This term is a function of the transport.** Over HTTP/2 cleartext a
+///   request is a stream on a pooled connection, so the whole window costs
+///   `FDS_PER_POOLED_CONNECTION x INFERENCE_POOL_CONNECTIONS` — a constant,
+///   eight descriptors at the shipped pool size — and the window is free to
+///   be as wide as the two budgets above allow. The per-unit term survives
+///   only for the HTTP/1.1 fallback, where it is exactly the cost run1
+///   blocker F6 measured. The clamp stays in both modes as defence in depth:
+///   it is cheap, and it is the last thing between a bogus desired-in-flight
+///   figure and `EMFILE`.
+///
 /// Never below [`MIN_IN_FLIGHT_UNITS`], so the clamp in
 /// [`UnitBudget::observe`] is always a valid range — including when the
 /// descriptor budget is smaller than the floor needs, which is a
@@ -171,29 +216,53 @@ fn in_flight_unit_ceiling(
     intermediate_budget_kib: u32,
     loader_concurrency: usize,
     soft_nofile: u64,
+    transport: InFlightTransport,
 ) -> usize {
     let by_budget = (intermediate_budget_kib / NOMINAL_UNIT_KIB.max(1)) as usize;
     let by_loaders = loader_concurrency
         .max(1)
         .saturating_mul(REQUEST_UNIT_BUDGET);
     let wanted = by_budget.max(by_loaders).max(MIN_IN_FLIGHT_UNITS);
-    let by_fds = usize::try_from(soft_nofile)
-        .unwrap_or(usize::MAX)
-        .saturating_sub(FD_RESERVE)
-        / FDS_PER_IN_FLIGHT_ITEM;
-    if by_fds < MIN_IN_FLIGHT_UNITS {
-        tracing::warn!(
-            soft_nofile,
-            reserve = FD_RESERVE,
-            fds_per_item = FDS_PER_IN_FLIGHT_ITEM,
-            floor = MIN_IN_FLIGHT_UNITS,
-            "the open file descriptor limit is below what one job's minimum \
-             in-flight window needs; the job runs at the floor anyway and may \
-             hit 'Too many open files' — raise the hard limit (ulimit -Hn, \
-             or the container runtime's nofile setting)"
-        );
+    let budget = usize::try_from(soft_nofile).unwrap_or(usize::MAX);
+    match transport {
+        InFlightTransport::Multiplexed => {
+            // The pool is the whole socket cost, so the only question left is
+            // whether the host can afford the pool at all. That is a fixed
+            // handful of descriptors, so this fires only on a host whose
+            // limit is pathological — and there the window is not the problem.
+            let needed =
+                FD_RESERVE.saturating_add(FDS_PER_POOLED_CONNECTION * INFERENCE_POOL_CONNECTIONS);
+            if budget < needed {
+                tracing::warn!(
+                    soft_nofile,
+                    reserve = FD_RESERVE,
+                    pool_connections = INFERENCE_POOL_CONNECTIONS,
+                    needed,
+                    "the open file descriptor limit is below what the inference \
+                     connection pool and the process's other files need; raise \
+                     the hard limit (ulimit -Hn, or the container runtime's \
+                     nofile setting)"
+                );
+            }
+            wanted
+        }
+        InFlightTransport::PerRequest => {
+            let by_fds = budget.saturating_sub(FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM;
+            if by_fds < MIN_IN_FLIGHT_UNITS {
+                tracing::warn!(
+                    soft_nofile,
+                    reserve = FD_RESERVE,
+                    fds_per_item = FDS_PER_IN_FLIGHT_ITEM,
+                    floor = MIN_IN_FLIGHT_UNITS,
+                    "the open file descriptor limit is below what one job's minimum \
+                     in-flight window needs; the job runs at the floor anyway and may \
+                     hit 'Too many open files' — raise the hard limit (ulimit -Hn, \
+                     or the container runtime's nofile setting)"
+                );
+            }
+            wanted.min(by_fds.max(MIN_IN_FLIGHT_UNITS))
+        }
     }
-    wanted.min(by_fds.max(MIN_IN_FLIGHT_UNITS))
 }
 
 /// The job's in-flight unit budget: a resizable semaphore whose capacity
@@ -1028,10 +1097,17 @@ async fn run_extraction_job_inner(
         // It starts at the floor and then follows the desired in-flight figure
         // the inference server publishes on each response — the one number that
         // crosses the boundary, in items, so core never learns about VRAM.
+        // Read *after* the model load, which is the first thing that talks to
+        // every endpoint and therefore the first thing that resolves each
+        // one's transport. An endpoint nothing has reached yet answers "not
+        // multiplexed", which is the conservative direction.
+        let transport =
+            InFlightTransport::from_multiplexed(context.pool.requests_are_multiplexed().await);
         let unit_slots = Arc::new(UnitBudget::new(in_flight_unit_ceiling(
             context.intermediate_budget_kib,
             context.loader_concurrency,
             crate::rlimit::soft_nofile_limit(),
+            transport,
         )));
         let unit_capacity = request_unit_capacity(defaults.batch_size);
         // The cap travels with each request; `None` = auto.
@@ -3223,33 +3299,43 @@ mod tests {
     fn the_in_flight_ceiling_comes_from_the_byte_budget_and_the_loader_slots() {
         // A descriptor budget that cannot bind, so the other two terms show.
         const FDS: u64 = 524_288;
-        // Defaults: 1024 MB of intermediate budget, 8 loader slots. The byte
-        // budget is the binding term.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, FDS),
-            1024 * 1024 / 256
-        );
-        // A tiny byte budget falls back to the loader-slot term, which is the
-        // work core can keep in flight regardless.
-        assert_eq!(
-            in_flight_unit_ceiling(1024, 8, FDS),
-            8 * REQUEST_UNIT_BUDGET,
-            "loader_concurrency x REQUEST_UNIT_BUDGET is the floor of the ceiling"
-        );
-        // Never below one request's worth, whatever the configuration says.
-        assert_eq!(in_flight_unit_ceiling(0, 0, FDS), MIN_IN_FLIGHT_UNITS);
+        for transport in [
+            InFlightTransport::Multiplexed,
+            InFlightTransport::PerRequest,
+        ] {
+            // Defaults: 1024 MB of intermediate budget, 8 loader slots. The
+            // byte budget is the binding term.
+            assert_eq!(
+                in_flight_unit_ceiling(1024 * 1024, 8, FDS, transport),
+                1024 * 1024 / 256,
+                "{transport:?}"
+            );
+            // A tiny byte budget falls back to the loader-slot term, which is
+            // the work core can keep in flight regardless.
+            assert_eq!(
+                in_flight_unit_ceiling(1024, 8, FDS, transport),
+                8 * REQUEST_UNIT_BUDGET,
+                "loader_concurrency x REQUEST_UNIT_BUDGET is the floor of the ceiling"
+            );
+            // Never below one request's worth, whatever the configuration says.
+            assert_eq!(
+                in_flight_unit_ceiling(0, 0, FDS, transport),
+                MIN_IN_FLIGHT_UNITS
+            );
+        }
     }
 
-    /// The descriptor term (Phase 6 finding F6). Every in-flight unit costs
-    /// two sockets in this process when inference is local, so the soft
-    /// `RLIMIT_NOFILE` caps the window however much byte budget and however
-    /// many loader slots the configuration offers.
+    /// The descriptor term of the HTTP/1.1 fallback (Phase 6 finding F6).
+    /// There every in-flight unit costs two sockets in this process, so the
+    /// soft `RLIMIT_NOFILE` caps the window however much byte budget and
+    /// however many loader slots the configuration offers.
     #[test]
     fn the_in_flight_ceiling_is_capped_by_the_descriptor_budget() {
+        const H1: InFlightTransport = InFlightTransport::PerRequest;
         // The shipped container's soft limit, and the shape that produced the
         // regression: the byte budget alone would offer 4096 units, i.e.
         // ~8192 sockets against 1024 descriptors.
-        let ceiling = in_flight_unit_ceiling(1024 * 1024, 8, 1024);
+        let ceiling = in_flight_unit_ceiling(1024 * 1024, 8, 1024, H1);
         assert_eq!(
             ceiling,
             (1024 - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM,
@@ -3264,13 +3350,13 @@ mod tests {
         // host — leaves the pre-F6 value untouched, so nothing about the
         // shipped defaults changes on a correctly configured machine.
         assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 524_288),
+            in_flight_unit_ceiling(1024 * 1024, 8, 524_288, H1),
             1024 * 1024 / 256
         );
         // Including the "no limit to read" sentinel from a non-Unix host,
         // where the term must not overflow into a *small* number.
         assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, crate::rlimit::NOFILE_LIMIT_UNKNOWN),
+            in_flight_unit_ceiling(1024 * 1024, 8, crate::rlimit::NOFILE_LIMIT_UNKNOWN, H1),
             1024 * 1024 / 256
         );
 
@@ -3280,24 +3366,69 @@ mod tests {
         // performance choice). The job logs a WARN and runs at 64.
         let need = MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE;
         assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 256),
+            in_flight_unit_ceiling(1024 * 1024, 8, 256, H1),
             MIN_IN_FLIGHT_UNITS
         );
         assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, need as u64 - 1),
+            in_flight_unit_ceiling(1024 * 1024, 8, need as u64 - 1, H1),
             MIN_IN_FLIGHT_UNITS
         );
         // One descriptor more and the fd term is exactly the floor, so the
         // two paths agree at the boundary.
         assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, need as u64),
+            in_flight_unit_ceiling(1024 * 1024, 8, need as u64, H1),
             MIN_IN_FLIGHT_UNITS
         );
         // Zero, which `soft_nofile_limit` never returns but arithmetic must
         // survive.
         assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 0),
+            in_flight_unit_ceiling(1024 * 1024, 8, 0, H1),
             MIN_IN_FLIGHT_UNITS
+        );
+    }
+
+    /// R10': once requests are multiplexed the socket cost stops scaling with
+    /// the window, so the descriptor budget stops being a term of it at all.
+    /// The whole window costs `2 x pool connections` — eight descriptors at
+    /// the shipped pool size — where the HTTP/1.1 fallback would have paid
+    /// two per unit.
+    ///
+    /// This is the finding-F6 shape: at the shipped container's soft limit of
+    /// 1024, the HTTP/1.1 window is clamped to 384 units and the multiplexed
+    /// one keeps the byte budget's full 4096 while using **8** sockets.
+    #[test]
+    fn multiplexing_takes_the_descriptor_budget_out_of_the_window() {
+        const H2: InFlightTransport = InFlightTransport::Multiplexed;
+        const H1: InFlightTransport = InFlightTransport::PerRequest;
+
+        let multiplexed = in_flight_unit_ceiling(1024 * 1024, 8, 1024, H2);
+        let per_request = in_flight_unit_ceiling(1024 * 1024, 8, 1024, H1);
+        assert_eq!(multiplexed, 1024 * 1024 / 256, "the byte budget's figure");
+        assert_eq!(per_request, (1024 - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM);
+        assert!(
+            multiplexed > per_request,
+            "multiplexing must not be the more conservative of the two"
+        );
+
+        // The whole point: the sockets that window costs are a constant.
+        let pool_sockets = FDS_PER_POOLED_CONNECTION * INFERENCE_POOL_CONNECTIONS;
+        assert_eq!(pool_sockets, 8);
+        assert!(
+            pool_sockets + FD_RESERVE <= 1024,
+            "the pool plus the reserve fits in the limit that could not hold the window"
+        );
+
+        // A pathological limit does not change the window — there is nothing
+        // to trade — and the floor still holds.
+        assert_eq!(
+            in_flight_unit_ceiling(1024 * 1024, 8, 64, H2),
+            1024 * 1024 / 256
+        );
+        assert_eq!(in_flight_unit_ceiling(0, 0, 64, H2), MIN_IN_FLIGHT_UNITS);
+        // And the sentinel budget behaves like an ample one.
+        assert_eq!(
+            in_flight_unit_ceiling(1024 * 1024, 8, crate::rlimit::NOFILE_LIMIT_UNKNOWN, H2),
+            1024 * 1024 / 256
         );
     }
 
@@ -3312,7 +3443,8 @@ mod tests {
         let need = MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE;
         let mut previous = 0usize;
         for soft in (need..need + 512).chain([4096usize, 8447, 65_536, 524_288]) {
-            let ceiling = in_flight_unit_ceiling(1024 * 1024, 8, soft as u64);
+            let ceiling =
+                in_flight_unit_ceiling(1024 * 1024, 8, soft as u64, InFlightTransport::PerRequest);
             assert!(
                 ceiling * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE <= soft,
                 "a window of {ceiling} units does not fit under {soft} descriptors"

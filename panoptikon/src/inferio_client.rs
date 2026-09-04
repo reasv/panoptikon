@@ -7,7 +7,7 @@ use reqwest_retry::policies::ExponentialBackoff;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -239,11 +239,136 @@ impl PredictResponse {
     }
 }
 
+/// How this client talks to one inference endpoint.
+///
+/// Local inference is loopback HTTP *inside this process*, so an in-flight
+/// predict has always cost two descriptors in one table — the client socket
+/// and the accepted server socket. Under HTTP/1.1 that cost is per concurrent
+/// request, which is what made a 2 000-item job exhaust the shipped
+/// container's descriptor table (run1 blocker F6: 983 sockets, 1 849 items
+/// unprocessed). Under HTTP/2 every request is a *stream* on a pooled
+/// connection, so the cost stops scaling with the window.
+///
+/// One path, not two: the gateway and the inference server genuinely run on
+/// different machines in real deployments (a NAS driving a GPU box), so the
+/// answer has to be the same locally and remotely. Prior knowledge rather
+/// than an h2c upgrade because there is no TLS to carry ALPN and the upgrade
+/// dance costs a round trip per connection; a server that does not speak it
+/// answers nothing an HTTP/2 client can read, which is exactly the signal the
+/// one-time probe uses to fall back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Transport {
+    /// HTTP/2 cleartext with prior knowledge.
+    H2c,
+    /// HTTP/1.1, one connection per concurrent request.
+    Http11,
+}
+
+impl Transport {
+    /// Whether requests share connections. The extraction job's descriptor
+    /// clamp is a different quantity in the two modes.
+    pub fn is_multiplexed(self) -> bool {
+        matches!(self, Transport::H2c)
+    }
+}
+
+/// Idle connections the client keeps to one inference endpoint.
+///
+/// Four rather than one so a connection being torn down (a server restart, an
+/// idle timeout) does not serialize the requests waiting behind it, and so a
+/// multi-worker inference server can be reached over more than one socket.
+/// Under h2c this is the *whole* socket budget for that endpoint.
+pub(crate) const INFERENCE_POOL_CONNECTIONS: usize = 4;
+
+/// Streams the client is willing to keep open on one h2 connection.
+///
+/// Not a protocol limit — hyper's server advertises no
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` at all — but a *client-side* one, and
+/// the reason the pool stays a pool: hyper opens an additional connection
+/// when every pooled one is at the peer's stream limit, so a client that
+/// offers unbounded concurrency is back to unbounded sockets against any
+/// server that does advertise a limit (nginx defaults to 128, Envoy to 100).
+/// 64 is below every such default, so the pool is never the thing that grows.
+const H2_STREAMS_PER_CONNECTION: usize = 64;
+
+/// Requests this client keeps in flight against one endpoint over h2c.
+/// Everything past it queues on a semaphore — which is the point: a queued
+/// request holds no socket, where an admitted one under HTTP/1.1 does.
+///
+/// 256 requests is also, by construction, a job's whole default in-flight
+/// unit budget (4096 units at 64 units per request), so the cap bounds
+/// sockets without bounding the work the orchestrator asked for.
+pub(crate) const INFERENCE_MAX_CONCURRENT_REQUESTS: usize =
+    INFERENCE_POOL_CONNECTIONS * H2_STREAMS_PER_CONNECTION;
+
+/// The two clients and the shared state of one inference endpoint.
+///
+/// Shared per base URL across every [`InferenceApiClient`] for that endpoint,
+/// which is load-bearing rather than tidy: a connection pool that is not
+/// shared is not a bound. Before this, each client instance built its own
+/// `reqwest::Client` with its own pool.
+#[derive(Debug)]
+struct EndpointRuntime {
+    h2: EndpointClients,
+    h1: EndpointClients,
+    /// The resolved transport, `None` until the first probe and again after a
+    /// connection error (a server can be restarted into a different one).
+    transport: RwLock<Option<Transport>>,
+    /// The h2c concurrency cap; see [`INFERENCE_MAX_CONCURRENT_REQUESTS`].
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Debug, Clone)]
+struct EndpointClients {
+    raw: reqwest::Client,
+    middleware: ClientWithMiddleware,
+}
+
+impl EndpointClients {
+    fn build(
+        configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+    ) -> Result<Self> {
+        let raw = configure(
+            reqwest::Client::builder().pool_max_idle_per_host(INFERENCE_POOL_CONNECTIONS),
+        )
+        .build()
+        .context("failed to build inference API client")?;
+        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+        let middleware = ClientBuilder::new(raw.clone())
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
+        Ok(Self { raw, middleware })
+    }
+}
+
+static ENDPOINTS: OnceLock<std::sync::Mutex<HashMap<String, Arc<EndpointRuntime>>>> =
+    OnceLock::new();
+
+/// The shared runtime for `base_url`, building it on first use.
+fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
+    let registry = ENDPOINTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = guard.get(base_url) {
+        return Ok(Arc::clone(existing));
+    }
+    let runtime = Arc::new(EndpointRuntime {
+        h2: EndpointClients::build(reqwest::ClientBuilder::http2_prior_knowledge)?,
+        h1: EndpointClients::build(|builder| builder.http1_only())?,
+        transport: RwLock::new(None),
+        gate: Arc::new(tokio::sync::Semaphore::new(
+            INFERENCE_MAX_CONCURRENT_REQUESTS,
+        )),
+    });
+    guard.insert(base_url.to_string(), Arc::clone(&runtime));
+    Ok(runtime)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct InferenceApiClient {
     base_url: String,
-    client: ClientWithMiddleware,
-    raw_client: reqwest::Client,
+    endpoint: Arc<EndpointRuntime>,
     cache_metadata: bool,
 }
 
@@ -265,19 +390,98 @@ impl InferenceApiClient {
         cache_metadata: bool,
     ) -> Result<Self> {
         let base_url = normalize_base_url(base_url.into());
-        let base = reqwest::Client::builder()
-            .build()
-            .context("failed to build inference API client")?;
-        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
-        let client = ClientBuilder::new(base.clone())
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
+        let endpoint = endpoint_runtime(&base_url)?;
         Ok(Self {
             base_url,
-            client,
-            raw_client: base,
+            endpoint,
             cache_metadata,
         })
+    }
+
+    /// The transport in use, probing once if it is not known yet.
+    ///
+    /// The probe is a real request to a real endpoint (`GET /cache`, the
+    /// cheapest thing this surface serves) sent with HTTP/2 prior knowledge.
+    /// *Any* answer proves the peer speaks it — a 404 or a 500 is as good as
+    /// a 200, because reading the status at all means the frames parsed. Only
+    /// a transport-level failure means HTTP/1.1, and that is remembered
+    /// per endpoint until a connection error clears it.
+    async fn transport(&self) -> Transport {
+        if let Some(transport) = *self.endpoint.transport.read().await {
+            return transport;
+        }
+        let probe = self
+            .endpoint
+            .h2
+            .raw
+            .get(format!("{}/cache", self.base_url))
+            .send()
+            .await;
+        let transport = match probe {
+            Ok(_) => Transport::H2c,
+            Err(err) => {
+                warn!(
+                    endpoint = %self.base_url,
+                    error = %err,
+                    "the inference endpoint did not answer HTTP/2 cleartext; \
+                     falling back to HTTP/1.1 for this endpoint"
+                );
+                Transport::Http11
+            }
+        };
+        // Last writer wins, and both writers agree: two concurrent probes
+        // reach the same peer.
+        *self.endpoint.transport.write().await = Some(transport);
+        if transport == Transport::H2c {
+            tracing::debug!(
+                endpoint = %self.base_url,
+                pool_connections = INFERENCE_POOL_CONNECTIONS,
+                max_concurrent = INFERENCE_MAX_CONCURRENT_REQUESTS,
+                "multiplexing inference requests over HTTP/2 cleartext"
+            );
+        }
+        transport
+    }
+
+    /// The transport already resolved for this endpoint, without probing.
+    /// `None` means nothing has talked to it yet, which callers that size
+    /// resource budgets must read as the conservative HTTP/1.1 case.
+    pub fn known_transport(&self) -> Option<Transport> {
+        self.endpoint
+            .transport
+            .try_read()
+            .ok()
+            .and_then(|guard| *guard)
+    }
+
+    /// Clears the remembered transport so the next request re-probes. Called
+    /// on a connection error: a server can be restarted into a build that
+    /// speaks a different protocol, and a fallback that never re-examines
+    /// itself is a permanent downgrade after one blip.
+    async fn forget_transport(&self) {
+        *self.endpoint.transport.write().await = None;
+    }
+
+    /// The clients for the transport in use, plus the concurrency permit that
+    /// keeps h2c requests queueing on the pool instead of opening sockets.
+    /// HTTP/1.1 takes no permit: there the descriptor clamp in
+    /// `jobs::extraction` is what bounds concurrency, and adding a second,
+    /// smaller bound here would silently throttle every existing deployment.
+    async fn active(
+        &self,
+    ) -> (
+        Transport,
+        EndpointClients,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        let transport = self.transport().await;
+        match transport {
+            Transport::H2c => {
+                let permit = Arc::clone(&self.endpoint.gate).acquire_owned().await.ok();
+                (transport, self.endpoint.h2.clone(), permit)
+            }
+            Transport::Http11 => (transport, self.endpoint.h1.clone(), None),
+        }
     }
 
     pub fn from_settings_with_metadata_cache(
@@ -325,8 +529,13 @@ impl InferenceApiClient {
         let mut attempts: u32 = 0;
         loop {
             let form = build_predict_form(inputs).await?;
-            let response = self
-                .raw_client
+            // Resolved per attempt, and the permit is held for exactly the
+            // request: a retry that waited out a backoff must not keep a
+            // stream slot the whole time, and a connection error between
+            // attempts may have changed the transport.
+            let (_transport, clients, _slot) = self.active().await;
+            let response = clients
+                .raw
                 .post(&url)
                 .query(&query)
                 .multipart(form)
@@ -386,6 +595,13 @@ impl InferenceApiClient {
                     return Err(anyhow::Error::new(failure));
                 }
                 Err(err) => {
+                    // A transport failure invalidates what the probe learned:
+                    // the peer may have been restarted into a build that
+                    // speaks the other protocol, and a fallback nothing ever
+                    // re-examines is a permanent downgrade after one blip.
+                    if err.is_connect() || err.is_request() {
+                        self.forget_transport().await;
+                    }
                     if should_retry_error(&err)
                         && let Some(delay) = next_retry_delay(attempts)
                     {
@@ -419,8 +635,9 @@ impl InferenceApiClient {
         if let Some(prewarm) = prewarm {
             query.push(("prewarm", prewarm.to_string()));
         }
-        let response = self
-            .client
+        let (_transport, clients, _slot) = self.active().await;
+        let response = clients
+            .middleware
             .put(url)
             .query(&query)
             .send()
@@ -431,8 +648,9 @@ impl InferenceApiClient {
 
     pub async fn unload_model(&self, inference_id: &str, cache_key: &str) -> Result<Value> {
         let url = format!("{}/cache/{}/{}", self.base_url, cache_key, inference_id);
-        let response = self
-            .client
+        let (_transport, clients, _slot) = self.active().await;
+        let response = clients
+            .middleware
             .delete(url)
             .send()
             .await
@@ -442,8 +660,9 @@ impl InferenceApiClient {
 
     pub async fn clear_cache(&self, cache_key: &str) -> Result<Value> {
         let url = format!("{}/cache/{}", self.base_url, cache_key);
-        let response = self
-            .client
+        let (_transport, clients, _slot) = self.active().await;
+        let response = clients
+            .middleware
             .delete(url)
             .send()
             .await
@@ -455,8 +674,9 @@ impl InferenceApiClient {
     #[allow(dead_code)]
     pub async fn get_cached_models(&self) -> Result<Value> {
         let url = format!("{}/cache", self.base_url);
-        let response = self
-            .client
+        let (_transport, clients, _slot) = self.active().await;
+        let response = clients
+            .middleware
             .get(url)
             .send()
             .await
@@ -492,8 +712,9 @@ impl InferenceApiClient {
 
     async fn fetch_metadata(&self) -> Result<Value> {
         let url = format!("{}/metadata", self.base_url);
-        let response = self
-            .client
+        let (_transport, clients, _slot) = self.active().await;
+        let response = clients
+            .middleware
             .get(url)
             .send()
             .await
@@ -503,8 +724,9 @@ impl InferenceApiClient {
 
     pub async fn get_external_inputs(&self) -> Result<Value> {
         let url = format!("{}/external-inputs", self.base_url);
-        let response = self
-            .client
+        let (_transport, clients, _slot) = self.active().await;
+        let response = clients
+            .middleware
             .get(url)
             .send()
             .await
@@ -517,8 +739,9 @@ impl InferenceApiClient {
     /// availability, authorization, and decoding failures remain errors.
     pub async fn get_external_inputs_optional(&self) -> Result<Option<Value>> {
         let url = format!("{}/external-inputs", self.base_url);
-        let response = self
-            .client
+        let (_transport, clients, _slot) = self.active().await;
+        let response = clients
+            .middleware
             .get(url)
             .send()
             .await
@@ -830,6 +1053,187 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use std::sync::{Arc, Mutex as StdMutex};
+
+    fn text_input(text: &str) -> InferenceInput {
+        InferenceInput::new(serde_json::json!({"text": text}), None)
+    }
+
+    /// Descriptors this process currently holds. Linux only, which is where
+    /// the descriptor budget is a real limit and where run1's blocker F6 was
+    /// measured; the count includes the accepted server ends, because the
+    /// stub server in these tests runs in this same process exactly as local
+    /// inference does.
+    #[cfg(target_os = "linux")]
+    fn open_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("/proc/self/fd is readable on Linux")
+            .count()
+    }
+
+    /// A local inference stub over `axum::serve`, i.e. the same hyper-util
+    /// auto builder the gateway serves its own inference surface with. It
+    /// answers `/cache` (the client's transport probe) and `/predict/...`
+    /// after a delay, so requests overlap.
+    async fn spawn_stub_service(delay: Duration) -> String {
+        let app = Router::new()
+            .route(
+                "/api/inference/cache",
+                get(|| async { Json(serde_json::json!({"cache": {}})) }),
+            )
+            .route(
+                "/api/inference/predict/{group}/{id}",
+                post(move || async move {
+                    tokio::time::sleep(delay).await;
+                    Json(serde_json::json!({"outputs": [{"ok": true}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// R10': concurrent predicts against an h2c endpoint are streams on a
+    /// bounded connection pool, so they cost a *constant* number of
+    /// descriptors instead of two each.
+    ///
+    /// This is run1 blocker F6 turned into an assertion: there, 2 000 items
+    /// drove the gateway to 983 sockets against a 1024 limit and the job
+    /// could not finish. Here 64 concurrent predicts must cost far fewer
+    /// descriptors than the 128 that one-socket-pair-per-request would need
+    /// — the bound being `2 x INFERENCE_POOL_CONNECTIONS`, plus slack for
+    /// the runtime's own churn while the sample is taken.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_predicts_share_the_connection_pool() {
+        const CONCURRENT: usize = 64;
+
+        let base_url = spawn_stub_service(Duration::from_millis(400)).await;
+        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+        // The probe, and one request, so the pool and every lazy allocation
+        // the runtime makes on the first round trip are already paid for.
+        client
+            .predict("g/model", "k", 1, 60, None, None, &[text_input("warm")])
+            .await
+            .expect("the stub answers");
+        assert_eq!(
+            client.known_transport(),
+            Some(Transport::H2c),
+            "axum::serve must accept HTTP/2 cleartext with prior knowledge"
+        );
+        let baseline = open_fds();
+
+        let mut inflight = tokio::task::JoinSet::new();
+        for _ in 0..CONCURRENT {
+            let client = client.clone();
+            inflight.spawn(async move {
+                client
+                    .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+                    .await
+                    .map(|_| ())
+            });
+        }
+        // Sampled while the requests are in flight: the stub's delay is long
+        // enough that they overlap, and the peak is what matters.
+        let mut peak = baseline;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            peak = peak.max(open_fds());
+        }
+        while let Some(result) = inflight.join_next().await {
+            result.expect("no panic").expect("the stub answers");
+        }
+
+        let growth = peak.saturating_sub(baseline);
+        let per_request_cost = CONCURRENT * 2;
+        assert!(
+            growth < per_request_cost,
+            "{CONCURRENT} concurrent predicts grew the descriptor table by {growth}, \
+             which is not better than one socket pair each ({per_request_cost})"
+        );
+        // The real bound: both ends of at most the pooled connections, plus
+        // a little slack for whatever else the runtime opened in the window
+        // the sample covers.
+        let pool_cost = 2 * INFERENCE_POOL_CONNECTIONS;
+        assert!(
+            growth <= pool_cost + 8,
+            "descriptor growth {growth} exceeds the pool's {pool_cost} plus slack"
+        );
+    }
+
+    /// The fallback: a server that does not speak HTTP/2 cleartext is
+    /// detected once, remembered, and served over HTTP/1.1 — with the
+    /// request that discovered it still succeeding.
+    ///
+    /// The stub is deliberately not an HTTP server library: it answers every
+    /// connection with a fixed HTTP/1.1 response, which is exactly what an
+    /// HTTP/1.1-only peer does to an HTTP/2 preface, and what the client's
+    /// probe has to survive.
+    #[tokio::test]
+    async fn an_http1_only_endpoint_falls_back_and_stays_usable() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    let body = br#"{"cache":{}}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let client =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{addr}"), false).unwrap();
+        assert_eq!(
+            client.known_transport(),
+            None,
+            "nothing is assumed before the first request"
+        );
+        let cached = client.get_cached_models().await.expect("HTTP/1.1 answers");
+        assert_eq!(cached, serde_json::json!({"cache": {}}));
+        assert_eq!(
+            client.known_transport(),
+            Some(Transport::Http11),
+            "the fallback must be remembered, not re-probed per request"
+        );
+        // Remembered: a second call answers without another probe.
+        assert!(client.get_cached_models().await.is_ok());
+        assert_eq!(client.known_transport(), Some(Transport::Http11));
+    }
+
+    /// Two clients for the same endpoint share one connection pool and one
+    /// transport decision. A pool that is not shared is not a bound, and the
+    /// gateway builds several clients for the same inference endpoint (the
+    /// job pool, the PQL path, the preload loop).
+    #[tokio::test]
+    async fn clients_for_one_endpoint_share_their_pool() {
+        let base_url = spawn_stub_service(Duration::ZERO).await;
+        let first = InferenceApiClient::new_with_metadata_cache(base_url.clone(), false).unwrap();
+        let second = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+        assert!(first.get_cached_models().await.is_ok());
+        assert_eq!(first.known_transport(), Some(Transport::H2c));
+        assert_eq!(
+            second.known_transport(),
+            Some(Transport::H2c),
+            "the second client must inherit the first one's probe"
+        );
+    }
 
     /// Optional external-input discovery treats only a 404 as an older
     /// unsupported server; other HTTP failures remain visible to callers.

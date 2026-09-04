@@ -1553,6 +1553,17 @@ metadata.description = "echo fixture"
             metadata["echo"]["inference_ids"]["test"]["description"],
             json!("echo fixture")
         );
+        // R10': the whole exchange below runs over HTTP/2 cleartext with
+        // prior knowledge — one multiplexed connection to the local service,
+        // not one socket pair per in-flight predict (run1 blocker F6). The
+        // service is `axum::serve`, exactly as the gateway serves it, so this
+        // also pins that hyper-util's auto builder accepts the h2 preface.
+        assert_eq!(
+            client.known_transport(),
+            Some(crate::inferio_client::Transport::H2c),
+            "the real client and the real service must agree on h2c"
+        );
+
         let external_inputs = client.get_external_inputs().await.expect("external inputs");
         assert_eq!(
             external_inputs["definitions"]["test_token"]["configured"],

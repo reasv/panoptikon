@@ -19,7 +19,13 @@ bundled = []
 bundled-ui = []
 
 [dependencies]
-axum = { version = "0.8", features = ["multipart"] }
+# `http2` is not one of axum's defaults, and `axum::serve` gates the HTTP/2
+# half of hyper-util's auto (version-sniffing) connection builder on it. The
+# gateway needs it because the inference client speaks HTTP/2 cleartext with
+# prior knowledge to the local inference surface, which is served by this same
+# `axum::serve` — that is what turns one socket pair per in-flight predict
+# into a bounded connection pool (test protocol R10', run1 blocker F6).
+axum = { version = "0.8", features = ["multipart", "http2"] }
 tokio = { version = "1.39", features = [
     "rt-multi-thread",
     "macros",
@@ -117,7 +123,11 @@ utoipa = "5.4"
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 utoipa-redoc = { version = "6", features = ["axum"] }
 # `stream`: setup.rs streams the pinned uv download to disk with progress.
-reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+# `http2` is a reqwest default, and it is named here anyway: the inference
+# client's h2c prior-knowledge path (`inferio_client.rs`) does not exist
+# without it, so it must not be able to disappear silently if a future
+# `default-features = false` is added for an unrelated reason.
+reqwest = { version = "0.12", features = ["json", "multipart", "stream", "http2"] }
 reqwest-middleware = { version = "0.3", features = ["multipart"] }
 reqwest-retry = "0.5"
 futures-util = "0.3"
