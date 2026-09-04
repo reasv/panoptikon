@@ -516,6 +516,32 @@ startup and caps the ceiling above at
 `FDS_PER_IN_FLIGHT_ITEM`). Ignoring a published figure — downward, never
 upward — is always allowed.
 
+**A server that publishes a figure must be able to carry it, and the
+transport is part of that promise.** Over HTTP/2 every in-flight predict is a
+stream, and a server advertises how many streams one connection may carry in
+`SETTINGS_MAX_CONCURRENT_STREAMS`. If that number is below the figure the
+same server publishes, the surplus requests sit in the client's HTTP/2 layer
+where neither side can see them: the dispatcher never merges them into a
+window, the ramp never measures a bigger batch, and the published figure rises
+forever against a ceiling nothing names. Run2's `S2-wdvit` leg is exactly that
+failure — a published figure of 1 632 items against `hyper`'s silent server
+default of 200 streams, which froze the calibration anchor at 136 units for
+the whole job while `/health` and the logs reported nothing unusual.
+
+This implementation therefore states the number rather than inheriting it:
+every listener advertises `MAX_CONCURRENT_STREAMS` (`main.rs`, 512 per
+connection, logged once at startup), and the client spreads its concurrency
+over independent connections, offering any one of them at most
+`H2_STREAMS_PER_CONNECTION` (64) streams. A **third-party peer** — or a
+reverse proxy in front of one, which is ordinary in the NAS-gateway /
+GPU-server split this protocol exists for — may still advertise less, and a
+proxy's own limit is what applies rather than the origin's. A caller cannot
+read the peer's setting through `reqwest`, so the honest guidance is the
+symmetric pair: a server must advertise at least as many streams as the
+largest figure it publishes divided by the items it expects per request, and
+a client must not treat a published figure as evidence that the transport
+will carry it.
+
 ### Memory sensing (optional response fields)
 
 Added for batch calibration (`docs/batch-calibration-design.md`): the worker

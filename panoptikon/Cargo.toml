@@ -37,10 +37,17 @@ tokio = { version = "1.39", features = [
 ] }
 fs2 = "0.4"
 hyper = { version = "1", features = ["http1", "http2", "client"] }
+# `server-auto` + `service` are what `main.rs::serve_with_stream_limit` drives
+# directly: `axum::serve` exposes no hook onto hyper-util's auto connection
+# builder, and the HTTP/2 `max_concurrent_streams` this server advertises has
+# to be set on it (leaving it unset is what capped run2's calibration ramp at
+# hyper's silent default of 200 streams).
 hyper-util = { version = "0.1", features = [
     "client-legacy",
     "http1",
     "http2",
+    "server-auto",
+    "service",
     "tokio",
 ] }
 tower-http = { version = "0.6", features = ["trace"] }

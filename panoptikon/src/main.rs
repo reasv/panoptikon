@@ -46,7 +46,7 @@ use axum::{
     routing::{any, delete, get, post, put},
 };
 use clap::Parser;
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_redoc::Redoc;
@@ -711,13 +711,19 @@ async fn async_main() -> anyhow::Result<()> {
     // One server task per listener, all serving the same router; the only
     // difference is the ListenerEndpoint extension the policy layer reads.
     //
-    // `axum::serve` builds hyper-util's *auto* connection builder, which
-    // sniffs the HTTP/2 client preface and serves either version on the same
-    // port — so h2c with prior knowledge needs no upgrade handshake and no
-    // second listener. It is gated on axum's `http2` feature, which
-    // `Cargo.toml` therefore names explicitly; the inference client
-    // (`inferio_client.rs`) probes for exactly this and falls back to
-    // HTTP/1.1 against a server without it.
+    // The serve loop is hyper-util's *auto* connection builder, which sniffs
+    // the HTTP/2 client preface and serves either version on the same port —
+    // so h2c with prior knowledge needs no upgrade handshake and no second
+    // listener. It is gated on axum's `http2` feature, which `Cargo.toml`
+    // therefore names explicitly; the inference client (`inferio_client.rs`)
+    // probes for exactly this and falls back to HTTP/1.1 against a server
+    // without it. `serve_with_stream_limit` drives that builder directly
+    // rather than through `axum::serve` so the stream limit is ours; see
+    // MAX_CONCURRENT_STREAMS.
+    tracing::info!(
+        max_concurrent_streams = MAX_CONCURRENT_STREAMS,
+        "serving HTTP/1.1 and HTTP/2 cleartext"
+    );
     let mut servers = Vec::new();
     for (name, listener) in listeners {
         let app = app
@@ -727,11 +733,7 @@ async fn async_main() -> anyhow::Result<()> {
             ))));
         let mut shutdown_rx = shutdown_rx.clone();
         servers.push(tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
+            serve_with_stream_limit(listener, app, async move {
                 let _ = shutdown_rx.changed().await;
             })
             .await
@@ -743,6 +745,164 @@ async fn async_main() -> anyhow::Result<()> {
     }
     let _ = cleanup.await;
     tracing::info!("gateway stopped");
+    Ok(())
+}
+
+/// Concurrent HTTP/2 streams this server admits **per connection**.
+///
+/// Every listener this binary opens serves `/api/inference` (the gateway
+/// nests it; `panoptikon inferio` is only that), so this number is the
+/// ceiling on concurrent predicts one peer connection can carry — which is
+/// exactly why it is written down here instead of being inherited.
+///
+/// **Why it was not written down before, and what that cost.** `axum::serve`
+/// builds hyper-util's auto connection builder and leaves its HTTP/2 config
+/// alone, so the advertised `SETTINGS_MAX_CONCURRENT_STREAMS` was hyper's
+/// default of **200**. Run2's `S2-wdvit` leg published a desired-in-flight
+/// figure of 1 632 items, the client's log line claimed a concurrency of 256,
+/// and the number that actually applied was 200 — named nowhere, logged
+/// nowhere, absent from `/health`, and absent from the descriptor arithmetic
+/// in `jobs::extraction::in_flight_unit_ceiling`. Window formation then
+/// degenerated into the involution `W -> 200 - W`, and the calibration ramp
+/// froze at an anchor of 136 units for the rest of the job. A ceiling no
+/// layer can name is not a policy.
+///
+/// **The number.** 512 = 8 x `inferio_client::H2_STREAMS_PER_CONNECTION`
+/// (64), which is the per-connection stream budget our own client offers a
+/// peer. Eight times it, because the limit is per *connection* and the
+/// clients on the other side are not all ours:
+///
+/// - our own gateway spreads its concurrency over independent connections and
+///   never offers one of them more than 64 streams, so a single gateway is
+///   covered eight times over;
+/// - several gateways are covered without arithmetic: each brings its own
+///   connections, each with its own budget of 512;
+/// - a reverse proxy in front of the inference server — the NAS-to-GPU-box
+///   deployment grows one easily — *does* fan several clients onto one
+///   upstream connection, and that is the case the factor of eight is for;
+/// - it stays under what a generous peer would consider hostile, and above
+///   every common server default (nginx 128, Envoy 100, hyper 200), so this
+///   server is never the tightest limit in a chain it is part of.
+///
+/// **The bound in the other direction.** A stream is not free: since
+/// `7e96de62` the predict handler buffers the whole multipart body before
+/// parsing it, so an open predict stream can hold up to
+/// [`inferio::http::PREDICT_BODY_LIMIT`] of server memory. 512 is therefore
+/// also the statement "one connection may pin at most 512 request bodies",
+/// which is a number an operator can multiply; before this it was 200 and
+/// nobody could have said so. Bounding the *aggregate* buffered predict
+/// bytes across streams would need a byte admission budget on the handler,
+/// which this does not add.
+pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 512;
+
+/// Serve `app` on `listener` until `shutdown` resolves, then drain.
+///
+/// This is `axum::serve(...).with_graceful_shutdown(...)` re-implemented on
+/// hyper-util's own auto builder, for one reason: `axum::serve` exposes no
+/// hook onto that builder, and [`MAX_CONCURRENT_STREAMS`] has to be set on
+/// it. Everything else here mirrors axum 0.8's loop deliberately — accept,
+/// spawn per connection, `serve_connection_with_upgrades` (websockets),
+/// `enable_connect_protocol` (HTTP/2 websockets), `graceful_shutdown` on the
+/// signal, and a `watch` channel whose last receiver dropping is what "every
+/// connection task has finished" means.
+///
+/// The one simplification: axum threads the peer address through a
+/// `MakeService` so `ConnectInfo` can be extracted. There is exactly one
+/// connect-info type in this binary (`SocketAddr`), so the extension is
+/// inserted directly per request instead, which is what
+/// `IntoMakeServiceWithConnectInfo` does at the end of its own chain.
+pub(crate) async fn serve_with_stream_limit<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use tower::ServiceExt as _;
+
+    // Dropping the only receiver is the signal; `closed()` on the sender is
+    // how every connection task learns about it. Same shape as axum's.
+    let (signal_tx, signal_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        shutdown.await;
+        drop(signal_rx);
+    });
+    // Held by every live connection task; `closed()` on the sender is the
+    // drain.
+    let (close_tx, close_rx) = tokio::sync::watch::channel(());
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                // Per-connection errors (a peer that vanished between the
+                // SYN and the accept, a momentary descriptor shortage) must
+                // not take the listener down; the sleep keeps a persistent
+                // one from spinning the CPU. This is what axum's `Listener`
+                // impl for `TcpListener` does.
+                Err(err) => {
+                    tracing::debug!(error = %err, "failed to accept a connection");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            _ = signal_tx.closed() => break,
+        };
+
+        let io = TokioIo::new(stream);
+        let app = app.clone();
+        let signal_tx = signal_tx.clone();
+        let close_rx = close_rx.clone();
+        tokio::spawn(async move {
+            let service = hyper::service::service_fn(
+                move |request: hyper::Request<hyper::body::Incoming>| {
+                    let mut request = request.map(axum::body::Body::new);
+                    request
+                        .extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
+                    app.clone().oneshot(request)
+                },
+            );
+            let mut builder = Builder::new(TokioExecutor::new());
+            builder
+                .http2()
+                // The whole reason this function exists.
+                .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+                // CONNECT protocol, needed for HTTP/2 websockets (axum sets
+                // it too; dropping it would be a silent regression).
+                .enable_connect_protocol();
+            let mut conn = std::pin::pin!(builder.serve_connection_with_upgrades(io, service));
+            let mut draining = false;
+            loop {
+                if draining {
+                    if let Err(err) = conn.as_mut().await {
+                        tracing::trace!("failed to serve connection: {err:#}");
+                    }
+                    break;
+                }
+                tokio::select! {
+                    result = conn.as_mut() => {
+                        if let Err(err) = result {
+                            tracing::trace!("failed to serve connection: {err:#}");
+                        }
+                        break;
+                    }
+                    _ = signal_tx.closed() => {
+                        conn.as_mut().graceful_shutdown();
+                        draining = true;
+                    }
+                }
+            }
+            drop(close_rx);
+        });
+    }
+
+    drop(close_rx);
+    drop(listener);
+    close_tx.closed().await;
     Ok(())
 }
 
@@ -793,11 +953,11 @@ async fn inferio_main(
         let _ = shutdown_tx.send(());
         shutdown::run_inferio_cleanup(manager).await;
     });
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    tracing::info!(
+        max_concurrent_streams = MAX_CONCURRENT_STREAMS,
+        "serving HTTP/1.1 and HTTP/2 cleartext"
+    );
+    serve_with_stream_limit(listener, app, async move {
         let _ = shutdown_rx.await;
     })
     .await?;
@@ -809,6 +969,62 @@ async fn inferio_main(
 #[cfg(test)]
 mod route_tests {
     use super::*;
+
+    /// `serve_with_stream_limit` replaces `axum::serve` at both listener
+    /// sites, so the three things `axum::serve` gave us for free are
+    /// asserted here rather than assumed: it answers, the `ConnectInfo`
+    /// extension the policy layer and the access log read is populated, and
+    /// the graceful shutdown both stops accepting and lets the serve future
+    /// return.
+    ///
+    /// The stream limit itself is measured end to end in
+    /// `inferio_client::tests::the_server_and_the_pool_bound_concurrent_predicts`,
+    /// which drives this same loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_serve_loop_answers_with_connect_info_and_then_drains() {
+        use axum::extract::ConnectInfo;
+        use std::net::SocketAddr;
+
+        let app = Router::new().route(
+            "/peer",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_stream_limit(listener, app, async move {
+            let _ = stop_rx.await;
+        }));
+
+        // Over h2c with prior knowledge: the version the inference client
+        // speaks, and the one the stream limit applies to.
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        let body = client
+            .get(format!("http://{addr}/peer"))
+            .send()
+            .await
+            .expect("the serve loop answers")
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with("127.0.0.1:"),
+            "ConnectInfo must carry the peer address, not a default: {body}"
+        );
+
+        let _ = stop_tx.send(());
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the serve future returns once the signal fires and connections drain");
+        drained.expect("no panic").expect("clean shutdown");
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "the listener must be closed once the serve future returns"
+        );
+    }
 
     #[test]
     fn relay_pairing_route_shapes_do_not_conflict() {

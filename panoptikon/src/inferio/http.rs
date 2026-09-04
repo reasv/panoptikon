@@ -66,7 +66,9 @@ use super::manager::{HealthReport, ManagerConfig, ModelManager};
 use super::prewarm::PrewarmConfig;
 use super::registry::{RegistryCache, RegistryConfig};
 use super::slot_error::Unattempted;
-use super::worker::{WorkerDeadlines, WorkerInput, WorkerOutput, WorkerSpawnConfig};
+use super::worker::{
+    MAX_FRAME_BYTES, WorkerDeadlines, WorkerInput, WorkerOutput, WorkerSpawnConfig,
+};
 use crate::api_error::ApiError;
 use crate::config::Settings;
 
@@ -531,10 +533,47 @@ fn accelerator_backend(accelerator: crate::config::Accelerator) -> &'static str 
     }
 }
 
+/// Bytes one predict request body may carry.
+///
+/// The route used to run under `DefaultBodyLimit::disable()` — no limit at
+/// all — inherited from the proxy path it replaced. Since `7e96de62` the
+/// handler buffers the whole body before parsing it (a streamed parse
+/// answered with the request stream still open, which cost the connection an
+/// `ENHANCE_YOUR_CALM` GOAWAY every ~65 000 streams), so "no limit" now means
+/// "a peer decides how much of this server's memory one stream holds". That
+/// has to be a number, and the number has to be one nothing legitimate can
+/// hit.
+///
+/// [`MAX_FRAME_BYTES`] is that number: it is the orchestrator's own wall on
+/// one worker-protocol frame, and it already bounds the *inputs* on the way
+/// in — `jobs::extraction`'s `check_frame_budget` refuses a single input
+/// above `FRAME_INPUT_BYTES_BUDGET` (this figure minus the envelope) before
+/// any predict is attempted, as a persisted `resource` verdict. So a body
+/// above it carries either one input this machine has already decided it
+/// cannot infer, or a batch larger than the largest object either side of
+/// the worker protocol ever holds. Refusing it at the door with a `413` is
+/// strictly better than buffering it and failing later.
+///
+/// Read with [`crate::MAX_CONCURRENT_STREAMS`]: the two together are the
+/// statement "one connection may pin at most 512 request bodies of at most
+/// 2 GiB". That product is a worst case against an arbitrary peer, not a
+/// memory budget — the shipped client chunks predicts at
+/// `REQUEST_UNIT_BUDGET` (64) units and offers one connection at most
+/// `H2_STREAMS_PER_CONNECTION` (64) streams. **Residual, stated rather than
+/// fixed:** a 64-input request whose inputs each exceed 32 MiB would be
+/// refused where it used to be served; bounding aggregate buffered predict
+/// bytes instead would need a byte admission budget on this handler.
+pub(crate) const PREDICT_BODY_LIMIT: usize = MAX_FRAME_BYTES;
+
 /// The inference routes, path-relative so they can be nested under
 /// `/api/inference` (gateway and standalone mode mount the same router).
-/// The body limit is disabled to match the proxy path, which streamed
-/// request bodies without any size cap (predict batches carry raw images).
+///
+/// axum's own body limit stays disabled, as it has been since this replaced
+/// the streaming proxy path: it is enforced by `Bytes::from_request`, and the
+/// one route with a large body ([`predict`]) collects its body itself so that
+/// a truncated one can be told apart from a malformed one. That route applies
+/// [`PREDICT_BODY_LIMIT`] in its own extractor instead, which is where the
+/// limit can also produce the right status.
 pub fn router(state: Arc<InferioState>) -> Router {
     Router::new()
         .route("/predict/{group}/{inference_id}", post(predict))
@@ -715,6 +754,10 @@ enum PredictBodyError {
     /// No `data` field. FastAPI answers a missing required Form field 422,
     /// and so does this.
     MissingData,
+    /// The body is larger than [`PREDICT_BODY_LIMIT`]. A `413`, and a verdict
+    /// about the request rather than about the media: the caller has to send
+    /// a smaller batch, and re-sending the same one will not help.
+    TooLarge,
 }
 
 impl IntoResponse for PredictBodyError {
@@ -741,7 +784,44 @@ impl IntoResponse for PredictBodyError {
                 ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "Field required: data")
                     .into_response()
             }
+            Self::TooLarge => ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "predict request body exceeds the {} MiB limit; send fewer inputs \
+                     per request",
+                    PREDICT_BODY_LIMIT / (1024 * 1024)
+                ),
+            )
+            .into_response(),
         }
+    }
+}
+
+/// Collect a request body under an explicit ceiling, keeping the three
+/// outcomes distinct.
+///
+/// The `DefaultBodyLimit` layer cannot do this job for [`predict`]: it is
+/// enforced by `Bytes::from_request`, and this route deliberately collects the
+/// raw body itself so a *truncated* body can be told apart from a *malformed*
+/// one (`7e96de62`). "Whole, and larger than we will hold" is a third thing,
+/// and it earns its own status rather than being reported as either of the
+/// other two — a caller must shrink the batch, not re-send it.
+async fn collect_within(body: Body, limit: usize) -> Result<axum::body::Bytes, PredictBodyError> {
+    match http_body_util::Limited::new(body, limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(err)
+            if err
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some() =>
+        {
+            Err(PredictBodyError::TooLarge)
+        }
+        // The body stream itself failed: nothing was parsed, so nothing was
+        // attempted.
+        Err(err) => Err(PredictBodyError::Incomplete(format!(
+            "the request body stream failed: {}",
+            error_chain(err.as_ref())
+        ))),
     }
 }
 
@@ -758,17 +838,7 @@ where
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(multipart_boundary);
-        let bytes = match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(err) => {
-                // The body stream itself failed: nothing was parsed, so
-                // nothing was attempted.
-                return Err(PredictBodyError::Incomplete(format!(
-                    "the request body stream failed: {}",
-                    error_chain(&err)
-                )));
-            }
-        };
+        let bytes = collect_within(body, PREDICT_BODY_LIMIT).await?;
         let request = Request::from_parts(parts, Body::from(bytes.clone()));
         Multipart::from_request(request, state)
             .await
@@ -2978,6 +3048,33 @@ metadata.cost.unit = "none"
     /// detail must carry the cause out of the source chain, or the next one
     /// is as undiagnosable as this one was.
     ///
+    /// The predict route's body ceiling: a whole body that is too big is
+    /// neither "malformed" nor "never arrived" but its own answer — `413`,
+    /// naming the limit — so a caller learns to send a smaller batch instead
+    /// of re-submitting the same one forever.
+    ///
+    /// Asserted on [`collect_within`] with a small limit rather than by
+    /// sending [`PREDICT_BODY_LIMIT`] bytes: the mapping from
+    /// `LengthLimitError` to the status is the whole of the behaviour, and
+    /// the constant is checked separately below.
+    #[tokio::test]
+    async fn a_predict_body_over_the_limit_is_too_large_not_malformed() {
+        let over = collect_within(Body::from(vec![b'x'; 64]), 32).await;
+        assert!(matches!(over, Err(PredictBodyError::TooLarge)));
+        let response = PredictBodyError::TooLarge.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let exact = collect_within(Body::from(vec![b'x'; 32]), 32).await;
+        assert!(
+            matches!(&exact, Ok(bytes) if bytes.len() == 32),
+            "a body exactly at the limit is not over it"
+        );
+
+        // The shipped ceiling is the orchestrator's own frame wall, so a body
+        // it refuses could never have become a worker frame anyway.
+        assert_eq!(PREDICT_BODY_LIMIT, MAX_FRAME_BYTES);
+    }
+
     /// This body also stops before its closing delimiter, so it is the
     /// *incomplete* half of the split as well: the caller is told the batch
     /// was never parsed, and re-submits it.

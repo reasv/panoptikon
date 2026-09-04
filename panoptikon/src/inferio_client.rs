@@ -1412,12 +1412,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
+            // The product's own serve loop, so the stream limit under test is
+            // the one the gateway advertises.
+            crate::serve_with_stream_limit(listener, app, std::future::pending())
+                .await
+                .unwrap();
         });
         format!("http://{addr}")
     }
@@ -1492,11 +1491,23 @@ mod tests {
         }
         assert_eq!(answered, OFFERED, "every offered predict must complete");
 
+        // Before S1-2 this read `HYPER_DEFAULT_MAX_CONCURRENT_STREAMS` (200):
+        // hyper's silent server default, below the client's own gate and
+        // named nowhere. With the limit made explicit at
+        // `crate::MAX_CONCURRENT_STREAMS` the server is no longer the bound,
+        // and what the handler sees is the number this process actually
+        // decided on.
+        assert!(
+            crate::MAX_CONCURRENT_STREAMS as usize > INFERENCE_MAX_CONCURRENT_REQUESTS,
+            "the server's stream limit must not be the tightest bound on our \
+             own client's concurrency"
+        );
         assert_eq!(
-            peak, HYPER_DEFAULT_MAX_CONCURRENT_STREAMS,
-            "the concurrency that reached the handler is neither the client's \
-             gate ({INFERENCE_MAX_CONCURRENT_REQUESTS}) nor what was offered \
-             ({OFFERED}) but the server's stream limit"
+            peak, INFERENCE_MAX_CONCURRENT_REQUESTS,
+            "the concurrency that reached the handler must be the client's own \
+             gate, not the transport's silent default \
+             ({HYPER_DEFAULT_MAX_CONCURRENT_STREAMS}) and not what was offered \
+             ({OFFERED})"
         );
         assert_eq!(
             sockets, 1,
