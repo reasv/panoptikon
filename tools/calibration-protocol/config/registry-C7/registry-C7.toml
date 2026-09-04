@@ -39,3 +39,15 @@ metadata.description = "(C7) EasyOCR English, batching ENABLED for the acceptanc
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000
+# CALIB, run2: the shipped entry gained `epoch = 2` and
+# `canvas_pixels = 6553600` when R7 landed (the CRAFT detector's 2560px
+# canvas: no submitted image can cost it more than 2560^2 decoded pixels).
+# A redefinition replaces the id's metadata WHOLESALE (registry.rs
+# `merge_registry_file`: the id's metadata table is inserted, not merged),
+# and a canvas is never inherited from a group that resolves to a different
+# unit -- so omitting these two keys here silently runs C7 *uncapped* and
+# on the pre-R7 unit denomination, which is the opposite of what the S8
+# ocr-C7 leg measures. Restated verbatim from
+# python/inferio/config/inference.toml.
+metadata.cost.epoch         = 2
+metadata.cost.canvas_pixels = 6553600
