@@ -100,14 +100,16 @@ pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
 /// Every rendering that means **this predict never reached a model**, so the
 /// request's items are untouched and re-submitting them is the correct answer.
 ///
-/// This is the condition [`WORKER_DIED_KIND`] actually names. One worker death
-/// does not produce one error: it produces four *different* strings depending
-/// on where each affected request was standing when the model went down, and
-/// only the first of them says "failed fatally". Matching that one alone —
-/// which is what this handler did before — left three quarters of a death's
-/// blast radius classified as an ordinary prediction failure, which is run1
-/// finding F7 in miniature: the items were recorded as errors even though
-/// nothing had been attempted.
+/// This is the condition [`WORKER_DIED_KIND`] actually names — the kind is
+/// named for the case that produces it in practice, but what it *asserts* is
+/// only that the request never reached a model, which is the thing a caller
+/// can act on. One worker death does not produce one error: it produces five
+/// *different* strings depending on where each affected request was standing
+/// when the model went down, and only the first of them says "failed fatally".
+/// Matching that one alone — which is what this handler did before — left most
+/// of a death's blast radius classified as an ordinary prediction failure,
+/// which is run1 finding F7 in miniature: the items were recorded as errors
+/// even though nothing had been attempted.
 ///
 /// Each entry is cited to the single place that formats it. **If one of those
 /// renderings changes, the unit tests below fail** — they assert on the exact
@@ -117,14 +119,14 @@ pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
 /// `anyhow` chain with no typed marker on it — `WorkerError` is the *non*-fatal
 /// per-request error, and a fatal teardown is a bare `anyhow!` — so text is the
 /// only signal that survives to this layer on every path. The principled fix is
-/// a `WorkerDied` marker attached with `anyhow::Error::new` at each of the four
-/// sites and downcast here, exactly as R9's cooldown already does
+/// an `Unattempted` marker attached with `anyhow::Error::new` at each of the
+/// sites below and downcast here, exactly as R9's cooldown already does
 /// ([`load_cooldown_response`] downcasts `LoadCooldownError` two lines above
 /// this check). That fix has to be made in `worker.rs`, `dispatch.rs` and
 /// `manager.rs`; until it is, this list is the bridge, and the downcast should
 /// be added *before* it rather than replacing it, so an older rendering still
 /// classifies.
-const UNATTEMPTED_REQUEST_MARKERS: [&str; 4] = [
+const UNATTEMPTED_REQUEST_MARKERS: [&str; 5] = [
     // `Worker::fatal` (`worker.rs`): the window that was executing on the
     // replica that died, and — re-raised verbatim by `dispatch::fail_requests`
     // — every request still queued behind it.
@@ -141,6 +143,20 @@ const UNATTEMPTED_REQUEST_MARKERS: [&str; 4] = [
     // `in_flight.shutdown()`, which aborts those window tasks and drops their
     // senders, so the fatal message never reaches them at all.
     "dropped the request",
+    // Two sites, one substring. `ModelManager::predict` when `tx.send` fails
+    // ("model {id} was unloaded before the request could be queued"), and
+    // `dispatch`'s `End::Graceful` arm failing the queue ("model {id} was
+    // unloaded").
+    //
+    // The first of those *is* a death: the fatal arm calls `rx.close()` and
+    // then the dispatch task ends, so every request that reaches `tx.send` a
+    // moment late — the tail of the same window — gets this instead of the
+    // fatal message. The second is a real unload (an explicit one, or the
+    // manager shutting down), which is not a death but is the same fact about
+    // the request: it never reached a model, its items are untouched, and one
+    // re-submission is the correct answer (the next predict reloads the
+    // model). Both are bounded by the caller's one-retry budget either way.
+    "was unloaded",
 ];
 
 /// The context `ModelManager::ensure_loaded` puts on a load failure, minus the
@@ -1788,10 +1804,10 @@ metadata.description = "echo fixture"
         state.manager.shutdown().await;
     }
 
-    /// Every rendering a single worker death produces, quoted from the four
-    /// places that format them, classifies as "never attempted" — so all of a
-    /// death's blast radius is re-queued, not just the quarter of it standing
-    /// on the replica that died.
+    /// Every rendering that means the request never reached a model, quoted
+    /// from the five places that format them, classifies as "never attempted"
+    /// — so all of a death's blast radius is re-queued, not just the fraction
+    /// of it standing on the replica that died.
     ///
     /// These literals are the coupling: if one of the cited `format!`s
     /// changes, this test is what notices, and the fix is to update
@@ -1814,8 +1830,15 @@ metadata.description = "echo fixture"
         // a window on a *surviving* replica sees when a sibling dies and
         // `in_flight.shutdown()` aborts it.
         let dropped = format!("the dispatcher for model {model} dropped the request");
+        // `ModelManager::predict` when the send fails: the dispatch task has
+        // already closed its receiver on the way out of the fatal arm, so the
+        // tail of the same window lands here instead of on the fatal message.
+        let too_late = format!("model {model} was unloaded before the request could be queued");
+        // `dispatch`'s `End::Graceful` arm. Not a death, but the same fact
+        // about the request: it never reached a model.
+        let unloaded = format!("model {model} was unloaded");
 
-        for chain in [&fatal, &idle, &poisoned, &dropped] {
+        for chain in [&fatal, &idle, &poisoned, &dropped, &too_late, &unloaded] {
             assert_eq!(
                 classify_predict_failure(chain, model),
                 PredictFailure::Unattempted,
