@@ -170,6 +170,83 @@ soak. (6) Add a run2 section to
 `tools/calibration-protocol/results/` (git-ignored; `run1/README.md`
 lists poisoned stores and safe seeds); nothing pushed.
 
+### Status after implementation (2026-09-04)
+
+All four tracks, their verifiers, a cross-track follow-up and an
+integration pass have landed on the branch — **82 commits**, `0d6b36c5`
+(the run2 handoff) → `65fd2f82`. Nothing pushed. The run2 legs
+(step 5 of the sequence above) have **not** started.
+
+| Track | Implementer commits | Verifier | Outcome |
+|---|---|---|---|
+| **L** (R1a/d + contention tag + variance filter, R4, R5 ledger half, R11 store) | `e6abd09e`, `8f71379a`, `9e8d6810`, `f161850f`, `83acdbdc`, `9a10bfe5`, `a1fb91a9`, `d911b676`, `40aa1d0e`, `b0cc2c95` | `2314e609`, `6afed305`, `1031504c`, `c0896110`, `75016a3f`, `6e515174`, `00798eda`, `0b166de1`, `9a9b5612` | Design approved; one defect in the knee-exclusion commit (a collapse verdict suppressed the OOM riding on the same batch) fixed, and the R3 **host** half — trust the worker's `oom_class`, stop deflating on wording — was added here rather than in P. |
+| **M** (R6 per-model locks + board gate, R9 cooldown) | `e6e510d0`, `e2679f62`, `3ad22c92` | `d8721f90`, `702ea8ac`, `391b66cb`, `804f5148` | Both changes correct as claimed; two holes closed — the `""` (unresolvable-pin) admission bucket now waits on every board's permit, and the cooldown ladder no longer panics at the 33rd consecutive failure. |
+| **E** (R2a re-queue + `partial`, R2b failures endpoint, R10' h2c pool, R11 UI types) | `521cca81`, `22256f8c`, `fed96ea4`, `ddd44e4a`, `f506dc2b`, `b2723f16`, `049d271c` | `a3120f12`, `8fef026e`, `168aa9bd`, `207aa3c0`, `c6a7a9ef`, `6dcd82e4`, `6a8fb930`, `618fc76c`, `299c3c65`, `1e6b80ea`, `8d352b33`, `232f523d`, `ec98f181`, `793f40a7`, `c6761368` | Design sound; **nine** defects fixed across two rounds — the worker-death signal matched one rendering of six, `occurred_at` was the batch-write time, a mid-stream reset permanently downgraded an endpoint to HTTP/1.1, and the scan-history Status column still read "Completed" for a `partial` job. |
+| **P** (protocol doc, R3 worker half, R5 worker half, R7 canvas, R8 measured context, R11 sentinel) | `793f869a`, `fffbc947`, `786fd3b1`, `84663c27`, `daacf07d`, `649125b9`, `a0d5bdf4` | `5ecba825`, `f37afe62`, `b34c9ec5`, `344178eb`, `5dedc5e4`, `baf3f0f2`, `fb202822`, `75bc41e9` | Six defects fixed — the closed OOM message list lost real device wordings, the R8 context probe differenced a stale baseline, and a failed load left it polling. |
+| **R12** (nemotron base as an analysis artefact) | `03bb8a4d`, `90409b41`, `7b3ea31e`, `0643942c`, `e31fbd4f`, `7a4d38fe` | `6665b931`, `832474b0`, `71cb0827`, `e9e44549` | **F-C retracted**: the 4.5× was a recorder attribution artefact, not a ledger error. `analyze.py`'s `base_accuracy` and `vramrec.py`'s identity cache were corrected, and the S2-base plateau leg added (§4). |
+
+**Cross-track follow-up** (`ee014235`, `9229edc5`, `893e8a7d`,
+`9be09e5e`): R7 was inert without them. The canvas is now resolved once
+(`CostDimension.canvas_pixels` from the registry, `manager::canvas_in_force`
+folding in the worker's load-report reading behind it, `Grant.canvas_pixels`
+on the wire) and applied on **both** sides — `dispatch::estimate_input_units`
+caps the host's window pricing at the same figure, which for the three
+grantless `easyocr_*` ids is the only cap there is. `slot_error::Unattempted`
+makes the worker-death classification typed rather than a substring list, and
+`ceiling_probe.py` now uses the worker's own OOM classifier and canvas.
+Integration review of those four found two defects, fixed in `18cc2e77`
+(the probe resolved a canvas and then priced without it) and `56aec556`.
+
+**Integration pass** at `65fd2f82`: `cargo test -p panoptikon`
+**1586 passed, 2 failed, 10 ignored** — the two are the known host
+artefacts (`db::batch_auto::tests::an_unwritable_config_warns_stamps_and_is_left_intact`
+and `media_tools::transcode::pool::tests::a_real_encode_publishes_an_artifact_the_next_submit_hits`,
+both failing on master too); `pytest tests` **302 passed, 13 skipped**;
+`cargo fmt --check` clean; `cargo clippy --all-targets` 8 warnings, all
+pre-existing and none in a file run2 touched (`db/vector_quants.rs:1485,1500`,
+`inferio/cpu.rs:178,213`, `jobs/extraction/input_handlers/audio.rs:179`,
+`media_tools/animation.rs:295`, `media_tools/outro.rs:529,556`);
+`cargo test --bin panoptikon openapi` **5 passed**. The `ui` gitlink
+(`9b28044`) carries types byte-identical to a fresh
+`openapi-typescript ../panoptikon/openapi.json`, so the spec and the
+submodule agree. `tools/calibration-protocol/codemap.md` had every
+`file:line` and symbol reference re-resolved at the tip (`65fd2f82`).
+
+**Host state after the pass:** release binary at `65fd2f82`
+(`target/release/panoptikon`, 86 397 864 B, built 12:41 UTC, reports
+`panoptikon 0.1.8`); `panoptikon:calib-cuda` rebuilt from a clean
+worktree at the tip — image `6fe5d86e3a1e`
+(`sha256:6fe5d86e3a1e…ef2e`), 9.43 GB, 378 s; run1's image kept as
+`panoptikon:calib-cuda-run1` (`2a2c93ad6375`). The CPU and master images
+are **not** rebuilt (still run1's). SGLang still up on both boards; no
+container started; nothing pushed.
+
+**Open items carried into the run2 legs.**
+
+1. **The canvas is not visible in `/health`.** `CostHealth` does not
+   report `canvas_pixels` (adding it is a spec change → `openapi.json`
+   regen → `ui` types regen → gitlink bump). A leg that wants to confirm
+   which canvas is in force reads the load-time DEBUG line
+   (`pricing each input at min(raw pixels, N), the canvas … states`) or
+   the worker's own `resolve_canvas_pixels` INFO line.
+2. **The three `easyocr_*` ids still ship `enable_batching = false`.**
+   The host cap now bounds their grants (F-B's symptom), but their worker
+   takes the grantless path, reports no `units`, and therefore still fits
+   no slope. S8-ocr-C7 measures the grant, not a fit, until that flag is
+   flipped.
+3. **The epoch bump re-measures seven models from scratch.** All seven
+   shipped `pixel` ids now carry `metadata.cost.epoch = 2`
+   (`doctr/dots_ocr`, the three `doctr/easyocr_*`,
+   `clip/qwen3-vl-embedding-{8b,2b}`, `clip/nemotron-embed-vl-1b-v2`),
+   because a canvas re-denominates what one unit *is* and the profile key
+   does not carry it. Any run1 profile row for them is ignored, not
+   migrated: a run2 leg on those models starts from an empty profile even
+   on this host.
+4. **The `ui` submodule commit `9b28044` is unpushed** (branch
+   `batch-calibration-ui`) — the user has to push it to
+   `reasv/panoptikon-ui`; until then the gitlink resolves only from this
+   host's clone, and a clean-worktree image build needs the local remote.
+
 ### Decisions taken during run1 by the orchestrator (2026-09-03)
 
 Decision 5 above splits every problem into "fix it now, with a separate
