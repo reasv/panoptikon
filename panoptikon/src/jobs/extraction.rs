@@ -616,6 +616,10 @@ async fn note_job_failure(
         stage: stage.to_string(),
         error,
         requeued,
+        // Stamped here, not by the writer: the buffer is flushed once at the
+        // end of the job, so a timestamp taken at write time would date every
+        // failure of a long job to the moment it stopped.
+        occurred_at: crate::db::extraction_write::current_iso_timestamp(),
     });
 }
 

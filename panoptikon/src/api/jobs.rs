@@ -826,7 +826,10 @@ pub(crate) struct JobItemFailure {
     /// Whether the item's inference was re-submitted once after the worker
     /// died and then failed again — its one retry was already spent.
     requeued: bool,
-    /// When the job recorded the failure.
+    /// When the item failed, as the job stamped it. Not the moment the
+    /// record was written: the job buffers these and writes them once at the
+    /// end, so a write-time stamp would date every failure of a long job to
+    /// its last second.
     occurred_at: String,
 }
 
@@ -1679,6 +1682,7 @@ mod tests {
                 stage: crate::db::extraction_errors::STAGE_INFERENCE.to_string(),
                 error: "inferio worker clip/model-a failed fatally: early eof".to_string(),
                 requeued: true,
+                occurred_at: "2026-09-04T11:22:33".to_string(),
             }],
         )
         .await
@@ -1708,7 +1712,10 @@ mod tests {
         assert_eq!(failure.stage, "inference");
         assert!(failure.error.contains("failed fatally"));
         assert!(failure.requeued, "the spent re-queue is visible");
-        assert!(!failure.occurred_at.is_empty());
+        assert_eq!(
+            failure.occurred_at, "2026-09-04T11:22:33",
+            "the endpoint serves when the item failed, not when the batch was written"
+        );
 
         assert_eq!(response.failed_jobs_total, 1);
         let job = &response.failed_jobs[0];

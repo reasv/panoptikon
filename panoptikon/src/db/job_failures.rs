@@ -24,7 +24,6 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::api_error::ApiError;
-use crate::db::extraction_write::current_iso_timestamp;
 use crate::db::ledger::{audit_filter_sql, clamp_list_limit, read_audit_column, truncate_error};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -63,6 +62,14 @@ pub(crate) struct JobItemFailureRecord {
     /// Whether this item's inference was re-submitted once after a worker
     /// death before failing again.
     pub requeued: bool,
+    /// When the item failed, stamped by the job at that moment.
+    ///
+    /// Carried on the record rather than taken by the writer, because the
+    /// writer runs once at the *end* of the job: a batch stamped on write
+    /// would date every failure of a four-hour job to the minute it stopped,
+    /// which is precisely the question this surface exists to answer ("when
+    /// did the inference server go away?").
+    pub occurred_at: String,
 }
 
 /// Resolves item and setter inside the statement, like the retry ledger's
@@ -93,7 +100,9 @@ const INSERT_SQL: &str = r#"
 /// Written as a batch at the end of the job rather than per item: a worker
 /// death fails a whole in-flight window at once (1 542 items in run1), and a
 /// writer round trip each would put that burst on the critical path of a
-/// failure the job is already recovering from.
+/// failure the job is already recovering from. Each record carries its own
+/// `occurred_at`, stamped when the item failed rather than now, so batching
+/// the write does not backdate the whole job's failures to its last second.
 ///
 /// Returns how many rows were written. A record whose item or setter has gone
 /// away writes nothing and is *not* an error: this is bookkeeping about work
@@ -105,7 +114,6 @@ pub(crate) async fn record_job_failures(
     job_id: i64,
     records: &[JobItemFailureRecord],
 ) -> ApiResult<u64> {
-    let now = current_iso_timestamp();
     let mut written = 0u64;
     for record in records {
         let error = truncate_error(&record.error);
@@ -114,7 +122,7 @@ pub(crate) async fn record_job_failures(
             .bind(&record.stage)
             .bind(error.as_ref())
             .bind(i64::from(record.requeued))
-            .bind(&now)
+            .bind(&record.occurred_at)
             .bind(&record.setter_name)
             .bind(&record.item_sha256)
             .execute(&mut *conn)
@@ -486,6 +494,11 @@ mod tests {
             .unwrap();
     }
 
+    /// When the job says the item failed — deliberately not "now", so the
+    /// round trip proves the record's own stamp is what is stored rather than
+    /// the moment of the batched write.
+    const FAILED_AT: &str = "2026-09-04T11:22:33";
+
     fn record(sha256: &str, stage: &str, requeued: bool) -> JobItemFailureRecord {
         JobItemFailureRecord {
             item_sha256: sha256.to_string(),
@@ -493,6 +506,7 @@ mod tests {
             stage: stage.to_string(),
             error: "inferio worker test/clip failed fatally: early eof".to_string(),
             requeued,
+            occurred_at: FAILED_AT.to_string(),
         }
     }
 
@@ -532,6 +546,10 @@ mod tests {
         assert_eq!(one.stage, "inference");
         assert!(one.requeued, "the re-queue must be visible in the audit");
         assert!(one.error.contains("failed fatally"));
+        assert_eq!(
+            one.occurred_at, FAILED_AT,
+            "the stored time is the record's own, not the moment of the batched write"
+        );
 
         let two = rows
             .iter()
