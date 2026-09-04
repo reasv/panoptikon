@@ -339,7 +339,8 @@ fn canvas_from_tables(
             _ => {
                 tracing::warn!(
                     inference_id = %full_inference_id,
-                    "metadata.cost.canvas_pixels {value} is not a positive integer;                      pricing this model's inputs uncapped"
+                    "metadata.cost.canvas_pixels {value} is not a positive \
+                     integer; pricing this model's inputs uncapped"
                 );
                 None
             }
@@ -349,7 +350,9 @@ fn canvas_from_tables(
         if declared(id_cost).is_some() || declared(group_cost).is_some() {
             tracing::debug!(
                 inference_id = %full_inference_id,
-                "metadata.cost.canvas_pixels is declared on a {} model; it                  describes the model's input geometry but prices nothing, since                  the cap applies to pixel-denominated units only",
+                "metadata.cost.canvas_pixels is declared on a {} model; it \
+                 describes the model's input geometry but prices nothing, \
+                 since the cap applies to pixel-denominated units only",
                 unit.as_str()
             );
         }
@@ -370,7 +373,8 @@ fn canvas_from_tables(
     if group_unit != unit {
         tracing::debug!(
             inference_id = %full_inference_id,
-            "id overrides the group's cost unit, so the group's canvas_pixels              (written for the group's own input geometry) is not inherited"
+            "id overrides the group's cost unit, so the group's canvas_pixels \
+             (written for the group's own input geometry) is not inherited"
         );
         return None;
     }
