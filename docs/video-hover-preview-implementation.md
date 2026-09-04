@@ -59,6 +59,25 @@ intent already exists: the play badge.
 | T9 | Mixed policy per rung | rejected: rung 0 costs no server work but the byte cap exists for a reason, and a user cannot predict which rung a file takes. One rule per setting. |
 | T10 | Cost when idle | as before: nothing is subscribed or requested per cell until an arm fires. The badge's hover contrast is a stylesheet rule, not state. |
 
+Implementation notes (ui `preview-trigger`, merged 2026-09-04): the
+preference lives in `lib/state/hoverPreviewTrigger.ts`, the countdown is a
+pure state machine in `lib/previewCountdown.ts` (`idle | counting | draining
+| started`, 700 ms fill, 150 ms drain, `previewFrameShown` is the T7 swap
+rule), and `hooks/usePreviewTriggerArm.ts` drives it through the director's
+own `armHoverPlay` on the badge element — so the badge inherits the
+real-pointermove-then-dwell discipline rather than re-earning it. Four
+readings worth knowing: (1) after the start, the badge ignores every arm
+loss including a fast-scroll suspend — only the card's leave cancels, as T5
+words it; (2) T6's "disappears at the first frame" is achieved by the badge
+ceasing to be interactive at the start, which restores the ordinary hover
+fade while a pending job's ring keeps suppressing it (V11), with no
+playing-state channel from the video; (3) the hit target is the badge SVG's
+square box, with the overlay around it still `pointer-events: none`, and the
+badge stays `aria-hidden` (the keyboard path is the card's link); (4) the
+`previewTrigger` prop defaults to `"card"` on both card components, so
+surfaces that pass no capability are byte-identical to before. Tests:
+`scripts/previewtrigger.test.mjs`.
+
 ## 2. The ladder, and the measurement that produced it
 
 The plan's rung 0 carried no size bound, on the reasoning that
