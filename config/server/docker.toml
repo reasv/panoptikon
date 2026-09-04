@@ -94,6 +94,21 @@ html_renderer_args = ["--no-sandbox", "--disable-dev-shm-usage"]
 [inference_local]
 enabled = true
 
+# How many models may be spawning and streaming their weights into ONE
+# board at a time. Default 1, which is what the retired host-wide load lock
+# gave each board; every unpinned model resolves to the same default board,
+# so 1 is host-wide serialization on the shipped configuration. Raising it
+# is safe — each load charges its expected base as a reservation inside the
+# same ledger critical section that prices it.
+# max_concurrent_loads = 1
+
+# Per-model cooldown after a failed load: the window doubles per
+# consecutive failure (2, 4, 8 … capped below), a successful load clears
+# it, and while it is armed predict and load answer 503 + Retry-After
+# instead of spawning another worker. 0 disables the cooldown.
+# load_failure_cooldown_secs = 2
+# load_failure_cooldown_max_secs = 300
+
 # How much of each GPU the inference orchestrator may admit work into. Two
 # composable limits; when both are set the budget is the min. The header below
 # is live and the table deliberately empty: an empty table freezes nothing —
