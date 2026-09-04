@@ -1095,16 +1095,7 @@ fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
 ///   term. Identical post-fit (the grant's MB figure is `units × slope`) and
 ///   strictly better pre-fit, where there is no slope to express it in.
 fn admitted_units(entry: &WorkerEntry, anchor: u64, knee: Option<u64>) -> u64 {
-    let seed = entry.seed_units.max(1);
-    let factor = 1u64
-        .checked_shl(entry.effective_ramp_step(anchor))
-        .unwrap_or(u64::MAX);
-    let ramped = seed.saturating_mul(factor).max(anchor);
-    let bounded = if anchor > 0 {
-        ramped.min(anchor.saturating_mul(RATCHET_FACTOR))
-    } else {
-        ramped
-    };
+    let bounded = uncapped_units(entry, anchor);
     let bounded = match knee {
         Some(knee) if knee > 0 => bounded.min(knee),
         _ => bounded,
@@ -1115,6 +1106,28 @@ fn admitted_units(entry: &WorkerEntry, anchor: u64, knee: Option<u64>) -> u64 {
     // batches. The design's real floor is at pack time — a batch is never
     // smaller than one item, whatever the budget says.
     (bounded >> entry.deflation.min(63)).max(1)
+}
+
+/// The unit budget the ramp and the extrapolation ratchet alone allow —
+/// [`admitted_units`] with neither the throughput knee nor deflation applied.
+///
+/// Split out because that is exactly the number a knee has to clear before it
+/// stops being able to cap anything, and [`VramLedger::note_knee_window_locked`]
+/// withdraws a widened knee on precisely that test (run2 change R1d). Reading
+/// it off `admitted_units` instead would fold in the deflation shift, so a
+/// deflated replica would have its knee withdrawn for a ceiling that is about
+/// to move back up; re-deriving it in a second place would let the two drift.
+fn uncapped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
+    let seed = entry.seed_units.max(1);
+    let factor = 1u64
+        .checked_shl(entry.effective_ramp_step(anchor))
+        .unwrap_or(u64::MAX);
+    let ramped = seed.saturating_mul(factor).max(anchor);
+    if anchor > 0 {
+        ramped.min(anchor.saturating_mul(RATCHET_FACTOR))
+    } else {
+        ramped
+    }
 }
 
 /// Whether a settling window's batches may describe this model's throughput
@@ -1518,6 +1531,22 @@ struct ModelCalibration {
     /// [`KNEE_EXPIRY_CLEAN_WINDOWS`] + 1, at twice the capped size, in
     /// exchange for a cap that can never again outlive its evidence.
     knee_re_explore_above: Option<u32>,
+    /// A knee that was in force on this board has **expired past the point of
+    /// capping anything and been withdrawn**, and the calibration store has
+    /// not been told yet (run2 change R1d).
+    ///
+    /// Explicit, and set where the withdrawal happens, because neither of the
+    /// quantities the write policy watches can express it. The store's merge
+    /// reads an absent knee as "this run fitted none" and keeps what is on
+    /// disk — correct for every case but this one — and `knee_units` alone
+    /// cannot distinguish them either, since the knee most in need of
+    /// withdrawing is a **seeded** one (`knee_is_local == false`, so it was
+    /// never in `persisted` to disappear from). That is F-A's own shape: the
+    /// stored knee is reseeded on every restart, and without this flag the
+    /// file keeps it forever however often the run retires it.
+    ///
+    /// Cleared once an update carrying it has been produced.
+    knee_withdrawn: bool,
     /// `(anchor, fit version, locally fitted knee)` as last handed to the
     /// calibration store. The write policy is "the ratchet anchor advanced or
     /// the fit meaningfully changed" — and `FitSnapshot::version` only moves
@@ -3075,18 +3104,24 @@ impl VramLedger {
         // local fit does. Quantized to a bucket edge, so "changed at all" and
         // "changed materially" are the same test.
         let knee = cal.knee_units.filter(|_| cal.knee_is_local);
-        // A knee this machine wrote that has now expired past the point of
-        // capping anything: the store has to be told to drop it, because a
-        // `None` knee otherwise reads as "nothing fitted this run" and the
-        // merge keeps whatever is on disk (run2 change R1d).
-        let knee_withdrawn =
-            knee.is_none() && cal.persisted.is_some_and(|persisted| persisted.2.is_some());
+        // A knee that has expired past the point of capping anything: the
+        // store has to be told to drop it, because a `None` knee otherwise
+        // reads as "nothing fitted this run" and the merge keeps whatever is
+        // on disk (run2 change R1d, [`ModelCalibration::knee_withdrawn`]).
+        let knee_withdrawn = cal.knee_withdrawn;
         let current = (cal.max_units_measured, fit_version, knee);
-        if cal.persisted.is_some_and(|persisted| {
-            persisted.1 == current.1 && persisted.0 >= current.0 && persisted.2 == current.2
-        }) {
+        if !knee_withdrawn
+            && cal.persisted.is_some_and(|persisted| {
+                persisted.1 == current.1 && persisted.0 >= current.0 && persisted.2 == current.2
+            })
+        {
+            // A withdrawal is never suppressed by the write policy: nothing
+            // the policy watches has to have moved for it (a seeded knee was
+            // never in `persisted` to move out of), and an unwritten
+            // withdrawal is a stored knee outliving its own expiry.
             return None;
         }
+        cal.knee_withdrawn = false;
         // The **persisted** anchor only ever moves forward, which the
         // suppression predicate above cannot achieve on its own: it is a
         // conjunction, so a fit or knee change riding along with a *lowered*
@@ -3697,7 +3732,14 @@ impl VramLedger {
 
     /// Units the dispatcher should aim to put in one window.
     fn window_target_units(&self, worker: WorkerId) -> u64 {
-        let state = self.lock();
+        let mut state = self.lock();
+        // This reads the deflation counter through `admitted_units`, and it is
+        // the *first* thing an idle replica's next window asks — before the
+        // grant path, which repays too late to size this window (run2 change
+        // R4). A stale counter here shrinks the window's content, and the
+        // grant that follows is bounded by that content however much budget
+        // the repayment just handed back.
+        Self::repay_deflation_locked(&mut state, worker);
         let Some(entry) = state.workers.get(&worker) else {
             return 1;
         };
@@ -4120,11 +4162,24 @@ impl VramLedger {
     /// the model climbs out of it one step per [`KNEE_EXPIRY_CLEAN_WINDOWS`]
     /// windows instead of never.
     ///
-    /// Once the widened cap can no longer bind — it has reached the ratchet's
-    /// own ceiling of `RATCHET_FACTOR × anchor` — the knee is **withdrawn**
-    /// outright rather than left as a number that does nothing, so that
-    /// `/health`, the store and the contention appetite all stop claiming a
-    /// cap this model no longer has.
+    /// Once the widened cap can no longer bind — it has reached
+    /// [`uncapped_units`], the budget the ramp and the extrapolation ratchet
+    /// allow on their own — the knee is **withdrawn** outright rather than
+    /// left as a number that does nothing, so that `/health`, the store and
+    /// the contention appetite all stop claiming a cap this model no longer
+    /// has. That test is the direct statement of "it cannot cap anything",
+    /// and unlike `RATCHET_FACTOR × anchor` it is also defined where
+    /// `anchor == 0` — the "nothing measured locally" sentinel, under which
+    /// the ratchet ceiling is off and a knee still caps the plain geometric
+    /// ramp. Leaving a knee standing there would be a number `/health` and the
+    /// store keep reporting for a cap that no longer exists, and the same
+    /// sentinel is handled rather than excused in [`deflation_cap`].
+    ///
+    /// **Both branches leave [`ModelCalibration::knee_re_explore_above`] set.**
+    /// Withdrawal is a widening to infinity, and the ring at that instant is
+    /// exactly what it was under the old cap — so a refit (which runs later in
+    /// this same settle) would otherwise reinstall the number that just
+    /// expired, undoing every widening that led here inside one window.
     fn note_knee_window_locked(
         state: &mut LedgerState,
         worker: WorkerId,
@@ -4134,6 +4189,9 @@ impl VramLedger {
         let entry = state.workers.get(&worker)?;
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let anchor = Self::anchor_locked(state, entry);
+        // The budget with no knee and no deflation in it: what a widened knee
+        // has to reach before it stops being able to cap anything.
+        let ceiling = uncapped_units(entry, anchor);
         let cal = state.calibration.get_mut(&key)?;
         let knee = cal.knee_units.filter(|knee| *knee > 0)?;
         if negative {
@@ -4149,18 +4207,25 @@ impl VramLedger {
         // `knee` is `2^(b+1) − 1`; the top of the next bucket is `2k + 1`, and
         // it cannot overflow for any knee the fit can produce (`b < 63`).
         let widened = knee.saturating_mul(2).saturating_add(1);
-        let withdrawn = anchor > 0 && widened >= anchor.saturating_mul(RATCHET_FACTOR);
+        let withdrawn = widened >= ceiling;
         if withdrawn {
             cal.knee_units = None;
             cal.knee_is_local = false;
-            cal.knee_re_explore_above = None;
+            // The store keeps whatever knee is on disk when an update brings
+            // none, so the withdrawal has to be stated rather than implied —
+            // and stated here, where it happens, because a knee this run
+            // *seeded* is not `knee_is_local` and its disappearance is
+            // otherwise indistinguishable from "this run fitted none".
+            cal.knee_withdrawn = true;
         } else {
             cal.knee_units = Some(widened);
-            // The samples in the ring were all taken under the old cap, so a
-            // refit would hand the same number straight back. The model has to
-            // run at the wider size before the ring may speak again.
-            cal.knee_re_explore_above = Some(size_bucket(knee));
         }
+        // The samples in the ring were all taken under the old cap, so a refit
+        // would hand the same number straight back. The model has to run at
+        // the wider size before the ring may speak again — and a withdrawal is
+        // just a widening with no upper bound, so it waits on the same
+        // evidence.
+        cal.knee_re_explore_above = Some(size_bucket(knee));
         Some(KneeExpired {
             inference_id: key.0,
             gpu: key.1,
@@ -5530,6 +5595,38 @@ impl VramLedger {
             .or_default();
         cal.knee_units = Some(knee);
         cal.knee_is_local = true;
+    }
+
+    /// Push sole-occupancy throughput observations straight into the knee
+    /// ring, so a test can put the ring in a state a real run would take
+    /// hundreds of windows to reach — in particular "the ring *would* fit a
+    /// knee right now", which is the only state in which the re-explore guard
+    /// after an expiry is observable at all.
+    #[cfg(test)]
+    fn seed_throughput_ring_for_test(
+        &self,
+        inference_id: &str,
+        gpu: &str,
+        curve: &[(u64, f64)],
+        each: usize,
+    ) {
+        let mut state = self.lock();
+        let cal = state
+            .calibration
+            .entry((inference_id.to_owned(), gpu.to_owned()))
+            .or_default();
+        for (units, units_per_sec) in curve {
+            for _ in 0..each {
+                cal.throughput.push_back(ThroughputSample {
+                    units: *units,
+                    units_per_sec: *units_per_sec,
+                    occupants: 0,
+                });
+                while cal.throughput.len() > KNEE_RING {
+                    cal.throughput.pop_front();
+                }
+            }
+        }
     }
 
     /// The runtime-only historical peak the knee threshold is anchored to.
@@ -7073,6 +7170,46 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].deflation, 0);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 64, "back to the full budget");
+    }
+
+    /// The window **target** reads the deflation counter too, and it is the
+    /// first thing an idle replica's next window asks — before the grant path,
+    /// which repays too late to size this one. A stale counter there shrinks
+    /// the window's content, and the grant that follows is bounded by that
+    /// content however much budget the repayment has just handed back.
+    #[test]
+    fn the_window_target_repays_deflation_before_it_reads_the_counter() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        for expected in [4, 8, 16, 32] {
+            assert_eq!(measured_window(&handle, &admission, expected), expected);
+        }
+        for _ in 0..3 {
+            admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .unwrap()
+                .finish(WindowOutcome::Responded { oom: true });
+        }
+        assert_eq!(
+            admission.window_target_units(),
+            8 * WINDOW_DEPTH_MULTIPLIER,
+            "three halvings off a budget of 64"
+        );
+
+        // Five intervals of idleness. Nothing has settled and nothing has
+        // asked for a grant, so this call is the whole of the replica's next
+        // window: if the repayment does not land here it does not land in
+        // time.
+        ledger.age_deflation_clock_for_test(admission.worker_id(), DEFLATION_REPAY_SECS * 5);
+        assert_eq!(
+            admission.window_target_units(),
+            64 * WINDOW_DEPTH_MULTIPLIER,
+            "every level owed, repaid at the first question asked"
+        );
     }
 
     /// R4's last clause, and it holds by construction rather than by a rule:
@@ -12637,7 +12774,48 @@ mod tests {
         assert_eq!(worker.knee_units, None, "withdrawn, not widened to 255");
         assert_eq!(worker.max_units_measured, 64);
         assert_eq!(worker.unit_budget, 128, "the ratchet governs from here");
-        assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).1, None);
+        assert_eq!(
+            ledger.knee_expiry_for_test("g/a", BOARD).1,
+            Some(size_bucket(127)),
+            "a withdrawal is a widening with no upper bound, so it leaves the \
+             same frontier for the ring to be let past"
+        );
+    }
+
+    /// The other half of that guard, and the reason it is not merely tidy: the
+    /// refit runs **later in the very settle that withdraws the knee**, from a
+    /// ring the widenings never changed. Without the frontier the withdrawal
+    /// would last exactly as long as the three statements between the two
+    /// calls.
+    #[test]
+    fn a_withdrawn_knee_is_not_handed_straight_back_by_its_own_settle() {
+        let (ledger, handle, admission) = knee_capped(127);
+        for _ in 1..KNEE_EXPIRY_CLEAN_WINDOWS {
+            window_at_the_cap(&handle, &admission);
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(127));
+
+        // A ring a refit would read a knee of 15 out of, put in place with one
+        // window of the expiry still to run. Everything in it predates the
+        // cap, which is exactly what makes it the wrong evidence to re-cap on.
+        ledger.seed_throughput_ring_for_test(
+            "g/a",
+            BOARD,
+            &[(8, 100.0), (16, 100.0), (32, 100.0)],
+            4,
+        );
+        window_at_the_cap(&handle, &admission);
+
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            None,
+            "the knee stays withdrawn until the model has run above the cap it \
+             was withdrawn from"
+        );
+        assert_eq!(
+            ledger.knee_expiry_for_test("g/a", BOARD).1,
+            Some(size_bucket(127))
+        );
     }
 
     /// The oscillation guard: right after a widening the ring is exactly what
@@ -12701,6 +12879,103 @@ mod tests {
             ledger.health()[0].workers[0].knee_units,
             Some(15),
             "re-established from honest samples, which is what the expiry is for"
+        );
+    }
+
+    /// R1d, the `anchor == 0` arm: a model that has never produced a local
+    /// high-water sample has no ratchet ceiling, so `RATCHET_FACTOR × anchor`
+    /// cannot say when a widened knee has stopped mattering. The ramp's own
+    /// ceiling can, and it is the same sentinel [`deflation_cap`] handles
+    /// rather than excuses — otherwise the knee widens until it binds nothing
+    /// and then sits in `/health` and in the store as a cap that does not
+    /// exist.
+    #[test]
+    fn a_knee_with_no_ratchet_anchor_is_withdrawn_once_it_stops_binding() {
+        let ledger = priced_ledger(200_000);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .unwrap();
+        push_memory(&handle, 190_000, 1000);
+        ledger.set_knee_for_test("g/a", BOARD, 3);
+        assert_eq!(
+            ledger.health()[0].workers[0].max_units_measured,
+            0,
+            "nothing has been measured locally, so there is no ratchet ceiling"
+        );
+
+        // 3 → 7, still inside the seed-sized ramp's own ceiling of 8.
+        for _ in 0..KNEE_EXPIRY_CLEAN_WINDOWS {
+            window_at_the_cap(&handle, &admission);
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(7));
+
+        // 15 would cap nothing the ramp allows, so the knee goes rather than
+        // standing as a number nothing can act on.
+        for _ in 0..KNEE_EXPIRY_CLEAN_WINDOWS {
+            window_at_the_cap(&handle, &admission);
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, None);
+    }
+
+    /// The knee a run **seeded** is the one most in need of retiring — F-A's
+    /// was reseeded into 56 replicas — and it is not `knee_is_local`, so
+    /// nothing the write policy watches moves when it goes. The withdrawal is
+    /// therefore stated outright, or the file keeps a cap the run has already
+    /// decided is wrong and hands it back on the next start.
+    #[test]
+    fn a_withdrawn_seeded_knee_is_reported_to_the_store_as_a_withdrawal() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 1.0,
+                residual_mb: 0.0,
+                samples: 20,
+                knee_units: Some(15),
+                local: true,
+                fit_is_local: true,
+                exact_torch: true,
+                max_units_measured: 64,
+                local_samples: 20,
+                knee_clean_windows: 0,
+                ring: Vec::new(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        push_memory(&handle, 190_000, 1000);
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+
+        // 15 → 31 → 63 → withdrawn: three expiries against a ramp ceiling of
+        // 64, none of which this replica ever wrote to the store, because a
+        // seeded knee is never `knee_is_local`.
+        //
+        // The batches are deliberately too small to reach the knee ring
+        // ([`FULL_BATCH_RATIO`]), so nothing refits underneath the expiry.
+        // What is under test is what the *store* is told, not what a ring
+        // says; the ring's own say is `a_widened_knee_is_not_refitted_…`.
+        for _ in 0..(KNEE_EXPIRY_CLEAN_WINDOWS * 3) {
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![warm_batch(1, 100.0)]);
+            token.finish(WindowOutcome::Responded { oom: false });
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, None);
+
+        let updates = profiles.updates.lock().unwrap();
+        let withdrawal = updates
+            .iter()
+            .find(|update| update.knee_withdrawn)
+            .expect("the store is told, or the file keeps a retired knee forever");
+        assert_eq!(
+            withdrawal.knee_units, None,
+            "and it carries no replacement, which is what the merge acts on"
         );
     }
 

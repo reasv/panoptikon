@@ -2506,6 +2506,46 @@ metadata.cost.unit = "none"
         );
     }
 
+    /// And it has to survive the process that decided it. A knee the run
+    /// retired but the *file* keeps is F-A one reboot removed: the next start
+    /// seeds it straight back and the model is capped again before it has run
+    /// a single window.
+    #[test]
+    fn a_withdrawn_knee_does_not_come_back_after_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        {
+            let store = store(root.path());
+            store.record(ProfileUpdate {
+                knee_units: Some(15),
+                ..update("clip/vit", "fp16", 0.79)
+            });
+            store.write_pending();
+            assert_eq!(store.local_entries()[0].knee_units, Some(15));
+            store.record(ProfileUpdate {
+                knee_units: None,
+                knee_withdrawn: true,
+                ..update("clip/vit", "fp16", 0.79)
+            });
+            store.write_pending();
+        }
+
+        // A second store over the same directory: exactly what the next run
+        // reads, and the only state a restart can see.
+        let store = store(root.path());
+        assert_eq!(
+            store.local_entries()[0].knee_units,
+            None,
+            "the withdrawal reached the file, not just the run that made it"
+        );
+        let seed = store
+            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
+            .expect("the entry still matches its own key");
+        assert_eq!(
+            seed.knee_units, None,
+            "so nothing reseeds the retired cap into the new run"
+        );
+    }
+
     /// R11: `dtype_method` is stored, round-trips, and is **ignored by
     /// matching and merging** — two rows that agree on `dtype` are one entry
     /// however each of them arrived at it.
