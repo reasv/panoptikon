@@ -117,7 +117,16 @@ enabled = true
 # header above it would otherwise land it in whichever table precedes this one.
 [inference_local.vram]
 # Margin over OTHER processes' VRAM usage (our own workers are measured, never
-# inflated): usable = total - other_used * (1 + margin). Default 0.10, on.
+# inflated). LEAVING THIS UNSET IS NOT THE SAME AS SETTING 0.10: unset means
+# the built-in fraction (0.10) applies AND at most 1 GiB is ever withheld, so
+# the last gigabytes of a busy board stay usable. Setting it here honours your
+# number verbatim and uncapped:
+#   unset:  usable = total - other_used - min(other_used * 0.10, 1 GiB)
+#   set:    usable = total - other_used * (1 + margin)
+# The cap covers the whole reserve, the automatic widening for an unconfirmed
+# cost model included. GET /api/inference/health reports which rule a board is
+# under, as `reserve_rule` ("capped_default" or "user_margin") and
+# `reserve_mb`.
 # margin = 0.10
 # Hard ceiling as a fraction of the board's total VRAM; the server lever for
 # partitioning one card between services. Default: off.
