@@ -2572,6 +2572,9 @@ def measure_batch(
     oom: bool = False,
     throughput_collapse: bool = False,
     oom_class: dict[str, Any] | None = None,
+    free_mb: int | None = None,
+    free_source: str | None = None,
+    clamped: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """One measurement map for the batch bracketed by `state` (never raises).
 
@@ -2593,6 +2596,14 @@ def measure_batch(
     `oom_class` beside an absent `oom` is "this worker saw no out-of-memory
     condition", including on a batch that failed for some other reason
     (docs/inferio-worker-protocol.md, "Memory sensing").
+
+    `free_mb`/`free_source` are the **pre-batch** driver reading the packing
+    harness's defensive clamp already takes, passed in rather than re-read
+    here: this function runs *after* the batch, and a reading taken then would
+    describe a different world from the one the clamp decided against. They
+    are what lets the orchestrator's external-usage term refresh once per
+    batch instead of once per staleness timer (run2 R5). `clamped` is that
+    clamp's report, present only when it actually shrank the batch.
     """
     try:
         _, _, peak_reserved, peak_allocated = _allocator_stats()
@@ -2610,6 +2621,11 @@ def measure_batch(
             "peak_allocated_mb": peak_allocated,
             "duration_ms": duration_ms,
         }
+        if free_mb is not None:
+            measurement["free_mb"] = free_mb
+            measurement["free_source"] = free_source
+        if clamped:
+            measurement["clamped"] = clamped
         if units is not None:
             measurement["units"] = units
         if oom:

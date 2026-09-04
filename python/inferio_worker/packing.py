@@ -40,7 +40,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, NamedTuple, Sequence
 
 from inferio_worker import memory
 
@@ -479,7 +479,25 @@ def plan_batches(
     return batches
 
 
-def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> int:
+class LiveBudget(NamedTuple):
+    """What one pre-batch memory reading decided, and the reading itself.
+
+    `units` is the budget the next batch may spend; `free_mb`/`free_source`
+    are the reading it was decided from, reported on the measurement so the
+    orchestrator's external-usage term refreshes at response cadence rather
+    than at its own staleness timer (run2 R5; run1 report §4, T3 measured
+    `external_mb` ageing to 166.9 s and a +30 GB step taking 31.5 s to reach
+    `/health`). `clamped` is the clamp's own report, present only when the
+    clamp actually shrank something.
+    """
+
+    units: int
+    free_mb: int | None
+    free_source: str | None
+    clamped: dict[str, int] | None
+
+
+def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
     """Shrink the budget if free memory has fallen below what it assumed.
 
     Shrink-only, and never above the grant. The rule compares live free
@@ -491,23 +509,39 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> int:
     Returns `unit_budget` unchanged when nothing can be read (no CUDA, no
     NVML, no torch) — the orchestrator's own staleness refresh and the impl's
     OOM backstop cover that case.
+
+    **The reading is taken even when there is nothing to clamp against.**
+    Before run2 a grant with `mb <= 0` — which is what a pre-fit grant on a
+    full board carries, i.e. precisely the memory-blind case — returned
+    without reading anything at all. It is still exactly **one** reading per
+    batch, the same one this function always took; reporting it is free, and
+    the batch that most needs the orchestrator to learn what the board looks
+    like is the one whose own grant could not say.
     """
+    free_mb, _, free_source = memory.free_total_mb()
     if not grant_mb or grant_mb <= 0:
-        return unit_budget
-    free_mb, _, _ = memory.free_total_mb()
+        return LiveBudget(unit_budget, free_mb, free_source, None)
     if free_mb is None or free_mb >= grant_mb:
-        return unit_budget
+        return LiveBudget(unit_budget, free_mb, free_source, None)
     shrunk = max(1, int(unit_budget * free_mb / grant_mb))
-    if shrunk < unit_budget:
-        logger.info(
-            "free memory fell to %d MiB against a %d MiB grant; shrinking this "
-            "batch's budget from %d to %d units",
-            free_mb,
-            grant_mb,
-            unit_budget,
-            shrunk,
-        )
-    return shrunk
+    if shrunk >= unit_budget:
+        # The ratio rounded back up to the whole budget: nothing was shrunk,
+        # so nothing is reported as shrunk.
+        return LiveBudget(unit_budget, free_mb, free_source, None)
+    logger.info(
+        "free memory fell to %d MiB against a %d MiB grant; shrinking this "
+        "batch's budget from %d to %d units",
+        free_mb,
+        grant_mb,
+        unit_budget,
+        shrunk,
+    )
+    return LiveBudget(
+        shrunk,
+        free_mb,
+        free_source,
+        {"from_units": unit_budget, "to_units": shrunk, "free_mb": free_mb},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -908,9 +942,9 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
     while pending:
         # Re-plan per batch: the defensive clamp can shrink the budget
         # mid-window, and the plan for the remaining items must honour that.
-        effective = clamp_to_live_memory(budget, grant_mb)
+        live = clamp_to_live_memory(budget, grant_mb)
         remaining_units = [units[index] for index in pending]
-        plan = plan_batches(remaining_units, aggregation, effective, cap_items)
+        plan = plan_batches(remaining_units, aggregation, live.units, cap_items)
         batch = [pending[position] for position in plan[0]]
         priced = batch_units(batch, units, aggregation)
 
@@ -945,6 +979,9 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
                     items=len(batch),
                     oom=oom,
                     oom_class=oom_class,
+                    free_mb=live.free_mb,
+                    free_source=live.free_source,
+                    clamped=live.clamped,
                 )
             )
             message = str(exc)
@@ -965,7 +1002,13 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
             )
             # Unpriced for the same reason as every other failure path: the
             # batch did not complete, so its peaks under-state its cost.
-            record(memory.measure_batch(state, items=len(batch)))
+            record(memory.measure_batch(
+                    state,
+                    items=len(batch),
+                    free_mb=live.free_mb,
+                    free_source=live.free_source,
+                    clamped=live.clamped,
+                ))
             raise WindowFailure(str(exc), measurements, exc) from exc
 
         # Did the impl run the batch it was handed? Several shipped impls
@@ -989,6 +1032,9 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
             units=priced if priceable else None,
             oom=absorbed_ooms > 0,
             oom_class=classify_oom(None, absorbed_ooms) if absorbed_ooms else None,
+            free_mb=live.free_mb,
+            free_source=live.free_source,
+            clamped=live.clamped,
         )
         if absorbed_ooms:
             logger.warning(

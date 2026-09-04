@@ -335,22 +335,102 @@ def test_every_input_is_planned_exactly_once():
 
 def test_the_clamp_shrinks_when_free_memory_fell(fake_torch):
     fake_torch.free = 250 * MIB
-    assert packing.clamp_to_live_memory(64, 1000) == 16, "250/1000 of 64"
+    shrunk = packing.clamp_to_live_memory(64, 1000)
+    assert shrunk.units == 16, "250/1000 of 64"
+    assert shrunk.clamped == {"from_units": 64, "to_units": 16, "free_mb": 250}
     # Never below one item.
-    assert packing.clamp_to_live_memory(2, 1_000_000) == 1
+    assert packing.clamp_to_live_memory(2, 1_000_000).units == 1
 
 
 def test_the_clamp_never_grows_and_degrades_to_a_no_op(fake_torch):
     fake_torch.free = 8000 * MIB
-    assert packing.clamp_to_live_memory(64, 1000) == 64, "shrink-only"
-    assert packing.clamp_to_live_memory(64, None) == 64, "no grant MB, no rule"
-    assert packing.clamp_to_live_memory(64, 0) == 64
+    assert packing.clamp_to_live_memory(64, 1000).units == 64, "shrink-only"
+    assert packing.clamp_to_live_memory(64, None).units == 64, "no grant MB, no rule"
+    assert packing.clamp_to_live_memory(64, 0).units == 64
+    for grant_mb in (1000, None, 0):
+        assert packing.clamp_to_live_memory(64, grant_mb).clamped is None
 
 
 def test_the_clamp_is_a_no_op_without_torch():
     """No CUDA, no NVML: nothing readable, so the budget stands and the OOM
     backstop covers the case."""
-    assert packing.clamp_to_live_memory(64, 1000) == 64
+    live = packing.clamp_to_live_memory(64, 1000)
+    assert live.units == 64
+    assert (live.free_mb, live.free_source, live.clamped) == (None, None, None)
+
+
+def test_the_clamp_reads_free_memory_even_with_nothing_to_clamp(fake_torch):
+    """R5: a grant carrying `mb <= 0` is the memory-blind case — precisely the
+    batch whose reading the orchestrator most needs — and before run2 it was
+    the one batch that took no reading at all. Still exactly one reading."""
+    fake_torch.free = 4321 * MIB
+    for grant_mb in (0, None):
+        live = packing.clamp_to_live_memory(64, grant_mb)
+        assert live.units == 64
+        assert (live.free_mb, live.free_source) == (4321, "torch")
+        assert live.clamped is None
+
+
+def test_a_budget_of_one_cannot_be_clamped_and_says_so(fake_torch):
+    """The floor is one item, so a budget already at one is never shrunk —
+    and a batch that ran at its granted budget is not a clamped batch,
+    however little memory there was."""
+    fake_torch.free = 1 * MIB
+    live = packing.clamp_to_live_memory(1, 1000)
+    assert live.units == 1
+    assert live.clamped is None
+    assert live.free_mb == 1, "the reading is still reported"
+
+
+def test_every_measurement_carries_the_pre_batch_free_reading(fake_torch):
+    """R5's wire half: the reading the clamp took rides every measurement, so
+    `external_mb` refreshes at response cadence (run1 report §4, T3)."""
+    fake_torch.free = 7000 * MIB
+    payload = packing.run_window(
+        Recorder(), items(6), grant(unit_budget=2, aggregation="count")
+    )
+    assert len(payload["measurements"]) == 3
+    for measurement in payload["measurements"]:
+        assert measurement["free_mb"] == 7000
+        assert measurement["free_source"] == "torch"
+        assert "clamped" not in measurement
+
+
+def test_a_clamped_batch_reports_what_the_clamp_did(fake_torch):
+    fake_torch.free = 100 * MIB
+    payload = packing.run_window(
+        Recorder(), items(4), grant(unit_budget=8, mb=1000, aggregation="count")
+    )
+    first = payload["measurements"][0]
+    assert first["clamped"] == {"from_units": 8, "to_units": 1, "free_mb": 100}
+    assert first["free_mb"] == 100
+
+
+def test_a_failed_batch_still_reports_its_pre_batch_reading(fake_torch):
+    """The failure paths carry it too: a batch that died is exactly when the
+    orchestrator wants to know what the board looked like going in."""
+    fake_torch.free = 512 * MIB
+
+    class Failing:
+        def predict(self, inputs):
+            raise ValueError("fixture failure")
+
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(Failing(), items(2), grant(unit_budget=2))
+    assert caught.value.measurements[0]["free_mb"] == 512
+
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(Recorder(wrong_count=True), items(2), grant(unit_budget=2))
+    assert caught.value.measurements[0]["free_mb"] == 512
+
+
+def test_the_grantless_path_reports_no_pre_batch_reading(fake_torch):
+    """It takes no clamp reading — there is no grant to clamp against — so it
+    reports none, rather than a post-batch reading under a pre-batch name."""
+    state = memory.begin_batch()
+    payload = memory.finish_batch(state, items=3)
+    assert "free_mb" not in payload["measurements"][0]
+    assert payload["memory"]["free_mb"] is not None, "the sample still carries one"
 
 
 def test_the_clamp_shrinks_the_batches_actually_run(fake_torch):
