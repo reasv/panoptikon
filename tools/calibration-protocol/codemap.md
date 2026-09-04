@@ -388,10 +388,10 @@ build/deploy/API. The plan that uses this is
 5. Ledger: `Responded{oom: true}` → `deflation + 1`; nothing enters
    fit/anchor.
 6. Core (`jobs/extraction.rs`): predict failure → `isolate_inputs` once
-   with `max_batch = 1` (`ISOLATION_MAX_BATCH` `:2467`,
-   `isolate_inputs` `:2479-2510`); still failing → item marked
+   with `max_batch = 1` (`ISOLATION_MAX_BATCH` `:2644`,
+   `isolate_inputs` `:2656-2703`); still failing → item marked
    transient, job continues; job fails "Systemic" only if every
-   attempted item failed for non-media reasons. `inferio_client.rs:924-931`
+   attempted item failed for non-media reasons. `inferio_client.rs:1714-1720`
    retries only 429/502/503/504/connect/timeout, not a 500 from an OOM.
 - **Death, seen from the job** (R2a): the predict 500 for a request that
   never reached a model now carries a machine-readable kind —
@@ -413,13 +413,21 @@ build/deploy/API. The plan that uses this is
   queue-failing path funnels through it) and `ModelManager::predict`'s two
   arms; it *carries* the message rather than wrapping it, so every
   rendering above is still produced byte for byte. The client parses it into the
-  typed `InferenceFailure` (`inferio_client.rs:121`, reached with
+  typed `InferenceFailure` (`inferio_client.rs:240`, reached with
   `inference_failure()`), and `jobs::extraction::run_item_inference`
-  (`extraction.rs:2179-2228`) re-submits that item's work **once**
-  (`classify_item_failure` `:2250-2261`, one retry per item per job, counted
+  (`extraction.rs:2270-2330`) re-submits that item's work **once**
+  (`classify_item_failure` `:2362-2373`, one retry per item per job, counted
   in `JobCounters::requeued_items`); `run_chunked_inference` skips its
   isolation pass for it (`is_unit_agnostic_failure`), since isolating
-  would re-ask a dead worker once per unit. Items that fail again are
+  would re-ask a dead worker once per unit. The policy's predicate is
+  `warrants_resubmission()`, which covers a **fourth** classification the
+  wire never carries: a `kind = "transport"` failure this client typed
+  itself (`InferenceFailure::from_transport`, `TransportPhase`
+  connect/send/headers/body, `inferio_client.rs:148-224`). The three
+  before-any-answer phases are `is_unattempted()` like the server's kinds;
+  `body` — the server answered and this end lost the answer — re-queues on
+  idempotence instead. `parse` never sets the phase, so a peer cannot claim
+  one, and every phase is unit-agnostic for the isolation skip above. Items that fail again are
   recorded in `data_job_failures` and the job reports **partial**. A
   `load_cooldown` 503 (R9) instead aborts the job through `JobAbort`
   (`:715-762`) with the model, retry instant and last error as the reason.
@@ -517,7 +525,7 @@ build/deploy/API. The plan that uses this is
   transport memo: hyper opens up to 100 streams on a fresh connection
   before the peer's SETTINGS arrive, so a peer advertising fewer refuses
   the surplus, and RFC 9113 §8.7 makes that reset the one that is safe to
-  retry. `Transport` (`:264-269`) is
+  retry. `Transport` (`:523-528`) is
   resolved once per endpoint by a `GET /cache` probe sent with prior
   knowledge (`transport` `:449-506`): *any* HTTP answer means `H2c`. A
   downgrade is only recorded on **positive evidence** — a failure that
@@ -607,7 +615,7 @@ build/deploy/API. The plan that uses this is
   (`http.rs:87`, attached by `with_desired_in_flight` `:848-858`, documented
   in the `#[utoipa::path]` for `predict` and hence in `openapi.json`).
   The client reads it back into `PredictResponse.desired_in_flight_items`
-  (`inferio_client.rs:78-86`, header constant `:92`, read at `:700`). **Absent = no change**
+  (`inferio_client.rs:78-88`, header constant `:94`, read at `:1427`). **Absent = no change**
   from the last figure (an older server, a model with no window yet, or
   the model unloaded in the gap); the caller's initial value is its floor.
 
