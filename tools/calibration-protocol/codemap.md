@@ -113,14 +113,14 @@ build/deploy/API. The plan that uses this is
 
 ### 1.4 Ledger state, budgets, grants
 
-- One `StdMutex<LedgerState>` (`ledger.rs:1799`), never held across
-  await or subprocess. `LedgerState` (`:1664-1705`): `gpus{uuid →
-  GpuLedger}` (`:1611-1661`), `workers{id → WorkerEntry}` (`:778-880`:
+- One `StdMutex<LedgerState>` (`ledger.rs:2143`), never held across
+  await or subprocess. `LedgerState` (`:1799-1840`): `gpus{uuid →
+  GpuLedger}` (`:1746-1796`), `workers{id → WorkerEntry}` (`:872-981`:
   `seed_units, base_mb, reserved_at_load_mb, reserved_mb, grants{id →
   GrantCharge{mb,requests,unit_budget}}, pending_requests, ramp_step,
   deflation, clean_windows, fit_watermark, last_trim_at,
   last_grant_settled_at`), `calibration{(inference_id, board_uuid) →
-  ModelCalibration}` (`:1549-1686`: sample ring 64 `FIT_RING`, transients
+  ModelCalibration}` (`:1549-1685`: sample ring 64 `FIT_RING`, transients
   32, `fit`, `fit_is_local`, `max_units_measured` (anchor), `seeded`,
   `local_samples`, throughput ring 128 `KNEE_RING`, `knee_best`,
   `knee_units`, `knee_is_local`, run2 `knee_clean_windows` +
@@ -215,14 +215,14 @@ build/deploy/API. The plan that uses this is
   nothing. Then `refit_locked` (`:4967-5016`, Theil–Sen `robust_fit` `:6367-6403`: ≥ 3
   samples, distinct x, slope > 0, else the old fit is kept) and
   `refit_knee_locked`.
-- Knee `fit_knee` (`:6541`, signature `(samples, floor_rate, anchor,
+- Knee `fit_knee` (`:6547`, signature `(samples, floor_rate, anchor,
   widened)`): log2 buckets, median per bucket, ≥ 12 samples over ≥ 3 buckets,
   threshold 0.9 × max(ring best, historical `knee_best`), candidate = the
   **smallest** quiet bucket ≥ threshold, returned as `2^(k+1) − 1`. Run2 (R1):
   only **sole-occupancy** samples are fitted (`refit_knee_locked` `:5038`); a
   bucket with fewer than `MIN_KNEE_BUCKET_SAMPLES = 2` observations is
   dropped; and any retained bucket whose **relative MAD** (`relative_mad`
-  `:6767`) exceeds `KNEE_MAX_BUCKET_DISPERSION = 0.20` refuses the whole fit,
+  `:6793`) exceeds `KNEE_MAX_BUCKET_DISPERSION = 0.20` refuses the whole fit,
   `knee_best` included.
   Run2 (R1e, finding F1) replaces the single frontier guard with five vetoes
   on that one candidate — there is no search for a bucket that survives them,
