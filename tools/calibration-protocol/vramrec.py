@@ -452,23 +452,35 @@ class ProcCache:
     environ when env capture is on. Anything short of that is returned to the
     caller for this sample and re-read on the next one, which costs three
     small `/proc` reads per sample per unresolved PID and resolves within one
-    sample of the exec. The retry is bounded by `MAX_ATTEMPTS` so a process
-    that is *permanently* unidentifiable -- a kernel thread (no argv ever) or
-    another user's process (environ is EACCES) -- settles into the cache
-    instead of being re-read for the length of the recording.
+    sample of the exec. The retry is bounded so a process that is
+    *permanently* unidentifiable -- a kernel thread (no argv ever) or another
+    user's process (environ is EACCES) -- settles into the cache instead of
+    being re-read for the length of the recording.
+
+    The bound is on *both* the attempt count and the wall clock, and it is the
+    wall clock that carries the guarantee. An attempt count alone measures the
+    retry window in samples, so its real length is whatever `--interval` says:
+    64 attempts is 16 s at the default 4 Hz but only 3.2 s at the 20 Hz a
+    future run needs for `base_accuracy` to see a load window, and a worker
+    slower than that to become readable would be given up on -- exactly the
+    failure this class exists to prevent, reintroduced by the cadence. So a
+    best-effort identity is only ever memoized once the PID has been
+    unresolved for `MAX_ATTEMPTS` reads *and* `MIN_RETRY_S` of wall clock.
     """
 
-    # 64 attempts is ~16 s at the default 4 Hz and ~64 s at 1 Hz: orders of
-    # magnitude more than the tens of milliseconds a fork/exec takes, and
-    # still a fixed, small bound on the wasted reads for a PID that will
-    # never resolve.
+    # Orders of magnitude more than the tens of milliseconds a fork/exec
+    # takes, and still a fixed, small bound on the wasted reads for a PID
+    # that will never resolve: at 4 Hz that is 240 attempts over the 60 s,
+    # at 20 Hz 1 200, and at 0.25 Hz the 64 attempts take 256 s.
     MAX_ATTEMPTS = 64
+    MIN_RETRY_S = 60.0
 
     def __init__(self, env_keys: Iterable[str], capture_env: bool) -> None:
         self.env_keys = tuple(env_keys)
         self.capture_env = capture_env
         self._cache: Dict[int, Dict[str, Any]] = {}
-        self._attempts: Dict[int, int] = {}
+        # pid -> (attempts so far, monotonic time of the first attempt)
+        self._attempts: Dict[int, Tuple[int, float]] = {}
 
     def get(self, pid: int) -> Dict[str, Any]:
         cached = self._cache.get(pid)
@@ -486,12 +498,15 @@ class ProcCache:
         # during teardown would otherwise cache nulls for its successor.
         if cmdline is None and comm is None:
             return entry
-        attempts = self._attempts.get(pid, 0) + 1
-        if (argv is not None and env_readable) or attempts >= self.MAX_ATTEMPTS:
+        now = time.monotonic()
+        attempts, since = self._attempts.get(pid, (0, now))
+        attempts += 1
+        exhausted = attempts >= self.MAX_ATTEMPTS and now - since >= self.MIN_RETRY_S
+        if (argv is not None and env_readable) or exhausted:
             self._cache[pid] = entry
             self._attempts.pop(pid, None)
         else:
-            self._attempts[pid] = attempts
+            self._attempts[pid] = (attempts, since)
         return entry
 
     def forget_dead(self, live: Iterable[int]) -> None:
