@@ -155,6 +155,28 @@ pub const EXTERNAL_SAMPLE_MAX_AGE: Duration = Duration::from_secs(10);
 /// oscillate and short enough that a transient one costs a few windows.
 pub const CLEAN_WINDOWS_TO_RESTORE: u32 = 3;
 
+/// Wall time that repays one level of deflation, in addition to the
+/// clean-window rule above (run2 change R4; finding F4 / Q2 / B8).
+///
+/// Clean windows can only repay while windows are *flowing*, and the case
+/// that hurt in run1 is the one where they are not: a fault storm deflates a
+/// replica hundreds of levels in seconds, the queue drains or the model goes
+/// idle, and nothing is left to earn the halvings back — run1 measured a
+/// two-minute fault costing 15.6 minutes at 0.43× throughput, and a counter
+/// that reached 8 074 levels in 148 s. Time is the repayment that does not
+/// need traffic.
+///
+/// 30 s, which is [`TRIM_DEBOUNCE`], and for the same reason that constant is
+/// 30 s: deflation is a response to a board that was tight, and the machinery
+/// that *relieves* a tight board — the idle-resident trim — runs at most once
+/// per replica per that interval. A level of deflation should survive at
+/// least one full relief cycle before being handed back, or the ledger would
+/// be undoing a correction faster than the condition behind it can clear.
+/// Against the cap ([`deflation_cap`]) the worst case is bounded: a model
+/// with a 1 024-unit anchor can be deflated 11 levels, so a fully deflated
+/// idle replica is whole again in five and a half minutes rather than never.
+pub const DEFLATION_REPAY_SECS: Duration = TRIM_DEBOUNCE;
+
 /// Extrapolation-ratchet factor: a unit budget never exceeds this times the
 /// largest locally measured clean high-water batch.
 pub const RATCHET_FACTOR: u64 = 2;
@@ -758,8 +780,15 @@ struct WorkerEntry {
     /// Ramp exponent: doublings earned by clean windows.
     ramp_step: u32,
     /// Halvings currently applied by deflation (runtime-only state,
-    /// deliberately not persisted across restarts).
+    /// deliberately not persisted across restarts, and gone with the replica
+    /// on a respawn — the manager builds a fresh [`WorkerEntry`], so "clear on
+    /// respawn" is a property of where this field lives rather than a rule
+    /// anything enforces).
     deflation: u32,
+    /// When the last level of deflation was applied or repaid by **time**
+    /// ([`DEFLATION_REPAY_SECS`], run2 change R4). `None` whenever
+    /// [`Self::deflation`] is 0, so an undeflated replica carries no clock.
+    deflation_repaid_at: Option<Instant>,
     /// Consecutive clean windows since the last negative sample.
     clean_windows: u32,
     /// Highest measurement `seq` already ingested. Reading by watermark
@@ -865,10 +894,84 @@ impl WorkerEntry {
 
     /// An OOM-classified failure or a WDDM throughput collapse halves the
     /// grants; the floor is one seed batch (see [`admitted_units`]).
-    fn note_negative_sample(&mut self) {
-        self.deflation = self.deflation.saturating_add(1);
+    ///
+    /// Capped at [`deflation_cap`] (run2 change R4): past the level that takes
+    /// the budget to a single unit the counter is a pure no-op on admission
+    /// and a pure liability on recovery, since every level of it has to be
+    /// repaid before the budget moves at all.
+    fn note_negative_sample(&mut self, anchor: u64) {
+        self.deflation = self
+            .deflation
+            .saturating_add(1)
+            .min(deflation_cap(anchor, self.seed_units));
         self.clean_windows = 0;
+        self.deflation_repaid_at = Some(Instant::now());
     }
+
+    /// Repay whole levels of deflation for wall time elapsed
+    /// ([`DEFLATION_REPAY_SECS`]), returning how many were repaid.
+    ///
+    /// The stamp advances by exactly the intervals consumed rather than to
+    /// `now`, so a repay that runs twice inside one interval does not lose the
+    /// remainder, and a replica nobody asked anything of for ten minutes
+    /// repays every level it owes on the next grant rather than one.
+    fn repay_deflation_by_time(&mut self, now: Instant) -> u32 {
+        if self.deflation == 0 {
+            self.deflation_repaid_at = None;
+            return 0;
+        }
+        let Some(since) = self.deflation_repaid_at else {
+            // First observation of a deflated replica: start the clock rather
+            // than repaying an unbounded amount for time before it existed.
+            self.deflation_repaid_at = Some(now);
+            return 0;
+        };
+        let elapsed = now.saturating_duration_since(since);
+        let levels = (elapsed.as_secs() / DEFLATION_REPAY_SECS.as_secs().max(1))
+            .min(u64::from(u32::MAX)) as u32;
+        if levels == 0 {
+            return 0;
+        }
+        let repaid = levels.min(self.deflation);
+        self.deflation -= repaid;
+        if self.deflation == 0 {
+            self.deflation_repaid_at = None;
+        } else {
+            self.deflation_repaid_at =
+                Some(since + DEFLATION_REPAY_SECS * u32::try_from(levels).unwrap_or(u32::MAX));
+        }
+        repaid
+    }
+}
+
+/// The most deflation levels worth holding: `ceil(log2(budget)) + 1`
+/// (run2 change R4; finding F4 / Q2 / B8).
+///
+/// Deflation is a right shift on the admitted unit budget, floored at one
+/// unit, so `ceil(log2(budget))` levels already take any budget to 1 and every
+/// level past that changes nothing about admission — while still having to be
+/// repaid, one clean window trio or one [`DEFLATION_REPAY_SECS`] at a time,
+/// before the budget can move at all. Run1 measured what uncapped costs: 108
+/// levels on a shipped model in Phase 1 and **8 074 levels in 148 s** in
+/// Phase 4, a two-minute fault paid for with 15.6 minutes at 0.43×
+/// throughput. The counter has to stop being a debt register.
+///
+/// The one spare level is deliberate. It preserves the distinction between "as
+/// deflated as it can be" and "one more negative just arrived": without it the
+/// counter saturates exactly where the budget does, and a replica already at
+/// one unit could not record that it OOMed again, which is the state
+/// [`CLEAN_WINDOWS_TO_RESTORE`] is measured against.
+///
+/// The scale is the ratchet **anchor** — the largest batch this machine has
+/// measured, which is what [`admitted_units`] shifts — falling back to the
+/// replica's seed where there is no anchor yet (`anchor == 0` is the sentinel
+/// for "nothing measured", and a pre-fit replica's budget is its seed).
+fn deflation_cap(anchor: u64, seed_units: u64) -> u32 {
+    let budget = anchor.max(seed_units).max(1);
+    // `ceil(log2(budget))`: `ilog2` floors, so a non-power-of-two needs one
+    // more, and a budget of 1 needs zero shifts to reach 1.
+    let levels = budget.ilog2() + u32::from(!budget.is_power_of_two());
+    levels + 1
 }
 
 /// The ramp exponent the ratchet anchor already implies: the smallest `k` with
@@ -2520,6 +2623,7 @@ impl VramLedger {
                 pending_requests: 0,
                 ramp_step: 0,
                 deflation: 0,
+                deflation_repaid_at: None,
                 clean_windows: 0,
                 fit_watermark: 0,
                 fit_version_sent: 0,
@@ -3529,6 +3633,8 @@ impl VramLedger {
     ) -> Option<GrantToken> {
         self.maybe_refresh_external(worker);
         let mut state = self.lock();
+        // Before anything reads the deflation counter to size this window.
+        Self::repay_deflation_locked(&mut state, worker);
         let gpu = state.workers.get(&worker)?.gpu.clone();
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.pending_requests = window_requests.saturating_add(queued_behind);
@@ -3691,6 +3797,35 @@ impl VramLedger {
         })
     }
 
+    /// Repay one level of deflation per [`DEFLATION_REPAY_SECS`] of wall time
+    /// for one replica (run2 change R4), and say so once per repayment.
+    ///
+    /// Called wherever the deflation counter is about to be *read* for a
+    /// decision — the grant path, the settle path and `/health` — rather than
+    /// on a timer, because there is no timer here and inventing one would add
+    /// a task whose only job is to decrement a number nobody is looking at.
+    /// The consequence is that an idle replica's repayment lands the moment
+    /// something asks, which is exactly when it matters.
+    fn repay_deflation_locked(state: &mut LedgerState, worker: WorkerId) {
+        let now = Instant::now();
+        let Some(entry) = state.workers.get_mut(&worker) else {
+            return;
+        };
+        let before = entry.deflation;
+        if entry.repay_deflation_by_time(now) == 0 {
+            return;
+        }
+        tracing::debug!(
+            model = %entry.inference_id,
+            gpu = %entry.gpu,
+            deflation_before = before,
+            deflation = entry.deflation,
+            repay_secs = DEFLATION_REPAY_SECS.as_secs(),
+            "repaid deflation by elapsed time; clean windows are not the only \
+             way back from a fault storm, and an idle replica has none to offer"
+        );
+    }
+
     /// Bring every outstanding window on `gpu` up to date with the board's
     /// current occupancy (run2 change R1, the contention tag).
     ///
@@ -3755,6 +3890,10 @@ impl VramLedger {
 
     fn settle_locked(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) -> Settled {
         let mut state = self.lock();
+        // Before the clean/negative bookkeeping below reads or moves it: a
+        // window that ran for longer than `DEFLATION_REPAY_SECS` has earned
+        // its time repayment whatever its outcome was.
+        Self::repay_deflation_locked(&mut state, worker);
         let Some(entry) = state.workers.get_mut(&worker) else {
             return Settled::default();
         };
@@ -3803,7 +3942,7 @@ impl VramLedger {
             };
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
-                    entry.note_negative_sample();
+                    entry.note_negative_sample(anchor);
                 } else {
                     entry.note_clean_window(ingested.high_water_samples > 0, anchor);
                 }
@@ -3984,7 +4123,7 @@ impl VramLedger {
         let ram_mb = state.gpus.get(&key.1)?.unified_ram_mb?;
         let anchor_before = Self::anchor_locked(state, entry);
         if let Some(entry) = state.workers.get_mut(&worker) {
-            entry.note_negative_sample();
+            entry.note_negative_sample(anchor_before);
         }
         // Floored at one unit, because zero is not "a very small anchor" — it
         // is the sentinel for *no local measurement at all*, and
@@ -4980,7 +5119,15 @@ impl VramLedger {
 
     /// Read-only ledger snapshot for `GET /health`.
     pub fn health(&self) -> Vec<GpuBudgetHealth> {
-        let state = self.lock();
+        let mut state = self.lock();
+        // `/health` reads the deflation counter, so it settles the time
+        // repayment first rather than reporting a level that the next grant
+        // is about to hand back (run2 change R4).
+        let workers: Vec<WorkerId> = state.workers.keys().copied().collect();
+        for worker in workers {
+            Self::repay_deflation_locked(&mut state, worker);
+        }
+        let state = &*state;
         let mut boards: Vec<GpuBudgetHealth> = state
             .gpus
             .iter()
@@ -5278,6 +5425,18 @@ impl VramLedger {
         let back = |at: Option<Instant>| at.and_then(|at| at.checked_sub(by));
         entry.last_grant_settled_at = back(entry.last_grant_settled_at);
         entry.last_trim_at = back(entry.last_trim_at);
+    }
+
+    /// Age this replica's deflation repayment clock by `by`, the same way and
+    /// for the same reason as [`Self::age_trim_clocks_for_test`]: a test that
+    /// waited out [`DEFLATION_REPAY_SECS`] for real would add half a minute
+    /// per level to every CI run.
+    #[cfg(test)]
+    fn age_deflation_clock_for_test(&self, worker: WorkerId, by: Duration) {
+        let mut state = self.lock();
+        if let Some(entry) = state.workers.get_mut(&worker) {
+            entry.deflation_repaid_at = entry.deflation_repaid_at.and_then(|at| at.checked_sub(by));
+        }
     }
 
     /// Install a fit snapshot directly, bypassing both routes a real one
@@ -6524,6 +6683,138 @@ mod tests {
         }
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 1, "one unit, and no lower");
+    }
+
+    /// R4: the counter stops at `ceil(log2(budget)) + 1`, which is one level
+    /// past what takes the budget to a single unit. Run1 measured 8 074 levels
+    /// in 148 s, which is 15.6 minutes of repayment for a two-minute fault.
+    #[test]
+    fn the_deflation_counter_is_capped_at_what_takes_the_budget_to_one() {
+        assert_eq!(deflation_cap(1, 1), 1, "already at one unit");
+        assert_eq!(deflation_cap(8, 4), 4, "3 halvings reach 1, plus the spare");
+        assert_eq!(deflation_cap(1024, 8), 11);
+        assert_eq!(
+            deflation_cap(1000, 8),
+            11,
+            "ceil, not floor: 1000 needs 10 halvings to reach 1"
+        );
+        assert_eq!(
+            deflation_cap(0, 64),
+            7,
+            "no anchor yet, so the seed is the budget's scale"
+        );
+
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        for expected in [4, 8, 16, 32] {
+            assert_eq!(measured_window(&handle, &admission, expected), expected);
+        }
+        // Anchor 32, seed 4: five halvings reach one unit, six is the cap.
+        for _ in 0..50 {
+            admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .unwrap()
+                .finish(WindowOutcome::Responded { oom: true });
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.deflation, deflation_cap(32, 4));
+        assert_eq!(worker.deflation, 6);
+        assert_eq!(worker.unit_budget, 1);
+
+        // And that is what makes recovery finite: six clean-window trios, not
+        // fifty.
+        for _ in 0..(CLEAN_WINDOWS_TO_RESTORE * 6) {
+            clean_window(&admission);
+        }
+        assert_eq!(ledger.health()[0].workers[0].deflation, 0);
+    }
+
+    /// R4: wall time repays a level as well as clean windows do — the case
+    /// clean windows cannot cover, where a fault storm deflates a replica and
+    /// then the traffic that would earn the halvings back stops.
+    #[test]
+    fn deflation_is_also_repaid_by_elapsed_time() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        for expected in [4, 8, 16, 32] {
+            assert_eq!(measured_window(&handle, &admission, expected), expected);
+        }
+        for _ in 0..3 {
+            admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .unwrap()
+                .finish(WindowOutcome::Responded { oom: true });
+        }
+        assert_eq!(ledger.health()[0].workers[0].deflation, 3);
+
+        // Not yet: a level is repaid per whole interval, never a fraction.
+        ledger.age_deflation_clock_for_test(
+            admission.worker_id(),
+            DEFLATION_REPAY_SECS - Duration::from_secs(1),
+        );
+        assert_eq!(ledger.health()[0].workers[0].deflation, 3);
+
+        ledger.age_deflation_clock_for_test(admission.worker_id(), Duration::from_secs(1));
+        assert_eq!(
+            ledger.health()[0].workers[0].deflation,
+            2,
+            "one interval, one level, with no window in sight"
+        );
+
+        // A long idle gap repays every level it owes, not one — the stamp
+        // advances by the intervals consumed rather than to now.
+        ledger.age_deflation_clock_for_test(admission.worker_id(), DEFLATION_REPAY_SECS * 5);
+        assert_eq!(ledger.health()[0].workers[0].deflation, 0);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 64, "back to the full budget");
+    }
+
+    /// R4's last clause, and it holds by construction rather than by a rule:
+    /// deflation lives on the [`WorkerEntry`], which a respawn replaces. The
+    /// test pins it because "runtime-only state" is exactly the kind of claim
+    /// that stops being true when someone adds a cache.
+    #[test]
+    fn a_respawned_replica_starts_undeflated() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        measured_window(&handle, &admission, 4);
+        for _ in 0..3 {
+            admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .unwrap()
+                .finish(WindowOutcome::Responded { oom: true });
+        }
+        assert_eq!(ledger.health()[0].workers[0].deflation, 3);
+        drop(admission);
+
+        let handle = loaded(Some(1000), Some(0));
+        let respawned = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        assert_eq!(
+            ledger.health()[0].workers[0].deflation,
+            0,
+            "the deflation died with the process that earned it"
+        );
+        assert_eq!(
+            ledger.health()[0].workers[0].max_units_measured,
+            4,
+            "while the (model, board) ratchet anchor, which is not per replica, \
+             survives it"
+        );
+        drop(respawned);
     }
 
     /// Aborted windows teach nothing: no ramp progress, no deflation.

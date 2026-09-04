@@ -748,6 +748,29 @@ Worker, per batch within its window:
   seed, down to a single unit: the seed is where the ramp *starts*, not a promise
   to a worker that just OOMed; the real floor is at pack time (a batch is never
   smaller than one item).
+- **Deflation is bounded and repaid by time as well as by windows** (run2
+  change R4; findings F4 / Q2 / B8). Run1 measured the counter as an uncapped
+  debt register: 108 levels on a shipped model in one phase, **8 074 levels in
+  148 s** in another, repaying at 7.04 levels/s and so charging 15.6 minutes at
+  0.43× throughput for a two-minute fault. Two rules fix it, and a third was
+  already true:
+  - **Cap** at `ceil(log2(max(anchor, seed))) + 1`. That many halvings already
+    take the budget to a single unit, so every level past it changes nothing
+    about admission while still having to be repaid before the budget can
+    move. The one spare level preserves the difference between "as deflated as
+    it can be" and "one more negative just arrived".
+  - **Repay one level per 30 s of wall time**, in addition to the
+    three-clean-windows rule. Clean windows can only repay while windows are
+    flowing, and the expensive case is the one where they are not: the fault
+    storm deflates the replica, the queue drains, and nothing is left to earn
+    the halvings back. 30 s is the idle-resident trim's debounce — the interval
+    at which the machinery that *relieves* a tight board can act — so a level
+    survives one full relief cycle before it is handed back. Against the cap
+    the worst case is bounded: an 11-level replica is whole again in five and a
+    half minutes.
+  - **Cleared on respawn**, which holds by construction: the counter lives on
+    the ledger's per-replica entry and the manager builds a fresh one. The
+    (model, board) ratchet anchor, which is not per replica, survives.
 - **A negative sample deflates and is then discarded.** It never enters the fit
   and never advances the ratchet anchor. Its `peak_reserved` is whatever the
   allocator managed before it gave up — an *under*-statement of the batch's real
