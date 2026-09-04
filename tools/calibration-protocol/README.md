@@ -279,9 +279,10 @@ log lines added in commit `49822c8b` — it needs
 `RUST_LOG=info,panoptikon::inferio=trace,panoptikon::db::batch_auto=debug` and
 `INFERIO_WORKER_LOG_LEVEL=DEBUG` in the gateway's environment.
 
-Six things about the verdicts are worth knowing before reading a table
-(all six come from run1; the last three close the holes the S15 mutation
-self-test exposed):
+Seven things about the verdicts are worth knowing before reading a table
+(all seven come from run1; three of them close the holes the S15 mutation
+self-test exposed, and the last one closes a hole run2 found in
+`base_accuracy` itself):
 
 - **`--expect-failures` counts failed *items*, `--expect-failed-jobs` counts
   whole jobs whose outcome is not `completed`.** A scenario like S4g, whose
@@ -334,6 +335,26 @@ self-test exposed):
   against a hog holding 30 720 MiB for 77 s); the nearest miss is
   `S11-C4-fixed`, a genuinely quiet board that held 30 s with a flat
   `external_mb 775..775` and correctly stays INFO.
+- **`base_accuracy` only judges a replica it can attribute and time.** Three
+  rules, all of them added after run1's S9 reported a 346.7 % FAIL that was
+  entirely an instrument artefact (the recorder had memoised a `[comm]`
+  cmdline and an empty env for a worker first sighted inside its fork/exec
+  window, so the check compared nemotron's `base_mb` against the *MiniLM*
+  worker's process). A PID is now recognised as ours by the gateway's own
+  `spawned an inferio worker … pid=Some(N)` line as well as by its recorded
+  cmdline/environ, so a recording already on disk re-analyses correctly. The
+  attributed PID must not predate the replica's spawn line, or the row is left
+  unjudged with a note. And the reading is the **minimum over the samples
+  between the load `ok` and the replica's first grant or predict** — from that
+  instant the process holds the batch's workspace too — with
+  `oracle_pid_min_mb` a post-load minimum rather than a lifetime one. A
+  demand-driven load starts its first batch tens of milliseconds after the load
+  `ok`, so at 1–4 Hz that window is usually **empty**: the row then reports its
+  numbers as **INFO** with the reason instead of FAILing on a reading that
+  provably contains workspace. To get a judged row, sample faster or give the
+  scenario a model that loads without immediately predicting (`S6-b18-loadstall`
+  holds nemotron resident and idle for 178 s at 3 788 MiB, which is `base_mb`
+  to the megabyte).
 
 ### Recording file descriptors
 
