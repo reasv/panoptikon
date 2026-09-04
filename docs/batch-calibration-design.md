@@ -577,9 +577,15 @@ on a model that has not been fitted yet.
   orchestrator remembers the negotiated outcome per (model, GPU) for
   subsequent loads. Two distinct states share the word: "dtype not yet
   known" is the absent query (`None`, matches every profile, takes the
-  conservative maximum), while the literal key value `"unknown"` is a
+  conservative maximum), while the literal key value `"unstated"` is a
   worker's report that it neither selected a dtype nor could infer one
-  from its weights; it matches only itself.
+  from its weights; it matches only itself. (Spelled `"unknown"` before
+  run2 change R11: a key component that reads as a failure invites a
+  consumer to treat it as one, and the two states above are exactly what
+  must not be confused. The rename moves the key, so rows written under
+  the old spelling stop matching and are re-measured — deliberate, and
+  cheap, because the sentinel was introduced during run1 and nothing has
+  been released under it.)
 - **External usage is derived, not margin-guessed, for our own
   processes.** Every worker reports `memory_reserved` per response (and
   `reserved_at_load` once, on the load response), so the orchestrator
@@ -966,11 +972,17 @@ platform     = "windows"               # windows | linux | macos
 backend      = "cuda"                  # accelerator extra (cuda | rocm | mps | cpu)
 torch        = "2.7.1+cu128"
 dtype        = "fp16"                  # load precision actually in use;
-                                       # "unknown" when the impl negotiates
+                                       # "unstated" when the impl negotiates
                                        # none and its weights could not be
                                        # read (a value, not an omission:
                                        # an absent key component makes the
-                                       # whole entry unkeyable)
+                                       # whole entry unkeyable). Spelled
+                                       # "unknown" before run2 (R11)
+dtype_method = "inferred"              # selected | attribute | inferred |
+                                       # unstated: how that precision was
+                                       # arrived at. Run2 (R11), additive and
+                                       # ignored by matching — the key is
+                                       # `dtype` whichever method produced it
 unit         = "item"                  # cost dimension in force when measured;
 aggregation  = "count"                 # part of the key (see below)
 

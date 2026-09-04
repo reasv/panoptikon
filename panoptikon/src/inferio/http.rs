@@ -2164,6 +2164,7 @@ metadata.cost.unit = "none"
             aggregation: "count",
             base_mb: 4321,
             base_method: Some("nvml".to_owned()),
+            dtype_method: Some("selected".to_owned()),
             slope_mb_per_unit: 0.79,
             residual_mb: 96.0,
             samples: 38,

@@ -3558,6 +3558,7 @@ config.replicas = 2
             aggregation: "count",
             base_mb: 1000,
             base_method: Some("nvml".to_owned()),
+            dtype_method: Some("selected".to_owned()),
             slope_mb_per_unit: slope,
             residual_mb: 0.0,
             samples: 3,

@@ -137,7 +137,7 @@ pub struct CalibrationProfile {
     /// provenance; lookup falls back to `major.minor`.
     pub torch: String,
     /// Load precision actually in use (`fp16` | `bf16` | `fp32`), or
-    /// `unknown` for a model whose impl negotiates no precision and whose
+    /// `unstated` for a model whose impl negotiates no precision and whose
     /// weights the worker could not inspect (a CTranslate2/ONNX engine, a
     /// remote API). The sentinel is a first-class key component here — it is
     /// stable for a given impl, so an entry written under it is matched by
@@ -167,6 +167,19 @@ pub struct CalibrationProfile {
     /// `nvml` | `fdinfo` | `free_delta` | `alloc_delta` — provenance for `base_mb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_method: Option<String>,
+    /// How the worker arrived at [`Self::dtype`]: `selected` (the impl
+    /// negotiated it), `attribute` (a real `torch.dtype` on the instance),
+    /// `inferred` (read off the loaded weights) or `unstated` (nothing
+    /// answered). Run2 change R11.
+    ///
+    /// **Additive and ignored by matching**, deliberately: the key is `dtype`,
+    /// whichever method produced it, so a row measured under an inferred fp16
+    /// and one under a negotiated fp16 are the same entry and must merge. What
+    /// it buys is the ability to read a stored file and know which kind of
+    /// evidence a row rests on — a negotiated precision is a promise, one read
+    /// off a tensor is an observation, and `unstated` is neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtype_method: Option<String>,
     /// Marginal cost in MiB per unit, fitted on reserved deltas. Zero means
     /// "no fit here" — the reader never adopts a zero slope, and the ledger
     /// deliberately writes an entry with no fit fields when everything local
@@ -446,6 +459,8 @@ pub struct ProfileUpdate {
     pub aggregation: &'static str,
     pub base_mb: u64,
     pub base_method: Option<String>,
+    /// Additive provenance for `dtype` (run2 change R11); nothing keys on it.
+    pub dtype_method: Option<String>,
     pub slope_mb_per_unit: f64,
     pub residual_mb: f64,
     pub samples: usize,
@@ -850,6 +865,7 @@ impl CalibrationStore {
                 aggregation: update.aggregation.to_owned(),
                 base_mb: update.base_mb,
                 base_method: update.base_method,
+                dtype_method: update.dtype_method,
                 slope_mb_per_unit: update.slope_mb_per_unit,
                 knee_units: update.knee_units,
                 knee_clean_windows: update.knee_clean_windows,
@@ -902,6 +918,12 @@ impl CalibrationStore {
                         profile.residual_mb = slot.residual_mb;
                         profile.samples = slot.samples;
                     }
+                    // Diagnostic provenance, so an update that does not
+                    // state it keeps whatever the row already says rather
+                    // than blanking it — an older worker reports no method
+                    // and has nothing to correct with.
+                    profile.dtype_method =
+                        profile.dtype_method.or_else(|| slot.dtype_method.take());
                     if profile.sample_units.is_empty() {
                         profile.sample_units = std::mem::take(&mut slot.sample_units);
                         profile.sample_reserved_mb = std::mem::take(&mut slot.sample_reserved_mb);
@@ -1477,6 +1499,7 @@ mod tests {
             aggregation: "count",
             base_mb: 4321,
             base_method: Some("nvml".to_owned()),
+            dtype_method: Some("selected".to_owned()),
             slope_mb_per_unit: slope,
             residual_mb: 96.0,
             samples: 38,
@@ -2481,6 +2504,50 @@ metadata.cost.unit = "none"
             None,
             "an explicit withdrawal drops it"
         );
+    }
+
+    /// R11: `dtype_method` is stored, round-trips, and is **ignored by
+    /// matching and merging** — two rows that agree on `dtype` are one entry
+    /// however each of them arrived at it.
+    #[test]
+    fn dtype_method_is_stored_but_never_keys_anything() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path());
+        store.record(ProfileUpdate {
+            dtype_method: Some("inferred".to_owned()),
+            ..update("clip/vit", "unstated", 0.79)
+        });
+        assert_eq!(
+            store.local_entries()[0].dtype_method.as_deref(),
+            Some("inferred")
+        );
+
+        // The same key, now reported as a negotiated precision: one entry,
+        // updated provenance — not a second row.
+        store.record(ProfileUpdate {
+            dtype_method: Some("selected".to_owned()),
+            ..update("clip/vit", "unstated", 1.5)
+        });
+        let entries = store.local_entries();
+        assert_eq!(entries.len(), 1, "the method is not part of the key");
+        assert_eq!(entries[0].dtype_method.as_deref(), Some("selected"));
+
+        // An update that states no method keeps the row's — an older worker
+        // has nothing to correct with.
+        store.record(ProfileUpdate {
+            dtype_method: None,
+            ..update("clip/vit", "unstated", 2.0)
+        });
+        assert_eq!(
+            store.local_entries()[0].dtype_method.as_deref(),
+            Some("selected")
+        );
+
+        // And it plays no part in lookup: the entry answers its own key.
+        let seed = store
+            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("unstated")))
+            .expect("the sentinel keys like any other dtype");
+        assert!(seed.local);
     }
 
     /// The knee's expiry counter is persisted and read back (run2 change R1d),

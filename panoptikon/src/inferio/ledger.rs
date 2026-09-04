@@ -817,6 +817,14 @@ struct WorkerEntry {
     /// never persisted — an unkeyed entry could not be read back safely.
     torch: Option<String>,
     dtype: Option<String>,
+    /// How the worker arrived at [`Self::dtype`]: `"selected"`, `"attribute"`,
+    /// `"inferred"` or `"unstated"` (run2 change R11). Carried into the
+    /// profile as an **additive** field: nothing keys or matches on it, and
+    /// the key stays `dtype` whichever method produced it. It is what tells a
+    /// maintainer reading a stored row which kind of evidence it rests on —
+    /// a negotiated precision and one read off the weights are the same key
+    /// and not the same claim.
+    dtype_method: Option<String>,
     /// `nvml` | `fdinfo` | `free_delta` | `alloc_delta`: provenance for
     /// `base_mb`, carried into the profile.
     base_method: Option<String>,
@@ -2677,6 +2685,7 @@ impl VramLedger {
                 degraded: cost.degraded,
                 torch: report.torch_version.clone(),
                 dtype: report.dtype.clone(),
+                dtype_method: report.dtype_method.clone(),
                 base_method: report.base_method.clone(),
                 seed_units,
                 base_mb: report.base_mb,
@@ -2999,7 +3008,7 @@ impl VramLedger {
     ///
     /// - `torch`/`dtype` must be known, or the entry could not be keyed (and
     ///   an unkeyed entry can never be read back). A worker that measured a
-    ///   footprint at all now always reports a dtype — `"unknown"` when its
+    ///   footprint at all now always reports a dtype — `"unstated"` when its
     ///   impl negotiates none and its weights could not be inspected — so
     ///   this guard is the old-worker and no-footprint case, not the common
     ///   one it used to be silently catching;
@@ -3033,6 +3042,7 @@ impl VramLedger {
             entry.unit.as_str(),
             entry.aggregation.as_str(),
             entry.base_method.clone(),
+            entry.dtype_method.clone(),
         );
         let (torch, dtype, base) = (entry.torch.clone(), entry.dtype.clone(), entry.base_mb);
         // The key guards, and the one place in this design where doing
@@ -3131,6 +3141,7 @@ impl VramLedger {
             aggregation: identity.4,
             base_mb,
             base_method: identity.5,
+            dtype_method: identity.6,
             slope_mb_per_unit: fit.map(|fit| fit.slope_mb_per_unit).unwrap_or(0.0),
             residual_mb: fit.map(|fit| fit.residual_mb).unwrap_or(0.0),
             samples: fit.map(|fit| fit.samples).unwrap_or(0),
@@ -8241,13 +8252,13 @@ mod tests {
         }
     }
 
-    /// `"unknown"` is a dtype like any other here. An impl that negotiates no
+    /// `"unstated"` is a dtype like any other here. An impl that negotiates no
     /// precision and whose weights could not be inspected (CTranslate2, ONNX,
     /// a remote API on a RAM-priced host) still keys, so what this machine
     /// measures about it survives the run instead of being thrown away — and
     /// the sentinel is stable, so the next run finds the entry again.
     #[test]
-    fn an_unknown_dtype_still_keys_and_persists() {
+    fn an_unstated_dtype_still_keys_and_persists() {
         let profiles = Arc::new(FakeProfiles::default());
         let ledger = ledger_with(100_000, no_margin(), &profiles);
         let mut telemetry = WorkerTelemetry::default();
@@ -8257,8 +8268,8 @@ mod tests {
             reserved_at_load_mb: Some(0),
             gpu_uuid: Some(BOARD.to_owned()),
             torch_version: Some("2.7.1+cu128".to_owned()),
-            dtype: Some("unknown".to_owned()),
-            dtype_method: Some("unknown".to_owned()),
+            dtype: Some("unstated".to_owned()),
+            dtype_method: Some("unstated".to_owned()),
             ..LoadReport::default()
         }));
         let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
@@ -8275,7 +8286,12 @@ mod tests {
             .last()
             .cloned()
             .expect("a measured window with a full key is persisted");
-        assert_eq!(update.dtype, "unknown", "the sentinel is stored verbatim");
+        assert_eq!(update.dtype, "unstated", "the sentinel is stored verbatim");
+        assert_eq!(
+            update.dtype_method.as_deref(),
+            Some("unstated"),
+            "and the method it came from rides along, additively"
+        );
         assert_eq!(update.torch, "2.7.1+cu128");
         assert_eq!(update.base_mb, 1000);
         assert_eq!(update.max_units_measured, 4);
