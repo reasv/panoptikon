@@ -27,6 +27,35 @@ logger = logging.getLogger(__name__)
 # `metadata.cost.canvas_pixels` for the three `doctr/easyocr_*` ids.
 DETECTOR_CANVAS_SIZE = 2560
 
+# EasyOCR's own `min_size` default (`easyocr.Reader.readtext`): boxes whose
+# longer side is at or below this many pixels **of the submitted image** are
+# dropped. The batched path applies it here rather than inside `detect`, so
+# that it keeps meaning raw pixels once detection has moved onto the canvas.
+DEFAULT_MIN_SIZE = 20
+
+# The per-request parameters this impl forwards, split by the easyOCR call
+# each one belongs to. `readtext`/`readtext_batched` take the union and route
+# them internally; the batched path here calls `Reader.detect` and
+# `Reader.recognize` itself (see `predict`), so it has to do that routing.
+#
+# `threshold` is easyOCR's DBNet box threshold and goes to the detector; this
+# impl *also* reads a `threshold` off the same config as its own confidence
+# floor, which is pre-existing and left alone.
+DETECT_PARAMS = frozenset({
+    "min_size", "text_threshold", "low_text", "link_threshold", "canvas_size",
+    "mag_ratio", "slope_ths", "ycenter_ths", "height_ths", "width_ths",
+    "add_margin", "threshold", "bbox_min_score", "bbox_min_size",
+    "max_candidates",
+})
+RECOGNIZE_PARAMS = frozenset({
+    "decoder", "beamWidth", "batch_size", "workers", "allowlist", "blocklist",
+    "detail", "rotation_info", "paragraph", "contrast_ths", "adjust_contrast",
+    "filter_ths", "y_ths", "x_ths", "output_format",
+})
+# The allow-list is the union by construction, so a parameter can never be
+# accepted from a caller and then silently dropped on the batched path.
+BATCH_PARAMS = frozenset(DETECT_PARAMS | RECOGNIZE_PARAMS)
+
 
 def _positive_int(value) -> int | None:
     """`value` as a positive int, or None. Refuses bools: a per-request
@@ -62,10 +91,13 @@ class EasyOCRModel(InferenceModel):
         #
         # `canvas_pixels` is tier 2 of the canvas resolution order — what this
         # model knows about itself when the registry declares nothing — and,
-        # since run2's D1-b fix, it is also this impl's *promise* that no
-        # input reaches the detector or the recogniser above that area
-        # (`fit_to_canvas` in `predict`). Declaring it and not enforcing it is
-        # what under-prices a batch.
+        # since run2's D1-b fix, it is also this impl's *promise* that the
+        # batch tensor it builds never exceeds that area per item
+        # (`fit_to_canvas`, in `_detect_bounded_recognize_raw`). Declaring it
+        # and not enforcing it is what under-prices a batch. The promise is
+        # about the tensor, not about every array: the recogniser's crops come
+        # from the raw image, and cost the same either way because each crop
+        # is resized to a fixed `imgH x imgW` before it becomes a tensor.
         #
         # `pads_to_common_size` says this impl builds one batch tensor at the
         # dimensions of its largest member (`pad_images_to_same_size`), so its
@@ -159,73 +191,31 @@ class EasyOCRModel(InferenceModel):
         # `configs[0]` would apply a rejected input's settings to the batch
         # that never contained it.
         #
-        # Read before the images are turned into arrays, because one of these
-        # parameters — `canvas_size` — decides how large those arrays may be.
+        # Read before anything is batched, because two of these parameters
+        # decide how the batched path is built: `canvas_size` bounds the
+        # detector's tensor, and `min_size` is applied by this impl rather
+        # than by `Reader.detect` (see `_detect_bounded_recognize_raw`).
         batch_params = {}
         if kept:
             first_config = configs[kept[0]]
-            for param in ['decoder', 'beamWidth', 'batch_size', 'workers', 'allowlist',
-                          'blocklist', 'detail', 'rotation_info', 'paragraph', 'min_size',
-                          'contrast_ths', 'adjust_contrast', 'filter_ths', 'text_threshold',
-                          'low_text', 'link_threshold', 'canvas_size', 'mag_ratio',
-                          'slope_ths', 'ycenter_ths', 'height_ths', 'width_ths', 'y_ths',
-                          'x_ths', 'add_margin', 'threshold', 'bbox_min_score',
-                          'bbox_min_size', 'max_candidates', 'output_format']:
+            for param in sorted(BATCH_PARAMS):
                 if param in first_config:
                     batch_params[param] = first_config[param]
 
-        # **Bound every input by the canvas before the batch tensor exists.**
-        #
-        # The detector would resize each image onto `canvas_size` itself — but
-        # only *after* `pad_images_to_same_size` has already materialised every
-        # member of the batch at the largest member's raw dimensions, and only
-        # for the detector: the recogniser crops from the same raw-sized array.
-        # Under the run2 R7 price cap that is a mispricing, not just waste:
-        # every input at or above the canvas prices identically
-        # (`min(raw, 6 553 600)`), so a 2480x3508 scan and an 8000x6000 sheet
-        # are indistinguishable to the harness's bucketing and can share a
-        # batch whose tensor is then 5.5x the area the batch was charged for
-        # (run2 D1-b; six such batches measured at 2 209-4 538 ms against
-        # 1 146-1 236 ms for size-homogeneous ones).
-        #
-        # Declaring a canvas is a statement that the model never processes more
-        # than that area per item, so this impl makes the statement true here,
-        # before anything is padded or batched. `fit_to_canvas` is the
-        # detector's own resize (`easyocr.imgproc.resize_aspect_ratio`,
-        # downscale half), so for the detector this is a no-op moved earlier;
-        # what changes is that the recogniser now crops from the same
-        # canvas-bounded array, which is the half that was never bounded.
-        canvas_size = (
-            _positive_int(batch_params.get("canvas_size")) or self.canvas_size
-        )
-        image_inputs: List[np.ndarray] = []
-        scales: List[float] = []
-        for image in images:
-            array, scale = fit_to_canvas(np.array(image), canvas_size)
-            image_inputs.append(array)
-            scales.append(scale)
+        # Every image at the resolution it was submitted at. These arrays
+        # exist either way: `decode_image_inputs` above has already decoded
+        # each payload at full size, so nothing below *adds* a raw-sized
+        # allocation — the canvas is a statement about the tensors this impl
+        # builds, not about the decode buffer every impl holds.
+        raw_images: List[np.ndarray] = [np.array(image) for image in images]
 
-        # Check if we need to pad images
-        heights = [img.shape[0] for img in image_inputs]
-        widths = [img.shape[1] for img in image_inputs]
+        use_batched = self.enable_batching and len(raw_images) > 1
 
-        use_batched = self.enable_batching and len(image_inputs) > 1
-
-        # If images have different sizes, pad them. Every member is already
-        # bounded by the canvas, so the padded tensor is too.
-        if (len(set(heights)) > 1 or len(set(widths)) > 1) and use_batched:
-            image_inputs = pad_images_to_same_size(image_inputs)
-
-        batch_results = []
-        # Process with batched method
+        batch_results: List = []
         if use_batched:
             try:
-                batch_results = run_with_oom_retry(
-                    lambda chunk: self.model.readtext_batched(
-                        list(chunk), **batch_params
-                    ),
-                    image_inputs,
-                    logger=logger,
+                batch_results = self._detect_bounded_recognize_raw(
+                    raw_images, batch_params
                 )
             except InferenceOOMError:
                 # A single input still OOMs after halving; individual
@@ -235,25 +225,19 @@ class EasyOCRModel(InferenceModel):
                 # Fall back to individual processing if batched processing fails
                 logger.error(f"Batch processing failed with error: {e}. Falling back to individual processing.")
                 use_batched = False
-        
+
         if not use_batched:
-            # Process images individually
+            # Process images individually, at the resolution the caller
+            # submitted. There is no batch tensor on this path — easyOCR's own
+            # `resize_aspect_ratio` bounds the detector for us
+            # (`easyocr/detection.py:33`) and the recogniser's tensor is a
+            # fixed `imgH x imgW` per crop regardless
+            # (`easyocr/recognition.py:42-45`) — so bounding here would cost
+            # transcription quality and save nothing.
             batch_results = []
-            for img in image_inputs:
+            for img in raw_images:
                 result = self.model.readtext(img, **batch_params)
                 batch_results.append(result)
-
-        # Detection ran on the canvas-bounded array, so every box comes back in
-        # *that* space. Put them back in the coordinates of the image that was
-        # submitted, which is the space easyOCR's own boxes are in when it does
-        # the resize internally (`craft_utils.adjustResultCoordinates` undoes
-        # the detector's ratio the same way). The line grouping below is
-        # scale-invariant, but the boxes are the only geometry this impl ever
-        # sees and they must mean what they say.
-        batch_results = [
-            scale_boxes_to_original(result, scale)
-            for result, scale in zip(batch_results, scales)
-        ]
 
         # Process results for each image
         for result, index in zip(batch_results, kept):
@@ -333,6 +317,104 @@ class EasyOCRModel(InferenceModel):
         
         return assemble_slots(len(inputs), kept, outputs, slots)
 
+    def _detect_bounded_recognize_raw(
+        self, raw_images: List[np.ndarray], batch_params: dict
+    ) -> List:
+        """Batch the detector under the canvas; recognise from the raw image.
+
+        This is `easyocr.Reader.readtext_batched` (`easyocr/easyocr.py:538-579`)
+        taken apart into the two public calls it is made of, because the two
+        halves want different arrays:
+
+        * **Detection** is the half whose tensor scales with the input's area
+          (`detection.py:24-46`: every member of the batch is resized onto
+          `canvas_size` and stacked into one CRAFT input), and it is the half
+          the batch tensor exists for. `pad_images_to_same_size` builds that
+          batch at its largest member's dimensions, so each input is bounded
+          by the canvas *first* (`fit_to_canvas`). Two things follow: the
+          padded array is inside the area the window was priced for
+          (`min(raw, canvas_pixels)` — run2 R7), and a small image is no
+          longer shrunk into the corner of a huge frame and then downscaled
+          again by the detector, which is what a mixed batch used to do to it.
+        * **Recognition** is not that half. Every crop is resized to the
+          recogniser's fixed `imgH x imgW` before it becomes a tensor
+          (`utils.py:566-577` then `recognition.py:70-97`, `NormalizePAD` at
+          `:42-45`), so its device memory is `batch_size x 1 x imgH x imgW` —
+          independent of the page's resolution. Cropping from the
+          canvas-bounded array would therefore hand the recogniser a ~0.32x
+          resolution crop on an 8000px sheet and buy exactly nothing, so the
+          crops come from the **raw** array, as they did before run2 D1-b.
+
+        The boxes bridge the two: they come back in the bounded array's space
+        and are mapped to raw coordinates before recognition, which is also
+        what makes `min_size` keep meaning raw pixels (it is applied here
+        rather than inside `detect`, see [`filter_small_detections`]).
+        """
+        canvas_size = (
+            _positive_int(batch_params.get("canvas_size")) or self.canvas_size
+        )
+        detect_params = {
+            key: value
+            for key, value in batch_params.items()
+            if key in DETECT_PARAMS
+        }
+        recognize_params = {
+            key: value
+            for key, value in batch_params.items()
+            if key in RECOGNIZE_PARAMS
+        }
+        # Detection must not filter: its boxes are in canvas space, where a
+        # `min_size` in raw pixels means something else. Zero disables the
+        # filter inside easyOCR (`easyocr.py:343`, a plain truthiness test).
+        min_size = detect_params.get("min_size", DEFAULT_MIN_SIZE)
+        detect_params["min_size"] = 0
+
+        bounded: List[np.ndarray] = []
+        scales: List[float] = []
+        for raw in raw_images:
+            array, scale = fit_to_canvas(raw, canvas_size)
+            bounded.append(array)
+            scales.append(scale)
+        if len({array.shape for array in bounded}) > 1:
+            bounded = pad_images_to_same_size(bounded)
+
+        def process_chunk(chunk):
+            # One stacked 4-D array is what `test_net` batches
+            # (`detection.py:25`); `reformat=False` because the members are
+            # already decoded arrays, and `reformat_input` cannot read a 4-D
+            # one at all.
+            horizontal_agg, free_agg = self.model.detect(
+                np.stack([item[0] for item in chunk]),
+                reformat=False,
+                **detect_params,
+            )
+            results = []
+            for (_, raw, scale), horizontal, free in zip(
+                chunk, horizontal_agg, free_agg
+            ):
+                horizontal, free = scale_detections_to_original(
+                    horizontal, free, scale
+                )
+                horizontal, free = filter_small_detections(
+                    horizontal, free, min_size, raw.shape
+                )
+                # `reformat=True` (the default) is deliberate: it runs the raw
+                # array through easyOCR's own `reformat_input`, so the grey
+                # image the crops come from is byte-for-byte the one
+                # `readtext_batched` would have produced.
+                results.append(
+                    self.model.recognize(
+                        raw, horizontal, free, **recognize_params
+                    )
+                )
+            return results
+
+        return run_with_oom_retry(
+            process_chunk,
+            list(zip(bounded, raw_images, scales)),
+            logger=logger,
+        )
+
     def unload(self) -> None:
         if self._model_loaded:
             del self.model
@@ -389,27 +471,95 @@ def fit_to_canvas(
     return resized, ratio
 
 
-def scale_boxes_to_original(results, scale: float):
-    """Undo [`fit_to_canvas`]'s ratio on every detected box.
+def scale_detections_to_original(horizontal_list, free_list, scale: float):
+    """Undo [`fit_to_canvas`]'s ratio on one image's detections.
 
-    Defensive by construction: easyOCR's return shape depends on `detail`,
-    `paragraph` and `output_format`, all of which a caller may set per
-    request, so anything that does not look like `(4-point box, ...)` is
-    passed through untouched rather than guessed at. A no-op at `scale == 1`,
-    which is every image that was already inside the canvas.
+    `Reader.detect` returns boxes in the space of the array it was handed —
+    it has already undone the *detector's* own internal ratio
+    (`craft_utils.adjustResultCoordinates`, `detection.py:59-60`), but not
+    ours. Undoing ours is what lets the crops be taken from the raw image,
+    which is the whole point of the split in
+    [`EasyOCRModel._detect_bounded_recognize_raw`].
+
+    Two shapes, both from `utils.group_text_box`: a horizontal box is
+    `[x_min, x_max, y_min, y_max]`, a free box is four `[x, y]` points. A
+    no-op at `scale == 1`, which is every image already inside the canvas.
+    Anything unreadable is passed through untouched rather than guessed at.
     """
-    if not results or scale >= 1.0 or scale <= 0:
-        return results
+    if scale >= 1.0 or scale <= 0:
+        return horizontal_list, free_list
     inverse = 1.0 / scale
-    scaled = []
-    for entry in results:
+
+    def horizontal(box):
         try:
-            box = entry[0]
-            moved = [[point[0] * inverse, point[1] * inverse] for point in box]
-            scaled.append([moved, *list(entry[1:])])
-        except Exception:
-            scaled.append(entry)
-    return scaled
+            return [value * inverse for value in box]
+        except Exception:  # pragma: no cover - defensive
+            return box
+
+    def free(box):
+        try:
+            return [[point[0] * inverse, point[1] * inverse] for point in box]
+        except Exception:  # pragma: no cover - defensive
+            return box
+
+    return (
+        [horizontal(box) for box in horizontal_list or []],
+        [free(box) for box in free_list or []],
+    )
+
+
+def filter_small_detections(horizontal_list, free_list, min_size, shape):
+    """easyOCR's own `min_size` filter, in the submitted image's pixels.
+
+    A verbatim restatement of `easyocr.py:343-347` — drop a box whose longer
+    side is not greater than `min_size` — applied here because the detector
+    ran on the canvas-bounded array, where "20 pixels" would silently mean 62
+    raw pixels on an 8000px sheet. Running it after
+    [`scale_detections_to_original`] keeps the threshold meaning what the
+    caller (and the unbatched path, and every pre-run2 release) means by it.
+
+    Also drops a box that does not intersect the raw image at all: detection
+    ran on a padded frame that is larger than this image, so a box found in
+    the padding has nowhere to be cropped from. `utils.get_image_list` clamps
+    a *partly* outside box itself (`:601-604`), so only the empty case needs
+    handling here.
+    """
+    height, width = int(shape[0]), int(shape[1])
+
+    def inside(x_min, x_max, y_min, y_max) -> bool:
+        return (
+            min(x_max, width) > max(x_min, 0)
+            and min(y_max, height) > max(y_min, 0)
+        )
+
+    kept_horizontal = []
+    for box in horizontal_list or []:
+        try:
+            x_min, x_max, y_min, y_max = box[0], box[1], box[2], box[3]
+            if min_size and max(x_max - x_min, y_max - y_min) <= min_size:
+                continue
+            if not inside(x_min, x_max, y_min, y_max):
+                continue
+        except Exception:  # pragma: no cover - defensive
+            pass
+        kept_horizontal.append(box)
+
+    kept_free = []
+    for box in free_list or []:
+        try:
+            xs = [point[0] for point in box]
+            ys = [point[1] for point in box]
+            if min_size and max(
+                max(xs) - min(xs), max(ys) - min(ys)
+            ) <= min_size:
+                continue
+            if not inside(min(xs), max(xs), min(ys), max(ys)):
+                continue
+        except Exception:  # pragma: no cover - defensive
+            pass
+        kept_free.append(box)
+
+    return kept_horizontal, kept_free
 
 
 def pad_images_to_same_size(images: List[np.ndarray]) -> List[np.ndarray]:
