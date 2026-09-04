@@ -664,8 +664,10 @@ pub(crate) struct ExtractionFailuresQuery {
     /// `input`, `blocked` or `resource`. Anything else is a 400.
     #[param(nullable)]
     error_class: Option<String>,
-    /// `prepare` (the gateway could not produce the model's input) or
-    /// `inference` (the worker rejected it).
+    /// `prepare` (the gateway could not produce the model's input),
+    /// `inference` (the worker rejected it) or `output` (the results could
+    /// not be written). `output` only ever appears on `job_failures`: a
+    /// recorded verdict is about the media, and a write that failed is not.
     #[param(nullable)]
     stage: Option<String>,
     /// Prefix of the recorded mime type, e.g. `image/`.
@@ -848,8 +850,13 @@ pub(crate) struct ExtractionFailuresResponse {
     /// page window.
     failed_jobs_total: i64,
     /// The jobs those failures belong to, newest first, paged by the same
-    /// `limit`/`offset`. Empty (with a total of 0) when any filter that only
-    /// describes an individual failure is present.
+    /// `limit`/`offset`. Empty (with a total of 0) when `error_class` or
+    /// `mime_prefix` is present, for the reason given on `job_failures`.
+    ///
+    /// Deliberately **not** narrowed by `setter` or `stage`, even though
+    /// `job_failures` is: a job record already names its setter, and a job is
+    /// not attributable to one stage at all, so filtering here would hide the
+    /// context of the rows above rather than refine it.
     failed_jobs: Vec<crate::db::job_failures::FailedJobRecord>,
 }
 
