@@ -284,6 +284,41 @@ allow = "*"
 default = "default"
 allow = "*"
 
+# CALIB deviation, run2: a hostless catch-all so the gateway's own inference
+# calls are not denied. R10' made `inferio_client` speak HTTP/2 cleartext to
+# the inference endpoint, and an HTTP/2 request carries its authority in the
+# `:authority` pseudo-header, never in `Host`. `policy::resolve_effective_host`
+# reads only `Host`, and `select_policy` requires a *matching* host whenever a
+# policy states any (`hosts.is_empty() || host.is_some_and(...)`), so every h2c
+# request matches no policy and is refused 403 `no_policy` -- including the
+# gateway's call to itself. With local inference that means
+# `POST /api/jobs/data/extraction` answers 500 ("failed to validate inference
+# external inputs error=inference request failed (403)") and no extraction job
+# can be created at all. Evidence:
+# results/run2/S2-wdvit-blocked-h2c403/. Only a policy that states *no* hosts
+# matches a hostless request -- `hosts = ["*"]` does not, since the wildcard is
+# only consulted when a host is present, and a policy with neither hosts nor
+# endpoints is rejected at config load ("policy 'x' must list at least one host
+# or endpoint"). So the one writable shape is an endpoint-scoped policy with no
+# hosts, below. The shipped `config/server/default.toml` has no such policy,
+# which is why this is a PRODUCT defect and is reported as one; the policy
+# below exists so the calibration legs can still be measured, and it changes
+# nothing the ledger does.
+[[policies]]
+name = "calib_hostless"
+ruleset = "allow_all"
+
+[policies.match]
+endpoints = ["default"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+
 # Free-form per-policy client settings, returned verbatim by
 # GET /api/client-config as the "client" object (alongside capability
 # booleans derived from the policy's ruleset). Recognized-by-convention
