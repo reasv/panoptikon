@@ -62,13 +62,21 @@ median absolute residual, >= 3 samples, slope > 0), so the two numbers are
 directly comparable.
 
 Units are priced with the worker's own `packing.price_inputs` /
-`packing.batch_units`, so `units` means the same thing on both sides.
+`packing.batch_units`, so `units` means the same thing on both sides —
+including the per-item pixel canvas (run2 R7): a `pixel` model is priced at
+`min(raw pixels, canvas)`, resolved from the registry declaration first and
+the loaded impl's own attribute second, exactly as a worker under a grant
+resolves it. `cost.canvas_pixels_in_force` in the output says which figure
+priced the run (`null` = uncapped), because a slope fitted under a cap and one
+fitted without it are different numbers.
 
 Output schema (JSON)
 --------------------
     {"schema": "ceiling_probe/1", "model": str, "impl_class": str,
      "config": {...}, "cost": {"unit": str, "aggregation": str,
-                               "seed_units": int|null, "epoch": int|null},
+                               "seed_units": int|null, "epoch": int|null,
+                               "canvas_pixels": int|null,
+                               "canvas_pixels_in_force": int|null},
      "device": {"index": int, "uuid": str, "name": str, "total_mb": int,
                 "cuda_visible_devices": str},
      "torch": str, "dtype": str|null, "python": str,
@@ -237,6 +245,42 @@ def _canvas_pixels(
     if not isinstance(declared, int) or isinstance(declared, bool) or declared < 1:
         return None
     return declared
+
+
+def batch_pricer(
+    packing: Any, cost: Dict[str, Any], instance: Any
+) -> Tuple[Any, Optional[int]]:
+    """The probe's per-batch price, in the ledger's own denomination.
+
+    Returns the pricing function and the per-item pixel canvas that is
+    actually in force, which the run record carries so a reader can tell
+    which denomination a fit is in.
+
+    The canvas is resolved through the worker's own
+    `packing.resolve_canvas_pixels`, with the registry's declaration standing
+    in for the grant the orchestrator would have sent (`_canvas_pixels` has
+    already applied the two registry rules) — so this tool walks exactly the
+    order a worker walks: declaration first, the loaded impl's own attribute
+    second, uncapped third.
+
+    Pricing raw pixels here while the ledger prices capped ones would make
+    the one comparison this tool exists for meaningless: the probe's slope is
+    MiB per unit, and after run2's R7 a "unit" of a canvassed model is a
+    *capped* pixel. Two slopes over different denominators cannot be
+    compared at all, which is precisely the shape of run1's spurious 4.33x
+    disagreement on nemotron (report §4, Q3/W1) — with the sides swapped.
+    """
+    unit = cost["unit"]
+    aggregation = cost["aggregation"]
+    canvas_pixels = packing.resolve_canvas_pixels(
+        {"canvas_pixels": cost.get("canvas_pixels")}, instance, unit
+    )
+
+    def price(inputs) -> int:  # noqa: ANN001
+        priced = packing.price_inputs(inputs, unit, canvas_pixels)
+        return packing.batch_units(range(len(inputs)), priced, aggregation)
+
+    return price, canvas_pixels
 
 
 # --------------------------------------------------------------------------
@@ -544,12 +588,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             return 0
 
-    unit = resolved["cost"]["unit"]
-    aggregation = resolved["cost"]["aggregation"]
-
-    def price(inputs) -> int:  # noqa: ANN001
-        priced = packing.price_inputs(inputs, unit)
-        return packing.batch_units(range(len(inputs)), priced, aggregation)
+    price, canvas_in_force = batch_pricer(packing, resolved["cost"], instance)
 
     def run_batch(count: int, repeat: int) -> Dict[str, Any]:
         inputs = build_inputs(items, count, args.mode, data_template)
@@ -705,6 +744,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     result = {
         **plan,
+        # The declared canvas is in `plan`; this is the one that priced every
+        # batch below, which is the impl's own attribute for a model the
+        # registry cannot state statically (dots.ocr).
+        "cost": {**resolved["cost"], "canvas_pixels_in_force": canvas_in_force},
         "torch": torch.__version__,
         "dtype": _resolve_dtype(instance),
         "device": {**board, "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]},

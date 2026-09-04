@@ -186,11 +186,15 @@ with the inference id's), pins the board with
 through `inferio_worker.discovery.find_impl_class`, and measures each batch
 with `torch.cuda.max_memory_reserved` / `max_memory_allocated` plus NVML's
 per-process figure. Units are priced with the worker's own
-`packing.price_inputs`/`batch_units`, and the slope is fitted with the same
+`packing.price_inputs`/`batch_units` — including run2's per-item pixel canvas,
+resolved from the registry declaration first and the loaded impl's own
+attribute second, as a worker under a grant resolves it, and reported as
+`cost.canvas_pixels_in_force` — and the slope is fitted with the same
 Theil–Sen estimator as `ledger.rs: robust_fit`, so probe and ledger numbers are
 directly comparable. A batch counts as an OOM by the worker's own
 `packing.classify_oom` — the same three tiers the ledger acts on, imported
-rather than copied — and each row carries the `oom_class` that decided it. `--dry-run` resolves and prints the plan without touching
+rather than copied — and each row carries the `oom_class` that decided it.
+`--dry-run` resolves and prints the plan without touching
 a GPU. `--bisect-oom` pairs with `hog.py leave-free N` to find the true OOM
 boundary at N MiB free.
 
