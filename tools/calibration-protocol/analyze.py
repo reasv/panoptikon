@@ -381,13 +381,27 @@ class Context:
         moment the recording can prove the process existed -- which is what
         makes it a usable lower bound on "was this PID already there before the
         replica under test was spawned?".
+
+        "Each PID" is really each *residency*: a pid number that vanishes from
+        every board for longer than `PID_REUSE_GAP_S` and comes back is read
+        as a new process, so a recycled pid cannot make a fresh worker look
+        decades old and lose its row. A live worker holds its base for as long
+        as it is resident, so it never gaps; run1 has no such gap in any of
+        its 61 recordings, and this host's `pid_max` is 4 194 304, so the
+        guard is insurance rather than a correction.
         """
         if self._pid_first_seen is None:
             first: Dict[int, float] = {}
+            last: Dict[int, float] = {}
             for sample in self.vram_samples:  # in time order
+                t_wall = sample["t_wall"]
                 for board in sample.get("gpus", []):
                     for proc in board.get("procs", []):
-                        first.setdefault(proc["pid"], sample["t_wall"])
+                        pid = proc["pid"]
+                        if (pid not in last
+                                or t_wall - last[pid] > PID_REUSE_GAP_S):
+                            first[pid] = t_wall
+                        last[pid] = t_wall
             self._pid_first_seen = first
         return self._pid_first_seen
 
@@ -396,9 +410,10 @@ class Context:
 
         The latest `spawned an inferio worker` line that `_worker_spawns` could
         tie to this model and that precedes the admission. `None` when the log
-        carries no spawn line for the model -- a leg logged below
-        `panoptikon::inferio=debug` has none at all, and the caller must then
-        say so rather than pretend the cross-check ran.
+        carries no spawn line for the model, which is the normal case for a
+        recording made before `c8d64a5a` added the line (run1 has it in 9 of
+        its 61 legs) and for one logged below `panoptikon::inferio=debug`. The
+        caller must then say so rather than pretend the cross-check ran.
         """
         best: Optional[float] = None
         for spawn in self.worker_spawns:
@@ -407,6 +422,90 @@ class Context:
             if best is None or spawn["t_wall"] > best:
                 best = spawn["t_wall"]
         return best
+
+    def attribute_replica_pid(
+        self, pids: List[int], admitted_t: float, spawn_t: Optional[float]
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Which of our PIDs on the board is the replica that was just admitted.
+
+        The freshest one. A replica is admitted the instant *its own* worker
+        finishes loading, so among our processes already holding memory at that
+        moment, the one the oracle sighted last is the one that just came up;
+        every older PID is a resident that was already there. The one hard
+        constraint is the spawn line, when the log carries it: a PID first
+        sighted *before* this replica's worker was forked cannot be that
+        worker -- run1/S9's 346.7% FAIL was an older worker being the only PID
+        the recording could see.
+
+        A sighting after the admission is not disqualifying, only unhelpful:
+        the oracle samples at 1-4 Hz and a worker allocates a few hundred
+        milliseconds before its load returns, so on a slow cadence a replica's
+        own PID is routinely first seen in the sample *after* the admission
+        (14 of run1's legs). With one PID on the board that costs nothing --
+        it is the only thing it can be. With several it is genuinely
+        ambiguous, and the row is declined rather than guessed.
+
+        Returns `(pid, None)`, or `(None, why)`.
+        """
+        first = self.pid_first_seen()
+        floor_t = None if spawn_t is None else spawn_t - SPAWN_CLOCK_SLACK_S
+        candidates = [(first[pid], pid) for pid in pids
+                      if first.get(pid) is not None
+                      and (floor_t is None or first[pid] >= floor_t)]
+        if not candidates:
+            return None, (f"none of the {len(pids)} worker PIDs on the board "
+                          "was first sighted at or after this replica's spawn "
+                          "line, so the replica that loaded is not "
+                          "attributable in the oracle")
+        resident = [pair for pair in candidates if pair[0] <= admitted_t]
+        if resident:
+            return max(resident)[1], None
+        if len(candidates) == 1:
+            return candidates[0][1], None
+        return None, (f"none of the {len(pids)} worker PIDs on the board was "
+                      "sighted before the admission -- the oracle first saw "
+                      "them all afterwards -- so which one loaded is not "
+                      "attributable")
+
+    def replica_departed_t(self, model: str, uuid: str,
+                           admitted_t: float) -> Optional[float]:
+        """When this model's replica left the board, if the recording says.
+
+        Two independent signals, whichever comes first: the ledger's own
+        `credited a departed replica's footprint ...` line for this
+        model/board, and the first health sample at or after the admission
+        that no longer lists a replica of this model on it. Either marks the
+        end of residency, and with it the end of any window in which the
+        worker's per-process figure is still `base_mb`: the process is tearing
+        its model down, and its NVML reading falls to the bare CUDA context on
+        the way out (run1/S6-b18-loadstall: 3 788 MiB for 178.5 s, then 550).
+        """
+        end: Optional[float] = None
+        for event in self.log:
+            if not event["message"].startswith(DEPARTED_REPLICA):
+                continue
+            fields = event["fields"]
+            if str(fields.get("model")) != model or str(fields.get("gpu")) != uuid:
+                continue
+            t_wall = event["t_wall"]
+            if t_wall is None or t_wall < admitted_t:
+                continue
+            end = t_wall if end is None else min(end, t_wall)
+            break
+        for sample in self.health_samples:
+            if sample["t_wall"] < admitted_t:
+                continue
+            resident = any(
+                entry.get("inference_id") == model
+                and any((replica.get("gpu_uuid") or replica.get("gpu")) == uuid
+                        for replica in entry.get("replicas") or [])
+                for entry in (sample.get("health") or {}).get("models") or []
+            )
+            if not resident:
+                end = (sample["t_wall"] if end is None
+                       else min(end, sample["t_wall"]))
+                break
+        return end
 
     def log_events(self, message: str) -> List[Dict[str, Any]]:
         return [event for event in self.log if event["message"] == message]
@@ -422,6 +521,20 @@ class Context:
 
 SPAWN_PID = re.compile(r"(\d+)")
 CONFIGURED_AS = "Configured as "
+DEPARTED_REPLICA = "credited a departed replica's footprint"
+
+# A pid number absent from every board for longer than this and then back is
+# read as a different process (`Context.pid_first_seen`).
+PID_REUSE_GAP_S = 60.0
+
+# Slack on "this PID was sighted before its own worker was forked". The
+# gateway's log clock and the recorder's are the same system clock, and a
+# worker needs hundreds of milliseconds of CUDA init before NVML lists it, so
+# the true margin is large and positive; the slack only absorbs a clock step
+# (an NTP correction mid-recording) turning a legitimate replica into a
+# decline. A *wrong*, older PID predates the spawn by many seconds -- run1/S9's
+# was minutes older -- so nothing this small can wave one through.
+SPAWN_CLOCK_SLACK_S = 2.0
 
 
 def _worker_spawns(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -434,6 +547,19 @@ def _worker_spawns(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     model behind each pid. A spawn with no such line stays `model: None` and
     is only ever used as "this pid is one of ours", never as evidence about
     which model it is.
+
+    The pairing is fail-closed, because the log cannot settle it. One impl
+    class serves many inference ids (`sentence_transformers` is every
+    sentence-transformer model), the `Configured as` line is the *worker's*
+    own stderr relayed under a label fixed at spawn, so it carries no pid --
+    the only lines that carry both a pid and an inference id are the death
+    and kill lines, long after the fact -- and two workers of one class that
+    are both mid-configure can finish in either order. So whenever a
+    `Configured as` line arrives with more than one spawn of its class still
+    pending, every spawn in that queue is marked ambiguous and none of them
+    ever takes a model: an unattributed pid costs a cross-check, a
+    cross-paired one would put a *wrong* spawn time on a replica. run1 has no
+    such case (56 spawns in S9, 0 ambiguous configures).
     """
     spawns: List[Dict[str, Any]] = []
     pending: Dict[str, List[Dict[str, Any]]] = {}
@@ -444,7 +570,8 @@ def _worker_spawns(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if match is None or event["t_wall"] is None:
                 continue
             spawn = {"pid": int(match.group(1)), "worker": worker,
-                     "t_wall": event["t_wall"], "model": None}
+                     "t_wall": event["t_wall"], "model": None,
+                     "ambiguous": False}
             spawns.append(spawn)
             pending.setdefault(worker, []).append(spawn)
             continue
@@ -454,7 +581,15 @@ def _worker_spawns(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         queue = pending.get(worker)
         if not queue:
             continue
-        queue.pop(0)["model"] = event["message"][index + len(CONFIGURED_AS):].strip()
+        if len(queue) > 1:
+            # Two of this class are up in the air at once: this line belongs
+            # to one of them and the log does not say which, and neither will
+            # the next one, so the whole queue loses its claim to a model.
+            for spawn in queue:
+                spawn["ambiguous"] = True
+        head = queue.pop(0)
+        if not head["ambiguous"]:
+            head["model"] = event["message"][index + len(CONFIGURED_AS):].strip()
     return spawns
 
 
@@ -497,6 +632,14 @@ def _at_or_after(rows: List[Dict[str, Any]], times: List[float], target: float,
 
 def _pct(value: float, of: float) -> float:
     return 100.0 * value / of if of else float("inf")
+
+
+def _pid_mb(board: Dict[str, Any], pid: int) -> Optional[int]:
+    """One PID's NVML per-process usage on this board, if it holds any."""
+    for proc in board.get("procs", []):
+        if proc["pid"] == pid and proc.get("used_mb"):
+            return int(proc["used_mb"])
+    return None
 
 
 # The hog is judged to have been held "long enough for the ledger to have no
@@ -698,55 +841,64 @@ def check_base_accuracy(ctx: Context) -> Verdict:
                          "note": "board absent from the oracle sample"})
             continue
         ours, pids = ctx.our_pids_mb(oracle)
-        if len(pids) != 1:
+        if not pids:
             rows.append({"model": model, "gpu": uuid, **info, "pids": pids,
                          "oracle_sum_mb": ours,
-                         "note": f"{len(pids)} worker PIDs on the board: "
-                                 "attribution is ambiguous"})
+                         "note": "no worker PID of ours on the board at the "
+                                 "admission"})
             continue
-        # One PID on the board is not evidence that it is *this* replica's. A
-        # worker whose identity the recording missed is invisible to
-        # `our_pids_mb`, and then some *other*, older worker is the only PID
-        # left standing and gets waved through: run1/S9 measured nemotron's
-        # `base_mb` against the MiniLM worker's process and reported 346.7%.
-        # So the PID must not predate the replica: it cannot have been holding
-        # memory before its own process was forked.
+        # Which of them is this replica? Not "the only one", which is what the
+        # check used to require: a worker whose identity the recording missed
+        # is invisible to `our_pids_mb`, and then some *other*, older worker is
+        # the only PID left standing and gets waved through -- run1/S9 measured
+        # nemotron's `base_mb` against the MiniLM worker's process and reported
+        # 346.7%. `attribute_replica_pid` takes the freshest sighting inside
+        # [spawn, admission] instead, so a board carrying several of our
+        # workers is resolved rather than declined, and a board carrying none
+        # that fits the replica is declined rather than guessed.
         spawn_t = ctx.replica_spawn_t(model, info["t_wall"])
-        first_seen = ctx.pid_first_seen().get(pids[0])
-        if spawn_t is not None and first_seen is not None and first_seen < spawn_t:
-            rows.append({"model": model, "gpu": uuid, **info, "pid": pids[0],
-                         "oracle_sum_mb": ours,
-                         "pid_predates_spawn_s": round(spawn_t - first_seen, 3),
-                         "note": "the loading worker's PID is not attributable "
-                                 f"in the oracle: PID {pids[0]} was already on "
-                                 f"the board {spawn_t - first_seen:.1f}s before "
-                                 "this replica's worker was spawned"})
+        pid, why = ctx.attribute_replica_pid(pids, info["t_wall"], spawn_t)
+        if pid is None:
+            rows.append({"model": model, "gpu": uuid, **info, "pids": pids,
+                         "oracle_sum_mb": ours, "note": why})
             continue
         spawn_check = ("pid is at or after the replica's spawn line"
                        if spawn_t is not None else
-                       "no spawn line for this model in the log "
-                       "(needs panoptikon::inferio=debug): PID attribution is "
-                       "not cross-checked")
+                       "no spawn line for this model in the log (the gateway "
+                       "predates the line, or it is below "
+                       "panoptikon::inferio=debug): the PID is the freshest "
+                       "sighting at the admission, not cross-checked against "
+                       "a spawn")
         # The window in which the process holds its base and nothing else:
         # from the load `ok` (the admission line is 0.2 ms later) to the
-        # replica's first grant or predict.
+        # replica's first grant or predict -- or, if it never works, to the
+        # moment it leaves the board. Both edges matter: past the first grant
+        # the reading carries the batch's workspace, and past the departure it
+        # is a process tearing its model down, which is *below* base and would
+        # win the minimum outright (S6-b18-loadstall: 3 788 for 178.5 s, then
+        # 550).
         times = work.get(model, [])
         index = bisect.bisect_left(times, info["t_wall"])
         busy_t = times[index] if index < len(times) else None
+        gone_t = ctx.replica_departed_t(model, uuid, info["t_wall"])
+        edges = [edge for edge in (busy_t, gone_t) if edge is not None]
+        end_t = min(edges) if edges else None
         window: List[Tuple[float, int]] = []
         floor = None            # post-load minimum: base + whatever never freed
         for sample in ctx.vram_samples:
             if sample["t_wall"] < info["t_wall"]:
                 continue
+            if gone_t is not None and sample["t_wall"] >= gone_t:
+                break
             board = ctx.oracle_board(sample, uuid)
             if board is None:
                 continue
             for proc in board.get("procs", []):
-                if proc["pid"] != pids[0] or not proc.get("used_mb"):
+                if proc["pid"] != pid or not proc.get("used_mb"):
                     continue
                 used = int(proc["used_mb"])
                 floor = used if floor is None else min(floor, used)
-                if busy_t is None or sample["t_wall"] < busy_t:
+                if end_t is None or sample["t_wall"] < end_t:
                     window.append((sample["t_wall"], used))
         if window:
             sample_t, reading = min(window, key=lambda pair: pair[1])
@@ -755,15 +907,26 @@ def check_base_accuracy(ctx: Context) -> Verdict:
             # No sample landed in the window. The `_at_or_after` reading is
             # still reported -- it is the nearest thing the recording has --
             # but it provably contains the first batch's workspace, so it is
-            # not evidence about `base_mb` and the row is not judged.
-            sample_t, reading = vram["t_wall"], ours
-            gap = "" if busy_t is None else (
-                f" (first work {round((busy_t - info['t_wall']) * 1000.0)}ms "
+            # not evidence about `base_mb` and the row is not judged. It is
+            # this PID's figure, never the board's sum over our workers: with
+            # more than one of ours resident the sum is several models.
+            sample_t = vram["t_wall"]
+            reading = _pid_mb(oracle, pid)
+            if reading is None:
+                rows.append({"model": model, "gpu": uuid, **info, "pids": pids,
+                             "oracle_sum_mb": ours,
+                             "note": f"PID {pid} holds nothing in the oracle "
+                                     "sample at the admission"})
+                continue
+            edge = ("first work" if busy_t is not None and end_t == busy_t
+                    else "the replica's departure")
+            gap = "" if end_t is None else (
+                f" ({edge} {round((end_t - info['t_wall']) * 1000.0)}ms "
                 "after the load, oracle period is longer)")
             cadence = ("no oracle sample fell between the load and this "
                        "replica's first grant or predict" + gap)
         error = abs(info["base_mb"] - reading)
-        rows.append({"model": model, "gpu": uuid, **info, "pid": pids[0],
+        rows.append({"model": model, "gpu": uuid, **info, "pid": pid,
                      "oracle_pid_mb": reading, "oracle_pid_min_mb": floor,
                      "error_mb": error, "spawn_check": spawn_check,
                      "oracle_window_samples": len(window),
