@@ -876,10 +876,20 @@ def executed_clamp(
     the front of the batch: `plan_batches` ordered it by descending price, so
     that is the most expensive `executed` items in it and therefore never an
     under-statement.
+
+    Three values of `executed` and three different honest answers. A count
+    between 1 and `len(batch)` prices that many items. **Zero** is a known
+    fact, not a missing one — `_executed_shape` returns it for an impl that
+    consulted the retry helper, got nothing through it and did the work by
+    another route (easyOCR's per-image fallback) — so it prices as zero
+    rather than as the whole batch, which would produce the nonsense
+    `from_units == to_units` on a batch that ran no part of its plan in one
+    call. `None` is the missing one (the impl does not route through the
+    helper at all), and there the whole batch is the only defensible figure.
     """
     ran = (
         list(batch[:executed])
-        if isinstance(executed, int) and 0 < executed < len(batch)
+        if isinstance(executed, int) and 0 <= executed < len(batch)
         else list(batch)
     )
     clamped = dict(existing) if existing else {}

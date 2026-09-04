@@ -1891,6 +1891,54 @@ def test_a_failed_batch_that_hit_a_ceiling_says_so_without_an_oom_flag(
     )
 
 
+def test_an_impl_that_executed_nothing_in_one_call_reports_zero_not_the_batch(
+    fake_torch, fake_oom_retry
+):
+    """`_executed_shape` returns 0 for an impl that consulted the retry
+    helper, got nothing through it and did the work by another route — which
+    is exactly easyOCR's per-image fallback. Zero is a *known* fact, so the
+    clamp prices it as zero; pricing it as the whole batch would print
+    `from_units == to_units` on a batch that ran no part of its plan in one
+    call.
+    """
+
+    class FallsBackPerImage:
+        def predict(self, inputs):
+            fake_oom_retry.record(0)
+            fake_oom_retry.note_index_limit()
+            return [None] * len(inputs)
+
+    payload = packing.run_window(
+        FallsBackPerImage(), items(4), grant(unit_budget=4, aggregation="count")
+    )
+    measurement = payload["measurements"][0]
+    assert measurement["clamped"]["from_units"] == 4
+    assert measurement["clamped"]["to_units"] == 0
+    assert measurement["clamped"]["reason"] == "index_limit"
+    assert "units" not in measurement
+    assert "oom" not in measurement
+
+
+def test_an_impl_that_never_consults_the_retry_helper_prices_the_whole_batch(
+    fake_torch, fake_oom_retry
+):
+    """The missing fact, as against the known zero above: nothing moved the
+    per-call record, so how much of the batch ran in one call is unknown and
+    the whole batch is the only defensible `to_units`."""
+
+    class OpaqueButCounting:
+        def predict(self, inputs):
+            fake_oom_retry.note_index_limit()
+            return [None] * len(inputs)
+
+    payload = packing.run_window(
+        OpaqueButCounting(), items(4), grant(unit_budget=4, aggregation="count")
+    )
+    clamped = payload["measurements"][0]["clamped"]
+    assert (clamped["from_units"], clamped["to_units"]) == (4, 4)
+    assert clamped["reason"] == "index_limit"
+
+
 def test_a_ceiling_that_cannot_be_trusted_is_no_ceiling_at_all():
     """Passive and total, like every other question this module asks a loaded
     impl. A ceiling is a count of items: a bool is not one, a float is not
