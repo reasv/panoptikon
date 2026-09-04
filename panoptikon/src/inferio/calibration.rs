@@ -225,6 +225,14 @@ pub struct CalibrationProfile {
     /// same knee into 56 replicas and never revisited it (finding F-A), and
     /// the whole point of the expiry is that a *stored* knee cannot pin a
     /// model forever either.
+    ///
+    /// The threshold this counts towards is **not** the same on both sides of
+    /// a restart (run2 change R1e, finding F1/S3). A knee restored from here
+    /// is one this process never measured, so it is provisional and re-tested
+    /// after `KNEE_SEED_REVALIDATION_WINDOWS` windows rather than
+    /// `KNEE_EXPIRY_CLEAN_WINDOWS`; a value written under the longer threshold
+    /// therefore reads as "already most of the way there" when it comes back,
+    /// which is the direction that errs towards letting the model out.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub knee_clean_windows: u32,
     /// The high-water sample ring, as two parallel arrays: `sample_units[i]`
