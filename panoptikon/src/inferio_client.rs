@@ -1224,6 +1224,7 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::{get, post};
     use axum::{Json, Router};
+    use std::net::SocketAddr;
     use std::sync::{Arc, Mutex as StdMutex};
 
     fn text_input(text: &str) -> InferenceInput {
@@ -1332,6 +1333,175 @@ mod tests {
         assert!(
             growth <= pool_cost + 8,
             "descriptor growth {growth} exceeds the pool's {pool_cost} plus slack"
+        );
+    }
+
+    /// `hyper`'s default `SETTINGS_MAX_CONCURRENT_STREAMS` for an HTTP/2
+    /// *server* (`hyper::proto::h2::server`), which `axum::serve` does not
+    /// override. Not a panoptikon number and not a panoptikon decision: it is
+    /// written down here only so the test that measures it can name what it
+    /// found.
+    const HYPER_DEFAULT_MAX_CONCURRENT_STREAMS: usize = 200;
+
+    /// What one endpoint's concurrency actually is, measured at the server's
+    /// own handler: how many predicts are inside it at once, and over how
+    /// many TCP connections they arrived.
+    struct ConcurrencyProbe {
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        entered: std::sync::atomic::AtomicUsize,
+        peers: StdMutex<std::collections::HashSet<SocketAddr>>,
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl ConcurrencyProbe {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+                entered: std::sync::atomic::AtomicUsize::new(0),
+                peers: StdMutex::new(std::collections::HashSet::new()),
+                release: tokio::sync::watch::channel(false).0,
+            })
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn sockets(&self) -> usize {
+            self.peers.lock().expect("probe mutex").len()
+        }
+    }
+
+    /// A stub inference endpoint whose predict handler *blocks* until the
+    /// test releases it, served through the very serve loop the gateway uses
+    /// for `/api/inference`. Every predict that reaches the handler is
+    /// counted, and its peer address recorded, so the test can read both the
+    /// stream concurrency the server allowed and the number of connections
+    /// the shipped client opened to carry it.
+    async fn spawn_blocking_stub(probe: Arc<ConcurrencyProbe>) -> String {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let handler_probe = Arc::clone(&probe);
+        let app = Router::new()
+            .route(
+                "/api/inference/cache",
+                get(|| async { Json(serde_json::json!({"cache": {}})) }),
+            )
+            .route(
+                "/api/inference/predict/{group}/{id}",
+                post(
+                    move |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                        SocketAddr,
+                    >| {
+                        let probe = Arc::clone(&handler_probe);
+                        async move {
+                            probe.peers.lock().expect("probe mutex").insert(peer);
+                            probe.entered.fetch_add(1, SeqCst);
+                            let now = probe.in_flight.fetch_add(1, SeqCst) + 1;
+                            probe.peak.fetch_max(now, SeqCst);
+                            let mut released = probe.release.subscribe();
+                            let _ = released.wait_for(|open| *open).await;
+                            probe.in_flight.fetch_sub(1, SeqCst);
+                            Json(serde_json::json!({"outputs": [{"ok": true}]}))
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// **S1: what actually bounds concurrent predicts, measured rather than
+    /// assumed.**
+    ///
+    /// The run2 `S2-wdvit` leg published a desired-in-flight figure of 1 632
+    /// items and never got more than 200 predicts onto the wire, on every
+    /// window, for the whole job. 200 is not a panoptikon number: it was
+    /// `hyper`'s default server `SETTINGS_MAX_CONCURRENT_STREAMS`, which
+    /// `axum::serve` never overrode, and `INFERENCE_POOL_CONNECTIONS = 4` did
+    /// not multiply it because hyper-util's pool shares **one** h2 connection
+    /// per host. Neither number was written down anywhere, logged, or visible
+    /// on `/health`; the client's own log line claimed 256.
+    ///
+    /// This test is that ceiling turned into an assertion, at both ends at
+    /// once: the server's handler counts how many predicts are inside it
+    /// concurrently, and records the peer address of each so the connection
+    /// count is measured rather than inferred. It offers far more requests
+    /// than any of the bounds involved, so whichever bound is smallest is
+    /// what it reads back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_server_and_the_pool_bound_concurrent_predicts() {
+        // Comfortably above every bound in play (the client gate, the
+        // server's stream limit, the pool), so the smallest one is what the
+        // handler sees.
+        const OFFERED: usize = 400;
+
+        let probe = ConcurrencyProbe::new();
+        let base_url = spawn_blocking_stub(Arc::clone(&probe)).await;
+        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+
+        let mut inflight = tokio::task::JoinSet::new();
+        for _ in 0..OFFERED {
+            let client = client.clone();
+            inflight.spawn(async move {
+                client
+                    .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+                    .await
+                    .map(|_| ())
+            });
+        }
+
+        // Let the concurrency settle: sample until the peak stops moving for
+        // a full second, with a hard deadline so a regression cannot hang the
+        // suite.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut last = usize::MAX;
+        let mut stable = 0;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let peak = probe.peak();
+            if peak == last && peak > 0 {
+                stable += 1;
+                if stable >= 10 {
+                    break;
+                }
+            } else {
+                stable = 0;
+                last = peak;
+            }
+        }
+
+        let peak = probe.peak();
+        let sockets = probe.sockets();
+        probe.release.send_replace(true);
+        let mut answered = 0usize;
+        while let Some(result) = inflight.join_next().await {
+            result.expect("no panic").expect("the stub answers");
+            answered += 1;
+        }
+        assert_eq!(answered, OFFERED, "every offered predict must complete");
+
+        assert_eq!(
+            peak, HYPER_DEFAULT_MAX_CONCURRENT_STREAMS,
+            "the concurrency that reached the handler is neither the client's \
+             gate ({INFERENCE_MAX_CONCURRENT_REQUESTS}) nor what was offered \
+             ({OFFERED}) but the server's stream limit"
+        );
+        assert_eq!(
+            sockets, 1,
+            "hyper-util's pool shares one h2 connection per host, so \
+             INFERENCE_POOL_CONNECTIONS does not multiply the stream limit"
         );
     }
 
