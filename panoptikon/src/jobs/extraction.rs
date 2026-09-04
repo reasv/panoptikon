@@ -793,13 +793,32 @@ impl Drop for IncompleteJobCleanup {
 struct CancelledJobStamp {
     index_db: String,
     job_id: i64,
+    /// The job's counters, for the failure records buffered in them.
+    ///
+    /// A cancelled job has the same audit debt as one that stopped early: the
+    /// items it already failed on are counted in `data_log`, so without this
+    /// they would be counted and *not listed* — the exact "the endpoint is
+    /// empty while the record says items failed" asymmetry run1 measured
+    /// (Q8/T8) and this whole surface exists to close.
+    counters: Arc<Mutex<JobCounters>>,
 }
 
 impl Drop for CancelledJobStamp {
     fn drop(&mut self) {
         let index_db = self.index_db.clone();
         let job_id = self.job_id;
+        let counters = Arc::clone(&self.counters);
+        // A `Drop` cannot await, so the lock is taken inside the spawned task.
+        // It is uncontended by construction: this guard is dropped with the
+        // job function, which is the only other holder.
         tokio::spawn(async move {
+            let (failures, dropped) = {
+                let mut guard = counters.lock().await;
+                (std::mem::take(&mut guard.failures), guard.failures_dropped)
+            };
+            // Before the stamp, so a reader that sees the outcome can already
+            // list the items behind it — the same order the normal end uses.
+            write_job_failures(&index_db, job_id, failures, dropped).await;
             let result = call_index_db_writer(&index_db, |reply| {
                 IndexDbWriterMessage::FinalizeCancelledJob { job_id, reply }
             })
@@ -1036,6 +1055,7 @@ async fn run_extraction_job_inner(
     let _cancel_stamp = CancelledJobStamp {
         index_db: job.index_db.clone(),
         job_id,
+        counters: Arc::clone(&counters),
     };
     let items_result: ApiResult<i64> = async {
         // The setter row has to exist before any output references it. It is
@@ -4051,6 +4071,53 @@ mod tests {
         abort.set("second".to_string());
         assert_eq!(abort.reason(), Some("first"));
         assert!(abort.is_set());
+    }
+
+    /// A cancelled job hands its buffered failure records on to be written,
+    /// instead of dropping them with the guard.
+    ///
+    /// The records are counted in `data_log` the moment they are noted, so a
+    /// guard that only stamped the outcome left a cancelled job saying "items
+    /// failed" while the failures endpoint listed none of them — the same
+    /// counted-but-not-listed asymmetry run1 found (Q8/T8) and this surface
+    /// exists to close. Draining the buffer is the observable here; that the
+    /// drained records round trip is
+    /// `db::job_failures::recorded_failures_come_back_with_their_item_and_path`.
+    #[tokio::test]
+    async fn cancelling_a_job_still_hands_over_its_failure_records() {
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        note_job_failure(
+            &counters,
+            "test/clip",
+            crate::db::extraction_errors::STAGE_INFERENCE,
+            "sha_one",
+            true,
+            "inferio worker test/clip failed fatally: early eof".to_string(),
+        )
+        .await;
+        assert_eq!(counters.lock().await.failures.len(), 1);
+
+        let stamp = CancelledJobStamp {
+            // No writer is registered for this name, so the write attempt
+            // WARNs and is swallowed — deliberately, since losing the audit
+            // must never be what fails a job.
+            index_db: "cancelled-job-stamp-test".to_string(),
+            job_id: 1,
+            counters: Arc::clone(&counters),
+        };
+        drop(stamp);
+
+        // The guard's work happens on a spawned task.
+        for _ in 0..64 {
+            if counters.lock().await.failures.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            counters.lock().await.failures.is_empty(),
+            "the cancel guard must take the buffered failures, not drop them"
+        );
     }
 
     fn image_model() -> ModelMetadata {
