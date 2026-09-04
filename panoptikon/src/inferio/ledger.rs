@@ -12894,18 +12894,19 @@ mod tests {
 
     /// Rule 4's gate is held up by the ring, not by the live anchor.
     ///
-    /// [`Self::note_unified_death_locked`] (DP-2) **halves**
+    /// [`VramLedger::note_unified_death_locked`] (DP-2) **halves**
     /// `max_units_measured` when a replica dies mid-window on a unified board.
     /// That is a runtime correction about what this machine should be trusted
-    /// to run next — `Self::pending_update_locked` already refuses to persist
-    /// it for exactly that reason — and it is not a statement that the ramp
-    /// never went past those sizes. Rule 4 asks the historical question, so it
-    /// reads the largest anchor the ring's own observations were *taken*
-    /// under. Reading the halved figure instead switched the rule off for the
-    /// highest candidate rules 1 and 3 allow: those two force the candidate at
-    /// least two buckets below the frontier, and the frontier is at most the
-    /// anchor's bucket, so one halving still leaves the gate closed — but the
-    /// second one opens it, on the ring the rule exists to refuse.
+    /// to run next — `VramLedger::pending_update_locked` already refuses to
+    /// persist it for exactly that reason — and it is not a statement that
+    /// the ramp never went past those sizes. Rule 4 asks the historical
+    /// question, so it reads the largest anchor the ring's own observations
+    /// were *taken* under. Reading the halved figure instead switched the
+    /// rule off for the highest candidate rules 1 and 3 allow: those two force
+    /// the candidate at least two buckets below the frontier, and the frontier
+    /// is at most the anchor's bucket, so one halving still leaves the gate
+    /// closed — but the second one opens it, on the ring the rule exists to
+    /// refuse.
     #[test]
     fn a_halved_anchor_does_not_excuse_a_knee_from_the_ramp_era_rule() {
         // A bend at 16 units, whose only observations date from the window
