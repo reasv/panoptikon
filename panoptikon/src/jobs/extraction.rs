@@ -2155,15 +2155,25 @@ struct ItemInference {
 /// One item's inference, with the two failures that are **not** about the
 /// item handled before it can be blamed for them.
 ///
-/// - **The worker died with the request in flight** ([`WORKER_DIED_KIND`]).
-///   The items in that request were never attempted: the process holding
-///   them stopped existing. Recording them as errors makes one death cost a
-///   whole in-flight window — 1 542 items from a single death in run1
-///   (finding F7), on a job that still reported *completed*. So the item's
-///   work is re-submitted **once**. The next predict is what respawns the
-///   worker and reloads the model, so there is nothing to wait for and no
-///   sleep here; a model that then fails to *load* comes back as a load
+/// - **The request was never attempted** — the worker died holding it
+///   ([`WORKER_DIED_KIND`]), or its request body never arrived in full
+///   ([`REQUEST_INCOMPLETE_KIND`], run2 defect P2). Either way the items in
+///   that request were never handed to a model, so nothing has been decided
+///   about the media. Recording them as errors makes one death cost a whole
+///   in-flight window — 1 542 items from a single death in run1 (finding
+///   F7), on a job that still reported *completed* — and makes one broken
+///   request body a permanent verdict on an image that is fine. So the
+///   item's work is re-submitted **once**. The next predict is what respawns
+///   the worker and reloads the model, so there is nothing to wait for and
+///   no sleep here; a model that then fails to *load* comes back as a load
 ///   failure, not a death, so this cannot spin.
+///
+///   The judgement this encodes is narrow on purpose: it is the server's
+///   typed `kind` that buys the retry, never the status. A transport-level
+///   4xx from the gateway's own inference surface is not a verdict about the
+///   media and is retried; an *untyped* 4xx from any upstream is left alone,
+///   because "400" on its own is exactly as consistent with a request this
+///   process will keep getting wrong.
 ///
 ///   Once per item, and only once, is the whole budget: a job of N items can
 ///   therefore cost at most 2N requests however many times the worker dies,
@@ -2233,8 +2243,8 @@ async fn run_item_inference(
 /// above is then only "call, classify, act".
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InferenceRecovery {
-    /// Re-submit this item's work, once. Only a worker death earns this, and
-    /// only the first time for a given item.
+    /// Re-submit this item's work, once. Only a request the server says was
+    /// never attempted earns this, and only the first time for a given item.
     Requeue,
     /// Stop the whole job with this reason. Only the load-failure cooldown
     /// earns it: it is a statement about the model for a stated window, so
@@ -2245,8 +2255,9 @@ enum InferenceRecovery {
 }
 
 /// The recovery policy. `already_requeued` is this item's one-shot budget:
-/// a second death on the retry is a real failure, so a job of N items can
-/// never cost more than 2N requests however many times the worker dies.
+/// a second unattempted request on the retry is a real failure, so a job of
+/// N items can never cost more than 2N requests however many times the
+/// worker dies or a request body is cut short.
 fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> InferenceRecovery {
     let Some(failure) = inference_failure(err) else {
         return InferenceRecovery::Fail;
@@ -2254,7 +2265,7 @@ fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> Inferen
     if failure.is_load_cooldown() {
         return InferenceRecovery::Abort(cooldown_reason(failure));
     }
-    if failure.is_worker_death() && !already_requeued {
+    if failure.is_unattempted() && !already_requeued {
         return InferenceRecovery::Requeue;
     }
     InferenceRecovery::Fail
@@ -3997,14 +4008,31 @@ mod tests {
         }
     }
 
+    /// The 400 an upstream without this surface's typed detail answers with:
+    /// a status and prose, and no machine-readable opinion at all.
+    fn untyped_bad_request() -> anyhow::Error {
+        anyhow::Error::new(crate::inferio_client::InferenceFailure {
+            status: 400,
+            kind: None,
+            message: "invalid multipart body".to_string(),
+            model: None,
+            last_error: None,
+            retry_at: None,
+            failures: None,
+            retry_after_secs: None,
+        })
+    }
+
     /// A failure the client typed. Built by hand rather than through a real
     /// server: the policy under test is about the `kind` field alone.
     fn typed_failure(kind: Option<&str>) -> anyhow::Error {
         anyhow::Error::new(crate::inferio_client::InferenceFailure {
-            status: if kind == Some(crate::inferio_client::LOAD_COOLDOWN_KIND) {
-                503
-            } else {
-                500
+            status: match kind {
+                Some(crate::inferio_client::LOAD_COOLDOWN_KIND) => 503,
+                // The status this kind actually rides on, so the test proves
+                // the retry is bought by the kind and not by a 5xx.
+                Some(crate::inferio_client::REQUEST_INCOMPLETE_KIND) => 400,
+                _ => 500,
             },
             kind: kind.map(str::to_owned),
             message: "Prediction failed".to_string(),
@@ -4027,7 +4055,9 @@ mod tests {
     /// on the retry — is a plain failure of that item.
     #[test]
     fn only_a_first_worker_death_buys_an_item_a_second_attempt() {
-        use crate::inferio_client::{LOAD_COOLDOWN_KIND, WORKER_DIED_KIND};
+        use crate::inferio_client::{
+            LOAD_COOLDOWN_KIND, REQUEST_INCOMPLETE_KIND, WORKER_DIED_KIND,
+        };
 
         assert_eq!(
             classify_item_failure(&typed_failure(Some(WORKER_DIED_KIND)), false),
@@ -4038,6 +4068,18 @@ mod tests {
             InferenceRecovery::Fail,
             "the one-shot budget is per item, so a second death is a failure"
         );
+        // Run2 P2: a 400 that says the request body never arrived is not a
+        // verdict about the media, and it spends the same one-shot budget.
+        assert_eq!(
+            classify_item_failure(&typed_failure(Some(REQUEST_INCOMPLETE_KIND)), false),
+            InferenceRecovery::Requeue,
+            "a request the server never parsed was never attempted"
+        );
+        assert_eq!(
+            classify_item_failure(&typed_failure(Some(REQUEST_INCOMPLETE_KIND)), true),
+            InferenceRecovery::Fail,
+            "one retry per item, whichever way the request went unattempted"
+        );
         // An untyped failure is every pre-existing predict failure in the
         // world: it must behave exactly as it did before this change.
         assert_eq!(
@@ -4047,6 +4089,14 @@ mod tests {
         assert_eq!(
             classify_item_failure(&anyhow::anyhow!("connection reset"), false),
             InferenceRecovery::Fail
+        );
+        // The retry is bought by the kind, never by the status: an upstream
+        // that answers a plain 400 has told us nothing that makes asking
+        // again any different from asking the first time.
+        assert_eq!(
+            classify_item_failure(&untyped_bad_request(), false),
+            InferenceRecovery::Fail,
+            "an untyped 4xx is not evidence that the request went unattempted"
         );
 
         // The cooldown aborts whether or not the item has already been

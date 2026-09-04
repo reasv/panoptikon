@@ -49,13 +49,15 @@ use std::time::Duration;
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    body::Body,
+    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use http_body_util::BodyExt as _;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -97,6 +99,23 @@ pub(crate) const DESIRED_IN_FLIGHT_HEADER: &str = "x-panoptikon-desired-in-fligh
 /// to be able to *tell*. Matching on the human message would put a job's
 /// retry policy at the mercy of a log string, so the kind rides in the body.
 pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
+
+/// `detail.kind` of a predict whose **request body never arrived in full**,
+/// so the batch was never parsed and never reached a model.
+///
+/// It is the same assertion [`WORKER_DIED_KIND`] makes — the request's items
+/// are untouched, so re-submitting them is correct — for the one other way a
+/// predict can end without being attempted: the body stream failing under
+/// the handler. It is a *separate* token because the two are separate facts,
+/// and a log line that blames a worker for a broken request body sends the
+/// next reader to the wrong place.
+///
+/// The status stays 400: a request body that stops early is a malformed
+/// request, and that is what every intermediary in the path will call it.
+/// The kind is what lets the *caller* tell "your bytes were wrong" (retrying
+/// changes nothing) from "your bytes did not all get here" (retrying is the
+/// whole answer) — a distinction the status alone cannot carry.
+pub(crate) const REQUEST_INCOMPLETE_KIND: &str = "request_incomplete";
 
 /// Every rendering that means **this predict never reached a model**, so the
 /// request's items are untouched and re-submitting them is the correct answer.
@@ -631,6 +650,282 @@ struct CacheListResponse {
     cache: std::collections::BTreeMap<String, Vec<String>>,
 }
 
+/// The predict body, read to its end *before* it is parsed.
+///
+/// Two separate things depend on the whole body being collected first, and
+/// both of them are run2 defect P2:
+///
+/// * **The request stream has to reach its end.** A server that answers
+///   while the request body is still open must reset the stream
+///   (RFC 9113 §8.1), and hyper does. The client's terminal DATA frame then
+///   lands on a stream this end has already closed, which h2 reports as a
+///   STREAM_CLOSED *stream error* and counts against
+///   `max_local_error_resets` — a counter that only ever rises, for the
+///   whole life of the connection. At 1 024 of them h2 stops the connection
+///   with `GOAWAY(ENHANCE_YOUR_CALM, "too_many_internal_resets")`, and
+///   **every** request body still being read on it fails at once. multer
+///   stops at the closing boundary and never polls the frame after it, so
+///   the streamed parse this handler used left that reset behind on every
+///   predict, on the one connection the gateway's h2c self-call keeps for a
+///   whole job. Measured against this router over h2c with the real client:
+///   381 of 300 032 predicts failed their parse, every one of them with
+///   `hyper::Error(Body, GoAway(b"too_many_internal_resets",
+///   ENHANCE_YOUR_CALM, Library))` under axum's fixed sentence — the exact
+///   `400 invalid multipart body` run2 P2 reported. Collecting the body
+///   first is what makes the stream end normally; the same 300 032 then
+///   fail none.
+///
+/// * **A transport failure stops looking like a malformed body.** Streamed,
+///   "the connection broke under me" and "these bytes are not multipart"
+///   both arrive as `axum::extract::multipart::MultipartError`, whose
+///   `Display` is one fixed sentence with no cause attached — which is why
+///   P2 reached the operator as `400 invalid multipart body` and nothing
+///   else. Collected, the two are different code paths: a failed `collect`
+///   is the body not arriving ([`REQUEST_INCOMPLETE_KIND`], the caller
+///   re-submits), and anything multer says afterwards is genuinely about the
+///   bytes.
+///
+/// What it costs is one extra resident copy of the body: `predict` already
+/// copies every field into a `Vec` before the batch runs, and the collected
+/// bytes now stay alive beside those copies until the parse is done. That
+/// is the same order as the batch this surface is about to hold in memory
+/// anyway, and it is bounded by the caller exactly as the field copies
+/// already were — this router disables the body limit, because a predict
+/// batch is legitimately large.
+struct BufferedMultipart {
+    multipart: Multipart,
+    /// The collected body, kept so a failed parse can say *why* it failed.
+    /// Free to keep: multer holds slices of this same buffer.
+    body: axum::body::Bytes,
+    /// The boundary the request's `Content-Type` declared, when it declared
+    /// a usable one.
+    boundary: Option<String>,
+}
+
+/// Why a predict body could not be read as a batch. Typed and small so the
+/// *decision* (below) and the *rendering* (in `IntoResponse`) stay separate
+/// — and so the one distinction a caller acts on is made in one place.
+enum PredictBodyError {
+    /// Every byte arrived and they are not a valid batch. An ordinary 400:
+    /// asking again produces the same answer.
+    Malformed(String),
+    /// The bytes did not all arrive, so nothing was parsed and nothing was
+    /// attempted. See [`REQUEST_INCOMPLETE_KIND`].
+    Incomplete(String),
+    /// No `data` field. FastAPI answers a missing required Form field 422,
+    /// and so does this.
+    MissingData,
+}
+
+impl IntoResponse for PredictBodyError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Malformed(detail) => ApiError::bad_request(detail).into_response(),
+            Self::Incomplete(detail) => {
+                tracing::warn!(
+                    detail = %detail,
+                    "a predict request body did not arrive as a whole multipart body; \
+                     the items in it were never attempted"
+                );
+                structured_error(
+                    StatusCode::BAD_REQUEST,
+                    InferenceErrorFields {
+                        kind: REQUEST_INCOMPLETE_KIND.to_owned(),
+                        message: Some("Request body did not arrive in full".to_owned()),
+                        last_error: Some(clamp_detail(&detail)),
+                        ..Default::default()
+                    },
+                )
+            }
+            Self::MissingData => {
+                ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "Field required: data")
+                    .into_response()
+            }
+        }
+    }
+}
+
+impl<S> FromRequest<S> for BufferedMultipart
+where
+    S: Send + Sync,
+{
+    type Rejection = PredictBodyError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = req.into_parts();
+        let boundary = parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(multipart_boundary);
+        let bytes = match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(err) => {
+                // The body stream itself failed: nothing was parsed, so
+                // nothing was attempted.
+                return Err(PredictBodyError::Incomplete(format!(
+                    "the request body stream failed: {}",
+                    error_chain(&err)
+                )));
+            }
+        };
+        let request = Request::from_parts(parts, Body::from(bytes.clone()));
+        Multipart::from_request(request, state)
+            .await
+            .map(|multipart| Self {
+                multipart,
+                body: bytes,
+                boundary,
+            })
+            .map_err(|rejection| {
+                // No usable boundary in the content type. Nothing about the
+                // body can be judged without one, so it is the header that
+                // is wrong, and that is an ordinary bad request.
+                PredictBodyError::Malformed(format!(
+                    "invalid multipart body: {}",
+                    rejection.body_text()
+                ))
+            })
+    }
+}
+
+impl BufferedMultipart {
+    /// The `data` field and the file parts, by index — or why the body could
+    /// not be read as a batch.
+    ///
+    /// All three places a multipart parse can fail are here, in one piece,
+    /// because they all need the same two things: the cause underneath
+    /// axum's fixed sentence, and [`Self::classify`]'s verdict on whether
+    /// the body was wrong or merely incomplete.
+    async fn into_fields(
+        mut self,
+    ) -> Result<(String, Vec<(Option<i64>, Vec<u8>)>), PredictBodyError> {
+        let mut data: Option<String> = None;
+        let mut files: Vec<(Option<i64>, Vec<u8>)> = Vec::new();
+        loop {
+            let field = match self.multipart.next_field().await {
+                Ok(Some(field)) => field,
+                Ok(None) => break,
+                Err(err) => return Err(self.classify("invalid multipart body", &err)),
+            };
+            match field.name() {
+                Some("data") => {
+                    data = Some(match field.text().await {
+                        Ok(text) => text,
+                        Err(err) => return Err(self.classify("invalid data field", &err)),
+                    });
+                }
+                Some("files") => {
+                    // Python maps each file to its batch slot via the
+                    // filename, which must be an integer index
+                    // (utils.py:19-31).
+                    let index = field
+                        .file_name()
+                        .and_then(|name| name.trim().trim_matches('"').parse::<i64>().ok());
+                    let bytes = match field.bytes().await {
+                        Ok(bytes) => bytes,
+                        Err(err) => return Err(self.classify("invalid file field", &err)),
+                    };
+                    files.push((index, bytes.to_vec()));
+                }
+                // FastAPI ignores unknown form fields; so do we.
+                _ => {}
+            }
+        }
+        data.map(|data| (data, files))
+            .ok_or(PredictBodyError::MissingData)
+    }
+
+    /// A failed parse, split by the only distinction that changes what the
+    /// caller should do.
+    ///
+    /// The whole body is in hand, so the question is asked of the bytes
+    /// rather than inferred from a parser's error variant: **does what
+    /// arrived carry the closing delimiter of the boundary this request
+    /// declared?**
+    ///
+    /// * It does not → what arrived is not a whole `multipart/form-data`
+    ///   body for these headers. Either it stopped early or it is not the
+    ///   body they describe; either way the batch was never parsed and never
+    ///   reached a model, so its items are untouched and re-submitting them
+    ///   is the right answer ([`REQUEST_INCOMPLETE_KIND`]).
+    /// * It does → the delimiters are all here and something *inside* them
+    ///   is wrong. That is a bad request in the ordinary sense.
+    ///
+    /// Asked only after the parse has already rejected the body, so a valid
+    /// request is never held against it and the scan costs nothing in the
+    /// case that matters.
+    fn classify(
+        &self,
+        prose: &str,
+        err: &axum::extract::multipart::MultipartError,
+    ) -> PredictBodyError {
+        let cause = error_chain(err);
+        let whole = self
+            .boundary
+            .as_deref()
+            .is_none_or(|boundary| body_carries_closing_delimiter(&self.body, boundary));
+        if whole {
+            return PredictBodyError::Malformed(format!("{prose}: {cause}"));
+        }
+        PredictBodyError::Incomplete(format!(
+            "{prose}: {cause}; {} bytes arrived without the closing delimiter of boundary {}",
+            self.body.len(),
+            self.boundary.as_deref().unwrap_or("?"),
+        ))
+    }
+}
+
+/// The `boundary` parameter of the request's `Content-Type`.
+///
+/// Read through `mime`, because that is how the parser underneath reads it
+/// (multer 3.1 `parse_boundary`: parse the header as a `Mime`, take
+/// `get_param(BOUNDARY).as_str()`). The verdict below turns on whether the
+/// body carries *this* boundary's closing delimiter, so it has to be the
+/// same string multer parsed with; a second, hand-rolled reading of the
+/// header would eventually disagree with it about some header neither of us
+/// thought about, and disagreeing here means answering the wrong thing.
+///
+/// `None` when the header carries none — a different failure, and one
+/// axum's own extractor rejects before this file sees it.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    let content_type = content_type.parse::<mime_guess::mime::Mime>().ok()?;
+    let boundary = content_type
+        .get_param(mime_guess::mime::BOUNDARY)?
+        .as_str()
+        .to_owned();
+    (!boundary.is_empty()).then_some(boundary)
+}
+
+/// Whether `body` contains `--<boundary>--`, the delimiter that ends a
+/// `multipart/form-data` body (RFC 2046 §5.1.1). Searched rather than
+/// required at the end, because an epilogue after it is legal.
+fn body_carries_closing_delimiter(body: &[u8], boundary: &str) -> bool {
+    let needle = format!("--{boundary}--").into_bytes();
+    if body.len() < needle.len() {
+        return false;
+    }
+    body.windows(needle.len()).any(|window| window == needle)
+}
+
+/// An error rendered with everything under it. The one-line `Display` of
+/// `MultipartError` (and of a body error) names the layer, never the cause,
+/// so the cause has to be walked out of the source chain by hand — without
+/// this, a parse failure is a sentence that fits every parse failure.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !rendered.ends_with(&text) {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+        }
+        source = cause.source();
+    }
+    rendered
+}
+
 /// `POST /predict/{group}/{inference_id}` — router.py `predict`.
 /// Parses the multipart request, auto-loads the model (pinned for the
 /// duration, TTL restored afterwards — the manager owns those semantics),
@@ -669,7 +964,11 @@ struct CacheListResponse {
                  older server, or a model that has not dispatched a window \
                  yet) and the caller keeps its own floor.")
         )),
-        (status = 400, description = "Malformed multipart body or inputs", body = crate::api_error::ErrorBody),
+        (status = 400, description = "Malformed multipart body or inputs. `detail` is a \
+            plain string when the bytes themselves are wrong, and an object carrying \
+            `kind = \"request_incomplete\"` when the request body did not arrive in full — \
+            that one says the batch was never parsed and never reached a model, so its \
+            items are untouched and re-submitting them is correct.", body = InferenceErrorBody),
         (status = 422, description = "Missing required `data` form field", body = crate::api_error::ErrorBody),
         (status = 500, description = "Model load or prediction failure. `detail` is a \
             plain string for an ordinary failure and an object carrying a machine-readable \
@@ -682,42 +981,12 @@ async fn predict(
     State(state): State<Arc<InferioState>>,
     Path((group, inference_id)): Path<(String, String)>,
     Query(params): Query<PredictParams>,
-    mut multipart: Multipart,
+    body: BufferedMultipart,
 ) -> Result<Response, ApiError> {
-    let mut data: Option<String> = None;
-    let mut files: Vec<(Option<i64>, Vec<u8>)> = Vec::new();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| ApiError::bad_request(format!("invalid multipart body: {err}")))?
-    {
-        match field.name() {
-            Some("data") => {
-                data =
-                    Some(field.text().await.map_err(|err| {
-                        ApiError::bad_request(format!("invalid data field: {err}"))
-                    })?);
-            }
-            Some("files") => {
-                // Python maps each file to its batch slot via the filename,
-                // which must be an integer index (utils.py:19-31).
-                let index = field
-                    .file_name()
-                    .and_then(|name| name.trim().trim_matches('"').parse::<i64>().ok());
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|err| ApiError::bad_request(format!("invalid file field: {err}")))?;
-                files.push((index, bytes.to_vec()));
-            }
-            // FastAPI ignores unknown form fields; so do we.
-            _ => {}
-        }
-    }
-    let data = data.ok_or_else(|| {
-        // FastAPI answers a missing required Form field with 422.
-        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "Field required: data")
-    })?;
+    let (data, files) = match body.into_fields().await {
+        Ok(fields) => fields,
+        Err(failure) => return Ok(failure.into_response()),
+    };
     let inputs = parse_input_request(&data, files)?;
 
     let full_id = format!("{group}/{inference_id}");
@@ -2399,8 +2668,13 @@ config.impl_class = "echo_test"
     /// warn-not-fail posture and the lazy degradation already used for
     /// broken registry TOML. Cargo runs this with CWD = the panoptikon crate,
     /// where `python/inferio/config` does not exist.
-    #[tokio::test]
-    async fn from_settings_degrades_when_builtin_config_dir_is_missing() {
+    /// Settings whose registry resolves to nothing: `python/inferio/config`
+    /// does not exist relative to the crate CWD cargo runs tests in, so
+    /// `InferioState::from_settings` takes its degraded path and the state
+    /// it builds serves an empty registry. Cheap, and it never spawns a
+    /// worker — which is what makes it usable by tests that only care about
+    /// what the HTTP layer does before the manager is reached.
+    fn registryless_settings() -> crate::config::Settings {
         use crate::config::{InferenceLocalConfig, Settings, UpstreamConfig, UpstreamsConfig};
 
         // Force the default-dirs error path deterministically: no
@@ -2410,7 +2684,7 @@ config.impl_class = "echo_test"
             "test premise: the built-in config dir is absent from the crate CWD"
         );
 
-        let settings = Settings {
+        Settings {
             server: crate::config::ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0,
@@ -2450,8 +2724,12 @@ config.impl_class = "echo_test"
                 enabled: true,
                 ..Default::default()
             },
-        };
+        }
+    }
 
+    #[tokio::test]
+    async fn from_settings_degrades_when_builtin_config_dir_is_missing() {
+        let settings = registryless_settings();
         let state = InferioState::from_settings(&settings)
             .expect("missing built-in config dir degrades instead of failing boot");
         // The degraded registry is empty but serviceable: /metadata-style
@@ -2540,6 +2818,330 @@ metadata.cost.unit = "none"
                 .get("calibration")
                 .is_none(),
             "a none-class model is never priced, so it is never calibrated"
+        );
+        state.manager.shutdown().await;
+    }
+
+    // ------------------------------------------------------------------
+    // P2 (run2 Phase A): the predict handler must read the request body to
+    // its end.
+    // ------------------------------------------------------------------
+
+    /// The root cause of P2, pinned on the one property that fixes it.
+    ///
+    /// A server that answers while the request body is still open has to
+    /// reset the stream (RFC 9113 §8.1), and hyper does. The client's
+    /// terminal DATA frame then arrives on a stream this end has closed,
+    /// which h2 counts as a local error reset; 1 024 of those on one
+    /// connection and it answers `GOAWAY(ENHANCE_YOUR_CALM,
+    /// "too_many_internal_resets")`, failing every request in flight. multer
+    /// stops at the closing boundary and never polls what follows it, so the
+    /// streamed parse this handler used left exactly that reset behind on
+    /// every predict.
+    ///
+    /// Asserted at the body rather than at the transport, so it is
+    /// deterministic and needs no socket: the body reports when it is polled
+    /// past its last chunk, and the request goes through the real router and
+    /// the real handler. The bytes and the chunking are reqwest's — the
+    /// closing boundary is its own chunk, and the end of the stream is a
+    /// separate poll — because that is the client this surface is called by.
+    /// The boundary the probe body below uses.
+    const PROBE_BOUNDARY: &str = "0123456789abcdef-0123456789abcdef";
+
+    /// A well-formed predict body, chunked the way reqwest chunks one — the
+    /// closing boundary is its own chunk and the end of the stream is a
+    /// further poll — that reports whether it was read to its end.
+    fn probe_body_after(tail_delay: Duration) -> (Body, Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::Ordering;
+
+        const BOUNDARY: &str = PROBE_BOUNDARY;
+        let mut head = Vec::new();
+        head.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        head.extend_from_slice(b"Content-Disposition: form-data; name=\"data\"\r\n\r\n");
+        head.extend_from_slice(br#"{"inputs":[null]}"#);
+        head.extend_from_slice(b"\r\n");
+        head.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        head.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"files\"; filename=\"0\"\r\n\
+              Content-Type: application/octet-stream\r\n\r\n",
+        );
+        head.extend_from_slice(&vec![b'x'; 4096]);
+        head.extend_from_slice(b"\r\n");
+        let closing = format!("--{BOUNDARY}--\r\n").into_bytes();
+
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let chunks = vec![
+            axum::body::Bytes::from(head),
+            axum::body::Bytes::from(closing),
+        ];
+        let stream = futures_util::stream::unfold(
+            (chunks.into_iter(), Arc::clone(&drained)),
+            move |(mut chunks, drained)| async move {
+                match chunks.next() {
+                    Some(chunk) => Some((
+                        Ok::<axum::body::Bytes, std::io::Error>(chunk),
+                        (chunks, drained),
+                    )),
+                    None => {
+                        // Polled past the last chunk: the only way to see
+                        // this is to read the body to its end. The delay
+                        // models the terminal DATA frame arriving after the
+                        // bytes — which is how a real h2 client sends one.
+                        tokio::time::sleep(tail_delay).await;
+                        drained.store(true, Ordering::SeqCst);
+                        None
+                    }
+                }
+            },
+        );
+
+        (Body::from_stream(stream), drained)
+    }
+
+    #[tokio::test]
+    async fn a_predict_reads_the_request_body_to_its_end() {
+        use std::sync::atomic::Ordering;
+        use tower::ServiceExt as _;
+
+        // The "before": the streamed parse this handler used to do, on the
+        // same body. multer answers `None` at the closing boundary and never
+        // polls what follows it, so the request stream never ends — which is
+        // the reset hyper then has to send.
+        let (body, streamed_drain) = probe_body_after(Duration::from_millis(200));
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={PROBE_BOUNDARY}"),
+            )
+            .body(body)
+            .unwrap();
+        let mut streamed = Multipart::from_request(request, &())
+            .await
+            .expect("the boundary parses");
+        let streamed_parse = async {
+            while let Some(field) = streamed.next_field().await.expect("the body parses") {
+                let _ = field.bytes().await.expect("the field reads");
+            }
+        };
+        let finished_early = tokio::time::timeout(Duration::from_millis(20), streamed_parse)
+            .await
+            .is_ok();
+        assert!(
+            finished_early && !streamed_drain.load(Ordering::SeqCst),
+            "test premise: a streamed multipart parse answers at the closing \
+             boundary and never waits for the end of the request stream"
+        );
+
+        // The "after": the shipped handler, on an identical body.
+        let (body, drained) = probe_body_after(Duration::from_millis(200));
+        let settings = registryless_settings();
+        let state = InferioState::from_settings(&settings).expect("state builds");
+        let request = axum::http::Request::builder()
+            .method("POST")
+            // A model the empty registry does not have: the handler fails
+            // after the body, which is all this test is about, and nothing
+            // spawns.
+            .uri("/predict/nope/model?cache_key=k&lru_size=1&ttl_seconds=-1")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={PROBE_BOUNDARY}"),
+            )
+            .body(body)
+            .unwrap();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+
+        assert!(
+            drained.load(Ordering::SeqCst),
+            "the handler answered without reading the request body to its end, \
+             which makes hyper reset the h2 stream on every predict (run2 P2)"
+        );
+        // And the body it read parsed: the failure that is left is the
+        // missing model, not the multipart.
+        let (content_type, body) = split_response(response).await;
+        assert!(content_type.contains("application/json"), "{content_type}");
+        let detail = String::from_utf8_lossy(&body);
+        assert!(
+            !detail.contains("invalid multipart body"),
+            "a well-formed body must not be reported as a malformed one: {detail}"
+        );
+        state.manager.shutdown().await;
+    }
+
+    /// The other half of P2: what the handler *says* when a multipart parse
+    /// fails. axum renders every cause of a `MultipartError` as the same
+    /// sentence, so the run2 log line ("invalid multipart body: Error parsing
+    /// `multipart/form-data` request") named the layer and nothing else. The
+    /// detail must carry the cause out of the source chain, or the next one
+    /// is as undiagnosable as this one was.
+    ///
+    /// This body also stops before its closing delimiter, so it is the
+    /// *incomplete* half of the split as well: the caller is told the batch
+    /// was never parsed, and re-submits it.
+    #[tokio::test]
+    async fn a_malformed_predict_body_names_its_cause() {
+        use tower::ServiceExt as _;
+
+        let settings = registryless_settings();
+        let state = InferioState::from_settings(&settings).expect("state builds");
+        // A body that stops in the middle of a part: well-formed prefix,
+        // no closing boundary.
+        let truncated = "--BOUNDARY\r\nContent-Disposition: form-data; name=\"data\"\r\n\r\n{";
+        // (the `data` field never terminates, so the failure is multer's
+        // IncompleteFieldData — reached through `Field::text`, which is one
+        // of the three places the handler renders a parse failure)
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/predict/nope/model?cache_key=k&lru_size=1&ttl_seconds=-1")
+            .header(
+                header::CONTENT_TYPE,
+                "multipart/form-data; boundary=BOUNDARY",
+            )
+            .body(Body::from(truncated))
+            .unwrap();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let (_content_type, body) = split_response(response).await;
+        let detail = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            detail.contains("invalid data field"),
+            "the prose the operator already knows: {detail}"
+        );
+        assert!(
+            detail.contains("incomplete data"),
+            "and the cause underneath it, which is the half P2 was missing: {detail}"
+        );
+        // Nothing was parsed and nothing was attempted, and the caller is
+        // told so in the one field it can act on.
+        let failure = crate::inferio_client::InferenceFailure::parse(
+            reqwest::StatusCode::BAD_REQUEST,
+            None,
+            &detail,
+        );
+        assert!(
+            failure.is_request_incomplete() && failure.is_unattempted(),
+            "a body that stops before its closing delimiter is an unattempted \
+             request, not a verdict on the media: {detail}"
+        );
+        state.manager.shutdown().await;
+    }
+
+    /// The split above is only as good as the boundary it reads out of the
+    /// header — and, more than that, it has to be the boundary *multer*
+    /// read, or the verdict is about a body nobody sent. So the shapes here
+    /// are asserted against `multer::parse_boundary`'s own answer as well as
+    /// against the expected string.
+    #[test]
+    fn the_declared_boundary_is_the_one_the_parser_used() {
+        fn multer_boundary(content_type: &str) -> Option<String> {
+            // multer 3.1 `parse_boundary`, inlined: it is not re-exported by
+            // axum, and the point is to reproduce it exactly.
+            let mime = content_type.parse::<mime_guess::mime::Mime>().ok()?;
+            if mime.type_() != mime_guess::mime::MULTIPART
+                || mime.subtype() != mime_guess::mime::FORM_DATA
+            {
+                return None;
+            }
+            Some(
+                mime.get_param(mime_guess::mime::BOUNDARY)?
+                    .as_str()
+                    .to_owned(),
+            )
+        }
+
+        for (content_type, expected) in [
+            ("multipart/form-data; boundary=abc-123", Some("abc-123")),
+            // The parameter name is case-insensitive; the value is not.
+            ("multipart/form-data; BOUNDARY=abc-123", Some("abc-123")),
+            // `=` is not a token character, so an unquoted value carrying
+            // one is not a parameter at all — to `mime`, to multer, and so
+            // to this.
+            ("multipart/form-data; boundary=a=b", None),
+            // A quoted boundary — the only way to send one containing a
+            // space — arrives unquoted, which is the form multer then looks
+            // for in the body.
+            ("multipart/form-data; boundary=\"a b\"", Some("a b")),
+            // `mime` rejects whitespace around the `=`, so multer sees no
+            // multipart at all and neither does this.
+            ("multipart/form-data ; boundary = abc", None),
+            ("multipart/form-data", None),
+            ("multipart/form-data; boundary=", None),
+        ] {
+            assert_eq!(
+                multipart_boundary(content_type),
+                expected.map(str::to_owned),
+                "boundary of {content_type:?}"
+            );
+            assert_eq!(
+                multipart_boundary(content_type),
+                multer_boundary(content_type).filter(|value| !value.is_empty()),
+                "this file and the parser must read {content_type:?} the same way"
+            );
+        }
+        // And what it finds is what the closing delimiter is looked for
+        // with, epilogue or no epilogue.
+        assert!(body_carries_closing_delimiter(
+            b"--abc\r\nx\r\n--abc--\r\nepilogue",
+            "abc"
+        ));
+        assert!(!body_carries_closing_delimiter(
+            b"--abc\r\nx\r\n--abc\r\n",
+            "abc"
+        ));
+        assert!(!body_carries_closing_delimiter(b"", "abc"));
+    }
+
+    /// The other side of the same split, and the reason it is asked of the
+    /// bytes rather than of the parser's error variant: a body that carries
+    /// the closing delimiter of the boundary it declared *did* all arrive,
+    /// so whatever is wrong is wrong inside it. Asking again would produce
+    /// the same answer, and the caller must not be told to re-submit.
+    #[tokio::test]
+    async fn a_complete_but_invalid_predict_body_is_an_ordinary_bad_request() {
+        use tower::ServiceExt as _;
+
+        let settings = registryless_settings();
+        let state = InferioState::from_settings(&settings).expect("state builds");
+        // Whole body, closing delimiter and all — but the part's headers are
+        // not headers, so multer rejects what is unambiguously all here.
+        let complete = "--BOUNDARY\r\n\u{1}not a header\r\n\r\nx\r\n--BOUNDARY--\r\n";
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/predict/nope/model?cache_key=k&lru_size=1&ttl_seconds=-1")
+            .header(
+                header::CONTENT_TYPE,
+                "multipart/form-data; boundary=BOUNDARY",
+            )
+            .body(Body::from(complete))
+            .unwrap();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let (_content_type, body) = split_response(response).await;
+        let detail = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            detail.contains("invalid multipart body"),
+            "the prose the operator already knows: {detail}"
+        );
+        let failure = crate::inferio_client::InferenceFailure::parse(
+            reqwest::StatusCode::BAD_REQUEST,
+            None,
+            &detail,
+        );
+        assert!(
+            !failure.is_unattempted(),
+            "a whole body that is not a multipart is a bad request, and \
+             re-submitting it would only fail again: {detail}"
         );
         state.manager.shutdown().await;
     }

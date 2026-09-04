@@ -104,6 +104,15 @@ pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
 /// time.
 pub(crate) const LOAD_COOLDOWN_KIND: &str = "load_cooldown";
 
+/// `detail.kind` of a predict the server never parsed because its **request
+/// body did not arrive in full** (`inferio::http::REQUEST_INCOMPLETE_KIND`).
+///
+/// It rides on a 400, and it is the one 400 that must not be read as a
+/// verdict: the status is right about the request and says nothing about the
+/// items, which were never handed to a model. Run2 defect P2 was one of
+/// these, recorded against an image that is perfectly fine.
+pub(crate) const REQUEST_INCOMPLETE_KIND: &str = "request_incomplete";
+
 /// A request the inference server refused, with the machine-readable half of
 /// its `{"detail": …}` body parsed out.
 ///
@@ -189,6 +198,29 @@ impl InferenceFailure {
     /// The worker process died with the request in flight.
     pub fn is_worker_death(&self) -> bool {
         self.kind.as_deref() == Some(WORKER_DIED_KIND)
+    }
+
+    /// The request body never arrived in full, so the server never parsed
+    /// the batch.
+    pub fn is_request_incomplete(&self) -> bool {
+        self.kind.as_deref() == Some(REQUEST_INCOMPLETE_KIND)
+    }
+
+    /// **The request's items were never attempted.** The two kinds that say
+    /// so are different accidents — a worker that died holding the request,
+    /// and a request body that stopped arriving — but they are one fact for
+    /// every caller: nothing was run, nothing was decided about the media,
+    /// and re-submitting the work is the only answer that is not a lie about
+    /// it. Callers act on this rather than on either kind so that a third
+    /// way to never reach a model is one constant away from being handled.
+    ///
+    /// Deliberately keyed on the typed kind and never on the status. An
+    /// untyped 4xx is not evidence of anything — a stock FastAPI upstream
+    /// answers 400 for a genuinely bad request too — and retrying every one
+    /// of them would double the request cost of any systematic client bug
+    /// while fixing nothing.
+    pub fn is_unattempted(&self) -> bool {
+        self.is_worker_death() || self.is_request_incomplete()
     }
 
     /// The model is inside its per-model load-failure cooldown.

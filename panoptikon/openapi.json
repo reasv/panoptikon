@@ -1631,11 +1631,11 @@
             }
           },
           "400": {
-            "description": "Malformed multipart body or inputs",
+            "description": "Malformed multipart body or inputs. `detail` is a plain string when the bytes themselves are wrong, and an object carrying `kind = \"request_incomplete\"` when the request body did not arrive in full — that one says the batch was never parsed and never reached a model, so its items are untouched and re-submitting them is correct.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
+                  "$ref": "#/components/schemas/InferenceErrorBody"
                 }
               }
             }
