@@ -405,8 +405,9 @@ class Context:
             self._pid_first_seen = first
         return self._pid_first_seen
 
-    def replica_spawn_t(self, model: str, admitted_t: float) -> Optional[float]:
-        """When the worker process behind this replica was forked, if known.
+    def replica_spawn(self, model: str,
+                      admitted_t: float) -> Optional[Dict[str, Any]]:
+        """The spawn record of the worker process behind this replica, if known.
 
         The latest `spawned an inferio worker` line that `_worker_spawns` could
         tie to this model and that precedes the admission. `None` when the log
@@ -414,25 +415,43 @@ class Context:
         recording made before `c8d64a5a` added the line (run1 has it in 9 of
         its 61 legs) and for one logged below `panoptikon::inferio=debug`. The
         caller must then say so rather than pretend the cross-check ran.
+
+        The record carries both `t_wall` and `pid`. Since run2 the line states
+        the inference id in the same event as the pid, so for those recordings
+        the pid *is* the answer to "which process is this replica" and no
+        heuristic is needed; see `attribute_replica_pid`.
         """
-        best: Optional[float] = None
+        best: Optional[Dict[str, Any]] = None
         for spawn in self.worker_spawns:
             if spawn["model"] != model or spawn["t_wall"] > admitted_t:
                 continue
-            if best is None or spawn["t_wall"] > best:
-                best = spawn["t_wall"]
+            if best is None or spawn["t_wall"] > best["t_wall"]:
+                best = spawn
         return best
 
+    def replica_spawn_t(self, model: str, admitted_t: float) -> Optional[float]:
+        """`replica_spawn`'s timestamp alone."""
+        spawn = self.replica_spawn(model, admitted_t)
+        return None if spawn is None else spawn["t_wall"]
+
     def attribute_replica_pid(
-        self, pids: List[int], admitted_t: float, spawn_t: Optional[float]
+        self, pids: List[int], admitted_t: float, spawn_t: Optional[float],
+        spawn_pid: Optional[int] = None,
     ) -> Tuple[Optional[int], Optional[str]]:
         """Which of our PIDs on the board is the replica that was just admitted.
 
-        The freshest one. A replica is admitted the instant *its own* worker
-        finishes loading, so among our processes already holding memory at that
-        moment, the one the oracle sighted last is the one that just came up;
-        every older PID is a resident that was already there. The one hard
-        constraint is the spawn line, when the log carries it: a PID first
+        **The pid the log states, when it states one.** A run2 spawn line
+        carries `inference_id=` and `pid=` as two fields of one event, so
+        `_worker_spawns` can name this replica's process outright; there is
+        nothing to infer and nothing that can be wrong about it. It is taken
+        as soon as the oracle has sighted that pid anywhere, whether or not
+        the pid is in the anchor sample's roster.
+
+        Otherwise the freshest one. A replica is admitted the instant *its own*
+        worker finishes loading, so among our processes already holding memory
+        at that moment, the one the oracle sighted last is the one that just
+        came up; every older PID is a resident that was already there. The one
+        hard constraint is the spawn line, when the log carries it: a PID first
         sighted *before* this replica's worker was forked cannot be that
         worker -- run1/S9's 346.7% FAIL was an older worker being the only PID
         the recording could see.
@@ -443,11 +462,20 @@ class Context:
         own PID is routinely first seen in the sample *after* the admission
         (14 of run1's legs). With one PID on the board that costs nothing --
         it is the only thing it can be. With several it is genuinely
-        ambiguous, and the row is declined rather than guessed.
+        ambiguous, and the row is declined rather than guessed. That last case
+        is what the stated pid closes: run2's S2-base loaded four models onto
+        one board 7 s apart, and MiniLM's own worker was first sighted 5 ms
+        *after* its admission, so the freshest resident pid was the MobileCLIP
+        worker and the row compared MiniLM's 654 MiB `base_mb` against
+        MobileCLIP's 732 MiB process (10.66%, a FAIL that was pure
+        attribution).
 
         Returns `(pid, None)`, or `(None, why)`.
         """
         first = self.pid_first_seen()
+        if spawn_pid is not None and (spawn_pid in pids
+                                      or first.get(spawn_pid) is not None):
+            return spawn_pid, None
         floor_t = None if spawn_t is None else spawn_t - SPAWN_CLOCK_SLACK_S
         candidates = [(first[pid], pid) for pid in pids
                       if first.get(pid) is not None
@@ -872,23 +900,31 @@ def check_base_accuracy(ctx: Context) -> Verdict:
         # is invisible to `our_pids_mb`, and then some *other*, older worker is
         # the only PID left standing and gets waved through -- run1/S9 measured
         # nemotron's `base_mb` against the MiniLM worker's process and reported
-        # 346.7%. `attribute_replica_pid` takes the freshest sighting inside
-        # [spawn, admission] instead, so a board carrying several of our
-        # workers is resolved rather than declined, and a board carrying none
-        # that fits the replica is declined rather than guessed.
-        spawn_t = ctx.replica_spawn_t(model, info["t_wall"])
-        pid, why = ctx.attribute_replica_pid(pids, info["t_wall"], spawn_t)
+        # 346.7%. `attribute_replica_pid` takes the pid the run2 spawn line
+        # states for this inference id, and failing that the freshest sighting
+        # inside [spawn, admission], so a board carrying several of our workers
+        # is resolved rather than declined, and a board carrying none that fits
+        # the replica is declined rather than guessed.
+        spawn = ctx.replica_spawn(model, info["t_wall"])
+        spawn_t = None if spawn is None else spawn["t_wall"]
+        spawn_pid = None if spawn is None else spawn["pid"]
+        pid, why = ctx.attribute_replica_pid(pids, info["t_wall"], spawn_t,
+                                             spawn_pid)
         if pid is None:
             rows.append({"model": model, "gpu": uuid, **info, "pids": pids,
                          "oracle_sum_mb": ours, "note": why})
             continue
-        spawn_check = ("pid is at or after the replica's spawn line"
-                       if spawn_t is not None else
-                       "no spawn line for this model in the log (the gateway "
-                       "predates the line, or it is below "
-                       "panoptikon::inferio=debug): the PID is the freshest "
-                       "sighting at the admission, not cross-checked against "
-                       "a spawn")
+        if spawn_pid is not None and pid == spawn_pid:
+            spawn_check = ("pid is the one the spawn line names for this "
+                           "inference id")
+        elif spawn_t is not None:
+            spawn_check = "pid is at or after the replica's spawn line"
+        else:
+            spawn_check = ("no spawn line for this model in the log (the "
+                           "gateway predates the line, or it is below "
+                           "panoptikon::inferio=debug): the PID is the "
+                           "freshest sighting at the admission, not "
+                           "cross-checked against a spawn")
         # The window in which the process holds its base and nothing else:
         # from the load `ok` (the admission line is 0.2 ms later) to the
         # replica's first grant or predict -- or, if it never works, to the
