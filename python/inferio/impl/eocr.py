@@ -11,6 +11,8 @@ from inferio.impl.utils import (
     clear_cache,
     decode_image_inputs,
     get_device,
+    looks_like_index_limit,
+    note_index_limit_event,
     run_with_oom_retry,
 )
 from inferio.model import InferenceModel
@@ -32,6 +34,61 @@ DETECTOR_CANVAS_SIZE = 2560
 # dropped. The batched path applies it here rather than inside `detect`, so
 # that it keeps meaning raw pixels once detection has moved onto the canvas.
 DEFAULT_MIN_SIZE = 20
+
+# easyOCR's own `mag_ratio` default (`easyocr.Reader.readtext`). It is the
+# one detect parameter besides `canvas_size` that moves the detector's tensor
+# dimensions, so the ceiling arithmetic below has to read it.
+DEFAULT_MAG_RATIO = 1.0
+
+# `easyocr.imgproc.resize_aspect_ratio` pads each side of the detector's
+# input up to the next multiple of this (`imgproc.py:54-61`).
+DETECTOR_SIZE_MULTIPLE = 32
+
+# ---------------------------------------------------------------------------
+# The detector's hard batch ceiling
+# ---------------------------------------------------------------------------
+#
+# CRAFT's batch dies of an **index**, not of memory, well before the board
+# fills: at batch 29 of 2560-bounded A4 pages `torch.max_pool2d` inside the
+# VGG backbone raises `RuntimeError: integer out of range`, with 3 GiB of a
+# 96 GiB board still free (run2 `run2-probes-report.md`, S1).
+#
+# The cause, and therefore the formula:
+#
+# * `at::native::safe_downcast<int32_t, int64_t>` (`ATen/native/Pool.h:49-57`,
+#   whose `TORCH_CHECK` message *is* "integer out of range") is applied by
+#   CUDA's `max_pool2d_with_indices` forward to its **output element count**,
+#   because the kernel is launched over that count as a signed 32-bit int.
+#   The ceiling is therefore `2**31 - 1` **elements of one pooling output**,
+#   not bytes, and no amount of free memory moves it.
+# * The binding pool is the **first** one in `vgg16_bn`
+#   (`torchvision.models.vgg16_bn().features[6]`, inside easyOCR's
+#   `vgg16_bn.slice1 = features[0:12]`, `easyocr/model/modules.py:38-39`,
+#   which is where run2's traceback lands). It is `MaxPool2d(2, 2)` over the
+#   64-channel block, so its output is `B x 64 x H//2 x W//2` for a detector
+#   input of `B x 3 x H x W`. Every later pool halves the resolution again
+#   while only doubling the channels, so each one is at most half the size of
+#   this one: 64·(H/2)·(W/2) > 128·(H/4)·(W/4) > 256·(H/8)·(W/8) > …. The
+#   3-channel input tensor itself is 21x smaller again and never binds.
+# * Convolutions do not share the ceiling — cuDNN indexes them in 64 bits or
+#   splits the launch — which is why the measured boundary is the pool's and
+#   not the 64-channel conv output's one item earlier.
+#
+# So, with `H`, `W` the padded (multiple-of-32) dimensions of the detector's
+# input tensor:
+#
+#     per_item_elements = 64 * (H // 2) * (W // 2)     ( = 16*H*W, H,W even)
+#     max_batch         = (2**31 - 1) // per_item_elements
+#
+# At run2's measured shape — `scan-2480x3508` fitted to the 2560 canvas is
+# 1809x2560, padded to 1824x2560 — that is 64·912·1280 = 74 711 040 elements
+# per item and `2147483647 // 74711040 = 28`: exactly the 28-ok/29-fail
+# boundary the probes found. A square 2560x2560 page gives 20, and a
+# 1240x1754 page (below the canvas, padded to 1248x1760) gives 61 — smaller
+# pages really do allow more, which is why the cap is computed per batch from
+# that batch's own padded dimensions and never fixed at a constant.
+KERNEL_INDEX_ELEMENT_LIMIT = 2**31 - 1
+DETECTOR_POOL_CHANNELS = 64
 
 # The per-request parameters this impl forwards, split by the easyOCR call
 # each one belongs to. `readtext`/`readtext_batched` take the union and route
@@ -69,6 +126,114 @@ def _positive_int(value) -> int | None:
     return number if number > 0 else None
 
 
+def _shape_as_height_width(shape) -> tuple[int, int] | None:
+    """A harness `(width, height)` pair as `(height, width)`, or None.
+
+    Defensive by design: the value crosses a process boundary as an image
+    header reading, so anything that is not a usable pair of positive
+    integers is "unknown", never a guess.
+    """
+    if shape is None:
+        return None
+    try:
+        width, height = int(shape[0]), int(shape[1])
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return height, width
+
+
+def ceil_to_multiple(value: int, multiple: int = DETECTOR_SIZE_MULTIPLE) -> int:
+    """`value` rounded up to a multiple of `multiple`, as easyOCR pads."""
+    remainder = value % multiple
+    return value if remainder == 0 else value + (multiple - remainder)
+
+
+def bounded_dims(
+    shape: tuple[int, int], canvas_size: int = DETECTOR_CANVAS_SIZE
+) -> tuple[int, int]:
+    """[`fit_to_canvas`]'s output dimensions for `(height, width)`.
+
+    The arithmetic only — no pixels are touched — so the packing harness can
+    ask what a batch *would* build before anything is decoded.
+    """
+    height, width = int(shape[0]), int(shape[1])
+    longest = max(height, width)
+    if longest <= 0 or longest <= canvas_size:
+        return max(1, height), max(1, width)
+    ratio = canvas_size / longest
+    return max(1, int(height * ratio)), max(1, int(width * ratio))
+
+
+def detector_tensor_dims(
+    shapes: Sequence[tuple[int, int] | None],
+    canvas_size: int = DETECTOR_CANVAS_SIZE,
+    mag_ratio: float = DEFAULT_MAG_RATIO,
+) -> tuple[int, int] | None:
+    """`(height, width)` of the CRAFT input tensor a batch of these builds.
+
+    Three steps, in the order this impl and easyOCR perform them:
+
+    1. [`fit_to_canvas`] bounds each raw shape ([`bounded_dims`]);
+    2. [`pad_images_to_same_size`] takes the element-wise maximum, so the
+       batch is one array at the largest bounded height by the largest
+       bounded width — which can come from two different members;
+    3. `easyocr.imgproc.resize_aspect_ratio` (`imgproc.py:37-61`) rescales
+       that array so its longer side is `min(mag_ratio * longest,
+       canvas_size)` and pads each side up to the next multiple of 32.
+
+    Step 3 is the identity at the shipped `mag_ratio = 1` (step 1 already put
+    the array at or under the canvas), but a caller *may* pass a larger one,
+    which magnifies up to — never past — the canvas. Returns None when no
+    shape is known.
+    """
+    dims = [bounded_dims(shape, canvas_size) for shape in shapes if shape]
+    if not dims:
+        return None
+    height = max(dim[0] for dim in dims)
+    width = max(dim[1] for dim in dims)
+    longest = max(height, width)
+    if longest <= 0:
+        return None
+    target = min((mag_ratio or DEFAULT_MAG_RATIO) * longest, canvas_size)
+    ratio = target / longest
+    return (
+        ceil_to_multiple(max(1, int(height * ratio))),
+        ceil_to_multiple(max(1, int(width * ratio))),
+    )
+
+
+def detector_pool_elements(height: int, width: int) -> int:
+    """Elements of the binding pooling output for one item of a `H x W` batch.
+
+    `64 x H//2 x W//2` — the output of `vgg16_bn.features[6]`, the first and
+    largest of CRAFT's pools. See the module header for why this one binds.
+    """
+    return DETECTOR_POOL_CHANNELS * (height // 2) * (width // 2)
+
+
+def max_detector_batch(
+    shapes: Sequence[tuple[int, int] | None],
+    canvas_size: int = DETECTOR_CANVAS_SIZE,
+    mag_ratio: float = DEFAULT_MAG_RATIO,
+) -> int | None:
+    """Largest batch of these shapes CRAFT's pooling kernel can index.
+
+    `(2**31 - 1) // per_item_elements`, from the module header's derivation.
+    Never below 1: a single item over the ceiling has no smaller batch to
+    fall back to, and saying so is the caller's per-image fallback's job, not
+    this function's. None when no shape is known.
+    """
+    dims = detector_tensor_dims(shapes, canvas_size, mag_ratio)
+    if dims is None:
+        return None
+    per_item = detector_pool_elements(*dims)
+    if per_item <= 0:  # pragma: no cover - defensive
+        return None
+    return max(1, KERNEL_INDEX_ELEMENT_LIMIT // per_item)
+
+
 class EasyOCRModel(InferenceModel):
     def __init__(
         self,
@@ -86,8 +251,10 @@ class EasyOCRModel(InferenceModel):
         canvas_size: int = DETECTOR_CANVAS_SIZE,
     ):
         self.canvas_size = _positive_int(canvas_size) or DETECTOR_CANVAS_SIZE
-        # The two attributes the worker's packing harness reads off a loaded
-        # impl (docs/inferio-worker-protocol.md, "Memory grants"):
+        # Two of the three things the worker's packing harness reads off a
+        # loaded impl (docs/inferio-worker-protocol.md, "Memory grants"); the
+        # third is [`max_batch_for`], the index ceiling, which is a question
+        # about a specific batch rather than a constant:
         #
         # `canvas_pixels` is tier 2 of the canvas resolution order — what this
         # model knows about itself when the registry declares nothing — and,
@@ -173,6 +340,41 @@ class EasyOCRModel(InferenceModel):
         
         self._model_loaded = True
 
+    def max_batch_for(
+        self, shapes: Sequence[tuple[int, int] | None]
+    ) -> int | None:
+        """Largest batch of these inputs one `predict` call can execute.
+
+        The third attribute the worker's packing harness reads off a loaded
+        impl (docs/inferio-worker-protocol.md, "Memory grants"), and the only
+        one that is a *question* rather than a statement. It answers exactly
+        one thing: the batch size above which a kernel's 32-bit element index
+        overflows on the tensor this impl builds — see the module header's
+        derivation and [`max_detector_batch`]. It is not a memory opinion;
+        memory is the grant's business, and the two ceilings are unrelated
+        (run2 measured this one firing with 3 GiB of 96 still free).
+
+        `shapes` are `(width, height)` pairs, in PIL's order, because the
+        harness reads them from an image header (`Image.size`); a member is
+        None where the header could not be read. An unreadable member is
+        charged the **square canvas**, this impl's worst case, on the same
+        principle as the harness's own unreadable-input pricing: a shape we
+        cannot see must not be assumed small.
+
+        None means "no ceiling from me" — which is the honest answer when
+        batching is disabled, since the unbatched path builds no batch tensor
+        at all and easyOCR bounds each `readtext` call by itself.
+        """
+        if not self.enable_batching:
+            return None
+        sizes: List[tuple[int, int] | None] = []
+        for shape in shapes:
+            size = _shape_as_height_width(shape)
+            sizes.append(size or (self.canvas_size, self.canvas_size))
+        if not sizes:
+            return None
+        return max_detector_batch(sizes, self.canvas_size)
+
     def predict(self, inputs: Sequence[PredictionInput]) -> List[dict]:
         self.load()
         
@@ -221,9 +423,40 @@ class EasyOCRModel(InferenceModel):
                 # A single input still OOMs after halving; individual
                 # processing would just OOM again unclassified.
                 raise
-            except Exception as e:
-                # Fall back to individual processing if batched processing fails
-                logger.error(f"Batch processing failed with error: {e}. Falling back to individual processing.")
+            except Exception as error:
+                # Never a silent fallback. Before run2 this logged one line
+                # carrying only `str(error)` and discarded the traceback, so
+                # the one failure this path actually meets — CRAFT's pooling
+                # kernel overflowing its 32-bit element index at batch 29 of
+                # 2560-bounded pages — named neither the operator nor the
+                # batch size, and the ledger, seeing a slower success rather
+                # than a failure, kept widening `unit_budget` past a batch
+                # this impl cannot execute (run2 probes report, S1).
+                #
+                # An index-limit failure only reaches here at a *single*
+                # input: `run_with_oom_retry` halves on it above, and this
+                # impl caps the batch before the kernel ever sees it. So this
+                # is the honest last resort it was always meant to be, and it
+                # says so with a traceback.
+                dims = detector_tensor_dims(
+                    [
+                        (int(image.shape[0]), int(image.shape[1]))
+                        for image in raw_images
+                    ],
+                    self._batch_canvas_size(batch_params),
+                    self._batch_mag_ratio(batch_params),
+                )
+                logger.warning(
+                    "easyOCR's batched path failed on %d inputs at a padded "
+                    "detector tensor of %s (%s); falling back to per-image "
+                    "processing",
+                    len(raw_images),
+                    "x".join(str(value) for value in dims) if dims else "unknown",
+                    "a kernel index ceiling"
+                    if looks_like_index_limit(error)
+                    else type(error).__name__,
+                    exc_info=True,
+                )
                 use_batched = False
 
         if not use_batched:
@@ -349,10 +582,14 @@ class EasyOCRModel(InferenceModel):
         and are mapped to raw coordinates before recognition, which is also
         what makes `min_size` keep meaning raw pixels (it is applied here
         rather than inside `detect`, see [`filter_small_detections`]).
+
+        The detector batch additionally carries a **hard ceiling that is not
+        about memory**: CRAFT's first pooling kernel indexes its output in a
+        signed 32-bit int, so the batch is chunked at
+        [`max_detector_batch`] of the padded dimensions this batch actually
+        builds — 28 items for canvas-bounded A4 pages, 20 for square ones.
         """
-        canvas_size = (
-            _positive_int(batch_params.get("canvas_size")) or self.canvas_size
-        )
+        canvas_size = self._batch_canvas_size(batch_params)
         detect_params = {
             key: value
             for key, value in batch_params.items()
@@ -377,6 +614,49 @@ class EasyOCRModel(InferenceModel):
             scales.append(scale)
         if len({array.shape for array in bounded}) > 1:
             bounded = pad_images_to_same_size(bounded)
+
+        # The index ceiling, computed from the arrays that exist rather than
+        # from headers: this is the authoritative one, and the harness's
+        # `max_batch_for` pre-cap is the same arithmetic run early enough to
+        # keep the batch priceable. Both are needed — an older orchestrator,
+        # an unreadable header or a `mag_ratio` the harness cannot see all
+        # leave the pre-cap absent or optimistic, and none of them may be
+        # allowed to hand the kernel a batch it cannot index.
+        tensor_dims = detector_tensor_dims(
+            [
+                (int(array.shape[0]), int(array.shape[1]))
+                for array in bounded
+            ],
+            canvas_size,
+            self._batch_mag_ratio(batch_params),
+        )
+        chunk_cap = max_detector_batch(
+            [
+                (int(array.shape[0]), int(array.shape[1]))
+                for array in bounded
+            ],
+            canvas_size,
+            self._batch_mag_ratio(batch_params),
+        )
+        if chunk_cap is not None and chunk_cap < len(bounded):
+            # Reported, not swallowed: `note_index_limit_event` is what lets
+            # the worker put `clamped.reason = "index_limit"` on this batch's
+            # measurement, so the ledger sees a batch that ran short of its
+            # budget for a reason that is not memory — instead of a silently
+            # slower window (run2 probes report, S1).
+            note_index_limit_event()
+            logger.warning(
+                "capping easyOCR's detector batch at %d of %d inputs: a "
+                "%s tensor costs %d pooling-output elements per item and "
+                "the kernel indexes at most %d",
+                chunk_cap,
+                len(bounded),
+                "x".join(str(value) for value in tensor_dims)
+                if tensor_dims
+                else "unknown",
+                detector_pool_elements(*tensor_dims) if tensor_dims else 0,
+                KERNEL_INDEX_ELEMENT_LIMIT,
+            )
 
         def process_chunk(chunk):
             # One stacked 4-D array is what `test_net` batches
@@ -412,8 +692,28 @@ class EasyOCRModel(InferenceModel):
         return run_with_oom_retry(
             process_chunk,
             list(zip(bounded, raw_images, scales)),
+            initial_chunk_size=chunk_cap,
             logger=logger,
         )
+
+    def _batch_canvas_size(self, batch_params: dict) -> int:
+        """The canvas this batch is bounded by: the caller's, else ours."""
+        return (
+            _positive_int(batch_params.get("canvas_size")) or self.canvas_size
+        )
+
+    def _batch_mag_ratio(self, batch_params: dict) -> float:
+        """The caller's `mag_ratio`, else easyOCR's default.
+
+        It only ever *magnifies*, and `resize_aspect_ratio` clamps its own
+        target at the canvas, so a value below 1 (or a nonsensical one) is
+        read as the default rather than allowed to shrink the estimate — the
+        ceiling arithmetic must never under-state the tensor.
+        """
+        value = batch_params.get("mag_ratio")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return DEFAULT_MAG_RATIO
+        return float(value) if value > DEFAULT_MAG_RATIO else DEFAULT_MAG_RATIO
 
     def unload(self) -> None:
         if self._model_loaded:
