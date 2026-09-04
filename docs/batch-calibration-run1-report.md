@@ -308,11 +308,20 @@ recordings and **none is a new safety defect**:
    against a hog that moves up to 93 GB in seconds. Safety did not rest on it:
    **0 of 78 789 grants exceeded the headroom they were priced against**, and
    `hog_tracking` confirms the instrument tracked (hog 0…93 696 MiB,
-   `external_mb` 0…95 257 MiB, ≥ 1 GiB held for 10 655 s).
-2. **`base_accuracy`** — wd-vit is **0.0 %** (964 vs 964). The FAIL is entirely
-   nemotron: `base_mb = 3 788` against an oracle per-process reading of
-   **848 MiB at admission + 343 ms**, 346.7 % over, lifetime minimum 654. The
-   direction is conservative, so it is not a safety defect (finding F-C).
+   `external_mb` 0…95 257 MiB, ≥ 1 GiB held for 10 655 s). Its *magnitudes*
+   were also inflated by the recorder defect below: a resident worker whose
+   identity the recording missed counts as external, by **16 888 MiB in the
+   worst sample alone**. Re-analysed with the fixed instruments the FAIL
+   stands but reads 91 042 MiB worst and **3 612 / 117 852** breaches.
+2. **`base_accuracy`** — wd-vit is **0.0 %** (964 vs 964). The nemotron row
+   read 346.7 % over — `base_mb = 3 788` against "an oracle per-process
+   reading of 848 MiB at admission + 343 ms" — but that 848 MiB is **the
+   MiniLM worker's process**, not nemotron's: the recorder had memoised the
+   `[comm]` cmdline of the nemotron worker's fork/exec window, so the check
+   never recognised it and attributed the row to the only worker PID it could
+   see. Nemotron's own per-process figure is 3 788 MiB, exactly `base_mb`
+   (F-C, retracted). Re-analysed, the row is unjudged and the check reports
+   **INFO**.
 3. **`grant_safety`** — 78 789 grants, **0 over their priced headroom**, **6
    over the oracle's live free memory** (0.008 %), 3 912 memory-blind
    (`mb = 0`, B1, all during spikes). **All six are
@@ -441,7 +450,7 @@ one-line headlines per leg are in `results/run1/README.md`.
 | **S6** Multi-model contention | **PASS with findings** | 0 OOM across **2 358 clean settles**; the idle-resident trim flagged in **1.837 s** with a 5.8 ms round trip and the oracle saw exactly `slack_mb` come back. Findings P5-2, P5-3, P5-4 |
 | **S7** Multi-GPU | **PASS** | GPU 1's ledger row **byte-identical** at every sample under a hog on GPU 0; `PinDiverged` logged **0** times |
 | **S8** Cost dimensions and packing | **PASS** | easyOCR acceptance test **8.56×** inference (54.72 s vs 468.20 s), 0 errors. `utilization` FAILs at 0.08 on the mixed-pixel corpus (finding Q3) |
-| **S9** Soak | **PASS on every §4 criterion** | 8 h 09 m, 13 cycles, **52 of 52 jobs completed**, 0 failed, `/failures` `{"total":0}`; **0 worker deaths** across 56 spawns; **0 `ERROR` lines and 0 panics** in 166 MB of log; deflation peaked at **1** and always returned to 0, worst recovery **109 s**, nothing deflated at the end; `calibration.toml` bounded at **6 635 B** with every `sample_units` ring **≤ 64**; server RSS fits **+113 MB/h** but mean-reverts on a 4 800–7 107 MB band (VmHWM 11 519 MB set in the first 10 minutes and never re-set); throughput **1.03×** S2 on wd-vit and **1.08×** on MobileCLIP; peak **8 257 fds** = 2 % of the 524 288 limit. Findings F-A (the pinned knee), F-B, F-C, F-D |
+| **S9** Soak | **PASS on every §4 criterion** | 8 h 09 m, 13 cycles, **52 of 52 jobs completed**, 0 failed, `/failures` `{"total":0}`; **0 worker deaths** across 56 spawns; **0 `ERROR` lines and 0 panics** in 166 MB of log; deflation peaked at **1** and always returned to 0, worst recovery **109 s**, nothing deflated at the end; `calibration.toml` bounded at **6 635 B** with every `sample_units` ring **≤ 64**; server RSS fits **+113 MB/h** but mean-reverts on a 4 800–7 107 MB band (VmHWM 11 519 MB set in the first 10 minutes and never re-set); throughput **1.03×** S2 on wd-vit and **1.08×** on MobileCLIP; peak **8 257 fds** = 2 % of the 524 288 limit. Findings F-A (the pinned knee), F-B, F-D (F-C is retracted: an instrument artefact, see §4) |
 | **S10** Migration | **PASS** both paths | Exactly one INFO line across four boots; only the batch-size keys removed; stamp row present; cap survives a restart |
 | **S11** Docker CUDA | **FAIL, fixed, closure verified** | **1 849 of 2 000 items unprocessed**, 1 240 `Too many open files`, peak 1 024 fds / 983 sockets, where the master image finished 2 000/2 000 at 177 fds (**F6**). On the rebuilt image: **2 000/2 000, 0 errors, 0 `Too many open files`, peak 3 003 fds against a 524 288 limit**, and calibration identical to the bare host. Everything else PASSed, including the 403-on-6339 CI assertion and base error **0.00 %** |
 | **S12** CPU board (Docker CPU) | **PASS on every stated criterion** | Board 64 137 MiB, budget 48 102 MiB, cgroup `memory.max` 16 384 MiB = **2.94× overcommit** (B19); the death-negative path converges 32 → 16 → 8 → 4 but only across job passes |
@@ -500,7 +509,7 @@ options rather than changed.
 | **N7** | LOW/MED | The anchor a job can reach is a function of the job's length (one doubling per settled window): 2 000 items buys 10 windows and stops at 512 = 20 % of the boundary with 70 GB unused | **User** |
 | **P5-7 (B17)** | LOW/MED | A hung idle-resident trim kills the model at ~20 s (a teardown race), not at the 60 s deadline, and the queued client gets a bare 500 after 18.6 s | **User** |
 | **T8 / Q8** | LOW/MED | A failed job records `end_time == start_time` and `failed = 0`; a failed item never reaches `/api/jobs/data/failures` (`{"total":0}` in every leg of the run) | **User** (outside the calibration feature) |
-| **F-C** | LOW (new) | `nemotron`'s `base_mb` over-states its resident **4.5×** at admission: 3 788 MiB priced against an oracle per-process reading of **848 MiB at admission + 343 ms**, lifetime minimum 654. Conservative, so safe, but it withholds 3.8 GB of headroom from other models for the life of the replica. It is the whole of the soak's `base_accuracy` FAIL (wd-vit is 0.0 %) | **User**; no option proposed, recorded for the next pass (a sibling of A3, opposite direction) |
+| **F-C** | **RETRACTED** (instrument artefact, not a ledger defect) | Read in run1 as "`nemotron`'s `base_mb` over-states its resident **4.5×**: 3 788 MiB against an oracle per-process reading of 848 MiB at admission + 343 ms, lifetime minimum 654". It does not. That 848 MiB is **a different worker's process** (MiniLM, pid 1995772; the "654" is MiniLM's own `base_mb`). `vramrec.py` had memoised the `[comm]` cmdline and empty env read inside the nemotron worker's fork/exec window for the whole 13 minutes of its life (815 of 815 samples carry `"[panoptikon-spaw]"`, `env: {}`), so `analyze.py` did not recognise it as ours and attributed the row to the only worker PID it could see. `base_mb = 3 788` is correct to **0.0 %** — 3 201 MiB of bf16 weights + allocator slack (`reserved_at_load_mb = 3 238`) + ~550 MiB of CUDA context — confirmed by a **178.5 s resident-idle plateau at 3 788 MiB** in `S6-b18-loadstall` and by an at-load sample in `S8-pixmix`. The ledger withholds 3 788 MiB because the replica is using 3 788 MiB. Re-analysed, S9's `base_accuracy` is **INFO**, not FAIL | **Closed, no user decision.** Instruments fixed in `03bb8a4d` (recorder), `90409b41`, `7b3ea31e`, `0643942c` (`analyze.py`) |
 | **F-D** | LOW (unexplained) | easyOCR degrades from **18.6 to ~12 it/s after cycle 2** and stays there. Not the ledger (`unit_budget` pinned at 2 000 000 throughout), not the hog (the 7.95 it/s pass ran through a calm window), not thermal (58 °C, 2 625/3 090 MHz, `clocks_throttle_reasons.active 0x0`). GPU utilization during OCR was **15 %**, so it is CPU-side | **Recorded, not explained** |
 | **F10 / G2** | LOW | `pid: host` buys 0.00 % of base error on this driver and costs the container's PID isolation | **Decision taken: do not add it** |
 | **F13** | LOW | `output_with_timeout` abandoned the timed-out `nvidia-smi` child and its reader thread (1.04 s of overlap measured) | **Fixed** in *Kill the probe child when the capability timeout expires* |
