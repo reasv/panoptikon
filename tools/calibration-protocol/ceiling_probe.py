@@ -157,6 +157,48 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
     return out
 
 
+def _merge_registry_document(merged: Dict[str, Any], document: Dict[str, Any]) -> None:
+    """Fold one registry file into the accumulator, the way the loader does.
+
+    Group-level `config` and `metadata` merge key by key across files, but an
+    `[group.G.inference_ids.ID]` table **replaces** any earlier definition of
+    that id wholesale — `registry.rs: load_file` inserts the parsed entry into
+    `entry.inference_ids`, it does not merge into it, and the Python loader it
+    mirrors does the same (`config.py:61-76`). Deep-merging the id tables
+    instead lets a shipped key survive an override that deliberately omits it,
+    which is not a cosmetic difference: `registry-C7nc.toml` exists precisely
+    to run easyOCR *without* `metadata.cost.canvas_pixels`, and under a deep
+    merge the shipped `6553600` leaked back in and priced the uncapped control
+    at the cap.
+    """
+    for key, value in document.items():
+        if key != "group" or not isinstance(value, dict):
+            merged[key] = (
+                _deep_merge(merged[key], value)
+                if isinstance(value, dict) and isinstance(merged.get(key), dict)
+                else value
+            )
+            continue
+        groups = merged.setdefault("group", {})
+        for group_name, group_data in value.items():
+            if not isinstance(group_data, dict):
+                groups[group_name] = group_data
+                continue
+            target = groups.setdefault(group_name, {})
+            for sub_key, sub_value in group_data.items():
+                if sub_key != "inference_ids" or not isinstance(sub_value, dict):
+                    target[sub_key] = (
+                        _deep_merge(target[sub_key], sub_value)
+                        if isinstance(sub_value, dict)
+                        and isinstance(target.get(sub_key), dict)
+                        else sub_value
+                    )
+                    continue
+                ids = target.setdefault("inference_ids", {})
+                for inference_id, id_table in sub_value.items():
+                    ids[inference_id] = id_table
+
+
 def load_registries(paths: List[Path]) -> Dict[str, Any]:
     import tomllib
 
@@ -166,7 +208,7 @@ def load_registries(paths: List[Path]) -> Dict[str, Any]:
             continue
         with path.open("rb") as handle:
             document = tomllib.load(handle)
-        merged = _deep_merge(merged, document)
+        _merge_registry_document(merged, document)
     return merged
 
 
