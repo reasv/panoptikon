@@ -50,7 +50,7 @@ build/deploy/API. The plan that uses this is
 - Host refresh (`gpu.rs:778-790` `query_memory_nvidia_smi`): `nvidia-smi
   --query-gpu=uuid,memory.total,memory.free`, 5 s timeout, all-or-nothing
   parse (`parse_memory`, `:796-821`). Triggered **only** from `VramLedger::request_grant`
-  (`ledger.rs:3787` → `maybe_refresh_external`, `:5032`) when `refresh_due`
+  (`ledger.rs:3923` → `maybe_refresh_external`, `:5207`) when `refresh_due`
   (`:1340`), now four conditions in order: no refresh in flight for that
   board, no failure within 10 s, **the board carries a departure stamp**,
   else freshest free sample older than `EXTERNAL_SAMPLE_MAX_AGE = 10 s`
@@ -76,7 +76,7 @@ build/deploy/API. The plan that uses this is
   New in run2, same file: `clamped{from_units,to_units,free_mb}`
   (`worker.rs:369`) and `oom_class{source,exception,free_mb_at_failure,device}`
   (`worker.rs:381`).
-  Recorded at registration (`ledger.rs:2682`) and every settle
+  Recorded at registration (`ledger.rs:2817`) and every settle
   (`ingest_locked` `:4489`, `:4679`) via `record_free_locked` (`:3299-3386`): authoritative
   labels `nvml|nvidia-smi|amdgpu-sysfs|mps|ram`
   (`free_source_is_authoritative`, `:1604-1609`); once a
@@ -84,7 +84,7 @@ build/deploy/API. The plan that uses this is
   (`:3351-3356`); older samples ignored; a sample whose own `total_mb`
   disagrees with the board (±5 %/512 MB) is discarded with a once-per-
   (model, board) WARN (`:3325-3340`).
-- On departure (`forget_worker`, `ledger.rs:2797`) the board's free sample
+- On departure (`forget_worker`, `ledger.rs:2933`) the board's free sample
   is *credited* with the departing replica's footprint, so `external` does
   not absorb it when the footprint leaves the `Σ` below; skipped (refresh
   still forced) when the sample predates that replica's load, since such a
@@ -104,7 +104,7 @@ build/deploy/API. The plan that uses this is
   `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (canonical inventory spelling; index
   pins translated) plus `PANOPTIKON_DEVICE_PIN=<same>` (`worker.rs:944-948`).
 - Ledger identity = what the worker reports (`LoadReport.gpu_uuid`),
-  resolved by `resolve_board` (`ledger.rs:2311-2381`): UUID match →
+  resolved by `resolve_board` (`ledger.rs:2446-2516`): UUID match →
   admit; PCI-address match + total cross-check (`total_tolerance_mb`
   `:161-163`); single-board fallback (no UUID reported, claims a GPU,
   total agrees); else `NoBoard` (DEBUG) → unpriced. Pin ≠ reported board
@@ -113,23 +113,24 @@ build/deploy/API. The plan that uses this is
 
 ### 1.4 Ledger state, budgets, grants
 
-- One `StdMutex<LedgerState>` (`ledger.rs:2008`), never held across
+- One `StdMutex<LedgerState>` (`ledger.rs:1799`), never held across
   await or subprocess. `LedgerState` (`:1664-1705`): `gpus{uuid →
   GpuLedger}` (`:1611-1661`), `workers{id → WorkerEntry}` (`:778-880`:
   `seed_units, base_mb, reserved_at_load_mb, reserved_mb, grants{id →
   GrantCharge{mb,requests,unit_budget}}, pending_requests, ramp_step,
   deflation, clean_windows, fit_watermark, last_trim_at,
   last_grant_settled_at`), `calibration{(inference_id, board_uuid) →
-  ModelCalibration}` (`:1448-1565`: sample ring 64 `FIT_RING`, transients
+  ModelCalibration}` (`:1549-1686`: sample ring 64 `FIT_RING`, transients
   32, `fit`, `fit_is_local`, `max_units_measured` (anchor), `seeded`,
   `local_samples`, throughput ring 128 `KNEE_RING`, `knee_best`,
   `knee_units`, `knee_is_local`, run2 `knee_clean_windows` +
-  `knee_re_explore_above`, `knee_withdrawn`, `persisted`;
-  `ledger.rs:1448`),
+  `knee_widened: Option<KneeWidening{bucket, from_seq}>` (`:1691`, R1e —
+  was `knee_re_explore_above`), `knee_withdrawn`, `throughput_seq`,
+  `persisted`; `ledger.rs:1549`),
   `remembered_bases`,
   `remembered_dtypes`, `pending_trims` (cap 32).
 - Budgets: `VramBudget{margin: Option<f64>, cap_fraction: Option<f64>}`
-  (`ledger.rs:468`), both `None` by default since run2 (R5) — an **unset**
+  (`ledger.rs:532`), both `None` by default since run2 (R5) — an **unset**
   margin is a distinct state from one set to `DEFAULT_MARGIN = 0.10`, and
   `VramBudget::margin_in_force` is what resolves it. Per-board overrides
   case-insensitive; from `[inference_local.vram]` (`http.rs`,
@@ -137,7 +138,7 @@ build/deploy/API. The plan that uses this is
   Validation (`config.rs`, `validate_inference_vram`): a *stated* margin must
   be finite ≥ 0; cap_fraction in (0, 1], so no per-board way to switch a
   global cap off.
-- Arithmetic (`reserve_locked` `ledger.rs:3425`, `limit_with_margin_locked`
+- Arithmetic (`reserve_locked` `ledger.rs:3561`, `limit_with_margin_locked`
   `:3439`):
   `limit = min(total×cap_fraction, total − external − reserve)`, where
   run2 (R5) `reserve = ceil(external×margin)` when the user set one
@@ -166,7 +167,7 @@ build/deploy/API. The plan that uses this is
   window_target, items: cap×3 if capped, bytes: MAX_WINDOW_BYTES}`;
   unpriced path bounds by registry `default_batch_size` else
   `default_max_batch` (32) (`dispatch.rs:37-48`).
-- Grant `request_grant` (`ledger.rs:3779-3965`): post-fit `units = min(wanted,
+- Grant `request_grant` (`ledger.rs:3915-4101`): post-fit `units = min(wanted,
   floor(share/slope))`, `mb = ceil(units × slope)`; pre-fit `units =
   wanted`, `mb = share`. **On a full board pre-fit grants carry `mb = 0`
   and are memory-blind** (the pre-fit arm, `:3857-3868`); post-fit affordable
@@ -202,7 +203,7 @@ build/deploy/API. The plan that uses this is
   `local_samples++`; warm batch with `units ≥ 0.8 × granted`
   (`FULL_BATCH_RATIO`) and `duration_ms > 0` → throughput sample — unless
   run2 (R1a/R1b) excludes it: the window was `squeezed` or memory-blind
-  (`knee_admits_window` `ledger.rs:1165`), the measurement carries `clamped`, and
+  (`knee_admits_window` `ledger.rs:1266`), the measurement carries `clamped`, and
   every admitted sample is tagged with the window's contention count
   (`GrantCharge::peak_occupants`, maintained by `note_occupancy_locked`
   `:4006`). A `throughput_collapse` from a window that was **not** sole
@@ -210,49 +211,63 @@ build/deploy/API. The plan that uses this is
   *verdict* only: an `oom` on the same measurement still deflates
   (`:4110-4115`), which is the shape an impl's own absorbed halving takes.
   `WorkerDied` → unified boards only: anchor halved + deflate
-  (`note_unified_death_locked` `:4300-4338`); discrete boards learn
-  nothing. Then `refit_locked` (`:4793-4842`, Theil–Sen `robust_fit` `:6156-6192`: ≥ 3
+  (`note_unified_death_locked` `:4449-4487`); discrete boards learn
+  nothing. Then `refit_locked` (`:4967-5016`, Theil–Sen `robust_fit` `:6367-6403`: ≥ 3
   samples, distinct x, slope > 0, else the old fit is kept) and
   `refit_knee_locked`.
-- Knee `fit_knee` (`:6259`): log2 buckets, median per bucket, ≥ 12 samples
-  over ≥ 3 buckets, threshold 0.9 × max(ring best, historical `knee_best`),
-  knee = first bucket ≥ threshold and < largest bucket, returned as
-  `2^(k+1) − 1`. Run2 (R1): only **sole-occupancy** samples are fitted
-  (`refit_knee_locked` `:4864`); a bucket with fewer than
-  `MIN_KNEE_BUCKET_SAMPLES = 2` observations is dropped; and any retained
-  bucket whose **relative MAD** (`relative_mad` `:6348`) exceeds
-  `KNEE_MAX_BUCKET_DISPERSION = 0.20` refuses the whole fit, `knee_best`
-  included. Run2 (R1d) also makes it expire: `note_knee_window_locked`
-  (`:4207`) counts clean windows run **at** the knee with headroom ≥
-  `RATCHET_FACTOR × appetite_mb_locked` (`:3589`), and at
-  `KNEE_EXPIRY_CLEAN_WINDOWS = 12` widens it one bucket (`2k+1`) — or
-  withdraws it once it reaches `uncapped_units` (`:1127-1138`), the budget the
-  ramp and the ratchet allow on their own, which is also defined where
-  `anchor == 0` — logging
-  `this model has run cleanly at its throughput knee…` at INFO.
-  `knee_re_explore_above` blocks a refit until a warm batch above the old cap
-  is observed, and is set by **both** arms (a withdrawal is a widening with
-  no upper bound); a withdrawal additionally sets
-  `ModelCalibration::knee_withdrawn`, which the store's merge reads as
-  "drop the stored knee" rather than "this run fitted none".
+- Knee `fit_knee` (`:6541`, signature `(samples, floor_rate, anchor,
+  widened)`): log2 buckets, median per bucket, ≥ 12 samples over ≥ 3 buckets,
+  threshold 0.9 × max(ring best, historical `knee_best`), candidate = the
+  **smallest** quiet bucket ≥ threshold, returned as `2^(k+1) − 1`. Run2 (R1):
+  only **sole-occupancy** samples are fitted (`refit_knee_locked` `:5038`); a
+  bucket with fewer than `MIN_KNEE_BUCKET_SAMPLES = 2` observations is
+  dropped; and any retained bucket whose **relative MAD** (`relative_mad`
+  `:6767`) exceeds `KNEE_MAX_BUCKET_DISPERSION = 0.20` refuses the whole fit,
+  `knee_best` included.
+  Run2 (R1e, finding F1) replaces the single frontier guard with five vetoes
+  on that one candidate — there is no search for a bucket that survives them,
+  a veto refuses the fit: (1) the largest bucket *observed* (before the
+  two-sample retain) must itself be quiet and must not be the knee; (2) the
+  knee may not be the smallest bucket observed either; (3)
+  `KNEE_PLATEAU_BUCKETS = 2` quiet buckets must lie above it, none faster by
+  `KNEE_RATIO`; (4) a knee below `size_bucket(max_units_measured)` needs two
+  observations in its own bucket taken once the anchor's bucket had already
+  passed it (`ThroughputSample::anchor`); (5) after a widening, the smallest
+  quiet bucket above `knee_widened.bucket` needs two observations with `seq ≥
+  from_seq`. R1e also marks a replica's **first settled window**
+  (`WorkerEntry::settled_windows`) as `ThroughputSample::warmup` and drops
+  those observations entirely.
+  Run2 (R1d) makes it expire: `note_knee_window_locked` (`:4343`) counts clean
+  windows run **at** the knee with headroom ≥ `RATCHET_FACTOR ×
+  appetite_mb_locked` (`:3725`), and at `KNEE_EXPIRY_CLEAN_WINDOWS = 12` —
+  `KNEE_SEED_REVALIDATION_WINDOWS = 4` for a knee this process never measured
+  (`!knee_is_local`, R1e) — widens it one bucket (`2k+1`), or withdraws it
+  once it reaches `uncapped_units` (`:1228-1239`), the budget the ramp and the
+  ratchet allow on their own, which is also defined where `anchor == 0` —
+  logging `this model has run cleanly at its throughput knee…` at INFO.
+  `knee_widened` is set by **both** arms (a withdrawal is a widening with no
+  upper bound) and is a permanent sequence mark rather than a flag the ingest
+  clears; a withdrawal additionally sets `ModelCalibration::knee_withdrawn`,
+  which the store's merge reads as "drop the stored knee" rather than "this
+  run fitted none".
   A shipped knee is adopted at seed time when no local knee exists, arrives
   with its persisted `knee_clean_windows`, and can only ratchet down within
   a run.
-- Load reservation `reserve_load` (`ledger.rs:2120-2130`): `max(remembered base,
+- Load reservation `reserve_load` (`ledger.rs:2255-2265`): `max(remembered base,
   store expected_base)` else `CONSERVATIVE_BASE_MB = 4096`; only WARNs
   when it exceeds headroom ("loading this model is expected to need more
   VRAM than the board's remaining headroom"); the load proceeds.
-- Idle trim `flag_trims_locked` (`ledger.rs:3699-3740`): other replicas on the
+- Idle trim `flag_trims_locked` (`ledger.rs:3835-3876`): other replicas on the
   board with no grant, `pending_requests == 0`, last settle ≥ 5 s ago,
   `pool_growth ≥ 256 MB`, debounce 30 s → `deliver_pending_trims`
   (`manager.rs:1674-1685`) → `try_trim` (`dispatch.rs:1066-1088`, dropped
   if the replica is busy) → `Worker::trim` with **fatal `TRIM_DEADLINE =
-  60 s`** (`worker.rs:129`) → `note_trimmed` (`ledger.rs:4980-5019`).
-- Seeding (`register_worker` `ledger.rs:2602-2755` → `seed_calibration_locked`
-  `:2910-3032`): once per (model, board) per run; fit adopted if none
+  60 s`** (`worker.rs:129`) → `note_trimmed` (`ledger.rs:5155-5194`).
+- Seeding (`register_worker` `ledger.rs:2737-2891` → `seed_calibration_locked`
+  `:3046-3174`): once per (model, board) per run; fit adopted if none
   and slope > 0; knee adopted even from a baseline; anchor/ring/
   `local_samples` only from a local profile with the exact torch string.
-- `Grant.squeezed` (`ledger.rs:5821`, set at `:3845-3868`): true when the
+- `Grant.squeezed` (`ledger.rs:6032`, set at `:3981-4004`): true when the
   board could afford **less** than the window target the anchor asked
   for. Two consumers, both added during run1: `flag_trims_locked` (a
   squeezed neighbour is what justifies asking an idle resident to release
