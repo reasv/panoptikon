@@ -6010,23 +6010,31 @@ fn oom_verdict(measurement: &BatchMeasurement, window: Option<&GrantCharge>) -> 
     if !measurement.oom {
         return OomVerdict::None;
     }
-    let Some(class) = measurement
-        .oom_class
-        .as_ref()
-        .filter(|class| class.source == OOM_SOURCE_MESSAGE_PATTERN)
-    else {
+    let Some(class) = measurement.oom_class.as_ref() else {
+        // A pre-run2 worker, whose bare `oom` is the contract it was
+        // written to.
         return OomVerdict::Trusted;
     };
-    let (Some(free_mb), Some(grant_mb)) = (
-        class.free_mb_at_failure,
-        window.map(|charge| charge.mb).filter(|mb| *mb > 0),
-    ) else {
-        return OomVerdict::Trusted;
-    };
-    if free_mb >= grant_mb {
-        OomVerdict::Contradicted { free_mb, grant_mb }
-    } else {
-        OomVerdict::Trusted
+    match class.source.as_str() {
+        OOM_SOURCE_TYPED | OOM_SOURCE_MARKER => OomVerdict::Trusted,
+        OOM_SOURCE_MESSAGE_PATTERN => {
+            let (Some(free_mb), Some(grant_mb)) = (
+                class.free_mb_at_failure,
+                window.map(|charge| charge.mb).filter(|mb| *mb > 0),
+            ) else {
+                // Nothing independent to weigh it against; the veto cannot
+                // fire and the classification stands.
+                return OomVerdict::Trusted;
+            };
+            if free_mb >= grant_mb {
+                OomVerdict::Contradicted { free_mb, grant_mb }
+            } else {
+                OomVerdict::Trusted
+            }
+        }
+        // A tier a future worker invented. The safe direction for an
+        // unknown memory signal is to believe it.
+        _ => OomVerdict::Trusted,
     }
 }
 
