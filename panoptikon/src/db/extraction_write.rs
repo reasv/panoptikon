@@ -25,8 +25,11 @@ pub(crate) struct DataLogUpdate {
     /// (`crate::db::job_failures`). [`OUTCOME_RUNNING`] on the per-item
     /// progress updates, which must not claim an ending.
     pub outcome: &'static str,
-    /// Why, for the outcomes that have a reason. `None` leaves the stored
-    /// value alone on a progress update and clears it on a clean completion.
+    /// Why, for the outcomes that have a reason; `None` on a clean completion
+    /// and on the progress updates, which clear it.
+    ///
+    /// A progress update cannot clear a reason another path already recorded:
+    /// `update_data_log` refuses to apply one to a row that has an outcome.
     pub failure_reason: Option<String>,
 }
 
@@ -239,7 +242,22 @@ pub(crate) async fn update_data_log(
     update: &DataLogUpdate,
 ) -> ApiResult<()> {
     let completed_value = if update.finished { 1 } else { 0 };
-    sqlx::query(
+    // A progress update must never un-finalize a job. It claims no ending
+    // (`OUTCOME_RUNNING`) and carries no reason, so applying it to a row that
+    // already recorded one would reset `outcome` to `''` and null
+    // `failure_reason` — putting the row back into the "still running" shape
+    // the whole column exists to distinguish. That ordering is reachable: the
+    // cancellation drop guard and `remove_incomplete_jobs` both stamp from
+    // outside the job's own sequence, so an item update still in the writer's
+    // queue can land after either of them. The terminal updates are
+    // deliberately unguarded — a job's own ending must always win.
+    let guard = if update.outcome == OUTCOME_RUNNING {
+        " AND outcome = ''"
+    } else {
+        ""
+    };
+    // `AssertSqlSafe`: the only interpolation is the constant above.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         UPDATE data_log
         SET end_time = ?,
@@ -255,9 +273,9 @@ pub(crate) async fn update_data_log(
             completed = ?,
             outcome = ?,
             failure_reason = ?
-        WHERE job_id = ?
-        "#,
-    )
+        WHERE job_id = ?{guard}
+        "#
+    )))
     .bind(current_iso_timestamp())
     .bind(update.image_files)
     .bind(update.video_files)
@@ -1037,6 +1055,46 @@ mod terminal_path_tests {
             "the guard must not touch a row that recorded its own ending"
         );
         assert_eq!(ending(conn, failed).await, before);
+    }
+
+    /// A per-item progress update that lands after the job's ending was
+    /// recorded must not undo it.
+    ///
+    /// Reachable because the cancel guard and the incomplete-job sweep both
+    /// stamp from outside the job's own sequence, so an item update still in
+    /// the writer's queue can be applied after either. Without the guard the
+    /// row goes back to `outcome = ''` with no reason — indistinguishable from
+    /// a job that is still running, which is the state this column exists to
+    /// tell apart.
+    #[tokio::test]
+    async fn a_late_progress_update_cannot_undo_a_recorded_ending() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let job_id = old_job(conn).await;
+
+        assert_eq!(finalize_cancelled_job(conn, job_id).await.unwrap(), 1);
+        let after_stamp = ending(conn, job_id).await;
+        assert_eq!(after_stamp.2, OUTCOME_CANCELLED);
+
+        let progress = DataLogUpdate {
+            outcome: OUTCOME_RUNNING,
+            failure_reason: None,
+            ..unfinished_update("unused")
+        };
+        update_data_log(conn, job_id, &progress).await.unwrap();
+        assert_eq!(
+            ending(conn, job_id).await,
+            after_stamp,
+            "a progress update must not reopen a finished job"
+        );
+
+        // A job's own ending still wins over whatever is there.
+        update_data_log(conn, job_id, &unfinished_update("inference is down"))
+            .await
+            .unwrap();
+        let (_, _, outcome, reason) = ending(conn, job_id).await;
+        assert_eq!(outcome, OUTCOME_FAILED);
+        assert_eq!(reason.as_deref(), Some("inference is down"));
     }
 
     /// The path a job's *process* death leaves behind: a later run finds the
