@@ -13,7 +13,9 @@ from inferio.impl.utils import (
     OOM_BATCH1_PREFIX,
     InferenceOOMError,
     last_oom_retry,
+    looks_like_index_limit,
     run_with_oom_retry,
+    total_index_limit_events,
     total_oom_halvings,
 )
 
@@ -234,3 +236,90 @@ def test_fixture_prefix_matches_constant():
         / "oom_impl.py"
     )
     assert f'"{OOM_BATCH1_PREFIX}' in fixture.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# The shape ceiling: halves like an OOM, is never reported as one (run2 S1)
+# ---------------------------------------------------------------------------
+
+
+def test_an_index_ceiling_halves_without_counting_as_an_oom():
+    """`RuntimeError("integer out of range")` is `at::native::safe_downcast`
+    refusing to launch a kernel over more elements than a signed 32-bit int
+    can address — the failure run2 measured easyOCR's CRAFT detector hitting
+    at batch 29 with 3 GiB of a 96 GiB board still free.
+
+    It is size-dependent, so halving is right. It is not a memory condition,
+    so it must not move the halving counter the worker reads as `oom`: a
+    negative sample here would deflate a model that has plenty of memory.
+    """
+    calls = []
+
+    def process(chunk):
+        calls.append(len(chunk))
+        if len(chunk) > 2:
+            raise RuntimeError("integer out of range")
+        return [x * 10 for x in chunk]
+
+    ooms_before = total_oom_halvings()
+    events_before = total_index_limit_events()
+    result, cache = _retry(process, list(range(8)))
+
+    assert result == [x * 10 for x in range(8)]
+    assert calls == [8, 4, 2, 2, 2, 2]
+    assert total_oom_halvings() == ooms_before, "not an out-of-memory condition"
+    assert total_index_limit_events() == events_before + 2, "one per halving"
+    assert cache.call_count == 0, (
+        "nothing here is short of memory; emptying the allocator would cost a "
+        "synchronise for no reason"
+    )
+    generation, largest, halvings = last_oom_retry()
+    assert (largest, halvings) == (2, 0), (
+        "the executed shape is still recorded — that is what makes the batch "
+        "unpriceable — but no halving is claimed"
+    )
+
+
+def test_an_index_ceiling_on_a_single_item_propagates_untouched():
+    """No smaller batch to try, and it is not an out-of-memory condition, so
+    it must not be re-raised as `InferenceOOMError`: the caller's own
+    fallback has to see it for what it is."""
+    def process(chunk):
+        raise RuntimeError("integer out of range")
+
+    events_before = total_index_limit_events()
+    with pytest.raises(RuntimeError, match="integer out of range"):
+        run_with_oom_retry(process, ["only"], oom_exceptions=(FakeOOM,))
+    assert total_index_limit_events() == events_before, (
+        "nothing was retried, so nothing was shrunk"
+    )
+
+
+def test_an_out_of_memory_condition_wins_over_the_ceiling_test():
+    """Order matters and is deliberate: every out-of-memory test runs first,
+    so a genuine allocator failure whose text happens to mention an index is
+    still the negative sample the deflation path exists for."""
+    def process(chunk):
+        if len(chunk) > 1:
+            raise FakeOOM("CUDA out of memory; integer out of range")
+        return list(chunk)
+
+    ooms_before = total_oom_halvings()
+    events_before = total_index_limit_events()
+    _retry(process, [1, 2])
+    assert total_oom_halvings() == ooms_before + 1
+    assert total_index_limit_events() == events_before
+
+
+def test_the_ceiling_classifier_is_narrow_where_the_oom_one_is_broad():
+    """Both decide "retry at half the size", but this one also decides a
+    failure is *not* a memory event, and a false positive there would hide a
+    genuine out-of-memory condition. So it matches only what torch emits."""
+    for text in ("integer out of range", "canUse32BitIndexMath(self)"):
+        assert looks_like_index_limit(RuntimeError(text)), text
+    for text in ("index out of range", "list index out of range", "out of memory"):
+        assert not looks_like_index_limit(IndexError(text)), text
+
+    chained = RuntimeError("wrapper")
+    chained.__cause__ = RuntimeError("integer out of range")
+    assert looks_like_index_limit(chained), "the chain is scanned, as for OOM"

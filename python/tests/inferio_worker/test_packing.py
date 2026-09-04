@@ -108,6 +108,7 @@ class FakeOomRetryUtils:
         self.generation = 0
         self.slot = None
         self.total = 0
+        self.index_limits = 0
 
     def record(self, largest, halvings=0):
         self.generation += 1
@@ -124,6 +125,16 @@ class FakeOomRetryUtils:
         in one `predict` — the per-call record above keeps the last call only.
         """
         return self.total
+
+    def note_index_limit(self):
+        """A batch the impl could not execute at the size it was formed at,
+        for a reason that is **not** memory — a kernel's 32-bit element index.
+        Deliberately a separate total from the halvings above: conflating the
+        two would deflate a model on a board with tens of GB free."""
+        self.index_limits += 1
+
+    def total_index_limit_events(self):
+        return self.index_limits
 
 
 @pytest.fixture(autouse=True)
@@ -1682,3 +1693,229 @@ def test_a_grant_far_below_the_slack_still_releases_the_pool(fake_torch):
     packing.run_window(impl, items(1), squeezed)
     assert fake_torch.empty_cache_calls == 1
     assert packing._under_grant_windows == 0
+
+
+# ---------------------------------------------------------------------------
+# The impl's shape ceiling (run2 S1)
+# ---------------------------------------------------------------------------
+#
+# A second, non-memory bound on a batch: a kernel whose 32-bit element index
+# cannot address the tensor the batch builds refuses it with the whole board
+# free. easyOCR's CRAFT detector stops at 28 canvas-bounded A4 pages that way.
+# Before run2 the impl turned that failure into a slower success, so the
+# ledger saw no OOM, no `clamped`, and kept widening `unit_budget` past a
+# batch the impl cannot execute — a 3.2x throughput loss with no signal at
+# all (`run2-probes-report.md`, S1).
+
+
+class Ceiling(Recorder):
+    """Impl stand-in that states a shape ceiling for any batch."""
+
+    def __init__(self, ceiling, **kwargs):
+        super().__init__(**kwargs)
+        self.ceiling = ceiling
+        self.asked: list[list] = []
+
+    def max_batch_for(self, shapes):
+        self.asked.append(list(shapes))
+        return self.ceiling
+
+
+def image_items(count: int, width: int = 40, height: int = 30):
+    return [PredictionInput(file=png_bytes(width, height)) for _ in range(count)]
+
+
+def test_a_shape_ceiling_trims_the_batch_and_says_why(fake_torch):
+    """The designed path: asked before the batch runs, so the batch that does
+    run is whole — a clean *priced* sample — and `clamped.reason` says it was
+    not the full budget for a reason that is not memory."""
+    model = Ceiling(2)
+    payload = packing.run_window(
+        model, image_items(6), grant(unit_budget=6, unit="item", aggregation="count")
+    )
+    assert [len(batch) for batch in model.batches] == [2, 2, 2], (
+        "the trimmed items were not dropped; they went to the next batch"
+    )
+    assert payload["outputs"] == [None] * 6
+    first, second, third = payload["measurements"]
+    assert first["clamped"] == {
+        "from_units": 6,
+        "to_units": 2,
+        "reason": "index_limit",
+        "free_mb": 8000,
+    }
+    assert second["clamped"]["from_units"] == 4
+    assert "clamped" not in third, "a batch that fit was never clamped"
+    for measurement in payload["measurements"]:
+        assert "oom" not in measurement and "oom_class" not in measurement
+        assert measurement["units"] == 2, "a whole batch is still priceable"
+
+
+def test_the_ceiling_is_asked_with_the_headers_the_pricer_already_read():
+    """One header read per window, whatever wants it: the shapes handed to
+    the hook are the pricer's own readings, in PIL's `(width, height)`."""
+    model = Ceiling(1)
+    inputs = [PredictionInput(file=png_bytes(40, 30)), PredictionInput(file=b"junk")]
+    packing.run_window(model, inputs, grant(unit_budget=99, unit="pixel"))
+    assert model.asked[0] == [(40, 30), None], (
+        "an unreadable header reaches the impl as None, not as a guess"
+    )
+
+
+def test_a_non_pixel_window_still_reads_shapes_for_an_impl_that_asks():
+    """A `count`-priced model reads no image headers at all — but if its impl
+    exposes the hook, the shapes it needs are read once, before the timed
+    section, exactly as pricing does."""
+    model = Ceiling(2)
+    packing.run_window(model, image_items(4), grant(unit_budget=4, unit="item"))
+    assert [len(batch) for batch in model.batches] == [2, 2]
+    assert model.asked[0] == [(40, 30)] * 4
+
+    plain = Recorder()
+    packing.run_window(plain, items(4), grant(unit_budget=4, unit="item"))
+    assert [len(batch) for batch in plain.batches] == [4], "no hook, no ceiling"
+
+
+def test_a_memory_clamp_and_a_shape_ceiling_merge_into_one_report(fake_torch):
+    """A measurement carries one `clamped`. When both bound, the honest
+    single statement spans them: `from_units` is what the grant started at,
+    `to_units` is what ran, and `reason` names the constraint that set
+    `to_units`."""
+    fake_torch.free = 500 * MIB
+    model = Ceiling(2)
+    payload = packing.run_window(
+        model,
+        image_items(4),
+        grant(unit_budget=8, mb=1000, unit="item", aggregation="count"),
+    )
+    first = payload["measurements"][0]
+    assert first["clamped"] == {
+        "from_units": 8,
+        "to_units": 2,
+        "reason": "index_limit",
+        "free_mb": 500,
+    }
+    assert [len(batch) for batch in model.batches] == [2, 2]
+
+
+def test_a_memory_clamp_alone_still_names_no_reason(fake_torch):
+    """`reason` is additive on the wire: its absence means the memory clamp,
+    which is what every pre-run2 worker emitted and what the orchestrator
+    already understands."""
+    fake_torch.free = 100 * MIB
+    payload = packing.run_window(
+        Recorder(), items(4), grant(unit_budget=8, mb=1000, aggregation="count")
+    )
+    assert payload["measurements"][0]["clamped"] == {
+        "from_units": 8,
+        "to_units": 1,
+        "free_mb": 100,
+    }
+
+
+def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
+    fake_torch, fake_oom_retry
+):
+    """The backstop, for a ceiling the harness could not pre-empt — an older
+    impl, or a per-request parameter only the impl sees. It reaches the
+    harness through `total_index_limit_events`, and the batch it produced is
+    unpriceable *and* explained, without ever setting `oom`."""
+
+    class SelfCapping:
+        def predict(self, inputs):
+            if len(inputs) > 2:
+                fake_oom_retry.record(2)
+                fake_oom_retry.note_index_limit()
+            else:
+                fake_oom_retry.record(len(inputs))
+            return [None] * len(inputs)
+
+    payload = packing.run_window(
+        SelfCapping(), items(5), grant(unit_budget=5, aggregation="count")
+    )
+    measurement = payload["measurements"][0]
+    assert measurement["clamped"] == {
+        "from_units": 5,
+        "to_units": 2,
+        "reason": "index_limit",
+        "free_mb": 8000,
+    }
+    assert "units" not in measurement, "it did not run the batch it was handed"
+    assert "oom" not in measurement and "oom_class" not in measurement, (
+        "a shape ceiling is not a negative sample; deflating on it would "
+        "shrink a model that has plenty of memory"
+    )
+
+
+def test_an_absorbed_oom_is_still_an_oom_and_carries_no_reason(
+    fake_torch, fake_oom_retry
+):
+    """The other half of the separation: the halving counter still produces
+    the negative sample the deflation path exists for, and does not acquire a
+    `clamped` map it never had."""
+
+    class Halving:
+        def predict(self, inputs):
+            fake_oom_retry.record(2, halvings=1)
+            return [None] * len(inputs)
+
+    payload = packing.run_window(
+        Halving(), items(5), grant(unit_budget=5, aggregation="count")
+    )
+    measurement = payload["measurements"][0]
+    assert measurement["oom"] is True
+    assert measurement["oom_class"]["exception"] == packing.OOM_HALVING_WITNESS
+    assert "clamped" not in measurement
+
+
+def test_a_failed_batch_that_hit_a_ceiling_says_so_without_an_oom_flag(
+    fake_torch, fake_oom_retry
+):
+    """A window that dies after the impl hit the ceiling still reports the
+    ceiling: the failure path is exactly where the orchestrator most needs to
+    know the size was not its choice."""
+
+    class Failing:
+        def predict(self, inputs):
+            fake_oom_retry.record(1)
+            fake_oom_retry.note_index_limit()
+            raise RuntimeError("integer out of range")
+
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(Failing(), items(4), grant(unit_budget=4))
+    measurement = caught.value.measurements[0]
+    assert measurement["clamped"]["reason"] == "index_limit"
+    assert measurement["clamped"]["to_units"] == 1
+    assert "oom" not in measurement, (
+        "`classify_oom` is right to refuse it: it genuinely is not one"
+    )
+
+
+def test_a_ceiling_that_cannot_be_trusted_is_no_ceiling_at_all():
+    """Passive and total, like every other question this module asks a loaded
+    impl. A ceiling is a count of items: a bool is not one, a float is not
+    one, and neither is an exception."""
+
+    class Hostile:
+        def __init__(self, answer):
+            self.answer = answer
+
+        def max_batch_for(self, shapes):
+            if isinstance(self.answer, Exception):
+                raise self.answer
+            return self.answer
+
+    for answer in (None, True, False, 0, -3, 2.5, "4", RuntimeError("no")):
+        assert packing.impl_max_batch(Hostile(answer), [(1, 1)]) is None, answer
+    assert packing.impl_max_batch(Hostile(3), [(1, 1)]) == 3
+    assert packing.impl_max_batch(SimpleNamespace(), [(1, 1)]) is None
+    assert packing.impl_max_batch(SimpleNamespace(max_batch_for=7), [(1, 1)]) is None
+
+
+def test_a_ceiling_is_never_asked_about_a_batch_of_one():
+    """Nothing to trim, and the impl's own backstop is what a batch of one
+    needs anyway — so the hook is not called at all."""
+    model = Ceiling(1)
+    packing.run_window(model, image_items(3), grant(unit_budget=1, unit="item"))
+    assert model.asked == []
+    assert [len(batch) for batch in model.batches] == [1, 1, 1]
