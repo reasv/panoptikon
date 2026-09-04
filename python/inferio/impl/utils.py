@@ -428,6 +428,85 @@ def looks_like_oom(exc: BaseException) -> bool:
     return False
 
 
+# Message fragments, lower-cased, of a kernel refusing a tensor because its
+# element count does not fit the *index arithmetic* the kernel is compiled
+# with — a hard shape ceiling that has nothing to do with how much memory the
+# board has free.
+#
+# `integer out of range` is `at::native::safe_downcast<dest_t, src_t>`
+# (`ATen/native/Pool.h`), which every pooling kernel runs over the figures it
+# has to hand to a 32-bit launcher — including, on CUDA,
+# `safe_downcast<int32_t, int64_t>(output.numel())` in
+# `DilatedMaxPool2d.cu`'s `max_pool2d_with_indices` forward. That is the one
+# run2's probes met: easyOCR's CRAFT detector at batch 29 of 2560-bounded
+# pages (`run2-probes-report.md`, S1).
+#
+# `canuse32bitindexmath` is the same ceiling stated by the other family of
+# kernels that assert on it rather than downcasting.
+INDEX_LIMIT_MARKERS = ("integer out of range", "canuse32bitindexmath")
+
+_total_index_limit_events = 0
+
+
+def total_index_limit_events() -> int:
+    """Kernel-index-ceiling events this process has seen, monotonically.
+
+    An *event* is one batch that could not be executed at the size it was
+    formed at because a kernel's 32-bit element index would have overflowed:
+    either [`run_with_oom_retry`] halving on such a failure, or an impl
+    capping a batch up front from its own ceiling formula
+    ([`note_index_limit_event`]).
+
+    Read by the worker's packing harness and by `ceiling_probe.py` the same
+    way [`total_oom_halvings`] is — diffed across one `predict` call, through
+    `sys.modules`, never imported. It is deliberately a **separate** counter:
+    an index ceiling is size-dependent, so it halves like an out-of-memory
+    condition, but it is not one, and reporting it as one would deflate a
+    model that has plenty of memory (protocol doc, "Memory sensing").
+
+    Monotonic and never reset, for the same reason `total_oom_halvings` is.
+    """
+    return _total_index_limit_events
+
+
+def note_index_limit_event() -> None:
+    """Record that a batch was shrunk by a kernel's index ceiling.
+
+    Called by [`run_with_oom_retry`] when it halves on such a failure, and by
+    an impl that computes the ceiling in advance and caps its own batch
+    rather than letting the kernel raise. Both are the same fact for the
+    orchestrator: this batch did not execute at the size it was formed at,
+    for a reason that is not memory.
+    """
+    global _total_index_limit_events
+    _total_index_limit_events += 1
+
+
+def looks_like_index_limit(exc: BaseException) -> bool:
+    """Whether an exception is a kernel's 32-bit index ceiling, by its text.
+
+    Scans the exception and its `__cause__`/`__context__`, as
+    [`looks_like_oom`] does, against [`INDEX_LIMIT_MARKERS`].
+
+    Deliberately narrow where `looks_like_oom` is deliberately broad. Both
+    decide "retry this at half the size", and both err in the direction that
+    costs one wasted attempt rather than a lost backstop — but this one also
+    decides that a failure is **not** a memory event, and a false positive
+    there would hide a genuine out-of-memory condition from the
+    orchestrator's deflation path. So it matches only strings torch emits for
+    an index overflow and nothing that merely sounds like one, and
+    [`run_with_oom_retry`] consults it only *after* every out-of-memory test
+    has already declined the exception.
+    """
+    for error in (exc, exc.__cause__, exc.__context__):
+        if error is None:
+            continue
+        lowered = str(error).lower()
+        if any(marker in lowered for marker in INDEX_LIMIT_MARKERS):
+            return True
+    return False
+
+
 def run_with_oom_retry(
     process_chunk,
     items,
@@ -476,6 +555,17 @@ def run_with_oom_retry(
       cheaper than the alternative of a missed backstop on the backends
       that have no other one.
 
+    **A fourth condition halves without being an OOM at all**: a kernel
+    whose 32-bit element index cannot address the tensor the chunk builds
+    ([`looks_like_index_limit`]). It is size-dependent, so the same halving
+    is the right response; it is not a memory condition, so it increments
+    [`total_index_limit_events`] and deliberately **not** the halving counter
+    the worker reads as the `oom` flag — reporting it as an out-of-memory
+    negative would deflate a model on a board with tens of GB free. At a
+    single item it propagates untouched rather than becoming an
+    `InferenceOOMError`, because a batch of one that overflows an index is
+    not something a smaller batch can fix.
+
     Every call records what it actually executed for `last_oom_retry` — the
     largest chunk that ran and how many halvings it took to get there. The
     record is reset at entry so a failed or empty call cannot leave the
@@ -522,11 +612,37 @@ def run_with_oom_retry(
                 or isinstance(err, MemoryError)
                 or looks_like_oom(err)
             ):
-                # Not an out-of-memory condition: an assertion, a bad input, a
-                # processor that rejected something. Halving would run it
-                # again at half the size and fail again, hiding the real
-                # error behind a retry loop.
-                raise
+                if not looks_like_index_limit(err):
+                    # Not an out-of-memory condition and not a shape ceiling:
+                    # an assertion, a bad input, a processor that rejected
+                    # something. Halving would run it again at half the size
+                    # and fail again, hiding the real error behind a retry
+                    # loop.
+                    raise
+                # A kernel's 32-bit element index overflowed. Size-dependent,
+                # so halving is exactly the right response — but it is *not*
+                # a memory event, so it must not touch `halvings`, which is
+                # what the harness reads as the `oom` flag. No `clear_cache()`
+                # either: nothing here is short of memory, and emptying the
+                # allocator would cost a synchronise for no reason.
+                if len(chunk) == 1:
+                    # One input alone exceeds the kernel's index range. There
+                    # is no smaller batch to fall back to, and it is not an
+                    # out-of-memory condition, so it must not be re-raised as
+                    # `InferenceOOMError`: the caller's own fallback (or the
+                    # orchestrator) has to see it for what it is.
+                    raise
+                chunk_size = max(1, len(chunk) // 2)
+                note_index_limit_event()
+                log.warning(
+                    "a kernel's 32-bit element index overflowed on a chunk of "
+                    "%d inputs; retrying at %d. This is a shape ceiling, not "
+                    "an out-of-memory condition, and is not reported as one.",
+                    len(chunk),
+                    chunk_size,
+                    exc_info=True,
+                )
+                continue
             clear_cache()
             if len(chunk) == 1:
                 raise InferenceOOMError(
