@@ -1640,6 +1640,16 @@
               }
             }
           },
+          "413": {
+            "description": "The request body is larger than this server will read. Send fewer inputs per request; re-sending the same body will get the same answer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Missing required `data` form field",
             "content": {
@@ -1652,6 +1662,16 @@
           },
           "500": {
             "description": "Model load or prediction failure. `detail` is a plain string for an ordinary failure and an object carrying a machine-readable `kind` for the ones a caller must act on differently — `worker_died` says the inference worker process died with the request in flight, so the request's items were never attempted and re-submitting them is correct.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InferenceErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Temporarily refused, with a `Retry-After`. `kind = \"body_budget_exhausted\"` means the server is already holding its whole predict-body budget in memory, so this body was never read and its items were never attempted — re-submit it. `kind = \"load_cooldown\"` is the opposite case and must not be retried before `retry_at`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7972,7 +7992,8 @@
           "gpus",
           "vram",
           "load_cooldowns",
-          "inference_clients"
+          "inference_clients",
+          "predict_body_budget"
         ],
         "properties": {
           "gpus": {
@@ -8007,6 +8028,10 @@
               "$ref": "#/components/schemas/ModelHealth"
             },
             "description": "Per loaded model liveness/queue snapshot, sorted by inference_id."
+          },
+          "predict_body_budget": {
+            "$ref": "#/components/schemas/PredictBodyBudgetHealth",
+            "description": "The inference **server** side's one memory bound that a peer can move:\nhow much of this process's predict-body budget is spoken for, and how\noften it has had to refuse a request. See\n[`crate::inferio::http::PREDICT_INFLIGHT_BODY_BYTES`]."
           },
           "prewarm": {
             "$ref": "#/components/schemas/PrewarmHealth",
@@ -10863,6 +10888,42 @@
               "last_modified",
               "type"
             ]
+          }
+        }
+      },
+      "PredictBodyBudgetHealth": {
+        "type": "object",
+        "description": "What this process's predict-body budget is doing right now, for\n`/health`.\n\nA refusal is a `503` an operator will see in a job's logs, so the state\nthat produced it has to be readable somewhere that is not a guess. The\npair to watch is `in_flight_bytes` against `budget_bytes`: a job that is\nbeing refused while the first is far below the second is being refused by\na *burst* rather than by a level, and the answer is the caller's request\nsizing, not this number.",
+        "required": [
+          "request_limit_bytes",
+          "budget_bytes",
+          "in_flight_bytes",
+          "refused_requests"
+        ],
+        "properties": {
+          "budget_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "[`PREDICT_INFLIGHT_BODY_BYTES`]: predict body bytes this process will\nhold at once, across every connection and peer.",
+            "minimum": 0
+          },
+          "in_flight_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Of those, how many are reserved right now — bodies arriving, plus\nbodies being parsed.",
+            "minimum": 0
+          },
+          "refused_requests": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Predict requests refused for want of budget since this process\nstarted. `0` is the number an operator should expect to see.",
+            "minimum": 0
+          },
+          "request_limit_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "[`PREDICT_BODY_LIMIT`]: the largest single predict body this server\nwill read, past which it answers `413`.",
+            "minimum": 0
           }
         }
       },

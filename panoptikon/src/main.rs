@@ -784,15 +784,18 @@ async fn async_main() -> anyhow::Result<()> {
 ///   every common server default (nginx 128, Envoy 100, hyper 200), so this
 ///   server is never the tightest limit in a chain it is part of.
 ///
-/// **The bound in the other direction.** A stream is not free: since
-/// `7e96de62` the predict handler buffers the whole multipart body before
-/// parsing it, so an open predict stream can hold up to
-/// [`inferio::http::PREDICT_BODY_LIMIT`] of server memory. 512 is therefore
-/// also the statement "one connection may pin at most 512 request bodies",
-/// which is a number an operator can multiply; before this it was 200 and
-/// nobody could have said so. Bounding the *aggregate* buffered predict
-/// bytes across streams would need a byte admission budget on the handler,
-/// which this does not add.
+/// **The bound in the other direction is not this number.** A stream is not
+/// free: since `7e96de62` the predict handler buffers the whole multipart
+/// body before parsing it, so an open predict stream can hold up to
+/// [`inferio::http::PREDICT_BODY_LIMIT`] of server memory. It is tempting to
+/// read `512 x 2 GiB` as the memory statement that follows, and that would be
+/// wrong twice over: nothing limits how many *connections* a peer opens, so
+/// the product bounds nothing, and a terabyte is not a budget anybody can
+/// act on. What actually bounds the memory is
+/// [`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`], which is charged across
+/// every stream and every peer and answers `503` when it is out. This number
+/// is a *concurrency* policy, and it is written down for the reason run2's S1
+/// exists: a ceiling no layer can name is not a policy.
 pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 512;
 
 /// Serve `app` on `listener` until `shutdown` resolves, then drain.

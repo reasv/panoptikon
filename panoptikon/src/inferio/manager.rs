@@ -524,6 +524,11 @@ pub struct HealthReport {
     /// what the transport under it will actually carry. Run2's S1 was
     /// precisely a disagreement between the two that neither half could see.
     pub inference_clients: Vec<crate::inferio_client::InferenceTransportHealth>,
+    /// The inference **server** side's one memory bound that a peer can move:
+    /// how much of this process's predict-body budget is spoken for, and how
+    /// often it has had to refuse a request. See
+    /// [`crate::inferio::http::PREDICT_INFLIGHT_BODY_BYTES`].
+    pub predict_body_budget: crate::inferio::http::PredictBodyBudgetHealth,
 }
 
 /// One model's load-failure cooldown in the [`HealthReport`] (R9). This is
@@ -1579,6 +1584,7 @@ impl ModelManager {
             vram,
             load_cooldowns,
             inference_clients: crate::inferio_client::endpoint_health(),
+            predict_body_budget: crate::inferio::http::predict_body_budget_health(),
         }
     }
 

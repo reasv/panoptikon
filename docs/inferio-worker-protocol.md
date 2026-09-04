@@ -611,6 +611,22 @@ largest figure it publishes divided by the items it expects per request, and
 a client must not treat a published figure as evidence that the transport
 will carry it.
 
+**A stream limit is not a memory limit, and this implementation does not
+pretend otherwise.** The predict handler buffers each request body before
+parsing it, so an admitted stream holds bytes; but the number of connections
+a peer may open is unbounded, so "streams per connection x bytes per body"
+bounds nothing. Memory is bounded where it is actually consumed: this
+implementation charges every predict body against a process-wide budget
+(`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`, 4 GiB — four gateways' worth
+of the default `intermediate_data_budget_mb`, and twice the largest single
+body it will accept) **before** it reads the bytes, and answers `503` with a
+`Retry-After` and `detail.kind = "body_budget_exhausted"` when it is out.
+That kind is one of the three that mean *the batch was never parsed and was
+never attempted*, so a caller re-submits it exactly as it re-submits a
+`worker_died` or a `request_incomplete` request rather than recording a
+failure against the media. `/health` reports the budget, what is reserved
+right now, and how many requests have ever been refused.
+
 ### Memory sensing (optional response fields)
 
 Added for batch calibration (`docs/batch-calibration-design.md`): the worker

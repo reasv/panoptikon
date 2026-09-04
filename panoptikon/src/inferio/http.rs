@@ -43,6 +43,7 @@
 //! upstream like every other inference path (a Python upstream 404s it —
 //! fine, the endpoint has no Python counterpart).
 
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -118,6 +119,20 @@ pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
 /// changes nothing) from "your bytes did not all get here" (retrying is the
 /// whole answer) — a distinction the status alone cannot carry.
 pub(crate) const REQUEST_INCOMPLETE_KIND: &str = "request_incomplete";
+
+/// `detail.kind` of a predict this server **declined to read**, because it is
+/// already holding [`PREDICT_INFLIGHT_BODY_BYTES`] of other predict bodies in
+/// memory.
+///
+/// The third way a predict can end without being attempted, and the only one
+/// of the three that is a statement about *this server* rather than about a
+/// worker or a connection: nothing is wrong with the request, there was
+/// simply no room to buffer it. It rides on a `503` with a `Retry-After`,
+/// which is what a temporarily-full server owes a caller, and it is a
+/// separate token from the other two for the same reason they are separate
+/// from each other — a log line that blames a broken body for an overloaded
+/// server sends the next reader to the wrong place.
+pub(crate) const BODY_BUDGET_KIND: &str = "body_budget_exhausted";
 
 /// Every rendering that means **this predict never reached a model**, so the
 /// request's items are untouched and re-submitting them is the correct answer.
@@ -554,16 +569,137 @@ fn accelerator_backend(accelerator: crate::config::Accelerator) -> &'static str 
 /// the worker protocol ever holds. Refusing it at the door with a `413` is
 /// strictly better than buffering it and failing later.
 ///
-/// Read with [`crate::MAX_CONCURRENT_STREAMS`]: the two together are the
-/// statement "one connection may pin at most 512 request bodies of at most
-/// 2 GiB". That product is a worst case against an arbitrary peer, not a
-/// memory budget — the shipped client chunks predicts at
-/// `REQUEST_UNIT_BUDGET` (64) units and offers one connection at most
-/// `H2_STREAMS_PER_CONNECTION` (64) streams. **Residual, stated rather than
-/// fixed:** a 64-input request whose inputs each exceed 32 MiB would be
-/// refused where it used to be served; bounding aggregate buffered predict
-/// bytes instead would need a byte admission budget on this handler.
+/// **It bounds one request, and it is sized for the largest legitimate one:
+/// a request carrying a single input.** `check_frame_budget` admits an input
+/// up to `FRAME_INPUT_BYTES_BUDGET` (this figure minus 8 MiB), and multipart
+/// adds only a couple of hundred bytes of envelope per part, so a one-input
+/// predict can legitimately come within that margin of this limit. Anything
+/// lower would refuse a request the job builds and has already committed to;
+/// anything higher would admit a body the worker frame could not carry. It is
+/// deliberately **not** derived from "64 inputs per request", which is the
+/// other legitimate shape: 64 x the largest input is 128 GiB, a number that
+/// bounds nothing.
+///
+/// **It is not, on its own, a memory bound**, and it never was. There is no
+/// limit on how many connections a peer opens, so
+/// `MAX_CONCURRENT_STREAMS x PREDICT_BODY_LIMIT` is not a ceiling either —
+/// it is one connection's worth of an unbounded number. The ceiling is
+/// [`PREDICT_INFLIGHT_BODY_BYTES`], which bounds the sum across every stream
+/// and every peer; this limit's job is to decide *per request* what is
+/// plausible, and to answer `413` rather than `503` when it is not.
 pub(crate) const PREDICT_BODY_LIMIT: usize = MAX_FRAME_BYTES;
+
+/// **Predict request bytes this process holds in memory at once**, summed
+/// across every connection, every stream and every peer.
+///
+/// This is the bound [`PREDICT_BODY_LIMIT`] cannot be. A per-request limit
+/// multiplied by a stream limit is not a memory budget when nothing bounds
+/// the number of connections — and even against one connection,
+/// `512 x 2 GiB` is a terabyte, which is a statement about arithmetic rather
+/// than about this machine. Since `7e96de62` the handler buffers each body
+/// before parsing it, so "how much can arrive at once" is a question with a
+/// real answer, and it has one.
+///
+/// **The number, derived from what the shipped client can legitimately
+/// offer.** A gateway job holds at most `[jobs] intermediate_data_budget_mb`
+/// (1 GiB by default) of loaded item data at a time — `jobs::extraction`
+/// takes that byte budget *before* a unit permit, so it bounds the item bytes
+/// in flight, which are exactly the bytes its predict bodies carry. Four
+/// times it covers four gateways at the shipped default running against one
+/// inference server, which is more than the deployment this exists for (a NAS
+/// and a GPU box) ever has. It is also `2 x PREDICT_BODY_LIMIT`, which is the
+/// property that keeps the budget from being a trap: the largest request this
+/// server will accept can always be admitted beside another one of the same
+/// size, so no legitimate request is ever permanently unadmittable.
+///
+/// **The worst case, honestly.** The budget counts bytes as they arrive. A
+/// body being *parsed* is briefly resident twice — the collected buffer, plus
+/// the per-field copies `parse_input_request` takes out of it — so the
+/// resident peak this admits is up to twice the budget, ~8 GiB, and only if
+/// every admitted byte is mid-parse at the same instant. Steady state for the
+/// job this serves is a few hundred KiB per request over a few hundred
+/// concurrent requests: two orders of magnitude below it.
+///
+/// **What happens at the wall.** The request is refused with `503` and a
+/// `Retry-After`, typed so the caller knows the batch was never parsed
+/// ([`crate::inferio_client::BODY_BUDGET_KIND`]) — the same assertion
+/// `worker_died` and `request_incomplete` make, and it earns the same
+/// recovery. It is never a wait: waiting would hold the stream open, which is
+/// the very thing `7e96de62` is about, and it would convert an overload into
+/// an unbounded latency instead of an answer.
+pub(crate) const PREDICT_INFLIGHT_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+const _: () = assert!(
+    PREDICT_INFLIGHT_BODY_BYTES >= 2 * PREDICT_BODY_LIMIT,
+    "the in-flight budget must admit two maximal bodies, or a maximal request \
+     can be refused for as long as another one is in flight"
+);
+
+/// The budget itself. Process-wide because the resource is: both listener
+/// modes (gateway and `panoptikon inferio`) mount this router, and a bound
+/// that is per-router is not a bound on the machine's memory.
+static PREDICT_BODY_BYTES: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(PREDICT_INFLIGHT_BODY_BYTES);
+
+/// Predict bodies refused for want of budget, ever. Reported on `/health`,
+/// because a bound nobody can see is indistinguishable from a bug — which is
+/// the whole lesson of run2 S1.
+static PREDICT_BODY_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// What this process's predict-body budget is doing right now, for
+/// `/health`.
+///
+/// A refusal is a `503` an operator will see in a job's logs, so the state
+/// that produced it has to be readable somewhere that is not a guess. The
+/// pair to watch is `in_flight_bytes` against `budget_bytes`: a job that is
+/// being refused while the first is far below the second is being refused by
+/// a *burst* rather than by a level, and the answer is the caller's request
+/// sizing, not this number.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct PredictBodyBudgetHealth {
+    /// [`PREDICT_BODY_LIMIT`]: the largest single predict body this server
+    /// will read, past which it answers `413`.
+    pub request_limit_bytes: u64,
+    /// [`PREDICT_INFLIGHT_BODY_BYTES`]: predict body bytes this process will
+    /// hold at once, across every connection and peer.
+    pub budget_bytes: u64,
+    /// Of those, how many are reserved right now — bodies arriving, plus
+    /// bodies being parsed.
+    pub in_flight_bytes: u64,
+    /// Predict requests refused for want of budget since this process
+    /// started. `0` is the number an operator should expect to see.
+    pub refused_requests: u64,
+}
+
+/// The budget's current state, read off the semaphore itself rather than off
+/// a counter kept beside it — there is only ever one truth about how much is
+/// reserved.
+pub(crate) fn predict_body_budget_health() -> PredictBodyBudgetHealth {
+    budget_health(
+        PREDICT_BODY_BYTES.available_permits(),
+        PREDICT_BODY_REFUSALS.load(Relaxed),
+    )
+}
+
+/// The mapping from "what the semaphore says" to what `/health` reports, as
+/// a pure function so it can be asserted without racing the process-wide
+/// budget every other test in this binary is also using.
+fn budget_health(available: usize, refusals: u64) -> PredictBodyBudgetHealth {
+    PredictBodyBudgetHealth {
+        request_limit_bytes: PREDICT_BODY_LIMIT as u64,
+        budget_bytes: PREDICT_INFLIGHT_BODY_BYTES as u64,
+        in_flight_bytes: PREDICT_INFLIGHT_BODY_BYTES.saturating_sub(available) as u64,
+        refused_requests: refusals,
+    }
+}
+
+/// Bytes the budget hands out at a time when the body declares no length.
+///
+/// A body with a `Content-Length` reserves once, exactly. A chunked one has
+/// to be charged as it arrives, and charging per frame would take the
+/// semaphore thousands of times for one body; a 1 MiB granularity makes it a
+/// handful, and over-reserves by less than one granule.
+const PREDICT_BODY_RESERVE_GRANULE: usize = 1024 * 1024;
 
 /// The inference routes, path-relative so they can be nested under
 /// `/api/inference` (gateway and standalone mode mount the same router).
@@ -727,10 +863,9 @@ struct CacheListResponse {
 /// What it costs is one extra resident copy of the body: `predict` already
 /// copies every field into a `Vec` before the batch runs, and the collected
 /// bytes now stay alive beside those copies until the parse is done. That
-/// is the same order as the batch this surface is about to hold in memory
-/// anyway, and it is bounded by the caller exactly as the field copies
-/// already were — this router disables the body limit, because a predict
-/// batch is legitimately large.
+/// cost is what [`PREDICT_INFLIGHT_BODY_BYTES`] bounds, per request through
+/// [`PREDICT_BODY_LIMIT`] and in aggregate through the reservation this
+/// holds.
 struct BufferedMultipart {
     multipart: Multipart,
     /// The collected body, kept so a failed parse can say *why* it failed.
@@ -739,11 +874,82 @@ struct BufferedMultipart {
     /// The boundary the request's `Content-Type` declared, when it declared
     /// a usable one.
     boundary: Option<String>,
+    /// The bytes this body holds out of the process-wide budget, returned
+    /// when the parse is done and this is dropped. Not read; owned.
+    _reservation: BodyReservation,
+}
+
+/// One request's claim on [`PREDICT_INFLIGHT_BODY_BYTES`], returned by
+/// `Drop` so every exit path — a refusal, a stream failure, a parse failure,
+/// a cancelled request — accounts for itself without a single explicit
+/// release.
+///
+/// It grows: a body that declares its length reserves once, and one that
+/// does not is charged in [`PREDICT_BODY_RESERVE_GRANULE`] steps as it
+/// arrives. Growth is always **try**, never a wait, so two half-reserved
+/// bodies can never wait on each other — an exhausted budget is answered,
+/// not queued.
+struct BodyReservation {
+    /// The budget this draws on. A parameter rather than a reference to the
+    /// static, so a test can exercise exhaustion without starving every other
+    /// request in the process (which is the same class of cross-test
+    /// interference the `/health` client section's `try_lock` caused).
+    budget: &'static tokio::sync::Semaphore,
+    permit: Option<tokio::sync::SemaphorePermit<'static>>,
+}
+
+impl BodyReservation {
+    fn new(budget: &'static tokio::sync::Semaphore) -> Self {
+        Self {
+            budget,
+            permit: None,
+        }
+    }
+
+    fn held(&self) -> usize {
+        self.permit
+            .as_ref()
+            .map_or(0, |permit| permit.num_permits())
+    }
+
+    /// Reserve up to `wanted` bytes in total for this body, or say the budget
+    /// is out. Idempotent below what is already held.
+    fn reserve(&mut self, wanted: usize) -> Result<(), PredictBodyError> {
+        let held = self.held();
+        let Some(extra) = wanted.checked_sub(held).filter(|extra| *extra > 0) else {
+            return Ok(());
+        };
+        let extra = u32::try_from(extra).unwrap_or(u32::MAX);
+        match self.budget.try_acquire_many(extra) {
+            Ok(permit) => {
+                match &mut self.permit {
+                    Some(existing) => existing.merge(permit),
+                    slot @ None => *slot = Some(permit),
+                }
+                Ok(())
+            }
+            Err(_) => {
+                let refusals = PREDICT_BODY_REFUSALS.fetch_add(1, Relaxed) + 1;
+                tracing::warn!(
+                    wanted,
+                    held,
+                    budget_bytes = PREDICT_INFLIGHT_BODY_BYTES,
+                    available_bytes = self.budget.available_permits(),
+                    refusals,
+                    "refusing a predict body: this process is already holding its \
+                     whole predict-body budget in memory. The batch was never \
+                     parsed, so the caller may re-submit it"
+                );
+                Err(PredictBodyError::Overloaded)
+            }
+        }
+    }
 }
 
 /// Why a predict body could not be read as a batch. Typed and small so the
 /// *decision* (below) and the *rendering* (in `IntoResponse`) stay separate
 /// — and so the one distinction a caller acts on is made in one place.
+#[derive(Debug)]
 enum PredictBodyError {
     /// Every byte arrived and they are not a valid batch. An ordinary 400:
     /// asking again produces the same answer.
@@ -758,6 +964,11 @@ enum PredictBodyError {
     /// about the request rather than about the media: the caller has to send
     /// a smaller batch, and re-sending the same one will not help.
     TooLarge,
+    /// This process is already holding [`PREDICT_INFLIGHT_BODY_BYTES`] of
+    /// predict bodies. A `503` with a `Retry-After`: nothing about this
+    /// request is wrong, there is simply no room to read it right now, and
+    /// re-sending it *is* the answer.
+    Overloaded,
 }
 
 impl IntoResponse for PredictBodyError {
@@ -793,36 +1004,102 @@ impl IntoResponse for PredictBodyError {
                 ),
             )
             .into_response(),
+            Self::Overloaded => {
+                let mut response = structured_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    InferenceErrorFields {
+                        kind: BODY_BUDGET_KIND.to_owned(),
+                        message: Some(format!(
+                            "the server is already holding its whole {} MiB predict-body \
+                             budget; this batch was not read and was not attempted",
+                            PREDICT_INFLIGHT_BODY_BYTES / (1024 * 1024)
+                        )),
+                        ..Default::default()
+                    },
+                );
+                // A figure the caller can act on rather than a bare 503: the
+                // budget is released by requests that are already being
+                // parsed, so the wait is short and bounded by them.
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+                response
+            }
         }
     }
 }
 
-/// Collect a request body under an explicit ceiling, keeping the three
-/// outcomes distinct.
+/// Collect a request body under a per-request ceiling **and** the
+/// process-wide byte budget, keeping the four outcomes distinct.
 ///
 /// The `DefaultBodyLimit` layer cannot do this job for [`predict`]: it is
 /// enforced by `Bytes::from_request`, and this route deliberately collects the
 /// raw body itself so a *truncated* body can be told apart from a *malformed*
-/// one (`7e96de62`). "Whole, and larger than we will hold" is a third thing,
-/// and it earns its own status rather than being reported as either of the
-/// other two — a caller must shrink the batch, not re-send it.
-async fn collect_within(body: Body, limit: usize) -> Result<axum::body::Bytes, PredictBodyError> {
-    match http_body_util::Limited::new(body, limit).collect().await {
-        Ok(collected) => Ok(collected.to_bytes()),
-        Err(err)
-            if err
-                .downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some() =>
-        {
-            Err(PredictBodyError::TooLarge)
+/// one (`7e96de62`). "Whole, and larger than we will hold" and "whole, and
+/// there is no room to hold it right now" are two further things, and each
+/// earns its own status rather than being reported as one of the others: the
+/// first says shrink the batch, the second says send the same batch again in
+/// a moment.
+///
+/// The budget is charged **before the bytes are read**, from
+/// `Content-Length` where there is one and in
+/// [`PREDICT_BODY_RESERVE_GRANULE`] steps where there is not, so a body is
+/// never admitted into memory the process has not already accounted for. A
+/// declared length over `limit` is refused without reading a byte of it.
+async fn collect_within(
+    body: Body,
+    limit: usize,
+    budget: &'static tokio::sync::Semaphore,
+) -> Result<(axum::body::Bytes, BodyReservation), PredictBodyError> {
+    use axum::body::HttpBody as _;
+
+    let mut reservation = BodyReservation::new(budget);
+    // The declared length, when the body declares one — every request the
+    // shipped client builds does, because `reqwest`'s multipart form is
+    // assembled from in-memory parts and sizes itself. A declared length is
+    // charged once and exactly; only an undeclared body pays the granule.
+    let declared = body.size_hint().exact();
+    let granule = if declared.is_some() {
+        1
+    } else {
+        PREDICT_BODY_RESERVE_GRANULE
+    };
+    if let Some(declared) = declared {
+        let declared = usize::try_from(declared).unwrap_or(usize::MAX);
+        if declared > limit {
+            return Err(PredictBodyError::TooLarge);
         }
-        // The body stream itself failed: nothing was parsed, so nothing was
-        // attempted.
-        Err(err) => Err(PredictBodyError::Incomplete(format!(
-            "the request body stream failed: {}",
-            error_chain(err.as_ref())
-        ))),
+        reservation.reserve(declared)?;
     }
+    let mut body = std::pin::pin!(body);
+    let mut collected = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            // The body stream itself failed: nothing was parsed, so nothing
+            // was attempted.
+            Err(err) => {
+                return Err(PredictBodyError::Incomplete(format!(
+                    "the request body stream failed: {}",
+                    error_chain(&err)
+                )));
+            }
+        };
+        // Trailers carry no payload; a body that ends in them is complete.
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let wanted = collected.len().saturating_add(data.len());
+        if wanted > limit {
+            return Err(PredictBodyError::TooLarge);
+        }
+        // A no-op when the declared length already covered this, and the
+        // real charge when there was none — or when a peer sent more than it
+        // said it would.
+        reservation.reserve(wanted.next_multiple_of(granule).min(limit))?;
+        collected.extend_from_slice(&data);
+    }
+    Ok((axum::body::Bytes::from(collected), reservation))
 }
 
 impl<S> FromRequest<S> for BufferedMultipart
@@ -838,7 +1115,8 @@ where
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(multipart_boundary);
-        let bytes = collect_within(body, PREDICT_BODY_LIMIT).await?;
+        let (bytes, reservation) =
+            collect_within(body, PREDICT_BODY_LIMIT, &PREDICT_BODY_BYTES).await?;
         let request = Request::from_parts(parts, Body::from(bytes.clone()));
         Multipart::from_request(request, state)
             .await
@@ -846,6 +1124,7 @@ where
                 multipart,
                 body: bytes,
                 boundary,
+                _reservation: reservation,
             })
             .map_err(|rejection| {
                 // No usable boundary in the content type. Nothing about the
@@ -1044,7 +1323,15 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
             plain string for an ordinary failure and an object carrying a machine-readable \
             `kind` for the ones a caller must act on differently — `worker_died` says the \
             inference worker process died with the request in flight, so the request's items \
-            were never attempted and re-submitting them is correct.", body = InferenceErrorBody)
+            were never attempted and re-submitting them is correct.", body = InferenceErrorBody),
+        (status = 413, description = "The request body is larger than this server will \
+            read. Send fewer inputs per request; re-sending the same body will get the \
+            same answer.", body = crate::api_error::ErrorBody),
+        (status = 503, description = "Temporarily refused, with a `Retry-After`. \
+            `kind = \"body_budget_exhausted\"` means the server is already holding its \
+            whole predict-body budget in memory, so this body was never read and its \
+            items were never attempted — re-submit it. `kind = \"load_cooldown\"` is the \
+            opposite case and must not be retried before `retry_at`.", body = InferenceErrorBody)
     )
 )]
 async fn predict(
@@ -2641,6 +2928,22 @@ metadata.description = "batch size reporter"
         );
         assert_eq!(endpoint.connections_in_use, Some(0));
 
+        // The server side's one peer-movable memory bound. The predict above
+        // has been answered, so its body's reservation is back; what stays is
+        // the pair of constants an operator needs to read a 503 against.
+        assert_eq!(
+            health.predict_body_budget.budget_bytes,
+            PREDICT_INFLIGHT_BODY_BYTES as u64
+        );
+        assert_eq!(
+            health.predict_body_budget.request_limit_bytes,
+            PREDICT_BODY_LIMIT as u64
+        );
+        assert!(
+            health.predict_body_budget.in_flight_bytes <= PREDICT_INFLIGHT_BODY_BYTES as u64,
+            "a reservation is returned when its request is answered"
+        );
+
         // Standalone (subcommand) mounting: bare /health, same handler.
         let standalone = standalone_router(Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3125,25 +3428,148 @@ metadata.cost.unit = "none"
     /// of re-submitting the same one forever.
     ///
     /// Asserted on [`collect_within`] with a small limit rather than by
-    /// sending [`PREDICT_BODY_LIMIT`] bytes: the mapping from
-    /// `LengthLimitError` to the status is the whole of the behaviour, and
-    /// the constant is checked separately below.
+    /// sending [`PREDICT_BODY_LIMIT`] bytes: the mapping from an over-long
+    /// body to the status is the whole of the behaviour, and the constant is
+    /// checked separately below.
     #[tokio::test]
     async fn a_predict_body_over_the_limit_is_too_large_not_malformed() {
-        let over = collect_within(Body::from(vec![b'x'; 64]), 32).await;
+        let over = collect_within(Body::from(vec![b'x'; 64]), 32, &PREDICT_BODY_BYTES).await;
         assert!(matches!(over, Err(PredictBodyError::TooLarge)));
         let response = PredictBodyError::TooLarge.into_response();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-        let exact = collect_within(Body::from(vec![b'x'; 32]), 32).await;
+        let exact = collect_within(Body::from(vec![b'x'; 32]), 32, &PREDICT_BODY_BYTES).await;
         assert!(
-            matches!(&exact, Ok(bytes) if bytes.len() == 32),
+            matches!(&exact, Ok((bytes, _)) if bytes.len() == 32),
             "a body exactly at the limit is not over it"
         );
 
+        // A body that declares no length at all is charged and bounded as it
+        // arrives, so the limit does not depend on a peer being honest about
+        // `Content-Length` — nor on it sending one.
+        let chunked = Body::from_stream(futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(&[b'x'; 24])),
+            Ok(axum::body::Bytes::from_static(&[b'x'; 24])),
+        ]));
+        assert!(
+            matches!(
+                collect_within(chunked, 32, &PREDICT_BODY_BYTES).await,
+                Err(PredictBodyError::TooLarge)
+            ),
+            "an undeclared body is bounded by what arrives, not by what it claims"
+        );
+        let chunked_ok = Body::from_stream(futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(&[b'x'; 16])),
+            Ok(axum::body::Bytes::from_static(&[b'x'; 16])),
+        ]));
+        assert!(
+            matches!(
+                collect_within(chunked_ok, 32, &PREDICT_BODY_BYTES).await,
+                Ok((bytes, _)) if bytes.len() == 32
+            ),
+            "and it is not refused for arriving in pieces"
+        );
+
         // The shipped ceiling is the orchestrator's own frame wall, so a body
-        // it refuses could never have become a worker frame anyway.
+        // it refuses could never have become a worker frame anyway — and it
+        // is sized for the largest legitimate *single-input* request, which
+        // `check_frame_budget` admits up to 8 MiB below it.
         assert_eq!(PREDICT_BODY_LIMIT, MAX_FRAME_BYTES);
+        assert!(crate::inferio::worker::FRAME_INPUT_BYTES_BUDGET < PREDICT_BODY_LIMIT);
+    }
+
+    /// **The bound `PREDICT_BODY_LIMIT` cannot be: what this process holds in
+    /// predict bodies at once, across every connection and every peer.**
+    ///
+    /// A per-request limit times a per-connection stream limit is not a
+    /// memory bound — nothing limits how many connections a peer opens, and
+    /// even for one connection `512 x 2 GiB` is a statement about arithmetic.
+    /// So the aggregate is a budget, charged before the bytes are read; and
+    /// because a body that cannot be admitted must be *answered* rather than
+    /// queued (a wait would hold the request stream open, which is the whole
+    /// of `7e96de62`), the refusal is a typed `503` the caller already knows
+    /// how to act on.
+    ///
+    /// Driven against a budget of the test's own, for the reason the whole
+    /// budget exists: exhausting the process-wide one would refuse every
+    /// other test's predicts in this binary. The semaphore is the only thing
+    /// substituted; the code under test, the counter and the rendering are
+    /// the production ones.
+    #[tokio::test]
+    async fn the_predict_body_budget_is_a_process_wide_ceiling_that_answers_503() {
+        // Two maximal bodies fit, so a maximal request is never refused for
+        // as long as another maximal one is in flight.
+        assert!(PREDICT_INFLIGHT_BODY_BYTES >= 2 * PREDICT_BODY_LIMIT);
+
+        // A tiny stand-in for the real budget, leaked so it has the `'static`
+        // lifetime a reservation outlives its request with.
+        let budget: &'static tokio::sync::Semaphore =
+            Box::leak(Box::new(tokio::sync::Semaphore::new(64)));
+
+        // Hold everything but 8 bytes of it.
+        let mut hog = BodyReservation::new(budget);
+        hog.reserve(56)
+            .expect("an empty budget admits a whole body");
+        assert_eq!(budget.available_permits(), 8);
+
+        // 8 bytes still fit; the ninth does not, and is refused rather than
+        // waited on — this test would hang instead of failing if it waited.
+        let refusals_before = predict_body_budget_health().refused_requests;
+        let (fits, _) = collect_within(Body::from(vec![b'x'; 8]), PREDICT_BODY_LIMIT, budget)
+            .await
+            .expect("a body inside the remaining budget is read");
+        assert_eq!(fits.len(), 8);
+        let refused = collect_within(Body::from(vec![b'x'; 9]), PREDICT_BODY_LIMIT, budget).await;
+        assert!(matches!(refused, Err(PredictBodyError::Overloaded)));
+        assert!(
+            predict_body_budget_health().refused_requests > refusals_before,
+            "a refusal is counted where an operator can see it"
+        );
+
+        // And the report is the semaphore's own state, not a counter kept
+        // beside it. Asserted on the mapping, because the real budget is
+        // shared with every other test in this binary.
+        let health = budget_health(PREDICT_INFLIGHT_BODY_BYTES - 4096, 7);
+        assert_eq!(health.budget_bytes, PREDICT_INFLIGHT_BODY_BYTES as u64);
+        assert_eq!(health.request_limit_bytes, PREDICT_BODY_LIMIT as u64);
+        assert_eq!(health.in_flight_bytes, 4096);
+        assert_eq!(health.refused_requests, 7);
+        assert!(predict_body_budget_health().in_flight_bytes <= PREDICT_INFLIGHT_BODY_BYTES as u64);
+
+        // The refusal is a 503 with a retry delay and the kind the caller's
+        // `is_unattempted()` reads — the batch was never parsed, so its items
+        // are untouched.
+        let response = PredictBodyError::Overloaded.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER).unwrap(),
+            "1",
+            "a temporarily-full server owes the caller a delay"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let failure = crate::inferio_client::InferenceFailure::parse(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Some(1),
+            &String::from_utf8_lossy(&body),
+        );
+        assert_eq!(failure.kind.as_deref(), Some(BODY_BUDGET_KIND));
+        assert!(
+            failure.is_unattempted(),
+            "the items were never handed to a model, so the caller re-submits"
+        );
+        assert!(
+            !failure.is_load_cooldown(),
+            "and it is not the one 503 that must never be retried"
+        );
+
+        drop(hog);
+        assert_eq!(
+            budget.available_permits(),
+            64,
+            "every reservation is returned by Drop, on every path"
+        );
     }
 
     /// This body also stops before its closing delimiter, so it is the

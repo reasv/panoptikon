@@ -115,6 +115,17 @@ pub(crate) const LOAD_COOLDOWN_KIND: &str = "load_cooldown";
 /// these, recorded against an image that is perfectly fine.
 pub(crate) const REQUEST_INCOMPLETE_KIND: &str = "request_incomplete";
 
+/// `detail.kind` of a predict the server refused to **read** because it was
+/// already holding its whole predict-body budget in memory
+/// (`inferio::http::BODY_BUDGET_KIND`).
+///
+/// It rides on a 503 with a `Retry-After`, and it says the same thing the
+/// other two unattempted kinds say: the body was never parsed, so the items
+/// in it were never handed to a model. The difference is only in what the
+/// caller should expect — this one clears on its own as the bodies ahead of
+/// it finish parsing, which is why the server can name a retry delay at all.
+pub(crate) const BODY_BUDGET_KIND: &str = "body_budget_exhausted";
+
 /// A request the inference server refused, with the machine-readable half of
 /// its `{"detail": …}` body parsed out.
 ///
@@ -208,13 +219,20 @@ impl InferenceFailure {
         self.kind.as_deref() == Some(REQUEST_INCOMPLETE_KIND)
     }
 
-    /// **The request's items were never attempted.** The two kinds that say
-    /// so are different accidents — a worker that died holding the request,
-    /// and a request body that stopped arriving — but they are one fact for
-    /// every caller: nothing was run, nothing was decided about the media,
-    /// and re-submitting the work is the only answer that is not a lie about
-    /// it. Callers act on this rather than on either kind so that a third
-    /// way to never reach a model is one constant away from being handled.
+    /// The server refused to read the body: it was already holding its whole
+    /// predict-body budget.
+    pub fn is_body_budget_exhausted(&self) -> bool {
+        self.kind.as_deref() == Some(BODY_BUDGET_KIND)
+    }
+
+    /// **The request's items were never attempted.** The three kinds that say
+    /// so are different accidents — a worker that died holding the request, a
+    /// request body that stopped arriving, and a body the server had no room
+    /// to read — but they are one fact for every caller: nothing was run,
+    /// nothing was decided about the media, and re-submitting the work is the
+    /// only answer that is not a lie about it. Callers act on this rather
+    /// than on any one kind, which is what made the third one a constant and
+    /// a line rather than a change of policy.
     ///
     /// Deliberately keyed on the typed kind and never on the status. An
     /// untyped 4xx is not evidence of anything — a stock FastAPI upstream
@@ -222,7 +240,7 @@ impl InferenceFailure {
     /// of them would double the request cost of any systematic client bug
     /// while fixing nothing.
     pub fn is_unattempted(&self) -> bool {
-        self.is_worker_death() || self.is_request_incomplete()
+        self.is_worker_death() || self.is_request_incomplete() || self.is_body_budget_exhausted()
     }
 
     /// The model is inside its per-model load-failure cooldown.

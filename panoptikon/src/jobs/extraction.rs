@@ -1368,7 +1368,7 @@ async fn run_extraction_job_inner(
             );
             if guard.requeued_items > 0 {
                 reason.push_str(&format!(
-                    " ({} were re-queued after an inference worker died)",
+                    " ({} were re-queued after a predict that never reached a model)",
                     guard.requeued_items
                 ));
             }
@@ -2290,8 +2290,10 @@ async fn run_item_inference(
                     setter = setter_name,
                     units = inputs.len(),
                     error = %err,
-                    "the inference worker died with this item's request in flight; \
-                     re-queueing its work once instead of recording it as an error"
+                    "this item's predict was never attempted — the worker died \
+                     holding it, its body never arrived, or the server had no \
+                     room to read it; re-queueing its work once instead of \
+                     recording it as an error"
                 );
             }
         }
@@ -2332,7 +2334,8 @@ fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> Inferen
     InferenceRecovery::Fail
 }
 
-/// The one-line summary of a job that re-queued items after a worker death.
+/// The one-line summary of a job that re-queued items whose predicts were
+/// never attempted.
 ///
 /// Split out and pure so it can be asserted directly: the bug it fixes (run2
 /// finding C5) was not in the arithmetic but in the *claim* — the branch that
@@ -2350,7 +2353,8 @@ fn requeue_summary(
     abort_reason: Option<&str>,
     failure: JobFailure,
 ) -> String {
-    let head = format!("{requeued} items were re-queued after an inference worker died");
+    let head =
+        format!("{requeued} items were re-queued after a predict that never reached a model");
     match (abort_reason, failure) {
         (Some(reason), _) => format!("{head}; the job was then aborted: {reason}"),
         (None, JobFailure::Systemic) => format!(
@@ -4310,7 +4314,8 @@ mod tests {
         let completed = requeue_summary(12, 0, 2_000, None, JobFailure::None);
         assert_eq!(
             completed,
-            "12 items were re-queued after an inference worker died and then completed"
+            "12 items were re-queued after a predict that never reached a model \
+             and then completed"
         );
 
         let systemic = requeue_summary(2_000, 2_000, 2_000, None, JobFailure::Systemic);
@@ -4348,7 +4353,7 @@ mod tests {
     #[test]
     fn only_a_first_worker_death_buys_an_item_a_second_attempt() {
         use crate::inferio_client::{
-            LOAD_COOLDOWN_KIND, REQUEST_INCOMPLETE_KIND, WORKER_DIED_KIND,
+            BODY_BUDGET_KIND, LOAD_COOLDOWN_KIND, REQUEST_INCOMPLETE_KIND, WORKER_DIED_KIND,
         };
 
         assert_eq!(
@@ -4369,6 +4374,19 @@ mod tests {
         );
         assert_eq!(
             classify_item_failure(&typed_failure(Some(REQUEST_INCOMPLETE_KIND)), true),
+            InferenceRecovery::Fail,
+            "one retry per item, whichever way the request went unattempted"
+        );
+        // A 503 that says the server had no room to read the body is the
+        // third way a predict goes unattempted, and it spends the same
+        // budget: it is not a verdict about the media either.
+        assert_eq!(
+            classify_item_failure(&typed_failure(Some(BODY_BUDGET_KIND)), false),
+            InferenceRecovery::Requeue,
+            "a body the server never read was never attempted"
+        );
+        assert_eq!(
+            classify_item_failure(&typed_failure(Some(BODY_BUDGET_KIND)), true),
             InferenceRecovery::Fail,
             "one retry per item, whichever way the request went unattempted"
         );
