@@ -33,7 +33,9 @@ host = "127.0.0.1"
 # Port for the gateway listener. 6342 is the port the legacy Python server
 # used, so existing links and clients keep working.
 port = 6392  # CALIB: per-configuration port
-# If true, use X-Forwarded-Host / Forwarded to select policy host.
+# If true, use X-Forwarded-Host / Forwarded to select policy host. They
+# outrank the request's own authority; see the Policies section below for the
+# full precedence.
 trust_forwarded_headers = true
 
 # Test endpoint: same gateway, same routes, but the "test_endpoint" policy
@@ -248,6 +250,17 @@ allow = [
 
 # --------- Policies ---------
 # Policies are checked in order. First match wins.
+#
+# `hosts` is matched against the request's effective host, which is (in
+# precedence order) the forwarded host when trust_forwarded_headers is on,
+# else the authority of the request target, else the Host header. The
+# authority is what makes `hosts` work over HTTP/2, which carries it in the
+# `:authority` pseudo-header and sends no Host header at all (RFC 9113
+# §8.3.1) -- the gateway serves HTTP/2 cleartext on every listener, and its
+# own inference client speaks it. All three are client-chosen, so `hosts` is
+# routing convenience, not a trust boundary; `endpoints` (below) is the
+# non-spoofable one. A request with neither an authority nor a Host is
+# hostless and can only match a policy that states no `hosts`.
 
 # Requests arriving on the "test" endpoint (port 6343) are confined to the
 # "stdtest" DBs regardless of Host header. Must come before the localhost
@@ -282,40 +295,7 @@ allow = "*"
 default = "default"
 allow = "*"
 
-# CALIB deviation, run2: a hostless catch-all so the gateway's own inference
-# calls are not denied. R10' made `inferio_client` speak HTTP/2 cleartext to
-# the inference endpoint, and an HTTP/2 request carries its authority in the
-# `:authority` pseudo-header, never in `Host`. `policy::resolve_effective_host`
-# reads only `Host`, and `select_policy` requires a *matching* host whenever a
-# policy states any (`hosts.is_empty() || host.is_some_and(...)`), so every h2c
-# request matches no policy and is refused 403 `no_policy` -- including the
-# gateway's call to itself. With local inference that means
-# `POST /api/jobs/data/extraction` answers 500 ("failed to validate inference
-# external inputs error=inference request failed (403)") and no extraction job
-# can be created at all. Evidence:
-# results/run2/S2-wdvit-blocked-h2c403/. Only a policy that states *no* hosts
-# matches a hostless request -- `hosts = ["*"]` does not, since the wildcard is
-# only consulted when a host is present, and a policy with neither hosts nor
-# endpoints is rejected at config load ("policy 'x' must list at least one host
-# or endpoint"). So the one writable shape is an endpoint-scoped policy with no
-# hosts, below. The shipped `config/server/default.toml` has no such policy,
-# which is why this is a PRODUCT defect and is reported as one; the policy
-# below exists so the calibration legs can still be measured, and it changes
-# nothing the ledger does.
-[[policies]]
-name = "calib_hostless"
-ruleset = "allow_all"
-
-[policies.match]
-endpoints = ["default"]
-
-[policies.index_db]
-default = "default"
-allow = "*"
-
-[policies.user_data_db]
-default = "default"
-allow = "*"
+# CALIB, run2: the `calib_hostless` catch-all policy is gone -- defect P1 (every h2c request carries its authority in `:authority`, matched no policy and was refused 403 `no_policy`) is fixed in this binary by 74ca202c and 4c2e00b6, which resolve the policy host from the request authority.
 
 # Free-form per-policy client settings, returned verbatim by
 # GET /api/client-config as the "client" object (alongside capability

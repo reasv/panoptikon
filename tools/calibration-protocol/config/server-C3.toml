@@ -39,7 +39,9 @@ host = "127.0.0.1"
 # Port for the gateway listener. 6342 is the port the legacy Python server
 # used, so existing links and clients keep working.
 port = 6372  # CALIB: per-configuration port
-# If true, use X-Forwarded-Host / Forwarded to select policy host.
+# If true, use X-Forwarded-Host / Forwarded to select policy host. They
+# outrank the request's own authority; see the Policies section below for the
+# full precedence.
 trust_forwarded_headers = true
 
 # Test endpoint: same gateway, same routes, but the "test_endpoint" policy
@@ -254,6 +256,17 @@ allow = [
 
 # --------- Policies ---------
 # Policies are checked in order. First match wins.
+#
+# `hosts` is matched against the request's effective host, which is (in
+# precedence order) the forwarded host when trust_forwarded_headers is on,
+# else the authority of the request target, else the Host header. The
+# authority is what makes `hosts` work over HTTP/2, which carries it in the
+# `:authority` pseudo-header and sends no Host header at all (RFC 9113
+# §8.3.1) -- the gateway serves HTTP/2 cleartext on every listener, and its
+# own inference client speaks it. All three are client-chosen, so `hosts` is
+# routing convenience, not a trust boundary; `endpoints` (below) is the
+# non-spoofable one. A request with neither an authority nor a Host is
+# hostless and can only match a policy that states no `hosts`.
 
 # Requests arriving on the "test" endpoint (port 6343) are confined to the
 # "stdtest" DBs regardless of Host header. Must come before the localhost

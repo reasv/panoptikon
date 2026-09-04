@@ -114,8 +114,10 @@ used to say the job would reject the payload against the declared
 `job_failures`. Use the job path whenever the *job-side* run2 behaviour is
 under test (R2a re-queue, R2b failures endpoint, `partial` / `failed`
 outcomes); a job needs the fixture's corpus indexed first (`POST
-/api/jobs/folders/rescan`) and, on run2, C1's `calib_hostless` policy (see
-`../config/server-C1.toml`).
+/api/jobs/folders/rescan`). The `calib_hostless` policy the run2 configs
+carried for this is gone: defect P1 (an h2c request carries its authority in
+`:authority`, matched no policy and was refused 403 `no_policy`) is fixed by
+`74ca202c` / `4c2e00b6`, so the stock `localhost` policy matches again.
 
 Inference ids: `calibfixture/{oom_second_batch,oom,failbatch,dying}_{cuda,cpu}`,
 plus the two Phase-4 additions `calibfixture/oom_timed_cuda` (batch-1 OOM for
