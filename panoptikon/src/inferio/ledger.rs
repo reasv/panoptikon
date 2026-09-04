@@ -460,6 +460,10 @@ pub struct FitSample {
 struct ThroughputSample {
     units: u64,
     units_per_sec: f64,
+    /// The window's contention tag ([`GrantCharge::peak_occupants`]): how
+    /// many *other* replicas on the board held a window overlapping this
+    /// one. Only `0` — sole occupancy — may fit a knee.
+    occupants: u32,
 }
 
 /// The fitted cost model for one (model, board) pair.
@@ -536,6 +540,25 @@ struct GrantCharge {
     /// feeding them to the knee is one of the three ways N1/T1 manufactured
     /// caps out of memory pressure.
     squeezed: bool,
+    /// The **contention tag** (run2 change R1; findings P5-4, P5-5): the
+    /// largest number of *other* replicas on this board that held an
+    /// outstanding window at any instant while this one was in flight. Zero
+    /// means this replica had the board to itself for the whole window.
+    ///
+    /// Maintained by [`VramLedger::note_occupancy_locked`], which the grant
+    /// path calls after every insertion: a window that starts alone and is
+    /// joined half way through is tagged 1, not 0.
+    ///
+    /// **Granularity, stated because it matters.** The tag is per *window*,
+    /// and it is attached to every throughput sample the window produces —
+    /// but a measurement carries only its own duration, never a start
+    /// instant, so "overlapping the sample's interval" cannot be answered any
+    /// finer than "overlapping the window's". The approximation is one-sided:
+    /// a window that was contended for one of its three batches tags all
+    /// three as contended, never the reverse. That costs honest samples
+    /// (which only delays a knee) and never admits contended ones (which is
+    /// what fits a wrong one).
+    peak_occupants: u32,
 }
 
 /// One requester's slice of a board's headroom, plus the contention floor it
@@ -3380,8 +3403,13 @@ impl VramLedger {
                     requests: window_requests,
                     unit_budget,
                     squeezed,
+                    peak_occupants: 0,
                 },
             );
+        // Now that this window is outstanding, every window on the board —
+        // including this one — has one more overlapping neighbour than it may
+        // have recorded.
+        Self::note_occupancy_locked(&mut state, &gpu);
         // Snapshotted under the lock and emitted with it dropped, exactly as
         // the registration and settle paths do: formatting a `tracing` event
         // under the ledger mutex puts every concurrent grant request behind a
@@ -3428,6 +3456,35 @@ impl VramLedger {
             },
             settled: false,
         })
+    }
+
+    /// Bring every outstanding window on `gpu` up to date with the board's
+    /// current occupancy (run2 change R1, the contention tag).
+    ///
+    /// Called once per grant issue, which is the only moment occupancy can
+    /// *rise*. Falls are irrelevant: the tag is a high-water mark over the
+    /// window's life, so a neighbour that finished still counts against every
+    /// window it overlapped.
+    ///
+    /// O(replicas on the board), and a board holds a handful — the ledger's
+    /// own arithmetic already walks the same set twice per grant.
+    fn note_occupancy_locked(state: &mut LedgerState, gpu: &str) {
+        let occupied = state
+            .workers
+            .values()
+            .filter(|entry| entry.gpu == gpu && !entry.grants.is_empty())
+            .count();
+        // Each of those windows has `occupied − 1` neighbours right now, and
+        // they all have the same number of them.
+        let Some(others) = occupied.checked_sub(1).filter(|others| *others > 0) else {
+            return;
+        };
+        let others = u32::try_from(others).unwrap_or(u32::MAX);
+        for entry in state.workers.values_mut().filter(|entry| entry.gpu == gpu) {
+            for charge in entry.grants.values_mut() {
+                charge.peak_occupants = charge.peak_occupants.max(others);
+            }
+        }
     }
 
     /// Release a grant and account for its window. Called by
@@ -3769,9 +3826,39 @@ impl VramLedger {
         let full_batch = window
             .filter(|charge| knee_admits_window(charge))
             .map(|charge| ((charge.unit_budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
+        // The window's contention tag, carried onto every throughput sample it
+        // produces and consulted for the collapse verdict below. An ingest
+        // with no window behind it is treated as contended: nothing states
+        // that the board was quiet, and only a positive statement admits a
+        // sample to the knee.
+        let occupants = window
+            .map(|charge| charge.peak_occupants)
+            .unwrap_or(u32::MAX);
+        let sole_occupancy = occupants == 0;
+        let mut suppressed_collapses = 0usize;
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
+            // A throughput collapse is a *comparison* between two of this
+            // window's batches, and a comparison is only meaningful inside one
+            // occupancy regime. Run1 measured three negatives on MiniLM
+            // produced purely by sharing a board, and zero when it ran alone
+            // (finding P5-5): a neighbour's window arriving between batch N−1
+            // and batch N halves the rate with nothing wrong at all. So the
+            // verdict is trusted only from a window that had the board to
+            // itself throughout — which is exactly the tag the knee is fitted
+            // under (run2 change R1). An OOM is a *structural* signal about
+            // one batch and is never suppressed by this.
+            //
+            // A suppressed collapse teaches nothing either way: it is
+            // discarded whole rather than admitted as a clean batch, because
+            // "we cannot tell whether this was a spill" is not the same
+            // finding as "this was not a spill", and its allocator peak is
+            // the one a spilling batch would also have shown.
+            if measurement.throughput_collapse && !sole_occupancy {
+                suppressed_collapses += 1;
+                continue;
+            }
             if measurement.oom || measurement.throughput_collapse {
                 // A negative sample is evidence that a batch this size did NOT
                 // work — an OOM, or a WDDM spill that silently ran out of a
@@ -3849,6 +3936,7 @@ impl VramLedger {
                 throughput.push(ThroughputSample {
                     units,
                     units_per_sec: units as f64 * 1000.0 / duration_ms,
+                    occupants,
                 });
             }
             if high_water {
@@ -3888,6 +3976,18 @@ impl VramLedger {
             ) {
                 transients.push((units, peak.saturating_sub(before)));
             }
+        }
+        if suppressed_collapses > 0 {
+            tracing::debug!(
+                model = %key.0,
+                gpu = %gpu,
+                suppressed_collapses,
+                occupants,
+                "ignored this window's throughput-collapse flags: another \
+                 replica held a window on the same board while it ran, so the \
+                 rate drop the worker compared against has a neighbour to \
+                 explain it and is not evidence about the batch size (P5-5)"
+            );
         }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.fit_watermark = new_watermark;
@@ -4031,7 +4131,18 @@ impl VramLedger {
         let Some(cal) = state.calibration.get(&key) else {
             return;
         };
-        let samples: Vec<ThroughputSample> = cal.throughput.iter().copied().collect();
+        // Sole-occupancy samples only (run2 change R1): a rate measured while
+        // a neighbour was running windows on the same board is a rate for
+        // *that* board state, not for this batch size, and run1 measured the
+        // knee firing on exactly that (findings P5-4, P5-5). The tag is
+        // carried rather than filtered at ingest so `/health`'s
+        // `throughput_samples` still reports everything the replica produced.
+        let samples: Vec<ThroughputSample> = cal
+            .throughput
+            .iter()
+            .filter(|sample| sample.occupants == 0)
+            .copied()
+            .collect();
         let floor = cal.knee_best.map(|(_, rate)| rate).unwrap_or(0.0);
         let Some(fit) = fit_knee(&samples, floor) else {
             return;
@@ -10399,6 +10510,7 @@ mod tests {
             ThroughputSample {
                 units,
                 units_per_sec,
+                occupants: 0,
             };
             count
         ]
@@ -10588,6 +10700,7 @@ mod tests {
             requests: 1,
             unit_budget: 64,
             squeezed: false,
+            peak_occupants: 0,
         };
         assert!(knee_admits_window(&honest));
         assert!(
@@ -10637,6 +10750,187 @@ mod tests {
             "its high-water batch is still an honest point on the memory curve"
         );
         assert_eq!(fit_sample_count(&ledger), 1);
+    }
+
+    /// A ledger whose models are all pre-seeded with a 1 MiB/unit fit, so two
+    /// replicas can hold overlapping windows without the pre-fit
+    /// "sole claimant takes the whole headroom" rule squeezing the second one
+    /// — which would test [`knee_admits_window`] all over again instead of the
+    /// contention tag.
+    fn priced_ledger(total_mb: u64) -> Arc<VramLedger> {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 1.0,
+                residual_mb: 0.0,
+                samples: 20,
+                knee_units: None,
+                local: false,
+                fit_is_local: false,
+                exact_torch: true,
+                max_units_measured: 0,
+                local_samples: 0,
+                ring: Vec::new(),
+            }),
+            ..FakeProfiles::default()
+        });
+        ledger_with(total_mb, no_margin(), &profiles)
+    }
+
+    /// One replica's warm windows, run while `neighbour` holds a window on the
+    /// same board for the whole of each of them.
+    fn contended_warm_window(
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        neighbour: &Admission,
+        batches: &[(u64, f64)],
+    ) {
+        let window = batches.iter().map(|(units, _)| *units).max().unwrap_or(1);
+        let held = neighbour.request_grant(4, None, 1, 0).expect("granted");
+        let token = admission
+            .request_grant(window, None, 1, 0)
+            .expect("granted");
+        assert!(!token.grant().squeezed, "the fixture is not a squeeze");
+        handle.lock().unwrap().record_measurements(
+            batches
+                .iter()
+                .map(|(units, rate_)| warm_batch(*units, *rate_))
+                .collect(),
+        );
+        token.finish(WindowOutcome::Responded { oom: false });
+        held.finish(WindowOutcome::Responded { oom: false });
+    }
+
+    /// R1's contention tag: the very curve that fits a knee on a quiet board
+    /// fits none at all when a neighbour held a window across every one of its
+    /// windows. The samples are still recorded — `/health` reports them — they
+    /// simply may not decide a permanent cap (findings P5-4, P5-5).
+    #[test]
+    fn a_neighbours_overlapping_window_keeps_a_curve_out_of_the_knee_fit() {
+        let ledger = priced_ledger(100_000);
+        let handle = loaded(Some(1000), Some(0));
+        let neighbour_handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        let neighbour = ledger
+            .register_worker("g/b", item_cost(4), &neighbour_handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+
+        for units in [8u64, 16, 32, 64] {
+            contended_warm_window(
+                &handle,
+                &admission,
+                &neighbour,
+                &[
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                ],
+            );
+        }
+
+        let board = &ledger.health()[0];
+        let worker = board
+            .workers
+            .iter()
+            .find(|worker| worker.inference_id == "g/a")
+            .expect("registered");
+        assert_eq!(
+            worker.throughput_samples, 16,
+            "every observation is kept and tagged"
+        );
+        assert_eq!(
+            worker.knee_units, None,
+            "none of them was measured with the board to itself"
+        );
+    }
+
+    /// The same curve, sole occupancy, does knee — so the test above is about
+    /// the tag and not about the fixture.
+    #[test]
+    fn the_same_curve_measured_alone_does_knee() {
+        let ledger = priced_ledger(100_000);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+
+        for units in [8u64, 16, 32, 64] {
+            warm_window(
+                &handle,
+                &admission,
+                &[
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                ],
+            );
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+    }
+
+    /// P5-5: a throughput collapse reported from a window a neighbour was
+    /// running through is not a negative sample. The same flag from a
+    /// sole-occupancy window still deflates.
+    #[test]
+    fn a_collapse_only_deflates_when_the_replica_had_the_board_to_itself() {
+        let ledger = priced_ledger(100_000);
+        let handle = loaded(Some(1000), Some(0));
+        let neighbour_handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        let neighbour = ledger
+            .register_worker("g/b", item_cost(4), &neighbour_handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+
+        let held = neighbour.request_grant(4, None, 1, 0).unwrap();
+        let token = admission.request_grant(8, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                ..warm_batch(8, 10.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        held.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(
+            ledger.health()[0]
+                .workers
+                .iter()
+                .find(|worker| worker.inference_id == "g/a")
+                .expect("registered")
+                .deflation,
+            0,
+            "a neighbour's window explains the rate drop"
+        );
+
+        // Alone, the identical flag is the WDDM spill signal it was added for.
+        let token = admission.request_grant(8, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                ..warm_batch(8, 10.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(
+            ledger.health()[0]
+                .workers
+                .iter()
+                .find(|worker| worker.inference_id == "g/a")
+                .expect("registered")
+                .deflation,
+            1
+        );
     }
 
     /// End to end: warm windows fit a knee, the knee caps the grant, and it

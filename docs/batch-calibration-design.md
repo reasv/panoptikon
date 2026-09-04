@@ -127,6 +127,31 @@ All three still feed the **cost fit** and the ratchet: a clean high-water
 batch's allocator envelope is an honest point on the memory curve whatever
 decided its size. Only the throughput ring is protected.
 
+**(b) The contention tag: only a sole occupant may describe a curve.** Every
+throughput sample carries the largest number of *other* replicas on the same
+board that held an outstanding window overlapping it, and the knee is fitted
+from the zero-tagged ones alone. A rate measured while a neighbour was
+running is a rate for that board state, not for that batch size; run1 fitted
+`knee_units = 7` under the loadgen and produced three throughput-collapse
+negatives on MiniLM purely from sharing a board (P5-4, P5-5).
+
+The tag is maintained by the grant path, which is the only moment occupancy
+can rise, and it is a **high-water mark over the window's life**: a window
+that starts alone and is joined half way through is tagged as contended.
+Granularity is per window rather than per sample, because a measurement
+carries a duration and no start instant — the approximation is one-sided, so
+it costs honest samples (a knee found late) and never admits contended ones
+(a wrong knee, which is the one that is permanent).
+
+The same tag decides the **throughput-collapse verdict**. The worker's
+collapse flag is a comparison between two consecutive batches, and a
+comparison is only meaningful inside one occupancy regime, so the host trusts
+it only from a window that had the board to itself throughout. A suppressed
+collapse is discarded whole rather than counted as a clean batch: "we cannot
+tell whether this was a spill" is not the finding "this was not a spill".
+Samples are **tagged and kept**, not dropped at ingest, so `/health`'s
+`throughput_samples` still reports everything the replica produced.
+
 ## Core decision: learn a cost model, not a max batch size
 
 Calibration does **not** learn "the batch size that fits". It learns a
@@ -223,17 +248,34 @@ Notes:
 - For `pixel` units, "units" means decoded pixels *as submitted* (after
   input-spec slicing/downscale) — the same quantity
   `slice_settings.mode = "pixels"` already reasons about upstream.
-- **Pixel pricing saturates on capped VLMs** (step-5 finding). Every
-  `pixel`-class model shipped has an internal ceiling — qwen3-vl 1.84 MP,
-  nemotron ~1.84 MP (6 tiles + thumbnail at 512px), dots_ocr its own
-  processor cap — while the worker prices the raw submitted pixel count,
-  which keeps rising past it. Above the ceiling a batch is *over*-priced
-  (safe, smaller batches); the cost is that a fit learned mostly from
-  above-ceiling items carries a slope that *under*-predicts a batch of
-  small ones by up to the saturation factor. The Package-1 backstop, the
-  WDDM collapse signal and the ratchet cover it, and the clean fix — a
-  per-model `metadata.cost.unit_cap_per_item` clamped into
-  `price_inputs` — is deferred rather than designed here.
+- **Pixel pricing saturates on capped VLMs** (step-5 finding, **fixed in
+  run2 by R7**). Every `pixel`-class model shipped has an internal ceiling —
+  qwen3-vl 1.84 MP (`MAX_PIXELS = 1800 x 32^2`), nemotron 1.84 MP (6 tiles +
+  thumbnail at 512px), easyOCR's CRAFT detector 6.55 MP (a 2560px longer
+  side), dots_ocr its own downloaded processor cap — while the worker priced
+  the raw submitted pixel count, which keeps rising past it. Above the ceiling
+  a batch was *over*-priced (safe, smaller batches); the costs were that a fit
+  learned mostly from above-ceiling items carries a slope that
+  *under*-predicts a batch of small ones by up to the saturation factor, and
+  that a single large item exhausts a whole window's budget on its own. Run1
+  measured both: nemotron fitted **4.33x** the probe's slope, 58 of 110
+  batches held one item, and easyOCR granted 23-94 GB against as little as
+  1 986 MiB of real free memory (run1 report §4, Q3/W1 and F-B).
+
+  The fix is the per-item cap this section previously deferred, now spelled
+  **`metadata.cost.canvas_pixels`** (an area, so the name says what it is —
+  the placeholder name `unit_cap_per_item` said only what it did to a price).
+  The registry declares it per model; `panoptikon/src/inferio/cost.rs`
+  resolves it, reading it only for a `pixel` unit and never inheriting it
+  across a unit change, the same scale-bound rule `seed_units` has; the
+  orchestrator forwards it on the grant as `canvas_pixels`; and the worker
+  prices every input at `min(raw_pixels, canvas_pixels)` in `price_inputs`.
+  A model whose canvas lives in a processor downloaded with the weights
+  rather than in the registry is covered by a documented fallback — the
+  worker reads the loaded impl's own `max_pixels`/`canvas_pixels` attribute,
+  floored at 512^2 so a misidentified attribute cannot *under*-price an item.
+  Absent everywhere = uncapped, exactly as before. Wire and worker details:
+  `docs/inferio-worker-protocol.md`, "Memory grants".
 - Backends without a free-memory query (MPS, CPU) degrade to no
   admission: seed-sized fixed batches plus the Package-1 backstop, the
   same class as `none`.
@@ -885,6 +927,22 @@ target role disappears — auto is the target). Per-ID override where an ID
 deviates from its group (`dots_ocr`, `easyocr_*`, `qwen3-vl-embedding-*`
 all deviate from their groups' dimensions and need per-ID `cost` blocks).
 
+Run2 adds one optional key, `canvas_pixels` — the model's per-item pixel
+ceiling, used only by `pixel`-priced models (see the taxonomy notes and
+`docs/inferio-worker-protocol.md`, "Memory grants"):
+
+```toml
+[group.clip.inference_ids.nemotron-embed-vl-1b-v2.metadata.cost]
+unit          = "pixel"
+aggregation   = "sum"
+seed_units    = 2000000
+canvas_pixels = 1835008   # (6 tiles + thumbnail) x 512^2
+```
+
+Both scale-bound keys — `seed_units` and `canvas_pixels` — stop being
+inherited the moment an ID redeclares `unit`; every other cost key is
+scale-free and inherits key by key.
+
 ## Batch size UX: auto everywhere, the number becomes a cap
 
 Auto is the only mode; what varies is whether a **cap** is present.
@@ -1056,10 +1114,9 @@ script, not a subsystem.
   reservations no longer miss on abbreviated-UUID pins; a resolved pin is
   canonicalised so the prewarm pool and the ledger agree about board
   equality), additive wire fields, and new log lines.
-- Per-item unit ceilings for `pixel`-class VLMs
-  (`metadata.cost.unit_cap_per_item`, clamped into the worker's
-  `price_inputs`): every capped VLM's price saturates in reality but not in
-  the pricer (see the taxonomy notes). Deferred, not designed.
+- ~~Per-item unit ceilings for `pixel`-class VLMs~~ — **done in run2 (R7)**,
+  as `metadata.cost.canvas_pixels` clamped into the worker's `price_inputs`
+  (see the taxonomy notes).
 - Whisper stays out of v1; if CT2 footprint recording is ever wanted it
   needs an NVML-based path (no torch allocator) and is Linux-reliable
   only.
