@@ -176,7 +176,10 @@ def isolated(torch_module=None):
     stronger hazard of the two: it does not merely disable a tier, it
     re-denominates *every* reading this module produces (`_ram_currency`), so
     an inherited value would turn each of these cases into a CPU-priced host
-    without changing a line of the test.
+    without changing a line of the test. The measured accelerator context is
+    reset for the same reason the board address is: it is measured once per
+    *process* and everything downstream of `base_method` reads it, so one
+    test's measurement would silently re-price the next test's base.
     """
     with (
         mock.patch.dict(sys.modules, {}, clear=False),
@@ -196,6 +199,11 @@ def isolated(torch_module=None):
                 clear=False,
             ),
             mock.patch.dict(memory._bdf_state, {"bdf": None}, clear=False),
+            mock.patch.dict(
+                memory._context_state,
+                {"measured_mb": None, "logged": False},
+                clear=False,
+            ),
             mock.patch.dict(memory._logged, {}, clear=False),
         ):
             for key in memory._logged:
@@ -383,6 +391,180 @@ def test_pool_overshoot_is_not_treated_as_implausible(fake_torch) -> None:
     report = memory.finish_load(before, object())
     assert report["base_method"] == "free_delta"
     assert report["base_mb"] == 4096
+
+
+# ---------------------------------------------------------------------------
+# Measured accelerator context (run2 R8)
+# ---------------------------------------------------------------------------
+
+
+class ProbeWorld:
+    """A fake memory query for the context probe: a torch whose CUDA comes up
+    when the test says so, and a driver free reading the test controls."""
+
+    def __init__(self, free_at_init=8000, reserved_at_init=0):
+        self.initialized = False
+        self.free_at_init = free_at_init
+        self.reserved_at_init = reserved_at_init
+        self.free_reads = 0
+        self.torch = SimpleNamespace(
+            cuda=SimpleNamespace(is_initialized=lambda: self.initialized)
+        )
+
+    def probe(self, free_before=8700):
+        return memory._ContextProbe(
+            free_before,
+            "nvml",
+            torch_reader=lambda: self.torch,
+            free_reader=self._read_free,
+            reserved_reader=lambda: self.reserved_at_init,
+        )
+
+    def _read_free(self):
+        self.free_reads += 1
+        return self.free_at_init
+
+
+def test_the_context_probe_measures_across_the_first_cuda_init() -> None:
+    # Expected behavior: the probe watches for the moment CUDA becomes live
+    # and differences the driver's free memory across it. 8700 -> 8000 is a
+    # 700 MiB context, which is the order run1 actually measured (report §4,
+    # A3: 666-678 MiB) against the 500 MiB constant.
+    world = ProbeWorld(free_at_init=8000)
+    probe = world.probe(free_before=8700)
+    assert probe.poll() is False, "CUDA is not up yet, so there is nothing to read"
+    assert world.free_reads == 0, "and nothing is read"
+    world.initialized = True
+    assert probe.poll() is True
+    assert probe.poll() is True, "idempotent once it has its answer"
+    assert world.free_reads == 1, "exactly one reading, ever"
+    assert probe.result() == 700
+
+
+def test_the_probe_subtracts_whatever_was_already_allocated() -> None:
+    # The flag flips before the weights are copied, but a few milliseconds is
+    # enough for a small allocation to land. Whatever landed is in the
+    # allocator pool at the same instant, so subtracting it makes the figure
+    # the context alone rather than the context plus a race.
+    world = ProbeWorld(free_at_init=7800, reserved_at_init=100)
+    probe = world.probe(free_before=8700)
+    world.initialized = True
+    probe.poll()
+    assert probe.result() == 800, "900 MiB of driver memory, 100 of it allocated"
+
+
+def test_an_implausible_context_measurement_is_discarded() -> None:
+    # A window a few milliseconds wide can still catch another process
+    # starting or stopping. Outside the band it is not a context.
+    for free_before, expected in (
+        (8000 + memory.CONTEXT_MIN_MB - 1, None),
+        (8000 + memory.CONTEXT_MAX_MB + 1, None),
+        (8000 + memory.CONTEXT_MIN_MB, memory.CONTEXT_MIN_MB),
+        (8000 + memory.CONTEXT_MAX_MB, memory.CONTEXT_MAX_MB),
+        (7000, None),  # the driver reported *more* free memory afterwards
+    ):
+        world = ProbeWorld(free_at_init=8000)
+        probe = world.probe(free_before=free_before)
+        world.initialized = True
+        probe.poll()
+        assert probe.result() == expected, free_before
+
+
+def test_a_process_that_never_initialises_cuda_measures_nothing() -> None:
+    # The CPU-fallback impl, the remote API, the CTranslate2 engine: the probe
+    # reads nothing at all and the fixed estimate stands.
+    world = ProbeWorld()
+    probe = world.probe()
+    probe.start()
+    assert probe.result() is None
+    assert world.free_reads == 0
+
+
+def test_the_probe_is_only_started_when_a_measurement_is_possible(
+    fake_torch, monkeypatch
+) -> None:
+    # Each gate states an impossibility, not a preference.
+    with isolated():
+        assert memory._start_context_probe(None, "nvml") is None, "no baseline"
+        assert memory._start_context_probe(8000, "torch") is None, "not a driver"
+        assert memory._start_context_probe(8000, None) is None
+        monkeypatch.setenv("INFERIO_DEVICE", "cpu")
+        assert memory._start_context_probe(8000, "nvml") is None, "RAM-priced"
+        monkeypatch.delenv("INFERIO_DEVICE")
+        memory._context_state["measured_mb"] = 700
+        assert memory._start_context_probe(8000, "nvml") is None, "already measured"
+        memory._context_state["measured_mb"] = None
+        started = memory._start_context_probe(8000, "nvml")
+        assert started is not None
+        assert started.result() is None, "and it stops cleanly"
+
+    with isolated(fake_torch_module(FakeCuda(initialized=True))):
+        assert memory._start_context_probe(8000, "nvml") is None, (
+            "a context that predates this window cannot be measured"
+        )
+
+
+def test_the_measured_context_replaces_the_estimate_in_the_base() -> None:
+    # End to end: a degraded load (no NVML own-PID) whose free delta is
+    # unusable falls to the allocator tier, and that tier now charges the
+    # context this process measured rather than the constant — and says so in
+    # `base_method`, because the two are different formulas.
+    cuda = FakeCuda(initialized=False)
+    with isolated(fake_torch_module(cuda)):
+        with mock.patch.object(memory, "_nvml_memory", return_value=(8700, 24_576)):
+            before = memory.begin_load()
+            assert before["free_source"] == "nvml"
+            world = ProbeWorld(free_at_init=8000)
+            world.initialized = True
+            probe = world.probe(free_before=8700)
+            probe.poll()
+            before["context_probe"] = probe
+
+            cuda.initialized = True
+            cuda.allocate(1024, reserved_mb=1024)
+            # The driver reports MORE free memory than before, so the free
+            # delta is unusable and the allocator floor answers.
+            report = memory.finish_load(before, object())
+            assert memory.context_allowance_mb() == (700, "measured")
+    assert report["base_method"] == "alloc_delta_measured"
+    assert report["base_mb"] == 1024 + 700
+    assert report["base_mb"] != 1024 + memory.CONTEXT_ESTIMATE_MB
+
+
+def test_the_fixed_estimate_is_the_last_resort_and_names_itself(fake_torch) -> None:
+    # No driver reading to measure against: the constant stands, and
+    # `base_method` keeps its original spelling so a profile written under it
+    # is not silently reinterpreted.
+    assert memory.context_allowance_mb() == (memory.CONTEXT_ESTIMATE_MB, "estimate")
+    before = memory.begin_load()
+    assert before["context_probe"] is None
+    fake_torch.allocate(800, reserved_mb=800)
+    fake_torch.free += 512 * MIB
+    report = memory.finish_load(before, object())
+    assert report["base_method"] == "alloc_delta"
+    assert report["base_mb"] == 800 + memory.CONTEXT_ESTIMATE_MB
+
+
+def test_a_measured_context_sharpens_the_plausibility_ceiling() -> None:
+    # The ceiling is `reserved_delta + context + slack`, and it is not
+    # circular: the context was measured over the initialisation window, not
+    # over this whole-load delta. With a 700 MiB context the ceiling is
+    # 100 + 700 + 2048 = 2848, so a 2800 MiB delta is now plausible where the
+    # 500 MiB constant (ceiling 2648) would have rejected it.
+    for measured, method in ((700, "free_delta"), (None, "alloc_delta")):
+        cuda = FakeCuda(initialized=True)
+        with isolated(fake_torch_module(cuda)):
+            memory._context_state["measured_mb"] = measured
+            answers = [(8700, 24_576), (5900, 24_576)]
+            with mock.patch.object(
+                memory,
+                "_nvml_memory",
+                side_effect=lambda: answers.pop(0) if answers else (5900, 24_576),
+            ):
+                before = memory.begin_load()
+                cuda.allocate(100, reserved_mb=100)
+                report = memory.finish_load(before, object())
+        assert report["base_method"] == method, measured
 
 
 def test_unusable_free_delta_still_charges_the_context(fake_torch) -> None:

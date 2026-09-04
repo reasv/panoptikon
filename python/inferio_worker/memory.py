@@ -17,7 +17,10 @@ are invisible until the ledger is built on top:
   never going to touch the GPU. So every torch path here additionally
   requires `torch.cuda.is_initialized()`: if the impl never initialized
   CUDA there is nothing of *ours* to measure and the honest answer is
-  "unknown".
+  "unknown". The context probe ([`_ContextProbe`], which measures what a
+  CUDA context costs this process) is a *watcher* for exactly this reason:
+  it waits for the impl to initialize CUDA and reads the driver across that
+  moment rather than initializing one itself to find out.
 - **Never invent a footprint.** A process that demonstrably never allocated
   on the device reports no `base_mb` at all rather than 0 — the driver's
   free-memory delta would otherwise attribute another process's
@@ -41,6 +44,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from collections import deque
 from collections.abc import Iterable
@@ -51,9 +55,37 @@ logger = logging.getLogger("inferio_worker.memory")
 
 _MIB = 1024 * 1024
 
-# Fixed CUDA-context allowance used when the driver's free-memory delta is
-# unusable. Contexts are 300-600 MB in practice; the design names ~500 MB.
+# Fixed accelerator-context allowance, used when this process could not
+# measure its own. Contexts are 300-600 MB in practice; the design names
+# ~500 MB. Run1 measured 666-678 MiB on the CUDA host it ran on (report §4,
+# A3/F9), which is why run2 measures rather than assumes
+# ([`_ContextProbe`]) and keeps this only as the last resort.
 CONTEXT_ESTIMATE_MB = 500
+
+# Plausibility band for a *measured* context, in MiB. A reading outside it is
+# not a context: the probe's window is a few milliseconds wide and another
+# process starting or stopping inside it would land in the same delta.
+#
+# The floor is well below any real context (the smallest anyone has reported
+# is a few hundred MB) and exists only to reject a delta of nothing. The
+# ceiling is 2 GiB: the largest context this project has measured is 678 MiB,
+# and doubling the largest observed value and rounding up to a power of two is
+# the standard way this module sets a "cannot possibly be ours" bound (compare
+# `IMPLAUSIBLE_SLACK_MB`). Being *over* the truth is the safe direction — a
+# larger context means a larger base means less admission — so the ceiling is
+# generous rather than tight.
+CONTEXT_MIN_MB = 64
+CONTEXT_MAX_MB = 2048
+
+# How often the context probe checks whether CUDA has come up, and how long it
+# is willing to wait. 5 ms is close enough to the initialisation that nothing
+# material can be allocated in between, and cheap enough (200 wakeups a second
+# on an `Event.wait`) to run for the whole of a load. The deadline is the
+# orchestrator's own `load_secs` default, so a probe can never meaningfully
+# outlive the load it belongs to even if that load raised and never collected
+# it.
+_CONTEXT_POLL_SECONDS = 0.005
+_CONTEXT_PROBE_MAX_SECONDS = 600
 
 # Extra allowance, on top of the context estimate, for memory our process
 # legitimately holds outside the caching allocator: cuDNN/cuBLAS workspaces,
@@ -2017,6 +2049,222 @@ def free_total_mb() -> tuple[int | None, int | None, str | None]:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Accelerator context: measured once per process, never assumed twice
+# ---------------------------------------------------------------------------
+
+# The context this process measured for itself, in MiB, or None if it never
+# could. A dict rather than a bare global so tests can isolate it the way they
+# isolate `_nvml_state`.
+_context_state: dict[str, Any] = {"measured_mb": None, "logged": False}
+
+
+class _ContextProbe:
+    """Measures the accelerator context: the board free-memory delta across
+    this process's **first CUDA initialisation**, taken before the impl has
+    allocated anything on the device (batch-calibration run2, R8).
+
+    Why it is a watcher and not a call. The context is created lazily by
+    whatever the impl does first, somewhere inside `instance.load()`, and this
+    module may not create one itself: initialising CUDA in a process that was
+    never going to touch the GPU — a remote API, a CTranslate2 engine, a
+    CPU-fallback impl — would cost that process 300-600 MB of a board it is
+    not using, which is the hard rule this module opens with. So the probe
+    *waits* for the impl to do it: a daemon thread polls `is_initialized()`
+    (a module flag read; it initialises nothing) every
+    [`_CONTEXT_POLL_SECONDS`] and takes one free-memory reading the moment it
+    flips. On a process that never initialises CUDA the probe reads nothing at
+    all and costs a sleeping thread.
+
+    Why the allocator pool is subtracted. The flag flips at the end of torch's
+    `_lazy_init`, before the weights are copied, but a few milliseconds is
+    enough for a small allocation to land. Whatever did land is visible in
+    `memory_reserved()` at the same instant, so subtracting it makes the
+    figure "everything we took from the driver that is not in the allocator" —
+    which is exactly what the context allowance stands for in `_resolve_base`
+    — rather than "everything we took", and removes the race instead of
+    tolerating it.
+
+    Both readings come from the **same source** as `begin_load`'s, because a
+    delta between two different sources is not a delta (NVML and
+    `mem_get_info` measured 3.4 GB apart on the dev box); and the probe only
+    runs when that source is a driver-level one, which pre-CUDA it always is.
+
+    Injectable readers so the tests can drive [`poll`] a step at a time
+    without threads or a GPU.
+    """
+
+    def __init__(
+        self,
+        free_before: int | None,
+        free_source: str | None,
+        torch_reader: Any = None,
+        free_reader: Any = None,
+        reserved_reader: Any = None,
+    ) -> None:
+        self._free_before = free_before
+        self._torch = torch_reader or _torch
+        self._read_free = free_reader or (lambda: _free_mb(free_source)[0])
+        self._read_reserved = reserved_reader or _reserved_mb_unguarded
+        self._free_at_init: int | None = None
+        self._reserved_at_init: int = 0
+        self._done = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def poll(self) -> bool:
+        """One observation. True once the probe has its answer, or has given
+        up; False while CUDA is still not live."""
+        if self._done:
+            return True
+        torch = self._torch()
+        if torch is None:
+            return False
+        try:
+            if not torch.cuda.is_initialized():
+                return False
+        except Exception:
+            # A torch that cannot answer will not answer later either.
+            self._done = True
+            return True
+        try:
+            self._free_at_init = self._read_free()
+            self._reserved_at_init = self._read_reserved() or 0
+        except Exception:  # pragma: no cover - defensive
+            self._free_at_init = None
+        self._done = True
+        return True
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._watch, name="inferio-context-probe", daemon=True
+        )
+        self._thread.start()
+
+    def _watch(self) -> None:
+        deadline = time.monotonic() + _CONTEXT_PROBE_MAX_SECONDS
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            try:
+                if self.poll():
+                    return
+            except Exception:  # pragma: no cover - defensive
+                return
+            self._stop.wait(_CONTEXT_POLL_SECONDS)
+
+    def result(self) -> int | None:
+        """Stop watching and return the measured context in MiB, or None.
+
+        `None` whenever the measurement is not one we are willing to stand
+        behind: CUDA never came up inside the load, a reading was missing, or
+        the delta fell outside [`CONTEXT_MIN_MB`]..[`CONTEXT_MAX_MB`].
+        """
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+        if self._free_before is None or self._free_at_init is None:
+            return None
+        measured = self._free_before - self._free_at_init - self._reserved_at_init
+        if measured < CONTEXT_MIN_MB or measured > CONTEXT_MAX_MB:
+            logger.debug(
+                "discarding a %d MiB context measurement: outside the "
+                "%d-%d MiB band a context can plausibly occupy",
+                measured,
+                CONTEXT_MIN_MB,
+                CONTEXT_MAX_MB,
+            )
+            return None
+        return measured
+
+
+def _reserved_mb_unguarded() -> int | None:
+    """The allocator pool size, for the probe thread. Separate from
+    [`_allocator_stats`] because the probe needs only this one number and
+    reads it at an instant when the peak counters are meaningless."""
+    torch = _torch_cuda()
+    if torch is None:
+        return None
+    try:
+        return _mb(torch.cuda.memory_reserved())
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _start_context_probe(
+    free_mb: int | None, free_source: str | None
+) -> "_ContextProbe | None":
+    """Start the context probe if this load could possibly answer, else None.
+
+    Every gate is a statement that a measurement is *impossible*, not a guess
+    about whether it would be useful:
+
+    - no pre-load free reading, or one from something other than a driver
+      (`nvml`/`amdgpu-sysfs`) — there is no baseline to difference against,
+      and no other source can even answer before CUDA is live;
+    - the process is priced against system RAM, where there is no device
+      context to measure;
+    - CUDA is **already** initialised, so the context predates this window
+      and its creation cannot be observed;
+    - this process already measured one, which cannot change: a context is
+      created once.
+    """
+    if free_mb is None or free_source not in ("nvml", "amdgpu-sysfs"):
+        return None
+    if _ram_currency() or _context_state["measured_mb"] is not None:
+        return None
+    torch = _torch()
+    if torch is not None:
+        try:
+            if torch.cuda.is_initialized():
+                return None
+        except Exception:
+            return None
+    probe = _ContextProbe(free_mb, free_source)
+    probe.start()
+    return probe
+
+
+def context_allowance_mb() -> tuple[int, str]:
+    """`(mb, "measured"|"estimate")`: the device memory this process holds
+    outside the caching allocator.
+
+    The term `base` needs whenever the allocator's own delta is all it has to
+    go on, and the term the free-delta plausibility ceiling is built from.
+    Measured for this process when [`_ContextProbe`] managed it, and the fixed
+    [`CONTEXT_ESTIMATE_MB`] otherwise — which run1 showed is 25% low on at
+    least one real driver (report §4, A3), i.e. a base that under-states the
+    footprint, which is the direction that over-admits.
+    """
+    measured = _context_state["measured_mb"]
+    if measured is not None:
+        return (int(measured), "measured")
+    return (CONTEXT_ESTIMATE_MB, "estimate")
+
+
+def _remember_context_mb(measured: int | None) -> None:
+    """Cache a context measurement for the life of the process, and say once
+    which figure everything downstream is using."""
+    if measured is not None and _context_state["measured_mb"] is None:
+        _context_state["measured_mb"] = measured
+    if _context_state["logged"]:
+        return
+    _context_state["logged"] = True
+    allowance, source = context_allowance_mb()
+    if source == "measured":
+        logger.info(
+            "measured this process's accelerator context at %d MiB across its "
+            "first CUDA initialisation; using it instead of the %d MiB estimate",
+            allowance,
+            CONTEXT_ESTIMATE_MB,
+        )
+    else:
+        logger.info(
+            "could not measure this process's accelerator context; using the "
+            "%d MiB estimate",
+            CONTEXT_ESTIMATE_MB,
+        )
+
+
 def begin_load() -> dict[str, Any]:
     """Snapshot what `finish_load` needs to price the load. Never raises.
 
@@ -2031,6 +2279,11 @@ def begin_load() -> dict[str, Any]:
     """
     try:
         free_mb, free_source = _free_mb()
+        # Started here, from the same reading, and *before* the peak reset:
+        # the probe's whole value is that its baseline is the last free
+        # reading taken while this process still had no CUDA context
+        # ([`_ContextProbe`]).
+        probe = _start_context_probe(free_mb, free_source)
         _reset_peaks()
         reserved, allocated, _, _ = _allocator_stats()
         return {
@@ -2038,6 +2291,7 @@ def begin_load() -> dict[str, Any]:
             "free_source": free_source,
             "reserved_mb": reserved,
             "allocated_mb": allocated,
+            "context_probe": probe,
         }
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("pre-load memory snapshot failed: %s", exc)
@@ -2059,6 +2313,11 @@ def finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
 
 
 def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
+    # Collect the context probe first: it holds a live thread, and everything
+    # below may consult the figure it produced.
+    probe = before.get("context_probe")
+    if probe is not None:
+        _remember_context_mb(probe.result())
     reserved, allocated, _, peak_allocated = _allocator_stats()
     free_after, _ = _free_mb(before.get("free_source"))
 
@@ -2171,11 +2430,18 @@ def _resolve_base(
     4. A usable free delta below the allocator floor means the driver saw
        less move than our own allocator did, so the floor wins instead.
 
-    Both routes to `alloc_delta` — an unusable free delta, and a usable one
-    the allocator floor beats — report the same formula: the allocator delta
-    **plus** the fixed context allowance. The context is real whether or not
-    the driver reading could show it, and one `base_method` value must name
-    exactly one formula or a stored profile cannot be interpreted at all.
+    Both routes to the allocator-delta tier — an unusable free delta, and a
+    usable one the allocator floor beats — report the same formula: the
+    allocator delta **plus** the context allowance. The context is real
+    whether or not the driver reading could show it, and one `base_method`
+    value must name exactly one formula or a stored profile cannot be
+    interpreted at all — which is why the tier has *two* names:
+    `"alloc_delta_measured"` when this process measured its own context
+    ([`_ContextProbe`], run2 R8) and `"alloc_delta"` when it fell back to the
+    fixed [`CONTEXT_ESTIMATE_MB`]. Run1 measured a real context of 666-678 MiB
+    against that 500 MiB constant (report §4, A3/F9): a 25% under-statement of
+    the base, which is the direction that over-admits, and the reason the
+    constant is now the last resort rather than the rule.
 
     `base_method` names whichever term actually produced the number, so a
     profile never claims driver-currency provenance for an allocator-derived
@@ -2231,23 +2497,36 @@ def _resolve_base(
         return (own, "mps")
 
     floor = alloc_floor or 0
+    context_mb, context_source = context_allowance_mb()
+    # `"alloc_delta"` and `"alloc_delta_measured"` are two formulas, not one
+    # with a footnote: a stored profile has to say whether the context in its
+    # base was measured on that machine or assumed, because the two differ by
+    # 25% on at least one real driver (run1 report §4, A3).
+    alloc_method = (
+        "alloc_delta_measured" if context_source == "measured" else "alloc_delta"
+    )
     free_delta = _free_delta(before.get("free_mb"), free_after)
-    ceiling = (reserved_delta or 0) + CONTEXT_ESTIMATE_MB + IMPLAUSIBLE_SLACK_MB
+    # The ceiling uses the same allowance. It is not circular — the context
+    # was measured across the initialisation window alone, independently of
+    # this whole-load delta — and a measured context makes the contamination
+    # test sharper rather than looser.
+    ceiling = (reserved_delta or 0) + context_mb + IMPLAUSIBLE_SLACK_MB
     if free_delta is None or free_delta <= 0 or free_delta > ceiling:
         if free_delta is not None and free_delta > ceiling:
             logger.debug(
                 "free-memory delta %d MiB implausible against %d MiB reserved "
-                "(+%d MiB context, +%d MiB workspace allowance); using the "
-                "allocator delta plus the context estimate",
+                "(+%d MiB %s context, +%d MiB workspace allowance); using the "
+                "allocator delta plus the context allowance",
                 free_delta,
                 reserved_delta or 0,
-                CONTEXT_ESTIMATE_MB,
+                context_mb,
+                context_source,
                 IMPLAUSIBLE_SLACK_MB,
             )
-        return (floor + CONTEXT_ESTIMATE_MB, "alloc_delta")
+        return (floor + context_mb, alloc_method)
     if free_delta >= floor:
         return (free_delta, "free_delta")
-    return (floor + CONTEXT_ESTIMATE_MB, "alloc_delta")
+    return (floor + context_mb, alloc_method)
 
 
 def _delta(after: int | None, before: int | None) -> int | None:
