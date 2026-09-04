@@ -63,7 +63,17 @@ build/deploy/API. The plan that uses this is
   synchronously, see § external below). Design doc promised an NVML
   per-process snapshot; the code reads free/total only.
 - Worker samples are the primary source: load and every predict response
-  carry `memory{free_mb,total_mb,free_source,reserved_mb,allocated_mb}`.
+  carry `memory{free_mb,total_mb,free_source,reserved_mb,allocated_mb}`, and
+  since run2 (R5) **every measurement** carries its own pre-batch
+  `free_mb`/`free_source` too (`worker.rs:377` `BatchMeasurement`). Both go
+  through `record_free_locked` under the same rules; within one response the
+  measurements apply in sequence order and the response-level sample last
+  (it is taken after the final batch, and `Worker::record_telemetry` stamps
+  it last for that reason), so `external_mb` refreshes at response cadence
+  rather than at the 10 s staleness timer (finding T3).
+  New in run2, same file: `clamped{from_units,to_units,free_mb}`
+  (`worker.rs:346`) and `oom_class{source,exception,free_mb_at_failure,device}`
+  (`worker.rs:358`).
   Recorded at registration (`ledger.rs:2008-2020`) and every settle
   (`:3165-3189`) via `record_free_locked` (`:2386-2456`): authoritative
   labels `nvml|nvidia-smi|amdgpu-sysfs|mps|ram` (`:1003-1008`); once a
@@ -110,18 +120,28 @@ build/deploy/API. The plan that uses this is
   ModelCalibration}` (`:893-965`: sample ring 64 `FIT_RING`, transients
   32, `fit`, `fit_is_local`, `max_units_measured` (anchor), `seeded`,
   `local_samples`, throughput ring 128 `KNEE_RING`, `knee_best`,
-  `knee_units`, `knee_is_local`, `persisted`), `remembered_bases`,
+  `knee_units`, `knee_is_local`, run2 `knee_clean_windows` +
+  `knee_re_explore_above`, `persisted`; `ledger.rs:1428`),
+  `remembered_bases`,
   `remembered_dtypes`, `pending_trims` (cap 32).
-- Budgets: `VramBudget{margin = 0.10, cap_fraction = None}` (`:100,
-  325-340`); per-board overrides case-insensitive (`:358-390`); from
-  `[inference_local.vram]` (`http.rs:240-258`). CPU board only ships
-  `cap_fraction = 0.75` (`:417-441`, `cpu.rs:59`). Validation
-  (`config.rs:1367-1404`): margin finite ≥ 0; cap_fraction in (0, 1], so
-  no per-board way to switch a global cap off.
-- Arithmetic (`:2469-2515`): `limit = min(total×cap_fraction, total −
-  ceil(external×(1+margin)))`; `headroom = limit − Σcharge −
-  Σload_reservations`; `charge = footprint + max(0, grants_mb −
-  pool_growth)` (`:673-677`).
+- Budgets: `VramBudget{margin: Option<f64>, cap_fraction: Option<f64>}`
+  (`ledger.rs:468`), both `None` by default since run2 (R5) — an **unset**
+  margin is a distinct state from one set to `DEFAULT_MARGIN = 0.10`, and
+  `VramBudget::margin_in_force` is what resolves it. Per-board overrides
+  case-insensitive; from `[inference_local.vram]` (`http.rs`,
+  `vram_budgets`). CPU board only ships `cap_fraction = 0.75` (`cpu.rs:59`).
+  Validation (`config.rs`, `validate_inference_vram`): a *stated* margin must
+  be finite ≥ 0; cap_fraction in (0, 1], so no per-board way to switch a
+  global cap off.
+- Arithmetic (`reserve_locked` `:3377`, `limit_with_margin_locked` `:3391`):
+  `limit = min(total×cap_fraction, total − external − reserve)`, where
+  run2 (R5) `reserve = ceil(external×margin)` when the user set one
+  (`reserve_rule = "user_margin"`) and `min(ceil(external×margin), 1024)`
+  when they did not (`"capped_default"`, `DEFAULT_RESERVE_CAP_MB`). The
+  user-margin form is the pre-run2 arithmetic to the MiB. `/health` and the
+  `issued a memory grant` line both report `reserve_mb` and `reserve_rule`.
+  `headroom = limit − Σcharge − Σload_reservations`;
+  `charge = footprint + max(0, grants_mb − pool_growth)`.
 - Effective margin (`:2545-2567`): configured + 0.15 while
   `local_samples < 5` (`LOCAL_CONFIRMATION_SAMPLES` `:224`) or cost
   dimension degraded + clamp(residual/base, ≤ 0.25); increment clamped
@@ -147,27 +167,51 @@ build/deploy/API. The plan that uses this is
   = 1 unit. `Grant{unit_budget, mb, unit, aggregation, user_cap_items}`
   encoded on the predict frame (`worker.rs:1722-1741`); fit snapshot
   attached when its version changed (`encode_fit`).
-- Ramp / deflation (`:689-727`): clean window **with ≥ 1 high-water
-  sample** → `ramp_step + 1`; clean without measurement → no growth;
-  while deflated, 3 clean windows (`CLEAN_WINDOWS_TO_RESTORE` `:156`)
-  restore one halving; negative → `deflation + 1` (unbounded
-  `saturating_add`), `clean_windows = 0`. Per-replica runtime state.
+- Ramp / deflation (`note_clean_window` `:926`, `note_negative_sample`
+  `:966`): clean window **with ≥ 1 high-water sample** → `ramp_step + 1`;
+  clean without measurement → no growth; while deflated, 3 clean windows
+  (`CLEAN_WINDOWS_TO_RESTORE`) restore one halving; negative →
+  `deflation + 1`, `clean_windows = 0`. Run2 (R4): the counter is **capped**
+  at `deflation_cap(anchor, seed) = ceil(log2(max(anchor,seed))) + 1`
+  (`:1032`) and additionally repays **one level per `DEFLATION_REPAY_SECS`
+  (30 s = `TRIM_DEBOUNCE`) of wall time** (`repay_deflation_by_time` `:982`,
+  driven from `repay_deflation_locked` `:3910` on the grant, settle and
+  `/health` paths). Per-replica runtime state, so a respawn clears it.
 - Settle (`:2923-3000`, `ingest_locked` `:3094-3366`): telemetry ring 256
   (`worker.rs:427`; gap → WARN); `oom || throughput_collapse` →
   negative, discarded; `peak_reserved > reserved_before` → high-water →
   `FitSample{units, peak − reserved_at_load}`, anchor candidate,
   `local_samples++`; warm batch with `units ≥ 0.8 × granted`
-  (`FULL_BATCH_RATIO` `:205`) and `duration_ms > 0` → throughput sample.
+  (`FULL_BATCH_RATIO`) and `duration_ms > 0` → throughput sample — unless
+  run2 (R1a/R1b) excludes it: the window was `squeezed` or memory-blind
+  (`knee_admits_window` `:1145`), the measurement carries `clamped`, and
+  every admitted sample is tagged with the window's contention count
+  (`GrantCharge::peak_occupants`, maintained by `note_occupancy_locked`
+  `:3940`). A `throughput_collapse` from a window that was **not** sole
+  occupancy is discarded rather than counted as a negative (P5-5).
   `WorkerDied` → unified boards only: anchor halved + deflate
   (`note_unified_death_locked` `:3039-3077`); discrete boards learn
   nothing. Then `refit_locked` (Theil–Sen `robust_fit` `:4141-4177`: ≥ 3
   samples, distinct x, slope > 0, else the old fit is kept) and
   `refit_knee_locked`.
-- Knee `fit_knee` (`:4244-4297`): log2 buckets, median per bucket, ≥ 12
-  samples over ≥ 3 buckets, threshold 0.9 × max(ring best, historical
-  `knee_best`), knee = first bucket ≥ threshold and < largest bucket,
-  returned as `2^(k+1) − 1`. Sticky. A shipped knee is adopted at seed
-  time when no local knee exists and can only ratchet down within a run.
+- Knee `fit_knee` (`:5925`): log2 buckets, median per bucket, ≥ 12 samples
+  over ≥ 3 buckets, threshold 0.9 × max(ring best, historical `knee_best`),
+  knee = first bucket ≥ threshold and < largest bucket, returned as
+  `2^(k+1) − 1`. Run2 (R1): only **sole-occupancy** samples are fitted
+  (`refit_knee_locked` `:4728`); a bucket with fewer than
+  `MIN_KNEE_BUCKET_SAMPLES = 2` observations is dropped; and any retained
+  bucket whose **relative MAD** (`relative_mad` `:6014`) exceeds
+  `KNEE_MAX_BUCKET_DISPERSION = 0.20` refuses the whole fit, `knee_best`
+  included. Run2 (R1d) also makes it expire: `note_knee_window_locked`
+  (`:4128`) counts clean windows run **at** the knee with headroom ≥
+  `RATCHET_FACTOR × appetite_mb_locked` (`:3541`), and at
+  `KNEE_EXPIRY_CLEAN_WINDOWS = 12` widens it one bucket (`2k+1`) — or
+  withdraws it once it passes `RATCHET_FACTOR × anchor` — logging
+  `this model has run cleanly at its throughput knee…` at INFO.
+  `knee_re_explore_above` blocks a refit until a warm batch above the old cap
+  is observed. A shipped knee is adopted at seed time when no local knee
+  exists, arrives with its persisted `knee_clean_windows`, and can only
+  ratchet down within a run.
 - Load reservation `reserve_load` (`:1476-1573`): `max(remembered base,
   store expected_base)` else `CONSERVATIVE_BASE_MB = 4096`; only WARNs
   when it exceeds headroom ("loading this model is expected to need more
@@ -202,12 +246,17 @@ build/deploy/API. The plan that uses this is
   `python/inferio/config/calibration/`, plus user
   `config/inference/calibration/`), local-authority fields stripped on
   import (`:242-247`). None ship yet.
-- `CalibrationProfile` (`:123-207`): key `inference_id, epoch, gpu (model
-  name as nvidia-smi prints it), platform (std::env::consts::OS),
-  backend, torch, dtype, unit, aggregation`; measurement `base_mb,
-  base_method, slope_mb_per_unit, knee_units, samples, residual_mb,
-  measured_at, generator`; local-only `max_units_measured,
-  local_samples, sample_units[], sample_reserved_mb[]`. `schema = 1`.
+- `CalibrationProfile` (`calibration.rs:123`): key `inference_id, epoch, gpu
+  (model name as nvidia-smi prints it), platform (std::env::consts::OS),
+  backend, torch, dtype, unit, aggregation` — `dtype` sentinel spelled
+  `unstated` since run2 (R11), not `unknown`; measurement `base_mb,
+  base_method, dtype_method (run2 R11, additive and never matched on),
+  slope_mb_per_unit, knee_units, samples, residual_mb, measured_at,
+  generator`; local-only `max_units_measured, local_samples,
+  knee_clean_windows (run2 R1d), sample_units[], sample_reserved_mb[]`.
+  `schema = 1`. `ProfileUpdate` additionally carries `knee_withdrawn`, the
+  one signal that erases a stored knee (the merge otherwise reads an absent
+  knee as "nothing fitted this run").
 - Write policy `pending_update_locked` (`ledger.rs:2266-2328`): needs
   torch, dtype, base_mb, `local_samples > 0`; fires on anchor advance,
   fit version change, local knee change; anchor monotone; debounce 30 s
