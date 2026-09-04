@@ -65,15 +65,15 @@ build/deploy/API. The plan that uses this is
 - Worker samples are the primary source: load and every predict response
   carry `memory{free_mb,total_mb,free_source,reserved_mb,allocated_mb}`, and
   since run2 (R5) **every measurement** carries its own pre-batch
-  `free_mb`/`free_source` too (`worker.rs:377` `BatchMeasurement`). Both go
+  `free_mb`/`free_source` too (`worker.rs:383` `BatchMeasurement`). Both go
   through `record_free_locked` under the same rules; within one response the
   measurements apply in sequence order and the response-level sample last
   (it is taken after the final batch, and `Worker::record_telemetry` stamps
   it last for that reason), so `external_mb` refreshes at response cadence
   rather than at the 10 s staleness timer (finding T3).
   New in run2, same file: `clamped{from_units,to_units,free_mb}`
-  (`worker.rs:346`) and `oom_class{source,exception,free_mb_at_failure,device}`
-  (`worker.rs:358`).
+  (`worker.rs:352`) and `oom_class{source,exception,free_mb_at_failure,device}`
+  (`worker.rs:364`).
   Recorded at registration (`ledger.rs:2008-2020`) and every settle
   (`:3165-3189`) via `record_free_locked` (`:2386-2456`): authoritative
   labels `nvml|nvidia-smi|amdgpu-sysfs|mps|ram` (`:1003-1008`); once a
@@ -121,7 +121,8 @@ build/deploy/API. The plan that uses this is
   32, `fit`, `fit_is_local`, `max_units_measured` (anchor), `seeded`,
   `local_samples`, throughput ring 128 `KNEE_RING`, `knee_best`,
   `knee_units`, `knee_is_local`, run2 `knee_clean_windows` +
-  `knee_re_explore_above`, `persisted`; `ledger.rs:1428`),
+  `knee_re_explore_above`, `knee_withdrawn`, `persisted`;
+  `ledger.rs:1441`),
   `remembered_bases`,
   `remembered_dtypes`, `pending_trims` (cap 32).
 - Budgets: `VramBudget{margin: Option<f64>, cap_fraction: Option<f64>}`
@@ -184,34 +185,42 @@ build/deploy/API. The plan that uses this is
   `local_samples++`; warm batch with `units ≥ 0.8 × granted`
   (`FULL_BATCH_RATIO`) and `duration_ms > 0` → throughput sample — unless
   run2 (R1a/R1b) excludes it: the window was `squeezed` or memory-blind
-  (`knee_admits_window` `:1145`), the measurement carries `clamped`, and
+  (`knee_admits_window` `:1158`), the measurement carries `clamped`, and
   every admitted sample is tagged with the window's contention count
   (`GrantCharge::peak_occupants`, maintained by `note_occupancy_locked`
-  `:3940`). A `throughput_collapse` from a window that was **not** sole
-  occupancy is discarded rather than counted as a negative (P5-5).
+  `:3987`). A `throughput_collapse` from a window that was **not** sole
+  occupancy is discarded rather than counted as a negative (P5-5) — the
+  *verdict* only: an `oom` on the same measurement still deflates
+  (`:4507-4527`), which is the shape an impl's own absorbed halving takes.
   `WorkerDied` → unified boards only: anchor halved + deflate
   (`note_unified_death_locked` `:3039-3077`); discrete boards learn
   nothing. Then `refit_locked` (Theil–Sen `robust_fit` `:4141-4177`: ≥ 3
   samples, distinct x, slope > 0, else the old fit is kept) and
   `refit_knee_locked`.
-- Knee `fit_knee` (`:5925`): log2 buckets, median per bucket, ≥ 12 samples
+- Knee `fit_knee` (`:6220`): log2 buckets, median per bucket, ≥ 12 samples
   over ≥ 3 buckets, threshold 0.9 × max(ring best, historical `knee_best`),
   knee = first bucket ≥ threshold and < largest bucket, returned as
   `2^(k+1) − 1`. Run2 (R1): only **sole-occupancy** samples are fitted
-  (`refit_knee_locked` `:4728`); a bucket with fewer than
+  (`refit_knee_locked` `:4845`); a bucket with fewer than
   `MIN_KNEE_BUCKET_SAMPLES = 2` observations is dropped; and any retained
-  bucket whose **relative MAD** (`relative_mad` `:6014`) exceeds
+  bucket whose **relative MAD** (`relative_mad` `:6309`) exceeds
   `KNEE_MAX_BUCKET_DISPERSION = 0.20` refuses the whole fit, `knee_best`
   included. Run2 (R1d) also makes it expire: `note_knee_window_locked`
-  (`:4128`) counts clean windows run **at** the knee with headroom ≥
-  `RATCHET_FACTOR × appetite_mb_locked` (`:3541`), and at
+  (`:4188`) counts clean windows run **at** the knee with headroom ≥
+  `RATCHET_FACTOR × appetite_mb_locked` (`:3581`), and at
   `KNEE_EXPIRY_CLEAN_WINDOWS = 12` widens it one bucket (`2k+1`) — or
-  withdraws it once it passes `RATCHET_FACTOR × anchor` — logging
+  withdraws it once it reaches `uncapped_units` (`:1120`), the budget the
+  ramp and the ratchet allow on their own, which is also defined where
+  `anchor == 0` — logging
   `this model has run cleanly at its throughput knee…` at INFO.
   `knee_re_explore_above` blocks a refit until a warm batch above the old cap
-  is observed. A shipped knee is adopted at seed time when no local knee
-  exists, arrives with its persisted `knee_clean_windows`, and can only
-  ratchet down within a run.
+  is observed, and is set by **both** arms (a withdrawal is a widening with
+  no upper bound); a withdrawal additionally sets
+  `ModelCalibration::knee_withdrawn`, which the store's merge reads as
+  "drop the stored knee" rather than "this run fitted none".
+  A shipped knee is adopted at seed time when no local knee exists, arrives
+  with its persisted `knee_clean_windows`, and can only ratchet down within
+  a run.
 - Load reservation `reserve_load` (`:1476-1573`): `max(remembered base,
   store expected_base)` else `CONSERVATIVE_BASE_MB = 4096`; only WARNs
   when it exceeds headroom ("loading this model is expected to need more
@@ -226,7 +235,7 @@ build/deploy/API. The plan that uses this is
   `:2123-2238`): once per (model, board) per run; fit adopted if none
   and slope > 0; knee adopted even from a baseline; anchor/ring/
   `local_samples` only from a local profile with the exact torch string.
-- `Grant.squeezed` (`ledger.rs:4807`, set at `:3292-3302`): true when the
+- `Grant.squeezed` (`ledger.rs:5790`, set at `:3828-3851`): true when the
   board could afford **less** than the window target the anchor asked
   for. Two consumers, both added during run1: `flag_trims_locked` (a
   squeezed neighbour is what justifies asking an idle resident to release
@@ -281,12 +290,24 @@ build/deploy/API. The plan that uses this is
 2. Harness `run_window` (`packing.py:685-830`): no in-harness retry; a
    multi-item OOM is prefixed `INFERENCE_OOM_WINDOW:`; `WindowFailure`
    carries the measurements.
-3. Host classification `message_reports_oom` (`ledger.rs:4111-4124`):
-   the two prefixes, "CUDA out of memory", "HIP out of memory", any line
-   containing "out of memory" (case-insensitive), the
-   `DefaultCPUAllocator`/"allocate memory" pair; applied by
-   `dispatch::error_reports_oom` (`dispatch.rs:982-991`) to message +
-   traceback only, never the stderr tail.
+3. Host classification, **rewritten in run2 (R3 host half)**. Two paths:
+   - **With a measurement**, `oom_verdict` (`ledger.rs:6009`, called from
+     `ingest_locked` `:4516`) reads `oom_class.source`:
+     `typed_exception`/`marker` (and an unrecognised tier, and a
+     measurement with no class at all — a pre-run2 worker) deflate on
+     their own; `message_pattern` is **vetoed** when
+     `free_mb_at_failure >=` the window's grant `mb` (`mb = 0` states no
+     envelope, so it cannot veto). One WARN per window names the figures.
+   - **Without one** (the error frame), `message_reports_oom`
+     (`ledger.rs:6082`) mirrors the worker's classifier: the two
+     `INFERENCE_OOM_*` prefixes, then per **line** — `OOM_MESSAGE_PATTERNS`
+     (`:5919`, ten allocator/driver spellings), the
+     `defaultcpuallocator`/"allocate memory" pair, and `out of memory`
+     **plus** a whole-word device token (`cuda|hip|rocm|nvml|xpu|sycl`,
+     `contains_word` `:6036`). The bare `out of memory` substring is gone
+     (Q1/B11). Applied by `dispatch::error_reports_oom`
+     (`dispatch.rs:1268`) to message + traceback only, never the stderr
+     tail.
 4. Dispatcher (`dispatch.rs:836-1161`): merged window failure → WARN
    "merged batch of {n} requests failed, falling back to per-request
    prediction" (`:913`) → **one** sequential per-request retry pass under
@@ -613,6 +634,11 @@ Pre-existing:
 - manager.rs: DEBUG "resolved cost dimension"; DEBUG "replica loaded";
   WARN "worker died fatally; dropping model from all caches"; DEBUG
   "unloading model".
+- worker.rs: DEBUG "spawned an inferio worker" — `worker=<impl_class>`,
+  `pid=Some(N)` and, since run2, `inference_id=<group/name>`
+  (`<unconfigured>` on the prewarm path, which has no model at spawn).
+  `analyze.py::_worker_spawns` prefers the stated id and falls back to the
+  old FIFO pairing against `Configured as …` for run1 recordings.
 - worker.rs (added by `c8d64a5a`): **WARN "an inferio worker process is
   gone. Cause: {why}. {attribution}. stderr tail: …"** with `worker`,
   `pid`, `status`, `signal`, `core_dumped`, `killed_by_gateway` — one per
