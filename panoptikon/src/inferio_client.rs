@@ -91,6 +91,144 @@ pub(crate) struct PredictResponse {
 /// `docs/inferio-worker-protocol.md`).
 pub(crate) const DESIRED_IN_FLIGHT_HEADER: &str = "x-panoptikon-desired-in-flight-items";
 
+/// `detail.kind` of a predict that failed because the inference worker
+/// process died with the request in flight
+/// (`inferio::http::WORKER_DIED_KIND`). The request's items were never
+/// attempted, so re-submitting them is correct — see run1 finding F7.
+pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
+
+/// `detail.kind` of a request refused because the model is inside its
+/// per-model load-failure cooldown. Unlike every other 503 this must **not**
+/// be retried: the server is telling the caller when to come back, and a job
+/// that keeps asking only burns the cooldown's whole window one request at a
+/// time.
+pub(crate) const LOAD_COOLDOWN_KIND: &str = "load_cooldown";
+
+/// A request the inference server refused, with the machine-readable half of
+/// its `{"detail": …}` body parsed out.
+///
+/// It is a typed error (attached to the returned `anyhow::Error`, so callers
+/// reach it with `downcast_ref`) rather than a string, because two callers
+/// act on it: an extraction job re-queues a [`WORKER_DIED_KIND`] request's
+/// items once instead of recording them as failures, and aborts outright on
+/// [`LOAD_COOLDOWN_KIND`]. Both decisions have to survive the error being
+/// wrapped in context on the way up, and neither may depend on prose.
+///
+/// `kind` is `None` for every failure that answered with the plain string
+/// detail — an older server, an unrelated 4xx/5xx — which is the
+/// "no machine-readable opinion" case every caller already handled.
+#[derive(Debug, Clone)]
+pub(crate) struct InferenceFailure {
+    /// HTTP status of the refusal.
+    pub status: u16,
+    /// `detail.kind`, when the body carried a structured detail.
+    pub kind: Option<String>,
+    /// Human-readable summary: `detail.message` for a structured detail, the
+    /// whole `detail` for a plain string one, and the raw body when it is
+    /// neither.
+    pub message: String,
+    /// The model the failure is about, `group/name`.
+    pub model: Option<String>,
+    /// The last error that put the model in this state (a cooldown), or the
+    /// fatal error chain (a worker death).
+    pub last_error: Option<String>,
+    /// RFC 3339 instant the model may be retried at.
+    pub retry_at: Option<String>,
+    /// Consecutive load failures counted so far.
+    pub failures: Option<u32>,
+    /// `Retry-After`, in seconds, when the server sent one.
+    pub retry_after_secs: Option<u64>,
+}
+
+impl InferenceFailure {
+    /// Parse one refused response. Never fails: a body this cannot read is
+    /// still a failure, it just carries no machine-readable half.
+    fn parse(status: reqwest::StatusCode, retry_after: Option<u64>, body: &str) -> Self {
+        let mut failure = Self {
+            status: status.as_u16(),
+            kind: None,
+            message: body.trim().to_owned(),
+            model: None,
+            last_error: None,
+            retry_at: None,
+            failures: None,
+            retry_after_secs: retry_after,
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(body) else {
+            return failure;
+        };
+        let Some(detail) = parsed.get("detail") else {
+            return failure;
+        };
+        if let Some(text) = detail.as_str() {
+            failure.message = text.to_owned();
+            return failure;
+        }
+        let Some(object) = detail.as_object() else {
+            return failure;
+        };
+        let text = |key: &str| object.get(key).and_then(Value::as_str).map(str::to_owned);
+        failure.kind = text("kind");
+        if let Some(message) = text("message") {
+            failure.message = message;
+        }
+        failure.model = text("model");
+        failure.last_error = text("last_error");
+        failure.retry_at = text("retry_at");
+        failure.failures = object
+            .get("failures")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        failure
+    }
+
+    /// The worker process died with the request in flight.
+    pub fn is_worker_death(&self) -> bool {
+        self.kind.as_deref() == Some(WORKER_DIED_KIND)
+    }
+
+    /// The model is inside its per-model load-failure cooldown.
+    pub fn is_load_cooldown(&self) -> bool {
+        self.kind.as_deref() == Some(LOAD_COOLDOWN_KIND)
+    }
+}
+
+impl std::fmt::Display for InferenceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "inference request failed ({})", self.status)?;
+        if let Some(kind) = &self.kind {
+            write!(f, " [{kind}]")?;
+        }
+        if !self.message.is_empty() {
+            write!(f, ": {}", self.message)?;
+        }
+        if let Some(retry_at) = &self.retry_at {
+            write!(f, "; retry at {retry_at}")?;
+        }
+        if let Some(last_error) = &self.last_error {
+            write!(f, "; last error: {last_error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for InferenceFailure {}
+
+/// The typed failure inside an error chain, if there is one. The chain is
+/// what callers hold: `InferencePool` wraps, and the job path adds context.
+pub(crate) fn inference_failure(err: &anyhow::Error) -> Option<&InferenceFailure> {
+    err.downcast_ref::<InferenceFailure>()
+}
+
+/// `Retry-After` in seconds, when the header is present and is a plain
+/// delta-seconds value (the only form this surface sends).
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 impl PredictResponse {
     fn plain(outputs: PredictOutput) -> Self {
         Self {
@@ -220,6 +358,22 @@ impl InferenceApiClient {
                     }
 
                     let status = response.status();
+                    let retry_after = retry_after_secs(response.headers());
+                    // Read before deciding: the body is what says whether a
+                    // 503 is the transient one this loop retries or the
+                    // cooldown that must be handed straight to the caller.
+                    let body = response.text().await.unwrap_or_default();
+                    let failure = InferenceFailure::parse(status, retry_after, &body);
+                    if failure.is_load_cooldown() {
+                        warn!(
+                            %url,
+                            %status,
+                            model = failure.model.as_deref().unwrap_or("?"),
+                            retry_at = failure.retry_at.as_deref().unwrap_or("?"),
+                            "inference predict refused: the model is in its load-failure cooldown"
+                        );
+                        return Err(anyhow::Error::new(failure));
+                    }
                     if should_retry_status(status)
                         && let Some(delay) = next_retry_delay(attempts)
                     {
@@ -228,9 +382,8 @@ impl InferenceApiClient {
                         continue;
                     }
 
-                    let body = response.text().await.unwrap_or_default();
                     warn!(%url, %status, %body, "inference predict failed");
-                    bail!("inference predict failed ({status})");
+                    return Err(anyhow::Error::new(failure));
                 }
                 Err(err) => {
                     if should_retry_error(&err)
@@ -559,8 +712,15 @@ async fn parse_json_response(response: reqwest::Response) -> Result<Value> {
             .context("decode inference response");
     }
     let status = response.status();
+    let retry_after = retry_after_secs(response.headers());
     let body = response.text().await.unwrap_or_default();
-    bail!("inference request failed ({status}): {body}");
+    // Typed here too: a load that hits the per-model cooldown must reach the
+    // job with its kind intact, exactly like a predict that does.
+    Err(anyhow::Error::new(InferenceFailure::parse(
+        status,
+        retry_after,
+        &body,
+    )))
 }
 
 fn extract_boundary(content_type: &str) -> Option<String> {

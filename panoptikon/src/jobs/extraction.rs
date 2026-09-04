@@ -25,6 +25,7 @@ use crate::db::{open_index_db_read, open_index_db_read_no_user_data};
 use crate::inferio::slot_error::{ProtocolViolation, SlotErrorClass};
 use crate::inferio_client::{
     InferenceFile, InferenceInput, PredictOutput, PredictResponse, PredictSlotError,
+    inference_failure,
 };
 use crate::jobs::continuous_scan;
 use crate::jobs::files::{FileScanService, is_resync_needed};
@@ -472,6 +473,13 @@ struct JobCounters {
     /// in silence.
     blocked_errors: i64,
     blocked: std::collections::BTreeSet<Blocker>,
+    /// How many items had their inference re-submitted once because the
+    /// worker process died with their request in flight (run1 finding F7).
+    /// Informational: a re-queued item that then succeeds is a plain success,
+    /// and one that fails again is a plain failure. It exists so the job's
+    /// summary can say *why* a job that looks healthy took a second pass over
+    /// part of its work.
+    requeued_items: i64,
     data_load_time: PhaseTimer,
     inference_time: PhaseTimer,
 }
@@ -504,6 +512,26 @@ enum JobFailure {
     Systemic,
 }
 
+/// Items this job attempted and could **not** finish, and for which it has no
+/// verdict explaining why: the difference between the error count and the
+/// subset that owes an `item_extraction_errors` row.
+///
+/// This is the quantity that makes a job *partial* rather than *completed*
+/// (run1 finding F7: one worker death failed 1 542 items and the job still
+/// reported completed). A media verdict is deliberately **not** counted: the
+/// item was attempted, the pipeline reached a conclusion about it, it is
+/// recorded and it is now skipped by the work query — the job did everything
+/// it could and completes with the warning it already logs. An unsettled
+/// failure is the opposite: the work simply did not happen, nothing explains
+/// it, and the item is still in the work query for the next run.
+///
+/// Saturating because `input_errors` is a subset of `errors` by construction;
+/// if that ever stopped holding, reporting *no* unsettled failures is the
+/// direction that cannot invent a partial job out of a counting bug.
+fn unsettled_failures(errors: i64, input_errors: i64) -> i64 {
+    errors.saturating_sub(input_errors).max(0)
+}
+
 /// `errors`/`input_errors` are the job's own counters, so `input_errors >
 /// errors` cannot happen; if it ever does, the run is treated as systemic
 /// rather than soft-completed on a count nobody can explain.
@@ -519,11 +547,49 @@ fn classify_extraction_job_failure(processed: i64, errors: i64, input_errors: i6
 }
 
 /// What an extraction job reports back to the queue: whether it changed the
-/// index (so maintenance is owed for its DB) and which batch-cache model it
-/// left loaded.
+/// index (so maintenance is owed for its DB), which batch-cache model it left
+/// loaded, and — when it did not finish everything — why.
 pub(crate) struct ExtractionOutcome {
     pub summary: ChangeSummary,
     pub loaded_model: Option<String>,
+    /// `Some(reason)` when the job ran to the end but some of the items it
+    /// attempted were not processed and carry no verdict saying why: the job
+    /// is **partial**, not completed. `None` is a clean completion.
+    ///
+    /// The distinction is the whole of run1 finding F7: before it, a job that
+    /// lost a whole in-flight window to one worker death still reported
+    /// *completed*, so nothing — not the queue, not the UI, not the job
+    /// history — could tell the user that a fraction of the work never
+    /// happened.
+    pub partial_reason: Option<String>,
+}
+
+/// Cooperative abort for one job's item tasks.
+///
+/// Only one thing sets it today: a [`crate::inferio_client::LOAD_COOLDOWN_KIND`]
+/// refusal, which says the model is unavailable until a stated instant. That
+/// is a fact about the whole job, not about one item, so the first task to
+/// see it stops the run instead of letting every remaining item spend a
+/// request discovering the same thing. Set once and never cleared — a
+/// `OnceLock`, so the first reason wins and the rest are dropped.
+#[derive(Default)]
+struct JobAbort {
+    reason: std::sync::OnceLock<String>,
+}
+
+impl JobAbort {
+    /// Record the first abort reason. Later calls are no-ops.
+    fn set(&self, reason: String) {
+        let _ = self.reason.set(reason);
+    }
+
+    fn reason(&self) -> Option<&str> {
+        self.reason.get().map(String::as_str)
+    }
+
+    fn is_set(&self) -> bool {
+        self.reason.get().is_some()
+    }
 }
 
 pub(crate) async fn run_extraction_job(
@@ -704,6 +770,7 @@ async fn run_extraction_job_inner(
         return Ok(ExtractionOutcome {
             summary,
             loaded_model: None,
+            partial_reason: None,
         });
     }
 
@@ -748,6 +815,14 @@ async fn run_extraction_job_inner(
             .await
     };
     if let Err(err) = load_result {
+        // A load refused by the per-model cooldown is not "the load failed":
+        // it is "this model is unavailable until <instant>", and the job says
+        // so with the model, the retry instant and the error that caused it.
+        if let Some(failure) = inference_failure(&err)
+            && failure.is_load_cooldown()
+        {
+            return Err(ApiError::internal(cooldown_reason(failure)));
+        }
         return Err(ApiError::internal(format!("Failed to load model: {err}")));
     }
 
@@ -785,6 +860,8 @@ async fn run_extraction_job_inner(
     // cancelled (task aborted), dropping the set aborts every in-flight item
     // instead of leaving detached tasks writing to the DB.
     let mut tasks = tokio::task::JoinSet::new();
+    // Cooperative stop for the whole run; see [`JobAbort`].
+    let abort = Arc::new(JobAbort::default());
 
     let (cursor_column, partition_column) = work_query_keys(&model);
     let chunk_sql = chunked_work_query_sql(&compiled.sql, cursor_column, WORK_CHUNK_ROWS);
@@ -798,6 +875,9 @@ async fn run_extraction_job_inner(
     // each work unit is dispatched at most once per job in both cases.
     let mut dispatched: std::collections::HashSet<i64> = std::collections::HashSet::new();
     loop {
+        if abort.is_set() {
+            break;
+        }
         // The connection lives only for this fetch: the read snapshot it
         // holds is released before any processing below awaits, so WAL
         // checkpoints advance throughout the job instead of stalling behind
@@ -817,6 +897,9 @@ async fn run_extraction_job_inner(
         };
         let fetched = rows.len();
         for row in &rows {
+            if abort.is_set() {
+                break;
+            }
             // Rows are ordered by the cursor key, so every row advances the
             // cursor — including rows that are skipped or fail to map, which
             // must not be re-fetched by the next chunk.
@@ -841,6 +924,7 @@ async fn run_extraction_job_inner(
             let unit_slots = Arc::clone(&unit_slots);
             let budget_slots = Arc::clone(&budget_slots);
             let ledger_shas = Arc::clone(&ledger_shas);
+            let abort = Arc::clone(&abort);
             tasks.spawn(async move {
                 let result = process_item(
                     &index_db,
@@ -859,6 +943,7 @@ async fn run_extraction_job_inner(
                     total_remaining,
                     &ledger_shas,
                     detect_outros,
+                    &abort,
                 )
                 .await;
                 if let Err(err) = result {
@@ -879,7 +964,7 @@ async fn run_extraction_job_inner(
         run_compiled_count(&mut count_conn, &compiled_count.sql, &compiled_count.params).await?
     };
 
-    let (final_update, failure, processed_data) = {
+    let (final_update, failure, processed_data, partial_reason) = {
         let guard = counters.lock().await;
         // Every attempted item failing on a cause that is *not* the item's
         // own media means a systemic problem (inference server down, model
@@ -914,6 +999,44 @@ async fn run_extraction_job_inner(
                 blocked.join(", ")
             );
         }
+        // Items the job attempted and could not finish, with nothing on
+        // record explaining why. Any at all and the job is *partial*: it ran
+        // to the end, but part of the work it selected simply did not happen
+        // and is still owed (run1 finding F7). An aborted job is not partial
+        // — it is failed, and the abort reason is what the user needs.
+        let unsettled = unsettled_failures(guard.errors, guard.input_errors);
+        let partial_reason = if failure == JobFailure::None && !abort.is_set() && unsettled > 0 {
+            let mut reason = format!(
+                "{unsettled} of {} attempted items could not be processed and are still owed",
+                guard.processed
+            );
+            if guard.requeued_items > 0 {
+                reason.push_str(&format!(
+                    " ({} were re-queued after an inference worker died)",
+                    guard.requeued_items
+                ));
+            }
+            Some(reason)
+        } else {
+            None
+        };
+        if let Some(reason) = &partial_reason {
+            tracing::warn!(
+                unsettled,
+                attempted = guard.processed,
+                requeued = guard.requeued_items,
+                setter = %model.setter_name,
+                "extraction job is partial: {reason}"
+            );
+        } else if guard.requeued_items > 0 {
+            tracing::info!(
+                requeued = guard.requeued_items,
+                setter = %model.setter_name,
+                "{} items were re-queued after an inference worker died and \
+                 then completed",
+                guard.requeued_items
+            );
+        }
         let update = DataLogUpdate {
             image_files: guard.image_files,
             video_files: guard.video_files,
@@ -924,7 +1047,7 @@ async fn run_extraction_job_inner(
             total_remaining: remaining_after,
             data_load_time: guard.data_load_time.busy_secs(),
             inference_time: guard.inference_time.busy_secs(),
-            finished: failure != JobFailure::Systemic,
+            finished: failure != JobFailure::Systemic && !abort.is_set(),
         };
         // The stored times are phase wall-clock (busy); aggregate worker time
         // only goes to the log, where work / busy reads as average parallelism.
@@ -935,7 +1058,12 @@ async fn run_extraction_job_inner(
             inference_work_secs = guard.inference_time.work_secs(),
             "extraction job phase timing"
         );
-        (update, failure, guard.processed - guard.errors > 0)
+        (
+            update,
+            failure,
+            guard.processed - guard.errors > 0,
+            partial_reason,
+        )
     };
     let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
         job_id,
@@ -949,6 +1077,9 @@ async fn run_extraction_job_inner(
     // instead of reloading (design §B). Every path that loses the boundary's
     // unload still falls back to the inferio TTL sweep, as it always did.
 
+    if let Some(reason) = abort.reason() {
+        return Err(ApiError::internal(reason.to_string()));
+    }
     if failure == JobFailure::Systemic {
         return Err(ApiError::internal(format!(
             "All {} attempted items failed; check the inference server",
@@ -969,6 +1100,7 @@ async fn run_extraction_job_inner(
     Ok(ExtractionOutcome {
         summary,
         loaded_model: Some(model.setter_name.clone()),
+        partial_reason,
     })
 }
 
@@ -1081,6 +1213,7 @@ async fn process_item(
     total_remaining: i64,
     ledger_shas: &std::collections::HashSet<String>,
     detect_outros: bool,
+    abort: &JobAbort,
 ) -> ApiResult<()> {
     let item_type = item.item_type.clone();
     let sha256 = item.sha256.clone();
@@ -1167,7 +1300,13 @@ async fn process_item(
     drop(loader_permit);
 
     let segments = inference_inputs.len() as i64;
-    let inference = match run_chunked_inference(
+    // Another item already found the model unavailable for a stated window:
+    // this one has nothing to gain from asking, and the run is over. Nothing
+    // is counted — the item was never attempted.
+    if abort.is_set() {
+        return Ok(());
+    }
+    let inference = match run_item_inference(
         &model.setter_name,
         pool,
         unit_slots,
@@ -1175,10 +1314,14 @@ async fn process_item(
         batch_cap,
         &inference_inputs,
         &counters,
+        abort,
     )
     .await
     {
-        Ok(inference) => inference,
+        Ok(Some(inference)) => inference,
+        // The abort was raised by *this* item's request: same rule as above,
+        // nothing counted, the driver stops dispatching.
+        Ok(None) => return Ok(()),
         Err(err) => {
             // A failure of the predict call itself stays transient — even
             // after `run_chunked_inference`'s isolation retry gave every one
@@ -1598,6 +1741,130 @@ struct ItemInference {
     slot_errors: Vec<PredictSlotError>,
 }
 
+/// One item's inference, with the two failures that are **not** about the
+/// item handled before it can be blamed for them.
+///
+/// - **The worker died with the request in flight** ([`WORKER_DIED_KIND`]).
+///   The items in that request were never attempted: the process holding
+///   them stopped existing. Recording them as errors makes one death cost a
+///   whole in-flight window — 1 542 items from a single death in run1
+///   (finding F7), on a job that still reported *completed*. So the item's
+///   work is re-submitted **once**. The next predict is what respawns the
+///   worker and reloads the model, so there is nothing to wait for and no
+///   sleep here; a model that then fails to *load* comes back as a load
+///   failure, not a death, so this cannot spin.
+///
+///   Once per item, and only once, is the whole budget: a job of N items can
+///   therefore cost at most 2N requests however many times the worker dies,
+///   and a second death on the retry is a real failure of that item.
+///
+/// - **The model is in its load-failure cooldown**
+///   ([`LOAD_COOLDOWN_KIND`]). That is a fact about the model for a stated
+///   window, not about this item, so it aborts the job (`Ok(None)`) instead
+///   of failing every remaining item one request at a time.
+///
+/// Everything else is returned untouched for the caller to classify.
+#[allow(clippy::too_many_arguments)]
+async fn run_item_inference(
+    setter_name: &str,
+    pool: &InferencePool,
+    unit_slots: &Arc<UnitBudget>,
+    unit_capacity: usize,
+    batch_cap: Option<u32>,
+    inputs: &[InferenceInput],
+    counters: &Arc<Mutex<JobCounters>>,
+    abort: &JobAbort,
+) -> anyhow::Result<Option<ItemInference>> {
+    let mut requeued = false;
+    loop {
+        let err = match run_chunked_inference(
+            setter_name,
+            pool,
+            unit_slots,
+            unit_capacity,
+            batch_cap,
+            inputs,
+            counters,
+        )
+        .await
+        {
+            Ok(inference) => return Ok(Some(inference)),
+            Err(err) => err,
+        };
+        match classify_item_failure(&err, requeued) {
+            InferenceRecovery::Fail => return Err(err),
+            InferenceRecovery::Abort(reason) => {
+                abort.set(reason);
+                return Ok(None);
+            }
+            InferenceRecovery::Requeue => {
+                requeued = true;
+                counters.lock().await.requeued_items += 1;
+                tracing::warn!(
+                    setter = setter_name,
+                    units = inputs.len(),
+                    error = %err,
+                    "the inference worker died with this item's request in flight; \
+                     re-queueing its work once instead of recording it as an error"
+                );
+            }
+        }
+    }
+}
+
+/// What a failed predict means for the item that made it, and for the job.
+///
+/// Pure, so the policy is testable without an inference server: the loop
+/// above is then only "call, classify, act".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InferenceRecovery {
+    /// Re-submit this item's work, once. Only a worker death earns this, and
+    /// only the first time for a given item.
+    Requeue,
+    /// Stop the whole job with this reason. Only the load-failure cooldown
+    /// earns it: it is a statement about the model for a stated window, so
+    /// every other item would get the same answer.
+    Abort(String),
+    /// Nothing to recover: the item failed, and the caller classifies it.
+    Fail,
+}
+
+/// The recovery policy. `already_requeued` is this item's one-shot budget:
+/// a second death on the retry is a real failure, so a job of N items can
+/// never cost more than 2N requests however many times the worker dies.
+fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> InferenceRecovery {
+    let Some(failure) = inference_failure(err) else {
+        return InferenceRecovery::Fail;
+    };
+    if failure.is_load_cooldown() {
+        return InferenceRecovery::Abort(cooldown_reason(failure));
+    }
+    if failure.is_worker_death() && !already_requeued {
+        return InferenceRecovery::Requeue;
+    }
+    InferenceRecovery::Fail
+}
+
+/// The abort reason a load-failure cooldown produces, naming the model, the
+/// instant it may be retried and the error that put it there — the three
+/// things the user needs to act, and the three the server bothers to send.
+fn cooldown_reason(failure: &crate::inferio_client::InferenceFailure) -> String {
+    let model = failure.model.as_deref().unwrap_or("the model");
+    let mut reason = format!("Inference is unavailable: {model} is in a load-failure cooldown");
+    if let Some(failures) = failure.failures {
+        reason.push_str(&format!(" after {failures} consecutive load failures"));
+    }
+    if let Some(retry_at) = &failure.retry_at {
+        reason.push_str(&format!("; retry at {retry_at}"));
+    } else if let Some(secs) = failure.retry_after_secs {
+        reason.push_str(&format!("; retry in {secs}s"));
+    }
+    if let Some(last_error) = &failure.last_error {
+        reason.push_str(&format!("; last error: {last_error}"));
+    }
+    reason
+}
+
 /// Runs inference over one item's work units in chunks of at most
 /// `unit_capacity`, holding one unit permit per work unit for the duration of
 /// each request. Together with the shared semaphore this caps the total
@@ -1646,6 +1913,13 @@ async fn run_chunked_inference(
                 // same way one input at a time. Isolating would burn a full extra
                 // GPU pass to learn nothing, so the chunk fails transiently now.
                 Err(err) if is_protocol_violation(&err) => return Err(err),
+                // Neither of these is a verdict on any single work unit: the
+                // worker process holding the request stopped existing, or the
+                // model is refused for a stated window. Isolating would
+                // re-ask the same dead-or-refused model once per unit, for
+                // nothing. Both are answered one level up, in
+                // [`run_item_inference`].
+                Err(err) if is_unit_agnostic_failure(&err) => return Err(err),
                 Err(err) if chunk.len() > 1 => {
                     tracing::warn!(
                         setter = setter_name,
@@ -1745,6 +2019,15 @@ async fn predict_units(
         Err(_) => unit_slots.settle(),
     }
     response
+}
+
+/// Whether a failure says nothing about any individual work unit, so
+/// isolating the chunk one unit at a time can only repeat it: the worker
+/// process died with the request in flight, or the model is inside its
+/// load-failure cooldown.
+fn is_unit_agnostic_failure(err: &anyhow::Error) -> bool {
+    inference_failure(err)
+        .is_some_and(|failure| failure.is_worker_death() || failure.is_load_cooldown())
 }
 
 /// Whether a failure is the peer answering in a shape the protocol does not
@@ -3228,6 +3511,112 @@ mod tests {
                 "processed={processed} errors={errors} input_errors={input_errors}"
             );
         }
+    }
+
+    /// A failure the client typed. Built by hand rather than through a real
+    /// server: the policy under test is about the `kind` field alone.
+    fn typed_failure(kind: Option<&str>) -> anyhow::Error {
+        anyhow::Error::new(crate::inferio_client::InferenceFailure {
+            status: if kind == Some(crate::inferio_client::LOAD_COOLDOWN_KIND) {
+                503
+            } else {
+                500
+            },
+            kind: kind.map(str::to_owned),
+            message: "Prediction failed".to_string(),
+            model: Some("group/model-a".to_string()),
+            last_error: Some("inferio worker group/model-a failed fatally: EOF".to_string()),
+            retry_at: kind
+                .filter(|kind| *kind == crate::inferio_client::LOAD_COOLDOWN_KIND)
+                .map(|_| "2026-09-04T12:00:00Z".to_string()),
+            failures: kind
+                .filter(|kind| *kind == crate::inferio_client::LOAD_COOLDOWN_KIND)
+                .map(|_| 3),
+            retry_after_secs: None,
+        })
+    }
+
+    /// The whole of the F7 policy, on the one function that decides it.
+    ///
+    /// A worker death is the only failure that buys a re-submission, it buys
+    /// exactly one per item, and everything else — including a *second* death
+    /// on the retry — is a plain failure of that item.
+    #[test]
+    fn only_a_first_worker_death_buys_an_item_a_second_attempt() {
+        use crate::inferio_client::{LOAD_COOLDOWN_KIND, WORKER_DIED_KIND};
+
+        assert_eq!(
+            classify_item_failure(&typed_failure(Some(WORKER_DIED_KIND)), false),
+            InferenceRecovery::Requeue
+        );
+        assert_eq!(
+            classify_item_failure(&typed_failure(Some(WORKER_DIED_KIND)), true),
+            InferenceRecovery::Fail,
+            "the one-shot budget is per item, so a second death is a failure"
+        );
+        // An untyped failure is every pre-existing predict failure in the
+        // world: it must behave exactly as it did before this change.
+        assert_eq!(
+            classify_item_failure(&typed_failure(None), false),
+            InferenceRecovery::Fail
+        );
+        assert_eq!(
+            classify_item_failure(&anyhow::anyhow!("connection reset"), false),
+            InferenceRecovery::Fail
+        );
+
+        // The cooldown aborts whether or not the item has already been
+        // re-queued: it is a statement about the model, not about this item.
+        for already in [false, true] {
+            match classify_item_failure(&typed_failure(Some(LOAD_COOLDOWN_KIND)), already) {
+                InferenceRecovery::Abort(reason) => {
+                    assert!(reason.contains("group/model-a"), "{reason}");
+                    assert!(reason.contains("2026-09-04T12:00:00Z"), "{reason}");
+                    assert!(reason.contains("3 consecutive load failures"), "{reason}");
+                    assert!(reason.contains("failed fatally"), "{reason}");
+                }
+                other => panic!("a cooldown must abort the job, got {other:?}"),
+            }
+        }
+    }
+
+    /// The typed failure has to survive the context the job path wraps it in
+    /// — `run_chunked_inference`'s isolation context, the pool's failover —
+    /// or the policy above silently degrades to "everything is a failure".
+    #[test]
+    fn the_typed_failure_survives_the_context_chain() {
+        let err = typed_failure(Some(crate::inferio_client::WORKER_DIED_KIND))
+            .context("batch failed and isolation did not recover it")
+            .context("inference predict request failed");
+        assert_eq!(
+            classify_item_failure(&err, false),
+            InferenceRecovery::Requeue
+        );
+    }
+
+    /// The counter that decides `partial`: only failures with no verdict
+    /// explaining them. A recorded media verdict is a conclusion, not undone
+    /// work, so it never makes a job partial.
+    #[test]
+    fn unsettled_failures_counts_only_the_failures_nothing_explains() {
+        assert_eq!(unsettled_failures(0, 0), 0);
+        assert_eq!(unsettled_failures(4, 4), 0, "all media verdicts");
+        assert_eq!(unsettled_failures(4, 1), 3);
+        assert_eq!(unsettled_failures(4, 0), 4);
+        // Impossible counts must not invent a partial job.
+        assert_eq!(unsettled_failures(2, 5), 0);
+    }
+
+    /// A job the abort stopped is *failed*, not partial: the reason is the
+    /// cooldown, and the items it never reached were never attempted.
+    #[test]
+    fn a_job_abort_records_the_first_reason_only() {
+        let abort = JobAbort::default();
+        assert!(!abort.is_set());
+        abort.set("first".to_string());
+        abort.set("second".to_string());
+        assert_eq!(abort.reason(), Some("first"));
+        assert!(abort.is_set());
     }
 
     fn image_model() -> ModelMetadata {

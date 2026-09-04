@@ -85,6 +85,98 @@ const NEVER_EXPIRES: &str = "9999-12-31T23:59:59.999999";
 /// `x-panoptikon-*` strip (`policy.rs`) does not touch it.
 pub(crate) const DESIRED_IN_FLIGHT_HEADER: &str = "x-panoptikon-desired-in-flight-items";
 
+/// Machine-readable `kind` of a predict that failed because the inference
+/// **worker process died** while the request was in flight, as opposed to
+/// the model failing to load or the worker answering with an error.
+///
+/// It exists because the blast radius of one death is a whole in-flight
+/// window (run1 finding F7: 1 542 items lost to a single death, on a job that
+/// still reported *completed*), and the only sane response — re-queue the
+/// window's items once rather than record them as errors — needs the caller
+/// to be able to *tell*. Matching on the human message would put a job's
+/// retry policy at the mercy of a log string, so the kind rides in the body.
+pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
+
+/// The rendering `Worker::fatal` puts on every fatal teardown
+/// (`inferio worker <label> failed fatally: …`). It is deliberately stable —
+/// `worker.rs` documents it as what operators grep for — and it is the one
+/// signal available on this side of `ModelManager::predict`, whose error is
+/// an `anyhow` chain: the dispatcher fails a died-on window's *sibling*
+/// requests by re-raising the fatal message as a fresh error, so the typed
+/// `WorkerError` is not on every affected request but this text is.
+const FATAL_WORKER_MARKER: &str = "failed fatally";
+
+/// The `{"detail": …}` body of an inference error, in the two shapes this
+/// surface answers with.
+///
+/// The string form is the original one and stays byte-identical for every
+/// failure that already had a detail string (router.py parity, see the module
+/// docs). The object form is additive and exists for the failures a *caller*
+/// has to act on differently — today a worker death (a job re-queues) and,
+/// for the load-failure cooldown, an "unavailable until" answer — so the
+/// machine-readable half never has to be recovered by pattern-matching prose.
+#[derive(serde::Serialize, ToSchema)]
+#[serde(untagged)]
+pub(crate) enum InferenceErrorDetail {
+    /// router.py's plain detail strings. Never constructed here — the plain
+    /// failures keep going through [`crate::api_error::ErrorBody`], byte for
+    /// byte — but it is half of the wire contract and half of the generated
+    /// client's type, so it is documented rather than inferred from absence.
+    #[allow(dead_code)]
+    Message(String),
+    /// A failure with a machine-readable [`InferenceErrorDetail::Message`]
+    /// replacement: `kind` names it, the rest is per-kind context.
+    Structured(InferenceErrorFields),
+}
+
+/// The fields a structured [`InferenceErrorDetail`] can carry. One flat,
+/// wholly-optional-but-`kind` struct rather than a variant per kind: every
+/// consumer dispatches on `kind` first, and a single shape keeps the wire
+/// contract (and the generated client type) from growing a case per failure
+/// mode.
+#[derive(serde::Serialize, ToSchema, Default)]
+pub(crate) struct InferenceErrorFields {
+    /// What went wrong, as a stable token: [`WORKER_DIED_KIND`], or
+    /// `load_cooldown` for the per-model load-failure backoff.
+    pub kind: String,
+    /// Human-readable summary; the string the plain form would have carried.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The model the failure is about, `group/name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The last error that put the model in this state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// RFC 3339 instant the model may be retried at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<String>,
+    /// Consecutive failures counted so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failures: Option<u32>,
+}
+
+/// The body every inference error path serializes. Same `{"detail": …}`
+/// envelope as [`crate::api_error::ErrorBody`]; only the detail is allowed to
+/// be an object.
+#[derive(serde::Serialize, ToSchema)]
+pub(crate) struct InferenceErrorBody {
+    pub detail: InferenceErrorDetail,
+}
+
+/// Build an error response whose detail is the structured form. Kept beside
+/// the types so every structured failure — this file's worker death, and the
+/// load-failure cooldown — answers in exactly one shape.
+pub(crate) fn structured_error(status: StatusCode, fields: InferenceErrorFields) -> Response {
+    (
+        status,
+        Json(InferenceErrorBody {
+            detail: InferenceErrorDetail::Structured(fields),
+        }),
+    )
+        .into_response()
+}
+
 /// Shared state of the local inference service: the model manager plus the
 /// mtime-cached registry used by `/metadata`.
 pub struct InferioState {
@@ -451,7 +543,11 @@ struct CacheListResponse {
         )),
         (status = 400, description = "Malformed multipart body or inputs", body = crate::api_error::ErrorBody),
         (status = 422, description = "Missing required `data` form field", body = crate::api_error::ErrorBody),
-        (status = 500, description = "Model load or prediction failure", body = crate::api_error::ErrorBody)
+        (status = 500, description = "Model load or prediction failure. `detail` is a \
+            plain string for an ordinary failure and an object carrying a machine-readable \
+            `kind` for the ones a caller must act on differently — `worker_died` says the \
+            inference worker process died with the request in flight, so the request's items \
+            were never attempted and re-submitting them is correct.", body = InferenceErrorBody)
     )
 )]
 async fn predict(
@@ -502,7 +598,7 @@ async fn predict(
         inputs = inputs.len(),
         "processing local inference predict"
     );
-    let outputs = state
+    let outputs = match state
         .manager
         .predict(
             &full_id,
@@ -514,16 +610,38 @@ async fn predict(
             inputs,
         )
         .await
-        .map_err(|err| {
+    {
+        Ok(outputs) => outputs,
+        Err(err) => {
             let chain = format!("{err:#}");
             tracing::error!(model = %full_id, error = %chain, "prediction failed");
             // router.py detail strings: load failures vs. predict failures.
+            // The load check keeps its precedence deliberately: a worker that
+            // dies *while loading* renders both markers, and re-queueing is
+            // the answer to an established worker dying mid-window, not to a
+            // model that will not come up at all (which the per-model load
+            // cooldown answers instead). Getting that order wrong would make
+            // every dies-on-load model cost each item a second full attempt.
             if chain.contains("failed to load model") {
-                ApiError::internal("Failed to load model")
-            } else {
-                ApiError::internal("Prediction failed")
+                return Err(ApiError::internal("Failed to load model"));
             }
-        })?;
+            if chain.contains(FATAL_WORKER_MARKER) {
+                return Ok(structured_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    InferenceErrorFields {
+                        kind: WORKER_DIED_KIND.to_owned(),
+                        // Same string the plain form carries, so a client that
+                        // only renders prose is unaffected by the shape change.
+                        message: Some("Prediction failed".to_owned()),
+                        model: Some(full_id.clone()),
+                        last_error: Some(clamp_detail(&chain)),
+                        ..Default::default()
+                    },
+                ));
+            }
+            return Err(ApiError::internal("Prediction failed"));
+        }
+    };
     // Read straight after the predict. Deliberately not this request's own
     // window: it is whatever window this model formed most recently, which
     // under concurrent predicts may be a later one. That is the point — the
@@ -535,6 +653,25 @@ async fn predict(
         encode_output_response(outputs),
         desired,
     ))
+}
+
+/// Bound on the error text a structured detail carries. A fatal worker error
+/// renders its stderr tail, which is a ring buffer of whatever the worker
+/// logged over its recent life and can be tens of kilobytes; the full text is
+/// already in the log line above, and the caller persists this one per failed
+/// item. 2000 bytes matches the extraction ledger's own audit clamp.
+const MAX_DETAIL_BYTES: usize = 2000;
+
+/// Clamp an error chain to [`MAX_DETAIL_BYTES`], on a char boundary.
+fn clamp_detail(text: &str) -> String {
+    if text.len() <= MAX_DETAIL_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_DETAIL_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 /// Attach [`DESIRED_IN_FLIGHT_HEADER`] to an already-encoded predict
@@ -933,6 +1070,9 @@ fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
         CacheKeyResponse,
         CacheListResponse,
         crate::api_error::ErrorBody,
+        InferenceErrorBody,
+        InferenceErrorDetail,
+        InferenceErrorFields,
         HealthReport,
         super::manager::ModelHealth,
         super::manager::ReplicaHealth,
@@ -1501,6 +1641,56 @@ metadata.description = "echo fixture"
 
     /// Extracts the `{"batch": n}` sizes the batchsize_test fixture reports
     /// from a client-side PredictOutput.
+    /// A predict whose worker dies mid-request answers with the
+    /// machine-readable `worker_died` kind, and the gateway's own client
+    /// parses it back into the typed failure the extraction job keys its
+    /// re-queue on. Both halves of run1 finding F7's fix in one round trip:
+    /// without the kind on the wire, or without the client typing it, the job
+    /// is back to recording a whole in-flight window as item errors.
+    #[tokio::test]
+    async fn a_worker_death_predict_answers_a_machine_readable_kind() {
+        let (_state, base_url, _registry_dir) = spawn_test_server_with_registry(
+            r#"
+[group.dying]
+config.impl_class = "dying_test"
+[group.dying.inference_ids.test]
+metadata.description = "kills its worker on predict"
+"#,
+        )
+        .await;
+        let client =
+            InferenceApiClient::new_with_metadata_cache(base_url, false).expect("client builds");
+        let err = client
+            .predict(
+                "dying/test",
+                "key",
+                1,
+                60,
+                None,
+                Some(false),
+                &[InferenceInput::new(json!({"text": "hi"}), None)],
+            )
+            .await
+            .expect_err("the worker exits mid-predict");
+
+        let failure = crate::inferio_client::inference_failure(&err)
+            .unwrap_or_else(|| panic!("the client must type a refused predict; got {err:#}"));
+        assert_eq!(failure.status, 500, "{failure}");
+        assert!(failure.is_worker_death(), "{failure}");
+        assert!(!failure.is_load_cooldown(), "{failure}");
+        assert_eq!(failure.model.as_deref(), Some("dying/test"), "{failure}");
+        assert_eq!(failure.message, "Prediction failed", "{failure}");
+        // The chain the operator greps for is carried through, clamped, so a
+        // job can record *why* an item was lost without re-reading the log.
+        let last_error = failure.last_error.as_deref().unwrap_or_default();
+        assert!(last_error.contains("failed fatally"), "{failure}");
+        assert!(
+            last_error.len() <= MAX_DETAIL_BYTES + 4,
+            "{}",
+            last_error.len()
+        );
+    }
+
     fn reported_batches(output: &PredictOutput) -> Vec<u64> {
         match output {
             PredictOutput::Json(values) => values

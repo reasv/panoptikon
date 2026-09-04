@@ -1651,11 +1651,11 @@
             }
           },
           "500": {
-            "description": "Model load or prediction failure",
+            "description": "Model load or prediction failure. `detail` is a plain string for an ordinary failure and an object carrying a machine-readable `kind` for the ones a caller must act on differently — `worker_died` says the inference worker process died with the request in flight, so the request's items were never attempted and re-submitting them is correct.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
+                  "$ref": "#/components/schemas/InferenceErrorBody"
                 }
               }
             }
@@ -7977,6 +7977,81 @@
           "ann"
         ]
       },
+      "InferenceErrorBody": {
+        "type": "object",
+        "description": "The body every inference error path serializes. Same `{\"detail\": …}`\nenvelope as [`crate::api_error::ErrorBody`]; only the detail is allowed to\nbe an object.",
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/InferenceErrorDetail"
+          }
+        }
+      },
+      "InferenceErrorDetail": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "router.py's plain detail strings. Never constructed here — the plain\nfailures keep going through [`crate::api_error::ErrorBody`], byte for\nbyte — but it is half of the wire contract and half of the generated\nclient's type, so it is documented rather than inferred from absence."
+          },
+          {
+            "$ref": "#/components/schemas/InferenceErrorFields",
+            "description": "A failure with a machine-readable [`InferenceErrorDetail::Message`]\nreplacement: `kind` names it, the rest is per-kind context."
+          }
+        ],
+        "description": "The `{\"detail\": …}` body of an inference error, in the two shapes this\nsurface answers with.\n\nThe string form is the original one and stays byte-identical for every\nfailure that already had a detail string (router.py parity, see the module\ndocs). The object form is additive and exists for the failures a *caller*\nhas to act on differently — today a worker death (a job re-queues) and,\nfor the load-failure cooldown, an \"unavailable until\" answer — so the\nmachine-readable half never has to be recovered by pattern-matching prose."
+      },
+      "InferenceErrorFields": {
+        "type": "object",
+        "description": "The fields a structured [`InferenceErrorDetail`] can carry. One flat,\nwholly-optional-but-`kind` struct rather than a variant per kind: every\nconsumer dispatches on `kind` first, and a single shape keeps the wire\ncontract (and the generated client type) from growing a case per failure\nmode.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "failures": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Consecutive failures counted so far.",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string",
+            "description": "What went wrong, as a stable token: [`WORKER_DIED_KIND`], or\n`load_cooldown` for the per-model load-failure backoff."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last error that put the model in this state."
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable summary; the string the plain form would have carried."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model the failure is about, `group/name`."
+          },
+          "retry_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339 instant the model may be retried at."
+          }
+        }
+      },
       "InferencePredictRequest": {
         "type": "object",
         "description": "Multipart form body of `POST /predict/{group}/{inference_id}`.",
@@ -8354,7 +8429,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The failure message for [`JobOutcomeStatus::Failed`], and the summary\nof what was left undone for [`JobOutcomeStatus::Partial`]."
           },
           "queue_id": {
             "type": "integer",
@@ -8369,6 +8445,7 @@
         "type": "string",
         "enum": [
           "completed",
+          "partial",
           "failed",
           "cancelled"
         ]
