@@ -181,6 +181,75 @@ pub const KNEE_RATIO: f64 = 0.9;
 pub const MIN_KNEE_SAMPLES: usize = 12;
 pub const MIN_KNEE_BUCKETS: usize = 3;
 
+/// Observations a log2 bucket must hold before it may take part in a knee fit
+/// at all (run2 change R1, the bucket-variance filter).
+///
+/// Two is the smallest number from which a dispersion can be computed: with
+/// one observation the bucket's "median" *is* that observation and its
+/// deviation from itself is zero, so a singleton bucket would sail through
+/// [`KNEE_MAX_BUCKET_DISPERSION`] while carrying exactly the evidence the
+/// filter exists to reject. Two also makes the per-bucket median a real
+/// summary rather than a relabelled sample.
+///
+/// Deliberately not higher. `MIN_KNEE_BUCKETS × MIN_KNEE_BUCKET_SAMPLES = 6`
+/// stays well inside [`MIN_KNEE_SAMPLES`], and the ramp visits each size for
+/// about one window — three batches, of which the first is high-water and
+/// excluded — so a gate of four per bucket would mean no knee is ever fitted
+/// during a clean ramp at all.
+pub const MIN_KNEE_BUCKET_SAMPLES: usize = 2;
+
+/// The bucket-variance filter (run2 change R1, the user's addition): the
+/// largest **relative median absolute deviation** — `MAD / median` of the
+/// units/sec observations inside one log2 bucket — at which that bucket's
+/// median is still allowed to decide a knee. One noisy bucket refuses the
+/// whole fit; nothing is capped and nothing is persisted until the evidence
+/// is quiet.
+///
+/// **Why a filter at all.** A desktop's own VRAM and GPU churn — a browser
+/// compositing, a game shader-compiling, another CUDA process — moves
+/// throughput without moving anything the ledger can observe. The contention
+/// tag above catches *our* neighbours and nothing else, so the only remaining
+/// defence is to notice that the samples disagree with each other and decline
+/// to read a curve out of them.
+///
+/// **Why relative MAD rather than a coefficient of variation.** The knee's
+/// per-bucket summary is already a median, precisely so one batch that raced a
+/// compositor redraw cannot move a permanent cap; the statistic that guards it
+/// has to be robust in the same way, or the same single outlier that the
+/// median ignores would *block* every fit instead. Run1's quiet wd-vit series
+/// is the case in point: relative MAD 0.003 against a CV of 0.252, the whole
+/// of the difference being a handful of ramp-phase outliers.
+///
+/// **Where 0.20 comes from**, from the run1 series (`results/run1`,
+/// request-level items/s per fixed-size batch, which is the same quantity plus
+/// queueing, so it *over*-states the noise of the batch-level series the ring
+/// actually holds):
+///
+/// | series | n | relative MAD |
+/// |---|---|---|
+/// | `S2-wdvit-loadgen`, quiet board | 22 | 0.003 |
+/// | `S2-minilm`, quiet board | 1003 | 0.052 |
+/// | `S6-contend` wd-vit / MobileCLIP | 216 / 732 | 0.034 / 0.034 |
+/// | `S6-contend` MiniLM — the series P5-5's three spurious collapse negatives came out of | 1303 | **0.899** |
+///
+/// Two derivations meet at the same number. Empirically, the geometric mean
+/// of the noisiest honest bucket (0.052) and the tainted one (0.899) is
+/// 0.216 — the midpoint of the two populations on the log scale dispersion
+/// actually lives on. Structurally, [`KNEE_RATIO`] makes the knee a decision
+/// about a 10% gap between bucket medians, and admitting a bucket whose
+/// typical sample sits within *twice* that gap of its own median is the
+/// loosest reading under which the medians still mean anything. 0.20 satisfies
+/// both, clears the worst honest bucket by 3.8× and rejects the tainted one by
+/// 4.5×.
+///
+/// **The asymmetry that justifies erring tight.** A false negative is a knee
+/// found late — bounded, self-correcting, and paid in throughput on a model
+/// whose curve has genuinely flattened. A false positive is F-A: `knee_units
+/// = 1` fitted four minutes into a soak, persisted, reseeded into 56 replicas,
+/// and 4 281 of 4 285 grants run at a single item for 7 h 55 m. There is no
+/// symmetric case to make.
+pub const KNEE_MAX_BUCKET_DISPERSION: f64 = 0.20;
+
 /// Fraction of its window's **granted unit budget** a batch must have
 /// actually carried before its throughput counts towards the knee.
 ///
@@ -5283,6 +5352,11 @@ fn fit_knee(samples: &[ThroughputSample], floor_rate: f64) -> Option<KneeFit> {
             .or_default()
             .push(sample.units_per_sec);
     }
+    // A bucket that cannot be *tested* for noise cannot be certified quiet, so
+    // it takes no part in the fit — not even in the sample and bucket counts
+    // below, which would otherwise let two singletons stand in for a curve
+    // (run2 change R1, [`MIN_KNEE_BUCKET_SAMPLES`]).
+    buckets.retain(|_, rates| rates.len() >= MIN_KNEE_BUCKET_SAMPLES);
     if buckets.values().map(Vec::len).sum::<usize>() < MIN_KNEE_SAMPLES
         || buckets.len() < MIN_KNEE_BUCKETS
     {
@@ -5292,6 +5366,30 @@ fn fit_knee(samples: &[ThroughputSample], floor_rate: f64) -> Option<KneeFit> {
         .iter_mut()
         .map(|(bucket, rates)| (*bucket, median(rates).unwrap_or(0.0)))
         .collect();
+    // The bucket-variance filter. One noisy bucket refuses the whole fit
+    // rather than merely excusing itself: the knee is the *smallest* bucket on
+    // the plateau, so dropping a noisy one silently moves the answer to its
+    // neighbour instead of declining to answer. Refusing also leaves
+    // `knee_best` where it was — a ring this disagreeing with itself is no
+    // more a witness to the peak than it is to the bend.
+    for (bucket, rates) in buckets.iter_mut() {
+        let Some(dispersion) = relative_mad(rates) else {
+            return None;
+        };
+        if dispersion > KNEE_MAX_BUCKET_DISPERSION {
+            tracing::debug!(
+                bucket,
+                observations = rates.len(),
+                dispersion,
+                threshold = KNEE_MAX_BUCKET_DISPERSION,
+                "declining to fit a throughput knee: the observations in one \
+                 batch-size bucket disagree with each other by more than the \
+                 knee's own decision band, so something outside this ledger \
+                 was moving throughput while they were taken"
+            );
+            return None;
+        }
+    }
     // Which bucket carries the peak is reported but never *used*: the
     // threshold is a rate, and the guard below is on the knee bucket. So this
     // is a plain maximum over the rates, ties going to whichever bucket
@@ -5325,6 +5423,23 @@ fn fit_knee(samples: &[ThroughputSample], floor_rate: f64) -> Option<KneeFit> {
         knee_units: knee,
         best,
     })
+}
+
+/// `MAD / median` of one bucket's rates: how far a typical observation sits
+/// from the bucket's own summary, as a fraction of it (run2 change R1, see
+/// [`KNEE_MAX_BUCKET_DISPERSION`]).
+///
+/// `None` for an empty set or a non-positive median — a bucket whose summary
+/// is zero has no scale to be relative to, and the caller reads `None` as
+/// "cannot certify this quiet", which declines the fit.
+fn relative_mad(values: &mut [f64]) -> Option<f64> {
+    let centre = median(values)?;
+    if !centre.is_finite() || centre <= 0.0 {
+        return None;
+    }
+    let mut deviations: Vec<f64> = values.iter().map(|value| (value - centre).abs()).collect();
+    let mad = median(&mut deviations)?;
+    Some(mad / centre)
 }
 
 fn median(values: &mut [f64]) -> Option<f64> {
@@ -10617,6 +10732,88 @@ mod tests {
         // The same series, one bucket wider, does answer.
         let wide = curve(&[(4, 100.0), (8, 100.0), (16, 100.0), (32, 100.0)], 4);
         assert_eq!(knee_of(&wide), Some(7));
+    }
+
+    /// A bucket holding one observation is dropped from the fit outright — its
+    /// dispersion is zero by construction, so it would otherwise carry exactly
+    /// the evidence the variance filter exists to reject
+    /// ([`MIN_KNEE_BUCKET_SAMPLES`]).
+    #[test]
+    fn singleton_buckets_do_not_count_towards_the_knee_gates() {
+        // Twelve observations across two buckets: enough samples, one bucket
+        // short.
+        let two_buckets = curve(&[(4, 100.0), (8, 100.0)], 6);
+        assert_eq!(two_buckets.len(), 12);
+        assert_eq!(knee_of(&two_buckets), None);
+
+        // A third bucket holding one observation does not make it three.
+        let mut with_singleton = two_buckets.clone();
+        with_singleton.extend(curve(&[(16, 100.0)], 1));
+        assert_eq!(with_singleton.len(), 13);
+        assert_eq!(
+            knee_of(&with_singleton),
+            None,
+            "a bucket whose dispersion cannot be measured takes no part"
+        );
+
+        // The same third size measured twice does.
+        let mut honest = two_buckets;
+        honest.extend(curve(&[(16, 100.0)], 2));
+        assert_eq!(honest.len(), 14);
+        assert_eq!(knee_of(&honest), Some(7));
+    }
+
+    /// The bucket-variance filter (R1, the user's addition). A curve whose
+    /// buckets are individually quiet knees; the same curve with one bucket's
+    /// observations disagreeing by more than
+    /// [`KNEE_MAX_BUCKET_DISPERSION`] refuses the whole fit — including the
+    /// historical peak, which a disagreeing ring is no better a witness to.
+    #[test]
+    fn a_noisy_bucket_refuses_the_whole_knee_fit() {
+        let quiet = curve(&[(4, 100.0), (8, 100.0), (16, 100.0), (32, 100.0)], 4);
+        assert_eq!(knee_of(&quiet), Some(7), "the control");
+
+        // Bucket 3 (units 8..=15) alternating 100 and 200: median 150, MAD 50,
+        // relative MAD 0.333 — past the 0.20 threshold.
+        let mut noisy = curve(&[(4, 100.0), (16, 100.0), (32, 100.0)], 4);
+        noisy.extend(curve(&[(8, 100.0), (8, 200.0)], 2));
+        assert_eq!(noisy.len(), 16);
+        assert_eq!(
+            knee_of(&noisy),
+            None,
+            "one bucket that disagrees with itself refuses the fit"
+        );
+
+        // The same bucket alternating 100 and 120: median 110, MAD 10,
+        // relative MAD 0.0909 — inside the threshold, so the fit proceeds.
+        let mut mild = curve(&[(4, 100.0), (16, 100.0), (32, 100.0)], 4);
+        mild.extend(curve(&[(8, 100.0), (8, 120.0)], 2));
+        assert_eq!(knee_of(&mild), Some(7));
+    }
+
+    /// The statistic itself, on the numbers its threshold was derived from.
+    #[test]
+    fn relative_mad_is_the_robust_dispersion_the_threshold_is_stated_in() {
+        assert_eq!(relative_mad(&mut []), None);
+        assert_eq!(
+            relative_mad(&mut [0.0, 0.0]),
+            None,
+            "no scale to be relative to"
+        );
+        assert_eq!(relative_mad(&mut [100.0; 6]), Some(0.0));
+        // A single factor-of-two outlier among five honest samples: the CV
+        // would be 0.36 and the fit would be refused; the median-based
+        // statistic sees the outlier for what it is.
+        let mut one_outlier = [100.0, 100.0, 100.0, 100.0, 100.0, 200.0];
+        assert_eq!(relative_mad(&mut one_outlier), Some(0.0));
+        // Half the samples off by a factor of two is not an outlier, it is
+        // disagreement, and it is rejected.
+        let mut disagreeing = [100.0, 100.0, 100.0, 200.0, 200.0, 200.0];
+        let dispersion = relative_mad(&mut disagreeing).expect("finite positive median");
+        assert!(
+            dispersion > KNEE_MAX_BUCKET_DISPERSION,
+            "{dispersion} must not pass the filter"
+        );
     }
 
     /// Which measurements reach the throughput series: warm-pool, priceable,

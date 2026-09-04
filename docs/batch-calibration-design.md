@@ -152,6 +152,39 @@ tell whether this was a spill" is not the finding "this was not a spill".
 Samples are **tagged and kept**, not dropped at ingest, so `/health`'s
 `throughput_samples` still reports everything the replica produced.
 
+**(c) The bucket-variance filter: no knee out of noisy evidence.** A
+desktop's own VRAM and GPU churn moves throughput without moving anything
+the ledger can observe — the contention tag sees our neighbours and nothing
+else. The remaining defence is to notice that the observations disagree with
+each other. So: a log2 bucket takes part in a fit only when it holds at least
+**2 observations** (a singleton's dispersion is zero by construction, which
+would wave through exactly the evidence being tested for), and if any
+participating bucket's **relative median absolute deviation** — `MAD /
+median` of its units/sec — exceeds **0.20**, no knee is fitted, none is
+persisted, and the historical peak is not updated either.
+
+Relative MAD rather than a coefficient of variation because the knee's own
+per-bucket summary is a median: the same robustness that stops one
+compositor-redraw outlier moving a permanent cap must stop it *blocking*
+one. Run1's quiet wd-vit series is the case in point — relative MAD 0.003
+against a CV of 0.252.
+
+0.20 comes from the run1 series and from the knee's own arithmetic, and the
+two agree. Measured (request-level items/s per fixed-size batch, which
+over-states the noise of the batch-level series the ring holds): quiet boards
+0.003 (`S2-wdvit-loadgen`) and 0.052 (`S2-minilm`); `S6-contend` 0.034 for
+wd-vit and MobileCLIP and **0.899** for MiniLM, which is the series P5-5's
+three spurious collapse negatives came out of. The geometric mean of 0.052
+and 0.899 is 0.216. Independently, `KNEE_RATIO = 0.9` makes the knee a
+decision about a 10% gap between bucket medians, and twice that gap is the
+loosest per-sample scatter under which those medians still mean anything.
+
+The cost is one-sided on purpose. A false negative is a knee found late:
+bounded, self-correcting, paid in throughput on a model whose curve has
+genuinely flattened. A false positive is F-A — `knee_units = 1` fitted four
+minutes into a soak, persisted, reseeded into 56 replicas, 4 281 of 4 285
+grants at one item for 7 h 55 m.
+
 ## Core decision: learn a cost model, not a max batch size
 
 Calibration does **not** learn "the batch size that fits". It learns a
