@@ -328,7 +328,7 @@ pub struct PrewarmSettings {
 /// `CUDA_VISIBLE_DEVICES` changes, while two identical cards on one host share
 /// a calibration profile and can still want different budgets (the one driving
 /// the monitors gets a bigger margin).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct VramConfig {
     /// Margin over *other processes'* usage — the desktop lever, on by
     /// default. Our own workers are never margin-inflated; their footprints
@@ -368,16 +368,6 @@ pub struct VramOverride {
     pub margin: Option<f64>,
     #[serde(default)]
     pub cap_fraction: Option<f64>,
-}
-
-impl Default for VramConfig {
-    fn default() -> Self {
-        Self {
-            margin: None,
-            cap_fraction: None,
-            gpu: BTreeMap::new(),
-        }
-    }
 }
 
 impl VramConfig {

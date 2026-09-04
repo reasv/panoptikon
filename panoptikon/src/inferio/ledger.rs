@@ -464,7 +464,7 @@ const MAX_RAMP_STEP: u32 = 32;
 /// as the defaults — a margin of 0 or of 0.9 has to behave sensibly — which is
 /// why margin widening is additive and clamps only its own increment, and why
 /// `cap_fraction` is NaN-guarded at every use.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct VramBudget {
     /// Margin over genuinely external usage. Our own workers are never
     /// margin-inflated — their footprints are measured, not guessed.
@@ -480,15 +480,6 @@ pub struct VramBudget {
     /// Hard ceiling as a fraction of total VRAM; the server lever, off by
     /// default (`None`).
     pub cap_fraction: Option<f64>,
-}
-
-impl Default for VramBudget {
-    fn default() -> Self {
-        Self {
-            margin: None,
-            cap_fraction: None,
-        }
-    }
 }
 
 impl VramBudget {
@@ -1010,8 +1001,7 @@ impl WorkerEntry {
         if self.deflation == 0 {
             self.deflation_repaid_at = None;
         } else {
-            self.deflation_repaid_at =
-                Some(since + DEFLATION_REPAY_SECS * u32::try_from(levels).unwrap_or(u32::MAX));
+            self.deflation_repaid_at = Some(since + DEFLATION_REPAY_SECS * levels);
         }
         repaid
     }
@@ -4150,10 +4140,7 @@ impl VramLedger {
             cal.knee_clean_windows = 0;
             return None;
         }
-        let Some(charge) = charge.filter(|charge| charge.knee_bound && charge.ample_headroom)
-        else {
-            return None;
-        };
+        let charge = charge.filter(|charge| charge.knee_bound && charge.ample_headroom)?;
         cal.knee_clean_windows = cal.knee_clean_windows.saturating_add(1);
         if cal.knee_clean_windows < KNEE_EXPIRY_CLEAN_WINDOWS {
             return None;
@@ -4371,7 +4358,7 @@ impl VramLedger {
         // throughput curve at all ([`knee_admits_window`]), which admits no
         // throughput sample from it however full its batches were.
         let full_batch = window
-            .filter(|charge| knee_admits_window(charge))
+            .filter(knee_admits_window)
             .map(|charge| ((charge.unit_budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
         // The window's contention tag, carried onto every throughput sample it
         // produces and consulted for the collapse verdict below. An ingest
@@ -5282,7 +5269,7 @@ impl VramLedger {
             .gpus
             .iter()
             .map(|(uuid, board)| {
-                let external = Self::external_locked(&state, uuid);
+                let external = Self::external_locked(state, uuid);
                 let (reserve, reserve_rule) = self.reserve_locked(
                     uuid,
                     external.unwrap_or(0),
@@ -5318,7 +5305,7 @@ impl VramLedger {
                             knee_is_local: cal.is_some_and(|cal| cal.knee_is_local),
                             throughput_samples: cal.map(|cal| cal.throughput.len()).unwrap_or(0),
                             local_samples: cal.map(|cal| cal.local_samples).unwrap_or(0),
-                            effective_margin: self.effective_margin_locked(&state, entry),
+                            effective_margin: self.effective_margin_locked(state, entry),
                             fit: cal.and_then(|cal| cal.fit).map(|fit| FitHealth {
                                 slope_mb_per_unit: fit.slope_mb_per_unit,
                                 intercept_mb: fit.intercept_mb,
@@ -5341,14 +5328,14 @@ impl VramLedger {
                         .free
                         .as_ref()
                         .map(|sample| sample.at.elapsed().as_millis() as u64),
-                    limit_mb: self.limit_locked(&state, uuid),
+                    limit_mb: self.limit_locked(state, uuid),
                     reserve_mb: reserve,
                     reserve_rule: reserve_rule.to_owned(),
-                    headroom_mb: self.headroom_locked(&state, uuid),
-                    charges_mb: Self::charges_locked(&state, uuid),
-                    footprints_mb: Self::footprints_locked(&state, uuid),
+                    headroom_mb: self.headroom_locked(state, uuid),
+                    charges_mb: Self::charges_locked(state, uuid),
+                    footprints_mb: Self::footprints_locked(state, uuid),
                     load_reservations_mb: board.load_reservations.values().copied().sum(),
-                    grants_mb: Self::grants_locked(&state, uuid),
+                    grants_mb: Self::grants_locked(state, uuid),
                     grants_outstanding: workers
                         .iter()
                         .map(|worker| worker.grants_outstanding)
@@ -5967,9 +5954,7 @@ fn fit_knee(samples: &[ThroughputSample], floor_rate: f64) -> Option<KneeFit> {
     // `knee_best` where it was — a ring this disagreeing with itself is no
     // more a witness to the peak than it is to the bend.
     for (bucket, rates) in buckets.iter_mut() {
-        let Some(dispersion) = relative_mad(rates) else {
-            return None;
-        };
+        let dispersion = relative_mad(rates)?;
         if dispersion > KNEE_MAX_BUCKET_DISPERSION {
             tracing::debug!(
                 bucket,
