@@ -4335,7 +4335,7 @@ impl VramLedger {
     /// store keep reporting for a cap that no longer exists, and the same
     /// sentinel is handled rather than excused in [`deflation_cap`].
     ///
-    /// **Both branches leave [`ModelCalibration::knee_re_explore_above`] set.**
+    /// **Both branches leave [`ModelCalibration::knee_widened`] set.**
     /// Withdrawal is a widening to infinity, and the ring at that instant is
     /// exactly what it was under the old cap — so a refit (which runs later in
     /// this same settle) would otherwise reinstall the number that just
@@ -5059,10 +5059,11 @@ impl VramLedger {
             .collect();
         let floor = cal.knee_best.map(|(_, rate)| rate).unwrap_or(0.0);
         // The ratchet anchor and the widening mark are inputs to the fit, not
-        // post-hoc filters on it (run2 change R1e): they decide *which*
-        // bucket may carry the knee, so a rule that disqualifies the lowest
-        // candidate lets the scan go on to the next one instead of refusing
-        // the whole fit. See [`fit_knee`] rules 4 and 5.
+        // post-hoc filters on it (run2 change R1e): they are per-sample tests
+        // inside a bucket, so only the fit can apply them — a caller holding
+        // nothing but the answer could not. Either one disqualifying the
+        // candidate refuses the whole fit, exactly as the variance filter
+        // does. See [`fit_knee`] rules 4 and 5.
         let Some(fit) = fit_knee(&samples, floor, cal.max_units_measured, cal.knee_widened) else {
             return;
         };
@@ -6531,13 +6532,16 @@ struct KneeFit {
 /// "the knee changed materially" trivially decidable for the write policy —
 /// any change is at least a factor of two.
 ///
-/// The candidate scan runs *upward* over the quiet buckets and takes the first
-/// that satisfies every rule, rather than testing only the lowest bucket on
-/// the plateau and declining if it fails. Declining outright would be the
-/// safer-looking choice and is the wrong one: the rules above disqualify low
-/// candidates specifically because the evidence for them is thin, and a
-/// well-supported knee two buckets higher is a real, honest brake that the
-/// all-or-nothing form would throw away.
+/// There is exactly **one** candidate — the smallest quiet bucket already on
+/// the plateau, which is the definition of the knee — and the five rules are
+/// vetoes on it, not a search for a bucket that survives them. A veto refuses
+/// the whole fit; it never moves the answer up a bucket. Scanning upward for a
+/// survivor would answer a different question — *"is there any size past which
+/// nothing is gained"*, which on a flat curve is always yes — instead of
+/// *"where does this curve stop gaining"*. It is also the shape the variance
+/// filter already has, and for the same reason: one bucket that cannot be
+/// trusted refuses the fit rather than quietly handing the cap to its
+/// neighbour.
 fn fit_knee(
     samples: &[ThroughputSample],
     floor_rate: f64,
@@ -12858,6 +12862,75 @@ mod tests {
         assert_eq!(
             fit_knee(&recorded(&steady), 0.0, 136, None).and_then(|fit| fit.knee_units),
             Some(7)
+        );
+    }
+
+    /// A veto refuses the fit; it never moves the knee up a bucket.
+    ///
+    /// [`fit_knee`] has exactly one candidate — the smallest quiet bucket
+    /// already on the plateau — and the five rules of run2 change R1e are
+    /// vetoes on it. The alternative shape, scanning upward for the first
+    /// bucket that survives every rule, answers *"is there any size past which
+    /// nothing is gained"* (yes, always, on a flat curve) rather than *"where
+    /// does this curve stop gaining"*, and it would let a rule that fired
+    /// because the evidence was thin install a cap next door instead of
+    /// declining. This ring separates the two shapes: the candidate is bucket
+    /// 2 and rule 4 refuses it, while bucket 3 would survive all five.
+    #[test]
+    fn a_vetoed_candidate_refuses_the_fit_rather_than_moving_up_a_bucket() {
+        // A bend at 4 units and a plateau from there to 32, with the 4-unit
+        // observations taken while the ramp was still stepping past 4 and
+        // everything above it taken in steady state at the anchor.
+        let series: &[Recorded] = &[
+            (2, 20.0, 2, 1),
+            (2, 20.0, 2, 1),
+            (2, 20.0, 2, 1),
+            (4, 100.0, 4, 2),
+            (4, 100.0, 4, 2),
+            (4, 100.0, 4, 2),
+            (8, 100.0, 32, 5),
+            (8, 100.0, 32, 5),
+            (8, 100.0, 32, 5),
+            (16, 100.0, 32, 6),
+            (16, 100.0, 32, 6),
+            (16, 100.0, 32, 6),
+            (32, 98.0, 32, 7),
+            (32, 98.0, 32, 7),
+            (32, 98.0, 32, 7),
+        ];
+        assert_eq!(
+            fit_knee(&recorded(series), 0.0, 32, None).and_then(|fit| fit.knee_units),
+            None,
+            "bucket 2 is the candidate and rule 4 refuses it, so there is no \
+             knee — the fit does not go looking for a bucket that survives"
+        );
+
+        // The bucket an upward scan would have landed on, shown to be a
+        // survivor so the assertion above is about the *shape* of the rules
+        // and not about bucket 3 failing for some reason of its own: with the
+        // ramp-era half of the ring replaced by steady-state observations at
+        // the same rate, the candidate is bucket 2 again and it now passes,
+        // which is the only difference between the two rings.
+        let steady: Vec<Recorded> = series
+            .iter()
+            .map(|(units, rate_, _, window)| (*units, *rate_, 32, *window))
+            .collect();
+        assert_eq!(
+            fit_knee(&recorded(&steady), 0.0, 32, None).and_then(|fit| fit.knee_units),
+            Some(7),
+            "the same curve, honestly sampled, knees at the top of bucket 2"
+        );
+        // And bucket 3 really would have survived every rule on the original
+        // ring, which is what makes the refusal a choice rather than a tie.
+        let above_the_veto: Vec<Recorded> = series
+            .iter()
+            .filter(|(units, _, _, _)| *units != 4)
+            .copied()
+            .collect();
+        assert_eq!(
+            fit_knee(&recorded(&above_the_veto), 0.0, 32, None).and_then(|fit| fit.knee_units),
+            Some(15),
+            "with the vetoed bucket gone the next one up is a legitimate knee"
         );
     }
 
