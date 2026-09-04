@@ -276,6 +276,107 @@ fn cost_table(metadata: &JsonMap<String, JsonValue>) -> Option<&JsonMap<String, 
     metadata.get("cost").and_then(JsonValue::as_object)
 }
 
+/// `metadata.cost.canvas_pixels`: the model's per-item **pixel canvas**, the
+/// largest number of decoded pixels one input can actually cost it whatever
+/// resolution it was submitted at (batch-calibration run2, R7; run1 report §4,
+/// Q3/W1 and F-B).
+///
+/// Every `pixel`-class model shipped resizes or tiles its input onto a fixed
+/// canvas before the first convolution — a tile grid, a `max_pixels` bound, a
+/// detector's `canvas_size` — while the worker's raw header-derived price
+/// keeps rising with whatever the user submitted. Run1 measured the two costs
+/// of that: a *fitted slope* that is a function of the corpus rather than of
+/// the model (nemotron fitted 4.33x the probe's), and batches of one item
+/// (58 of 110). The orchestrator forwards this figure on the grant and the
+/// worker prices every input at `min(raw_pixels, canvas_pixels)`.
+///
+/// Two rules, both of them consequences of what the number *means*:
+///
+/// - **It is read only for a `pixel`-unit model.** The value is an area;
+///   capping a token count or an item count by an area is meaningless, and on
+///   a `count`-aggregated model it would be inert anyway (`min(1, cap)` is 1).
+///   A declaration on a non-`pixel` id is ignored with a debug line rather
+///   than an error — it is legitimate documentation of a model's geometry.
+/// - **It is scale-bound, exactly as `seed_units` is** (see
+///   [`resolve_seed_units`]): a group's canvas is never inherited by an id
+///   that redeclares the unit. `[group.clip]` is `item`-priced and its
+///   `qwen3-vl` / `nemotron` ids are not, so a group-level canvas there would
+///   describe the CLIP tower's fixed 224/378px input and would under-price
+///   every tile of a VLM that deviates — the one error direction that
+///   over-admits.
+///
+/// `None` = uncapped, which is what every model did before run2 and what an
+/// unparseable value degrades to.
+///
+/// Not yet called: the consumer is the grant encoder
+/// (`worker.rs::encode_grant`, which forwards it to the worker as
+/// `grant.canvas_pixels`), which is owned by the ledger track of the same
+/// change set. The registry half is here because the registry schema is one
+/// thing and lives in one file.
+#[allow(dead_code)]
+pub fn resolve_canvas_pixels(registry: &Registry, full_inference_id: &str) -> Option<u32> {
+    let (group_name, inference_id) = full_inference_id.split_once('/')?;
+    let group = registry.groups.get(group_name)?;
+    let entry = group.inference_ids.get(inference_id)?;
+    let id_cost = cost_table(&entry.metadata);
+    let group_cost = cost_table(&group.group_metadata);
+    let resolved = CostDimension::from_tables(id_cost, group_cost, full_inference_id);
+    canvas_from_tables(id_cost, group_cost, resolved.unit, full_inference_id)
+}
+
+fn canvas_from_tables(
+    id_cost: Option<&JsonMap<String, JsonValue>>,
+    group_cost: Option<&JsonMap<String, JsonValue>>,
+    unit: CostUnit,
+    full_inference_id: &str,
+) -> Option<u32> {
+    let declared = |table: Option<&JsonMap<String, JsonValue>>| {
+        table.and_then(|table| table.get("canvas_pixels")).cloned()
+    };
+    let parse = |value: &JsonValue| -> Option<u32> {
+        match value.as_u64().and_then(|pixels| u32::try_from(pixels).ok()) {
+            Some(pixels) if pixels >= 1 => Some(pixels),
+            _ => {
+                tracing::warn!(
+                    inference_id = %full_inference_id,
+                    "metadata.cost.canvas_pixels {value} is not a positive integer;                      pricing this model's inputs uncapped"
+                );
+                None
+            }
+        }
+    };
+    if unit != CostUnit::Pixel {
+        if declared(id_cost).is_some() || declared(group_cost).is_some() {
+            tracing::debug!(
+                inference_id = %full_inference_id,
+                "metadata.cost.canvas_pixels is declared on a {} model; it                  describes the model's input geometry but prices nothing, since                  the cap applies to pixel-denominated units only",
+                unit.as_str()
+            );
+        }
+        return None;
+    }
+    if let Some(value) = declared(id_cost) {
+        return parse(&value);
+    }
+    let value = declared(group_cost)?;
+    // Resolved-vs-resolved, for the reason `resolve_seed_units` documents: a
+    // group that declares no unit (or an unparseable one) is itself priced in
+    // `item`, so `item` is the scale its canvas was written on.
+    let group_unit = group_cost
+        .and_then(|table| table.get("unit"))
+        .and_then(JsonValue::as_str)
+        .and_then(CostUnit::parse)
+        .unwrap_or(CostUnit::Item);
+    if group_unit != unit {
+        tracing::debug!(
+            inference_id = %full_inference_id,
+            "id overrides the group's cost unit, so the group's canvas_pixels              (written for the group's own input geometry) is not inherited"
+        );
+        return None;
+    }
+    parse(&value)
+}
+
 /// `seed_units` under the per-key overlay, with the one exception the overlay
 /// needs: a seed is **scale-bound**. An id that redeclares `unit` (with or
 /// without `aggregation`) and nothing else must not inherit the group's seed,
@@ -407,6 +508,136 @@ metadata.cost.seed_units = 4000000
         let plain = CostDimension::resolve(&registry, "doctr/plain");
         assert_eq!(plain.unit, CostUnit::Item);
         assert_eq!(plain.aggregation, Some(CostAggregation::Count));
+    }
+
+    /// The per-item pixel canvas is read for a `pixel` model, per id and
+    /// inherited from a group that shares the unit.
+    #[test]
+    fn a_pixel_model_reads_its_canvas() {
+        let (registry, _dir) = registry_from(
+            r#"
+[group.doctr]
+config.impl_class = "doctr"
+[group.doctr.metadata.cost]
+unit        = "pixel"
+aggregation = "max-times-count"
+seed_units  = 2000000
+canvas_pixels = 6553600
+[group.doctr.inference_ids.easyocr]
+[group.doctr.inference_ids.tighter]
+metadata.cost.canvas_pixels = 1843200
+"#,
+        );
+        assert_eq!(
+            resolve_canvas_pixels(&registry, "doctr/easyocr"),
+            Some(6_553_600),
+            "inherited from a group of the same unit"
+        );
+        assert_eq!(
+            resolve_canvas_pixels(&registry, "doctr/tighter"),
+            Some(1_843_200),
+            "the id's own value wins"
+        );
+    }
+
+    /// Absent = uncapped, which is what every model did before run2.
+    #[test]
+    fn an_undeclared_canvas_is_uncapped() {
+        let (registry, _dir) = registry_from(
+            r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.metadata.cost]
+unit        = "pixel"
+aggregation = "sum"
+seed_units  = 2000000
+[group.g.inference_ids.x]
+"#,
+        );
+        assert_eq!(resolve_canvas_pixels(&registry, "g/x"), None);
+        assert_eq!(resolve_canvas_pixels(&registry, "g/missing"), None);
+        assert_eq!(resolve_canvas_pixels(&registry, "nogroup/x"), None);
+        assert_eq!(resolve_canvas_pixels(&registry, "unslashed"), None);
+    }
+
+    /// The cap is an area, so it prices nothing on a model whose unit is not
+    /// pixels — including the `item` group the deviating pixel ids live in.
+    #[test]
+    fn a_canvas_is_inert_outside_pixel_pricing() {
+        let (registry, _dir) = registry_from(
+            r#"
+[group.clip]
+config.impl_class = "openclip"
+[group.clip.metadata.cost]
+unit        = "item"
+aggregation = "count"
+seed_units  = 8
+canvas_pixels = 142884
+[group.clip.inference_ids.vit]
+[group.clip.inference_ids.tokens]
+metadata.cost.unit = "token"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.canvas_pixels = 1843200
+"#,
+        );
+        assert_eq!(resolve_canvas_pixels(&registry, "clip/vit"), None);
+        assert_eq!(resolve_canvas_pixels(&registry, "clip/tokens"), None);
+    }
+
+    /// Scale-bound, exactly as `seed_units` is: an id that redeclares the
+    /// unit does not inherit a canvas written for the group's own geometry.
+    #[test]
+    fn a_canvas_is_not_inherited_across_a_unit_change() {
+        let (registry, _dir) = registry_from(
+            r#"
+[group.clip]
+config.impl_class = "openclip"
+[group.clip.metadata.cost]
+unit        = "item"
+aggregation = "count"
+seed_units  = 8
+canvas_pixels = 142884
+[group.clip.inference_ids.nemotron]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units = 2000000
+[group.clip.inference_ids.declared]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units = 2000000
+metadata.cost.canvas_pixels = 1835008
+"#,
+        );
+        assert_eq!(
+            resolve_canvas_pixels(&registry, "clip/nemotron"),
+            None,
+            "142884 is the CLIP tower's 378^2, which would under-price a tiled VLM"
+        );
+        assert_eq!(
+            resolve_canvas_pixels(&registry, "clip/declared"),
+            Some(1_835_008)
+        );
+    }
+
+    /// A bad value degrades to uncapped, never to an error and never to a
+    /// number nobody wrote.
+    #[test]
+    fn an_unparseable_canvas_degrades_to_uncapped() {
+        for value in ["0", "-1", "\"1843200\"", "1.5"] {
+            let (registry, _dir) = registry_from(&format!(
+                r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.metadata.cost]
+unit        = "pixel"
+aggregation = "sum"
+seed_units  = 2000000
+[group.g.inference_ids.x]
+metadata.cost.canvas_pixels = {value}
+"#
+            ));
+            assert_eq!(resolve_canvas_pixels(&registry, "g/x"), None, "{value}");
+        }
     }
 
     /// The `none` class needs no aggregation and no seed, and is not

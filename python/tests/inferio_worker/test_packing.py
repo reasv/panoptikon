@@ -239,6 +239,122 @@ def test_an_unreadable_image_is_charged_the_largest_seen_never_zero():
     ]
 
 
+# ---------------------------------------------------------------------------
+# Per-item pixel canvas (run2 R7)
+# ---------------------------------------------------------------------------
+
+
+def test_pricing_without_a_canvas_is_unchanged():
+    """Absent = uncapped, which is what every model did before run2."""
+    inputs = [PredictionInput(file=png_bytes(8000, 6000))]
+    assert packing.price_inputs(inputs, "pixel") == [48_000_000]
+    assert packing.price_inputs(inputs, "pixel", None) == [48_000_000]
+    assert packing.price_inputs(inputs, "pixel", 0) == [48_000_000]
+
+
+def test_a_48_megapixel_item_is_priced_at_the_canvas():
+    """The whole point of R7: nemotron tiles at (6 + thumbnail) x 512^2, so a
+    48 MP scan costs it 1.84 MP, not 26x that (run1 report §4, Q3/W1)."""
+    inputs = [
+        PredictionInput(file=png_bytes(8000, 6000)),
+        PredictionInput(file=png_bytes(1024, 1024)),
+    ]
+    assert packing.price_inputs(inputs, "pixel", 1_835_008) == [1_835_008, 1_048_576]
+
+
+def test_the_canvas_lets_large_images_pack():
+    """The other half: 58 of 110 batches held a single item because one large
+    item exhausted the whole budget on its own."""
+    inputs = [PredictionInput(file=png_bytes(4000, 3000)) for _ in range(4)]
+    uncapped = packing.price_inputs(inputs, "pixel")
+    capped = packing.price_inputs(inputs, "pixel", 1_835_008)
+    assert packing.plan_batches(uncapped, "sum", 4_000_000) == [[0], [1], [2], [3]]
+    assert packing.plan_batches(capped, "sum", 4_000_000) == [[0, 1], [2, 3]]
+
+
+def test_the_canvas_also_caps_the_unreadable_input_fallback():
+    """The fallback is the same quantity by another route, so it is capped by
+    the same ceiling — otherwise one corrupt file re-creates the batch of one
+    the cap exists to prevent."""
+    inputs = [
+        PredictionInput(file=png_bytes(8000, 6000)),
+        PredictionInput(file=b"not an image"),
+    ]
+    assert packing.price_inputs(inputs, "pixel", 1_835_008) == [1_835_008, 1_835_008]
+    assert packing.price_inputs([PredictionInput()], "pixel", 1_000_000) == [1_000_000]
+
+
+def test_a_canvas_prices_nothing_outside_pixel_units():
+    text = PredictionInput(data="x" * 400)
+    assert packing.price_inputs([text], "token", 1_835_008) == [100]
+    assert packing.price_inputs(items(3), "item", 1_835_008) == [1, 1, 1]
+
+
+def test_the_registry_canvas_wins_over_the_impls_own():
+    impl = SimpleNamespace(max_pixels=999_999)
+    assert (
+        packing.resolve_canvas_pixels({"canvas_pixels": 1_835_008}, impl, "pixel")
+        == 1_835_008
+    )
+
+
+def test_the_impls_own_resolution_is_the_documented_fallback():
+    """Tier 2, for a model whose canvas lives in a processor downloaded with
+    the weights (`doctr/dots_ocr`) rather than in the registry."""
+    # One level: `instance.embedder.max_pixels` (qwen3-vl-embedding).
+    one_level = SimpleNamespace(embedder=SimpleNamespace(max_pixels=1_843_200))
+    assert packing.resolve_canvas_pixels({}, one_level, "pixel") == 1_843_200
+    # Two levels: `instance.model.processor.max_pixels` (the HF VLM shape).
+    two_levels = SimpleNamespace(
+        model=SimpleNamespace(processor=SimpleNamespace(max_pixels=11_289_600))
+    )
+    assert packing.resolve_canvas_pixels({}, two_levels, "pixel") == 11_289_600
+    # Nothing to find is uncapped, exactly as before this field existed.
+    assert packing.resolve_canvas_pixels({}, SimpleNamespace(), "pixel") is None
+    assert packing.resolve_canvas_pixels({}, one_level, "item") is None
+
+
+def test_an_implausible_canvas_reading_is_refused():
+    """Too *small* a cap under-prices an item, which over-admits — the one
+    error direction the ledger cannot absorb — so a suspiciously small
+    attribute is treated as a misidentified one."""
+    for value in (4, 1024, packing.CANVAS_FLOOR_PIXELS - 1, 0, -1, True, "1843200"):
+        impl = SimpleNamespace(max_pixels=value)
+        assert packing.resolve_canvas_pixels({}, impl, "pixel") is None, value
+    at_the_floor = SimpleNamespace(max_pixels=packing.CANVAS_FLOOR_PIXELS)
+    assert (
+        packing.resolve_canvas_pixels({}, at_the_floor, "pixel")
+        == packing.CANVAS_FLOOR_PIXELS
+    )
+
+
+def test_canvas_introspection_never_raises():
+    class Hostile:
+        @property
+        def max_pixels(self):
+            raise RuntimeError("no")
+
+        @property
+        def processor(self):
+            raise RuntimeError("no")
+
+    assert packing.resolve_canvas_pixels({}, Hostile(), "pixel") is None
+
+
+def test_a_granted_canvas_reaches_the_window(fake_torch):
+    """End to end: the grant's canvas is what the batches are packed by."""
+    model = Recorder()
+    inputs = [PredictionInput(file=png_bytes(4000, 3000)) for _ in range(4)]
+    payload = packing.run_window(
+        model,
+        inputs,
+        grant(unit_budget=4_000_000, unit="pixel", aggregation="sum",
+              canvas_pixels=1_835_008),
+    )
+    assert [len(batch) for batch in model.batches] == [2, 2]
+    assert payload["measurements"][0]["units"] == 2 * 1_835_008
+
+
 def test_token_and_item_and_audio_pricing():
     text = PredictionInput(data="x" * 400)
     assert packing.price_inputs([text], "token") == [100]

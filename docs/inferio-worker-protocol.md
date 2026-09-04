@@ -184,16 +184,19 @@ Resolution order in the worker, and the documented fallback:
    the figure the registry declares, so both sides speak one number.
 2. otherwise, for `pixel` inputs only, the loaded impl's own known input
    resolution, if it exposes one: a positive integer `canvas_pixels`,
-   `max_pixels` or `image_max_pixels` attribute on the instance or on one of
-   its processor-shaped attributes (`processor`, `image_processor`,
-   `embedder`, `model`, one level deep). Read passively — the worker never
-   constructs anything and never imports anything to ask — and floored at
-   512x512 pixels, below which a reading is treated as a misidentified
-   attribute rather than a canvas. Too *small* a cap is the one direction that
-   hurts (it under-prices an item, which over-admits), so the floor is the
-   guard, and the resolved source is logged once per process. This tier is
-   what covers a model whose canvas the registry cannot state statically
-   because it lives in the downloaded processor's config (`doctr/dots_ocr`).
+   `max_pixels` or `image_max_pixels` attribute on the instance, or on
+   something reached from it through at most two processor-shaped attributes
+   (`processor`, `image_processor`, `embedder`, `model`) — one level reaches
+   `instance.embedder.max_pixels`, two reach `instance.model.processor.*`,
+   which are the two shapes the shipped impls actually have. Read passively —
+   the worker never constructs anything and never imports anything to ask —
+   and floored at 512x512 pixels, below which a reading is treated as a
+   misidentified attribute rather than a canvas. Too *small* a cap is the one
+   direction that hurts (it under-prices an item, which over-admits), so the
+   floor is the guard, and the resolved source is logged once per process.
+   This tier is what covers a model whose canvas the registry cannot state
+   statically because it lives in the downloaded processor's config
+   (`doctr/dots_ocr`).
 3. otherwise uncapped, exactly as before this field existed.
 
 The registry declaration the orchestrator reads it from:

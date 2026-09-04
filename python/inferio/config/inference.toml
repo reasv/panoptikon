@@ -59,6 +59,9 @@ input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 # is the first-touch batch on unknown hardware. Per-id blocks below override
 # these key by key.
 # wd_tagger's own preprocess resizes every image to a fixed 448px square.
+# The WD v3 taggers pad to square and run the model's own timm transform at a
+# fixed 448^2 = 200 704 px. Not declared as `canvas_pixels`: it prices nothing
+# under `item`/`count` (see the note in `[group.clip.metadata.cost]`).
 [group.tags.metadata.cost]
 unit        = "item"
 aggregation = "count"
@@ -218,6 +221,11 @@ input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
 # magnitude at the 1536px slice this group submits, so the recognition variance
 # the design flagged is margin-absorbed and item/count stands. dots_ocr and the
 # easyocr ids deviate (see their per-id blocks).
+# docTR detection resizes to the architecture's fixed canvas (`db_resnet50`
+# is 1024^2 = 1 048 576 px) and recognition to fixed 32x128 crops, so the
+# whole group has a canvas — but it is `item`/`count` priced, so recording it
+# is all the key would do (see `[group.clip.metadata.cost]`). The `dots_ocr`
+# and `easyocr_*` ids below deviate to `pixel` and declare theirs.
 [group.doctr.metadata.cost]
 unit        = "item"
 aggregation = "count"
@@ -250,6 +258,13 @@ metadata.min_compute_capability = 8.0
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
 metadata.cost.seed_units  = 2000000
+# No `canvas_pixels` here on purpose. dots.ocr's per-item ceiling is its
+# downloaded `AutoProcessor`'s own `max_pixels`, which travels with the
+# weights and is not a fact this file can state truthfully across model
+# revisions. The worker's second resolution tier reads it off the loaded
+# processor instead (docs/inferio-worker-protocol.md, "Memory grants"), which
+# is authoritative and version-correct; declaring a guess here would override
+# it with a number nobody measured.
 
 [group.doctr.inference_ids.easyocr_standard_en]
 config.impl_class = "easyocr"
@@ -268,6 +283,14 @@ metadata.description = "(Recommended) EasyOCR - English Text, Standard Recog Net
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000
+# The CRAFT detector resizes so the *longer* side is at most `canvas_size`
+# (easyocr default 2560, `imgproc.resize_aspect_ratio`, then padded up to the
+# next multiple of 32, which 2560 already is), so no submitted image can cost
+# it more than 2560^2 decoded pixels however large it was. A square image is
+# the only shape that reaches the bound, which makes this the true supremum
+# rather than a typical value — and a cap that is too *large* only caps less,
+# while one that is too small under-prices and over-admits.
+metadata.cost.canvas_pixels = 6553600
 
 [group.doctr.inference_ids.easyocr_standard_en_ja]
 config.impl_class = "easyocr"
@@ -277,6 +300,7 @@ metadata.description = "(Recommended) EasyOCR - English/Japanese Text, Standard 
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000
+metadata.cost.canvas_pixels = 6553600   # the detector's 2560px canvas, as above
 
 [group.doctr.inference_ids.easyocr_standard_en_ch_sim]
 config.impl_class = "easyocr"
@@ -286,6 +310,7 @@ metadata.description = "(Recommended) EasyOCR - English/Chinese Simplified Text,
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000
+metadata.cost.canvas_pixels = 6553600   # the detector's 2560px canvas, as above
 
 [group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_small]
 config.detection_model  = "db_resnet50"
@@ -341,6 +366,8 @@ input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
 
 # The processor resizes to a fixed 768x768 and the generation budget is fixed
 # per task prompt.
+# Florence-2's processor resizes every input to a fixed 768^2 = 589 824 px.
+# Recorded, not declared, for the reason in `[group.clip.metadata.cost]`.
 [group.florence2.metadata.cost]
 unit        = "item"
 aggregation = "count"
@@ -725,6 +752,16 @@ output_type          = "clip"
 
 # openclip preprocesses to a fixed resolution per model (224/378/384px). The
 # qwen3-vl / nemotron / jina ids deviate (see their per-id blocks).
+#
+# No `canvas_pixels` here, and none on the openclip ids, deliberately. The
+# canvas is real and per-id — the model name states it: 224^2 = 50 176 px,
+# 256^2 = 65 536, 336^2 = 112 896, 378^2 = 142 884, 384^2 = 147 456,
+# 448^2 = 200 704 — but it prices nothing on an `item`/`count` model, where
+# every input already costs exactly one unit and `min(1, canvas)` is 1
+# (panoptikon/src/inferio/cost.rs, `resolve_canvas_pixels`). Recording the
+# numbers here rather than declaring them keeps the key meaning "this caps a
+# price" everywhere it appears; the day one of these ids is reclassified to
+# `pixel`, its canvas is one line away.
 [group.clip.metadata.cost]
 unit        = "item"
 aggregation = "count"
@@ -767,11 +804,16 @@ metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
 # what makes `sum` the right aggregation. Two known approximations, both
 # conservative-to-neutral and both left to the fit's margin: the language half
 # of the same forward *is* padded to the batch's longest sequence
-# (`padding=True` in _preprocess_inputs), and the worker prices raw submitted
-# pixels, which saturate against the cap above ~1.8 MP.
+# (`padding=True` in _preprocess_inputs). The second approximation — pricing
+# raw submitted pixels, which saturate against the cap above ~1.8 MP — is what
+# `canvas_pixels` below now removes.
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
 metadata.cost.seed_units  = 2000000
+# MAX_PIXELS = 1800 * IMAGE_FACTOR^2 = 1800 * 32 * 32
+# (impl/deps/qwen_3_vl_embedding.py), i.e. at most 1800 merged vision tokens
+# per image, whatever resolution it arrived at.
+metadata.cost.canvas_pixels = 1843200
 
 
 [group.clip.inference_ids.qwen3-vl-embedding-2b]
@@ -786,6 +828,7 @@ metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
 metadata.cost.seed_units  = 2000000
+metadata.cost.canvas_pixels = 1843200   # the same MAX_PIXELS as the 8B id
 
 [group.clip.inference_ids.PE-Core-L-14-336_meta]
 config.model_name = "PE-Core-L-14-336"
@@ -854,12 +897,15 @@ metadata.link = "https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2"
 # dynamic_preprocess cuts 512px tiles (processing_llama_nemotron_vl.py
 # dynamic_preprocess / image_size = 512) bounded by max_input_tiles = 6 plus the
 # thumbnail, which impl/nemotron_embed_vl.py sets explicitly — a per-item
-# ceiling of ~1.84 MP, the same order as qwen3-vl's cap, so pixel pricing
-# saturates above it exactly as it does there. Genuinely batched through
-# run_with_oom_retry, so measurements describe real GPU batches.
+# ceiling of ~1.84 MP, the same order as qwen3-vl's cap. Genuinely batched
+# through run_with_oom_retry, so measurements describe real GPU batches.
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
 metadata.cost.seed_units  = 2000000
+# (max_input_tiles = 6, plus the thumbnail) * 512^2 = 7 * 262144. This is the
+# model run1 measured fitting 4.33x the probe's slope purely because the
+# corpus was above the ceiling (report §4, Q3/W1).
+metadata.cost.canvas_pixels = 1835008
 
 [group.clip.inference_ids.jina-clip-v2-api]
 config.model_name     = "jina-clip-v2"

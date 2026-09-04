@@ -112,6 +112,28 @@ COLLAPSE_RATIO = 0.4
 # pixel unit class's own seed.
 UNREADABLE_PIXEL_UNITS = 2_000_000
 
+# Attribute names that hold a model's per-item pixel canvas, and the
+# attributes that hold the object holding it. Read passively off an already
+# constructed instance: the worker never builds anything and never imports
+# anything to ask (docs/inferio-worker-protocol.md, "Memory grants").
+CANVAS_ATTRS = ("canvas_pixels", "max_pixels", "image_max_pixels")
+CANVAS_HOLDERS = ("processor", "image_processor", "embedder", "model")
+
+# How deep the canvas hunt goes through [`CANVAS_HOLDERS`]. Two, because the
+# shipped shapes need exactly two: `instance.embedder.max_pixels`
+# (qwen3-vl-embedding) is one, `instance.model.processor.*` (nemotron,
+# dots.ocr) is two. Bounded because this walks an object graph nobody here
+# controls.
+CANVAS_WALK_DEPTH = 2
+
+# Smallest number a canvas reading is believed at: 512x512. Every shipped
+# `pixel` model's real canvas is well above it (1.8 MP for the VLMs, 6.6 MP
+# for easyOCR's detector), and a *too small* cap is the one direction that
+# hurts — it under-prices an item, which over-admits — so an attribute that
+# happens to be named `max_pixels` and holds something else is refused rather
+# than trusted.
+CANVAS_FLOOR_PIXELS = 512 * 512
+
 # Flat per-input allowance for `audio-second` pricing: reading a clip's real
 # duration needs a decoder, and nothing in the shipped registry is priced
 # this way yet (CLAP pads to a fixed window and is `item`/`count`).
@@ -375,23 +397,161 @@ def _text_bytes(data: Any) -> int:
     return len(repr(data))
 
 
-def price_inputs(inputs: Sequence[Any], unit: str) -> list[int]:
+def _positive_int(value: Any) -> int | None:
+    """`value` as a positive int, or None. Refuses bools and anything that
+    is not already a number: an attribute hunt must not coerce a string."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = int(value)
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return number if number > 0 else None
+
+
+def _canvas_on(obj: Any) -> int | None:
+    """A plausible canvas held directly on `obj`, or None."""
+    for attribute in CANVAS_ATTRS:
+        try:
+            value = getattr(obj, attribute, None)
+        except Exception:  # pragma: no cover - a property that raises
+            continue
+        pixels = _positive_int(value)
+        if pixels is None:
+            continue
+        if pixels < CANVAS_FLOOR_PIXELS:
+            logger.debug(
+                "ignoring %s = %r as a pixel canvas: below the %d-pixel floor",
+                attribute,
+                value,
+                CANVAS_FLOOR_PIXELS,
+            )
+            continue
+        return pixels
+    return None
+
+
+def impl_canvas_pixels(instance: Any) -> int | None:
+    """The loaded impl's own known input resolution, or None.
+
+    Tier 2 of the canvas resolution order
+    (docs/inferio-worker-protocol.md, "Memory grants"): what a model whose
+    canvas the registry cannot state statically — because it lives in a
+    processor config downloaded with the weights — still knows about itself.
+    Passive: every reading is a `getattr` on an object the impl already
+    built, bounded to [`CANVAS_WALK_DEPTH`] levels through
+    [`CANVAS_HOLDERS`], and never trusted below [`CANVAS_FLOOR_PIXELS`].
+
+    Never raises: a canvas that cannot be read is simply no cap, which is
+    what every model did before this field existed.
+    """
+    try:
+        seen: set[int] = set()
+        level = [instance]
+        for _ in range(CANVAS_WALK_DEPTH + 1):
+            following = []
+            for obj in level:
+                if obj is None or id(obj) in seen:
+                    continue
+                seen.add(id(obj))
+                pixels = _canvas_on(obj)
+                if pixels is not None:
+                    return pixels
+                for holder in CANVAS_HOLDERS:
+                    try:
+                        following.append(getattr(obj, holder, None))
+                    except Exception:  # pragma: no cover - a property that raises
+                        continue
+            if not following:
+                return None
+            level = following
+        return None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("canvas introspection failed: %s", exc)
+        return None
+
+
+def resolve_canvas_pixels(grant: dict[str, Any], instance: Any, unit: str) -> int | None:
+    """The per-item pixel cap for this window, in the documented order.
+
+    Registry first (`grant.canvas_pixels`, the figure both sides price
+    against), the impl's own known input resolution second, uncapped third.
+    Only for `pixel` inputs: the cap describes an area, and capping a token
+    count or an item count by an area is meaningless — a `count`-aggregated
+    model would in any case be unaffected, since `min(1, cap)` is 1.
+
+    Logged once per process, at the tier that answered, because a slope
+    fitted under a cap and one fitted without it are different numbers and a
+    maintainer reading a store has to be able to tell which this was.
+    """
+    if unit != "pixel":
+        return None
+    declared = _positive_int(grant.get("canvas_pixels"))
+    if declared is not None:
+        _log_canvas_once("the registry", declared)
+        return declared
+    measured = impl_canvas_pixels(instance)
+    if measured is not None:
+        _log_canvas_once("the loaded impl", measured)
+        return measured
+    _log_canvas_once(None, None)
+    return None
+
+
+_canvas_logged = False
+
+
+def _log_canvas_once(source: str | None, pixels: int | None) -> None:
+    global _canvas_logged
+    if _canvas_logged:
+        return
+    _canvas_logged = True
+    if source is None:
+        logger.info(
+            "no per-item pixel canvas declared or discoverable; pricing raw "
+            "submitted pixels, as before run2"
+        )
+        return
+    logger.info(
+        "pricing each input at min(raw pixels, %d), the canvas %s states",
+        pixels,
+        source,
+    )
+
+
+def price_inputs(
+    inputs: Sequence[Any], unit: str, canvas_pixels: int | None = None
+) -> list[int]:
     """Per-input units in the model's cost dimension. Never zero, never raises.
 
     An unreadable `pixel` input is charged the largest input seen so far in
     this window (falling back to [`UNREADABLE_PIXEL_UNITS`]) rather than
     failing the window: one corrupt file must not cost 63 good ones their
     batch, and over-charging it only makes its batch smaller.
+
+    `canvas_pixels` is the model's per-item ceiling (run2 R7,
+    [`resolve_canvas_pixels`]): every `pixel`-class model shipped resizes or
+    tiles its input onto a fixed canvas, so its real cost stops rising there
+    while a raw header-derived price keeps rising with whatever the user
+    submitted. Run1 measured what that costs — a fitted slope 4.33x the
+    probe's on nemotron, 58 of 110 batches holding one item (report §4,
+    Q3/W1, F-B). Applied to the raw reading *and* to the unreadable-input
+    fallback, which is the same quantity by another route.
     """
     units: list[int] = []
     largest = 0
     if unit == "pixel":
+        cap = canvas_pixels if canvas_pixels and canvas_pixels > 0 else None
         for entry in inputs:
             priced = _pixels(getattr(entry, "file", None))
+            if priced is not None and cap is not None:
+                priced = min(priced, cap)
             units.append(priced if priced is not None else 0)
             if priced:
                 largest = max(largest, priced)
         fallback = largest or UNREADABLE_PIXEL_UNITS
+        if cap is not None:
+            fallback = min(fallback, cap)
         return [priced or fallback for priced in units]
     if unit == "token":
         for entry in inputs:
@@ -922,7 +1082,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
     trimmed = maybe_shrink(grant_mb)
 
     # Pricing happens once, up front, OUTSIDE every timed section.
-    units = price_inputs(inputs, unit)
+    units = price_inputs(inputs, unit, resolve_canvas_pixels(grant, instance, unit))
 
     outputs: list[Any] = [None] * len(inputs)
     measurements: list[dict[str, Any]] = []
