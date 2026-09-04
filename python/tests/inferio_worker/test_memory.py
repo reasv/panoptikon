@@ -833,7 +833,7 @@ def test_dtype_prefers_the_negotiated_value_over_config_strings(fake_torch) -> N
         memory.resolved_dtype_name(SimpleNamespace(_dtype=FakeDtype("torch.float32")))
         == "fp32"
     )
-    # An unrecognised value is "unknown", never a guess.
+    # An unrecognised value reads as no answer at all, never as a guess.
     assert memory.resolved_dtype_name(SimpleNamespace(dtype=FakeDtype("int8"))) is None
 
     # 2. select_dtype's recorded decision outranks a config string, and is
@@ -907,14 +907,17 @@ def test_dtype_is_inferred_from_the_loaded_weights(fake_torch) -> None:
     assert memory.resolved_dtype(attribute) == ("fp32", "attribute")
 
 
-def test_a_non_torch_model_reports_the_unknown_sentinel(fake_torch) -> None:
+def test_a_non_torch_model_reports_the_unstated_sentinel(fake_torch) -> None:
     # CTranslate2/faster-whisper, ONNX Runtime, a remote API: nothing in the
     # instance is a module, so there is nothing to read a precision off.
-    # "unknown" is a value, not an omission — a key component that is absent
-    # makes the whole profile unkeyable, which is the bug this exists for.
+    # "unstated" is a value, not an omission — a key component that is absent
+    # makes the whole profile unkeyable, which is the bug this exists for. It
+    # says the impl stated no precision, which is a fact about the impl, not
+    # about the worker's ability to look (run2 R11; it was spelled "unknown"
+    # when the sentinel was introduced during run1).
     with_fake_nn()
     engine = SimpleNamespace(model=SimpleNamespace(compute_type="float16"))
-    assert memory.resolved_dtype(engine) == ("unknown", "unknown")
+    assert memory.resolved_dtype(engine) == ("unstated", "unstated")
     assert memory.resolved_dtype_name(engine) is None, (
         "the stated-precision helper still answers None; only the reported "
         "value falls back"
@@ -923,8 +926,8 @@ def test_a_non_torch_model_reports_the_unknown_sentinel(fake_torch) -> None:
     # same answer by a different route.
     del sys.modules["torch"].nn
     assert memory.resolved_dtype(SimpleNamespace(model=object())) == (
-        "unknown",
-        "unknown",
+        "unstated",
+        "unstated",
     )
 
 
@@ -992,7 +995,7 @@ def test_the_dtype_walk_survives_a_hostile_object_graph(fake_torch) -> None:
     left = SimpleNamespace()
     right = SimpleNamespace(other=left)
     left.other = right
-    assert memory.resolved_dtype(left) == ("unknown", "unknown")
+    assert memory.resolved_dtype(left) == ("unstated", "unstated")
 
     # A thousand modules in one dict: the container cap means only the first
     # few are ever unwrapped, and one of them answers.
@@ -1004,11 +1007,11 @@ def test_the_dtype_walk_survives_a_hostile_object_graph(fake_torch) -> None:
     assert memory.resolved_dtype(horde) == ("fp16", "inferred")
 
     # A thousand *attributes* are not capped, but the visit budget is: a
-    # module sitting past it is not found, and "unknown" — not a hang — is
+    # module sitting past it is not found, and the sentinel — not a hang — is
     # the answer. This asserts the bound, not a wish.
     crowd = SimpleNamespace(**{f"a{i:04d}": object() for i in range(1000)})
     crowd.zz_weights = FakeModule(params=("torch.float16",))
-    assert memory.resolved_dtype(crowd) == ("unknown", "unknown")
+    assert memory.resolved_dtype(crowd) == ("unstated", "unstated")
     # The same crowd answers the moment the module is under a name the walk
     # looks at first, which is what `_MODEL_ATTRS` is for.
     crowd.model = FakeModule(params=("torch.float16",))

@@ -2358,7 +2358,7 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     # before any of this existed (this function's docstring). A dtype we
     # actually *know* is reported either way: it is additive, and it is what
     # a later reload of the same model is keyed against.
-    if dtype != DTYPE_UNKNOWN or "base_mb" in payload:
+    if dtype != DTYPE_UNSTATED or "base_mb" in payload:
         payload["dtype"] = dtype
         payload["dtype_method"] = dtype_method
     uuid, name = device_identity()
@@ -2584,7 +2584,16 @@ _DTYPE_NAMES = {
 # entry written under it is found again by the next run; and the day that
 # impl starts negotiating a real dtype the key moves and the old row is
 # ignored, exactly as a dtype *change* is (design, "Invalidation").
-DTYPE_UNKNOWN = "unknown"
+#
+# Spelled `"unstated"` since run2 (R11); it was `"unknown"` when the sentinel
+# was introduced during run1. The two words are not the same claim: "unstated"
+# says the impl declared no precision, which is a fact about the impl, while
+# "unknown" reads as a fact about the worker's own competence — and a key
+# component that reads as a failure invites a consumer to treat it as one. The
+# rename moves the profile key, so a profile stored under the old spelling
+# stops matching and is re-measured, exactly as a stale epoch is; nothing has
+# been released under the old spelling, so that costs one run's measurements.
+DTYPE_UNSTATED = "unstated"
 
 # How the reported dtype was arrived at, reported beside it as
 # `dtype_method`: the impl stated it (`select_dtype`, `resolved_dtype`), it
@@ -2593,7 +2602,10 @@ DTYPE_UNKNOWN = "unknown"
 DTYPE_METHOD_SELECTED = "selected"
 DTYPE_METHOD_ATTRIBUTE = "attribute"
 DTYPE_METHOD_INFERRED = "inferred"
-DTYPE_METHOD_UNKNOWN = "unknown"
+# Renamed with the dtype sentinel above, and for the same reason: a `dtype` of
+# "unstated" beside a `dtype_method` of "unknown" would look like two
+# different facts where there is one.
+DTYPE_METHOD_UNSTATED = "unstated"
 
 # Bounds on the hunt for a `torch.nn.Module` inside the impl instance. Depth
 # 2 reaches `self.model` (every torch impl here) and `self.model.<part>` (the
@@ -2808,7 +2820,7 @@ def resolved_dtype(instance: Any) -> tuple[str, str]:
     model, and the sentinel answers for the rest. The method travels beside
     the value so a consumer can tell a negotiated precision (`"selected"`)
     from one read off an attribute (`"attribute"`) or off the weights
-    (`"inferred"`), and both from `"unknown"` — the key treats all four
+    (`"inferred"`), and both from `"unstated"` — the key treats all four
     alike, but a maintainer reading a store should not have to guess which
     kind of evidence a row was keyed on.
     """
@@ -2822,7 +2834,7 @@ def resolved_dtype(instance: Any) -> tuple[str, str]:
         name = None
     if name is not None:
         return name, DTYPE_METHOD_INFERRED
-    return DTYPE_UNKNOWN, DTYPE_METHOD_UNKNOWN
+    return DTYPE_UNSTATED, DTYPE_METHOD_UNSTATED
 
 
 # ---------------------------------------------------------------------------

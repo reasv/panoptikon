@@ -54,15 +54,27 @@ gpu          = "NVIDIA GeForce RTX 5090"   # GPU model name, exactly as nvidia-s
 platform     = "windows"               # windows | linux | macos
 backend      = "cuda"                  # accelerator extra: cuda | rocm | cpu
 torch        = "2.7.1+cu128"           # full torch.__version__
-dtype        = "fp16"                  # load precision actually in use; "unknown"
+dtype        = "fp16"                  # load precision actually in use; "unstated"
                                        # when the impl negotiates none and its
                                        # weights could not be read (a key value,
-                                       # not an omission — see the protocol doc)
+                                       # not an omission — see the protocol doc).
+                                       # Spelled "unknown" before run2 (R11);
+                                       # rows under the old spelling no longer
+                                       # match and are re-measured
+dtype_method = "inferred"              # selected | attribute | inferred | unstated:
+                                       # how that precision was arrived at.
+                                       # Diagnostic only — the key is `dtype`
 unit         = "item"                  # denormalized from metadata, for readability
 aggregation  = "count"
 
 base_mb           = 4321               # load footprint, process-level
-base_method       = "nvml"             # nvml | fdinfo | free_delta | alloc_delta
+base_method       = "nvml"             # nvml | fdinfo | mps | rss | free_delta |
+                                       # alloc_delta_measured | alloc_delta.
+                                       # The two alloc_delta spellings are two
+                                       # formulas: the measured one charges the
+                                       # context this process measured across
+                                       # its first CUDA init (run2 R8), the
+                                       # other the fixed 500 MiB estimate
 slope_mb_per_unit = 0.79               # marginal cost per unit, MiB
 knee_units        = 512                # optional; not fitted yet (rollout step 4)
 samples           = 38
