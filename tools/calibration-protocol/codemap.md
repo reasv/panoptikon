@@ -321,6 +321,13 @@ build/deploy/API. The plan that uses this is
    halved, unbounded halvings to 1; single-item OOM →
    `InferenceOOMError("INFERENCE_OOM_BATCH_SIZE_1: …")`. Absorbed
    halvings mark the successful batch `oom = True` → negative sample.
+   Since run2 S1 a **fourth** condition halves without being an OOM:
+   `looks_like_index_limit` (torch's `"integer out of range"` from
+   `at::native::safe_downcast`, and `canUse32BitIndexMath`) — tested only
+   after every OOM test has declined, no `clear_cache()` (nothing is short of
+   memory), counted in `total_index_limit_events` and **not** in the halving
+   counter, and propagated untouched at a single item rather than becoming an
+   `InferenceOOMError`.
 2. Harness `run_window` (`packing.py:1267-1438`): no in-harness retry; a
    multi-item OOM is prefixed `INFERENCE_OOM_WINDOW:`; `WindowFailure`
    carries the measurements.
@@ -1031,6 +1038,24 @@ that lands after any of them is refused rather than reopening the row
   if `grant_mb > 0` and live free < grant_mb, `units = max(1, unit_budget ×
   free / grant_mb)`, shrink-only, and `clamped = {from_units, to_units,
   free_mb}`. All three extra fields ride every measurement of the batch.
+- Shape ceiling (run2 S1, `MAX_BATCH_ATTR = "max_batch_for"`,
+  `impl_max_batch`, `cap_batch_to_impl_ceiling`, `merge_clamps`,
+  `executed_clamp`): the **second, non-memory** bound on a batch. After
+  planning and before the timed section, an impl exposing
+  `max_batch_for(shapes)` is asked how many of the planned batch's items one
+  call can execute; `shapes` are the pricer's own `(width, height)` header
+  readings (`_shape_readings`, now the single header pass, with `_areas`
+  deriving the prices), `None` where unreadable. A trimmed batch reports
+  `clamped = {from_units, to_units, free_mb, reason: "index_limit"}` and the
+  dropped items go to the next batch, so what runs is whole and therefore
+  still **priced**. Never asked for a batch of one. `merge_clamps` folds a
+  memory clamp and a ceiling into one map (`from_units` = the granted
+  budget, `to_units` = what ran, `reason` = the constraint that set it);
+  `executed_clamp` is the backstop for an impl that capped itself inside
+  `predict`, read from `_index_limit_total()` —
+  `inferio.impl.utils.total_index_limit_events()`, diffed across the call
+  exactly as the OOM halvings are, and deliberately a **separate** counter so
+  the batch never acquires the `oom` flag.
 - Throughput collapse (`_note_throughput` :622-682): `COLLAPSE_RATIO =
   0.4`, `COMPARATOR_MAX_AGE = 8`; comparable only if pool grew, priced,
   `units ≥ previous`; flagged batch does not become the comparator;
@@ -1051,7 +1076,7 @@ that lands after any of them is refused rather than reopening the row
 | tagmatch/danbooru[-saucenao] | danbooru_tagger | none | – | 1 | network |
 | doctr/db_resnet50_* (7) | doctr | item / count | 8 | 1 | docTR re-batches internally |
 | doctr/dots_ocr | dotsocr | pixel / sum | 2 000 000 | 2 | min CC 8.0, ~6 GB; no `canvas_pixels` — its cap lives in the downloaded processor, so the worker's tier-2 fallback reads it and **reports it on the load response**, which is what lets the host price it too |
-| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 2 | **`enable_batching = false`** → grantless, so the **host** cap is the only cap; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas), which the impl now **enforces** on the batch tensor before it pads (run2 D1-b, `eocr.py::fit_to_canvas`). Batched path = `Reader.detect` on the bounded batch + `Reader.recognize` per image on the **raw** array (`_detect_bounded_recognize_raw`), boxes mapped back by `scale_detections_to_original` and `min_size` applied in raw pixels: the recogniser's tensor is a fixed `imgH x imgW` per crop, so bounding it would cost transcription quality and save no device memory |
+| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 2 | **`enable_batching = false`** → grantless, so the **host** cap is the only cap; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas), which the impl now **enforces** on the batch tensor before it pads (run2 D1-b, `eocr.py::fit_to_canvas`). Batched path = `Reader.detect` on the bounded batch + `Reader.recognize` per image on the **raw** array (`_detect_bounded_recognize_raw`), boxes mapped back by `scale_detections_to_original` and `min_size` applied in raw pixels: the recogniser's tensor is a fixed `imgH x imgW` per crop, so bounding it would cost transcription quality and save no device memory. Also the only impl with a **shape ceiling** (run2 S1, `max_batch_for` / `max_detector_batch`): CRAFT's first pool, `vgg16_bn.features[6]`, launches over `B × 64 × H//2 × W//2` output elements downcast to int32, so `(2**31 − 1) // (64 · H//2 · W//2)` of the batch's *padded* dims caps it — 28 canvas-bounded A4 pages, 20 square ones — and the batch is chunked there rather than falling back per image on an unlogged `RuntimeError: integer out of range` |
 | florence2/msft_large-* (4) | florence2 | item / count | 4 | 1 | |
 | vlm/moondream-2b-25-03-* (5) | moondream_captioner | none | – | 2 | |
 | textembed/all-mpnet-base-v2, all-MiniLM-L6-v2, stella_* | sentence_transformers | token / max-times-count | 4000 | 1 | no impl-side OOM retry |
