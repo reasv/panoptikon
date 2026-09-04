@@ -80,6 +80,29 @@ the final report cites.
    orchestrator adjudicates thresholds and decides fixes per decision 5.
 3. Final report per §7 Phase 9; restart SGLang.
 
+### Decisions taken by the user after run1 (2026-09-04): the run2 change set
+
+The user reviewed the run1 report and approved the following. Rule stated
+for all of them: "the most thorough, robust, principled solution always".
+Each is implemented by an Opus agent on its own commit(s), reviewed by a
+separate verifier, then the affected scenarios are re-run (run2) and the
+report gains a run2 section.
+
+| # | Change | Decision and design |
+|---|---|---|
+| R1 | Throughput knee (T1/N1/P5-4/F-A) | (a) exclude throughput samples from windows the ledger knows were squeezed, memory-blind or clamped by the worker; (d) the knee is a brake that expires after N clean windows at the cap with ample headroom (re-widening), not a permanent ceiling; plus the user's extra failure mode: tag every throughput sample with the board's concurrent-active-worker count and fit the knee (and judge throughput collapse, P5-5) only from samples taken while the model was the sole active occupant. |
+| R2 | Death blast radius (F7) | Re-queue the in-flight items of a died-on window once instead of recording them as errors; a job whose items still fail after that is reported partial, not completed. Also fix the pre-existing empty `/api/jobs/data/failures` (Q8/T8): failed items and failed jobs must appear there. |
+| R3 | OOM classification (Q1) | Structural signal: the worker catches typed OOM exceptions (CUDA, HIP, MPS, CPU allocator) and reports an explicit flag; the host trusts the flag; string matching stays only as a fallback restricted to driver-shaped messages and deflates only when the worker's live free-memory reading at failure time confirms memory was tight. |
+| R4 | Deflation (Q2/B8) | Cap the counter at log2(anchor) + 1 (beyond that it is a no-op); repay by time as well as by clean windows; clear on respawn. User note: approved, though "beside the issue" (the classifier is the root). |
+| R5 | Margin near a full board (T4/P5-2) | The margin exists so a desktop user's variable VRAM use does not spill into ours; a user-set margin is honoured as today. **Default rule:** reserve = min(external × margin, 1024 MiB), so at most 1 GB is ever withheld from the budget; `limit = total − external − reserve`. Orchestrator's call, approved by delegation: the worker reports free memory per batch (not per window), so `external_mb` stops being a window-boundary quantity (T3). |
+| R6 | Load lock (B18/P5-3) | Per-model locks with a separate board-admission gate; the global load lock is retired. |
+| R7 | Pixel pricing (W1/Q3/F-B) | Implement the design's deferred per-item cap: price each item at min(raw pixels, canvas pixels), canvas declared per model in the registry (fallback: the model's known input resolution); makes the slope corpus-independent and lets large images pack. |
+| R8 | Degraded base tier (W4/F9) | Measure the CUDA context (board free before/after first CUDA init) instead of the 500 MiB constant; record `base_method` in every platform pass. |
+| R9 | Load-failure backoff (B15/Q5) | Per-model cooldown after consecutive load failures, exponential and capped; predicts fail fast with "unavailable until"; jobs abort on the first one. |
+| R10 | Socket cost (F6 option 4) | In-process dispatch for local inference (no loopback HTTP per item); the HTTP client stays for remote servers. Largest change; last in the queue. |
+| R11 | Small choices (orchestrator's calls, delegated) | Store `dtype_method` in the profile; rename the dtype sentinel to `unstated`; do not add `pid: host`; regenerate the UI types from `openapi.json`. |
+| R12 | Verification | Nemotron's 4.5× base at admission (F-C) is checked as an analysis artefact (oracle sampled while weights streamed) before any change. |
+
 ### Decisions taken during run1 by the orchestrator (2026-09-03)
 
 Decision 5 above splits every problem into "fix it now, with a separate
