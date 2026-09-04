@@ -3492,8 +3492,10 @@ config.replicas = 2
             residual_mb: 0.0,
             samples: 3,
             knee_units: None,
+            knee_withdrawn: false,
             max_units_measured: 16,
             local_samples: 3,
+            knee_clean_windows: 0,
             ring: vec![FitSample {
                 units: 16,
                 delta_mb: 160,

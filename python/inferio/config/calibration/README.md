@@ -76,7 +76,11 @@ base_method       = "nvml"             # nvml | fdinfo | mps | rss | free_delta 
                                        # its first CUDA init (run2 R8), the
                                        # other the fixed 500 MiB estimate
 slope_mb_per_unit = 0.79               # marginal cost per unit, MiB
-knee_units        = 512                # optional; not fitted yet (rollout step 4)
+knee_units        = 512                # optional: the throughput knee. A cap, not
+                                       # a ceiling — the orchestrator widens it by
+                                       # one log2 bucket after 12 clean windows run
+                                       # at it with memory to spare, and withdraws
+                                       # it once it can no longer bind (run2, R1d)
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence
 measured_at       = "2026-07-30T00:00:00Z"
@@ -128,12 +132,19 @@ Baselines accrete from maintainers' and volunteers' local stores. To
 contribute one, copy entries out of your
 `<data_folder>/inferio/calibration.toml` into a file here.
 
-The local store carries four extra fields — `max_units_measured`,
-`local_samples`, `sample_units`, `sample_reserved_mb` — that record *local
-authority*: the largest batch that machine actually ran, how much local
-evidence stands behind the fit, and the raw samples it was fitted from. They
-are **stripped on import**, so you may leave them in the copied file; they
-will be ignored. Nothing else needs editing.
+The local store carries five extra fields — `max_units_measured`,
+`local_samples`, `sample_units`, `sample_reserved_mb`, `knee_clean_windows` —
+that record *local authority*: the largest batch that machine actually ran,
+how much local evidence stands behind the fit, the raw samples it was fitted
+from, and (run2, R1d) how many clean windows that machine has already run at
+`knee_units` towards retiring it. They are **stripped on import**, so you may
+leave them in the copied file; they will be ignored. Nothing else needs
+editing.
+
+`knee_units` itself is *not* stripped — a knee can only ever make a grant
+smaller, which is the one authority a foreign profile has beyond pricing. What
+does not travel with it is the progress towards re-testing it: those windows
+ran on your board, not on the importer's.
 
 Two things make a baseline worth shipping: it was measured under real load
 (not a single window), and `residual_mb` is small relative to `base_mb` — a

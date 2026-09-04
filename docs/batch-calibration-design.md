@@ -185,6 +185,53 @@ genuinely flattened. A false positive is F-A — `knee_units = 1` fitted four
 minutes into a soak, persisted, reseeded into 56 replicas, 4 281 of 4 285
 grants at one item for 7 h 55 m.
 
+**(d) The knee is a brake with an expiry, not a ceiling.** The three rules
+above narrow what may become evidence; this one bounds the damage of a cap
+fitted from evidence that was wrong anyway — which no filter can rule out,
+and which run1 showed nothing ever revisits.
+
+After **12 clean windows** run *at* the knee, on a board that had room for
+`RATCHET_FACTOR × appetite` while they ran, the cap **widens by one log2
+bucket** (`knee_units` is the top of its bucket, so `2k + 1` is the top of the
+next) and the counter resets. Once a widening reaches the extrapolation
+ratchet's own ceiling — `RATCHET_FACTOR × anchor`, past which it could not cap
+anything — the knee is withdrawn outright.
+
+- *12*, because [`MIN_KNEE_SAMPLES`] is 12: twelve honest observations is what
+  the estimator demands before it may cap anything, so twelve clean windows at
+  that cap is the symmetric price of re-testing it.
+- *At the knee* means the knee was the binding constraint **and** the window
+  carried enough work to reach it. A window short of work, or held down by the
+  ramp or the ratchet, says nothing about the cap.
+- *With room to spare* means `headroom ≥ RATCHET_FACTOR × slope × min(anchor,
+  knee)` and the window was not squeezed — exactly what the widened budget
+  would cost. Re-widening into a full board would be a squeeze, not a probe.
+- A **negative** window resets the counter. A model that just ran out of
+  memory is not a model asking to be let out.
+
+**One step, not a clearing.** Re-widening by a bucket rather than removing the
+cap is the whole difference between a brake and no brake: if the knee was
+right, the excursion costs one bucket's worth of throughput for one window and
+the next refit puts it back; if it was wrong, the model climbs out of it one
+step per twelve windows instead of never. The counter lives per (model,
+board), not per replica — F-A's damage was done *across* 56 worker spawns, so
+a counter that died with the replica would never have reached its threshold —
+and it is **persisted** alongside `knee_units` as a local-only store field, so
+a restart does not hand a stored knee a fresh twelve windows to be right in.
+A knee that expires all the way to withdrawal is erased from the store by an
+explicit signal, because the merge rule otherwise reads an absent knee as
+"nothing fitted this run".
+
+**The oscillation guard.** Immediately after a widening the sample ring is
+exactly what it was when the knee expired, so a refit would hand the same
+number straight back before the model ever ran at the wider size. A widened
+knee therefore records the old cap's bucket as a frontier, and no refit may
+install a knee until a warm batch **above** it has actually been observed.
+Once one has, the refit runs normally — and on a genuinely flat curve it
+re-establishes the same knee, which is the expiry working, not failing: the
+steady-state cost is one probing window in thirteen, at twice the capped size,
+in exchange for a cap that can never again outlive its evidence.
+
 ## Core decision: learn a cost model, not a max batch size
 
 Calibration does **not** learn "the batch size that fits". It learns a
@@ -863,6 +910,9 @@ max_units_measured = 1024              # ratchet anchor: largest locally
                                        # measured clean high-water batch
 local_samples      = 12                # local clean samples; also the
                                        # non-local-profile confirmation gate
+knee_clean_windows = 7                 # run2 (R1d): clean windows already run
+                                       # at knee_units, with memory to spare,
+                                       # towards re-widening it
 ```
 
 Key tuple for lookup: `(inference_id, epoch, gpu, unit, aggregation,

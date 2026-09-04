@@ -2157,8 +2157,10 @@ metadata.cost.unit = "none"
             residual_mb: 96.0,
             samples: 38,
             knee_units: Some(512),
+            knee_withdrawn: false,
             max_units_measured: 1024,
             local_samples: 12,
+            knee_clean_windows: 0,
             ring: Vec::new(),
         });
 

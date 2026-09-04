@@ -201,6 +201,19 @@ pub struct CalibrationProfile {
     /// the widened margin of a not-yet-locally-confirmed profile.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub local_samples: u32,
+    /// The throughput knee's **expiry state** (run2 change R1d): clean windows
+    /// run at `knee_units`, with memory to spare, since it last moved.
+    ///
+    /// Local-only, and for the same reason as `local_samples`: it is a count
+    /// of what happened on *this* board, and a shipped baseline that carried
+    /// one would be claiming a stranger's windows towards this machine's
+    /// decision to re-test the cap. Persisted so a restart does not reset the
+    /// progress of a knee it is about to reseed — the run1 soak reseeded the
+    /// same knee into 56 replicas and never revisited it (finding F-A), and
+    /// the whole point of the expiry is that a *stored* knee cannot pin a
+    /// model forever either.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub knee_clean_windows: u32,
     /// The high-water sample ring, as two parallel arrays: `sample_units[i]`
     /// units grew the pool by `sample_reserved_mb[i]` MiB over
     /// `reserved_at_load`. Parallel arrays rather than an array of pairs
@@ -249,6 +262,7 @@ impl CalibrationProfile {
     fn strip_local_authority(&mut self) {
         self.max_units_measured = 0;
         self.local_samples = 0;
+        self.knee_clean_windows = 0;
         self.sample_units.clear();
         self.sample_reserved_mb.clear();
     }
@@ -413,6 +427,9 @@ pub struct ProfileSeed {
     pub max_units_measured: u64,
     /// Local clean samples accrued so far. Zero unless `local`.
     pub local_samples: u32,
+    /// The knee's expiry progress, as this machine left it. Zero unless
+    /// `local`.
+    pub knee_clean_windows: u32,
     /// The high-water sample ring behind the fit. Empty unless `local`.
     pub ring: Vec<FitSample>,
 }
@@ -433,8 +450,18 @@ pub struct ProfileUpdate {
     pub residual_mb: f64,
     pub samples: usize,
     pub knee_units: Option<u64>,
+    /// The knee this machine had persisted has expired past the point where it
+    /// caps anything and is being **withdrawn** (run2 change R1d).
+    ///
+    /// A separate flag rather than "`knee_units` is `None`", because the merge
+    /// rule reads a `None` knee as "this run fitted none", which must never
+    /// erase one an earlier run wrote. Withdrawal is the one case where it
+    /// must: a stored knee that outlives its own expiry is exactly the F-A
+    /// failure, one restart removed.
+    pub knee_withdrawn: bool,
     pub max_units_measured: u64,
     pub local_samples: u32,
+    pub knee_clean_windows: u32,
     pub ring: Vec<FitSample>,
 }
 
@@ -805,6 +832,7 @@ impl CalibrationStore {
         {
             let mut state = self.lock();
             self.load_local_locked(&mut state, true);
+            let update_withdrew_knee = update.knee_withdrawn;
             let mut ring = update.ring;
             if ring.len() > SAMPLE_RING {
                 // Keep the newest: ring eviction is recency aging.
@@ -824,6 +852,7 @@ impl CalibrationStore {
                 base_method: update.base_method,
                 slope_mb_per_unit: update.slope_mb_per_unit,
                 knee_units: update.knee_units,
+                knee_clean_windows: update.knee_clean_windows,
                 samples: update.samples.min(u32::MAX as usize) as u32,
                 residual_mb: update.residual_mb,
                 measured_at: now_rfc3339(),
@@ -857,7 +886,12 @@ impl CalibrationStore {
                     // it, so an update carrying `None` must leave a knee an
                     // earlier run wrote exactly where it is. A freshly fitted
                     // one still wins — it is `Some` and `or` keeps it.
-                    profile.knee_units = profile.knee_units.or(slot.knee_units);
+                    // ... unless the ledger says the knee it wrote has now
+                    // expired past the point of capping anything, which is the
+                    // one signal that means "withdraw it", not "I have none".
+                    if !update_withdrew_knee {
+                        profile.knee_units = profile.knee_units.or(slot.knee_units);
+                    }
                     if profile.slope_mb_per_unit <= 0.0 && profile.samples == 0 {
                         // This update carries no locally derived fit (the
                         // ledger's write policy omits the fit fields while
@@ -1069,6 +1103,7 @@ impl CalibrationProfiles for CalibrationStore {
             exact_torch: best.exact_torch,
             max_units_measured: best.profile.max_units_measured,
             local_samples: best.profile.local_samples,
+            knee_clean_windows: best.profile.knee_clean_windows,
             ring: best.profile.ring(),
         })
     }
@@ -1446,8 +1481,10 @@ mod tests {
             residual_mb: 96.0,
             samples: 38,
             knee_units: None,
+            knee_withdrawn: false,
             max_units_measured: 1024,
             local_samples: 12,
+            knee_clean_windows: 0,
             ring: (1..=4)
                 .map(|k| FitSample {
                     units: k * 8,
@@ -2429,6 +2466,53 @@ metadata.cost.unit = "none"
             Some(31),
             "and a freshly fitted one replaces it"
         );
+
+        // The one signal that *does* erase it: the ledger reporting that the
+        // knee it wrote has expired past the point of capping anything (run2
+        // change R1d). Without this a stored knee outlives its own expiry
+        // across a restart, which is finding F-A one reboot removed.
+        store.record(ProfileUpdate {
+            knee_units: None,
+            knee_withdrawn: true,
+            ..update("clip/vit", "fp16", 2.0)
+        });
+        assert_eq!(
+            store.local_entries()[0].knee_units,
+            None,
+            "an explicit withdrawal drops it"
+        );
+    }
+
+    /// The knee's expiry counter is persisted and read back (run2 change R1d),
+    /// and — being local authority like the anchor and the confirmation count
+    /// — is stripped when the same file is imported as a shipped baseline.
+    #[test]
+    fn the_knee_expiry_counter_round_trips_and_is_local_only() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path());
+        store.record(ProfileUpdate {
+            knee_units: Some(15),
+            knee_clean_windows: 7,
+            ..update("clip/vit", "fp16", 0.79)
+        });
+        assert_eq!(store.local_entries()[0].knee_clean_windows, 7);
+        let seed = store
+            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
+            .expect("the entry matches its own key");
+        assert!(seed.local);
+        assert_eq!(seed.knee_units, Some(15));
+        assert_eq!(
+            seed.knee_clean_windows, 7,
+            "a restart resumes the expiry where the last run left it"
+        );
+
+        // The same rows, read as a shipped baseline: the knee travels (it can
+        // only ever make a grant smaller) and the progress towards retiring it
+        // does not, because those windows ran on somebody else's board.
+        let mut profile = store.local_entries().remove(0);
+        profile.strip_local_authority();
+        assert_eq!(profile.knee_units, Some(15));
+        assert_eq!(profile.knee_clean_windows, 0);
     }
 
     /// Deleting a shipped file is noticed even when it was not the newest

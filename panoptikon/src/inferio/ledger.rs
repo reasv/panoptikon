@@ -93,7 +93,7 @@ use serde::{Deserialize, Serialize};
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
-use super::worker::{ClampReport, LoadReport, TelemetryHandle};
+use super::worker::{LoadReport, TelemetryHandle};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
 /// `usable = total − other_used × (1 + margin)`.
@@ -249,6 +249,27 @@ pub const MIN_KNEE_BUCKET_SAMPLES: usize = 2;
 /// and 4 281 of 4 285 grants run at a single item for 7 h 55 m. There is no
 /// symmetric case to make.
 pub const KNEE_MAX_BUCKET_DISPERSION: f64 = 0.20;
+
+/// Clean windows **run at the knee, with headroom to spare**, after which the
+/// knee expires and re-widens by one log2 bucket (run2 change R1d; findings
+/// P5-4 and F-A).
+///
+/// The knee has to stop being a permanent ceiling. F-A is what permanence
+/// looks like in the field: one fit, four minutes into an eight-hour soak,
+/// from 68 observations, never revisited across 13 job passes and 56 worker
+/// spawns because it is persisted and every new replica is reseeded from it —
+/// 4 281 of 4 285 grants at `unit_budget = 1`. A brake that expires costs a
+/// model with a genuinely flat curve one probing window per expiry; a ceiling
+/// that does not costs a model with a mis-fitted knee everything, forever.
+///
+/// Equal to [`MIN_KNEE_SAMPLES`], and derived from it: twelve honest
+/// observations is what the estimator demands before it may cap anything, so
+/// twelve clean windows at that cap is the symmetric price of re-testing it.
+/// A window is roughly [`WINDOW_DEPTH_MULTIPLIER`] batches, so this is tens of
+/// seconds of steady work on a fast model and a few minutes on a slow one —
+/// short against F-A's 7 h 55 m and long enough that a model is not spending a
+/// visible fraction of its windows probing.
+pub const KNEE_EXPIRY_CLEAN_WINDOWS: u32 = MIN_KNEE_SAMPLES as u32;
 
 /// Fraction of its window's **granted unit budget** a batch must have
 /// actually carried before its throughput counts towards the knee.
@@ -628,6 +649,20 @@ struct GrantCharge {
     /// (which only delays a knee) and never admits contended ones (which is
     /// what fits a wrong one).
     peak_occupants: u32,
+    /// The **throughput knee** is what held this window's batch size back:
+    /// [`admitted_units`] would have admitted more without it, and the window
+    /// carried enough work to reach the cap. One of the two conditions the
+    /// knee's expiry counts (run2 change R1d) — a window short of work, or one
+    /// held down by the ramp or the ratchet, says nothing about whether the
+    /// cap is still the right one.
+    knee_bound: bool,
+    /// The board had headroom for at least [`RATCHET_FACTOR`] times this
+    /// model's appetite when the window was priced, and the window was not
+    /// squeezed. The other condition the knee's expiry counts: re-widening is
+    /// only safe where the memory for the wider batch demonstrably exists, and
+    /// the factor is exactly what the widened budget would need
+    /// (`slope × 2 × min(anchor, knee)`).
+    ample_headroom: bool,
 }
 
 /// One requester's slice of a board's headroom, plus the contention floor it
@@ -951,6 +986,8 @@ fn knee_admits_window(charge: &GrantCharge) -> bool {
 struct Settled {
     update: Option<ProfileUpdate>,
     death: Option<DeathNegative>,
+    /// The throughput knee expired and was widened or withdrawn (run2 R1d).
+    knee_expiry: Option<KneeExpired>,
     /// What this window taught the ledger, for the log. Owns its strings so
     /// the line is formatted after the lock is dropped.
     window: Option<WindowSettled>,
@@ -1000,6 +1037,50 @@ impl WindowSettled {
                 clean_windows = self.clean_windows,
                 max_units_measured = self.max_units_measured,
                 "settled a granted window"
+            ),
+        }
+    }
+}
+
+/// The throughput knee reached its expiry and was re-widened (or withdrawn)
+/// (run2 change R1d). Owns its strings so the line is formatted after the lock
+/// is dropped.
+struct KneeExpired {
+    inference_id: String,
+    gpu: String,
+    from_units: u64,
+    /// `None` when the widened cap could no longer bind and the knee was
+    /// withdrawn outright.
+    to_units: Option<u64>,
+    windows: u32,
+    granted_units: u64,
+}
+
+impl KneeExpired {
+    fn emit(self) {
+        match self.to_units {
+            Some(to_units) => tracing::info!(
+                model = %self.inference_id,
+                gpu = %self.gpu,
+                knee_units_before = self.from_units,
+                knee_units_after = to_units,
+                clean_windows_at_the_knee = self.windows,
+                last_grant_units = self.granted_units,
+                "this model has run cleanly at its throughput knee for long \
+                 enough, with memory to spare, that the knee is worth \
+                 re-testing; widening the cap by one batch-size step. A knee \
+                 is a brake, not a ceiling: if the curve really does flatten \
+                 here, the next fit from honest samples puts it back"
+            ),
+            None => tracing::info!(
+                model = %self.inference_id,
+                gpu = %self.gpu,
+                knee_units_before = self.from_units,
+                clean_windows_at_the_knee = self.windows,
+                last_grant_units = self.granted_units,
+                "this model's throughput knee has widened past the point where \
+                 it could cap anything and has been withdrawn; the ramp and \
+                 the extrapolation ratchet govern its batch size from here"
             ),
         }
     }
@@ -1241,6 +1322,36 @@ struct ModelCalibration {
     /// preserves whatever knee an entry already carries when an update
     /// brings none, so this never erases a knee we wrote in a previous run.
     knee_is_local: bool,
+    /// Clean windows run **at** the knee with ample headroom since the knee
+    /// last moved: the knee's expiry counter (run2 change R1d). At
+    /// [`KNEE_EXPIRY_CLEAN_WINDOWS`] the cap widens by one log2 bucket and
+    /// this resets.
+    ///
+    /// Per (model, board) rather than per replica, deliberately: F-A's damage
+    /// was done *across* 56 worker spawns, each of them reseeded from the same
+    /// persisted knee, so a counter that died with the replica would never
+    /// reach its threshold on a model the manager keeps cycling. Persisted
+    /// alongside the knee for the same reason, one restart out.
+    knee_clean_windows: u32,
+    /// After a re-widening, the log2 bucket the old knee sat in: the frontier
+    /// the model has been let out to explore, and which it has **not** yet
+    /// produced any observation above.
+    ///
+    /// A refit while this is set may not install a knee. Without it the
+    /// expiry never takes effect: the ring is unchanged by the widening, so
+    /// the very next settle re-fits the number that just expired and the model
+    /// never actually runs at the wider size. Cleared by
+    /// [`VramLedger::ingest_locked`] the moment a warm batch **above** this
+    /// bucket is observed — that is the exploration happening, as opposed to
+    /// the ring merely still remembering the pre-knee ramp, which reached
+    /// those sizes before the cap existed.
+    ///
+    /// Note what this does *not* do: once the new evidence is in, a refit may
+    /// re-establish the same knee, and on a genuinely flat curve it will. That
+    /// is the expiry working — one probing window in every
+    /// [`KNEE_EXPIRY_CLEAN_WINDOWS`] + 1, at twice the capped size, in
+    /// exchange for a cap that can never again outlive its evidence.
+    knee_re_explore_above: Option<u32>,
     /// `(anchor, fit version, locally fitted knee)` as last handed to the
     /// calibration store. The write policy is "the ratchet anchor advanced or
     /// the fit meaningfully changed" — and `FitSnapshot::version` only moves
@@ -2638,6 +2749,13 @@ impl VramLedger {
             // Explicit rather than implied by the branch: a seeded knee is a
             // foreign measurement and may never travel back out.
             cal.knee_is_local = false;
+            // A seeded knee arrives with its expiry progress (run2 change
+            // R1d), which is local-only and therefore zero from anything but
+            // this machine's own store. Without it a restart would hand a
+            // persisted knee a fresh set of `KNEE_EXPIRY_CLEAN_WINDOWS`
+            // windows to be right in — which is F-A with an extra step, since
+            // the soak respawned the model 56 times.
+            cal.knee_clean_windows = seed.knee_clean_windows;
         }
         if adopt_fit {
             cal.fit = Some(FitSnapshot {
@@ -2788,6 +2906,12 @@ impl VramLedger {
         // local fit does. Quantized to a bucket edge, so "changed at all" and
         // "changed materially" are the same test.
         let knee = cal.knee_units.filter(|_| cal.knee_is_local);
+        // A knee this machine wrote that has now expired past the point of
+        // capping anything: the store has to be told to drop it, because a
+        // `None` knee otherwise reads as "nothing fitted this run" and the
+        // merge keeps whatever is on disk (run2 change R1d).
+        let knee_withdrawn =
+            knee.is_none() && cal.persisted.is_some_and(|persisted| persisted.2.is_some());
         let current = (cal.max_units_measured, fit_version, knee);
         if cal.persisted.is_some_and(|persisted| {
             persisted.1 == current.1 && persisted.0 >= current.0 && persisted.2 == current.2
@@ -2842,8 +2966,15 @@ impl VramLedger {
             residual_mb: fit.map(|fit| fit.residual_mb).unwrap_or(0.0),
             samples: fit.map(|fit| fit.samples).unwrap_or(0),
             knee_units: knee,
+            knee_withdrawn,
             max_units_measured,
             local_samples: cal.local_samples,
+            // Expiry progress rides along with whatever else triggered this
+            // write rather than triggering one of its own: a counter that
+            // moved every window would defeat the write policy's whole point,
+            // and losing at most one restart's worth of progress costs
+            // `KNEE_EXPIRY_CLEAN_WINDOWS` windows, not permanence.
+            knee_clean_windows: cal.knee_clean_windows,
             ring: cal.samples.iter().copied().collect(),
         })
     }
@@ -3191,6 +3322,31 @@ impl VramLedger {
         Self::fit_locked(state, entry).filter(|fit| fit.slope_mb_per_unit > 0.0)
     }
 
+    /// What this model can actually *use*, in MiB: the design's contention
+    /// appetite term `slope × knee_units`, implemented as `slope ×
+    /// min(ratchet anchor, knee)` — the calibrated batch size bounded by both
+    /// the evidence and the throughput knee, so a knee-capped worker cannot
+    /// claim a share of the board sized for a batch it will never be admitted
+    /// for. Pre-fit there is no slope, so the model's measured `base` is the
+    /// only size signal there is.
+    ///
+    /// Two callers, and they must agree: [`Self::share_locked`] divides
+    /// headroom by it, and the grant path compares headroom against
+    /// [`RATCHET_FACTOR`] times it to decide whether a knee-bound window ran
+    /// with room to spare (run2 change R1d). A second, drifting copy of this
+    /// expression would make "ample headroom" mean something the contention
+    /// split does not.
+    fn appetite_mb_locked(state: &LedgerState, entry: &WorkerEntry) -> f64 {
+        let anchor = match Self::knee_locked(state, entry) {
+            Some(knee) => Self::anchor_locked(state, entry).min(knee),
+            None => Self::anchor_locked(state, entry),
+        };
+        match Self::pricing_fit_locked(state, entry) {
+            Some(fit) if anchor > 0 => (fit.slope_mb_per_unit * anchor as f64).max(1.0),
+            _ => entry.base_mb.unwrap_or(SEED_BATCH_FLOOR_MB).max(1) as f64,
+        }
+    }
+
     /// Contention split: **demand first** (a model with an empty queue gets
     /// no new grants), then appetite-weighted shares — `slope × ratchet
     /// anchor` once calibrated, `base` weighting before — with a floor of one
@@ -3221,22 +3377,7 @@ impl VramLedger {
             })
             .map(|(_, entry)| entry)
             .collect();
-        let appetite = |entry: &WorkerEntry| -> f64 {
-            // The design's appetite term is `slope × knee_units`: what this
-            // model can actually *use*, which is the calibrated batch size
-            // bounded by both the evidence (the anchor) and the throughput
-            // knee. A model capped at its knee must not claim a share of the
-            // board sized for a batch it will never be admitted for.
-            let anchor = match Self::knee_locked(state, entry) {
-                Some(knee) => Self::anchor_locked(state, entry).min(knee),
-                None => Self::anchor_locked(state, entry),
-            };
-            match Self::pricing_fit_locked(state, entry) {
-                Some(fit) if anchor > 0 => (fit.slope_mb_per_unit * anchor as f64).max(1.0),
-                // Pre-fit: weight by base, the only size signal available.
-                _ => entry.base_mb.unwrap_or(SEED_BATCH_FLOOR_MB).max(1) as f64,
-            }
-        };
+        let appetite = |entry: &WorkerEntry| -> f64 { Self::appetite_mb_locked(state, entry) };
         let floor_mb = |entry: &WorkerEntry| -> u64 {
             match Self::pricing_fit_locked(state, entry) {
                 Some(fit) => {
@@ -3402,13 +3543,24 @@ impl VramLedger {
         };
         let headroom = self.headroom_with_margin_locked(&state, &gpu, margin);
         let share = self.share_locked(&state, worker, headroom);
-        let (mut unit_budget, mut mb, unit, aggregation, squeezed) = {
+        let (mut unit_budget, mut mb, unit, aggregation, squeezed, knee_bound, ample_headroom) = {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
             let fit = Self::pricing_fit_locked(&state, entry);
-            let wanted = admitted_units(entry, anchor, Self::knee_locked(&state, entry))
-                .min(window_units.max(1))
-                .max(1);
+            let capped = admitted_units(entry, anchor, Self::knee_locked(&state, entry));
+            let wanted = capped.min(window_units.max(1)).max(1);
+            // Did the *knee* decide this window's size? Both halves matter to
+            // the expiry (run2 change R1d): the cap has to have bitten
+            // (`capped < uncapped`) and the window has to have carried enough
+            // work to reach it (`wanted == capped`), or a short queue would
+            // count as a window run at the cap.
+            let knee_bound =
+                capped < admitted_units(entry, anchor, None) && wanted >= capped && capped > 0;
+            // Was there room to have run wider? The comparand is exactly what
+            // the widened budget would cost: `RATCHET_FACTOR` times the
+            // model's appetite, which is `slope × min(anchor, knee)`.
+            let ample_headroom = (headroom as f64)
+                >= Self::appetite_mb_locked(&state, entry) * RATCHET_FACTOR as f64;
             let mut units = wanted;
             let mut mb = share.mb;
             // Whether *memory* is what held this window back, as opposed to
@@ -3446,7 +3598,17 @@ impl VramLedger {
                 // shrink condition `share_locked` applies above.
                 share.mb <= share.floor && headroom < share.floor_sum
             };
-            (units, mb, entry.unit, entry.aggregation, squeezed)
+            (
+                units,
+                mb,
+                entry.unit,
+                entry.aggregation,
+                squeezed,
+                knee_bound,
+                // A squeezed window never had room to spare, whatever the
+                // arithmetic above says about the board as a whole.
+                ample_headroom && !squeezed,
+            )
         };
         if squeezed {
             Self::flag_trims_locked(&mut state, &gpu, worker);
@@ -3473,6 +3635,8 @@ impl VramLedger {
                     unit_budget,
                     squeezed,
                     peak_occupants: 0,
+                    knee_bound,
+                    ample_headroom,
                 },
             );
         // Now that this window is outstanding, every window on the board —
@@ -3578,6 +3742,9 @@ impl VramLedger {
         if let Some(death) = settled.death {
             death.emit();
         }
+        if let Some(expiry) = settled.knee_expiry {
+            expiry.emit();
+        }
         if let Some(window) = settled.window {
             window.emit();
         }
@@ -3619,6 +3786,9 @@ impl VramLedger {
             entry.fit_version_sent = 0;
         }
         let ingested = Self::ingest_locked(&mut state, worker, granted_units);
+        // The knee's expiry, if this window was the one that tripped it.
+        // Emitted with the ledger lock dropped, like every other alarm here.
+        let mut knee_expiry: Option<KneeExpired> = None;
         // Hoisted for the settle log only; the accounting below is unchanged.
         let mut responded_negative = false;
         if let WindowOutcome::Responded { oom } = outcome {
@@ -3638,6 +3808,7 @@ impl VramLedger {
                     entry.note_clean_window(ingested.high_water_samples > 0, anchor);
                 }
             }
+            knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
         }
         let death = matches!(outcome, WindowOutcome::WorkerDied)
             .then(|| Self::note_unified_death_locked(&mut state, worker, charge.is_some()))
@@ -3685,8 +3856,82 @@ impl VramLedger {
         Settled {
             update,
             death,
+            knee_expiry,
             window,
         }
+    }
+
+    /// Advance (or reset) the knee's expiry counter for one settled window,
+    /// and widen the knee when it has been earned (run2 change R1d).
+    ///
+    /// A window counts towards the expiry only when all four hold: it
+    /// responded, it was clean, the **knee** is what held its batch size back,
+    /// and the board had room for [`RATCHET_FACTOR`] times this model's
+    /// appetite while it ran. Anything else leaves the counter alone — except
+    /// a negative window, which resets it, because a model that just OOMed is
+    /// not a model asking to be let out.
+    ///
+    /// The widening is by **one log2 bucket**: `knee_units` is the top of its
+    /// bucket, so `2k + 1` is the top of the next one, and the budget resumes
+    /// exactly one ramp step above the cap rather than jumping to whatever the
+    /// ratchet would have allowed. That is the difference between a brake and
+    /// no brake at all: if the knee was right, the excursion costs one step's
+    /// worth of throughput and the next refit puts it back; if it was wrong,
+    /// the model climbs out of it one step per [`KNEE_EXPIRY_CLEAN_WINDOWS`]
+    /// windows instead of never.
+    ///
+    /// Once the widened cap can no longer bind — it has reached the ratchet's
+    /// own ceiling of `RATCHET_FACTOR × anchor` — the knee is **withdrawn**
+    /// outright rather than left as a number that does nothing, so that
+    /// `/health`, the store and the contention appetite all stop claiming a
+    /// cap this model no longer has.
+    fn note_knee_window_locked(
+        state: &mut LedgerState,
+        worker: WorkerId,
+        charge: Option<GrantCharge>,
+        negative: bool,
+    ) -> Option<KneeExpired> {
+        let entry = state.workers.get(&worker)?;
+        let key = (entry.inference_id.clone(), entry.gpu.clone());
+        let anchor = Self::anchor_locked(state, entry);
+        let cal = state.calibration.get_mut(&key)?;
+        let knee = cal.knee_units.filter(|knee| *knee > 0)?;
+        if negative {
+            cal.knee_clean_windows = 0;
+            return None;
+        }
+        let Some(charge) = charge.filter(|charge| charge.knee_bound && charge.ample_headroom)
+        else {
+            return None;
+        };
+        cal.knee_clean_windows = cal.knee_clean_windows.saturating_add(1);
+        if cal.knee_clean_windows < KNEE_EXPIRY_CLEAN_WINDOWS {
+            return None;
+        }
+        cal.knee_clean_windows = 0;
+        // `knee` is `2^(b+1) − 1`; the top of the next bucket is `2k + 1`, and
+        // it cannot overflow for any knee the fit can produce (`b < 63`).
+        let widened = knee.saturating_mul(2).saturating_add(1);
+        let withdrawn = anchor > 0 && widened >= anchor.saturating_mul(RATCHET_FACTOR);
+        if withdrawn {
+            cal.knee_units = None;
+            cal.knee_is_local = false;
+            cal.knee_re_explore_above = None;
+        } else {
+            cal.knee_units = Some(widened);
+            // The samples in the ring were all taken under the old cap, so a
+            // refit would hand the same number straight back. The model has to
+            // run at the wider size before the ring may speak again.
+            cal.knee_re_explore_above = Some(size_bucket(knee));
+        }
+        Some(KneeExpired {
+            inference_id: key.0,
+            gpu: key.1,
+            from_units: knee,
+            to_units: (!withdrawn).then_some(widened),
+            windows: KNEE_EXPIRY_CLEAN_WINDOWS,
+            granted_units: charge.unit_budget,
+        })
     }
 
     /// DP-2: a replica that died with a granted window in flight, on a board
@@ -4076,11 +4321,25 @@ impl VramLedger {
                 cal.transients.pop_front();
             }
         }
+        let mut widest_bucket: Option<u32> = None;
         for sample in throughput {
+            widest_bucket = Some(widest_bucket.unwrap_or(0).max(size_bucket(sample.units)));
             cal.throughput.push_back(sample);
             while cal.throughput.len() > KNEE_RING {
                 cal.throughput.pop_front();
             }
+        }
+        // A re-widened knee is a frontier the model has been let out to
+        // explore (run2 change R1d). This is where the exploration is
+        // *observed*: a warm batch above the old cap is the new evidence, and
+        // only after one lands may a refit speak again. Keying on the ring's
+        // contents instead would clear the flag immediately, because the ring
+        // still holds the pre-knee ramp's samples from above the cap — the
+        // very evidence the expiry just declared spent.
+        if let (Some(above), Some(widest)) = (cal.knee_re_explore_above, widest_bucket)
+            && widest > above
+        {
+            cal.knee_re_explore_above = None;
         }
         // The ratchet counts only *local* clean high-water batches.
         cal.max_units_measured = cal.max_units_measured.max(anchor);
@@ -4217,6 +4476,7 @@ impl VramLedger {
             return;
         };
         let previous = cal.knee_units;
+        let re_explore_above = cal.knee_re_explore_above;
         let unchanged = cal.knee_units == fit.knee_units && cal.knee_is_local;
         let Some(cal) = state.calibration.get_mut(&key) else {
             return;
@@ -4226,6 +4486,13 @@ impl VramLedger {
         // peak, and that is the number later fits are held to.
         if fit.best.1 > floor {
             cal.knee_best = Some(fit.best);
+        }
+        // A widening that has not yet been explored: the ring is exactly what
+        // it was when the knee expired, so a refit would hand the expired
+        // number straight back before the model ever ran at the wider size
+        // (see [`ModelCalibration::knee_re_explore_above`]).
+        if re_explore_above.is_some() {
+            return;
         }
         let Some(knee) = fit.knee_units else {
             return;
@@ -4983,6 +5250,17 @@ impl VramLedger {
             .and_then(|cal| cal.knee_best)
     }
 
+    /// This (model, board)'s knee expiry state: the clean-windows-at-the-cap
+    /// counter and the "not yet explored above" bucket (run2 change R1d).
+    #[cfg(test)]
+    fn knee_expiry_for_test(&self, inference_id: &str, gpu: &str) -> (u32, Option<u32>) {
+        self.lock()
+            .calibration
+            .get(&(inference_id.to_owned(), gpu.to_owned()))
+            .map(|cal| (cal.knee_clean_windows, cal.knee_re_explore_above))
+            .unwrap_or((0, None))
+    }
+
     /// Age this replica's two trim clocks — the idle-quiet-period stamp and
     /// the per-replica debounce — by `by`.
     ///
@@ -5557,6 +5835,7 @@ pub struct FitHealth {
 mod tests {
     use super::*;
     use crate::inferio::calibration::{CalibrationStore, StoreEnv, StorePaths};
+    use crate::inferio::worker::ClampReport;
     use crate::inferio::worker::{
         BatchMeasurement, LoadReport, MemorySample, Timestamped, WorkerTelemetry,
     };
@@ -6627,6 +6906,7 @@ mod tests {
                 // proves the ledger refuses them on `local` alone.
                 max_units_measured: 4096,
                 local_samples: 99,
+                knee_clean_windows: 0,
                 ring: vec![FitSample {
                     units: 4096,
                     delta_mb: 40_960,
@@ -6698,6 +6978,7 @@ mod tests {
                 exact_torch: true,
                 max_units_measured: 64,
                 local_samples: 6,
+                knee_clean_windows: 0,
                 ring: ring.clone(),
             }),
             ..FakeProfiles::default()
@@ -6741,6 +7022,7 @@ mod tests {
                 exact_torch: true,
                 max_units_measured: 64,
                 local_samples: 6,
+                knee_clean_windows: 0,
                 ring: vec![FitSample {
                     units: 64,
                     delta_mb: 640,
@@ -6795,6 +7077,7 @@ mod tests {
                     exact_torch: true,
                     max_units_measured: 0,
                     local_samples: LOCAL_CONFIRMATION_SAMPLES,
+                    knee_clean_windows: 0,
                     ring: Vec::new(),
                 }),
                 ..FakeProfiles::default()
@@ -7053,6 +7336,7 @@ mod tests {
                 exact_torch: false,
                 max_units_measured: 64,
                 local_samples: 6,
+                knee_clean_windows: 0,
                 ring: vec![FitSample {
                     units: 64,
                     delta_mb: 740,
@@ -7169,6 +7453,7 @@ mod tests {
                 exact_torch: true,
                 max_units_measured: 0,
                 local_samples: 0,
+                knee_clean_windows: 0,
                 ring: Vec::new(),
             }),
             ..FakeProfiles::default()
@@ -10898,6 +11183,8 @@ mod tests {
             unit_budget: 64,
             squeezed: false,
             peak_occupants: 0,
+            knee_bound: false,
+            ample_headroom: true,
         };
         assert!(knee_admits_window(&honest));
         assert!(
@@ -10967,6 +11254,7 @@ mod tests {
                 exact_torch: true,
                 max_units_measured: 0,
                 local_samples: 0,
+                knee_clean_windows: 0,
                 ring: Vec::new(),
             }),
             ..FakeProfiles::default()
@@ -11211,6 +11499,7 @@ mod tests {
                 exact_torch: true,
                 max_units_measured: 0,
                 local_samples: 0,
+                knee_clean_windows: 0,
                 ring: Vec::new(),
             }),
             ..FakeProfiles::default()
@@ -11273,6 +11562,7 @@ mod tests {
                 exact_torch: true,
                 max_units_measured: 0,
                 local_samples: 0,
+                knee_clean_windows: 0,
                 ring: Vec::new(),
             }),
             ..FakeProfiles::default()
@@ -11491,31 +11781,269 @@ mod tests {
         );
 
         // Steady state under the cap, long enough that the ring (128) turns
-        // over and the sizes above the knee age out of it entirely.
+        // over and the sizes above the knee age out of it entirely. Batch
+        // sizes follow the live grant rather than a constant, because the
+        // knee's expiry (run2 change R1d) re-widens the cap by one bucket
+        // every `KNEE_EXPIRY_CLEAN_WINDOWS` clean windows run at it — so what
+        // this test pins is the direction: the cap never walks *downward*,
+        // which is the absorbing failure the historical anchor and the
+        // full-budget rule exist to prevent.
+        let mut smallest_cap = u64::MAX;
         for _ in 0..120 {
             let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-            assert_eq!(token.grant().unit_budget, 15);
+            let granted = token.grant().unit_budget;
+            smallest_cap = smallest_cap.min(granted);
             handle.lock().unwrap().record_measurements(vec![
-                warm_batch(15, 95.0),
-                warm_batch(11, 92.0),
-                warm_batch(6, 85.0),
-                warm_batch(3, 70.0),
+                warm_batch(granted, 95.0),
+                warm_batch(granted * 3 / 4, 92.0),
+                warm_batch(granted / 2, 85.0),
+                warm_batch(granted / 4, 70.0),
                 warm_batch(1, 40.0),
             ]);
             token.finish(WindowOutcome::Responded { oom: false });
         }
 
         let worker = &ledger.health()[0].workers[0];
-        assert_eq!(
-            worker.throughput_samples, KNEE_RING,
-            "one admitted sample per window, and the ring is full"
+        assert!(
+            worker.throughput_samples > 0,
+            "each window's full-budget batch is admitted"
         );
         assert_eq!(
-            worker.knee_units,
+            smallest_cap, 15,
+            "120 refits of a ring full of tails never capped below the fitted knee"
+        );
+        assert!(
+            worker.knee_units.unwrap_or(u64::MAX) >= 15,
+            "and the knee itself only ever moved outward: {:?}",
+            worker.knee_units
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Knee expiry (run2 R1d)
+    // ------------------------------------------------------------------
+
+    /// A replica capped by a knee on a wide-open board, with an anchor big
+    /// enough that the knee is the binding constraint. `set_knee_for_test`
+    /// installs the cap so the test is about the expiry rather than about
+    /// reconstructing the curve that fits one.
+    fn knee_capped(knee: u64) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
+        let ledger = ledger(200_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        push_memory(&handle, 190_000, 1000);
+        // One measured window, so the ratchet anchor is 64 and the knee has
+        // something to cap.
+        measured_window(&handle, &admission, 64);
+        ledger.set_knee_for_test("g/a", BOARD, knee);
+        (ledger, handle, admission)
+    }
+
+    /// One clean window that spends its whole granted budget, whatever that
+    /// budget currently is.
+    fn window_at_the_cap(handle: &TelemetryHandle, admission: &Admission) -> u64 {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let granted = token.grant().unit_budget;
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(granted, 100.0)]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        granted
+    }
+
+    /// R1d: a knee that has been right for [`KNEE_EXPIRY_CLEAN_WINDOWS`] clean
+    /// windows, on a board with room to spare, widens by one bucket. F-A is
+    /// the case this exists for — one fit, four minutes into an eight-hour
+    /// soak, never revisited.
+    #[test]
+    fn a_knee_expires_after_clean_windows_at_the_cap_with_room_to_spare() {
+        let (ledger, handle, admission) = knee_capped(15);
+        for window in 1..KNEE_EXPIRY_CLEAN_WINDOWS {
+            assert_eq!(window_at_the_cap(&handle, &admission), 15);
+            assert_eq!(
+                ledger.knee_expiry_for_test("g/a", BOARD).0,
+                window,
+                "one window of credit each"
+            );
+        }
+        assert_eq!(window_at_the_cap(&handle, &admission), 15, "the last one");
+
+        let (counter, re_explore) = ledger.knee_expiry_for_test("g/a", BOARD);
+        assert_eq!(counter, 0, "the counter resets with the widening");
+        assert_eq!(
+            re_explore,
+            Some(3),
+            "and the old cap's bucket is the frontier to be explored"
+        );
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(31),
+            "one log2 bucket wider — the ramp resumes one step above the knee, \
+             not at whatever the ratchet would allow"
+        );
+        assert_eq!(ledger.health()[0].workers[0].unit_budget, 31);
+    }
+
+    /// Both conditions, each shown to be load-bearing: a window that did not
+    /// run *at* the cap earns no credit, and neither does one on a board with
+    /// no room for the wider batch.
+    #[test]
+    fn only_a_window_run_at_the_cap_with_room_to_spare_counts_towards_expiry() {
+        let (ledger, handle, admission) = knee_capped(15);
+
+        // Short of work: the window asked for 4 units, so nothing about it
+        // says the cap of 15 is still the right one.
+        for _ in 0..KNEE_EXPIRY_CLEAN_WINDOWS {
+            let token = admission.request_grant(4, None, 1, 0).unwrap();
+            assert_eq!(token.grant().unit_budget, 4);
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![warm_batch(4, 100.0)]);
+            token.finish(WindowOutcome::Responded { oom: false });
+        }
+        assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).0, 0);
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+
+        // A negative window resets whatever credit had accrued: a model that
+        // just ran out of memory is not a model asking to be let out.
+        window_at_the_cap(&handle, &admission);
+        assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).0, 1);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        token.finish(WindowOutcome::Responded { oom: true });
+        assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).0, 0);
+    }
+
+    /// A knee whose widening reaches the extrapolation ratchet's own ceiling
+    /// cannot cap anything any more, so it is withdrawn rather than left
+    /// standing as a number that does nothing.
+    #[test]
+    fn a_knee_widened_past_the_ratchet_ceiling_is_withdrawn() {
+        // Anchor 64 ⇒ the ratchet allows 128, so a knee of 127 widens to 255
+        // and stops binding.
+        let (ledger, handle, admission) = knee_capped(127);
+        for _ in 0..KNEE_EXPIRY_CLEAN_WINDOWS {
+            window_at_the_cap(&handle, &admission);
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.knee_units, None, "withdrawn, not widened to 255");
+        assert_eq!(worker.max_units_measured, 64);
+        assert_eq!(worker.unit_budget, 128, "the ratchet governs from here");
+        assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).1, None);
+    }
+
+    /// The oscillation guard: right after a widening the ring is exactly what
+    /// it was when the knee expired, so a refit must not hand the same number
+    /// straight back. It may once the model has actually run above the old
+    /// cap — and on a genuinely flat curve it does, which is the expiry
+    /// working rather than failing.
+    #[test]
+    fn a_widened_knee_is_not_refitted_until_the_model_has_run_wider() {
+        let ledger = priced_ledger(200_000);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .unwrap();
+        push_memory(&handle, 190_000, 1000);
+        measured_window(&handle, &admission, 64);
+
+        // A flat curve over four buckets fits a knee at the top of bucket 3.
+        for units in [8u64, 16, 32, 64] {
+            warm_window(
+                &handle,
+                &admission,
+                &[
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                    (units, 100.0),
+                ],
+            );
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+
+        // Run it at the cap until it expires. The ring is unchanged by the
+        // widening — it still holds the 16/32/64 samples from the ramp — so
+        // without the guard the very next refit would restore 15 before the
+        // model ever ran at 31.
+        let mut windows = 0;
+        while ledger.health()[0].workers[0].knee_units == Some(15) {
+            window_at_the_cap(&handle, &admission);
+            windows += 1;
+            assert!(
+                windows <= KNEE_EXPIRY_CLEAN_WINDOWS,
+                "the knee never expired"
+            );
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(31));
+        assert_eq!(
+            ledger.knee_expiry_for_test("g/a", BOARD).1,
+            Some(3),
+            "and the refit in that same settle did not restore it from the \
+             ring the expiry just declared spent"
+        );
+
+        // One window at the wider size is the evidence the guard waits for,
+        // and the refit then re-establishes the same knee from the same flat
+        // curve — which is the correct answer for a curve that is flat, and
+        // the expiry working rather than failing.
+        assert_eq!(window_at_the_cap(&handle, &admission), 31);
+        assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).1, None);
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
             Some(15),
-            "120 refits later the knee has not moved a bucket"
+            "re-established from honest samples, which is what the expiry is for"
         );
-        assert_eq!(worker.unit_budget, 15);
+    }
+
+    /// A persisted knee is reseeded **with its expiry state**, so a restart
+    /// does not hand it a fresh set of clean windows to be right in. That is
+    /// F-A one reboot removed: the soak reseeded the same knee into 56
+    /// replicas, and a per-replica counter would never have reached its
+    /// threshold.
+    #[test]
+    fn a_seeded_knee_resumes_the_expiry_its_last_run_left() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 1.0,
+                residual_mb: 0.0,
+                samples: 20,
+                knee_units: Some(15),
+                local: true,
+                fit_is_local: true,
+                exact_torch: true,
+                max_units_measured: 64,
+                local_samples: 20,
+                knee_clean_windows: KNEE_EXPIRY_CLEAN_WINDOWS - 1,
+                ring: Vec::new(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        push_memory(&handle, 190_000, 1000);
+
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+        assert_eq!(
+            ledger.knee_expiry_for_test("g/a", BOARD).0,
+            KNEE_EXPIRY_CLEAN_WINDOWS - 1,
+            "the counter came back with the knee"
+        );
+        assert_eq!(window_at_the_cap(&handle, &admission), 15);
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(31),
+            "one window, not twelve, because eleven of them were paid last run"
+        );
     }
 
     /// The other half of the same guarantee, on the fit itself: the threshold
@@ -11625,6 +12153,7 @@ mod tests {
                     exact_torch: true,
                     max_units_measured: 0,
                     local_samples: 0,
+                    knee_clean_windows: 0,
                     ring: Vec::new(),
                 }),
                 "g/a",
@@ -11666,6 +12195,7 @@ mod tests {
                     exact_torch: true,
                     max_units_measured: 0,
                     local_samples: 0,
+                    knee_clean_windows: 0,
                     ring: Vec::new(),
                 }),
                 "g/b",
