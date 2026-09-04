@@ -277,27 +277,48 @@ impl Transport {
 /// Four rather than one so a connection being torn down (a server restart, an
 /// idle timeout) does not serialize the requests waiting behind it, and so a
 /// multi-worker inference server can be reached over more than one socket.
-/// Under h2c this is the *whole* socket budget for that endpoint.
+///
+/// It bounds the connections kept *idle*, which is not the same as the
+/// endpoint's socket budget: hyper opens another connection whenever every
+/// pooled one is at the peer's advertised stream limit. The real bound on
+/// sockets in both transports is [`INFERENCE_MAX_CONCURRENT_REQUESTS`] — see
+/// there.
 pub(crate) const INFERENCE_POOL_CONNECTIONS: usize = 4;
 
-/// Streams the client is willing to keep open on one h2 connection.
+/// Streams one h2 connection is *expected* to carry, for deriving
+/// [`INFERENCE_MAX_CONCURRENT_REQUESTS`].
 ///
-/// Not a protocol limit — hyper's server advertises no
-/// `SETTINGS_MAX_CONCURRENT_STREAMS` at all — but a *client-side* one, and
-/// the reason the pool stays a pool: hyper opens an additional connection
-/// when every pooled one is at the peer's stream limit, so a client that
-/// offers unbounded concurrency is back to unbounded sockets against any
-/// server that does advertise a limit (nginx defaults to 128, Envoy to 100).
-/// 64 is below every such default, so the pool is never the thing that grows.
+/// Deliberately only an expectation: nothing communicates it to hyper, and
+/// there is no client setting that would. What the peer allows is whatever it
+/// advertises in `SETTINGS_MAX_CONCURRENT_STREAMS` (hyper's own server
+/// advertises 200, nginx defaults to 128, Envoy to 100), and hyper opens a
+/// further connection when the pooled ones are saturated. So 64 is the
+/// pessimistic assumption that makes the concurrency cap below imply a
+/// *small* number of connections against every common peer, not a number
+/// enforced anywhere.
 const H2_STREAMS_PER_CONNECTION: usize = 64;
 
-/// Requests this client keeps in flight against one endpoint over h2c.
-/// Everything past it queues on a semaphore — which is the point: a queued
-/// request holds no socket, where an admitted one under HTTP/1.1 does.
+/// Requests this client keeps in flight against one endpoint. Everything past
+/// it queues on a semaphore — which is the point: a queued request holds no
+/// socket, where an admitted one does.
+///
+/// **This is the one number that actually bounds sockets**, in both
+/// transports. Under h2c the connections needed are
+/// `ceil(256 / peer_max_streams)` — four against a peer allowing 64, three
+/// against Envoy, one against hyper's own server — and in the worst case a
+/// peer allowing one stream each it is 256 connections, i.e. 512 descriptors,
+/// which the reserve in `jobs::extraction` still leaves room for. Under
+/// HTTP/1.1 it is one connection per admitted request, so the same 256.
 ///
 /// 256 requests is also, by construction, a job's whole default in-flight
 /// unit budget (4096 units at 64 units per request), so the cap bounds
-/// sockets without bounding the work the orchestrator asked for.
+/// sockets without bounding the work the orchestrator asked for. It is a code
+/// constant rather than something derived from `desired_in_flight`: that
+/// figure is the inference server's opinion about GPU batch shape, and
+/// deriving a *socket* budget from it would let a model's batching advice
+/// move this process's descriptor usage. It is also per endpoint per gateway,
+/// so it is not, and cannot be, a bound on what a shared remote GPU server
+/// sees across several gateways.
 pub(crate) const INFERENCE_MAX_CONCURRENT_REQUESTS: usize =
     INFERENCE_POOL_CONNECTIONS * H2_STREAMS_PER_CONNECTION;
 
@@ -499,10 +520,22 @@ impl InferenceApiClient {
     }
 
     /// The clients for the transport in use, plus the concurrency permit that
-    /// keeps h2c requests queueing on the pool instead of opening sockets.
-    /// HTTP/1.1 takes no permit: there the descriptor clamp in
-    /// `jobs::extraction` is what bounds concurrency, and adding a second,
-    /// smaller bound here would silently throttle every existing deployment.
+    /// keeps requests queueing on the pool instead of opening sockets.
+    ///
+    /// The permit is taken in **both** transports, on
+    /// [`INFERENCE_MAX_CONCURRENT_REQUESTS`]. Gating only h2c would leave the
+    /// HTTP/1.1 path — the one where a request costs a whole socket — as the
+    /// only unbounded one, and it is reachable *after* a job has already sized
+    /// its in-flight window for multiplexing: `in_flight_unit_ceiling` is
+    /// evaluated once, before the item loop, so a peer restarted mid-job into
+    /// a build without HTTP/2 flips the transport under a window sized at the
+    /// full byte budget. That is run1 blocker F6's `EMFILE` with extra steps.
+    ///
+    /// It cannot throttle an existing deployment: 256 concurrent requests is
+    /// four times a job's default in-flight budget (4096 units at 64 units
+    /// per request), so nothing that fits the descriptor clamp can reach it —
+    /// only the case the clamp does *not* cover, a model whose requests carry
+    /// very few units each, which is exactly the case that exhausts sockets.
     async fn active(
         &self,
     ) -> (
@@ -511,12 +544,10 @@ impl InferenceApiClient {
         Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         let transport = self.transport().await;
+        let permit = Arc::clone(&self.endpoint.gate).acquire_owned().await.ok();
         match transport {
-            Transport::H2c => {
-                let permit = Arc::clone(&self.endpoint.gate).acquire_owned().await.ok();
-                (transport, self.endpoint.h2.clone(), permit)
-            }
-            Transport::Http11 => (transport, self.endpoint.h1.clone(), None),
+            Transport::H2c => (transport, self.endpoint.h2.clone(), permit),
+            Transport::Http11 => (transport, self.endpoint.h1.clone(), permit),
         }
     }
 
@@ -1251,6 +1282,46 @@ mod tests {
         // Remembered: a second call answers without another probe.
         assert!(client.get_cached_models().await.is_ok());
         assert_eq!(client.known_transport(), Some(Transport::Http11));
+    }
+
+    /// The concurrency gate admits at most
+    /// [`INFERENCE_MAX_CONCURRENT_REQUESTS`] requests in **both** transports.
+    ///
+    /// Gating only h2c would leave the transport where a request costs a whole
+    /// socket as the only unbounded one — and it is reachable after a job has
+    /// already sized its in-flight window for multiplexing, because
+    /// `in_flight_unit_ceiling` runs once before the item loop. This asserts
+    /// the property on the permit itself rather than on socket counts, which
+    /// `concurrent_predicts_share_the_connection_pool` already measures.
+    #[tokio::test]
+    async fn both_transports_take_a_concurrency_permit() {
+        for transport in [Transport::H2c, Transport::Http11] {
+            let client = InferenceApiClient::new_with_metadata_cache(
+                format!("http://gate-test-{transport:?}"),
+                false,
+            )
+            .unwrap();
+            // Pinned rather than probed: this is about the gate, and there is
+            // nothing listening on that name.
+            let runtime = Arc::clone(&client.endpoint);
+            *runtime.transport.write().await = Some(transport);
+
+            let before = runtime.gate.available_permits();
+            assert_eq!(before, INFERENCE_MAX_CONCURRENT_REQUESTS);
+            let (resolved, _clients, permit) = client.active().await;
+            assert_eq!(resolved, transport);
+            assert!(
+                permit.is_some(),
+                "{transport:?} must be admitted through the gate, not around it"
+            );
+            assert_eq!(
+                runtime.gate.available_permits(),
+                before - 1,
+                "{transport:?} must hold a permit while its request is in flight"
+            );
+            drop(permit);
+            assert_eq!(runtime.gate.available_permits(), before);
+        }
     }
 
     /// An endpoint that could not be reached at all must not be recorded as

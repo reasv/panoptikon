@@ -27,8 +27,8 @@ use crate::db::system_config::{SystemConfig, SystemConfigStore};
 use crate::db::{open_index_db_read, open_index_db_read_no_user_data};
 use crate::inferio::slot_error::{ProtocolViolation, SlotErrorClass};
 use crate::inferio_client::{
-    INFERENCE_POOL_CONNECTIONS, InferenceFile, InferenceInput, PredictOutput, PredictResponse,
-    PredictSlotError, inference_failure,
+    INFERENCE_MAX_CONCURRENT_REQUESTS, INFERENCE_POOL_CONNECTIONS, InferenceFile, InferenceInput,
+    PredictOutput, PredictResponse, PredictSlotError, inference_failure,
 };
 use crate::jobs::continuous_scan;
 use crate::jobs::files::{FileScanService, is_resync_needed};
@@ -199,14 +199,23 @@ const FD_RESERVE: usize = 256;
 ///   [`FDS_PER_IN_FLIGHT_ITEM`] and [`FD_RESERVE`].
 ///
 ///   **This term is a function of the transport.** Over HTTP/2 cleartext a
-///   request is a stream on a pooled connection, so the whole window costs
-///   `FDS_PER_POOLED_CONNECTION x INFERENCE_POOL_CONNECTIONS` — a constant,
-///   eight descriptors at the shipped pool size — and the window is free to
-///   be as wide as the two budgets above allow. The per-unit term survives
-///   only for the HTTP/1.1 fallback, where it is exactly the cost run1
-///   blocker F6 measured. The clamp stays in both modes as defence in depth:
-///   it is cheap, and it is the last thing between a bogus desired-in-flight
-///   figure and `EMFILE`.
+///   request is a stream on a pooled connection, so the window's width stops
+///   driving the socket count altogether and it is free to be as wide as the
+///   two budgets above allow. The per-unit term survives only for the
+///   HTTP/1.1 fallback, where it is exactly the cost run1 blocker F6
+///   measured.
+///
+///   What bounds descriptors in the multiplexed mode is not this function but
+///   `INFERENCE_MAX_CONCURRENT_REQUESTS`, the client's own per-endpoint gate,
+///   which admits at most 256 requests in either transport. That is the
+///   honest statement of the bound: `INFERENCE_POOL_CONNECTIONS` caps *idle*
+///   connections, and hyper opens more when the peer's advertised stream
+///   limit is below the offered concurrency, so "the pool is the whole cost"
+///   holds only against a peer generous with streams. The gate holds against
+///   every peer, and — because it is taken on the HTTP/1.1 path too — it also
+///   covers the case this function cannot: the ceiling is computed once,
+///   before the item loop, so an endpoint that flips to HTTP/1.1 mid-job
+///   keeps a window sized for multiplexing.
 ///
 /// Never below [`MIN_IN_FLIGHT_UNITS`], so the clamp in
 /// [`UnitBudget::observe`] is always a valid range — including when the
@@ -226,22 +235,28 @@ fn in_flight_unit_ceiling(
     let budget = usize::try_from(soft_nofile).unwrap_or(usize::MAX);
     match transport {
         InFlightTransport::Multiplexed => {
-            // The pool is the whole socket cost, so the only question left is
-            // whether the host can afford the pool at all. That is a fixed
-            // handful of descriptors, so this fires only on a host whose
-            // limit is pathological — and there the window is not the problem.
-            let needed =
-                FD_RESERVE.saturating_add(FDS_PER_POOLED_CONNECTION * INFERENCE_POOL_CONNECTIONS);
+            // The window's width no longer drives the socket count, so the
+            // only question left is whether the host can afford the client's
+            // own concurrency gate. Sized on the *worst* case rather than the
+            // shipped pool size: a peer that advertises one stream per
+            // connection makes hyper open one connection per admitted
+            // request, so the ceiling on connections is the gate, not
+            // `INFERENCE_POOL_CONNECTIONS`. At the shipped numbers that is
+            // 256 + 2 x 256 = 768, which the container default of 1024 still
+            // clears — so this fires on a host that has genuinely too few.
+            let needed = FD_RESERVE
+                .saturating_add(FDS_PER_POOLED_CONNECTION * INFERENCE_MAX_CONCURRENT_REQUESTS);
             if budget < needed {
                 tracing::warn!(
                     soft_nofile,
                     reserve = FD_RESERVE,
                     pool_connections = INFERENCE_POOL_CONNECTIONS,
+                    max_concurrent = INFERENCE_MAX_CONCURRENT_REQUESTS,
                     needed,
                     "the open file descriptor limit is below what the inference \
-                     connection pool and the process's other files need; raise \
-                     the hard limit (ulimit -Hn, or the container runtime's \
-                     nofile setting)"
+                     connection pool and the process's other files need in the \
+                     worst case; raise the hard limit (ulimit -Hn, or the \
+                     container runtime's nofile setting)"
                 );
             }
             wanted
@@ -3436,12 +3451,23 @@ mod tests {
             "multiplexing must not be the more conservative of the two"
         );
 
-        // The whole point: the sockets that window costs are a constant.
+        // The whole point: the sockets that window costs no longer scale with
+        // it. Against a peer generous with streams that is the pool itself.
         let pool_sockets = FDS_PER_POOLED_CONNECTION * INFERENCE_POOL_CONNECTIONS;
         assert_eq!(pool_sockets, 8);
         assert!(
             pool_sockets + FD_RESERVE <= 1024,
             "the pool plus the reserve fits in the limit that could not hold the window"
+        );
+        // And in the worst case — a peer allowing one stream per connection,
+        // or the transport flipping to HTTP/1.1 mid-job — it is the client's
+        // concurrency gate, which must still fit the shipped container's
+        // limit. This is what makes the unclamped window safe.
+        let worst_case = FDS_PER_POOLED_CONNECTION * INFERENCE_MAX_CONCURRENT_REQUESTS;
+        assert_eq!(worst_case, 512);
+        assert!(
+            worst_case + FD_RESERVE <= 1024,
+            "the gate's worst case must fit the shipped container's soft limit"
         );
 
         // A pathological limit does not change the window — there is nothing
