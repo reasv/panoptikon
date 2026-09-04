@@ -63,7 +63,7 @@ use tokio::time::timeout;
 
 use super::ledger::{FitSnapshot, Grant};
 use super::registry::SpawnSpec;
-use super::slot_error::{ERROR_SLOT_KEY, SlotError, slot_error_from_parts};
+use super::slot_error::{ERROR_SLOT_KEY, SlotError, Unattempted, slot_error_from_parts};
 use crate::process_tree::{
     JobGuard, detach_from_console, die_with_parent, kill_process_group, spawn_supervised_tokio,
 };
@@ -1652,10 +1652,12 @@ impl Worker {
         deadline: Option<Duration>,
     ) -> Result<Vec<(Value, Value)>> {
         if self.dead {
-            bail!(
+            // Typed: this request never reached a model, so its caller may
+            // re-submit it once (R2a). The rendering is unchanged.
+            return Err(Unattempted::error(format!(
                 "inferio worker {} is dead after a previous fatal error",
                 self.label
-            );
+            )));
         }
         if self.in_flight {
             // Classified `Desync` even though the process may in fact be gone:
@@ -1820,11 +1822,14 @@ impl Worker {
     /// predict and what operators grep for.
     async fn fatal(&mut self, why: String, cause: FatalCause) -> anyhow::Error {
         let death = self.record_death(why, cause).await;
-        anyhow!(
+        // Typed [`Unattempted`] (R2a): whatever this window was doing, nothing
+        // was written for it, so its caller may re-submit it once. The marker
+        // carries the message instead of wrapping it precisely so the
+        // rendering above stays what this doc comment promises.
+        Unattempted::error(format!(
             "inferio worker {} failed fatally: {}; {death}",
-            death.worker,
-            death.why
-        )
+            death.worker, death.why
+        ))
     }
 
     /// Whose signal this death carries, sampled **before** the fatal path

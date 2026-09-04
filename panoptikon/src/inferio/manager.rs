@@ -129,7 +129,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Timelike};
 use hashlink::LinkedHashMap;
 use serde::{Deserialize, Serialize};
@@ -148,6 +148,7 @@ use super::gpu::{GpuInfo, GpuInventory};
 use super::ledger::{Admission, GpuBudgetHealth, LoadReservation, VramBudgets, VramLedger};
 use super::prewarm::{PrewarmConfig, PrewarmHealth, PrewarmPool};
 use super::registry::{Registry, RegistryCache, SpawnSpec};
+use super::slot_error::Unattempted;
 use super::worker::{
     LoadReport, MemorySample, TelemetryHandle, Worker, WorkerError, WorkerInput, WorkerOutput,
     WorkerSpawnConfig,
@@ -1346,16 +1347,23 @@ impl ModelManager {
             max_batch,
             reply: reply_tx,
         };
+        // Both arms are typed [`Unattempted`] (R2a): the send failed because
+        // the dispatch task had already ended — the fatal arm closes the
+        // receiver, so the tail of a dying model's window lands here
+        // microseconds after its siblings — and a dropped reply sender is how
+        // a window running on a *surviving* replica learns that a sibling
+        // died (`in_flight.shutdown()` aborts those tasks). Neither request
+        // ran; both may be re-submitted once.
         let result = if tx.send(DispatchMsg::Predict(request)).is_err() {
-            Err(anyhow!(
+            Err(Unattempted::error(format!(
                 "model {inference_id} was unloaded before the request could be queued"
-            ))
+            )))
         } else {
             match reply_rx.await {
                 Ok(result) => result,
-                Err(_) => Err(anyhow!(
+                Err(_) => Err(Unattempted::error(format!(
                     "the dispatcher for model {inference_id} dropped the request"
-                )),
+                ))),
             }
         };
         // The guard's Drop does the unpin + requested-TTL restore (Python's

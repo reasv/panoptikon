@@ -335,18 +335,23 @@ build/deploy/API. The plan that uses this is
 - **Death, seen from the job** (R2a): the predict 500 for a request that
   never reached a model now carries a machine-readable kind —
   `{"detail": {"kind": "worker_died", "message", "model", "last_error"}}`,
-  built by `structured_error` (`http.rs:276`). What earns it is
-  `classify_predict_failure` (`:199`): the chain matches one of the five
-  `UNATTEMPTED_REQUEST_MARKERS` (`:129`) — `failed fatally`,
-  `exited while idle`, `is dead after a previous fatal error`,
-  `dropped the request`, `was unloaded` — each cited to the one place
-  that formats it, because a single death renders a *different* string
-  per affected request depending on where it was standing. A load failure
-  of **this model's id** keeps precedence (`LOAD_FAILURE_MARKER` `:164`,
-  anchored so a stale line in a worker's stderr tail cannot forge one).
-  The classification is by text because `ModelManager::predict` answers a
-  bare `anyhow` chain; the typed replacement is an open item on
-  `worker.rs`/`dispatch.rs`/`manager.rs`. The client parses it into the
+  built by `structured_error` (`http.rs:276`) on the one arm of
+  `predict_failure_response`. What earns it is `classify_predict_failure`:
+  **the typed `Unattempted` marker first** (`slot_error.rs:119-165`,
+  downcast through the whole context chain), then — as the documented
+  fallback for an error raised by code predating it — one of the five
+  `UNATTEMPTED_REQUEST_MARKERS` — `failed fatally`, `exited while idle`,
+  `is dead after a previous fatal error`, `dropped the request`,
+  `was unloaded` — each cited to the one place that formats it, because a
+  single death renders a *different* string per affected request depending
+  on where it was standing. A load failure of **this model's id** keeps
+  precedence over both (`LOAD_FAILURE_MARKER`, anchored so a stale line in
+  a worker's stderr tail cannot forge one). The marker is attached at three
+  places covering all six shapes: `Worker::fatal` and the poisoned
+  `Worker::roundtrip` (`worker.rs`), `dispatch::fail_requests` (every
+  queue-failing path funnels through it) and `ModelManager::predict`'s two
+  arms; it *carries* the message rather than wrapping it, so every
+  rendering above is still produced byte for byte. The client parses it into the
   typed `InferenceFailure` (`inferio_client.rs:121`, reached with
   `inference_failure()`), and `jobs::extraction::run_item_inference`
   (`:2179`) re-submits that item's work **once**

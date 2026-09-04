@@ -63,6 +63,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use super::manager::{HealthReport, ManagerConfig, ModelManager};
 use super::prewarm::PrewarmConfig;
 use super::registry::{RegistryCache, RegistryConfig};
+use super::slot_error::Unattempted;
 use super::worker::{WorkerDeadlines, WorkerInput, WorkerOutput, WorkerSpawnConfig};
 use crate::api_error::ApiError;
 use crate::config::Settings;
@@ -100,6 +101,15 @@ pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
 /// Every rendering that means **this predict never reached a model**, so the
 /// request's items are untouched and re-submitting them is the correct answer.
 ///
+/// **The documented fallback, not the primary signal.** Since run2 the six
+/// sites that produce these strings attach a typed
+/// [`Unattempted`](crate::inferio::slot_error::Unattempted) marker, which
+/// [`classify_predict_failure`] downcasts *first*; this list still runs after
+/// that downcast so an error raised by code that predates the marker — or by
+/// a path nobody has typed yet — classifies exactly as it did before. It is
+/// kept, and kept tested, for that reason alone: deleting it would make the
+/// classification silently narrower for any such path.
+///
 /// This is the condition [`WORKER_DIED_KIND`] actually names — the kind is
 /// named for the case that produces it in practice, but what it *asserts* is
 /// only that the request never reached a model, which is the thing a caller
@@ -115,17 +125,14 @@ pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
 /// renderings changes, the unit tests below fail** — they assert on the exact
 /// literals, so the coupling is checked rather than hoped for.
 ///
-/// None of this is how it should work. `ModelManager::predict` answers an
-/// `anyhow` chain with no typed marker on it — `WorkerError` is the *non*-fatal
-/// per-request error, and a fatal teardown is a bare `anyhow!` — so text is the
-/// only signal that survives to this layer on every path. The principled fix is
-/// an `Unattempted` marker attached with `anyhow::Error::new` at each of the
-/// sites below and downcast here, exactly as R9's cooldown already does
-/// ([`load_cooldown_response`] downcasts `LoadCooldownError` two lines above
-/// this check). That fix has to be made in `worker.rs`, `dispatch.rs` and
-/// `manager.rs`; until it is, this list is the bridge, and the downcast should
-/// be added *before* it rather than replacing it, so an older rendering still
-/// classifies.
+/// The typed marker each of these renderings now carries lives at three
+/// places, covering all six shapes: `Worker::fatal` and the poisoned
+/// `Worker::roundtrip` (`worker.rs`), `dispatch::fail_requests` — every
+/// queue-failing path funnels through it, so the fatal arm, the graceful
+/// unload, the tail of a died-on window and an isolation pass's remainder are
+/// one change — and `ModelManager::predict`'s two arms. The marker carries
+/// the message rather than wrapping it, so each of the literals below is
+/// still produced byte for byte and these tests still mean something.
 const UNATTEMPTED_REQUEST_MARKERS: [&str; 5] = [
     // `Worker::fatal` (`worker.rs`): the window that was executing on the
     // replica that died, and — re-raised verbatim by `dispatch::fail_requests`
@@ -174,10 +181,16 @@ enum PredictFailure {
     Other,
 }
 
-/// Classify a failed predict from its rendered `anyhow` chain.
+/// Classify a failed predict: the typed marker first, then its rendered
+/// `anyhow` chain.
 ///
 /// Pure, so the coupling to four other modules' message formats is pinned by
 /// unit tests rather than by a live worker death per case.
+///
+/// **The downcast is the primary signal** and runs before the substring list
+/// (`UNATTEMPTED_REQUEST_MARKERS`, whose docs say why the list survives it).
+/// It walks the whole context chain, so the `.context` the inference pool and
+/// the job runner add on the way out cannot hide it.
 ///
 /// **The load check keeps its precedence**, deliberately: a worker that dies
 /// *while loading* renders both, and re-queueing is the answer to an
@@ -196,9 +209,17 @@ enum PredictFailure {
 /// model's id* to forge it. The unanchored form is still honoured last, so
 /// every chain that answered `Failed to load model` before still does
 /// (router.py parity) unless a death marker outranks it.
-fn classify_predict_failure(chain: &str, full_id: &str) -> PredictFailure {
+fn classify_predict_failure(err: &anyhow::Error, chain: &str, full_id: &str) -> PredictFailure {
+    // The load check keeps its precedence over *both* unattempted signals,
+    // for the reason above: a model that will not come up must not cost each
+    // item a second full attempt. A worker that dies while loading renders
+    // the anchored load context, and `ensure_loaded` wraps whatever the
+    // spawn produced — typed marker included.
     if chain.contains(&format!("{LOAD_FAILURE_MARKER} {full_id}")) {
         return PredictFailure::LoadFailed;
+    }
+    if err.downcast_ref::<Unattempted>().is_some() {
+        return PredictFailure::Unattempted;
     }
     if UNATTEMPTED_REQUEST_MARKERS
         .iter()
@@ -719,39 +740,7 @@ async fn predict(
         .await
     {
         Ok(outputs) => outputs,
-        Err(err) => {
-            // R9's cooldown first: it is a *refusal to try*, so it is
-            // neither of the two failures below and carries its own status.
-            if let Some(response) = load_cooldown_response(&err) {
-                return Ok(response);
-            }
-            let chain = format!("{err:#}");
-            tracing::error!(model = %full_id, error = %chain, "prediction failed");
-            // router.py detail strings: load failures vs. predict failures.
-            match classify_predict_failure(&chain, &full_id) {
-                PredictFailure::LoadFailed => {
-                    return Err(ApiError::internal("Failed to load model"));
-                }
-                PredictFailure::Unattempted => {
-                    return Ok(structured_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        InferenceErrorFields {
-                            kind: WORKER_DIED_KIND.to_owned(),
-                            // Same string the plain form carries, so a client
-                            // that only renders prose is unaffected by the
-                            // shape change.
-                            message: Some("Prediction failed".to_owned()),
-                            model: Some(full_id.clone()),
-                            last_error: Some(clamp_detail(&chain)),
-                            ..Default::default()
-                        },
-                    ));
-                }
-                PredictFailure::Other => {
-                    return Err(ApiError::internal("Prediction failed"));
-                }
-            }
-        }
+        Err(err) => return predict_failure_response(err, &full_id),
     };
     // Read straight after the predict. Deliberately not this request's own
     // window: it is whatever window this model formed most recently, which
@@ -764,6 +753,37 @@ async fn predict(
         encode_output_response(outputs),
         desired,
     ))
+}
+
+/// The answer to a failed `ModelManager::predict`, in one place so the shape
+/// a caller sees is decided by [`classify_predict_failure`] and nothing else
+/// — and so a test can drive each rendering of a worker death through the
+/// exact code the handler runs, rather than through a copy of it.
+fn predict_failure_response(err: anyhow::Error, full_id: &str) -> Result<Response, ApiError> {
+    // R9's cooldown first: it is a *refusal to try*, so it is neither of the
+    // two failures below and carries its own status.
+    if let Some(response) = load_cooldown_response(&err) {
+        return Ok(response);
+    }
+    let chain = format!("{err:#}");
+    tracing::error!(model = %full_id, error = %chain, "prediction failed");
+    // router.py detail strings: load failures vs. predict failures.
+    match classify_predict_failure(&err, &chain, full_id) {
+        PredictFailure::LoadFailed => Err(ApiError::internal("Failed to load model")),
+        PredictFailure::Unattempted => Ok(structured_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            InferenceErrorFields {
+                kind: WORKER_DIED_KIND.to_owned(),
+                // Same string the plain form carries, so a client that only
+                // renders prose is unaffected by the shape change.
+                message: Some("Prediction failed".to_owned()),
+                model: Some(full_id.to_owned()),
+                last_error: Some(clamp_detail(&chain)),
+                ..Default::default()
+            },
+        )),
+        PredictFailure::Other => Err(ApiError::internal("Prediction failed")),
+    }
 }
 
 /// Bound on the error text a structured detail carries. A fatal worker error
@@ -1246,6 +1266,7 @@ mod tests {
     use crate::inferio_client::{
         InferenceApiClient, InferenceFile, InferenceInput, PredictOutput, parse_predict_response,
     };
+    use anyhow::anyhow;
     use axum::body::to_bytes;
     use serde_json::json;
     use std::fs;
@@ -1838,13 +1859,60 @@ metadata.description = "echo fixture"
         // about the request: it never reached a model.
         let unloaded = format!("model {model} was unloaded");
 
+        // Untyped on purpose: these are the *fallback* path, i.e. exactly
+        // what an error raised by code predating the typed marker looks like
+        // here. The typed path is the test below.
         for chain in [&fatal, &idle, &poisoned, &dropped, &too_late, &unloaded] {
             assert_eq!(
-                classify_predict_failure(chain, model),
+                classify_predict_failure(&anyhow!("{chain}"), chain, model),
                 PredictFailure::Unattempted,
                 "{chain}"
             );
         }
+    }
+
+    /// The typed marker is the primary signal: an `Unattempted` error
+    /// classifies as one whatever it says, so a reworded death cannot
+    /// silently cost a window its re-queue — which is the whole weakness the
+    /// substring list above was a bridge for.
+    #[test]
+    fn the_typed_marker_classifies_a_death_whatever_it_renders() {
+        let model = "clip/model-a";
+        let novel = "the replica evaporated in a way nobody has written a marker for";
+        assert_eq!(
+            classify_predict_failure(&Unattempted::error(novel), novel, model),
+            PredictFailure::Unattempted
+        );
+        // The same text, untyped, is an ordinary failure — so the assertion
+        // above is about the type and not about the words.
+        assert_eq!(
+            classify_predict_failure(&anyhow!("{novel}"), novel, model),
+            PredictFailure::Other
+        );
+
+        // The marker survives the `.context` the pool and the job runner add
+        // on the way out: `downcast_ref` walks the whole chain.
+        let wrapped = Unattempted::error(novel)
+            .context("inference request failed")
+            .context("endpoint http://localhost:1/api/inference");
+        assert_eq!(
+            classify_predict_failure(&wrapped, &format!("{wrapped:#}"), model),
+            PredictFailure::Unattempted
+        );
+
+        // And the load check still outranks it, for the reason it outranks
+        // the substrings: a model that will not come up must not cost every
+        // item a second full attempt.
+        let while_loading = Unattempted::error("inferio worker died")
+            .context(format!("failed to load model {model}"));
+        assert_eq!(
+            classify_predict_failure(&while_loading, &format!("{while_loading:#}"), model),
+            PredictFailure::LoadFailed
+        );
+
+        // The message is passed through byte for byte, so the fallback list
+        // and its tests still describe what a caller actually sees.
+        assert_eq!(format!("{}", Unattempted::error(novel)), novel);
     }
 
     /// A death whose stderr tail happens to carry the words a *load* failure
@@ -1864,7 +1932,11 @@ metadata.description = "echo fixture"
              [worker] ok"
         );
         assert_eq!(
-            classify_predict_failure(&death_with_a_stale_tail, model),
+            classify_predict_failure(
+                &anyhow!("{death_with_a_stale_tail}"),
+                &death_with_a_stale_tail,
+                model
+            ),
             PredictFailure::Unattempted,
             "a stale tail line must not outrank a death marker"
         );
@@ -1876,21 +1948,93 @@ metadata.description = "echo fixture"
              early eof"
         );
         assert_eq!(
-            classify_predict_failure(&real, model),
+            classify_predict_failure(&anyhow!("{real}"), &real, model),
             PredictFailure::LoadFailed,
             "a load failure of this model keeps its precedence over the death"
         );
 
         // Parity: a chain that said `Failed to load model` before, with no
         // death marker on it, still does.
+        let parity = "failed to load model something-else: nope";
         assert_eq!(
-            classify_predict_failure("failed to load model something-else: nope", model),
+            classify_predict_failure(&anyhow!("{parity}"), parity, model),
             PredictFailure::LoadFailed
         );
+        let ordinary = "the worker returned an error";
         assert_eq!(
-            classify_predict_failure("the worker returned an error", model),
+            classify_predict_failure(&anyhow!("{ordinary}"), ordinary, model),
             PredictFailure::Other
         );
+    }
+
+    /// The six renderings, through the code the handler actually runs and out
+    /// the other side **as the extraction job's own client reads them**.
+    ///
+    /// The classification test above stops at the verdict; this one carries
+    /// each shape to the JSON the job sees, because that is where the
+    /// re-queue decision is really made: `classify_item_failure` asks
+    /// `InferenceFailure::is_worker_death()`, which reads `detail.kind` out
+    /// of exactly this body. A shape that classified right but answered the
+    /// wrong body would re-queue nothing.
+    #[tokio::test]
+    async fn every_shape_of_a_worker_death_reaches_the_job_as_worker_died() {
+        let model = "clip/model-a";
+        let shapes: Vec<anyhow::Error> = vec![
+            // `Worker::fatal`, and every request `dispatch::fail_requests`
+            // hands the same rendering to.
+            Unattempted::error(format!(
+                "inferio worker {model}#0 failed fatally: early eof; process status: \
+                 signal 9; stderr tail:\nTraceback…"
+            )),
+            // `dispatch::reap_idle_replicas`, through `fail_requests`.
+            Unattempted::error(format!(
+                "inferio worker for model {model} exited while idle: pid 41 signal 9"
+            )),
+            // `Worker::roundtrip` refusing a poisoned worker.
+            Unattempted::error(format!(
+                "inferio worker {model}#1 is dead after a previous fatal error"
+            )),
+            // `ModelManager::predict`, reply sender dropped.
+            Unattempted::error(format!(
+                "the dispatcher for model {model} dropped the request"
+            )),
+            // `ModelManager::predict`, send after the dispatcher ended.
+            Unattempted::error(format!(
+                "model {model} was unloaded before the request could be queued"
+            )),
+            // `dispatch`'s `End::Graceful` arm, through `fail_requests`.
+            Unattempted::error(format!("model {model} was unloaded")),
+        ];
+        for err in shapes {
+            let rendered = format!("{err:#}");
+            let response = predict_failure_response(err, model)
+                .unwrap_or_else(|api| panic!("{rendered} answered a plain error: {api:?}"));
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let failure = crate::inferio_client::InferenceFailure::parse(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                &String::from_utf8_lossy(&body),
+            );
+            assert!(
+                failure.is_worker_death(),
+                "{rendered} reached the job as {failure:?}"
+            );
+            assert_eq!(failure.model.as_deref(), Some(model));
+            assert_eq!(
+                failure.last_error.as_deref(),
+                Some(rendered.as_str()),
+                "the job records what actually happened"
+            );
+        }
+
+        // The counterexample, through the same path: an ordinary predict
+        // failure must stay a plain error, or every failed item would be
+        // re-submitted once for nothing.
+        let ordinary = predict_failure_response(anyhow!("the model returned no outputs"), model);
+        assert!(ordinary.is_err(), "an ordinary failure is not structured");
     }
 
     /// A predict whose worker dies mid-request answers with the

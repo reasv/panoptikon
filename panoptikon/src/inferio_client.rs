@@ -143,7 +143,11 @@ pub(crate) struct InferenceFailure {
 impl InferenceFailure {
     /// Parse one refused response. Never fails: a body this cannot read is
     /// still a failure, it just carries no machine-readable half.
-    fn parse(status: reqwest::StatusCode, retry_after: Option<u64>, body: &str) -> Self {
+    ///
+    /// Visible to the rest of the crate so the local service's own tests can
+    /// check what they answer *as the job's client reads it* — the two sides
+    /// of a wire contract are only tested together if one test runs both.
+    pub(crate) fn parse(status: reqwest::StatusCode, retry_after: Option<u64>, body: &str) -> Self {
         let mut failure = Self {
             status: status.as_u16(),
             kind: None,

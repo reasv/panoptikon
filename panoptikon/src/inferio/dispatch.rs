@@ -121,7 +121,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use futures_util::future::join_all;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -133,6 +133,7 @@ use super::ledger::{
     message_reports_oom,
 };
 use super::manager::ModelManager;
+use super::slot_error::Unattempted;
 use super::worker::{
     MAX_FRAME_BYTES, Worker, WorkerError, WorkerInput, WorkerOutput, estimate_input_bytes,
 };
@@ -1491,13 +1492,20 @@ fn split_window_outputs(
 /// are not Clone; the message is what matters to the callers).
 fn fail_requests(requests: impl Iterator<Item = DispatchRequest>, message: &str) {
     for request in requests {
-        let _ = request.reply.send(Err(anyhow!("{message}")));
+        // Every caller of this fails requests that **never reached a model**:
+        // the queue behind a dead replica, the queue of a model being
+        // unloaded, the tail of a window whose merged predict died, and the
+        // requests an isolation pass had not got to yet. So the typed marker
+        // belongs here rather than at each of them (R2a) — one place, and the
+        // rendering each caller composed is passed through unchanged.
+        let _ = request.reply.send(Err(Unattempted::error(message)));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
     use serde_json::json;
 
     fn shape(units: u64, items: usize, cap: Option<u32>) -> WindowItem {
