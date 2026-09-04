@@ -27,6 +27,15 @@
 # DIAGNOSTIC, not a proposed configuration: dropping the canvas would put
 # the model back on raw-pixel pricing, which is F-B/W1.
 #
+# SINCE THE run2 D1-b FIX, REMOVING THE REGISTRY KEY IS NO LONGER ENOUGH.
+# `inferio.impl.eocr` now states its own canvas (`canvas_pixels =
+# canvas_size**2`) and the worker reports it on the `load ok` response, so
+# tier 2 of the resolution order fills the gap the registry leaves and C7nc
+# would come out capped at 6 553 600 anyway. `config.canvas_size` below is
+# what actually removes the cap: it raises the impl's stated canvas above
+# any real image, so the reported figure caps nothing and `fit_to_canvas`
+# never downscales. See config/README.md, "Running an uncapped control".
+#
 # Used as:  run-gateway.sh C7nc <root dir>   (ports 6392/6393/6389)
 # ==========================================================================
 
@@ -69,3 +78,14 @@ metadata.cost.seed_units  = 2000000
 # python/inferio/config/inference.toml.
 metadata.cost.epoch         = 2
 # metadata.cost.canvas_pixels = 6553600   # C7nc: DELIBERATELY ABSENT (see the header)
+
+# The second half of "no canvas", and the half the registry cannot express.
+# 40 000 px is far above the longest side of anything in the corpus (the
+# largest is 8 000), so `fit_to_canvas` is the identity on every input and the
+# impl reports `canvas_pixels = 1 600 000 000` -- a cap that caps nothing, so
+# both sides price at the raw pixel count. It stays inside `Option<u32>`
+# (`inferio/cost.rs:154`), which a larger figure would not. easyOCR's own
+# detector is untouched by this: `canvas_size` reaches `Reader.detect` only as
+# a per-request parameter, never from this config, so CRAFT still resizes onto
+# its own 2560 px canvas and this control changes pricing and packing ONLY.
+config.canvas_size = 40000

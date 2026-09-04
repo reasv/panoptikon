@@ -12,7 +12,7 @@ server TOMLs are seeded once and user-owned).
 | `server-C2.toml` + `env.C2` | C1 + `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (UUID form) | 6362 / 6363 / 6359, 6360 | branch |
 | `server-C3.toml` + `env.C3` | C1 + `CUDA_VISIBLE_DEVICES=1` (index form) | 6372 / 6373 / 6369, 6370 | branch |
 | `server-C7.toml` + `env.C7` | C1 + the user registry `registry-C7/registry-C7.toml` (MobileCLIP-S1 pinned to GPU 1; `enable_batching = true` on `doctr/easyocr_standard_en`) | 6382 / 6383 / 6379, 6380 | branch |
-| `server-C7nc.toml` + `env.C7nc` | C7 with its registry's `metadata.cost.canvas_pixels` removed — the run2 Phase-D1 control that separates R7's per-item pixel cap from the `enable_batching` flag (diagnostic, not a proposed configuration) | 6392 / 6393 / 6389, 6390 | branch |
+| `server-C7nc.toml` + `env.C7nc` | C7 with its registry's `metadata.cost.canvas_pixels` removed **and** `config.canvas_size = 40000` — the run2 Phase-D1 control that separates R7's per-item pixel cap from the `enable_batching` flag (diagnostic, not a proposed configuration; see "Running an uncapped control" below for why both halves are needed) | 6392 / 6393 / 6389, 6390 | branch |
 
 C4–C6 are not here: they are Docker configurations (image build args and
 compose overlays, Phase 6).
@@ -23,6 +23,55 @@ the server configs, which are not registries. The registry file sets
 `allow_override = true` and restates each redefined id in full — redefinition
 replaces the id's config *and* its id-level metadata, so an omitted
 `metadata.cost` would silently fall back to the group's default.
+
+## Running an uncapped control
+
+Removing `metadata.cost.canvas_pixels` from a registry **no longer makes a
+model uncapped**, and a control that only does that measures the capped
+configuration under a different name.
+
+Since run2's D1-b fix the canvas has two sources, and the registry is only the
+first of them (`docs/inferio-worker-protocol.md`, "Memory grants"):
+
+1. `metadata.cost.canvas_pixels` in the registry;
+2. **what the loaded impl states about itself**, which the worker reads at
+   load and reports back on the `load ok` response — so the orchestrator caps
+   by it too, exactly as if the registry had declared it.
+
+`inferio.impl.eocr` states one (`canvas_pixels = canvas_size ** 2`, default
+2560² = 6 553 600) because it now enforces one: it resizes every input onto
+that canvas before it pads a batch. Delete the registry key and tier 2 fills
+the hole with the same number.
+
+To genuinely remove the cap, raise the impl's own canvas above every image in
+the corpus, in the same registry entry:
+
+```toml
+[group.doctr.inference_ids.easyocr_standard_en]
+config.impl_class      = "easyocr"
+config.enable_batching = true
+config.canvas_size     = 40000          # 1 600 000 000 px: caps nothing
+metadata.cost.epoch    = 2
+# metadata.cost.canvas_pixels           # deliberately absent
+```
+
+`registry-C7nc/registry-C7nc.toml` ships exactly this. Three things to know
+about the figure:
+
+* it must exceed the **longest side** of every input (the corpus's largest is
+  8 000 px), not the area — the impl's ceiling is a side length and the pixel
+  figure is its square;
+* keep `canvas_size ** 2` inside `u32` (`panoptikon/src/inferio/cost.rs:154`
+  types the wire field `Option<u32>`); 40 000 gives 1.6 × 10⁹, and anything
+  above 65 535 does not fit;
+* it changes **pricing and packing only**. `canvas_size` reaches easyOCR's own
+  `Reader.detect` as a per-request parameter, never from this config, so the
+  CRAFT detector still resizes onto its own 2560 px canvas and the control is
+  not a different model — which is the point: it isolates R7.
+
+Confirm from the log before trusting a leg: the `load ok` line should carry
+`canvas_pixels=1600000000` and the window's `sample_units` should hold raw
+pixel counts (no multiple of 6 553 600).
 
 ## Running one
 

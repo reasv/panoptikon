@@ -2,12 +2,15 @@
 # Calibration protocol server config: C7nc  ("C7, no canvas")
 #
 # C7 in every respect except that its registry directory is registry-C7nc/,
-# whose easyOCR entry is C7's minus `metadata.cost.canvas_pixels`. It is the
-# run2 Phase-D1 control that isolates R7's per-item pixel cap from the
-# `enable_batching = true` flag: same binary, same flag, same corpus, one
-# registry key different. See registry-C7nc/registry-C7nc.toml's header for
-# what it is testing and why it is a diagnostic rather than a proposed
-# configuration.
+# whose easyOCR entry is C7's minus `metadata.cost.canvas_pixels` and plus
+# `config.canvas_size = 40000`. It is the run2 Phase-D1 control that isolates
+# R7's per-item pixel cap from the `enable_batching = true` flag: same binary,
+# same flag, same corpus, the cap removed. Both halves are required since the
+# run2 D1-b fix -- the impl states a canvas of its own and the worker reports
+# it, so deleting the registry key alone leaves the model capped at 6 553 600
+# anyway. See registry-C7nc/registry-C7nc.toml's header and README.md's
+# "Running an uncapped control" for what it is testing and why it is a
+# diagnostic rather than a proposed configuration.
 #
 # Deviations from C7: ports 6392 / 6393 / 6389 (ui upstream 6390) so it can
 # run beside C0/C1/C7, and config_dirs points at registry-C7nc/.
