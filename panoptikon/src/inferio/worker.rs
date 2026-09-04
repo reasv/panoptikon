@@ -159,6 +159,12 @@ impl Default for WorkerDeadlines {
     }
 }
 
+/// What the spawn log line says in place of an inference id when the worker
+/// is not being spawned for one — the prewarm path, which spawns by impl
+/// class alone. Deliberately not a plausible id: a reader pairing pids to
+/// models must be able to tell "no model" from a model called that.
+pub const UNCONFIGURED_WORKER: &str = "<unconfigured>";
+
 /// Everything needed to spawn worker processes: interpreter, impl-class
 /// search dirs (sent in the handshake), PYTHONPATH prepends (so the child
 /// resolves the `inferio_worker` package in the src/ layout), extra env,
@@ -1063,6 +1069,29 @@ impl Worker {
         impl_class: &str,
         device: Option<String>,
     ) -> Result<Worker> {
+        Self::spawn_labelled(cfg, None, impl_class, device).await
+    }
+
+    /// [`Self::spawn`], told which inference id the caller is about to
+    /// `configure` this worker as.
+    ///
+    /// The id is used for **one thing**: the spawn log line, which otherwise
+    /// names only the impl class and the pid. One impl class serves many
+    /// models (`sentence_transformers` is every sentence-transformer model),
+    /// so an offline reader pairing a pid to a model had to match the spawn
+    /// line against the worker's own later `Configured as …` line by arrival
+    /// order, and give up whenever two workers of one class were mid-configure
+    /// at once (`tools/calibration-protocol/analyze.py`, `_worker_spawns`).
+    /// Stating the id on the line the pid is on settles it at the source.
+    ///
+    /// `None` for the prewarm path, which spawns by impl class with no model
+    /// bound at all — see [`Self::spawn`]'s callers.
+    async fn spawn_labelled(
+        cfg: &WorkerSpawnConfig,
+        inference_id: Option<&str>,
+        impl_class: &str,
+        device: Option<String>,
+    ) -> Result<Worker> {
         let command = worker_command(cfg, device.as_deref())?;
         // Through the permanent spawner thread, never `command.spawn()`:
         // `worker_command` armed PR_SET_PDEATHSIG, whose scope on Linux is
@@ -1079,7 +1108,12 @@ impl Worker {
         // Latched now: the reap clears it, and a death report without a pid
         // cannot be lined up against NVML, `ps` or a kernel log.
         let pid = child.id();
-        tracing::debug!(worker = %impl_class, pid = ?pid, "spawned an inferio worker");
+        tracing::debug!(
+            worker = %impl_class,
+            inference_id = inference_id.unwrap_or(UNCONFIGURED_WORKER),
+            pid = ?pid,
+            "spawned an inferio worker"
+        );
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
         let stderr = child.stderr.take().expect("stderr is piped");
@@ -1172,9 +1206,10 @@ impl Worker {
         // which one of the two families the warning covers depends on
         // ([`colliding_device_variables`]).
         warn_on_visibility_overrides(&spawn_cfg, spec, device.as_deref());
-        let mut worker = Self::spawn(&spawn_cfg, &spec.impl_class, device)
-            .await
-            .with_context(|| format!("failed to spawn inferio worker for {inference_id}"))?;
+        let mut worker =
+            Self::spawn_labelled(&spawn_cfg, Some(inference_id), &spec.impl_class, device)
+                .await
+                .with_context(|| format!("failed to spawn inferio worker for {inference_id}"))?;
         if let Err(err) = worker.configure(inference_id, &spec.config_kwargs).await {
             worker.kill().await;
             return Err(err);

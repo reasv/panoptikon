@@ -521,6 +521,10 @@ class Context:
 
 SPAWN_PID = re.compile(r"(\d+)")
 CONFIGURED_AS = "Configured as "
+# What the spawn line carries in place of an inference id when the worker is
+# not being spawned for one -- the prewarm path (`worker.rs`,
+# `UNCONFIGURED_WORKER`).
+UNCONFIGURED_WORKER = "<unconfigured>"
 DEPARTED_REPLICA = "credited a departed replica's footprint"
 
 # A pid number absent from every board for longer than this and then back is
@@ -540,7 +544,20 @@ SPAWN_CLOCK_SLACK_S = 2.0
 def _worker_spawns(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Every `spawned an inferio worker` line, with the model it went on to be.
 
-    The spawn line names the impl class (`worker=nemotron-embed-vl`) and the
+    Since run2 the spawn line **states the inference id itself**
+    (`inference_id=tags/wd-vit-tagger-v3`, beside `worker=` and `pid=`), which
+    is the only pairing that cannot be wrong: the id and the pid are two
+    fields of one event. When it is present it is used and the queue below can
+    no longer overwrite it. `inference_id=<unconfigured>` is the prewarm path,
+    which really has no model at spawn, and is read as absent.
+
+    The queue is otherwise untouched, and a prewarmed worker is why: it is
+    spawned by impl class and only configured later, when something claims
+    it, so its `Configured as` line still has to be attributed the old way
+    even in a run where every other spawn states its id.
+
+    The fallback below is for recordings made before that -- run1's included.
+    The older line names the impl class (`worker=nemotron-embed-vl`) and the
     OS pid (`pid=Some(1998478)`), not the inference id. The worker itself logs
     `Configured as <inference id>` a moment later under the same `worker=`
     field, so pairing the two in order -- FIFO per impl class -- names the
@@ -569,8 +586,11 @@ def _worker_spawns(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             match = SPAWN_PID.search(str(event["fields"].get("pid", "")))
             if match is None or event["t_wall"] is None:
                 continue
+            stated = str(event["fields"].get("inference_id", "")).strip()
+            if stated in ("", UNCONFIGURED_WORKER, "None"):
+                stated = None
             spawn = {"pid": int(match.group(1)), "worker": worker,
-                     "t_wall": event["t_wall"], "model": None,
+                     "t_wall": event["t_wall"], "model": stated,
                      "ambiguous": False}
             spawns.append(spawn)
             pending.setdefault(worker, []).append(spawn)
@@ -588,7 +608,7 @@ def _worker_spawns(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             for spawn in queue:
                 spawn["ambiguous"] = True
         head = queue.pop(0)
-        if not head["ambiguous"]:
+        if not head["ambiguous"] and head["model"] is None:
             head["model"] = event["message"][index + len(CONFIGURED_AS):].strip()
     return spawns
 
