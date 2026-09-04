@@ -125,6 +125,35 @@ class FakeOomRetryUtils:
         return self.total
 
 
+@pytest.fixture(autouse=True)
+def no_ambient_accelerator():
+    """Every test in this module describes the harness, not this machine.
+
+    `memory._free_total_mb` prefers NVML to torch and memoizes the module for
+    the life of the *process*, and `_torch_cuda` answers off whatever `torch`
+    happens to be in `sys.modules`. A test module that ran earlier and
+    imported torch (`tests/inferio/impl`) therefore leaves this process able
+    to read the developer's real board, and the clamp, `free_mb` and
+    `free_mb_at_failure` assertions below start measuring that board instead
+    of the fixture's — a nine-test failure that depends on nothing but
+    collection order. It is the *default* order: the project's own `pytest`
+    invocation collects `tests/` whole (pyproject `testpaths`).
+
+    So the ambient driver is removed for every test here, and the fakes are
+    injected on top of nothing.
+    """
+    with (
+        mock.patch.dict(sys.modules),
+        mock.patch.dict(
+            memory._nvml_state,
+            {"module_tried": True, "module": None, "handle": None},
+            clear=False,
+        ),
+    ):
+        sys.modules.pop("torch", None)
+        yield
+
+
 @pytest.fixture
 def fake_oom_retry():
     utils = FakeOomRetryUtils()

@@ -906,7 +906,15 @@ def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
 
     Driven in-process rather than as a subprocess for the obvious reason: the
     assertion is about module state the harness holds, which no frame reports.
+    In-process means "a worker with no live CUDA" has to be *made* true: this
+    interpreter may have imported torch and initialized a context for an
+    earlier test module (`tests/inferio/impl`), and `empty_cache()` would then
+    genuinely release something and legitimately call `note_trimmed()`. The
+    ambient torch is removed for the duration, which is the premise the test
+    is about.
     """
+    from unittest import mock
+
     from inferio_worker import __main__ as harness
     from inferio_worker import packing
 
@@ -927,7 +935,9 @@ def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
             {"type": "unload", "id": 3},
         )
         proto_out = io.BytesIO()
-        assert harness._serve(proto_in, proto_out) == 0
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("torch", None)
+            assert harness._serve(proto_in, proto_out) == 0
         assert packing._last_growth == (4096, 123.0), (
             "a trim that freed nothing must not retire the comparator"
         )
