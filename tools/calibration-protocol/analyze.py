@@ -631,6 +631,15 @@ def check_base_accuracy(ctx: Context) -> Verdict:
     arbitrary later sample: NVML's per-process figure includes allocator pool
     growth, so after the first window it measures base + pool, and only the
     load-time reading is comparable to `base_mb`.
+
+    "At load time" has a hard right-hand edge: the replica's first grant or
+    first predict. From that instant the process holds the batch's cuBLAS and
+    cuDNN workspace as well as its base, and no sample taken later measures the
+    same quantity `base_mb` does. The reading is therefore the *minimum* over
+    the samples in [admission, first work), and a replica that starts its first
+    batch inside one sample period leaves that window empty -- run1/S9 predicted
+    46 ms after the load ok against a 1 Hz oracle. That is a fact about the
+    cadence, not about the ledger, so such a row is reported and not judged.
     """
     if not ctx.health_samples or not ctx.vram_samples:
         return Verdict("base_accuracy", "SKIP", "needs healthrec and vramrec")
@@ -661,6 +670,19 @@ def check_base_accuracy(ctx: Context) -> Verdict:
                 }
     if not seen:
         return Verdict("base_accuracy", "SKIP", "no replica reported a base_mb")
+
+    # When did each model first do work? Either log line marks the end of the
+    # clean window: the grant is issued as the window opens, and the predict is
+    # the batch itself.
+    work: Dict[str, List[float]] = {}
+    for message in ("issued a memory grant", "processing local inference predict"):
+        for event in ctx.log_events(message):
+            name = event["fields"].get("model")
+            if name is None or event["t_wall"] is None:
+                continue
+            work.setdefault(str(name), []).append(event["t_wall"])
+    for times in work.values():
+        times.sort()
 
     rows: List[Dict[str, Any]] = []
     for (model, uuid), info in seen.items():
@@ -705,31 +727,57 @@ def check_base_accuracy(ctx: Context) -> Verdict:
                        "no spawn line for this model in the log "
                        "(needs panoptikon::inferio=debug): PID attribution is "
                        "not cross-checked")
-        # The lifetime minimum is a second, weaker estimate of the same thing.
-        floor = None
+        # The window in which the process holds its base and nothing else:
+        # from the load `ok` (the admission line is 0.2 ms later) to the
+        # replica's first grant or predict.
+        times = work.get(model, [])
+        index = bisect.bisect_left(times, info["t_wall"])
+        busy_t = times[index] if index < len(times) else None
+        window: List[Tuple[float, int]] = []
+        floor = None            # post-load minimum: base + whatever never freed
         for sample in ctx.vram_samples:
+            if sample["t_wall"] < info["t_wall"]:
+                continue
             board = ctx.oracle_board(sample, uuid)
             if board is None:
                 continue
             for proc in board.get("procs", []):
-                if proc["pid"] == pids[0] and proc.get("used_mb"):
-                    floor = proc["used_mb"] if floor is None else min(floor, proc["used_mb"])
-        error = abs(info["base_mb"] - ours)
+                if proc["pid"] != pids[0] or not proc.get("used_mb"):
+                    continue
+                used = int(proc["used_mb"])
+                floor = used if floor is None else min(floor, used)
+                if busy_t is None or sample["t_wall"] < busy_t:
+                    window.append((sample["t_wall"], used))
+        if window:
+            sample_t, reading = min(window, key=lambda pair: pair[1])
+            cadence = None
+        else:
+            # No sample landed in the window. The `_at_or_after` reading is
+            # still reported -- it is the nearest thing the recording has --
+            # but it provably contains the first batch's workspace, so it is
+            # not evidence about `base_mb` and the row is not judged.
+            sample_t, reading = vram["t_wall"], ours
+            gap = "" if busy_t is None else (
+                f" (first work {round((busy_t - info['t_wall']) * 1000.0)}ms "
+                "after the load, oracle period is longer)")
+            cadence = ("no oracle sample fell between the load and this "
+                       "replica's first grant or predict" + gap)
+        error = abs(info["base_mb"] - reading)
         rows.append({"model": model, "gpu": uuid, **info, "pid": pids[0],
-                     "oracle_pid_mb": ours, "oracle_pid_min_mb": floor,
+                     "oracle_pid_mb": reading, "oracle_pid_min_mb": floor,
                      "error_mb": error, "spawn_check": spawn_check,
-                     # How far after the admission the oracle sample sits. A
-                     # model that loads and runs its first batch inside one
-                     # sample period cannot be resolved: the sample then
-                     # carries the batch's cuBLAS/cuDNN workspace as well as
-                     # the base, and the row is a comment on the cadence, not
-                     # on the ledger (run1/S14: MiniLM, 654 vs 774).
-                     "oracle_dt_ms": round((vram["t_wall"] - info["t_wall"]) * 1000.0),
-                     "error_pct": round(_pct(error, max(1, ours)), 2)})
+                     "oracle_window_samples": len(window),
+                     "first_work_dt_ms": (None if busy_t is None else
+                                          round((busy_t - info["t_wall"]) * 1000.0)),
+                     "cadence_blind": cadence is not None,
+                     **({"cadence_note": cadence} if cadence else {}),
+                     # How far after the admission the reading sits.
+                     "oracle_dt_ms": round((sample_t - info["t_wall"]) * 1000.0),
+                     "error_pct": round(_pct(error, max(1, reading)), 2)})
 
-    judged = [row for row in rows if row.get("error_pct") is not None
-              and row.get("base_method") == "nvml"]
     reported = [row for row in rows if row.get("error_pct") is not None]
+    judged = [row for row in reported if row.get("base_method") == "nvml"
+              and not row.get("cadence_blind")]
     if not reported:
         return Verdict("base_accuracy", "SKIP",
                        "; ".join(f"{row['model']}: {row.get('note')}" for row in rows),
@@ -737,12 +785,19 @@ def check_base_accuracy(ctx: Context) -> Verdict:
     detail = "; ".join(
         f"{row['model']} base_mb={row['base_mb']} ({row['base_method']}) vs oracle "
         f"PID {row['oracle_pid_mb']} MiB at admission+{row['oracle_dt_ms']}ms = "
-        f"{row['error_pct']}% (lifetime min {row['oracle_pid_min_mb']})"
+        f"{row['error_pct']}% (post-load min {row['oracle_pid_min_mb']})"
+        + (f" [not judged: {row['cadence_note']}]" if row.get("cadence_blind") else "")
         for row in reported
     )
     if not judged:
+        reasons = []
+        if any(row.get("cadence_blind") for row in reported):
+            reasons.append("no oracle sample fell between the load and the "
+                           "replica's first work")
+        if any(row.get("base_method") != "nvml" for row in reported):
+            reasons.append("base_method is not nvml")
         return Verdict("base_accuracy", "INFO",
-                       detail + "  [report-only: base_method is not nvml]",
+                       detail + "  [report-only: " + "; ".join(reasons) + "]",
                        {"rows": rows})
     worst = max(judged, key=lambda row: row["error_pct"])
     verdict = "PASS" if worst["error_pct"] <= 10.0 else "FAIL"
