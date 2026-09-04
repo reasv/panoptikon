@@ -191,6 +191,7 @@ def resolve_model(registry: Dict[str, Any], inference_id: str) -> Dict[str, Any]
     config = _deep_merge(group.get("config") or {}, entry.get("config") or {})
     metadata = _deep_merge(group.get("metadata") or {}, entry.get("metadata") or {})
     cost = metadata.get("cost") or {}
+    unit = cost.get("unit", "item")
     impl_class = config.pop("impl_class", None)
     if not impl_class:
         raise SystemExit(f"ceiling_probe: no impl_class for {inference_id}")
@@ -200,13 +201,42 @@ def resolve_model(registry: Dict[str, Any], inference_id: str) -> Dict[str, Any]
         "config": config,
         "metadata": metadata,
         "cost": {
-            "unit": cost.get("unit", "item"),
+            "unit": unit,
             "aggregation": cost.get("aggregation", "count"),
             "seed_units": cost.get("seed_units"),
             "epoch": cost.get("epoch"),
+            "canvas_pixels": _canvas_pixels(
+                (entry.get("metadata") or {}).get("cost") or {},
+                (group.get("metadata") or {}).get("cost") or {},
+                unit,
+            ),
             "degraded": not cost,
         },
     }
+
+
+def _canvas_pixels(
+    id_cost: Dict[str, Any], group_cost: Dict[str, Any], unit: str
+) -> Optional[int]:
+    """`metadata.cost.canvas_pixels`, under the orchestrator's own two rules.
+
+    Resolved here rather than off the merged metadata because the merge is
+    key-by-key and this key is **scale-bound**: `cost.rs: canvas_from_tables`
+    reads it only for a `pixel` unit, and never inherits a group's value into
+    an id that redeclares the unit — `[group.clip]` is `item`-priced and its
+    VLM ids are not, so inheriting the CLIP tower's canvas there would cap a
+    tiled VLM at 378² and under-price every one of its items.
+    """
+    if unit != "pixel":
+        return None
+    declared = id_cost.get("canvas_pixels")
+    if declared is None:
+        if group_cost.get("unit", "item") != unit:
+            return None
+        declared = group_cost.get("canvas_pixels")
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared < 1:
+        return None
+    return declared
 
 
 # --------------------------------------------------------------------------
