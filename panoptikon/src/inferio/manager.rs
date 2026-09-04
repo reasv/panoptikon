@@ -4097,9 +4097,6 @@ config.replicas = 2
         fn record(&self, _update: ProfileUpdate) {}
     }
 
-    /// A ROCm-shaped inventory whose row indices are the registry's own
-    /// device pins (`device/test` pins "3" and "7"), so the pin vocabulary
-    /// and the ledger's key vocabulary are guaranteed to differ.
     /// R7's precedence rule, in the one place it is decided: the registry's
     /// declaration beats the canvas a worker read off the loaded impl, the
     /// report fills in for a model the registry cannot state statically
@@ -4145,6 +4142,9 @@ config.replicas = 2
         );
     }
 
+    /// A ROCm-shaped inventory whose row indices are the registry's own
+    /// device pins (`device/test` pins "3" and "7"), so the pin vocabulary
+    /// and the ledger's key vocabulary are guaranteed to differ.
     fn rocm_test_gpus() -> GpuInventory {
         let board = |index: u32, bdf: &str| GpuInfo {
             index,
