@@ -890,9 +890,15 @@ secret, or general Tauri IPC to browser pages. Other policies receive no shell
 capability and the routes respond as unavailable. The sidecar accepts only a
 literal loopback HTTP bridge URL with an explicit port, disables environment
 proxies, and refuses redirects for this authenticated hop. Mutating browser requests
-must use a loopback or `localhost` request `Host` and have an HTTP `Origin`
-equal to it; this also blocks DNS rebinding, and contradictory Fetch Metadata
-is rejected. Snooze and dismissal include the version shown by the tab, so
+must address the sidecar by a loopback or `localhost` authority and have an
+HTTP `Origin` equal to it; this also blocks DNS rebinding, and contradictory
+Fetch Metadata is rejected. That authority is resolved the same way the
+policy layer resolves a request's host — the request target's authority (an
+HTTP/2 `:authority`) if it has one, else the `Host` header — so an HTTP/2
+request is judged by the same name an HTTP/1.1 one is, and no request can be
+judged by two different names. The forwarded headers are the one deliberate
+difference: this guard never consults them, because it is a check on what the
+browser itself addressed. Snooze and dismissal include the version shown by the tab, so
 Desktop returns a conflict instead of applying a stale action to a newer
 release.
 

@@ -469,8 +469,49 @@ fn needs_db_params(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/")
 }
 
-/// The host a request claims for itself, normalized (port and any IPv6
-/// brackets removed, lowercased) for `[policies.match] hosts` comparison.
+/// The authority a request claims for itself: `host[:port]`, verbatim — no
+/// case folding, no port stripping, and any (deprecated) `userinfo@` prefix
+/// left in place so a caller that must refuse one still sees it.
+///
+/// Sources, in order:
+///
+/// 1. The **request target's authority**. An HTTP/2 request carries its
+///    authority in the `:authority` pseudo-header and normally sends no
+///    `Host` header at all (RFC 9113 §8.3.1); hyper puts that authority on
+///    the request URI, so it is what `Uri::authority` returns. The same
+///    field carries an HTTP/1.1 absolute-form request target, which RFC 9112
+///    §3.2.2 likewise makes override `Host`.
+/// 2. The `Host` header — the ordinary HTTP/1.1 origin-form request, whose
+///    URI has no authority at all, so this is the only source there.
+///
+/// `None` means the request named an authority in neither place; every
+/// caller treats that as unknown, never as a match.
+///
+/// This is the single definition of "the host this request is for", shared
+/// so that the same request cannot be judged by two different names: the
+/// policy layer selects `[policies.match] hosts` with it (through
+/// `resolve_effective_host`, which layers the trusted forwarded headers on
+/// top), and the Desktop bridge guard (`api::desktop`) checks browser
+/// same-origin with it. Both therefore see an HTTP/2 request's `:authority`
+/// exactly where they see an HTTP/1.1 request's `Host`.
+pub(crate) fn request_authority<'a>(
+    uri: &'a Uri,
+    headers: &'a header::HeaderMap,
+) -> Option<&'a str> {
+    if let Some(authority) = uri.authority() {
+        // An `Authority` is never the empty string, but one that is only a
+        // port (`":8080"`) has an empty host; that names nothing, so fall
+        // through rather than report an empty host.
+        if !authority.host().is_empty() {
+            return Some(authority.as_str());
+        }
+    }
+    header_to_str(headers.get(header::HOST)).filter(|value| !value.trim().is_empty())
+}
+
+/// The host a request claims for itself, normalized (userinfo, port and any
+/// IPv6 brackets removed, lowercased) for `[policies.match] hosts`
+/// comparison.
 ///
 /// Sources, highest precedence first:
 ///
@@ -478,14 +519,9 @@ fn needs_db_params(path: &str) -> bool {
 ///    trust_forwarded_headers` is set — the reverse-proxy deployment, where
 ///    the front proxy, not this request's own framing, is the authority on
 ///    the name the client used.
-/// 2. The **request target's authority**. An HTTP/2 request carries its
-///    authority in the `:authority` pseudo-header and normally sends no
-///    `Host` header at all (RFC 9113 §8.3.1); hyper puts that authority on
-///    the request URI, so it is what `req.uri().authority()` returns. The
-///    same field carries an HTTP/1.1 absolute-form request target, which
-///    RFC 9112 §3.2.2 likewise makes override `Host`.
-/// 3. The `Host` header — the ordinary HTTP/1.1 origin-form request, whose
-///    URI has no authority at all, so this is the only source there.
+/// 2. The request target's authority, then the `Host` header — whichever
+///    `request_authority` finds, in that order and for the reasons given
+///    there.
 ///
 /// Reading the authority introduces no new trust: `:authority` is exactly as
 /// client-controlled as `Host`, and any client that can set one can set the
@@ -513,17 +549,7 @@ fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<
         }
     }
 
-    // `Authority::host()` already drops the port and any (deprecated, and
-    // for HTTP/2 forbidden) userinfo; normalize_host handles the IPv6
-    // brackets it keeps, and the case.
-    if let Some(authority) = req.uri().authority() {
-        let host = authority.host();
-        if !host.is_empty() {
-            return Some(normalize_host(host));
-        }
-    }
-
-    header_to_str(req.headers().get(header::HOST)).map(normalize_host)
+    request_authority(req.uri(), req.headers()).map(normalize_host)
 }
 
 fn parse_forwarded_host(value: &str) -> Option<String> {
@@ -548,6 +574,14 @@ fn parse_forwarded_host(value: &str) -> Option<String> {
 
 pub(crate) fn normalize_host(value: &str) -> String {
     let value = value.trim();
+    // An authority may carry a deprecated `userinfo@` prefix (RFC 3986
+    // §3.2.1; forbidden outright in an HTTP/2 `:authority`). It is not part
+    // of the host, and the host is what follows the last `@` — the same
+    // split `http::uri::Authority::host` makes.
+    let value = match value.rfind('@') {
+        Some(at) => &value[at + 1..],
+        None => value,
+    };
     if value.starts_with('[')
         && let Some(end) = value.find(']')
     {
@@ -1348,6 +1382,81 @@ allow = "*"
                 false
             ),
             Some("authority.local".to_string())
+        );
+
+        // A `Host` carrying userinfo is normalized the same way an authority
+        // is: the host is what follows the last `@`, so the two sources can
+        // never resolve one request to two different names.
+        assert_eq!(
+            resolve(
+                req(|b| b.uri("/api/items").header("host", "user@Header.Local:80")),
+                false
+            ),
+            Some("header.local".to_string())
+        );
+        // An empty `Host` names nothing, so it is hostless rather than an
+        // empty host that a `hosts = ["*"]` policy would match.
+        assert_eq!(
+            resolve(req(|b| b.uri("/api/items").header("host", "")), false),
+            None
+        );
+    }
+
+    /// `request_authority` is the shared source rule — the policy layer and
+    /// the Desktop bridge guard both resolve a request's host through it, so
+    /// an HTTP/2 request cannot be judged by one name here and another
+    /// there. It is pinned separately from `resolve_effective_host` because
+    /// it returns the authority *verbatim*: the Desktop guard compares a
+    /// whole browser origin (scheme, host **and port**) against it and must
+    /// still be able to refuse a userinfo prefix.
+    #[test]
+    fn request_authority_prefers_the_request_target_over_host() {
+        let req = |build: fn(axum::http::request::Builder) -> axum::http::request::Builder| {
+            build(Request::builder()).body(Body::empty()).unwrap()
+        };
+        let authority =
+            |req: &Request<Body>| request_authority(req.uri(), req.headers()).map(str::to_string);
+
+        // HTTP/1.1 origin-form: the URI has no authority, so `Host` is it,
+        // and the port survives.
+        assert_eq!(
+            authority(&req(|b| b
+                .uri("/api/items")
+                .header("host", "Example.Local:8080"))),
+            Some("Example.Local:8080".to_string())
+        );
+        // HTTP/2 (and HTTP/1.1 absolute-form): the request target's
+        // authority, which outranks any `Host` that disagrees with it.
+        assert_eq!(
+            authority(&req(|b| b
+                .uri("http://Authority.Local:6342/api/items")
+                .header("host", "header.local:6342"))),
+            Some("Authority.Local:6342".to_string())
+        );
+        // Verbatim means verbatim: an IPv6 literal keeps its brackets, and a
+        // userinfo prefix is reported rather than quietly dropped, so the
+        // Desktop guard can reject it.
+        assert_eq!(
+            authority(&req(|b| b.uri("http://[::1]:6342/api/items"))),
+            Some("[::1]:6342".to_string())
+        );
+        assert_eq!(
+            authority(&req(|b| b.uri("http://user@authority.local/api/items"))),
+            Some("user@authority.local".to_string())
+        );
+        // A target that is only a port names no host: fall through to `Host`
+        // rather than report an empty one.
+        assert_eq!(
+            authority(&req(|b| b
+                .uri("http://:8080/api/items")
+                .header("host", "header.local"))),
+            Some("header.local".to_string())
+        );
+        // Neither source, and an empty `Host`, are both "no authority".
+        assert_eq!(authority(&req(|b| b.uri("/api/items"))), None);
+        assert_eq!(
+            authority(&req(|b| b.uri("/api/items").header("host", ""))),
+            None
         );
     }
 

@@ -11,7 +11,7 @@ use std::{
 use axum::{
     Extension, Json,
     extract::{Path as AxumPath, State},
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -33,7 +33,7 @@ use crate::{
         continuous_scan, cron, extraction::resolve_model_metadata,
         inference_pool::job_inference_context, queue::JobModel,
     },
-    policy::PolicyContext,
+    policy::{PolicyContext, request_authority},
     proxy::ProxyState,
 };
 
@@ -284,6 +284,7 @@ pub(crate) async fn update_status(
 async fn desktop_bridge_action(
     state: Arc<ProxyState>,
     context: PolicyContext,
+    uri: Uri,
     headers: HeaderMap,
     path: &'static str,
     body: Option<JsonValue>,
@@ -291,7 +292,7 @@ async fn desktop_bridge_action(
     // Preserve the policy boundary first: callers without the Desktop client
     // opt-in still see this route as unavailable, independent of headers.
     let bridge = ensure_desktop_shell_policy(&state, &context)?;
-    ensure_same_origin_desktop_action(&headers)?;
+    ensure_same_origin_desktop_action(&uri, &headers)?;
     let response = desktop_bridge_request(&bridge, Method::POST, path, body).await?;
     if response.status().is_success() {
         Ok(StatusCode::NO_CONTENT)
@@ -303,7 +304,20 @@ async fn desktop_bridge_action(
     }
 }
 
-fn ensure_same_origin_desktop_action(headers: &HeaderMap) -> Result<(), ApiError> {
+/// The browser authority is resolved with `policy::request_authority`, the
+/// same rule that selects the request's policy: the request target's
+/// authority (an HTTP/2 `:authority`, or an HTTP/1.1 absolute-form target)
+/// if it has one, else the `Host` header. Reading only `Host` denied every
+/// HTTP/2 request — the gateway serves h2c on every listener — and would
+/// have let one request be judged by two different names. A request that
+/// names no authority at all is still refused, as is a duplicated `Host`.
+///
+/// The trusted forwarded headers the policy layer layers on top are
+/// deliberately *not* consulted here: this is a check on what the browser
+/// itself addressed, and it must stay a loopback authority. A proxied
+/// deployment therefore fails this guard closed, which is correct — the
+/// Desktop shell bridge is reachable only from the local browser.
+fn ensure_same_origin_desktop_action(uri: &Uri, headers: &HeaderMap) -> Result<(), ApiError> {
     fn forbidden() -> ApiError {
         ApiError::new(
             StatusCode::FORBIDDEN,
@@ -327,11 +341,15 @@ fn ensure_same_origin_desktop_action(headers: &HeaderMap) -> Result<(), ApiError
         return Err(forbidden());
     }
 
-    let mut host_values = headers.get_all(header::HOST).iter();
-    let expected = host_values
-        .next()
-        .and_then(|value| value.to_str().ok())
-        .and_then(|host| reqwest::Url::parse(&format!("http://{host}/")).ok())
+    // A second `Host` is refused whichever source wins: hyper rejects a
+    // duplicated one on HTTP/1.1 already, and an HTTP/2 request that carries
+    // both an `:authority` and contradictory `Host` fields is malformed
+    // (RFC 9113 §8.3.1).
+    if headers.get_all(header::HOST).iter().nth(1).is_some() {
+        return Err(forbidden());
+    }
+    let expected = request_authority(uri, headers)
+        .and_then(|authority| reqwest::Url::parse(&format!("http://{authority}/")).ok())
         .ok_or_else(forbidden)?;
     let expected_is_loopback = match expected.host() {
         Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
@@ -339,13 +357,12 @@ fn ensure_same_origin_desktop_action(headers: &HeaderMap) -> Result<(), ApiError
         Some(url::Host::Ipv6(address)) => address.is_loopback(),
         None => false,
     };
-    if host_values.next().is_some()
-        || !expected.username().is_empty()
+    if !expected.username().is_empty()
         || expected.password().is_some()
         || expected.path() != "/"
         || expected.query().is_some()
         || expected.fragment().is_some()
-        // Origin/Host equality alone is vulnerable to DNS rebinding: an
+        // Origin/authority equality alone is vulnerable to DNS rebinding: an
         // attacker-owned hostname can remain same-origin while resolving to
         // this listener. Desktop opens only localhost, so require the browser
         // authority itself to name a loopback host.
@@ -371,21 +388,24 @@ fn ensure_same_origin_desktop_action(headers: &HeaderMap) -> Result<(), ApiError
 pub(crate) async fn open_update_window(
     State(state): State<Arc<ProxyState>>,
     Extension(context): Extension<PolicyContext>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    desktop_bridge_action(state, context, headers, "/open", None).await
+    desktop_bridge_action(state, context, uri, headers, "/open", None).await
 }
 
 #[utoipa::path(post, operation_id = "snooze_desktop_update_ribbon", path = "/api/desktop/update-ribbon/snooze", tag = "desktop", request_body = DesktopUpdateSnoozeRequest, responses((status = 204, description = "Ribbon snoozed for 24 hours"), (status = 403, description = "Same-origin browser request required"), (status = 409, description = "Available update version changed")))]
 pub(crate) async fn snooze_update_ribbon(
     State(state): State<Arc<ProxyState>>,
     Extension(context): Extension<PolicyContext>,
+    uri: Uri,
     headers: HeaderMap,
     Json(request): Json<DesktopUpdateSnoozeRequest>,
 ) -> Result<StatusCode, ApiError> {
     desktop_bridge_action(
         state,
         context,
+        uri,
         headers,
         "/snooze",
         Some(json!({ "version": request.version })),
@@ -397,12 +417,14 @@ pub(crate) async fn snooze_update_ribbon(
 pub(crate) async fn dismiss_update_ribbon(
     State(state): State<Arc<ProxyState>>,
     Extension(context): Extension<PolicyContext>,
+    uri: Uri,
     headers: HeaderMap,
     Json(request): Json<DesktopUpdateDismissRequest>,
 ) -> Result<StatusCode, ApiError> {
     desktop_bridge_action(
         state,
         context,
+        uri,
         headers,
         "/dismiss",
         Some(json!({ "version": request.version })),
@@ -590,6 +612,24 @@ mod desktop_bridge_tests {
     use axum::routing::post;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// The request target an ordinary HTTP/1.1 browser sends: origin-form,
+    /// so the URI carries no authority and the `Host` header is the only
+    /// source for the browser's authority.
+    fn origin_form() -> Uri {
+        Uri::from_static("/api/desktop/update-window/open")
+    }
+
+    /// The request target hyper hands over for HTTP/2: the `:authority`
+    /// pseudo-header lands on the URI (see `policy::request_authority`).
+    fn h2_target(authority: &str) -> Uri {
+        Uri::builder()
+            .scheme("http")
+            .authority(authority)
+            .path_and_query("/api/desktop/update-window/open")
+            .build()
+            .unwrap()
+    }
+
     fn browser_headers(origin: &str, host: &str, fetch_site: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
@@ -719,16 +759,16 @@ mod desktop_bridge_tests {
             "localhost:6342",
             Some("same-origin"),
         );
-        ensure_same_origin_desktop_action(&headers).unwrap();
+        ensure_same_origin_desktop_action(&origin_form(), &headers).unwrap();
 
         let headers = browser_headers("http://localhost", "localhost:80", None);
-        ensure_same_origin_desktop_action(&headers).unwrap();
+        ensure_same_origin_desktop_action(&origin_form(), &headers).unwrap();
 
         let headers = browser_headers("http://127.0.0.1:6342", "127.0.0.1:6342", None);
-        ensure_same_origin_desktop_action(&headers).unwrap();
+        ensure_same_origin_desktop_action(&origin_form(), &headers).unwrap();
 
         let headers = browser_headers("http://[::1]:6342", "[::1]:6342", None);
-        ensure_same_origin_desktop_action(&headers).unwrap();
+        ensure_same_origin_desktop_action(&origin_form(), &headers).unwrap();
     }
 
     /// Cross-origin forms/fetches, scheme mismatches, opaque or missing
@@ -767,8 +807,190 @@ mod desktop_bridge_tests {
                 headers
             },
         ] {
-            assert!(ensure_same_origin_desktop_action(&headers).is_err());
+            assert!(ensure_same_origin_desktop_action(&origin_form(), &headers).is_err());
         }
+    }
+
+    /// An HTTP/2 request carries its authority in `:authority` and sends no
+    /// `Host` header at all (RFC 9113 §8.3.1), and the gateway serves HTTP/2
+    /// cleartext on every listener. Reading only `Host` therefore refused
+    /// every HTTP/2 Desktop action, and on an HTTP/1.1 absolute-form target
+    /// it would have judged the request by a different name than the policy
+    /// layer did. Both are resolved through `policy::request_authority` now,
+    /// so one request has exactly one authority — and the loopback
+    /// (anti-rebinding) requirement applies to it unchanged.
+    #[test]
+    fn desktop_action_is_judged_by_the_request_authority() {
+        fn origin_only(origin: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+            headers
+        }
+
+        // HTTP/2 shape: authority, no `Host` anywhere. Admitted exactly as
+        // the equivalent HTTP/1.1 request is.
+        ensure_same_origin_desktop_action(
+            &h2_target("127.0.0.1:6342"),
+            &origin_only("http://127.0.0.1:6342"),
+        )
+        .unwrap();
+        ensure_same_origin_desktop_action(
+            &h2_target("localhost:6342"),
+            &origin_only("http://LOCALHOST:6342"),
+        )
+        .unwrap();
+        ensure_same_origin_desktop_action(
+            &h2_target("[::1]:6342"),
+            &origin_only("http://[::1]:6342"),
+        )
+        .unwrap();
+
+        // The authority is the name that is judged, not merely tolerated:
+        // a rebound attacker hostname, a mismatched port, a non-loopback
+        // authority hiding behind a loopback `Host`, and a userinfo prefix
+        // are all still refused.
+        for (uri, headers) in [
+            (
+                h2_target("attacker.example:6342"),
+                origin_only("http://attacker.example:6342"),
+            ),
+            (
+                h2_target("127.0.0.1:6342"),
+                origin_only("http://127.0.0.1:6343"),
+            ),
+            (
+                // HTTP/1.1 absolute-form: the policy layer selects on
+                // `attacker.example`, so the guard must not be satisfied by
+                // the loopback `Host` beside it.
+                h2_target("attacker.example:6342"),
+                browser_headers("http://127.0.0.1:6342", "127.0.0.1:6342", None),
+            ),
+            (
+                h2_target("user@127.0.0.1:6342"),
+                origin_only("http://127.0.0.1:6342"),
+            ),
+            // Neither an authority nor a `Host`: fail closed, as before.
+            (origin_form(), origin_only("http://127.0.0.1:6342")),
+        ] {
+            assert!(ensure_same_origin_desktop_action(&uri, &headers).is_err());
+        }
+
+        // ...and where the two sources disagree, the authority wins — the
+        // same precedence the policy layer applies, so the two can never
+        // judge one request by two different names.
+        ensure_same_origin_desktop_action(
+            &h2_target("127.0.0.1:6342"),
+            &browser_headers("http://127.0.0.1:6342", "attacker.example:6342", None),
+        )
+        .unwrap();
+    }
+
+    /// Settings for the h2c leg below: one policy that admits any named host
+    /// and opts into the Desktop client, so the *policy* layer cannot be what
+    /// separates the two legs — the guard is.
+    const DESKTOP_H2C_SETTINGS: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[rulesets.allow_all]
+allow_all = true
+
+[[policies]]
+name = "any-host"
+ruleset = "allow_all"
+
+[policies.match]
+hosts = ["*"]
+
+[policies.client]
+desktop = true
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#;
+
+    /// The same over a real HTTP/2 cleartext connection, behind the real
+    /// `PolicyLayer`: the `:authority` must survive hyper, the policy layer
+    /// (which rewrites the request URI to inject the DB query parameters),
+    /// the router and the extractors to reach this guard — which is the whole
+    /// reason the Desktop bridge was unusable over the h2c the gateway serves
+    /// on every listener. The guard answers 409 rather than 403 so a policy
+    /// refusal upstream of it could not be mistaken for its own verdict, and
+    /// the negative leg keeps the anti-rebinding guarantee honest on this
+    /// path.
+    #[tokio::test]
+    async fn desktop_action_over_real_h2c_is_judged_by_its_authority() {
+        async fn guard(uri: Uri, headers: HeaderMap) -> StatusCode {
+            match ensure_same_origin_desktop_action(&uri, &headers) {
+                Ok(()) => StatusCode::NO_CONTENT,
+                Err(_) => StatusCode::CONFLICT,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(&path, DESKTOP_H2C_SETTINGS).unwrap();
+        let settings = Arc::new(crate::config::Settings::load(Some(path)).unwrap());
+        let token_key = Arc::new(crate::policy_token::TokenKey::random());
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route("/api/desktop/update-window/open", post(guard))
+            .layer(crate::policy::PolicyLayer::new(settings, token_key));
+        // `axum::serve` builds hyper-util's auto connection builder, the one
+        // production uses, so this socket answers h2c with prior knowledge.
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .resolve("attacker.example", address)
+            .build()
+            .unwrap();
+        let target = |host: &str| {
+            format!(
+                "http://{host}:{}/api/desktop/update-window/open",
+                address.port()
+            )
+        };
+        let origin = |host: &str| format!("http://{host}:{}", address.port());
+
+        let response = client
+            .post(target("127.0.0.1"))
+            .header(header::ORIGIN, origin("127.0.0.1"))
+            .send()
+            .await
+            .unwrap();
+        // Assert the version too: a silent fallback to HTTP/1.1 would send a
+        // `Host` header and make this leg vacuous.
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = client
+            .post(target("attacker.example"))
+            .header(header::ORIGIN, origin("attacker.example"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        server.abort();
+        let _ = server.await;
     }
 }
 
