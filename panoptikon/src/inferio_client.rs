@@ -2371,12 +2371,19 @@ mod tests {
     /// "not reachable".
     #[tokio::test]
     async fn an_unreachable_endpoint_is_not_remembered_as_http11() {
-        // Bind and drop, so the port is almost certainly closed and is not
-        // one another test is using.
-        let addr = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap()
-        };
+        // A port nothing in this process can be listening on. Binding and
+        // dropping an *ephemeral* port was the obvious way to get one and is
+        // not sound: the port goes straight back to the pool this binary's
+        // other tests bind from, so the "closed" port is occasionally a
+        // neighbour's stub service and the call under test succeeds. Port 1
+        // is below `ip_local_port_range` and cannot be bound without
+        // privileges, so no test can take it.
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "the premise of this test is that {addr} refuses connections; \
+             something on this host is listening on it"
+        );
         let client =
             InferenceApiClient::new_with_metadata_cache(format!("http://{addr}"), false).unwrap();
 
