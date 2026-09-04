@@ -336,6 +336,41 @@ pub struct LoadReport {
     pub memory: Option<MemorySample>,
 }
 
+/// The worker's defensive clamp, as reported on the batch it shrank.
+///
+/// The clamp is shrink-only and runs before every batch: it re-reads live
+/// free memory and packs smaller if the world moved since the grant was
+/// priced. The report is what makes that visible to the ledger, which
+/// otherwise sees a small batch and cannot tell it from a window tail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClampReport {
+    /// The unit count the batch would have carried on the grant alone.
+    pub from_units: u64,
+    /// What it actually carried after the clamp.
+    pub to_units: u64,
+    /// The live free reading that decided it.
+    pub free_mb: u64,
+}
+
+/// The worker's structural classification of an out-of-memory failure
+/// (run2 change R3). Carried only on a measurement whose `oom` is true.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OomClass {
+    /// `"typed_exception"` (a real `torch.OutOfMemoryError`/HIP/MPS/CPU
+    /// allocator type), `"message_pattern"` (a driver-shaped message, the
+    /// fallback) or `"marker"` (the harness's own `INFERENCE_OOM_*`
+    /// sentinel).
+    pub source: String,
+    /// The exception type the worker saw, as a string.
+    pub exception: String,
+    /// The worker's live free reading at the moment of the failure, when it
+    /// could take one. This is the corroboration a message-pattern match
+    /// needs before it is trusted.
+    pub free_mb_at_failure: Option<u64>,
+    /// The device the failure happened on, as the worker names it.
+    pub device: String,
+}
+
 /// One GPU batch the worker actually ran, from a `predict` response (or an
 /// `error` reply — a window that failed part-way still measured what ran).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -362,6 +397,37 @@ pub struct BatchMeasurement {
     /// silent throughput collapse instead of an OOM, so this is the synthetic
     /// negative sample that stands in for the exception that never fires.
     pub throughput_collapse: bool,
+    /// Present when the worker's **defensive clamp** shrank this batch below
+    /// the grant's unit budget because live free memory had moved since the
+    /// grant was priced (protocol doc, "Memory grants").
+    ///
+    /// The ledger reads it as an exclusion, not as a measurement: a clamped
+    /// batch ran at the size the *world* allowed, not at the size the model
+    /// was free to reach, so it says nothing about where this model's
+    /// throughput curve bends (finding N1/T1, run2 change R1a). Its
+    /// allocator peaks are still honest and still feed the cost fit.
+    pub clamped: Option<ClampReport>,
+    /// Present only on a measurement whose [`Self::oom`] is true: the
+    /// worker's own **structural** classification of the failure (run2
+    /// change R3, worker half).
+    ///
+    /// Absent means the worker did not classify it, which is not the same as
+    /// "not an OOM" — but a failure the worker saw and decided was *not* an
+    /// out-of-memory condition carries no `oom_class` **and** leaves `oom`
+    /// false, so the host never deflates on it.
+    pub oom_class: Option<OomClass>,
+    /// The live free-memory reading the worker's defensive clamp took right
+    /// before this batch, and the driver that answered it — the same
+    /// semantics and the same source vocabulary as the response-level memory
+    /// sample's `free_mb`/`free_source` (protocol doc, "Memory sensing").
+    ///
+    /// This is what makes `external_mb` refresh at **response** cadence
+    /// rather than at the ledger's 10 s staleness timer: the clamp already
+    /// reads free memory before every batch, and a window several batches
+    /// deep therefore carries several readings the ledger would otherwise
+    /// never see (finding T3, run2 change R5).
+    pub free_mb: Option<u64>,
+    pub free_source: Option<String>,
     //
     // The protocol's `trimmed` flag (protocol doc, "Measurements") is
     // deliberately **not** parsed into a field here. It marks the first
@@ -2156,9 +2222,46 @@ impl BatchMeasurement {
                     duration_ms: field_f64(map, "duration_ms"),
                     oom: field_bool(map, "oom"),
                     throughput_collapse: field_bool(map, "throughput_collapse"),
+                    clamped: ClampReport::parse(map_get(map, "clamped")),
+                    oom_class: OomClass::parse(map_get(map, "oom_class")),
+                    free_mb: field_u64(map, "free_mb"),
+                    free_source: field_string(map, "free_source"),
                 })
             })
             .collect()
+    }
+}
+
+impl ClampReport {
+    /// `None` unless the map is there and carries all three numbers: a
+    /// partial report cannot say what was clamped from what, and the ledger
+    /// reads the presence of this map as "exclude this batch", which is too
+    /// consequential to infer from a fragment.
+    fn parse(value: Option<&Value>) -> Option<Self> {
+        let Value::Map(map) = value? else {
+            return None;
+        };
+        Some(Self {
+            from_units: field_u64(map, "from_units")?,
+            to_units: field_u64(map, "to_units")?,
+            free_mb: field_u64(map, "free_mb")?,
+        })
+    }
+}
+
+impl OomClass {
+    /// `None` when the map is absent or carries no `source` — the field that
+    /// says *how* the worker decided, which is the whole point of it.
+    fn parse(value: Option<&Value>) -> Option<Self> {
+        let Value::Map(map) = value? else {
+            return None;
+        };
+        Some(Self {
+            source: field_string(map, "source")?,
+            exception: field_string(map, "exception").unwrap_or_default(),
+            free_mb_at_failure: field_u64(map, "free_mb_at_failure"),
+            device: field_string(map, "device").unwrap_or_default(),
+        })
     }
 }
 

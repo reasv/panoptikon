@@ -93,7 +93,7 @@ use serde::{Deserialize, Serialize};
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
-use super::worker::{LoadReport, TelemetryHandle};
+use super::worker::{ClampReport, LoadReport, TelemetryHandle};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
 /// `usable = total − other_used × (1 + margin)`.
@@ -525,6 +525,17 @@ struct GrantCharge {
     /// fact: by settle time the ramp has moved, the anchor has moved, and a
     /// recomputed budget would describe the next window rather than this one.
     unit_budget: u64,
+    /// The board could afford less than the window target the anchor asked
+    /// for, i.e. **memory** is what held this window back
+    /// ([`Grant::squeezed`]).
+    ///
+    /// Carried into the settle because a squeezed window's batches are the
+    /// one class [`FULL_BATCH_RATIO`] cannot catch: they *did* spend their
+    /// granted budget — the budget was simply the squeeze. Their rate
+    /// describes a contended board, not this model's throughput curve, and
+    /// feeding them to the knee is one of the three ways N1/T1 manufactured
+    /// caps out of memory pressure.
+    squeezed: bool,
 }
 
 /// One requester's slice of a board's headroom, plus the contention floor it
@@ -811,6 +822,35 @@ fn admitted_units(entry: &WorkerEntry, anchor: u64, knee: Option<u64>) -> u64 {
     // batches. The design's real floor is at pack time — a batch is never
     // smaller than one item, whatever the budget says.
     (bounded >> entry.deflation.min(63)).max(1)
+}
+
+/// Whether a settling window's batches may describe this model's throughput
+/// curve at all (run2 change R1a; findings N1 / T1 / P5-4 / F-A).
+///
+/// The knee is a statement about how fast a model runs *at a batch size*, so
+/// every observation behind it must come from a window that was free to
+/// choose its size. Two window-wide disqualifications, both of which the
+/// ledger already knew at grant time and neither of which
+/// [`FULL_BATCH_RATIO`] can catch — because a disqualified window's batches
+/// do spend their budget, the budget having already been cut:
+///
+/// - **squeezed** ([`GrantCharge::squeezed`]): the board could afford less
+///   than the anchor asked for, so the size is a report on memory pressure.
+///   Feeding it in is how S4d fitted `knee_units = 1`;
+/// - **memory-blind** (`mb == 0`): a pre-fit grant on a full board carries no
+///   MB reservation at all. Such a window ran unpriced, against a board the
+///   ledger could not size it for, and its rate is the least trustworthy
+///   number in the system.
+///
+/// The third exclusion — a batch the worker's own clamp shrank — is
+/// per-*measurement* rather than per-window (only some batches of a window
+/// get clamped) and lives in [`VramLedger::ingest_locked`].
+///
+/// All three still feed the **cost fit**: a clean high-water batch's
+/// allocator envelope is an honest point on the memory curve whatever
+/// decided its size. Only the throughput ring is protected here.
+fn knee_admits_window(charge: &GrantCharge) -> bool {
+    !charge.squeezed && charge.mb > 0
 }
 
 /// What settling one window produced for the caller to do *outside* the
@@ -3339,6 +3379,7 @@ impl VramLedger {
                     mb,
                     requests: window_requests,
                     unit_budget,
+                    squeezed,
                 },
             );
         // Snapshotted under the lock and emitted with it dropped, exactly as
@@ -3432,8 +3473,9 @@ impl VramLedger {
         if let Some(charge) = charge {
             entry.pending_requests = entry.pending_requests.saturating_sub(charge.requests);
         }
-        // What this window's batches were free to reach; see [`FULL_BATCH_RATIO`].
-        let granted_units = charge.map(|charge| charge.unit_budget);
+        // What this window's batches were free to reach; see
+        // [`FULL_BATCH_RATIO`] and [`knee_admits_window`].
+        let granted_units = charge;
         // The idle clock the trim path reads starts here, not at the moment the
         // grant map happens to be empty: a replica working through a queue is
         // grantless between every pair of windows, and that is not idleness.
@@ -3600,12 +3642,13 @@ impl VramLedger {
 
     /// Drain this worker's new telemetry into the ledger by watermark.
     ///
-    /// `granted_units` is the settling window's own per-batch unit budget, and
-    /// it gates the **throughput ring only** ([`FULL_BATCH_RATIO`]): the cost
-    /// fit and the ratchet take every clean high-water batch regardless, since
-    /// a small batch's envelope is a perfectly good point on the memory curve.
-    /// `None` — an ingest with no window behind it — admits no throughput
-    /// sample at all, because there is nothing to call a batch full against.
+    /// `window` is the settling window's own grant, and it gates the
+    /// **throughput ring only** ([`FULL_BATCH_RATIO`], [`knee_admits_window`]):
+    /// the cost fit and the ratchet take every clean high-water batch
+    /// regardless, since a small batch's envelope is a perfectly good point on
+    /// the memory curve. `None` — an ingest with no window behind it — admits
+    /// no throughput sample at all, because there is nothing to call a batch
+    /// full against.
     ///
     /// One approximation, and it errs the safe way: an ingest can also pick up
     /// batches an *aborted* window left above the watermark, which ran under
@@ -3616,7 +3659,7 @@ impl VramLedger {
     fn ingest_locked(
         state: &mut LedgerState,
         worker: WorkerId,
-        granted_units: Option<u64>,
+        window: Option<GrantCharge>,
     ) -> Ingested {
         let Some(entry) = state.workers.get(&worker) else {
             return Ingested::default();
@@ -3719,10 +3762,13 @@ impl VramLedger {
         let mut throughput: Vec<ThroughputSample> = Vec::new();
         let mut anchor = 0u64;
         // The smallest batch this window counts as having spent its budget.
-        // `None` when there is no window to measure against, which admits
-        // nothing.
-        let full_batch =
-            granted_units.map(|budget| ((budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
+        // `None` when there is no window to measure against — and `None` too
+        // when the window itself is disqualified from describing the
+        // throughput curve at all ([`knee_admits_window`]), which admits no
+        // throughput sample from it however full its batches were.
+        let full_batch = window
+            .filter(|charge| knee_admits_window(charge))
+            .map(|charge| ((charge.unit_budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -3784,8 +3830,17 @@ impl VramLedger {
             // - a batch that did not spend its window's granted budget
             //   ([`FULL_BATCH_RATIO`]): a tail, a capped batch, a squeezed
             //   one. It ran at a small size because there was nothing more to
-            //   run, which is not evidence about the size.
+            //   run, which is not evidence about the size;
+            // - a batch the worker's **defensive clamp** shrank. The clamp is
+            //   the last of the three ways a batch runs small for a reason
+            //   that has nothing to do with this model's curve, and it is the
+            //   one the ledger cannot infer: the grant's budget was honest,
+            //   the batch simply could not use it because live free memory had
+            //   moved since (run2 change R1a, finding N1/T1). Its allocator
+            //   peaks still feed the cost fit, which is a statement about
+            //   memory and is true at whatever size ran.
             if warm
+                && measurement.clamped.is_none()
                 && let (Some(units), Some(duration_ms), Some(full_batch)) =
                     (units, measurement.duration_ms, full_batch)
                 && duration_ms > 0.0
@@ -5440,8 +5495,7 @@ mod tests {
             allocated_before_mb: Some(before),
             peak_allocated_mb: Some(peak),
             duration_ms: Some(10.0),
-            oom: false,
-            throughput_collapse: false,
+            ..BatchMeasurement::default()
         }
     }
 
@@ -10374,8 +10428,7 @@ mod tests {
             allocated_before_mb: Some(10),
             peak_allocated_mb: Some(20),
             duration_ms: Some(units as f64 * 1000.0 / units_per_sec),
-            oom: false,
-            throughput_collapse: false,
+            ..BatchMeasurement::default()
         }
     }
 
@@ -10502,6 +10555,17 @@ mod tests {
                 reserved_before_mb: None,
                 ..warm_batch(8, 500.0)
             },
+            // Clamped by the worker: the batch ran at the size live free
+            // memory allowed, not at the size the model was free to reach
+            // (run2 R1a).
+            BatchMeasurement {
+                clamped: Some(ClampReport {
+                    from_units: 8,
+                    to_units: 8,
+                    free_mb: 900,
+                }),
+                ..warm_batch(8, 500.0)
+            },
             // The one that counts.
             warm_batch(8, 500.0),
         ]);
@@ -10510,8 +10574,69 @@ mod tests {
         assert_eq!(
             ledger.health()[0].workers[0].throughput_samples,
             1,
-            "seven of the eight measurements are excluded, each for its own reason"
+            "eight of the nine measurements are excluded, each for its own reason"
         );
+    }
+
+    /// R1a, the window-wide half: the two states in which *every* batch of a
+    /// window is disqualified from describing the throughput curve, stated on
+    /// the predicate itself so the rule is readable without a board fixture.
+    #[test]
+    fn a_squeezed_or_memory_blind_window_describes_no_throughput_curve() {
+        let honest = GrantCharge {
+            mb: 512,
+            requests: 1,
+            unit_budget: 64,
+            squeezed: false,
+        };
+        assert!(knee_admits_window(&honest));
+        assert!(
+            !knee_admits_window(&GrantCharge {
+                squeezed: true,
+                ..honest
+            }),
+            "a squeezed window's size is a report on memory pressure"
+        );
+        assert!(
+            !knee_admits_window(&GrantCharge { mb: 0, ..honest }),
+            "a memory-blind grant priced nothing, so its rate describes nothing"
+        );
+    }
+
+    /// The same rule end to end: a board with no headroom left squeezes the
+    /// window, and none of its warm batches reaches the knee ring — while its
+    /// pool-growing batch still reaches the **cost fit**, which is a statement
+    /// about memory and is true at whatever size ran.
+    #[test]
+    fn a_squeezed_windows_batches_reach_the_fit_but_not_the_knee() {
+        // 1 200 MiB of board against a resident whose base is 1 100: under
+        // `SEED_BATCH_FLOOR_MB` of headroom, which is what "squeezed" means
+        // pre-fit.
+        let ledger = ledger(1_200, no_margin());
+        let handle = loaded(Some(1_100), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .unwrap();
+        push_memory(&handle, 100, 0);
+
+        let token = admission.request_grant(8, None, 1, 0).unwrap();
+        assert!(token.grant().squeezed, "the fixture is the squeezed case");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(8, 500.0), measurement(8, 0, 40)]);
+        token.finish(WindowOutcome::Responded { oom: false });
+
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            worker.throughput_samples, 0,
+            "a squeezed window teaches the knee nothing"
+        );
+        assert_eq!(
+            worker.max_units_measured, 8,
+            "its high-water batch is still an honest point on the memory curve"
+        );
+        assert_eq!(fit_sample_count(&ledger), 1);
     }
 
     /// End to end: warm windows fit a knee, the knee caps the grant, and it

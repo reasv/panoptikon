@@ -98,6 +98,35 @@ in ways the one-line statement is not:
   back out under our own generator stamp, and never overwrites a knee this
   machine fitted.
 
+### Throughput knee: what run2 changed (R1)
+
+Run1 measured the knee estimator firing on the wrong evidence and then
+outliving it: `knee_units` 1 on S4d, 63 on S4e, 7 under the loadgen, 31 for
+MobileCLIP against an optimum of 128, and — the half that made the rest
+permanent — a soak whose knee was fitted **once**, four minutes in, and never
+refitted for 7 h 55 m across 13 job passes and 56 worker spawns, because it
+is persisted and every new replica is reseeded from it (report §4, findings
+N1 / T1 / P5-4 / F-A). Four changes, and they are deliberately layered: three
+of them narrow what may *become* evidence, and the fourth bounds the damage
+of a cap fitted from evidence that was wrong anyway.
+
+**(a) A window that was not free to choose its size describes no curve.**
+Three exclusions on top of the full-budget rule above, all of which the
+ledger already knows without asking anyone:
+
+- a **squeezed** window (`Grant.squeezed`: the board could afford less than
+  the anchor asked for) — its batches did spend their granted budget, so
+  `FULL_BATCH_RATIO` waves them through, but the budget *was* the squeeze;
+- a **memory-blind** window (the grant's `mb` is 0: a pre-fit grant on a full
+  board, priced against nothing);
+- a batch the **worker's defensive clamp** shrank (the measurement carries a
+  `clamped` map). This one is per batch rather than per window, because the
+  clamp fires per batch.
+
+All three still feed the **cost fit** and the ratchet: a clean high-water
+batch's allocator envelope is an honest point on the memory curve whatever
+decided its size. Only the throughput ring is protected.
+
 ## Core decision: learn a cost model, not a max batch size
 
 Calibration does **not** learn "the batch size that fits". It learns a
