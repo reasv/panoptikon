@@ -1064,7 +1064,26 @@ impl WorkerEntry {
     /// the ramp exponent to its ceiling on pure hope. Restoring deflation is
     /// different — it is recovery, gated on *nothing going wrong* — so a clean
     /// measurement-free window still counts towards that.
-    fn note_clean_window(&mut self, measured: bool, anchor: u64) {
+    ///
+    /// `ceiling` is the impl's own [`ShapeCeiling`], and it is the **third
+    /// brake** on the ramp beside the throughput knee and the extrapolation
+    /// ratchet. The other two cap the *budget* and leave the exponent free to
+    /// climb; this one stops the exponent as well, because the two questions
+    /// have different answers here. A window that ran at the ceiling ran at a
+    /// size the impl chose, not one the ledger's budget produced, so it is no
+    /// evidence that a bigger batch would work — and it never can be, since
+    /// every window from here on is trimmed back to the same size. Left to
+    /// itself the ramp would spend its earned doublings walking to
+    /// `MAX_RAMP_STEP` against a wall, and the moment the ceiling was cleared
+    /// (a canvas change, a corpus of smaller pages) the budget would jump
+    /// straight to the ratchet ceiling with nothing measured in between —
+    /// exactly the "growth must never hand control to extrapolation" rule
+    /// [`admitted_units`] exists to enforce.
+    ///
+    /// Deflation repayment is deliberately *not* gated on it: buying back a
+    /// halving is recovery from a memory fault, and a shape ceiling is not a
+    /// memory condition.
+    fn note_clean_window(&mut self, measured: bool, anchor: u64, ceiling: Option<u64>) {
         if self.deflation > 0 {
             self.clean_windows += 1;
             if self.clean_windows >= CLEAN_WINDOWS_TO_RESTORE {
@@ -1082,7 +1101,11 @@ impl WorkerEntry {
                 // step with. That is how the budget froze at the anchor for
                 // good instead of reaching `RATCHET_FACTOR × anchor`.
                 let step = self.effective_ramp_step(anchor);
-                if step < MAX_RAMP_STEP {
+                // At or past the shape ceiling the next doubling buys nothing
+                // and costs the evidence trail described above.
+                let at_ceiling =
+                    ceiling.is_some_and(|ceiling| uncapped_units(self, anchor) >= ceiling);
+                if step < MAX_RAMP_STEP && !at_ceiling {
                     self.ramp_step = step + 1;
                 }
             }
@@ -1235,10 +1258,35 @@ fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
 /// - it is on the unit side rather than the design's `slope × knee_units` MB
 ///   term. Identical post-fit (the grant's MB figure is `units × slope`) and
 ///   strictly better pre-fit, where there is no slope to express it in.
-fn admitted_units(entry: &WorkerEntry, anchor: u64, knee: Option<u64>) -> u64 {
+///
+/// `ceiling` is the impl's own [`ShapeCeiling`], and it is a second pure
+/// `min` alongside the knee — the difference between them being what each one
+/// claims. A knee says a bigger batch is not *worth* running; a shape ceiling
+/// says the impl will not run one at all, because a kernel's index arithmetic
+/// overflows at that padded tensor shape. Every unit admitted above it is
+/// admission the model cannot spend: the worker plans a bigger batch, trims it
+/// back to the same size, and the grant reserved memory for a batch that never
+/// existed. That is the over-admission run2 S1 measured — invisible then,
+/// because the trim was silent, and reported since as
+/// `clamped.reason = "index_limit"`.
+///
+/// It sits beside the knee rather than inside it deliberately: it is
+/// runtime-only, never persisted, never travels in a profile, and — being a
+/// statement about kernels rather than about rates — it is applied even where
+/// a knee is refused for want of honest evidence.
+fn admitted_units(
+    entry: &WorkerEntry,
+    anchor: u64,
+    knee: Option<u64>,
+    ceiling: Option<u64>,
+) -> u64 {
     let bounded = uncapped_units(entry, anchor);
     let bounded = match knee {
         Some(knee) if knee > 0 => bounded.min(knee),
+        _ => bounded,
+    };
+    let bounded = match ceiling {
+        Some(ceiling) if ceiling > 0 => bounded.min(ceiling),
         _ => bounded,
     };
     // Deflation may shrink below the seed, all the way to a single unit: the
@@ -1314,6 +1362,9 @@ struct Settled {
     /// Which tier classified this window's out-of-memory, when it was one
     /// (run2 defect C2). Emitted beside [`Self::window`]'s negative WARN.
     oom: Option<OomNegative>,
+    /// The (model, board)'s shape ceiling was set, lowered or cleared by this
+    /// window (run2 S1). Once per change, never per window.
+    shape_ceiling: Option<ShapeCeilingEvent>,
 }
 
 /// Which tier classified one window as an out-of-memory negative, and on what
@@ -1478,6 +1529,29 @@ fn clamp_log_field(clamps: &[Option<String>]) -> String {
 /// (docs/inferio-worker-protocol.md, measurement fields).
 const CLAMP_REASON_MEMORY: &str = "memory";
 
+/// The one clamp reason this host acts on beyond the log (run2 S1): a
+/// size-dependent, **non-memory** kernel ceiling — an int32 index limit in a
+/// CUDA/HIP pooling kernel — cut the batch. Unlike the memory clamp it is a
+/// permanent property of the impl at a padded tensor shape, so it feeds the
+/// per-(model, board) [`ShapeCeiling`]. Any other reason a worker names is
+/// printed verbatim and otherwise treated exactly like the memory clamp: the
+/// host never invents a meaning for a word it does not know.
+const CLAMP_REASON_INDEX_LIMIT: &str = "index_limit";
+
+/// Whether this measurement was cut by a clamp naming `reason`.
+///
+/// A clamp that names **no** reason is the defensive memory clamp — the wire's
+/// absence is pinned to it (docs/inferio-worker-protocol.md, measurement
+/// fields) — so it never answers `true` for a named reason, and a host that
+/// does not recognise a reason simply gets `false` rather than a guess.
+fn clamp_reason_is(measurement: &BatchMeasurement, reason: &str) -> bool {
+    measurement
+        .clamped
+        .as_ref()
+        .and_then(|clamp| clamp.reason.as_deref())
+        .is_some_and(|named| named == reason)
+}
+
 /// The throughput knee reached its expiry and was re-widened (or withdrawn)
 /// (run2 change R1d). Owns its strings so the line is formatted after the lock
 /// is dropped.
@@ -1595,6 +1669,10 @@ struct Ingested {
     /// transient of a busy board, a shape ceiling is permanent for these
     /// shapes. Rendered for the settle line by [`clamp_log_field`].
     clamps: Vec<Option<String>>,
+    /// This window moved the (model, board)'s [`ShapeCeiling`] (run2 S1).
+    /// `None` — the overwhelmingly common case — is "nothing changed", which
+    /// is why the line is emitted from here rather than per window.
+    shape_ceiling: Option<ShapeCeilingEvent>,
 }
 
 /// Whether this board's free reading is worth a live driver query right now.
@@ -1856,6 +1934,10 @@ struct ModelCalibration {
     /// on its own schedule; it is quantized to a bucket edge, so any change
     /// at all is a material one.
     persisted: Option<(u64, u64, Option<u64>)>,
+    /// The batch size this model's own kernels have said they cannot execute
+    /// at this corpus's shapes (run2 S1). See [`ShapeCeiling`] — including why
+    /// it is **runtime-only** and appears in no `ProfileUpdate`.
+    shape_ceiling: Option<ShapeCeiling>,
     /// Next [`ThroughputSample::seq`]. Counts observations *offered* to the
     /// ring, not ones still in it, so eviction never rewinds it and a
     /// widening's sequence mark stays meaningful for the life of the process.
@@ -1875,6 +1957,253 @@ struct KneeWidening {
     /// ingests before it expires. Every sample whose `seq` is at or past this
     /// was taken after the model was let out.
     from_seq: u64,
+}
+
+/// A batch size the **impl itself** has said it cannot execute at this
+/// corpus's shapes (run2 S1): the third brake on the budget, beside the
+/// throughput knee and the extrapolation ratchet.
+///
+/// The signal is a `clamped` report whose `reason` is
+/// [`CLAMP_REASON_INDEX_LIMIT`] — a size-dependent, *non-memory* kernel
+/// ceiling. easyOCR's is the one that was measured: CRAFT's first
+/// `MaxPool2d` (`vgg16_bn.features[6]`) launches over its output element
+/// count as a signed `int32`, so `64 × ⌊H/2⌋ × ⌊W/2⌋ × B` may not exceed
+/// `2^31 − 1` whatever the board has free. Nothing about it is transient —
+/// on CUDA/HIP it is a permanent property of that impl at that padded tensor
+/// shape, and it will bind again on every batch of similar pages, forever.
+///
+/// **Runtime-only, and deliberately never persisted.** Two of its three
+/// inputs are not properties of the machine at all:
+///
+/// * the padded dims come from *this corpus* (a library of A4 scans and one
+///   of thumbnails put the ceiling decades apart), and
+/// * `units` is denominated in the pixel canvas and cost epoch the clamped
+///   window was priced under (run2 R7), so the same physical ceiling is a
+///   different number after a canvas change.
+///
+/// Writing it into a calibration profile would therefore hand the next run —
+/// or, worse, another machine via a shipped baseline — a cap measured against
+/// a corpus it will never see. It lives here, beside the throughput ring and
+/// [`ModelCalibration::knee_best`], and a restart re-learns it from the first
+/// clamped window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShapeCeiling {
+    /// The largest batch the impl has been observed to actually execute
+    /// before its own ceiling cut one: the `to_units` of an `index_limit`
+    /// clamp, and the **smallest** such figure seen while this ceiling stood
+    /// (a wider report describes a batch of smaller pages and says nothing
+    /// about the frame that bound).
+    units: u64,
+    /// The canvas the clamped window was priced under
+    /// ([`WorkerEntry::canvas_pixels`]). A ceiling in units means nothing
+    /// without it, so a replica loaded under a different canvas never reads
+    /// this one.
+    canvas_pixels: Option<u32>,
+    /// The cost epoch it was observed under ([`WorkerEntry::epoch`]) — the
+    /// declared invalidation lever for "one unit now means something else".
+    epoch: u32,
+    /// When it was recorded. Read only by the log line that lowers or clears
+    /// it, where the age is what separates a corpus that genuinely changed
+    /// from an in-flight window settling behind a ceiling set moments ago.
+    observed_at: Instant,
+}
+
+/// What one settle did to a (model, board)'s [`ShapeCeiling`]. Logged at INFO
+/// once per change — never per window — because a ceiling that moves is the
+/// operator's only notice that a model is being held below its memory budget
+/// by its own kernels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShapeCeilingEvent {
+    inference_id: String,
+    gpu: String,
+    /// `set`, `lowered` or `cleared`.
+    action: &'static str,
+    /// The ceiling now in force; `None` on `cleared`.
+    units: Option<u64>,
+    /// The ceiling that stood before this change; `None` on `set`.
+    previous_units: Option<u64>,
+    /// Why, for the two clearing causes: [`CEILING_CAUSE_PROFILE`] or
+    /// [`CEILING_CAUSE_RAN_WIDER`]; [`CEILING_CAUSE_REPORTED`] for a clamp.
+    cause: &'static str,
+    canvas_pixels: Option<u32>,
+    epoch: u32,
+    /// Age of the ceiling being replaced, in seconds. `None` on `set`.
+    previous_age_secs: Option<u64>,
+}
+
+impl ShapeCeilingEvent {
+    fn emit(self) {
+        tracing::info!(
+            model = %self.inference_id,
+            gpu = %self.gpu,
+            action = self.action,
+            shape_ceiling_units = self.units.map_or(-1i64, |units| units as i64),
+            previous_units = self.previous_units.map_or(-1i64, |units| units as i64),
+            cause = self.cause,
+            canvas_pixels = self.canvas_pixels.map_or(-1i64, i64::from),
+            epoch = self.epoch,
+            previous_age_secs = self.previous_age_secs.map_or(-1i64, |secs| secs as i64),
+            "this model's own kernels named a batch size they cannot execute \
+             at this corpus's shapes; the unit budget will not widen past it \
+             and the ramp takes no step beyond it. A shape ceiling is not a \
+             memory condition and never deflates anything — it is runtime-only \
+             state, re-learned after a restart and dropped the moment the \
+             canvas, the cost epoch or the corpus moves (run2 S1)"
+        );
+    }
+}
+
+/// The `cause` of a [`ShapeCeilingEvent`]: the worker reported the clamp.
+const CEILING_CAUSE_REPORTED: &str = "index_limit_clamp";
+/// The replica's canvas or cost epoch is not the one the ceiling was observed
+/// under, so its unit figure no longer denominates anything.
+const CEILING_CAUSE_PROFILE: &str = "canvas_or_epoch_changed";
+/// A batch **larger** than the ceiling ran without the impl cutting it: these
+/// are not the dims the ceiling was measured at any more.
+const CEILING_CAUSE_RAN_WIDER: &str = "ran_wider_uncut";
+
+/// Fold this window's `index_limit` evidence into a (model, board)'s shape
+/// ceiling, returning what changed (`None` = nothing did).
+///
+/// Four rules, in this order, because a single window can carry more than one
+/// of them:
+///
+/// 1. **Invalidate on identity.** A ceiling recorded under another canvas or
+///    cost epoch is a number in another currency. Dropped, not converted:
+///    the conversion would need the padded dims, which the ledger never sees.
+/// 2. **Clear when contradicted.** A batch larger than the ceiling that ran
+///    *without* an `index_limit` clamp proves the impl's frame moved (the
+///    corpus's pages got smaller), so the recorded figure is no longer that
+///    impl's ceiling for this work.
+/// 3. **Record, or lower.** A clamp establishes a ceiling where there is
+///    none, and replaces a standing one only when it is **smaller** — several
+///    reports over a mixed corpus are all true, and the binding frame is the
+///    element-wise max of the batch, so the smallest observation is the one
+///    that holds for every batch this model is handed.
+/// 4. **Never raise in place.** Rule 2 clears rather than raising to the size
+///    that was demonstrated, and that is not timidity — it is the only
+///    non-deadlocking choice. A ceiling *caps admission*, so raising it to
+///    the largest batch seen would pin the budget at exactly the size that
+///    was last demonstrated and make the next, larger demonstration
+///    impossible: the cap would lock itself in at the first number it ever
+///    saw. Clearing costs at most one over-wide window — the impl trims it,
+///    reports the clamp, and rule 3 re-establishes the ceiling from the
+///    fresh observation — and that window is priced, not failed.
+fn update_shape_ceiling(
+    cal: &mut ModelCalibration,
+    canvas_pixels: Option<u32>,
+    epoch: u32,
+    reported: Option<u64>,
+    ran_wider_uncut: u64,
+    now: Instant,
+) -> Option<ShapeCeilingChange> {
+    // `(cause, previous units, previous age in seconds)` for the invalidation,
+    // taken before the write so the borrow of `cal.shape_ceiling` ends first.
+    let cleared = match &cal.shape_ceiling {
+        Some(current) if current.canvas_pixels != canvas_pixels || current.epoch != epoch => {
+            Some((
+                CEILING_CAUSE_PROFILE,
+                current.units,
+                now.saturating_duration_since(current.observed_at).as_secs(),
+            ))
+        }
+        Some(current) if ran_wider_uncut > current.units => Some((
+            CEILING_CAUSE_RAN_WIDER,
+            current.units,
+            now.saturating_duration_since(current.observed_at).as_secs(),
+        )),
+        _ => None,
+    };
+    if cleared.is_some() {
+        cal.shape_ceiling = None;
+    }
+    let reported = reported.filter(|units| *units > 0);
+    let standing = cal.shape_ceiling;
+    match (reported, standing) {
+        // A clamp with nothing standing — either nothing was ever recorded, or
+        // this same window's evidence just retired what was. Both are a `set`:
+        // no ceiling was in force at the instant the clamp landed. The dropped
+        // figure is still reported beside it, so a composite settle reads as
+        // one event rather than none.
+        (Some(units), None) => {
+            cal.shape_ceiling = Some(ShapeCeiling {
+                units,
+                canvas_pixels,
+                epoch,
+                observed_at: now,
+            });
+            Some(ShapeCeilingChange {
+                action: "set",
+                cause: CEILING_CAUSE_REPORTED,
+                units: Some(units),
+                previous_units: cleared.map(|(_, units, _)| units),
+                previous_age_secs: cleared.map(|(_, _, age)| age),
+            })
+        }
+        // A clamp below the one in force: the binding frame is bigger than we
+        // knew, and the smaller figure is the one that holds for every batch.
+        (Some(units), Some(current)) if units < current.units => {
+            cal.shape_ceiling = Some(ShapeCeiling {
+                units,
+                canvas_pixels,
+                epoch,
+                observed_at: now,
+            });
+            Some(ShapeCeilingChange {
+                action: "lowered",
+                cause: CEILING_CAUSE_REPORTED,
+                units: Some(units),
+                previous_units: Some(current.units),
+                previous_age_secs: Some(
+                    now.saturating_duration_since(current.observed_at).as_secs(),
+                ),
+            })
+        }
+        // A clamp at or above the one in force teaches nothing: a batch of
+        // smaller pages fits more of them under the same element limit, and
+        // the ceiling already in force is the stricter true statement.
+        (Some(_), Some(_)) => None,
+        (None, _) => cleared.map(|(cause, units, age)| ShapeCeilingChange {
+            action: "cleared",
+            cause,
+            units: None,
+            previous_units: Some(units),
+            previous_age_secs: Some(age),
+        }),
+    }
+}
+
+/// What [`update_shape_ceiling`] did, for the INFO line the settle emits once
+/// the ledger lock is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShapeCeilingChange {
+    /// `set` (none was in force), `lowered` (a standing one was replaced by a
+    /// smaller report) or `cleared`.
+    action: &'static str,
+    cause: &'static str,
+    /// The ceiling now in force; `None` on `cleared`.
+    units: Option<u64>,
+    /// The figure this change displaced, when there was one.
+    previous_units: Option<u64>,
+    previous_age_secs: Option<u64>,
+}
+
+/// The shape ceiling this replica's batches are actually subject to, or
+/// `None` where the recorded one does not describe it.
+///
+/// The identity check is on the **read** side as well as in
+/// [`update_shape_ceiling`] because the two answer different questions: the
+/// update path clears a stale ceiling when a window settles, and this one
+/// guarantees that a replica loaded under a different canvas — one that has
+/// settled no window yet, and may never settle one — is never priced against
+/// another canvas's number.
+fn shape_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Option<u64> {
+    cal.and_then(|cal| cal.shape_ceiling)
+        .filter(|ceiling| {
+            ceiling.canvas_pixels == entry.canvas_pixels && ceiling.epoch == entry.epoch
+        })
+        .map(|ceiling| ceiling.units)
+        .filter(|units| *units > 0)
 }
 
 /// The freshest free-memory reading for a board, and where it came from.
@@ -3862,6 +4191,20 @@ impl VramLedger {
             .filter(|knee| *knee > 0)
     }
 
+    /// The shape ceiling in force for this replica (run2 S1): a batch size the
+    /// impl's own kernels have said they cannot execute at this corpus's
+    /// shapes. `None` — no cap — until an `index_limit` clamp reports one, and
+    /// again the moment the replica's canvas or cost epoch stops matching the
+    /// one it was observed under ([`shape_ceiling_for`]).
+    fn shape_ceiling_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
+        shape_ceiling_for(
+            state
+                .calibration
+                .get(&(entry.inference_id.clone(), entry.gpu.clone())),
+            entry,
+        )
+    }
+
     fn fit_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<FitSnapshot> {
         state
             .calibration
@@ -4077,6 +4420,7 @@ impl VramLedger {
             entry,
             Self::anchor_locked(&state, entry),
             Self::knee_locked(&state, entry),
+            Self::shape_ceiling_locked(&state, entry),
         )
         .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
         .max(1)
@@ -4129,15 +4473,25 @@ impl VramLedger {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
             let fit = Self::pricing_fit_locked(&state, entry);
-            let capped = admitted_units(entry, anchor, Self::knee_locked(&state, entry));
+            let ceiling = Self::shape_ceiling_locked(&state, entry);
+            let capped = admitted_units(entry, anchor, Self::knee_locked(&state, entry), ceiling);
             let wanted = capped.min(window_units.max(1)).max(1);
             // Did the *knee* decide this window's size? Both halves matter to
             // the expiry (run2 change R1d): the cap has to have bitten
             // (`capped < uncapped`) and the window has to have carried enough
             // work to reach it (`wanted == capped`), or a short queue would
             // count as a window run at the cap.
-            let knee_bound =
-                capped < admitted_units(entry, anchor, None) && wanted >= capped && capped > 0;
+            //
+            // The comparand keeps the **shape ceiling** applied and drops only
+            // the knee, so a window held down by the impl's own kernels is not
+            // credited to the knee (run2 S1). Without that, a run of clipped
+            // windows would walk `knee_clean_windows` to its threshold and
+            // widen a cap on evidence gathered at a size the knee had nothing
+            // to do with — the ledger reading a clipped plateau as a knee the
+            // model had earned its way out of.
+            let knee_bound = capped < admitted_units(entry, anchor, None, ceiling)
+                && wanted >= capped
+                && capped > 0;
             // Was there room to have run wider? The comparand is exactly what
             // the widened budget would cost: `RATCHET_FACTOR` times the
             // model's appetite, which is `slope × min(anchor, knee)`.
@@ -4363,6 +4717,11 @@ impl VramLedger {
         if let Some(expiry) = settled.knee_expiry {
             expiry.emit();
         }
+        // Before the window's own line too: the ceiling is what explains the
+        // `clamped=index_limit` field that line is about to carry.
+        if let Some(ceiling) = settled.shape_ceiling {
+            ceiling.emit();
+        }
         // Before the window's own line, so the classification reads as the
         // reason for the negative that follows it.
         if let Some(oom) = settled.oom {
@@ -4434,11 +4793,18 @@ impl VramLedger {
                 Some(entry) => Self::anchor_locked(&state, entry),
                 None => 0,
             };
+            // Read after the ingest for the same reason: this window's own
+            // `index_limit` clamps have already established (or retired) the
+            // ceiling the ramp is about to be judged against (run2 S1).
+            let ceiling = match state.workers.get(&worker) {
+                Some(entry) => Self::shape_ceiling_locked(&state, entry),
+                None => None,
+            };
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
                 } else {
-                    entry.note_clean_window(ingested.high_water_samples > 0, anchor);
+                    entry.note_clean_window(ingested.high_water_samples > 0, anchor, ceiling);
                 }
             }
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
@@ -4510,6 +4876,7 @@ impl VramLedger {
             knee_expiry,
             window,
             oom,
+            shape_ceiling: ingested.shape_ceiling,
         }
     }
 
@@ -4791,6 +5158,17 @@ impl VramLedger {
             .workers
             .get(&worker)
             .map(|entry| entry.inference_id.clone());
+        // The currency any `index_limit` clamp in this window is denominated
+        // in (run2 S1). Both are fixed for the life of a [`WorkerEntry`], so
+        // every window this replica ran was priced under exactly these — which
+        // is what makes stamping the ceiling with them, rather than guessing
+        // afterwards, correct. A replica the ledger has already forgotten
+        // reports neither, and its clamps establish no ceiling: a number in an
+        // unknown currency is worse than no number.
+        let profile = state
+            .workers
+            .get(&worker)
+            .map(|entry| (entry.canvas_pixels, entry.epoch));
 
         let mut negative = false;
         let mut saw_oom = false;
@@ -4842,6 +5220,19 @@ impl VramLedger {
         // opposite things about whether the size will come back
         // ([`clamp_log_field`]).
         let mut clamps: Vec<Option<String>> = Vec::new();
+        // The shape-ceiling evidence this window carried (run2 S1):
+        //
+        // * the **smallest** `to_units` any `index_limit` clamp reported — the
+        //   binding padded frame is the element-wise max over a batch, so the
+        //   smallest report is the one that holds for every batch;
+        // * the **largest** batch that executed without the impl cutting it,
+        //   which is what contradicts a ceiling that no longer describes these
+        //   dims.
+        let mut index_limit_to: Option<u64> = None;
+        let mut ran_wider_uncut = 0u64;
+        // Throughput-collapse verdicts dropped because the batch was cut by
+        // the impl's own shape ceiling rather than by anything about its rate.
+        let mut clipped_collapses = 0usize;
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -4902,9 +5293,41 @@ impl VramLedger {
             // there is. Skipping the whole measurement here would drop that
             // OOM on the floor whenever a neighbour happened to be running,
             // which is precisely when the ledger most needs to hear it.
-            let collapse_suppressed = measurement.throughput_collapse && !sole_occupancy;
+            //
+            // A batch the impl's **shape ceiling** cut is the second thing a
+            // collapse verdict cannot be read across (run2 S1). The worker
+            // compares this batch's rate against the previous one's; a batch
+            // trimmed from the granted 200 units to the 28 the kernel's index
+            // arithmetic allows runs a fraction of the work at a fraction of
+            // the amortization, and the drop is arithmetic, not a spill. The
+            // whole point of the ceiling is that it carries **no `oom`** — the
+            // impl said "not this shape", not "not this much memory" — so
+            // letting the collapse half of the verdict through would deflate a
+            // model on an empty board for a reason that has nothing to do with
+            // memory, and go on doing it on every batch of similar pages
+            // forever. A genuine out-of-memory on the same measurement is
+            // untouched: `oom` is read independently below.
+            let clipped = clamp_reason_is(measurement, CLAMP_REASON_INDEX_LIMIT);
+            // Recorded before the negative branch below, and deliberately: the
+            // clamp states what the impl *executed*, which is true whatever
+            // the batch then went on to do. A batch clipped to 28 units that
+            // subsequently ran out of memory still says the kernel would not
+            // have taken 29.
+            if clipped && let Some(clamp) = &measurement.clamped {
+                let to_units = clamp.to_units;
+                if to_units > 0 {
+                    index_limit_to =
+                        Some(index_limit_to.map_or(to_units, |seen: u64| seen.min(to_units)));
+                }
+            }
+            let collapse_suppressed =
+                measurement.throughput_collapse && (!sole_occupancy || clipped);
             if collapse_suppressed {
-                suppressed_collapses += 1;
+                if clipped {
+                    clipped_collapses += 1;
+                } else {
+                    suppressed_collapses += 1;
+                }
             }
             let collapse = measurement.throughput_collapse && !collapse_suppressed;
             // The worker's structural OOM classification, read for what it is
@@ -4944,6 +5367,16 @@ impl VramLedger {
                 continue;
             }
             let units = measurement.units.filter(|units| *units > 0);
+            // The contradiction that retires a shape ceiling: a batch that ran
+            // — no out-of-memory, no collapse, and the impl did **not** cut it
+            // for its shapes — bigger than the ceiling in force. The dims
+            // moved, so the recorded figure is not this impl's ceiling for this
+            // work any more (see [`update_shape_ceiling`], rules 2 and 4). A
+            // *memory*-clamped batch still counts: it executed the units it
+            // reports, which is the whole of the claim being made here.
+            if !clipped {
+                ran_wider_uncut = ran_wider_uncut.max(units.unwrap_or(0));
+            }
             // Three states, not two: a measurement that carries no allocator
             // reading at all says nothing about the pool either way, and must
             // not be read as "warm" (see the warm-pool exclusion below).
@@ -5111,6 +5544,19 @@ impl VramLedger {
                  explain it and is not evidence about the batch size (P5-5)"
             );
         }
+        if clipped_collapses > 0 {
+            tracing::debug!(
+                model = %key.0,
+                gpu = %gpu,
+                clipped_collapses,
+                "ignored this window's throughput-collapse flags: the impl's \
+                 own shape ceiling cut these batches (clamped.reason = \
+                 index_limit), so the rate the worker compared against was \
+                 taken over a fraction of the work and the drop is arithmetic \
+                 rather than a spill. A shape ceiling carries no out-of-memory \
+                 and never deflates anything (run2 S1)"
+            );
+        }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.fit_watermark = new_watermark;
             // Counted here, after `warmup_window` was read, so that the first
@@ -5120,7 +5566,33 @@ impl VramLedger {
         }
         let high_water_samples = fit_samples.len();
         let throughput_samples = throughput.len();
+        let ceiling_identity = key.clone();
         let cal = state.calibration.entry(key).or_default();
+        // The shape ceiling, before anything else this window taught: it is
+        // read by the very next grant and by the ramp accounting the settle is
+        // about to do, and unlike the fit or the knee it needs no ring and no
+        // refit — one clamp is the whole of the evidence (run2 S1).
+        let shape_ceiling = profile.and_then(|(canvas_pixels, epoch)| {
+            update_shape_ceiling(
+                cal,
+                canvas_pixels,
+                epoch,
+                index_limit_to,
+                ran_wider_uncut,
+                Instant::now(),
+            )
+            .map(|change| ShapeCeilingEvent {
+                inference_id: ceiling_identity.0.clone(),
+                gpu: ceiling_identity.1.clone(),
+                action: change.action,
+                units: change.units,
+                previous_units: change.previous_units,
+                cause: change.cause,
+                canvas_pixels,
+                epoch,
+                previous_age_secs: change.previous_age_secs,
+            })
+        });
         for sample in fit_samples {
             cal.samples.push_back(sample);
             while cal.samples.len() > FIT_RING {
@@ -5196,6 +5668,7 @@ impl VramLedger {
             oom_evidence: trusted_oom,
             oom_samples: trusted_ooms,
             clamps,
+            shape_ceiling,
         }
     }
 
@@ -5832,6 +6305,7 @@ impl VramLedger {
                             .get(&(entry.inference_id.clone(), entry.gpu.clone()));
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
                         let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
+                        let shape_ceiling = shape_ceiling_for(cal, entry);
                         LedgerWorkerHealth {
                             inference_id: entry.inference_id.clone(),
                             footprint_mb: entry.footprint_mb(),
@@ -5846,9 +6320,10 @@ impl VramLedger {
                             ramp_step: entry.ramp_step,
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
-                            unit_budget: admitted_units(entry, anchor, knee),
+                            unit_budget: admitted_units(entry, anchor, knee, shape_ceiling),
                             max_units_measured: anchor,
                             knee_units: knee,
+                            shape_ceiling_units: shape_ceiling,
                             knee_is_local: cal.is_some_and(|cal| cal.knee_is_local),
                             throughput_samples: cal.map(|cal| cal.throughput.len()).unwrap_or(0),
                             local_samples: cal.map(|cal| cal.local_samples).unwrap_or(0),
@@ -6165,6 +6640,23 @@ impl VramLedger {
                 )
             })
             .unwrap_or((0, None))
+    }
+
+    /// This (model, board)'s **stored** shape ceiling, identity included and
+    /// *unfiltered* (run2 S1). `/health` reports the figure only when it
+    /// describes the replica asking; this hook is how a test tells "the
+    /// record was cleared" from "the record is being ignored".
+    #[cfg(test)]
+    fn shape_ceiling_for_test(
+        &self,
+        inference_id: &str,
+        gpu: &str,
+    ) -> Option<(u64, Option<u32>, u32)> {
+        self.lock()
+            .calibration
+            .get(&(inference_id.to_owned(), gpu.to_owned()))
+            .and_then(|cal| cal.shape_ceiling)
+            .map(|ceiling| (ceiling.units, ceiling.canvas_pixels, ceiling.epoch))
     }
 
     /// Age this replica's two trim clocks — the idle-quiet-period stamp and
@@ -7297,6 +7789,17 @@ pub struct LedgerWorkerHealth {
     /// Whether that knee was fitted on this machine (as opposed to seeded
     /// from a profile, which may cap but never travels back to the store).
     pub knee_is_local: bool,
+    /// Shape ceiling (run2 S1): a batch size this model's own kernels have
+    /// said they cannot execute at the shapes this corpus is feeding them —
+    /// an int32 index limit in a CUDA/HIP pooling kernel, reported as
+    /// `clamped.reason = "index_limit"`. `None` until one is reported.
+    ///
+    /// It caps `unit_budget` and stops the ramp, and it is **not** a memory
+    /// condition: it never deflates anything. Runtime-only and denominated in
+    /// the canvas and cost epoch shown for this replica — it is re-learned
+    /// after a restart and dropped when the canvas, the epoch or the corpus
+    /// moves, so it appears in no calibration profile.
+    pub shape_ceiling_units: Option<u64>,
     /// Warm-pool throughput observations behind the knee fit. Runtime-only:
     /// the store persists the fitted knee, not the series.
     pub throughput_samples: usize,
@@ -13840,6 +14343,614 @@ mod tests {
             "an index-limited batch does not describe this model's curve, \
              whether or not it carried a free reading"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Shape ceiling (run2 S1)
+    // ------------------------------------------------------------------
+
+    /// A batch the impl cut for its **shapes**: the wire report the ceiling
+    /// is learned from. `free_mb` is absent, which is what a shape ceiling
+    /// looks like — it is decided by the shapes, not by a reading.
+    fn clipped_batch(to_units: u64, from_units: u64, units_per_sec: f64) -> BatchMeasurement {
+        BatchMeasurement {
+            clamped: Some(ClampReport {
+                from_units,
+                to_units,
+                free_mb: None,
+                reason: Some(CLAMP_REASON_INDEX_LIMIT.to_owned()),
+            }),
+            ..warm_batch(to_units, units_per_sec)
+        }
+    }
+
+    /// A pixel model with a canvas and an epoch, so the two identity
+    /// components a ceiling is stamped with can be moved independently. The
+    /// seed is small because every figure here is scale-free arithmetic; a
+    /// real pixel seed is millions.
+    fn canvas_cost(seed: u32, canvas_pixels: Option<u32>, epoch: u32) -> CostDimension {
+        CostDimension {
+            unit: CostUnit::Pixel,
+            aggregation: Some(CostAggregation::Sum),
+            epoch,
+            seed_units: Some(seed),
+            degraded: false,
+            canvas_pixels,
+        }
+    }
+
+    /// One window whose batches the impl cut at `to_units`, settled clean.
+    fn clipped_window(handle: &TelemetryHandle, admission: &Admission, to_units: u64) {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let granted = token.grant().unit_budget;
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![clipped_batch(to_units, granted, 90.0)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+    }
+
+    /// A replica on a wide-open board, ready to be clipped.
+    fn clippable(seed: u32) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
+        let ledger = ledger(200_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(seed), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 190_000, 1000);
+        (ledger, handle, admission)
+    }
+
+    /// **The signal.** One `index_limit` clamp is the whole of the evidence:
+    /// no ring, no fit, no threshold. The impl has said it cannot execute a
+    /// batch that size at these shapes, and every unit admitted above it is
+    /// admission the model cannot spend.
+    #[test]
+    fn an_index_limit_clamp_sets_the_shape_ceiling_and_caps_the_budget() {
+        let (ledger, handle, admission) = clippable(64);
+        assert_eq!(
+            ledger.health()[0].workers[0].shape_ceiling_units,
+            None,
+            "nothing is capped until an impl says so"
+        );
+        assert_eq!(ledger.health()[0].workers[0].unit_budget, 64);
+
+        clipped_window(&handle, &admission, 16);
+
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.shape_ceiling_units, Some(16));
+        assert_eq!(
+            worker.unit_budget, 16,
+            "the budget never widens past a size the impl has said it cannot run"
+        );
+        // And it is a memory-free statement: no deflation, and the window was
+        // clean.
+        assert_eq!(worker.deflation, 0);
+        assert_eq!(worker.clean_windows, 1);
+        // Stamped with the identity it was observed under — an item model has
+        // no canvas, and its epoch is the registered one.
+        assert_eq!(
+            ledger.shape_ceiling_for_test("g/a", BOARD),
+            Some((16, None, 1))
+        );
+    }
+
+    /// **The smallest report wins, and a wider one never raises it.** The
+    /// binding padded frame is the element-wise max over a batch, so a report
+    /// from a batch of smaller pages fits more of them under the same element
+    /// limit and says nothing about the frame that actually bound.
+    #[test]
+    fn the_smallest_index_limit_report_is_the_ceiling() {
+        let (ledger, handle, admission) = clippable(64);
+
+        // Two clamps in one window, in the unhelpful order.
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle.lock().unwrap().record_measurements(vec![
+            clipped_batch(32, 64, 90.0),
+            clipped_batch(12, 64, 90.0),
+            clipped_batch(48, 64, 90.0),
+        ]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(ledger.health()[0].workers[0].shape_ceiling_units, Some(12));
+
+        // A wider report in a later window leaves it alone.
+        clipped_window(&handle, &admission, 40);
+        assert_eq!(
+            ledger.health()[0].workers[0].shape_ceiling_units,
+            Some(12),
+            "a wider report describes a batch of smaller pages"
+        );
+
+        // A narrower one lowers it: the frame that binds is bigger than we knew.
+        clipped_window(&handle, &admission, 5);
+        assert_eq!(ledger.health()[0].workers[0].shape_ceiling_units, Some(5));
+        assert_eq!(ledger.health()[0].workers[0].unit_budget, 5);
+    }
+
+    /// **Identity.** A ceiling is denominated in the canvas and the cost epoch
+    /// the clamped window was priced under (run2 R7). A replica loaded under
+    /// either a different canvas or a different epoch is a replica whose units
+    /// mean something else, and the recorded figure is neither converted nor
+    /// applied — it is dropped, because converting it would need the padded
+    /// dims, which the ledger never sees.
+    #[test]
+    fn a_shape_ceiling_does_not_survive_a_canvas_or_epoch_change() {
+        for (first, second, moved) in [
+            (
+                canvas_cost(64, Some(1_835_008), 2),
+                canvas_cost(64, Some(4_000_000), 2),
+                "canvas",
+            ),
+            (
+                canvas_cost(64, Some(1_835_008), 2),
+                canvas_cost(64, Some(1_835_008), 3),
+                "epoch",
+            ),
+            (
+                canvas_cost(64, Some(1_835_008), 2),
+                canvas_cost(64, None, 2),
+                "canvas withdrawn",
+            ),
+        ] {
+            let ledger = ledger(200_000, no_margin());
+            let handle = loaded(Some(1000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", first, &handle, None)
+                .expect("admitted");
+            push_memory(&handle, 190_000, 1000);
+            clipped_window(&handle, &admission, 16);
+            assert_eq!(
+                ledger.health()[0].workers[0].shape_ceiling_units,
+                Some(16),
+                "{moved}: the ceiling is in force for the replica that reported it"
+            );
+            drop(admission);
+
+            // The model comes back under a different profile. The calibration
+            // for the pair survives (that is the point of keying it per model
+            // and board), the ceiling does not.
+            let handle = loaded(Some(1000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", second, &handle, None)
+                .expect("admitted");
+            push_memory(&handle, 190_000, 1000);
+            assert_eq!(
+                ledger.health()[0].workers[0].shape_ceiling_units,
+                None,
+                "{moved} moved, so the recorded units denominate nothing"
+            );
+            assert_eq!(
+                ledger.health()[0].workers[0].unit_budget,
+                64,
+                "{moved}: and nothing caps the budget"
+            );
+            // The read filter is what makes that safe before any window
+            // settles; the record itself is retired by the first one that does.
+            assert!(ledger.shape_ceiling_for_test("g/a", BOARD).is_some());
+            clean_window(&admission);
+            assert_eq!(
+                ledger.shape_ceiling_for_test("g/a", BOARD),
+                None,
+                "{moved}: and the stale record is cleared, not merely ignored"
+            );
+        }
+    }
+
+    /// **The contradiction.** A batch *larger* than the ceiling that the impl
+    /// did **not** cut proves the frame moved, so the recorded figure is not
+    /// this impl's ceiling for this work any more.
+    ///
+    /// It is cleared rather than raised to the size just demonstrated, and
+    /// that is the only non-deadlocking choice: a ceiling caps admission, so
+    /// raising it to the largest batch seen would pin the budget at exactly
+    /// that size and make the next, larger demonstration impossible.
+    #[test]
+    fn a_batch_that_ran_wider_uncut_retires_the_shape_ceiling() {
+        let (ledger, handle, admission) = clippable(64);
+        clipped_window(&handle, &admission, 16);
+        assert_eq!(ledger.health()[0].workers[0].unit_budget, 16);
+
+        // A window granted before the ceiling existed settles behind it: its
+        // batches ran at 64 units and the impl cut none of them.
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(64, 90.0)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+
+        assert_eq!(
+            ledger.health()[0].workers[0].shape_ceiling_units,
+            None,
+            "cleared, not raised to 64 — a cap at the demonstrated size locks \
+             itself in at the first number it ever sees"
+        );
+        assert_eq!(ledger.health()[0].workers[0].unit_budget, 64);
+        assert_eq!(ledger.shape_ceiling_for_test("g/a", BOARD), None);
+
+        // A batch that merely *reached* the ceiling contradicts nothing.
+        clipped_window(&handle, &admission, 16);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(16, 90.0)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            ledger.health()[0].workers[0].shape_ceiling_units,
+            Some(16),
+            "running *at* the ceiling is what a capped model does every window"
+        );
+
+        // A **clipped** batch above it contradicts nothing either: the impl
+        // cut that one, which is the ceiling working rather than moving.
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![clipped_batch(20, 64, 90.0)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(ledger.health()[0].workers[0].shape_ceiling_units, Some(16));
+    }
+
+    /// **The third brake.** The ramp takes no step past the ceiling. The knee
+    /// and the ratchet cap the *budget* and leave the exponent free; this one
+    /// stops the exponent too, because a window trimmed back to the ceiling is
+    /// no evidence that a bigger batch would work and never can be — every
+    /// window from here on is trimmed to the same size. Left to itself the
+    /// ramp would walk to `MAX_RAMP_STEP` against a wall and the budget would
+    /// jump to the ratchet ceiling the moment the ceiling cleared, with
+    /// nothing measured in between.
+    #[test]
+    fn the_ramp_takes_no_step_past_the_shape_ceiling() {
+        // Control: no ceiling, and the ramp climbs one step per measured
+        // window.
+        let (ledger, handle, admission) = clippable(4);
+        for _ in 0..4 {
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            let granted = token.grant().unit_budget;
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![measurement(granted, 1000, 1100)]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        }
+        assert_eq!(ledger.health()[0].workers[0].ramp_step, 4);
+        drop(admission);
+
+        // The same four windows under a ceiling of 16: the ramp climbs *to*
+        // it — 4, 8, 16 — and stops.
+        let (ledger, handle, admission) = clippable(4);
+        clipped_window(&handle, &admission, 16);
+        for _ in 0..4 {
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            let granted = token.grant().unit_budget;
+            assert!(granted <= 16, "granted {granted}");
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![measurement(granted, 1000, 1100)]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            worker.ramp_step, 2,
+            "4 → 8 → 16, and then the ceiling: no doublings are spent against \
+             a wall"
+        );
+        assert_eq!(worker.unit_budget, 16);
+
+        // Deflation repayment is deliberately not gated on the ceiling:
+        // buying back a halving is recovery from a memory fault, and a shape
+        // ceiling is not a memory condition.
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        });
+        assert_eq!(ledger.health()[0].workers[0].deflation, 1);
+        for _ in 0..CLEAN_WINDOWS_TO_RESTORE {
+            clean_window(&admission);
+        }
+        assert_eq!(
+            ledger.health()[0].workers[0].deflation,
+            0,
+            "clean windows still repay a halving under a ceiling"
+        );
+    }
+
+    /// **Never a negative.** An `index_limit` clamp carries no `oom` — the
+    /// impl said "not this shape", not "not this much memory" — so it must
+    /// never deflate anything, on an empty board or any other.
+    ///
+    /// The throughput-collapse half is the trap: a batch trimmed from 64 units
+    /// to 8 runs a fraction of the work at a fraction of the amortization, and
+    /// the worker's rate comparison sees a collapse. Before this it was a
+    /// negative, and it would have been one again on every batch of similar
+    /// pages forever.
+    #[test]
+    fn an_index_limit_clamp_produces_no_negative_sample() {
+        let (ledger, handle, admission) = clippable(64);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle.lock().unwrap().record_measurements(vec![
+            BatchMeasurement {
+                throughput_collapse: true,
+                ..clipped_batch(8, 64, 10.0)
+            },
+            BatchMeasurement {
+                throughput_collapse: true,
+                ..clipped_batch(8, 64, 9.0)
+            },
+        ]);
+        token.finish(WindowOutcome::Responded { oom: None });
+
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.deflation, 0, "a shape ceiling is not a memory fault");
+        assert_eq!(worker.clean_windows, 1, "the window settled clean");
+        assert_eq!(worker.shape_ceiling_units, Some(8));
+
+        // The control, twice over. A *memory* clamp's collapse is still a
+        // negative on a sole-occupancy board…
+        let (ledger, handle, admission) = clippable(64);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                clamped: Some(ClampReport {
+                    from_units: 64,
+                    to_units: 8,
+                    free_mb: Some(900),
+                    reason: None,
+                }),
+                ..warm_batch(8, 10.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            ledger.health()[0].workers[0].deflation,
+            1,
+            "the memory clamp's collapse verdict is untouched"
+        );
+
+        // …and a genuine out-of-memory on a clipped batch is read
+        // independently: the ceiling suppresses the *collapse* verdict, never
+        // the allocator's own report.
+        let (ledger, handle, admission) = clippable(64);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                oom: true,
+                throughput_collapse: true,
+                ..clipped_batch(8, 64, 10.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            worker.deflation, 1,
+            "an OOM is an OOM whatever cut the batch"
+        );
+        assert_eq!(
+            worker.shape_ceiling_units,
+            Some(8),
+            "and the ceiling is still learned: the clamp states what executed, \
+             which is true whatever the batch went on to do"
+        );
+    }
+
+    /// **A clipped run is not a plateau.** The knee estimator sees a flat rate
+    /// against a rising budget and would conclude the model has bent; it has
+    /// not, it has been clipped. Two defences, and both are asserted here: a
+    /// clamped batch never enters the throughput ring at all (so no bucket,
+    /// no frontier, no `observed_top` is built out of one), and a window the
+    /// *ceiling* held down is not credited to the knee's expiry — which would
+    /// otherwise widen a cap on evidence the knee had nothing to do with.
+    #[test]
+    fn a_run_of_clipped_windows_is_never_read_as_a_throughput_plateau() {
+        let (ledger, handle, admission) = knee_capped(15);
+        assert_eq!(ledger.health()[0].workers[0].unit_budget, 15);
+        // The impl's own ceiling, below the knee.
+        clipped_window(&handle, &admission, 8);
+        assert_eq!(ledger.health()[0].workers[0].unit_budget, 8);
+        let samples_before = ledger.health()[0].workers[0].throughput_samples;
+        // That first window *was* knee-bound — the ceiling did not exist when
+        // it was granted — so it earned its one window of credit honestly.
+        // Everything after it is held down by the ceiling instead.
+        let credit_before = ledger.knee_expiry_for_test("g/a", BOARD).0;
+        assert_eq!(credit_before, 1);
+
+        for _ in 0..(KNEE_EXPIRY_CLEAN_WINDOWS * 2) {
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            let granted = token.grant().unit_budget;
+            assert_eq!(granted, 8, "held at the ceiling, not at the knee");
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![clipped_batch(granted, 15, 90.0)]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        }
+
+        assert_eq!(
+            ledger.health()[0].workers[0].throughput_samples,
+            samples_before,
+            "not one clipped batch reached the ring, so no bucket, no \
+             frontier and no plateau can be built out of them"
+        );
+        assert_eq!(
+            ledger.knee_expiry_for_test("g/a", BOARD).0,
+            credit_before,
+            "and none of those windows counts as a window run *at the knee*: \
+             the knee is not what held them down — two full expiry periods \
+             later the counter has not moved"
+        );
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(15),
+            "so the knee neither widened nor moved on clipped evidence"
+        );
+    }
+
+    /// **Runtime-only.** The ceiling depends on this corpus's padded dims and
+    /// on the canvas the window was priced under, so it is in no
+    /// `ProfileUpdate` and in no `ProfileSeed` — a restart re-learns it from
+    /// the first clamped window, and a shipped baseline can never carry one.
+    #[test]
+    fn a_shape_ceiling_never_survives_a_restart() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 190_000, 1000);
+        // A measured window first, so the run has something to persist at
+        // all, and then the clamp.
+        measured_window(&handle, &admission, 64);
+        clipped_window(&handle, &admission, 16);
+        assert_eq!(ledger.health()[0].workers[0].shape_ceiling_units, Some(16));
+
+        let written = profiles.updates.lock().unwrap().clone();
+        assert!(!written.is_empty(), "the anchor was persisted");
+
+        // The next run, seeded from everything that store could possibly hold
+        // — anchor, knee, local samples and all.
+        let last = written.last().cloned().unwrap();
+        let restored = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: last.base_mb,
+                slope_mb_per_unit: 10.0,
+                residual_mb: last.residual_mb,
+                samples: last.samples,
+                knee_units: last.knee_units,
+                local: true,
+                fit_is_local: true,
+                exact_torch: true,
+                max_units_measured: last.max_units_measured,
+                local_samples: last.local_samples,
+                knee_clean_windows: last.knee_clean_windows,
+                ring: last.ring.clone(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let fresh = ledger_with(200_000, no_margin(), &restored);
+        let handle = loaded(Some(1000), Some(0));
+        let _admission = fresh
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 190_000, 1000);
+
+        let worker = &fresh.health()[0].workers[0];
+        assert_eq!(
+            worker.max_units_measured, 64,
+            "the ratchet anchor is exactly the kind of thing that persists"
+        );
+        assert_eq!(
+            worker.shape_ceiling_units, None,
+            "and the shape ceiling is exactly the kind that does not"
+        );
+        assert!(worker.unit_budget >= 64, "so nothing caps the restored run");
+        assert_eq!(fresh.shape_ceiling_for_test("g/a", BOARD), None);
+    }
+
+    /// The rules, on the state machine itself, where each one is readable
+    /// without a board fixture — including the two that a live ledger can
+    /// only reach through a stale window.
+    #[test]
+    fn the_shape_ceiling_state_machine() {
+        let now = Instant::now();
+        let mut cal = ModelCalibration::default();
+
+        // Nothing reported, nothing standing: nothing happens.
+        assert_eq!(
+            update_shape_ceiling(&mut cal, Some(9), 2, None, 0, now),
+            None
+        );
+        assert!(cal.shape_ceiling.is_none());
+
+        // A zero-unit report is not a ceiling: it would admit nothing at all.
+        assert_eq!(
+            update_shape_ceiling(&mut cal, Some(9), 2, Some(0), 0, now),
+            None
+        );
+        assert!(cal.shape_ceiling.is_none());
+
+        // Set.
+        let set = update_shape_ceiling(&mut cal, Some(9), 2, Some(16), 0, now).expect("set");
+        assert_eq!(set.action, "set");
+        assert_eq!(set.cause, CEILING_CAUSE_REPORTED);
+        assert_eq!(set.units, Some(16));
+        assert_eq!(set.previous_units, None);
+
+        // A wider report is not news.
+        assert_eq!(
+            update_shape_ceiling(&mut cal, Some(9), 2, Some(20), 0, now),
+            None
+        );
+
+        // Lowered.
+        let lowered = update_shape_ceiling(&mut cal, Some(9), 2, Some(10), 0, now).expect("lower");
+        assert_eq!(lowered.action, "lowered");
+        assert_eq!(lowered.previous_units, Some(16));
+        assert_eq!(lowered.units, Some(10));
+
+        // Cleared by a wider uncut batch.
+        let cleared = update_shape_ceiling(&mut cal, Some(9), 2, None, 11, now).expect("clear");
+        assert_eq!(cleared.action, "cleared");
+        assert_eq!(cleared.cause, CEILING_CAUSE_RAN_WIDER);
+        assert_eq!(cleared.units, None);
+        assert_eq!(cleared.previous_units, Some(10));
+
+        // Cleared by the identity moving.
+        update_shape_ceiling(&mut cal, Some(9), 2, Some(10), 0, now).expect("set again");
+        let cleared = update_shape_ceiling(&mut cal, Some(7), 2, None, 0, now).expect("clear");
+        assert_eq!(cleared.cause, CEILING_CAUSE_PROFILE);
+        assert!(cal.shape_ceiling.is_none());
+
+        // A window that both retires the old figure and reports a new one is
+        // one event, not none: no ceiling was in force at the instant the
+        // clamp landed, so it reads as a `set` that names what it displaced.
+        update_shape_ceiling(&mut cal, Some(7), 2, Some(10), 0, now).expect("set");
+        let composite =
+            update_shape_ceiling(&mut cal, Some(7), 2, Some(30), 25, now).expect("clear and set");
+        assert_eq!(composite.action, "set");
+        assert_eq!(composite.previous_units, Some(10));
+        assert_eq!(composite.units, Some(30));
+        assert_eq!(
+            cal.shape_ceiling.map(|ceiling| ceiling.units),
+            Some(30),
+            "the fresh report is the ceiling, not the retired one"
+        );
+    }
+
+    /// The budget arithmetic, with the ceiling as what it is: a second pure
+    /// `min` beside the knee, applied before deflation and never a floor.
+    #[test]
+    fn the_shape_ceiling_is_a_pure_min_on_the_budget() {
+        let (ledger, handle, admission) = clippable(64);
+        // An anchor of 64 and a ceiling of 16: the ratchet says 128 is
+        // affordable and the impl says 16 is executable.
+        measured_window(&handle, &admission, 64);
+        assert_eq!(ledger.health()[0].workers[0].max_units_measured, 64);
+        clipped_window(&handle, &admission, 16);
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            worker.max_units_measured, 64,
+            "the anchor is a statement about memory and is untouched"
+        );
+        assert_eq!(worker.unit_budget, 16, "but the budget is not");
+
+        // Applied *before* deflation, so a deflating replica keeps halving
+        // from the capped budget rather than being propped up by it.
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        });
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.deflation, 1);
+        assert_eq!(worker.unit_budget, 8, "16 >> 1, not 16");
     }
 
     /// The settle line's `clamped` field: the count alone cannot say whether

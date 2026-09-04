@@ -8913,6 +8913,15 @@
             "format": "int64",
             "minimum": 0
           },
+          "shape_ceiling_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Shape ceiling (run2 S1): a batch size this model's own kernels have\nsaid they cannot execute at the shapes this corpus is feeding them —\nan int32 index limit in a CUDA/HIP pooling kernel, reported as\n`clamped.reason = \"index_limit\"`. `None` until one is reported.\n\nIt caps `unit_budget` and stops the ramp, and it is **not** a memory\ncondition: it never deflates anything. Runtime-only and denominated in\nthe canvas and cost epoch shown for this replica — it is re-learned\nafter a restart and dropped when the canvas, the epoch or the corpus\nmoves, so it appears in no calibration profile.",
+            "minimum": 0
+          },
           "throughput_samples": {
             "type": "integer",
             "description": "Warm-pool throughput observations behind the knee fit. Runtime-only:\nthe store persists the fitted knee, not the series.",
