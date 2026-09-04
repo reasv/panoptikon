@@ -554,6 +554,12 @@ CONFIGURED_AS = "Configured as "
 # `UNCONFIGURED_WORKER`).
 UNCONFIGURED_WORKER = "<unconfigured>"
 DEPARTED_REPLICA = "credited a departed replica's footprint"
+# The ledger's per-negative out-of-memory tier line (run2 defect C2,
+# `ledger.rs::OomNegative::emit`): one INFO per window settled as an OOM
+# negative, carrying `source`, `trust`, `exception`, `free_mb_at_failure`,
+# `grant_mb` and `oom_samples`. Matched as a prefix of the message, whose
+# tail is the reason the line exists.
+OOM_TIER_LINE = "classified this window as an out-of-memory negative"
 
 # A pid number absent from every board for longer than this and then back is
 # read as a different process (`Context.pid_first_seen`).
@@ -1193,7 +1199,14 @@ def check_grant_safety(ctx: Context) -> Verdict:
 
 
 def check_failures(ctx: Context) -> Verdict:
-    """OOM negatives, worker deaths and merged-window fallbacks in the log."""
+    """OOM negatives, worker deaths and merged-window fallbacks in the log.
+
+    Each OOM negative also names the tier that classified it (run2 defect C2,
+    `ledger.rs::OomNegative::emit`), tallied here as `source/trust`. A
+    recording made before that line existed carries none, so the clause and
+    the `oom_tiers` number are added only when there is something to say --
+    an older scenario's verdicts are unchanged.
+    """
     if not ctx.log:
         return Verdict("failures", "SKIP", "no panoptikon.log")
     negatives = [
@@ -1210,6 +1223,20 @@ def check_failures(ctx: Context) -> Verdict:
     deaths = len(ctx.log_matching("worker died fatally"))
     fallbacks = ctx.log_matching("falling back to per-request prediction")
     oom_fallbacks = sum(1 for event in fallbacks if event["fields"].get("oom") is True)
+    tiers: Dict[str, int] = {}
+    for event in ctx.log_matching(OOM_TIER_LINE):
+        key = "{}/{}".format(event["fields"].get("source", "?"),
+                             event["fields"].get("trust", "?"))
+        tiers[key] = tiers.get(key, 0) + 1
+    tier_clause = ""
+    if tiers:
+        named = ", ".join(f"{key}={count}" for key, count in sorted(tiers.items()))
+        # A negative with no tier line is a hole in the attribution, not a
+        # rounding error: say so rather than letting the tally look complete.
+        unnamed = ooms - sum(tiers.values())
+        tier_clause = f"; tiers {named}"
+        if unnamed:
+            tier_clause += f", {unnamed} unnamed"
     expected_ooms = ctx.args.expect_ooms
     expected_deaths = ctx.args.expect_deaths
     bad = ooms > expected_ooms or deaths > expected_deaths
@@ -1220,9 +1247,11 @@ def check_failures(ctx: Context) -> Verdict:
         f"{collapses} throughput-collapse negatives, "
         f"{unified_deaths} unified-board death negatives, "
         f"{deaths} fatal worker deaths (expected <= {expected_deaths}), "
-        f"{len(fallbacks)} merged-window fallbacks ({oom_fallbacks} OOM)",
+        f"{len(fallbacks)} merged-window fallbacks ({oom_fallbacks} OOM)"
+        f"{tier_clause}",
         {"negative_reasons": reasons, "worker_deaths": deaths,
          "fallbacks": len(fallbacks), "oom_fallbacks": oom_fallbacks,
+         **({"oom_tiers": tiers} if tiers else {}),
          "first_death": (ctx.log_matching("worker died fatally") or [{}])[0].get("line")},
     )
 

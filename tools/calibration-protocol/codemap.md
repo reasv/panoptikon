@@ -649,7 +649,12 @@ Added by commit `49822c8b` (ledger.rs / calibration.rs):
   emitted immediately before that window's own WARN. Run2 defect **C2**:
   before this, only the *vetoed* `message_pattern` path printed, so a
   deflation the ledger trusted outright could not be attributed to a tier
-  from the log at all. `ledger.rs`, `OomNegative::emit`
+  from the log at all. `ledger.rs`, `OomNegative::emit`. Read by
+  `analyze.py`'s `failures` check, which tallies `source/trust` per
+  negative and names any negative the tally could not attribute
+  (`; tiers marker/trusted=5954`); the clause and the `oom_tiers` number
+  appear only when the recording carries the line, so a pre-C2 leg's
+  verdicts are byte-identical
 - DEBUG "refitted the memory cost model" (slope_mb_per_unit,
   intercept_mb, residual_mb, samples, version)
 - DEBUG "refreshed the board's free memory from the host probe" (gpu,
