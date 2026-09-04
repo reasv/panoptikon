@@ -61,6 +61,20 @@ Policies are selected by effective host and/or listener endpoint: in
 anything, both non-empty means both must match, and at least one must be
 non-empty. Policies are checked in config order and the first match wins, so
 endpoint-scoped policies should be listed before broad host policies.
+
+The **effective host** is, in precedence order: the `Forwarded` /
+`X-Forwarded-Host` host when `[server] trust_forwarded_headers` is on; else
+the authority of the request target; else the `Host` header. The middle
+source is what makes `hosts` work over HTTP/2: an HTTP/2 request carries its
+authority in the `:authority` pseudo-header and sends no `Host` header at all
+(RFC 9113 §8.3.1), and the gateway serves HTTP/2 cleartext on every listener
+(its own inference client speaks h2c to it). An HTTP/1.1 absolute-form request
+target is the same field, which RFC 9112 §3.2.2 likewise makes override
+`Host`. All of these are chosen by the client — matching on `hosts` is
+convenience routing, not a trust boundary; `endpoints` is the non-spoofable
+one. A request with neither an authority nor a `Host` is hostless, and only
+policies that state no `hosts` (endpoint-scoped ones) can match it.
+
 Policies then optionally restrict API routes via reusable
 rulesets. DB-aware API routes always receive explicit `index_db` and
 `user_data_db` query parameters, and the gateway validates or rewrites them per

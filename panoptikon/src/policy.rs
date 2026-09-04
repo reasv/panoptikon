@@ -469,6 +469,35 @@ fn needs_db_params(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/")
 }
 
+/// The host a request claims for itself, normalized (port and any IPv6
+/// brackets removed, lowercased) for `[policies.match] hosts` comparison.
+///
+/// Sources, highest precedence first:
+///
+/// 1. `Forwarded` / `X-Forwarded-Host`, but only when `[server]
+///    trust_forwarded_headers` is set — the reverse-proxy deployment, where
+///    the front proxy, not this request's own framing, is the authority on
+///    the name the client used.
+/// 2. The **request target's authority**. An HTTP/2 request carries its
+///    authority in the `:authority` pseudo-header and normally sends no
+///    `Host` header at all (RFC 9113 §8.3.1); hyper puts that authority on
+///    the request URI, so it is what `req.uri().authority()` returns. The
+///    same field carries an HTTP/1.1 absolute-form request target, which
+///    RFC 9112 §3.2.2 likewise makes override `Host`.
+/// 3. The `Host` header — the ordinary HTTP/1.1 origin-form request, whose
+///    URI has no authority at all, so this is the only source there.
+///
+/// Reading the authority introduces no new trust: `:authority` is exactly as
+/// client-controlled as `Host`, and any client that can set one can set the
+/// other. The precedence only decides which of two client-chosen names picks
+/// a policy in the malformed case where both are present and disagree (RFC
+/// 9113 §8.3.1 requires them to be consistent); the request target wins,
+/// matching what both HTTP versions say the authority *is*. Non-spoofable
+/// routing remains the listener endpoint (`ListenerEndpoint`), as before.
+///
+/// A request with neither an authority nor a `Host` is still hostless
+/// (`None`), and `select_policy` then matches only policies that state no
+/// `hosts`.
 fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<String> {
     if trust_forwarded {
         if let Some(value) = header_to_str(req.headers().get("forwarded"))
@@ -481,6 +510,16 @@ fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<
             if !host.is_empty() {
                 return Some(normalize_host(host));
             }
+        }
+    }
+
+    // `Authority::host()` already drops the port and any (deprecated, and
+    // for HTTP/2 forbidden) userinfo; normalize_host handles the IPv6
+    // brackets it keeps, and the case.
+    if let Some(authority) = req.uri().authority() {
+        let host = authority.host();
+        if !host.is_empty() {
+            return Some(normalize_host(host));
         }
     }
 
@@ -565,6 +604,11 @@ fn rule_matches(rule: &RuleConfig, method: &Method, path: &str) -> bool {
 /// endpoint. An empty `hosts`/`endpoints` list matches anything, including
 /// an unknown host/endpoint (`None`); a non-empty list requires a known
 /// value that matches.
+///
+/// `host` is what `resolve_effective_host` resolved, which is the HTTP/2
+/// `:authority` for an HTTP/2 request just as it is the `Host` header for an
+/// HTTP/1.1 one — a request is hostless (`None`) only when it carries
+/// neither, at which point every policy that states any `hosts` declines it.
 pub(crate) fn select_policy<'a>(
     settings: &'a Settings,
     host: Option<&str>,
@@ -1216,6 +1260,222 @@ allow = "*"
         // never match, hosts-only ones are unaffected.
         assert_eq!(name(Some("localhost"), None), Some("localhost"));
         assert_eq!(name(None, None), None);
+    }
+
+    /// Every source `resolve_effective_host` reads, and their precedence.
+    /// The authority case is the HTTP/2 one: hyper builds the request URI
+    /// from `:authority`, and an HTTP/2 request sends no `Host` header at
+    /// all (RFC 9113 §8.3.1), so a gateway that only read `Host` saw every
+    /// HTTP/2 request as hostless — including its own h2c self-calls to the
+    /// local inference surface (run2 defect P1).
+    #[test]
+    fn effective_host_reads_authority_host_and_forwarded() {
+        let resolve = |req: Request<Body>, trust: bool| resolve_effective_host(&req, trust);
+        let req = |build: fn(axum::http::request::Builder) -> axum::http::request::Builder| {
+            build(Request::builder()).body(Body::empty()).unwrap()
+        };
+
+        // HTTP/1.1 origin-form: no authority on the URI, `Host` is it.
+        assert_eq!(
+            resolve(
+                req(|b| b.uri("/api/items").header("host", "Example.Local:8080")),
+                false
+            ),
+            Some("example.local".to_string())
+        );
+        // HTTP/2: authority on the URI, no `Host` header anywhere.
+        assert_eq!(
+            resolve(req(|b| b.uri("http://Example.Local:8080/api/items")), false),
+            Some("example.local".to_string())
+        );
+        // Both present and disagreeing is malformed per RFC 9113 §8.3.1;
+        // the request target's authority is what both HTTP versions call
+        // the authority, so it wins. Neither value is more trusted than the
+        // other — both are chosen by the same client.
+        assert_eq!(
+            resolve(
+                req(|b| b
+                    .uri("http://authority.local/api/items")
+                    .header("host", "header.local")),
+                false
+            ),
+            Some("authority.local".to_string())
+        );
+        // IPv6 literal authority: brackets and port stripped, like `Host`.
+        assert_eq!(
+            resolve(req(|b| b.uri("http://[::1]:6342/api/items")), false),
+            Some("::1".to_string())
+        );
+        // Userinfo (deprecated, and forbidden in `:authority`) is not the
+        // host: `Authority::host()` skips it.
+        assert_eq!(
+            resolve(
+                req(|b| b.uri("http://user@authority.local/api/items")),
+                false
+            ),
+            Some("authority.local".to_string())
+        );
+        // Neither source: hostless, exactly as before.
+        assert_eq!(resolve(req(|b| b.uri("/api/items")), false), None);
+
+        // Trusted forwarded headers still outrank both — the reverse-proxy
+        // deployment is unchanged by any of the above.
+        assert_eq!(
+            resolve(
+                req(|b| b
+                    .uri("http://authority.local/api/items")
+                    .header("host", "header.local")
+                    .header("x-forwarded-host", "front.local")),
+                true
+            ),
+            Some("front.local".to_string())
+        );
+        assert_eq!(
+            resolve(
+                req(|b| b
+                    .uri("http://authority.local/api/items")
+                    .header("forwarded", "host=fwd.local;proto=https")),
+                true
+            ),
+            Some("fwd.local".to_string())
+        );
+        // Untrusted, the same headers are ignored and the authority stands.
+        assert_eq!(
+            resolve(
+                req(|b| b
+                    .uri("http://authority.local/api/items")
+                    .header("x-forwarded-host", "front.local")),
+                false
+            ),
+            Some("authority.local".to_string())
+        );
+    }
+
+    /// The same through apply_policy: a request carrying only an authority
+    /// (the shape hyper hands over for HTTP/2) selects the host policy it
+    /// names, instead of being refused 403 `no_policy`.
+    #[test]
+    fn authority_only_request_selects_the_host_policy() {
+        let settings = endpoint_settings();
+        let key = TokenKey::random();
+
+        let mut req = Request::builder()
+            .uri("http://localhost:6342/api/items")
+            .body(Body::empty())
+            .unwrap();
+        let decision = apply_policy(&mut req, &settings, &key).unwrap();
+        assert_eq!(decision.policy.name, "localhost");
+
+        // An authority no policy states is still refused, as a `Host` of
+        // the same name would be.
+        let mut req = Request::builder()
+            .uri("http://unknown.local/api/items")
+            .body(Body::empty())
+            .unwrap();
+        let err = apply_policy(&mut req, &settings, &key)
+            .err()
+            .expect("an unstated authority must not match a host policy");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.reason, "no_policy");
+    }
+
+    /// Settings for the h2c integration test: one hosts-only policy, no
+    /// endpoint-scoped or hostless catch-all, so the effective host is the
+    /// only thing that can select a policy.
+    const H2C_SETTINGS: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[rulesets.allow_all]
+allow_all = true
+
+[[policies]]
+name = "named-host"
+ruleset = "allow_all"
+
+[policies.match]
+hosts = ["authority.test"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#;
+
+    /// The real PolicyLayer over a real `axum::serve` socket, reached by a
+    /// real HTTP client on both versions: HTTP/1.1 with a `Host` header and
+    /// HTTP/2 cleartext with prior knowledge (`:authority`, no `Host`) must
+    /// resolve the same policy for the same URL. This is the gateway's own
+    /// inference self-call shape (`inferio_client.rs`), which run2 turned
+    /// h2c and which every `Host`-only host resolution answered 403
+    /// `no_policy`.
+    #[tokio::test]
+    async fn h2c_authority_selects_the_same_policy_as_http1_host() {
+        async fn echo_policy(axum::Extension(context): axum::Extension<PolicyContext>) -> String {
+            context.policy_name
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(&path, H2C_SETTINGS).unwrap();
+        let settings = Arc::new(Settings::load(Some(path)).unwrap());
+        let token_key = Arc::new(TokenKey::random());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // `axum::serve` builds hyper-util's *auto* connection builder, which
+        // sniffs the HTTP/2 client preface — the same one production uses,
+        // so both versions arrive on this one port.
+        let app = axum::Router::new()
+            .route("/api/items", axum::routing::get(echo_policy))
+            .layer(PolicyLayer::new(settings, token_key));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Both clients resolve the policy's stated host to this socket, so
+        // the only difference between the two legs is the HTTP version —
+        // and therefore whether the authority travels in `Host` or in
+        // `:authority`.
+        let http1 = reqwest::Client::builder()
+            .resolve("authority.test", addr)
+            .build()
+            .unwrap();
+        let h2c = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .resolve("authority.test", addr)
+            .build()
+            .unwrap();
+        let named = format!("http://authority.test:{}/api/items", addr.port());
+        let literal = format!("http://127.0.0.1:{}/api/items", addr.port());
+
+        let response = http1.get(&named).send().await.unwrap();
+        assert_eq!(response.version(), reqwest::Version::HTTP_11);
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "named-host");
+
+        let response = h2c.get(&named).send().await.unwrap();
+        // Assert the version too: a silent fallback to HTTP/1.1 would make
+        // the rest of this leg vacuous.
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "named-host");
+
+        // ...and the authority is matched, not merely tolerated: a request
+        // naming a host no policy states is refused on both versions.
+        let response = http1.get(&literal).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        let response = h2c.get(&literal).send().await.unwrap();
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     }
 
     /// End-to-end through apply_policy: the ListenerEndpoint request
