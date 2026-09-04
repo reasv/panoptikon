@@ -296,26 +296,36 @@ build/deploy/API. The plan that uses this is
 5. Ledger: `Responded{oom: true}` → `deflation + 1`; nothing enters
    fit/anchor.
 6. Core (`jobs/extraction.rs`): predict failure → `isolate_inputs` once
-   with `max_batch = 1` (`:1402-1425`); still failing → item marked
+   with `max_batch = 1` (`:2346-2376`, `ISOLATION_MAX_BATCH` `:2467`,
+   `isolate_inputs` `:2479`); still failing → item marked
    transient, job continues; job fails "Systemic" only if every
-   attempted item failed for non-media reasons. `inferio_client.rs:383-389`
+   attempted item failed for non-media reasons. `inferio_client.rs:920-925`
    retries only 429/502/503/504/connect/timeout, not a 500 from an OOM.
-- **Death, seen from the job** (R2a): the predict 500 for a fatal worker
-  now carries a machine-readable kind —
+- **Death, seen from the job** (R2a): the predict 500 for a request that
+  never reached a model now carries a machine-readable kind —
   `{"detail": {"kind": "worker_died", "message", "model", "last_error"}}`,
-  built by `structured_error` (`http.rs:170`) when the error chain
-  contains `FATAL_WORKER_MARKER "failed fatally"` (`:107`) and the load
-  marker does not (load failures keep precedence). The client parses it
-  into the typed `InferenceFailure` (`inferio_client.rs:121`, reached
-  with `inference_failure()`), and `jobs::extraction::run_item_inference`
-  (`:2134`) re-submits that item's work **once**
-  (`classify_item_failure` `:2205`, one retry per item per job, counted
+  built by `structured_error` (`http.rs:276`). What earns it is
+  `classify_predict_failure` (`:199`): the chain matches one of the five
+  `UNATTEMPTED_REQUEST_MARKERS` (`:129`) — `failed fatally`,
+  `exited while idle`, `is dead after a previous fatal error`,
+  `dropped the request`, `was unloaded` — each cited to the one place
+  that formats it, because a single death renders a *different* string
+  per affected request depending on where it was standing. A load failure
+  of **this model's id** keeps precedence (`LOAD_FAILURE_MARKER` `:164`,
+  anchored so a stale line in a worker's stderr tail cannot forge one).
+  The classification is by text because `ModelManager::predict` answers a
+  bare `anyhow` chain; the typed replacement is an open item on
+  `worker.rs`/`dispatch.rs`/`manager.rs`. The client parses it into the
+  typed `InferenceFailure` (`inferio_client.rs:121`, reached with
+  `inference_failure()`), and `jobs::extraction::run_item_inference`
+  (`:2179`) re-submits that item's work **once**
+  (`classify_item_failure` `:2250`, one retry per item per job, counted
   in `JobCounters::requeued_items`); `run_chunked_inference` skips its
   isolation pass for it (`is_unit_agnostic_failure`), since isolating
   would re-ask a dead worker once per unit. Items that fail again are
   recorded in `data_job_failures` and the job reports **partial**. A
   `load_cooldown` 503 (R9) instead aborts the job through `JobAbort`
-  (`:696`) with the model, retry instant and last error as the reason.
+  (`:715`) with the model, retry instant and last error as the reason.
 - Worker death mid-window: `roundtrip` EOF → fatal (`worker.rs:1305-1315,
   1422-1444`); dispatcher `End::Fatal` fails the queue, aborts sibling
   windows, kills all replicas; `handle_worker_death`
@@ -363,18 +373,21 @@ build/deploy/API. The plan that uses this is
   524 288, the same pair as a bare login shell — and `soft_nofile_limit`
   feeds `jobs::extraction::in_flight_unit_ceiling` a descriptor term.
   **R10' made that term a function of the transport**
-  (`InFlightTransport`, `extraction.rs:130`; the ceiling `:215`):
+  (`InFlightTransport`, `extraction.rs:130`; the ceiling `:224`):
   - `PerRequest` (the HTTP/1.1 fallback) keeps the original
     `by_fds = (soft − FD_RESERVE 256) / FDS_PER_IN_FLIGHT_ITEM 2`
     (`extraction.rs:117,170`), which **caps** the other two terms rather
     than joining the max;
-  - `Multiplexed` (h2c) has no per-unit socket cost at all: the whole
-    window costs `FDS_PER_POOLED_CONNECTION 2 ×
-    INFERENCE_POOL_CONNECTIONS 4` = **8** descriptors
-    (`extraction.rs:124`, `inferio_client.rs:281`), so the window is
-    whatever the byte budget and the loader slots allow, and the only
-    check left is a WARN when even the pool plus the reserve does not
-    fit. The clamp stays in both modes as defence in depth.
+  - `Multiplexed` (h2c) has no per-unit socket cost at all
+    (`extraction.rs:124`, `inferio_client.rs:286`), so the window is
+    whatever the byte budget and the loader slots allow. What bounds
+    sockets there is the client's own gate,
+    `INFERENCE_MAX_CONCURRENT_REQUESTS 256`, so the only check left is a
+    WARN when `FD_RESERVE 256 + 2 × 256 = 768` does not fit the soft
+    limit — the worst case, a peer that allows one stream per
+    connection. Against a peer generous with streams the real cost is the
+    pool, 8 descriptors. The clamp stays in both modes as defence in
+    depth.
   The job picks the mode from `InferencePool::requests_are_multiplexed`
   (`jobs/inference_pool.rs:51`), read after the model load (which is what
   resolves each endpoint's transport); an endpoint nothing has reached
@@ -389,13 +402,22 @@ build/deploy/API. The plan that uses this is
   HTTP/1.1 client, both with `pool_max_idle_per_host =
   INFERENCE_POOL_CONNECTIONS 4`, plus a semaphore of
   `INFERENCE_MAX_CONCURRENT_REQUESTS 256`
-  (`INFERENCE_POOL_CONNECTIONS × H2_STREAMS_PER_CONNECTION 64`, `:301`)
-  applied on the h2c path only. `Transport` (`:260`) is resolved once per
-  endpoint by a `GET /cache` probe sent with prior knowledge (`transport`
-  `:409`): *any* HTTP answer means `H2c`, a transport error means
-  `Http11`; the result is remembered and cleared again on a connect /
-  request error so a restarted peer is re-probed. `known_transport`
-  (`:449`) reads it without probing, for the descriptor budget above. The
+  (`INFERENCE_POOL_CONNECTIONS × H2_STREAMS_PER_CONNECTION 64`, `:322`)
+  taken in **both** transports (`active` `:609`) — HTTP/1.1 is the one
+  where a request costs a whole socket, and it is reachable after a job
+  has already sized its window for multiplexing. `Transport` (`:260`) is
+  resolved once per endpoint by a `GET /cache` probe sent with prior
+  knowledge (`transport` `:445`): *any* HTTP answer means `H2c`. A
+  downgrade is only recorded on **positive evidence** — a failure that
+  could be a refusal (`could_be_an_http2_refusal` `:546`: not connect,
+  not timeout), repeated, and then the peer answering the same request
+  over HTTP/1.1 (`peer_answers_http11` `:521`). Anything else records
+  nothing and re-probes next call, because one wrong memo costs the
+  endpoint its multiplexing for the life of the process. The memo is
+  cleared on a connect/request error by `predict` and by `checked_send`
+  (`:579`), which every other call goes through, so it cannot be stale
+  upward either. `known_transport` (`:553`) reads it without probing, for
+  the descriptor budget above. The
   server end needs nothing beyond axum's `http2` feature: `axum::serve`
   builds hyper-util's version-sniffing auto builder (`main.rs:711`).
 - **`PR_SET_PDEATHSIG` is thread-scoped**, and this was run1's blocker
@@ -437,17 +459,17 @@ build/deploy/API. The plan that uses this is
   Lock order and the no-deadlock argument are in the `manager.rs` module
   docs.
 - Core request sizing (**changed by the §8 G7 fix; the feedback signal is
-  implemented**): `REQUEST_UNIT_BUDGET = 64` (`extraction.rs:66`) is now
+  implemented**): `REQUEST_UNIT_BUDGET = 64` (`extraction.rs:70`) is now
   only the per-request chunk. The per-job in-flight total is a resizable
-  `UnitBudget` (`extraction.rs:152`, state `:159`, built at `:712`) that
+  `UnitBudget` (`extraction.rs:304`, state `:311`, built at `:1151`) that
   follows a figure the orchestrator publishes on every predict response:
-  `observe` (`:201`) grows by `add_permits` and shrinks by withholding
+  `observe` (`:353`) grows by `add_permits` and shrinks by withholding
   only *free* permits (`forget_permits`), retrying the remainder as
-  outstanding permits return (`settle` `:237`); it is called from
-  `predict_units` (`:1679`, `settle` on the error path `:1680`). Floor
-  `MIN_IN_FLIGHT_UNITS = 64` (`:87`, also the starting value, and a
+  outstanding permits return (`settle` `:389`); it is called from
+  `predict_units` (`:2433`, `settle` on the error path `:2434`). Floor
+  `MIN_IN_FLIGHT_UNITS = 64` (`:91`, also the starting value, and a
   deadlock bound since one chunk acquires up to 64 permits at once);
-  ceiling `in_flight_unit_ceiling` (`:215`) =
+  ceiling `in_flight_unit_ceiling` (`:224`) =
   `wanted = max(intermediate_budget_kib / NOMINAL_UNIT_KIB,
   loader_concurrency × 64, 64)` with `NOMINAL_UNIT_KIB = 256` (`:100`),
   then `min(wanted, max(by_fds, 64))` on the HTTP/1.1 path and `wanted`
@@ -489,7 +511,7 @@ build/deploy/API. The plan that uses this is
   is only the unpriced-window bound now.
 - Per-DB config: `cron_jobs[].batch_size` and
   `job_settings[].default_batch_size` are `Option<i64>` caps, `None` =
-  auto; cap chain `resolve_job_defaults` (`extraction.rs:1865-1908`):
+  auto; cap chain `resolve_job_defaults` (`extraction.rs:2820-2879`):
   request > per-ID setting > group setting. `data_log.batch_size` stores
   0 for auto. `POST /api/jobs/data/extraction?batch_size=` is an optional
   cap. The Desktop wizard cannot clear a stored cap
@@ -647,20 +669,26 @@ occurred_at)` — one row per item a job attempted, could not finish, and has
 it suppresses nothing and the item is selected again next run
 (`docs/failed-media-retry-design.md`, "The other half"). `job_id` is not a
 foreign key (job rows are deleted); retention is
-`prune_orphan_job_failures` (`:143`), run from `remove_incomplete_jobs` at
-the start of every extraction job. Written once at the end of the job
-(`record_job_failures` `:103`), buffered in `JobCounters::failures` and
-bounded at `MAX_RECORDED_JOB_FAILURES = 10 000`
-(`extraction.rs:576`) — the counts in `data_log` stay exact.
+`prune_orphan_job_failures` (`:151`), run from `remove_incomplete_jobs` at
+the start of every extraction job — which under `atomic_extraction_jobs`
+(off by default) is also when an unfinished job's rows go. Written once at
+the end of the job (`record_job_failures` `:112`), buffered in
+`JobCounters::failures` and bounded at `MAX_RECORDED_JOB_FAILURES = 10 000`
+(`extraction.rs:591`) — the counts in `data_log` stay exact. Each record
+carries the `occurred_at` the job stamped when the item failed
+(`note_job_failure` `:600`), not the moment of the batched write.
 
 `data_log` gains `outcome` (`''`/`completed`/`partial`/`failed`/`cancelled`;
 `''` on every pre-existing row, rendered as `running`) and
 `failure_reason`. Every terminal path writes them: the normal end, the
-early-return path through `finalize_unfinished_job` (`extraction.rs:853`,
+early-return path through `finalize_unfinished_job` (`extraction.rs:891`,
 which is what gives a failed job a real `end_time` — run1 finding T8), and
-the cancel path through the `CancelledJobStamp` drop guard (`:793`) plus
-`finalize_cancelled_job` (`db/extraction_write.rs:150`), whose statement is
-guarded so either order of the two is correct. The queue's
+the cancel path through the `CancelledJobStamp` drop guard (`:812`, which
+also flushes the job's buffered failure records) plus
+`finalize_cancelled_job` (`db/extraction_write.rs:153`), whose statement is
+guarded so either order of the two is correct. A per-item progress update
+that lands after any of them is refused rather than reopening the row
+(`update_data_log`'s `outcome = ''` guard). The queue's
 `JobOutcomeStatus` gains `partial` (`jobs/queue.rs`).
 
 ### 1.10 Suspected weak points (ranked; plan §5 maps each to a scenario)
