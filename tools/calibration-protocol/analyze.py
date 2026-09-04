@@ -317,6 +317,7 @@ class Context:
         self.worker_re = re.compile(self.args.worker_pattern)
         self.worker_spawns = _worker_spawns(self.log)
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
+        self._pid_first_seen: Optional[Dict[int, float]] = None
 
     # -- joining ----------------------------------------------------------
     def vram_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
@@ -372,6 +373,40 @@ class Context:
             if proc.get("used_mb"):
                 total += int(proc["used_mb"])
         return total, pids
+
+    def pid_first_seen(self) -> Dict[int, float]:
+        """The first oracle sample in which each PID held memory on any board.
+
+        NVML lists a process from its first allocation, so this is the earliest
+        moment the recording can prove the process existed -- which is what
+        makes it a usable lower bound on "was this PID already there before the
+        replica under test was spawned?".
+        """
+        if self._pid_first_seen is None:
+            first: Dict[int, float] = {}
+            for sample in self.vram_samples:  # in time order
+                for board in sample.get("gpus", []):
+                    for proc in board.get("procs", []):
+                        first.setdefault(proc["pid"], sample["t_wall"])
+            self._pid_first_seen = first
+        return self._pid_first_seen
+
+    def replica_spawn_t(self, model: str, admitted_t: float) -> Optional[float]:
+        """When the worker process behind this replica was forked, if known.
+
+        The latest `spawned an inferio worker` line that `_worker_spawns` could
+        tie to this model and that precedes the admission. `None` when the log
+        carries no spawn line for the model -- a leg logged below
+        `panoptikon::inferio=debug` has none at all, and the caller must then
+        say so rather than pretend the cross-check ran.
+        """
+        best: Optional[float] = None
+        for spawn in self.worker_spawns:
+            if spawn["model"] != model or spawn["t_wall"] > admitted_t:
+                continue
+            if best is None or spawn["t_wall"] > best:
+                best = spawn["t_wall"]
+        return best
 
     def log_events(self, message: str) -> List[Dict[str, Any]]:
         return [event for event in self.log if event["message"] == message]
@@ -647,6 +682,29 @@ def check_base_accuracy(ctx: Context) -> Verdict:
                          "note": f"{len(pids)} worker PIDs on the board: "
                                  "attribution is ambiguous"})
             continue
+        # One PID on the board is not evidence that it is *this* replica's. A
+        # worker whose identity the recording missed is invisible to
+        # `our_pids_mb`, and then some *other*, older worker is the only PID
+        # left standing and gets waved through: run1/S9 measured nemotron's
+        # `base_mb` against the MiniLM worker's process and reported 346.7%.
+        # So the PID must not predate the replica: it cannot have been holding
+        # memory before its own process was forked.
+        spawn_t = ctx.replica_spawn_t(model, info["t_wall"])
+        first_seen = ctx.pid_first_seen().get(pids[0])
+        if spawn_t is not None and first_seen is not None and first_seen < spawn_t:
+            rows.append({"model": model, "gpu": uuid, **info, "pid": pids[0],
+                         "oracle_sum_mb": ours,
+                         "pid_predates_spawn_s": round(spawn_t - first_seen, 3),
+                         "note": "the loading worker's PID is not attributable "
+                                 f"in the oracle: PID {pids[0]} was already on "
+                                 f"the board {spawn_t - first_seen:.1f}s before "
+                                 "this replica's worker was spawned"})
+            continue
+        spawn_check = ("pid is at or after the replica's spawn line"
+                       if spawn_t is not None else
+                       "no spawn line for this model in the log "
+                       "(needs panoptikon::inferio=debug): PID attribution is "
+                       "not cross-checked")
         # The lifetime minimum is a second, weaker estimate of the same thing.
         floor = None
         for sample in ctx.vram_samples:
@@ -659,7 +717,7 @@ def check_base_accuracy(ctx: Context) -> Verdict:
         error = abs(info["base_mb"] - ours)
         rows.append({"model": model, "gpu": uuid, **info, "pid": pids[0],
                      "oracle_pid_mb": ours, "oracle_pid_min_mb": floor,
-                     "error_mb": error,
+                     "error_mb": error, "spawn_check": spawn_check,
                      # How far after the admission the oracle sample sits. A
                      # model that loads and runs its first batch inside one
                      # sample period cannot be resolved: the sample then
