@@ -539,6 +539,48 @@ units / 40 % by budget, and the binding constraint was neither memory nor
 the knee but the **job's length** — one doubling per settled window, so
 2 000 items buys 10 windows (finding N7).
 
+### S2-base Resident-idle plateau (the `base_accuracy` leg)
+Same configuration and models as S2, but **nothing is inferred**. Load
+each model under test through `PUT /api/inference/load/{group}/{id}`
+(`inferio/http.rs: load_model`, and `loadgen.py --prewarm-only --hold 90`
+drives exactly that), then hold every one of them resident and idle for
+**≥ 60 s** before any predict, with `vramrec.py` and `healthrec.py`
+running and no job in the queue. Two minutes per configuration; run it
+once, early, and re-run it after any change to how a worker measures its
+own load footprint.
+
+The leg exists because `base_accuracy` had no way to be judged. The only
+oracle samples that measure the same quantity as a worker's `base_mb`
+are those between the replica's load `ok` and its **first grant or
+predict** — after that the process holds the batch's cuBLAS/cuDNN
+workspace as well as its base. A demand-driven load starts its first
+batch 0–92 ms after the admission while the oracle runs at 1–4 Hz, so in
+run1 that window was empty in **42 of 60 legs** and the check could only
+report. Holding the models idle turns the window into hundreds of
+samples. Check:
+- `base_accuracy` **PASS**, not INFO: every row judged
+  (`cadence_blind: false`, no `[report-only: …]` on the verdict) with
+  `oracle_window_samples` in the hundreds, and `error_pct` within a few
+  percent — the threshold is 10 %, and the two clean plateaus run1
+  recorded by accident both read **0.0 %** (nemotron 3 788 MiB flat over
+  714 samples in `S6-b18-loadstall`; wd-vit 964 in `S8-pixmix`).
+- Every model resident at once: `lru_size` at least the model count (or
+  one `cache_key` each) and `ttl_seconds` longer than the hold, or a
+  later load evicts an earlier model and its window closes at the
+  departure instead of the end of the hold.
+- A row that stays unjudged is a **defect in the leg**, not a finding —
+  something predicted (`first_work_dt_ms` names the moment), a model was
+  evicted, or the load failed (`loadgen.py` exits non-zero and its
+  `kind: "hold"` record lists `models_failed`). The one honest
+  exception is a `base_method` other than `nvml`, which is not the
+  oracle's quantity and is reported, never judged.
+- Nothing else is asserted here: no ramp, no store, no throughput. The
+  leg's whole content is that `base_mb` is what the process actually
+  holds when it holds nothing else.
+
+*Unrun as of run1; the tooling is in place (`loadgen.py --prewarm-only`,
+`tools/calibration-protocol/README.md` "S2-base").*
+
 ### S3 Restart and resume
 Restart C1 after S2; run a fresh `ramp` corpus for the same model.
 Check: first window's `unit_budget` equals the persisted anchor (no

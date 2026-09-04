@@ -27,7 +27,7 @@ schema; this table is the index, not the reference.
 | `hog.py` | External-pressure generator (GPU via torch, RAM via numpy) with schedules and an HTTP control endpoint. |
 | `corpus.py` | Deterministic media corpus with a per-item unit-cost manifest. |
 | `healthrec.py` | Polls `/api/inference/health` and `/api/jobs/queue` at 500 ms. JSONL. |
-| `loadgen.py` | Concurrent `POST /api/inference/predict/<id>` driver for contention scenarios. |
+| `loadgen.py` | Concurrent `POST /api/inference/predict/<id>` driver for contention scenarios; `--prewarm-only` loads and holds idle instead (the S2-base plateau leg). |
 | `ceiling_probe.py` | Ground-truth base/slope/OOM boundary per model, outside the orchestrator. |
 | `analyze.py` | Joins the recordings and prints the §6 verdict table. |
 | `oracle_calibrate.py` | The §2 instrument calibration: does the oracle see a known allocation? One command, PASS/FAIL. |
@@ -342,19 +342,25 @@ self-test exposed, and the last one closes a hole run2 found in
   window, so the check compared nemotron's `base_mb` against the *MiniLM*
   worker's process). A PID is now recognised as ours by the gateway's own
   `spawned an inferio worker … pid=Some(N)` line as well as by its recorded
-  cmdline/environ, so a recording already on disk re-analyses correctly. The
-  attributed PID must not predate the replica's spawn line, or the row is left
-  unjudged with a note. And the reading is the **minimum over the samples
-  between the load `ok` and the replica's first grant or predict** — from that
-  instant the process holds the batch's workspace too — with
-  `oracle_pid_min_mb` a post-load minimum rather than a lifetime one. A
+  cmdline/environ, so a recording already on disk re-analyses correctly. Among
+  our PIDs on the board the row takes **the freshest sighting inside
+  [spawn, admission]** — the replica is admitted the instant its own worker
+  finishes loading, so the newest process is the one that just came up — and
+  declines only when nothing on the board fits: a board holding several of our
+  workers is resolved, not waved through and not skipped. And the reading is
+  the **minimum over the samples between the load `ok` and the end of the
+  replica's idle window**, which closes at its first grant or predict (from
+  that instant the process holds the batch's workspace too) or at its
+  departure from the board (from that instant it is tearing the model down,
+  which reads *below* base and would win the minimum outright). Same bounds
+  for `oracle_pid_min_mb`, a post-load minimum rather than a lifetime one. A
   demand-driven load starts its first batch tens of milliseconds after the load
   `ok`, so at 1–4 Hz that window is usually **empty**: the row then reports its
   numbers as **INFO** with the reason instead of FAILing on a reading that
-  provably contains workspace. To get a judged row, sample faster or give the
-  scenario a model that loads without immediately predicting (`S6-b18-loadstall`
-  holds nemotron resident and idle for 178 s at 3 788 MiB, which is `base_mb`
-  to the megabyte).
+  provably contains workspace. To get a judged row, sample faster or run a leg
+  that loads without predicting — **`S2-base`** below is that leg, and
+  `S6-b18-loadstall` is run1's accidental one (nemotron resident and idle for
+  178.5 s over 714 samples at 3 788 MiB, `base_mb` to the megabyte, 0.0 %).
 
 ### Recording file descriptors
 
@@ -429,6 +435,66 @@ curl -s "http://127.0.0.1:6342/api/jobs/data/history?index_db=cal&page=1&page_si
 $V $T/analyze.py --scenario "$DIR" --probe "$DIR/probe-wd.json" --learning \
     --json "$DIR/verdicts.json" --plot "$DIR/timeline.png"
 ```
+
+### S2-base — the leg that gives `base_accuracy` something to judge
+
+`base_accuracy` can only judge a replica from the samples between its load and
+its **first grant or predict**; past that instant the process holds the batch's
+workspace as well as its base. A demand-driven load starts its first batch tens
+of milliseconds after the load `ok`, so at 1–4 Hz that window is normally empty
+and every row is reported unjudged (run1: 42 of 60 legs INFO). `S2-base` is the
+leg that fixes that, by loading each model under test and then doing **nothing**
+for at least 60 s, which is hundreds of samples of flat plateau at oracle
+cadence. No corpus, no job queue, no hog — the whole point is the absence of
+work. Run it once per configuration; it takes about two minutes.
+
+```bash
+V=python/.venv/bin/python
+T=tools/calibration-protocol
+RUN=20260904-c1
+DIR=$($V $T/newrun.py --scenario S2-base --run-id $RUN --config C1 \
+        --note "prewarm and hold: base_accuracy plateau")
+
+# The gateway must be up with the standard calibration logging
+# (RUST_LOG=info,panoptikon::inferio=trace ...), and no job may be running.
+$V $T/vramrec.py   --out "$DIR/vramrec.jsonl" --interval 0.25 &
+$V $T/healthrec.py --out "$DIR/healthrec.jsonl" &
+
+# `lru_size` must be at least the number of models sharing the cache key, or
+# the second load evicts the first and only the last model is resident.
+$V $T/loadgen.py --base http://127.0.0.1:6342 --out "$DIR/loadgen.jsonl" \
+    --prewarm-only --hold 90 \
+    --model 'id=tags/wd-vit-tagger-v3,lru_size=4' \
+    --model 'id=clip/apple_MobileCLIP-S1,lru_size=4' \
+    --model 'id=textembed/all-MiniLM-L6-v2,lru_size=4' \
+    --model 'id=clip/nemotron-embed-vl-1b-v2,lru_size=4'
+
+kill %1 %2
+cp data/panoptikon.log "$DIR/panoptikon.log"
+$V $T/analyze.py --scenario "$DIR" --checks base_accuracy \
+    --json "$DIR/verdicts.json"
+```
+
+Expected: **`base_accuracy` PASS**, every model judged (no `[not judged: ...]`
+and no `[report-only: ...]` on the verdict), each row carrying an
+`oracle_window_samples` in the hundreds and an `error_pct` of a few percent or
+less. Read the JSON, not just the table: a row is only evidence if
+`cadence_blind` is `false`. Three things turn it back into INFO or SKIP, and
+each is a mistake in the leg rather than a finding —
+
+* **something predicted.** Anything that touches a model during the hold — a
+  running job, a stray `loadgen.py`, the UI — closes its window at the first
+  grant. `first_work_dt_ms` in the row names the moment.
+* **a model was evicted.** `lru_size` below the model count, or a
+  `ttl_seconds` shorter than the hold, ends the window early; the row's
+  `oracle_window_samples` collapses and the detail says the window closed at
+  "the replica's departure".
+* **the load failed.** `loadgen.py` exits non-zero and the `kind: "hold"`
+  record lists the model under `models_failed`.
+
+The one thing this leg cannot do is judge a `base_method` that is not `nvml`:
+a worker that fell back to a torch-allocator reading is reported and never
+judged, because it is not measuring the same quantity as the oracle.
 
 ## Phase 0 state
 
