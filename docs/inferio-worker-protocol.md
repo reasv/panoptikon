@@ -306,6 +306,21 @@ batch of canvas-bounded A4 pages stops at 28 items and a batch of square ones
 at 20, whatever the board has free. Run2's probes measured exactly that
 boundary with 3 GiB of 96 still available.
 
+**A ceiling is a statement about a device, and an impl must answer for the
+one it will run on.** The easyOCR figures above are CUDA's: the downcast is
+`safe_downcast<int, int64_t>(output.numel())` in
+`ATen/native/cuda/DilatedMaxPool2d.cu`, and torch's CPU pooling kernel
+(`ATen/native/cpu/MaxPoolKernel.cpp`) indexes in 64 bits and has no such
+limit at all. So the impl returns `None` from `max_batch_for`, and skips its
+own internal cap, whenever the model is configured for the CPU or has already
+resolved to a non-CUDA device — a `reason: "index_limit"` naming a limit that
+host does not have would be a false statement about a permanent property of
+the model. Where the device is not yet known (the harness may ask before the
+first `load`), an impl configured for the GPU should charge the ceiling: a
+missing cap costs a failed batch, a needless one costs a smaller batch.
+`run_with_oom_retry`'s halving on such a failure stays unconditional, because
+it needs no formula and so claims nothing about which kernel ran.
+
 When the ceiling trims a batch, the harness reports it as
 `clamped = {from_units, to_units, free_mb, reason: "index_limit"}` on that
 batch's measurement, and the trimmed items go to the next batch of the same
