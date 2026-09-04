@@ -1109,11 +1109,15 @@ impl InferenceApiClient {
         let mut attempts: u32 = 0;
         loop {
             let form = build_predict_form(inputs).await?;
-            // Resolved per attempt, and the permit is held for exactly the
-            // request: a retry that waited out a backoff must not keep a
-            // stream slot the whole time, and a connection error between
-            // attempts may have changed the transport.
-            let (_transport, clients, _slot) = self.active().await;
+            // Resolved per attempt, and the lease is held for exactly the
+            // request — every `continue` below drops it *before* it waits out
+            // its backoff. A retry that kept its gate permit and its lane
+            // claim across the wait would hold a concurrency slot for seconds
+            // while doing nothing, and would do it precisely when the server
+            // has just said it is overloaded. Re-resolving also matters: a
+            // connection error between attempts may have changed the
+            // transport.
+            let (_transport, clients, lease) = self.active().await;
             let response = clients
                 .raw
                 .post(&url)
@@ -1167,6 +1171,7 @@ impl InferenceApiClient {
                         && let Some(delay) = next_retry_delay(attempts)
                     {
                         attempts += 1;
+                        drop(lease);
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -1193,6 +1198,7 @@ impl InferenceApiClient {
                         && let Some(delay) = next_retry_delay(attempts)
                     {
                         attempts += 1;
+                        drop(lease);
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -2314,6 +2320,83 @@ mod tests {
                 .all(|lane| lane.in_flight.load(Relaxed) == 0),
             "every lane claim is returned with its lease"
         );
+    }
+
+    /// **A retry does not sit on a concurrency slot while it waits.**
+    ///
+    /// The gate permit and the lane claim are what bound this client's
+    /// concurrency; a request that is doing nothing but waiting out a backoff
+    /// must hold neither, and the case it matters in is the one where the
+    /// server has *just said* it is overloaded (a 503, which this loop
+    /// retries). Measured from outside, on the endpoint's own health
+    /// snapshot, while the client is provably mid-backoff.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backoff_holds_no_gate_permit_and_no_lane() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // 503 once, then answer. The first attempt therefore ends in the
+        // retry path, and the client sleeps `PREDICT_MIN_DELAY` (1s).
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = axum::Router::new().route(
+            "/api/inference/predict/{group}/{model}",
+            axum::routing::post(move || {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    if attempts.fetch_add(1, SeqCst) == 0 {
+                        return (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            "{\"detail\":{\"kind\":\"body_budget_exhausted\"}}",
+                        );
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        "{\"outputs\":[]}",
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            crate::serve_with_stream_limit(listener, app, std::future::pending()).await
+        });
+
+        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+        let runtime = Arc::clone(&client.endpoint);
+        let predicting = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+                    .await
+            }
+        });
+
+        // Sample inside the backoff: the first attempt has been answered and
+        // the second has not been sent. The window is a whole second, so a
+        // sample a fifth of the way in is not a race.
+        while attempts.load(SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            attempts.load(SeqCst),
+            1,
+            "the sample must land between the refusal and the retry"
+        );
+        let (_target, in_flight) = runtime.gate_snapshot(Some(Transport::H2c));
+        assert_eq!(in_flight, 0, "a waiting retry holds no gate permit");
+        assert_eq!(runtime.lanes_in_use(), 0, "and no lane claim either");
+
+        predicting
+            .await
+            .expect("no panic")
+            .expect("the second attempt is answered");
+        assert_eq!(attempts.load(SeqCst), 2);
     }
 
     /// Lanes are recruited by load, not spread across: the socket cost of an
