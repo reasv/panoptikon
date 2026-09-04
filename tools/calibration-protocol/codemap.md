@@ -626,10 +626,16 @@ reversible.
   this process's first CUDA initialisation (a daemon thread polling
   `torch.cuda.is_initialized()` every 5 ms, started by `begin_load` only when
   the pre-load reading came from `nvml`/`amdgpu-sysfs`, CUDA is not yet live
-  and the host is not RAM-priced; the allocator pool at that instant is
-  subtracted; accepted only within `CONTEXT_MIN_MB`..`CONTEXT_MAX_MB` =
-  64..2048), else the fixed `CONTEXT_ESTIMATE_MB = 500`. `base_method` is
-  `"alloc_delta_measured"` for the first and `"alloc_delta"` for the second.
+  and the host is not RAM-priced; the baseline is re-read every 250 ms
+  (`_CONTEXT_BASELINE_SECONDS`) while it waits, so a long load does not put an
+  external process's memory in the delta; at the flip the allocator pool is
+  read *before* the free memory and subtracted; accepted only within
+  `CONTEXT_MIN_MB`..`CONTEXT_MAX_MB` = 64..2048), else the fixed
+  `CONTEXT_ESTIMATE_MB = 500`. `base_method` is `"alloc_delta_measured"` for
+  the first and `"alloc_delta"` for the second. The probe is collected by
+  `finish_load`, or by `memory.abort_load` from `__main__`'s load-failure arm
+  (a load that raised never reaches `finish_load`, and its watcher would
+  otherwise poll for its whole 600 s deadline).
 - **Docker without `--pid=host`**: NVML reports host PIDs, so
   `os.getpid()` is never listed; one INFO line ("NVML lists no process
   with pid … expected in a container started without --pid=host",
@@ -686,9 +692,12 @@ reversible.
   told: three tiers over the same chain, in strength order — typed
   (`torch.OutOfMemoryError`, looked up through `sys.modules`; `MemoryError`),
   marker (`InferenceOOMError`, `INFERENCE_OOM` text, or the halving counter
-  moving), then a closed list of driver-shaped substrings
-  (`OOM_MESSAGE_PATTERNS`/`OOM_MESSAGE_PAIRS`) that deliberately excludes a
-  bare "out of memory" (B11). Returns the `oom_class` map
+  moving), then driver-shaped text: a listed substring that never says "out
+  of memory" itself (`OOM_MESSAGE_PATTERNS`), the `OOM_MESSAGE_PAIRS` pair, or
+  the words "out of memory" **with a device-API token as a whole word**
+  (`OOM_DEVICE_TOKENS` = cuda|hip|rocm|nvml|xpu|sycl), which covers torch's
+  four spellings and CTranslate2's. A bare "out of memory" naming no device is
+  excluded (B11). Returns the `oom_class` map
   `{source, exception, free_mb_at_failure, device}` or None, and None now
   means `oom` is absent. Rust `message_reports_oom` (Part 1 §1.6).
 - Harness on any exception (`packing.py:736-765`): unpriced measurement
