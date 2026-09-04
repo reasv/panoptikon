@@ -72,7 +72,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 MIB = 1024 * 1024
 
@@ -124,13 +124,24 @@ def _read_text(path: str) -> Optional[str]:
         return None
 
 
-def proc_cmdline(pid: int) -> Optional[str]:
+def proc_argv(pid: int) -> Optional[str]:
+    """The process's real argv, or None when /proc/<pid>/cmdline gives nothing.
+
+    Separate from `proc_cmdline` so a caller can tell a genuine argv from the
+    `[comm]` fallback below: the two are the difference between "this process
+    is identified" and "this process has not exec'd yet" (`ProcCache`).
+    """
     raw = _read_text(f"/proc/{pid}/cmdline")
     if raw is None:
         return None
     parts = [part for part in raw.split("\0") if part]
-    if parts:
-        return " ".join(parts)
+    return " ".join(parts) if parts else None
+
+
+def proc_cmdline(pid: int) -> Optional[str]:
+    argv = proc_argv(pid)
+    if argv is not None:
+        return argv
     # Kernel threads have an empty cmdline; fall back to comm in brackets.
     comm = proc_comm(pid)
     return f"[{comm}]" if comm else None
@@ -142,9 +153,21 @@ def proc_comm(pid: int) -> Optional[str]:
 
 
 def proc_env(pid: int, keys: Iterable[str]) -> Dict[str, str]:
+    return proc_env_read(pid, keys)[0]
+
+
+def proc_env_read(pid: int, keys: Iterable[str]) -> Tuple[Dict[str, str], bool]:
+    """`(matched vars, environ was readable)`.
+
+    The flag matters because an empty dict has two causes that must not be
+    confused: a process whose environ we cannot read *yet* (it is mid-fork,
+    and the vars will appear a sample later) and one whose environ simply
+    carries none of the wanted names (the hog, another user's process) or is
+    unreadable for good — permanently. `ProcCache` retries only the first.
+    """
     raw = _read_text(f"/proc/{pid}/environ")
     if raw is None:
-        return {}
+        return {}, False
     wanted = set(keys)
     found: Dict[str, str] = {}
     for entry in raw.split("\0"):
@@ -153,7 +176,7 @@ def proc_env(pid: int, keys: Iterable[str]) -> Dict[str, str]:
         name, _, value = entry.partition("=")
         if name in wanted or name.startswith(ENV_PREFIXES):
             found[name] = value
-    return found
+    return found, True
 
 
 def proc_mem(pid: int) -> Dict[str, Optional[int]]:
@@ -411,32 +434,72 @@ def _pci_bus_id(pynvml: Any, handle: Any) -> Optional[str]:
 
 
 class ProcCache:
-    """Per-PID cmdline/environ cache: /proc/<pid>/environ never changes."""
+    """Per-PID cmdline/environ cache: /proc/<pid>/environ never changes.
+
+    It never changes *after the exec*, which is the whole subtlety: NVML lists
+    a PID as soon as it touches the driver, and a worker touches it inside the
+    fork/exec window, while `/proc/<pid>/cmdline` still reads empty and
+    `/proc/<pid>/environ` is not yet the child's. Reading then yields the
+    `[comm]` fallback (`[panoptikon-spaw]`) and an empty env -- a *negative*,
+    and memoizing a negative pins it for the process's whole life. Run1's S9
+    lost a nemotron worker that way: 815 of 815 samples carried
+    `"cmdline": "[panoptikon-spaw]", "env": {}`, so `analyze.py` never
+    recognised it as ours, counted it as external, and compared its `base_mb`
+    against a different worker's process (a 346.7% `base_accuracy` FAIL that
+    was purely an artefact of this cache).
+
+    So only a *complete* identity is memoized: a real argv, plus a readable
+    environ when env capture is on. Anything short of that is returned to the
+    caller for this sample and re-read on the next one, which costs three
+    small `/proc` reads per sample per unresolved PID and resolves within one
+    sample of the exec. The retry is bounded by `MAX_ATTEMPTS` so a process
+    that is *permanently* unidentifiable -- a kernel thread (no argv ever) or
+    another user's process (environ is EACCES) -- settles into the cache
+    instead of being re-read for the length of the recording.
+    """
+
+    # 64 attempts is ~16 s at the default 4 Hz and ~64 s at 1 Hz: orders of
+    # magnitude more than the tens of milliseconds a fork/exec takes, and
+    # still a fixed, small bound on the wasted reads for a PID that will
+    # never resolve.
+    MAX_ATTEMPTS = 64
 
     def __init__(self, env_keys: Iterable[str], capture_env: bool) -> None:
         self.env_keys = tuple(env_keys)
         self.capture_env = capture_env
         self._cache: Dict[int, Dict[str, Any]] = {}
+        self._attempts: Dict[int, int] = {}
 
     def get(self, pid: int) -> Dict[str, Any]:
         cached = self._cache.get(pid)
         if cached is not None:
             return cached
-        entry = {
-            "cmdline": proc_cmdline(pid),
-            "comm": proc_comm(pid),
-            "env": proc_env(pid, self.env_keys) if self.capture_env else {},
-        }
+        argv = proc_argv(pid)
+        comm = proc_comm(pid)
+        if self.capture_env:
+            env, env_readable = proc_env_read(pid, self.env_keys)
+        else:
+            env, env_readable = {}, True
+        cmdline = argv if argv is not None else (f"[{comm}]" if comm else None)
+        entry = {"cmdline": cmdline, "comm": comm, "env": env}
         # Only memoize once the process was actually observed; a PID read
         # during teardown would otherwise cache nulls for its successor.
-        if entry["cmdline"] is not None or entry["comm"] is not None:
+        if cmdline is None and comm is None:
+            return entry
+        attempts = self._attempts.get(pid, 0) + 1
+        if (argv is not None and env_readable) or attempts >= self.MAX_ATTEMPTS:
             self._cache[pid] = entry
+            self._attempts.pop(pid, None)
+        else:
+            self._attempts[pid] = attempts
         return entry
 
     def forget_dead(self, live: Iterable[int]) -> None:
         live_set = set(live)
         for pid in [pid for pid in self._cache if pid not in live_set]:
             self._cache.pop(pid, None)
+        for pid in [pid for pid in self._attempts if pid not in live_set]:
+            self._attempts.pop(pid, None)
 
 
 def build_sample(
