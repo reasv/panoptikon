@@ -4484,11 +4484,23 @@ impl VramLedger {
             // "we cannot tell whether this was a spill" is not the same
             // finding as "this was not a spill", and its allocator peak is
             // the one a spilling batch would also have shown.
-            if measurement.throughput_collapse && !sole_occupancy {
+            //
+            // Suppression is of the *collapse verdict*, never of the
+            // measurement: one batch can carry both flags, and the pair is
+            // correlated rather than exotic. The worker sets `oom` on a
+            // batch whose impl absorbed an out-of-memory inside its own
+            // halving loop (`packing.measure_batch`, `absorbed_ooms > 0`),
+            // and that batch then runs its retries inside the same wall
+            // clock — so its rate collapses for the most structural reason
+            // there is. Skipping the whole measurement here would drop that
+            // OOM on the floor whenever a neighbour happened to be running,
+            // which is precisely when the ledger most needs to hear it.
+            let collapse_suppressed = measurement.throughput_collapse && !sole_occupancy;
+            if collapse_suppressed {
                 suppressed_collapses += 1;
-                continue;
             }
-            if measurement.oom || measurement.throughput_collapse {
+            let collapse = measurement.throughput_collapse && !collapse_suppressed;
+            if measurement.oom || collapse {
                 // A negative sample is evidence that a batch this size did NOT
                 // work — an OOM, or a WDDM spill that silently ran out of a
                 // system-RAM fallback. Its `peak_reserved` is whatever the
@@ -4502,7 +4514,10 @@ impl VramLedger {
                 // then discarded; only the watermark moves.
                 negative = true;
                 saw_oom |= measurement.oom;
-                saw_collapse |= measurement.throughput_collapse;
+                saw_collapse |= collapse;
+                continue;
+            }
+            if collapse_suppressed {
                 continue;
             }
             let units = measurement.units.filter(|units| *units > 0);
@@ -12255,6 +12270,53 @@ mod tests {
                 .expect("registered")
                 .deflation,
             1
+        );
+    }
+
+    /// Suppressing the collapse verdict must not suppress the **OOM** riding
+    /// on the same measurement. The worker sets both on one batch whenever an
+    /// impl's own halving loop absorbed an out-of-memory
+    /// (`packing.measure_batch`, `absorbed_ooms > 0`): the retries run inside
+    /// the same wall clock, so the batch's rate collapses for the most
+    /// structural reason there is. Dropping the measurement whole would lose
+    /// a real out-of-memory condition exactly when a neighbour happened to be
+    /// running — a silent over-admission against a model that has just proved
+    /// it cannot take the size.
+    #[test]
+    fn a_suppressed_collapse_still_reports_the_oom_it_rode_in_with() {
+        let ledger = priced_ledger(100_000);
+        let handle = loaded(Some(1000), Some(0));
+        let neighbour_handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        let neighbour = ledger
+            .register_worker("g/b", item_cost(4), &neighbour_handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 1000);
+
+        let held = neighbour.request_grant(4, None, 1, 0).unwrap();
+        let token = admission.request_grant(8, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                oom: true,
+                ..warm_batch(8, 10.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: false });
+        held.finish(WindowOutcome::Responded { oom: false });
+        assert_eq!(
+            ledger.health()[0]
+                .workers
+                .iter()
+                .find(|worker| worker.inference_id == "g/a")
+                .expect("registered")
+                .deflation,
+            1,
+            "the neighbour explains the rate drop; it does not explain the \
+             allocator giving up"
         );
     }
 

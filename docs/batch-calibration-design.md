@@ -149,6 +149,11 @@ comparison is only meaningful inside one occupancy regime, so the host trusts
 it only from a window that had the board to itself throughout. A suppressed
 collapse is discarded whole rather than counted as a clean batch: "we cannot
 tell whether this was a spill" is not the finding "this was not a spill".
+What is suppressed is the *verdict*, never the measurement: one batch can
+carry `oom` and `throughput_collapse` together — an impl whose own halving
+loop absorbed an out-of-memory runs its retries inside the same wall clock,
+so its rate collapses for the most structural reason there is — and the OOM
+is a statement about that batch which no neighbour explains.
 Samples are **tagged and kept**, not dropped at ingest, so `/health`'s
 `throughput_samples` still reports everything the replica produced.
 
