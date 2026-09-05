@@ -555,6 +555,13 @@ enum JobFailure {
     Systemic,
 }
 
+/// The reason a systemically failed job records and returns, in one place:
+/// the stored `failure_reason` and the error the caller sees are the same
+/// sentence about the same count.
+fn systemic_failure_reason(errors: i64) -> String {
+    format!("All {errors} attempted items failed; check the inference server")
+}
+
 /// Items this job attempted, could **not** finish, and has no verdict for:
 /// the difference between the error count and the subset that owes an
 /// `item_extraction_errors` row. Any at all makes the job *partial* rather
@@ -1189,13 +1196,7 @@ async fn run_extraction_job_inner(
         let (outcome, failure_reason) = if let Some(reason) = abort.reason() {
             (OUTCOME_FAILED, Some(reason.to_string()))
         } else if failure == JobFailure::Systemic {
-            (
-                OUTCOME_FAILED,
-                Some(format!(
-                    "All {} attempted items failed; check the inference server",
-                    guard.errors
-                )),
-            )
+            (OUTCOME_FAILED, Some(systemic_failure_reason(guard.errors)))
         } else if let Some(reason) = &partial_reason {
             (OUTCOME_PARTIAL, Some(reason.clone()))
         } else {
@@ -1248,9 +1249,8 @@ async fn run_extraction_job_inner(
         return Err(ApiError::internal(reason.to_string()));
     }
     if failure == JobFailure::Systemic {
-        return Err(ApiError::internal(format!(
-            "All {} attempted items failed; check the inference server",
-            final_update.errors
+        return Err(ApiError::internal(systemic_failure_reason(
+            final_update.errors,
         )));
     }
     summary.or_with(ChangeSummary {
