@@ -304,7 +304,15 @@ subscribed per card.
 `lib/videoPreview.ts` is the client's half of the server's
 `usable_outro_cut_cs`: no `content_end_ms`, a boundary at or past the item's
 duration (no card to cut), or a cut inside the guard-and-freeze band all
-answer null, and null names no cut. It is start-anchored — at plan time
+answer null, and null names no cut. Mirrored exactly, not approximately: a
+recorded duration of zero or less counts as a real duration the boundary is
+past (the server's `is_some_and`, unlike `outroCutPoint`'s "zero is
+unknown"), and the server's own floored centisecond —
+`floor((content_end_ms − 60) / 10)`, where the player rounds — must clear
+`validate_bounds`' freeze guard (more than 2 cs), so a boundary of 85..89 ms
+names no cut even though the player's rounding would give one; 90 ms is the
+first that does. Only the *verdict* is the server's; the seconds value
+returned is still the player's rounded cut. It is start-anchored — at plan time
 there is no element to anchor against — and is used for two things only:
 whether to name the cut, and the copy rung's size estimate. The server
 measures the real one.
@@ -330,6 +338,20 @@ cut as its own segment (`sha:preview-trim:e1600:outro`) so a capped request
 and a capped-and-cut one are different slots before the server has answered,
 and flipping the preference lands the next hover on a fresh slot.
 
+The client's cut segment carries the row's `content_end_ms`, not the bare
+literal: `sha:preview-trim:e1600:outro8005`, `sha:preview:outro8005`. The
+wire body is unchanged (`cut: "outro"`, resolved by the server); the key
+says which boundary the slot was minted for, because a `done` slot is never
+forgotten this session while the server resolves the literal against the
+row it holds *now*. A boundary that changes in-session (re-detection, a
+re-search after the detector ran) therefore reaches the server as a fresh
+request instead of replaying the old artifact from the client's slot — and
+the segment can never equal the clip route's `sha:<preset>:outro`
+(`clipStoreKey`), with which the preview shares one store on the promise
+that the two namespaces never meet. Without a cut there is no segment at
+all, so an uncut key is byte-identical to the one it had before this
+section.
+
 **The copy rung's estimate** shrinks to the cut:
 `size × min(16, cut, duration) / duration`. A 20 MB twelve-second TikTok
 with an 8 s cut was over the cap whole and went straight to the encoder;
@@ -347,20 +369,27 @@ hover, against the byte cap's whole purpose. The native `loop` attribute
 stays on; when the cut does not apply (durations disagreeing by a second or
 more, which `outroCutPoint` reads as two different files) native loop wraps
 at zero, which is the start anyway. Only the previewing cell mounts the hook
-and its one duration listener.
+and its two duration listeners (`loadedmetadata` and `durationchange`).
 
 **The stream copy gets the same browser-side cut.** Measured while
 implementing: ffmpeg's output-side `-t` on a `-c:v copy` of a B-frame source
 kept **two frames past the bound** (`-t 7.94` at 30 fps gave 241 frames,
 8.03 s) — packet reordering, not the GOP-end overrun `run.rs` guesses at.
 That is a frame or two of end card at every loop seam, so the copy
-artifact's element gets the plan's start-anchored cut unrefined (the copy
-keeps the source's timestamps; the artifact's own duration is no anchor —
-it is the artifact's, not the file's). The re-encode rung is cut on the
+artifact's element gets the plan's start-anchored cut unrefined. The copy's
+raw packet timestamps are the source's, but it is written with
+`-avoid_negative_ts make_zero` and its edit list no longer compensates the
+B-frame CTS offset, so on an engine that honours edit lists its frames
+present about one reorder delay *later* than the source's (~66 ms at 30 fps
+with three B-frames): the client's cut fires up to that much *early* — into
+content, never into the card — which is the safe direction and why the
+unrefined cut is acceptable. The artifact's own duration is no anchor — it
+is the artifact's, not the file's. The re-encode rung is cut on the
 frame and gets no browser-side cut. A copy of a long item whose cut lies past
 the window has its cut beyond the artifact's end, where it never fires.
 
-**Tests.** Server: `parse_cut` accepts the pair; through the handler, a cap
+**Tests.** Server: the handler accepts the pair (`parse_cut` no longer sees
+`end_cs`); through the handler, a cap
 past the outro resolves to the outro and a cap inside it to the cap, each
 under the key the bare bound would mint; an unusable outro is a 404 with or
 without a cap; the openapi fixture regenerated. Client
