@@ -7771,101 +7771,73 @@ mod tests {
         );
     }
 
-    /// R5: an **unset** margin gets the default fraction *and* a 1 GiB cap on what it
-    /// may withhold, so the last gigabytes of a busy GPU stay usable.
+    /// The reserve rule: an **unset** margin gets the default fraction *and* a
+    /// [`DEFAULT_RESERVE_CAP_MB`] cap on what it may withhold, so the last
+    /// gigabytes of a busy GPU stay usable; a margin the user wrote down is
+    /// honoured verbatim and uncapped; and the cap only binds where the fraction
+    /// exceeds it. Rows one and two are the same fraction under different
+    /// rules, which is the whole point of the `Option`.
     #[test]
-    fn an_unset_margin_never_withholds_more_than_the_reserve_cap() {
-        // 97 887 MiB of GPU, 1 000 of it ours, and only 8 000 free: the
-        // regime where `external × 1.1` used to reach the total.
-        let ledger = ledger(97_887, VramBudget::default());
-        let handle = loaded(Some(1000), Some(0));
-        let admission = ledger
-            .register_worker("g/a", item_cost(64), &handle, None)
-            .unwrap();
-        push_memory(&handle, 8_000, 0);
-        ledger.ingest_all_for_test();
+    fn the_reserve_is_capped_only_under_an_unset_margin() {
+        // 97 887 MiB of GPU, 1 000 of it ours.
+        // (label, budget, free reading, external, reserve, rule, headroom left)
+        for (label, budget, free_mb, external, reserve, rule, priced) in [
+            (
+                "the fraction would have withheld 8 889 MiB: the regime where \
+                 `external × 1.1` used to reach the total and leave a limit of 0",
+                VramBudget::default(),
+                8_000,
+                88_887,
+                DEFAULT_RESERVE_CAP_MB,
+                RESERVE_RULE_CAPPED_DEFAULT,
+                true,
+            ),
+            (
+                "a margin the user wrote down is the pre-run2 arithmetic to the \
+                 MiB: total − ceil(external × 1.1)",
+                user_margin(DEFAULT_MARGIN),
+                8_000,
+                88_887,
+                8_889,
+                RESERVE_RULE_USER_MARGIN,
+                false,
+            ),
+            (
+                "on a quiet GPU ceil(4 000 × 0.10) = 400 is well under the cap, \
+                 so the default rule is arithmetically the old one",
+                VramBudget::default(),
+                92_887,
+                4_000,
+                400,
+                RESERVE_RULE_CAPPED_DEFAULT,
+                true,
+            ),
+        ] {
+            let ledger = ledger(97_887, budget);
+            let handle = loaded(Some(1000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(64), &handle, None)
+                .unwrap();
+            push_memory(&handle, free_mb, 0);
+            ledger.ingest_all_for_test();
 
-        let gpu = &ledger.health()[0];
-        assert_eq!(gpu.external_mb, 88_887);
-        assert_eq!(
-            gpu.reserve_mb, DEFAULT_RESERVE_CAP_MB,
-            "the fraction would have withheld 8 889 MiB"
-        );
-        assert_eq!(gpu.reserve_rule, RESERVE_RULE_CAPPED_DEFAULT);
-        assert_eq!(gpu.limit_mb, 97_887 - 88_887 - 1024);
-        assert_eq!(gpu.limit_mb, 7_976, "and not 0, which is what T4 saw");
-        assert!(gpu.headroom_mb > 0);
-
-        // A grant on that GPU is priced, not memory-blind.
-        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        assert!(
-            token.grant().mb > 0,
-            "an `mb = 0` grant is priced against nothing"
-        );
-    }
-
-    /// The same GPU with a margin the user wrote down: honoured verbatim, uncapped,
-    /// exactly as before run2.
-    #[test]
-    fn a_configured_margin_is_honoured_verbatim_and_uncapped() {
-        let ledger = ledger(97_887, user_margin(DEFAULT_MARGIN));
-        let handle = loaded(Some(1000), Some(0));
-        let _admission = ledger
-            .register_worker("g/a", item_cost(64), &handle, None)
-            .unwrap();
-        push_memory(&handle, 8_000, 0);
-        ledger.ingest_all_for_test();
-
-        let gpu = &ledger.health()[0];
-        assert_eq!(gpu.external_mb, 88_887);
-        assert_eq!(gpu.reserve_mb, 8_889, "ceil(88 887 × 0.10)");
-        assert_eq!(gpu.reserve_rule, RESERVE_RULE_USER_MARGIN);
-        assert_eq!(
-            gpu.limit_mb,
-            97_887 - 88_887 - 8_889,
-            "the pre-run2 arithmetic, to the MiB: total − ceil(external × 1.1)"
-        );
-        assert_eq!(gpu.margin, DEFAULT_MARGIN);
-
-        // Setting the same number the default uses is a *different* state
-        // from setting nothing, which is the whole point of the Option.
-        let unset_ledger =
-            VramLedger::for_test(&[(GPU, "TEST 9000", 97_887)], VramBudget::default());
-        let unset_handle = loaded(Some(1000), Some(0));
-        let _unset_admission = unset_ledger
-            .register_worker("g/a", item_cost(64), &unset_handle, None)
-            .unwrap();
-        push_memory(&unset_handle, 8_000, 0);
-        unset_ledger.ingest_all_for_test();
-        assert_eq!(
-            unset_ledger.health()[0].margin,
-            DEFAULT_MARGIN,
-            "same fraction"
-        );
-        assert_ne!(
-            unset_ledger.health()[0].reserve_mb,
-            ledger.health()[0].reserve_mb,
-            "different rule"
-        );
-    }
-
-    /// The cap only binds where the fraction exceeds it: on a quiet GPU the
-    /// default rule is arithmetically identical to the old one.
-    #[test]
-    fn the_reserve_cap_does_not_bind_on_a_gpu_with_little_external_usage() {
-        let ledger = ledger(97_887, VramBudget::default());
-        let handle = loaded(Some(1000), Some(0));
-        let _admission = ledger
-            .register_worker("g/a", item_cost(64), &handle, None)
-            .unwrap();
-        // 4 000 MiB of external usage: ceil(4 000 × 0.10) = 400, well under the cap.
-        push_memory(&handle, 92_887, 0);
-        ledger.ingest_all_for_test();
-        let gpu = &ledger.health()[0];
-        assert_eq!(gpu.external_mb, 4_000);
-        assert_eq!(gpu.reserve_mb, 400);
-        assert_eq!(gpu.reserve_rule, RESERVE_RULE_CAPPED_DEFAULT);
-        assert_eq!(gpu.limit_mb, 97_887 - 4_000 - 400);
+            let gpu = &ledger.health()[0];
+            assert_eq!(gpu.external_mb, external, "{label}");
+            assert_eq!(gpu.reserve_mb, reserve, "{label}");
+            assert_eq!(gpu.reserve_rule, rule, "{label}");
+            assert_eq!(gpu.limit_mb, 97_887 - external - reserve, "{label}");
+            assert_eq!(gpu.margin, DEFAULT_MARGIN, "{label}");
+            if priced {
+                // The GPU still has room, and a grant on it is priced rather
+                // than memory-blind.
+                assert!(gpu.headroom_mb > 0, "{label}");
+                let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+                assert!(
+                    token.grant().mb > 0,
+                    "{label}: an `mb = 0` grant is priced against nothing"
+                );
+            }
+        }
     }
 
     /// A degraded cost dimension — no parseable `metadata.cost` — widens the same way,
