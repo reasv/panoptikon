@@ -989,11 +989,12 @@ that lands after any of them is refused rather than reopening the row
   `reserved_before_mb`, `allocated_before_mb`, `started`;
   `measure_batch()` emits `items, reserved_before_mb,
   peak_reserved_mb, allocated_before_mb, peak_allocated_mb, duration_ms`
-  (predict call only), optional `units`, `oom`, `throughput_collapse`,
+  (predict call only), optional `units` and `oom`,
   and since run2 `free_mb`/`free_source` (the clamp's pre-batch reading, R5),
   `clamped` (R5) and `oom_class` (R3);
-  the harness adds `trimmed` on a window's first measurement
-  (`packing.py:1085-1088`). **Caches are not emptied between batches**;
+  the harness adds `throughput_collapse` when the comparator retires
+  (`packing.py:1019`) and `trimmed` on a window's first measurement
+  (`packing.py:1073`). **Caches are not emptied between batches**;
   `empty_cache()` only on an orchestrator `trim` (`__main__.py:363-374`),
   the reactive shrink (`packing.maybe_shrink` `packing.py:186-242`), or
   inside `run_with_oom_retry` after an OOM. Peaks reset at the end of

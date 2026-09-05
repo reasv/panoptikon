@@ -393,6 +393,72 @@ grouped rows), by one agent, with a separate verifier running the suites,
 the named regression tests, and for rows touching the ledger or dispatcher
 the recorded-ring replay tests and `analyze.py` on two run2 legs.
 
+## Phase 2 result — what was executed
+
+Four executors (P1, R2, R1, R3) ran the approved rows on branches
+`deslop2/{P1,R2,R1,R3}`, merged into the branch at `889f6bd4` on top of
+`028635f7`. **26 of the 27 approved rows landed, in 36 commits** (one per row,
+or one per file for the grouped rows), plus four runners-up the R2 brief allowed
+(`R2-cpu-1`, `R2-wk-3`, `R2-pt-2`, `R2-cap-2`). Tier C and the user-decision
+rows (3 `GateState`/`UnitBudget`, 29 `AJ1`, 30 `L13`, 31 rlimit/rocm plumbing,
+32 `E4`) were not touched.
+
+**One row skipped: 17 (`R2-main-1`, `serve_with_stream_limit`).** The fold is
+behaviourally fine but it *adds* lines: the wrapper is 12 lines, and passing the
+constant at the 6 call sites costs more than that, measured at **+7 lines net**
+in the cheapest shape (`main.rs` +19/−24, `inferio_client.rs` +15/−3) and +17 in
+the shape rustfmt actually produces, because 5 of the call sites take an
+`async move { … }` shutdown argument that rustfmt then breaks one-per-line. It
+also reaches into another group's file. Kept as it is.
+
+The one behaviour change in the whole phase is the sanctioned one: row 26's
+`capability.rs` fold also fixed `join().ok()?`, which turned a *successful*
+capability probe into "unknown host" whenever a drain thread panicked
+(`e8af3257`, with the test that pins it).
+
+Production lines per file (`linecount.py`: code / comment, excluding each Rust
+file's `mod tests` region):
+
+| file | code before | code after | Δ code | Δ comment | Δ test |
+|---|--:|--:|--:|--:|--:|
+| `panoptikon/src/inferio/ledger.rs` | 3 995 | 3 952 | −43 | +6 | +27 |
+| `panoptikon/src/jobs/extraction.rs` | 2 291 | 2 249 | −42 | +15 | 0 |
+| `panoptikon/src/inferio/worker.rs` | 1 476 | 1 442 | −34 | +3 | 0 |
+| `panoptikon/src/inferio/gpu.rs` | 814 | 790 | −24 | 0 | 0 |
+| `python/inferio_worker/memory.py` | 1 303 | 1 282 | −21 | −7 | 0 |
+| `panoptikon/src/inferio/manager.rs` | 1 492 | 1 476 | −16 | +2 | −40 |
+| `python/inferio_worker/packing.py` | 792 | 779 | −13 | 0 | 0 |
+| `panoptikon/src/inferio/http.rs` | 1 102 | 1 092 | −10 | −4 | +1 |
+| `panoptikon/src/inferio/capability.rs` | 172 | 163 | −9 | +7 | +20 |
+| `panoptikon/src/inferio/dispatch.rs` | 865 | 857 | −8 | +10 | 0 |
+| `python/inferio/impl/eocr.py` | 474 | 466 | −8 | +2 | 0 |
+| `panoptikon/src/accelerator_env.rs` | 202 | 196 | −6 | +3 | 0 |
+| `panoptikon/src/inferio/cpu.rs` | 108 | 104 | −4 | +2 | 0 |
+| `panoptikon/src/process_tree.rs` | 382 | 378 | −4 | +2 | 0 |
+| `python/inferio_worker/__main__.py` | 286 | 282 | −4 | 0 | 0 |
+| `panoptikon/src/inferio/cost.rs` | 284 | 281 | −3 | +1 | 0 |
+| `panoptikon/src/inferio_client.rs` | 1 219 | 1 216 | −3 | 0 | 0 |
+| `tools/calibration-protocol/analyze.py` | 1 534 | 1 531 | −3 | −1 | 0 |
+| `tools/calibration-protocol/vramrec.py` | 475 | 473 | −2 | 0 | 0 |
+| `panoptikon/src/inferio/prewarm.rs` | 398 | 398 | 0 | 0 | −44 |
+| `panoptikon/src/inferio/calibration.rs` | 834 | 840 | **+6** | +3 | 0 |
+| **total** | **20 498** | **20 247** | **−251** | **+44** | **−36** |
+
+`git diff --shortstat 028635f7 HEAD` over the same 22 files: **627 insertions,
+870 deletions** — 243 physical lines net. Test regions lost 84 lines (the two
+duplicated `test_spawn_config` sets) and gained 48 (the two new pinning tests).
+For scale, the whole branch is `git diff --shortstat 7aa92b20 HEAD` =
+**154 files changed, 73 067 insertions(+), 5 586 deletions(−)**, so phase 2
+removed about 0.3 % of what the branch added.
+
+The reviewers' estimate was ~600 removable lines (~90 test-only); the outcome is
+251 production lines and 84 test lines. The estimates were optimistic for a
+structural reason: they counted the duplicated *body*, but an extracted helper
+costs its own signature, doc comment and call syntax back, so a fold of N
+duplicated lines across k sites returns N − (helper overhead) − k rather than N
+— which is also why one row (`calibration.rs`'s `key()`) is line-positive and
+`R2-main-1` was skipped outright.
+
 ## Phase 3 — the remaining product-task steps (after deslopping)
 
 State when this was written: run2's change set R1–R12 (R10′) and the
