@@ -316,6 +316,83 @@ item touches a measured mechanism, the relevant recorded leg replays:
 the knee replay tests, `analyze.py` on run2 legs). Nothing outside the
 chosen list is touched.
 
+## Phase 2 result — the ranked candidate list (user picks)
+
+Four read-only reviewers (ledger/calibration/cost; gpu/manager/worker;
+dispatch/http/client/jobs; Python worker and tooling) assessed every file the
+branch touched against the objective signals (long functions, single-caller
+helpers, test hooks in production, clones, dead code, clippy length and
+complexity lints). Their full tables (130 rows with evidence per row) are in
+the session scratchpad (`deslop-2-candidates-{R1,R2,R3,P1}.md`). The
+headline: **the code is dense, not bloated**. Every function over 100 lines
+was judged a *move* if split (the intermediate struct costs what the body
+saves, and several carry ordering risk: grant settlement, the lease-before-
+sleep order, the settle/request_grant sequence). What is genuinely removable
+is duplication: about **600 lines**, of which ~90 are test-only. Nothing
+below touches a wire field, a store column, a `/health` field, a config key,
+a log line the analyzer parses, or a regression-listed assertion.
+
+Tier A: no behavioural surface, a verifier is the existing suite. Tier B:
+low risk, named regression tests cover it. Tier C: medium risk or a schema
+change; the user decides. "Do" = the reviewer recommends it.
+
+| # | id | file | what | lines | tier | rec |
+|--:|---|---|---|--:|:-:|:-:|
+| 1 | R2-mgr-1 + R2-pw-1 | manager.rs:2175, prewarm.rs:547 | third and second copies of `worker::testing`'s spawn helpers (test-only) | 90 | A | do |
+| 2 | E1 | jobs/extraction.rs:1489-1645 | the transient item-failure sequence written three times in `process_item` | 55 | B | do |
+| 3 | C1 | inferio_client.rs:433-561 + extraction.rs:191-297 | `GateState` and `UnitBudget` are the same resizable semaphore with a pending shrink, written twice; the two release paths differ | 45 | C | user |
+| 4 | E2 | jobs/extraction.rs:1375-1601 | the verdict sequence (`record_item_failure` → `finalize_item` → match) twice | 25 | B | do |
+| 5 | D2 | dispatch.rs:487-760 | the four-variant `DispatchMsg` drain written three times | 25 | B | do |
+| 6 | L3 | ledger.rs:1887/5014/10090 | the 12-field `GpuLedger` literal three times; `#[derive(Default)]` | 25 | A | do |
+| 7 | H1 | http.rs:1033, manager.rs | `clamp_detail` and `clamp_cooldown_error` are copies of `db::ledger::truncate_error` | 24 | A | do |
+| 8 | R2-wk-1 | worker.rs:496-516 | 21 lines of prose in one WARN that the protocol doc already states; the `attribution=` token stays | 22 | A | do |
+| 9 | P1-M1 | memory.py:2011-2029 | `measure_batch`'s except arm rebuilds the wire map; provably unreachable | 19 | A | do |
+| 10 | L2 | ledger.rs | `transients` ring written per batch, only ever read as `.len()`; a saturating counter is wire-identical | 15 | A | do |
+| 11 | E3 | jobs/extraction.rs:741/1182 | twin 12-field `DataLogUpdate` literals | 14 | B | do |
+| 12 | L5 | ledger.rs `update_shape_ceiling` | `set`/`lowered` arms identical but for the label | 14 | A | do |
+| 13 | R2-gpu-1 | gpu.rs:711-741 | `memory_query`'s Cpu/Mps arms, same 14-line shape | 14 | A | do |
+| 14 | P1-P1 | packing.py:932-964 | two counters differing by one attribute name | 14 | A | do |
+| 15 | L4 | ledger.rs | the calibration key spelled out six times | 12 | A | do |
+| 16 | P1-E1 | eocr.py:510-531 | shapes list, `mag_ratio` and `detector_tensor_dims` computed twice | 12 | B | do |
+| 17 | R2-main-1 | main.rs:753-769 | `serve_with_stream_limit` wrapper whose content is one constant | 12 | A | do |
+| 18 | R2-mgr-3 | manager.rs:189-209 | two single-caller constructors for a two-field private struct | 12 | A | do |
+| 19 | R2-wk-2 | worker.rs:738-752 | two prose variants of one visibility warning | 12 | A | do |
+| 20 | P1-M3 | memory.py:1268-1292 | three early returns that return what the fall-through returns | 11 | A | do |
+| 21 | L6 | ledger.rs `fit_knee` | buckets walked twice, same rates re-collected | 10 | B | do |
+| 22 | C1 (cal) | calibration.rs | `matches_key`/`same_entry` restate the key tuple | 10 | A | do |
+| 23 | K1 | cost.rs | identical 5-line group-unit resolution in two fns | 10 | A | do |
+| 24 | D3 | dispatch.rs:592-604 | window units/items/bytes folded in one pass | 10 | A | do |
+| 25 | R2-gpu-3 | gpu.rs:251-275 | two identical empty-inventory returns | 10 | A | do |
+| 26 | R2-gpu-2, R2-cap-1, R2-acc-1 | gpu.rs:1094, capability.rs:190, accelerator_env.rs:142 | subsumed branch; identical drain threads (fixes the silent `None`); five copies of push-unless-set | 24 | A | do |
+| 27 | C2, C3, E5, L7, L14 | inferio_client.rs, extraction.rs, ledger.rs | small folds (probe helper, memo rule, hoisted sentence, double `get`, double clone) | 30 | A | do |
+| 28 | P1-M2, P1-T1, P1-T2, P1-S1, P1-E2, P1-M6/M7 | memory.py, analyze.py, vramrec.py, `__main__.py`, eocr.py | dead parameter, dead method, dead wrapper, four repeated local imports, unused import, two belt-and-braces clauses (the unified arm's `max()`es at memory.py:797 are load-bearing: leave them) | 24 | A | do |
+| 29 | AJ1 | api/jobs.rs | `JobItemFailure` DTO twin of `db::job_failures::JobItemFailureRow`; needs an openapi + ui regeneration for a schema rename | 35 | C | user |
+| 30 | L13 | ledger.rs | move `mod tests` (8 212 lines) to `ledger/tests.rs`; 0 lines saved, the file drops under 3 000; must land first or last | 0 | A | user |
+| 31 | R2-rl-1, R2-rocm-1 | rlimit.rs:33-108, rocm.rs:86-133 | log-only plumbing (`NofileRaise`, `ProbeFailure`) that typed tests assert on; removing them removes seven tests | 70 | C | defer |
+| 32 | E4 | jobs/extraction.rs | extract the 120-line outcome/logging tail; saves ~5 lines but makes the outcome policy testable without a DB | 5 | B | user |
+
+Not recommended, with the reason: every long function (`ingest_locked` 466,
+`run_extraction_job_inner` 477, `run_dispatcher` 330, `process_item` 310
+after #2, `fit_knee`, `spawn_model`, `ensure_loaded`, `roundtrip`,
+`predict`, `run_window` 179, `_serve` 238, the tooling `main`s); the `GpuLog`
+enum and `emit` (log-only, but it buys the documented lock-hold-time
+property); the `WindowSettled` twin WARN/DEBUG arms (the analyzer selects by
+level and reads `reason`); the `_for_test` hooks and `ProbeStub` (all
+`#[cfg(test)]`-gated, nothing ships); cross-script deduplication in the
+protocol tooling (each tool is a single stdlib-only file by contract);
+`CostUnit::AudioSecond` (an accepted registry value).
+
+Correctness items found on the way, not deslop picks: `eocr.py` `unload()`
+via `InferenceModel.__del__` raises `ImportError` at interpreter shutdown
+(master-era `__del__`); `writes_are_debounced_and_flushed_on_demand` is a
+timing race (flaked once under load); `GpuInfo::total_mb` is the one public
+health field without an OpenAPI description.
+
+Execution once the user picks: one commit per row (or per file for the
+grouped rows), by one agent, with a separate verifier running the suites,
+the named regression tests, and for rows touching the ledger or dispatcher
+the recorded-ring replay tests and `analyze.py` on two run2 legs.
+
 ## Phase 3 — the remaining product-task steps (after deslopping)
 
 State when this was written: run2's change set R1–R12 (R10′) and the
