@@ -197,7 +197,8 @@ sends them.
 
 ```
 ceiling_probe.py --model <inference_id> [--corpus manifest.json]
-                 [--group G] [--kind K] [--mode auto|file|text] [--data JSON]
+                 [--group G] [--kind K] [--data JSON]
+                 [--mode auto|file|text|audio-npy] [--audio-sample-rate N]
                  [--device N] [--batches 1,2,4,...] [--max-batch 64]
                  [--repeats N] [--warmup N] [--bisect-oom] [--bisect-max N]
                  [--repo DIR] [--impl-dir DIR] [--registry FILE]
@@ -221,6 +222,16 @@ rather than copied — and each row carries the `oom_class` that decided it.
 `--dry-run` resolves and prints the plan without touching
 a GPU. `--bisect-oom` pairs with `hog.py leave-free N` to find the true OOM
 boundary at N MiB free.
+
+`--mode audio-npy` is required for the `whisper` and `clap` groups: those
+impls read their input with `deserialize_array`
+(`np.load(allow_pickle=False)`), so what a probe must hand them is the mono
+float32 `.npy` buffer the `audio_tracks` handler builds, not the `.wav`/`.mp3`
+container from `results/corpus/audio`. The mode decodes with ffmpeg exactly as
+`input_handlers/audio.rs` does, at `--audio-sample-rate` (default 16 000, the
+handler's own default, which neither group overrides). Passing the container
+bytes instead fails at batch 1 with `ValueError: This file contains pickled
+(object) data`.
 
 It also resolves the protocol's own fault-injection fixtures, whether or not
 `fixtures/install-fixtures.sh` has been run:

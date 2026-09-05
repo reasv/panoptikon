@@ -383,8 +383,53 @@ def load_items(corpus: Optional[str], group: Optional[str],
     return items, manifest.get("root")
 
 
+_AUDIO_NPY_CACHE: Dict[Tuple[str, int], bytes] = {}
+
+
+def audio_npy_bytes(path: Path, sample_rate: int) -> bytes:
+    """The payload the `audio_tracks` handler sends, built the same way.
+
+    `whisper.py` and `clap.py` read their input with
+    `inferio.impl.utils.deserialize_array`, i.e. `np.load(allow_pickle=False)`:
+    what they are given is a `.npy` buffer of mono float32 PCM, never the
+    container file. This mirrors
+    `panoptikon/src/jobs/extraction/input_handlers/audio.rs`
+    (`load_audio_single` -> ffmpeg to mono `s16le` at the handler's
+    `sample_rate`, then `serialize_npy_f32`), whose `sample_rate` opt defaults
+    to 16 000 and which both groups take unchanged.
+    """
+    import io
+
+    import numpy as np
+
+    key = (str(path), sample_rate)
+    cached = _AUDIO_NPY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    command = [
+        os.environ.get("PANOPTIKON_FFMPEG", "ffmpeg"), "-nostdin", "-v", "error",
+        "-i", str(path), "-vn", "-ac", "1",
+        "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(sample_rate), "-",
+    ]
+    import subprocess
+
+    result = subprocess.run(command, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise SystemExit(
+            f"ceiling_probe: ffmpeg failed on {path}: "
+            f"{result.stderr.decode('utf-8', 'replace')[:400]}"
+        )
+    samples = np.frombuffer(result.stdout, dtype="<i2").astype(np.float32) / 32768.0
+    buffer = io.BytesIO()
+    np.save(buffer, samples)
+    payload = buffer.getvalue()
+    _AUDIO_NPY_CACHE[key] = payload
+    return payload
+
+
 def build_inputs(items: List[Dict[str, Any]], count: int, mode: str,
-                 data_template: Dict[str, Any]):  # noqa: ANN201
+                 data_template: Dict[str, Any],
+                 audio_sample_rate: int = 16000):  # noqa: ANN201
     from inferio.inferio_types import PredictionInput
 
     inputs = []
@@ -396,6 +441,10 @@ def build_inputs(items: List[Dict[str, Any]], count: int, mode: str,
             payload = dict(data_template)
             payload["text"] = path.read_text(encoding="utf-8", errors="replace")
             inputs.append(PredictionInput(data=payload, file=None))
+        elif mode == "audio-npy":
+            inputs.append(PredictionInput(
+                data=dict(data_template),
+                file=audio_npy_bytes(path, audio_sample_rate)))
         else:
             inputs.append(PredictionInput(data=dict(data_template),
                                           file=path.read_bytes()))
@@ -448,7 +497,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--corpus", help="corpus.py manifest.json or its directory")
     parser.add_argument("--group", help="corpus group filter")
     parser.add_argument("--kind", help="corpus kind filter")
-    parser.add_argument("--mode", choices=("auto", "file", "text"), default="auto")
+    parser.add_argument("--mode", choices=("auto", "file", "text", "audio-npy"),
+                        default="auto",
+                        help="audio-npy: decode each item to the mono float32 "
+                             ".npy buffer the `audio_tracks` handler sends, "
+                             "which is what whisper and clap read")
+    parser.add_argument("--audio-sample-rate", type=int, default=16000,
+                        help="sample rate for --mode audio-npy; the "
+                             "`audio_tracks` handler's own default")
     parser.add_argument("--data", default="{}",
                         help="JSON merged into every input's data dict")
     parser.add_argument("--device", type=int, default=0, help="NVML GPU index")
@@ -580,7 +636,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     price, canvas_in_force = batch_pricer(packing, resolved["cost"], instance)
 
     def run_batch(count: int, repeat: int) -> Dict[str, Any]:
-        inputs = build_inputs(items, count, args.mode, data_template)
+        inputs = build_inputs(items, count, args.mode, data_template,
+                              args.audio_sample_rate)
         units = price(inputs)
         torch.cuda.synchronize()
         reserved_before = int(torch.cuda.memory_reserved() // MIB)
