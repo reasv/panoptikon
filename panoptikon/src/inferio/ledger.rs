@@ -1491,6 +1491,7 @@ fn free_source_is_authoritative(source: &str) -> bool {
     )
 }
 
+#[derive(Default)]
 struct GpuLedger {
     name: String,
     total_mb: u64,
@@ -1889,14 +1890,8 @@ impl VramLedger {
                         total_mb: gpu.total_mb,
                         unified_ram_mb: gpu.unified_ram_mb,
                         vram_carveout_mb: gpu.vram_carveout_mb,
-                        total_adopted: false,
                         bdf: gpu.bdf.as_deref().map(str::to_ascii_lowercase),
-                        free: None,
-                        seen_authoritative_free: false,
-                        load_reservations: HashMap::new(),
-                        refreshing: false,
-                        last_refresh_failed_at: None,
-                        free_adjusted_at: None,
+                        ..GpuLedger::default()
                     },
                 )
             })
@@ -5014,16 +5009,8 @@ impl VramLedger {
                     GpuLedger {
                         name: (*name).to_owned(),
                         total_mb: *total_mb,
-                        unified_ram_mb: None,
-                        vram_carveout_mb: None,
-                        total_adopted: false,
                         bdf: bdf.map(str::to_ascii_lowercase),
-                        free: None,
-                        seen_authoritative_free: false,
-                        load_reservations: HashMap::new(),
-                        refreshing: false,
-                        last_refresh_failed_at: None,
-                        free_adjusted_at: None,
+                        ..GpuLedger::default()
                     },
                 )
             })
@@ -10090,16 +10077,10 @@ mod tests {
             |free: Option<FreeSample>, failed: Option<Instant>, refreshing: bool| GpuLedger {
                 name: "TEST 9000".to_owned(),
                 total_mb: 10_000,
-                unified_ram_mb: None,
-                vram_carveout_mb: None,
-                total_adopted: false,
-                bdf: None,
                 free,
-                seen_authoritative_free: false,
-                load_reservations: HashMap::new(),
                 refreshing,
                 last_refresh_failed_at: failed,
-                free_adjusted_at: None,
+                ..GpuLedger::default()
             };
         let stale = || {
             Some(FreeSample {
