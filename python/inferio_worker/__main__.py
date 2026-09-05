@@ -25,6 +25,10 @@ State machine (protocol v2):
   survives.
 - A failed handshake is the one error the worker does not survive (exit
   non-zero).
+- The handshake's `batch_memory_frames` flag is the one capability the
+  orchestrator announces. With it, a granted `predict` writes a `memory`
+  frame carrying the in-flight request id after each batch but the last;
+  without it (an older orchestrator) the stream is exactly what it was.
 """
 
 from __future__ import annotations
@@ -93,20 +97,55 @@ def _send_error(
     )
 
 
-def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
-    """Process the handshake frame; returns the impl *class* or None.
+def _memory_frame_emitter(
+    proto_out: BinaryIO, req_id: int, wanted: bool
+) -> Any:
+    """The per-batch `memory` frame writer for one in-flight `predict`, or None
+    when the orchestrator did not ask for the frames.
+
+    Bound to `req_id` and handed only to `run_window`, which is the whole of
+    the desynchronization argument: a `memory` frame is legal *before* the
+    terminal reply for the request now in flight and at no other moment, so
+    the emitter cannot outlive the request whose id it carries.
+    """
+    if not wanted:
+        return None
+
+    from inferio_worker import protocol
+
+    def emit(sample: dict[str, Any]) -> None:
+        protocol.write_frame(
+            proto_out, {"type": "memory", "id": req_id, "memory": sample}
+        )
+
+    return emit
+
+
+def _handshake(
+    proto_in: BinaryIO, proto_out: BinaryIO
+) -> tuple[type | None, bool]:
+    """Process the handshake frame; returns `(impl class, per-batch memory
+    frames wanted)`, the class being None on any failure.
 
     v2: the handshake carries identity only (impl_class + impl_dirs). The
     class is located but not instantiated — `configure` does that later.
     Per the protocol doc, any handshake failure sends an `error` frame and
     the worker exits non-zero (the caller handles the exit).
+
+    `batch_memory_frames` is the one *capability* the handshake carries: an
+    orchestrator that sets it reads mid-request `memory` frames instead of
+    treating them as a desynchronized stream. It is announced, not agreed —
+    absent (an orchestrator predating them) means the frames are never sent,
+    which is the whole of the compatibility story in that direction. The
+    protocol version is untouched: this is an additive key, and both sides
+    ignore unknown ones.
     """
     from inferio_worker import protocol
 
     msg = protocol.read_frame(proto_in)
     if msg is None:
         logger.error("EOF before handshake; exiting.")
-        return None
+        return None, False
     req_id = msg.get("id", 0)
     if msg.get("type") != "handshake":
         _send_error(
@@ -114,7 +153,7 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
             req_id,
             f"Expected handshake as first frame, got {msg.get('type')!r}",
         )
-        return None
+        return None, False
     version = msg.get("protocol_version")
     if version != protocol.PROTOCOL_VERSION:
         _send_error(
@@ -123,7 +162,8 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
             f"Unsupported protocol version {version!r}; this worker speaks "
             f"{protocol.PROTOCOL_VERSION}",
         )
-        return None
+        return None, False
+    batch_memory_frames = msg.get("batch_memory_frames") is True
 
     # cuDNN path setup before any impl module import; failure is only a
     # warning.
@@ -143,18 +183,18 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
     except Exception as e:
         logger.error("handshake failed: %s", e, exc_info=True)
         _send_error(proto_out, req_id, str(e), traceback.format_exc())
-        return None
+        return None, False
 
     logger.info("Handshake ok for impl class %s", impl_class_name)
     _send_ok(proto_out, req_id, protocol_version=protocol.PROTOCOL_VERSION)
-    return impl_cls
+    return impl_cls, batch_memory_frames
 
 
 def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
     from inferio_worker import memory, protocol
     from inferio_worker.inputs import prediction_input_from_frame
 
-    impl_cls = _handshake(proto_in, proto_out)
+    impl_cls, batch_memory_frames = _handshake(proto_in, proto_out)
     if impl_cls is None:
         return EXIT_HANDSHAKE_FAILED
 
@@ -319,7 +359,16 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     from inferio_worker import packing
 
                     _send_ok(
-                        proto_out, req_id, **packing.run_window(instance, inputs, grant)
+                        proto_out,
+                        req_id,
+                        **packing.run_window(
+                            instance,
+                            inputs,
+                            grant,
+                            _memory_frame_emitter(
+                                proto_out, req_id, batch_memory_frames
+                            ),
+                        ),
                     )
             except Exception as e:
                 # Includes serialization failures from write_frame (bad

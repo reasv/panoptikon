@@ -752,3 +752,63 @@ def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
         )
     finally:
         packing.note_trimmed()
+
+
+def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
+    """`batch_memory_frames` is announced, not agreed: present-and-true means
+    the orchestrator reads mid-request `memory` frames, and every other answer
+    — absent (an orchestrator predating them), null, or a stray truthy value —
+    means it does not and the frames are never written."""
+    from inferio_worker import __main__ as worker_main
+    from inferio_worker import protocol
+
+    def negotiated(**extra) -> tuple[bool, bool]:
+        request = io.BytesIO()
+        protocol.write_frame(request, {**handshake_msg(req_id=1), **extra})
+        request.seek(0)
+        reply = io.BytesIO()
+        impl_cls, wanted = worker_main._handshake(request, reply)
+        return impl_cls is not None, wanted
+
+    assert negotiated() == (True, False), "absent: the pre-frames orchestrator"
+    assert negotiated(batch_memory_frames=True) == (True, True)
+    for hostile in (None, False, 1, "true", {}):
+        assert negotiated(batch_memory_frames=hostile) == (True, False), hostile
+
+
+def test_a_worker_that_can_measure_nothing_answers_the_capability_in_silence(
+    worker: WorkerProcess,
+) -> None:
+    """The old-worker/new-host and no-torch directions in one exchange: the
+    extra handshake key is an unknown key to anything that does not want it,
+    and a granted window on a host with no accelerator writes exactly one
+    frame for the request — the `ok`."""
+    worker.send({**handshake_msg(req_id=1), "batch_memory_frames": True})
+    assert worker.recv()["type"] == "ok"
+    worker.send(configure_msg(req_id=2))
+    assert worker.recv()["type"] == "ok"
+    worker.send({"type": "load", "id": 3})
+    assert worker.recv()["type"] == "ok"
+
+    worker.send(
+        {
+            "type": "predict",
+            "id": 4,
+            "inputs": [{"data": index, "file": None} for index in range(4)],
+            "grant": {
+                "unit_budget": 1, "mb": 1024, "unit": "item",
+                "aggregation": "count", "user_cap_items": None,
+            },
+        }
+    )
+    resp = worker.recv()
+    assert resp["type"] == "ok", resp
+    assert resp["id"] == 4
+    assert len(resp["measurements"]) == 4, "four batches, and still no frames"
+
+    # The next frame on the stream is the next reply, not a straggler.
+    worker.send({"type": "ping", "id": 5})
+    assert worker.recv() == {"type": "ok", "id": 5}
+    worker.send({"type": "unload", "id": 6})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
