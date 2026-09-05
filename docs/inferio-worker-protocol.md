@@ -1347,6 +1347,22 @@ window is in flight per worker either way, so a trim never races a batch.
   liveness fact and never a memory negative on a unified-memory device. Busy
   replicas are deliberately not swept — their window discovers the death
   sooner and with the request context attached.
+- **Four deliberate deviations from the legacy Python manager**, each a bug
+  there rather than a semantic worth porting:
+  - A failed load leaves no phantom id in `/cache`. Python's `_unload_model`
+    deletes the `_cache_key_map` entry only when the model actually loaded, so
+    a failed load leaves `id -> []` in `list_loaded_models()` forever; the
+    Rust manager keeps its refs tidy instead.
+  - `lru_size <= 0` refuses the load with an error. Python evicts the
+    just-inserted entry and then loads the model anyway, leaking a process
+    with no reference left to unload it.
+  - An explicit unload during an in-flight predict lets the running batch
+    finish first — the dispatcher processes the shutdown after the batch.
+    Python terminates the process mid-predict and fails the request.
+  - The post-predict TTL restore only updates the expiration. Python's
+    `finally: load_model(...)` also re-runs move-to-end/resize and would even
+    *respawn* a model that had been unloaded mid-predict, which is an
+    accidental side effect of reusing the load path.
 
 ## Environment (spawn contract)
 
