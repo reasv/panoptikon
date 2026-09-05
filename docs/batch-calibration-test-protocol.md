@@ -75,20 +75,26 @@ report gains a run2 section.
 | **Implementation done** | 2026-09-04 | All four tracks, their verifiers, a cross-track follow-up (R7 was inert without it) and an integration pass landed: **82 commits**, `0d6b36c5` → `65fd2f82`. Suites green bar the two known host artefacts | run2 report §3 (per-R row, with commits and verifier verdicts) and §2 (integration pass) |
 | **Phase A, C, D1 and the probes** | 2026-09-04 | Ran on `65fd2f82` and found **eleven defects** (P1, P2, F1, S1/S1b, C2, C4, C5, D1-b, easyOCR's int32 ceiling, the ledger shape ceiling, the typed transport failure). All eleven fixed, verified and integrated — a further **70 commits**, `65fd2f82` → `34a591aa` | run2 report §4.1–§4.4 (per-leg criteria) and §5 (per-defect root cause, fix, verifier, leg expectation) |
 | **Phase A′ and S4a** | 2026-09-04 21:44–21:58 | Ran on the rebuilt binary `34a591aa` on the **unmodified** `server-C1.toml`, both GPUs at 2 MiB before every leg. **All three PASS on every stated expectation**, closing P1, P2, F1, S1 and R5 by measurement rather than by test. Two findings, neither a defect: the worker's live clamp now double-counts our own allocator pool, and S3's throughput is 0.88× master at exact run1 parity | run2 report §4.5 and §4.6 |
-| **Blocked** | from 2026-09-04 21:59 | The user recreated SGLang (77 702 MiB on both GPUs), so **S4b, S4d, S4g, Phase D and Phase E are blocked, not failed**. Running them against a live SGLang would be invalid *and* a risk to the user's service | run2 report §4.5, §4.7, §4.8 — commands, configs and checks for each |
-| **Deslopping** | 2026-09-04 | The user reviewed the PR size (+86 051 lines, ~19 000 of them product code) and asked for a comment/test/doc concision pass and an assess-first approach to code bloat before the blocked legs run | `docs/batch-calibration-deslop-plan.md` |
+| **Blocked** | 2026-09-04 21:59 → 2026-09-05 05:13 | The user recreated SGLang (77 702 MiB on both GPUs), so S4b, S4d, S4g, Phase D and Phase E stood **blocked, not failed** for a day: running them against a live SGLang would have been invalid *and* a risk to the user's service | run2 report §4.5, §4.7, §4.8 |
+| **Deslopping** | 2026-09-04 → 2026-09-05 | The user reviewed the PR size (+86 051 lines, ~19 000 of them product code) and asked for a comment/test/doc concision pass and an assess-first approach to code bloat first. Phase 1 landed (whole-PR insertions 86 255 → 72 594, production tokens byte-identical); phase 2's candidate list awaits the user's picks | `docs/batch-calibration-deslop-plan.md` |
+| **Phase 3 legs measured** | 2026-09-05 05:13–10:18 | The user authorised stopping SGLang; all seven remaining legs ran on the deslopped tip binary `63a8ad73` (image `5b2b3ed166c0` for S11-C4) and SGLang was restarted at the end. **S4g, S4d, S8 pixmix, S11-C4 and the 4 h soak PASS; S4b PASSes but its "within a few seconds" latency is bounded by the in-flight window; the shape ceiling is unreachable through a job on a 98 GB GPU.** No product defect in any leg; two tool fixes (`555213ac`, `176f6ad9`). Three items now need the user (report §6): S4b's expectation, the ceiling's reachability, and the soak's `oracle_agreement` (14.12 % → 13.53 % only) | run2 report §4.5, §4.7, §4.8 (per-leg expectation tables) and §6 |
 
-**Artefacts the remaining legs must use.** Release binary `34a591aa`
-(`target/release/panoptikon`, 86 313 672 B, built 21:28:07 UTC,
-`panoptikon 0.1.8`) — the last commit on the branch that touches code, so it
-is the tip's code — and image `panoptikon:calib-cuda` = **`0b2261f94c8f`**
-(9.43 GB), with `panoptikon:calib-cuda-run2a` (`6fe5d86e3a1e`) and
-`panoptikon:calib-cuda-run1` (`2a2c93ad6375`) kept beside it; the CPU and
-master images are still run1's. Nothing is pushed, and the `ui` submodule
-commits `9b28044` and `8abf631` are unpushed, so a clean-worktree image build
-needs this host's clone as a remote. The `calib_hostless` workaround is gone
-from every calibration config (`ea59a63b`), so **every job-driven leg now runs
-on the shipped policy shape and must record that job creation works**.
+**Artefacts the legs ran on.** Phases A/C/D1 on `65fd2f82`; Phase A′ and S4a on
+release binary `34a591aa` (86 313 672 B, built 21:28:07 UTC) with image
+`panoptikon:calib-cuda` `0b2261f94c8f`; **Phase 3 on `63a8ad73`**
+(`/home/admin/projects/panoptikon-wt/build-target/release/panoptikon`,
+**86 303 120 B**, built 2026-09-05 04:53 UTC, `panoptikon 0.1.8`) — the last
+commit on the branch that touches code, so it is the tip's code — with image
+`panoptikon:calib-cuda` = **`5b2b3ed166c0`** (built 04:59 UTC from a clean
+detached worktree at the same commit). `0b2261f94c8f` is retagged
+`panoptikon:calib-cuda-run2b`, beside `-run2a` (`6fe5d86e3a1e`) and `-run1`
+(`2a2c93ad6375`); the CPU and master images are still run1's. Nothing is
+pushed, and the `ui` submodule commits `9b28044` and `8abf631` are unpushed, so
+a clean-worktree image build needs this host's clone as a remote. The
+`calib_hostless` workaround is gone from every calibration config
+(`ea59a63b`), so **every leg from Phase A′ onwards ran on the shipped policy
+shape and recorded that job creation works** — including S11-C4, on the shipped
+`docker.toml` inside the image.
 
 **Open items carried into the remaining legs.** The three `easyocr_*` ids
 still ship `enable_batching = false`, so their worker takes the grantless path
@@ -100,23 +106,28 @@ canvas re-denominates what one unit *is*: every run1 profile row for them is
 ignored rather than migrated, so a leg on those models starts from an empty
 profile even on this host.
 
-### Resume sequence, when the GPUs are idle again
+### The sequence as it ran (2026-09-05), and what is left
 
-Stopping SGLang is the user's decision, never a leg's.
+Stopping SGLang is the user's decision, never a leg's; the user gave it for
+this phase and the service was stopped 05:13 and restarted 10:18 UTC.
 
-1. **Wait for idle GPUs** — `nvidia-smi` showing no compute apps on 0 and 1.
-2. **S4b, S4d, S4g** on `34a591aa`, seeded from
+1. **S4g, S4d, S4b** on `63a8ad73`, seeded from
    `results/run2/S2-wdvit-v2/calibration.after.toml` (anchor 439, no knee),
-   driven over the **`ramp8`** corpus; commands in run2 report §4.5.
-3. **Phase D** — S8 pixmix (C1, nemotron, `corpus/pixmix`, empty store, slope
-   judged against the probe of the *same* image group), S11-C4 (image
-   `0b2261f94c8f`, shipped `docker.toml` policy, in-container socket count),
-   and the easyOCR shape ceiling under C7 at **28 items ≈ 183 500 800 units**.
-   Runbook: report §4.7.
-4. **Phase E** — the 4 h S9 soak on C1 over the `soak` corpus. Runbook:
-   report §4.8.
-5. **Finalise** the report's §4.5–§4.8 from the resulting runlogs, and this
-   plan's §4 and §5 rows with them. The run has no host step left to perform.
+   S4d/S4b over the **`ramp8`** corpus — `results/run2/S4g-v2`, `S4d-v2`,
+   `S4b-v2`; all PASS (report §4.5).
+2. **Phase D** — S8 pixmix (fit +0.07 % off its own group's probe, the 20 MP
+   items packed 46 and 27 to a window), S11-C4 (image `5b2b3ed166c0`, shipped
+   `docker.toml`, 80 fds / 37 sockets in the container) and the easyOCR C7
+   ceiling leg (**NOT REACHED**: the ledger prices the 28-item batch at
+   272 313 MiB against 94 070 measured) — `results/run2/S8-pixmix`, `S11-C4`,
+   `S8-ocr-C7-ceiling` (report §4.7).
+3. **Phase E** — the 4 h S9 soak on C1 over the `soak` corpus, 29/29 jobs
+   `completed`, 0 deaths, no persisted knee — `results/run2/S9` (report §4.8).
+4. **Left to do**: the user's decisions (report §6 options table, now including
+   S4b's expectation, the ceiling's reachability and the soak's
+   `oracle_agreement`), the phase 2 deslop picks, pushing the two `ui`
+   submodule commits, and the Nix UI pin at release time. **No host step
+   remains.**
 
 ### Decisions taken during run1 by the orchestrator (2026-09-03)
 
@@ -596,8 +607,9 @@ at 98.2 % of free nine times without an OOM (T10); and S4g's B15 count is
 **4 attempts**, `reqwest_retry`'s, after which the whole job aborts — not
 one load per item.
 
-**Run2 (`34a591aa`): S4a done and PASS; S4b, S4d and S4g BLOCKED.**
-`results/run2/S4a-v2/`, report §4.5. **T4/P5-2 are closed by measurement**:
+**Run2: S4a on `34a591aa` and PASS; S4g, S4d and S4b on `63a8ad73` and PASS.**
+`results/run2/S4a-v2/`, `S4g-v2/`, `S4d-v2/`, `S4b-v2/`; report §4.5.
+**T4/P5-2 are closed by measurement**:
 `reserve_rule = "capped_default"`, `reserve_mb` exactly 1 024 against run1's
 8 579, `limit_mb` 11 071 against 3 517, the executed batch 83 items against
 run1's 11, and 147 granted of the probe's 220-unit boundary at that free
@@ -609,10 +621,17 @@ clamp fired 22 times, comparing NVML's free reading *after* our own caching
 allocator took its pool against a grant the ledger had already charged for,
 so **44 % of the grant goes unused with nothing external moving** (finding
 S4a-A2, a user decision: subtract our own `memory_reserved − memory_allocated`
-before the comparison, or price the grant net of the pool). S4b, S4d and S4g
-are **blocked, not failed** by the user's SGLang holding both GPUs; the resume
-commands and the seed store are in report §4.5, and `ramp8` is still the
-corpus to use.
+before the comparison, or price the grant net of the pool).
+
+| Profile | Run2 verdict, on `63a8ad73` | Recording |
+|---|---|---|
+| **S4g** no room to load | **PASS on every criterion.** A per-model `failure_reason` (model + cooldown + the torch OOM) and `failed_jobs_total 1` — run1's **F1** and **F2** both closed; **2 load attempts / 25.4 s** against run1's 4 / 259.1 s; the server `ok` throughout and wd-vit 180/180 after the release; the cooldown ladder 2 s → 4 s visible in `/health.load_cooldowns[]` | `results/run2/S4g-v2/` |
+| **S4d** step down | **PASS on all three stated expectations.** **0 of 18** memory-blind grants, `limit_mb` min **6 975** over 1 533 samples with none at 0, and the budget back to `S2-wdvit-v2`'s published 878 in **2 windows / 6.1 s**. 16 000/16 000, throughput 0.92× of S2. **S1b's shrink lands in the next window** (82 → 43, 85 → 43) | `results/run2/S4d-v2/` |
+| **S4b** step up | **PASS except the headline latency.** The +30 GB step reaches the grant line in **22.4 s** and `/health` in 22.5 s (run1: 31.0 s) — but **21.3 s of that is the single in-flight batch**, because per-batch readings are applied at `token.finish`, so "within a few seconds" is unreachable without mid-window publication (finding S4b-A1, a user decision). Budget flat at 561 for seven windows where run1 oscillated; 0 clamps needed; 16 000/16 000 at 0.96× of S2 | `results/run2/S4b-v2/` |
+
+Both remaining criteria of this scenario are settled on this host: judge the
+step latency against **one in-flight window**, not a wall-clock "few seconds",
+and judge `utilization` against the boundary at the hog's free level.
 
 ### S5 OOM backstop and negative samples
 ~~C2 (single-GPU fallback lets torch-free fixtures register)~~ **the
@@ -899,13 +918,38 @@ never had:
   *boundary* must come from the cold series), and **`--bisect-oom` is only
   trustworthy when the impl has no silent fallback**.
 
-The **pixmix** half is still pending; it runs on the rebuilt binary and its
-fit must be compared against the probe of the group its `sample_units` are
-multiples of (expected ≈ 1.0; against the `img-20mp` probe the same fit reads
-≈ 6.0× and would mean nothing). **Nemotron's memory is a function of the tile
-grid its aspect ratio picks, not of pixel count** — 1 MP and 4 MP squares
-allocate byte-identically, and so do 0.3 MP and 20 MP 4:3 images — so even in
-capped units the per-unit cost spans **8.35×** over that corpus.
+**Run2, the pixmix half** (`results/run2/S8-pixmix/`, `63a8ad73`; report §4.7).
+**PASS on every packing and canvas expectation.** The fit is **+0.07 %** off
+the `img-0.3mp` probe its corpus is dominated by (0.0012809 against 0.0012800),
+where the same fit against the `img-1mp` probe reads 4.78× and means nothing;
+`canvas_pixels=1835008` appears on all 52 grants, on the load report and in
+`/health`; and the 50 × 20 MP items went through **two windows of 46 and 27
+items** where run1 gave 58 of 110 batches a single item — the canvas price
+1 835 008 against a raw 20 280 000 is an 11.05× reduction, and run1's raw price
+exceeded the whole peak budget. `utilization` reads **0.07** and FAILs: the
+corpus (638 M priced units, ~2.2× one batch at the probe's boundary) ran out
+while the ramp was still doubling, and the knee estimator refuses three times
+saying so. **Nemotron's memory is a function of the tile grid its aspect ratio
+picks, not of pixel count** — 1 MP and 4 MP squares allocate byte-identically,
+and so do 0.3 MP and 20 MP 4:3 images — so even in capped units the per-unit
+cost spans **8.35×** over that corpus.
+
+**Run2, the shape-ceiling leg** (`results/run2/S8-ocr-C7-ceiling/`; report
+§4.7). Everything passes except the ceiling itself, which is **not reachable
+through a job on a 97 887 MiB GPU**: to grant the 28-item batch that triggers
+CRAFT's int32 limit (183 500 800 capped units) the ledger must first reserve
+what its fit says it costs, `796 + 0.0014796440700825149 × 183 500 800 =
+272 313 MiB` — **2.78× the whole GPU** — where the probe measures **94 070 MiB**
+for the same batch (~2.9×, rising to 3.8× at batch 37 as easyOCR's memory
+flattens and the Theil–Sen line does not). The loop is self-closing: no fit
+sample above 34.8 M units exists because no grant above it is issued. So
+`shape_ceiling_units` stayed `null` in all 386 samples and `index_limit` never
+appeared, while the leg PASSes on 460/460 items, host-side canvas pricing, P1,
+grant safety, `oracle_agreement` (worst 19 MiB) and a slope byte-identical to
+run1's. **Recognition text is byte-identical to run1's** — with the caveat that
+the synthetic corpus's > 2560 px scans yield no recognised text in either run,
+so that check is an equality of two empty sets; testing the detect-bounded /
+recognise-raw split properly needs a corpus with real text on a large page.
 
 ### S9 Soak (overnight)
 C1, 8–12 h: a loop of extraction jobs over the `soak` corpus alternating
@@ -915,6 +959,26 @@ models, `hog.py` on a randomized schedule (steps, spikes, calm periods),
 returns to 0 after calm periods; `calibration.toml` size bounded (ring
 64); server RSS flat; no worker deaths except intended; throughput per
 job within ±20 % of the S2 figure during calm periods.
+
+**Run2: PASS on every expectation, at 4 h instead of 8**
+(`results/run2/S9/`, `63a8ad73`, 06:01:15 → 10:04:38; report §4.8).
+**29/29 jobs `completed`** with 0 `partial`, 0 failed items, 0 `invalid
+multipart` and 0 `request_incomplete` — the P2 acceptance test; **0 deaths**
+in 33 spawns; **no `knee_units` on any of the four profiles**, where run1
+persisted 1 on wd-vit and never refitted for 7 h 55 m; deflation peaked at 1
+and returned to 0 within 30 s each time; the store is **5 550 B** with the
+64-ring respected; `load_cooldowns` never populated; RSS 5 134 → 7 341 MB with
+VmHWM 11 310 MB; `refused_requests` 0; peak descriptors **271** against run1's
+8 257; 0 ERROR and 0 panic in 388 623 events. Three `analyze.py` FAILs, all
+adjudicated in report §4.8: the 3 332 "memory-blind" grants are the contention
+floor (`headroom_mb=0`, run1's 3 912 identical in shape, 0 of 21 206 grants
+over their priced headroom); 7 OOM negatives, each carrying its C2 tier line,
+against run1's 3 OOM **and 34 collapse** in twice the time; and 7 271
+`ledger_invariant` samples of 61 222, 99.7 % of them while `external_mb`
+> 10 GiB — the hog stepping up under residents that already hold their grants.
+The one number that did not move is `oracle_agreement`: **13.53 %** against
+run1's 14.12 %, a 0.6 pp improvement where R12's attribution fix was expected
+to give a step change (finding S9-A1, open).
 
 ### S10 Migration
 Create an index DB under C0 (master) with `job_settings[].default_batch_size`
@@ -958,6 +1022,23 @@ inside the container**. Record the base error C4 incurs versus the oracle
 - Repeating S4b and S4c inside the container **passed, and faster than bare**:
   the +30 GB step was visible at **+1.2 s** against the bare host's 31.5 s
   (different window lengths, not a different mechanism).
+
+**Run2 (C4): PASS on every criterion** (`results/run2/S11-C4/`, image
+`5b2b3ed166c0`, the shipped `compose/docker-compose.C4.yml` with no `pid: host`
+and no nofile overlay; report §4.7). **2 000/2 000, 0 errors, 0 failed items**,
+60.39 s of inference. **This is the real P1 test** — the job was created
+through the shipped `docker.toml` policy over h2c inside the shipped image:
+`EXTRACTION_POST_RC=0`, **0 `no_policy` and 0 × 403** in 2 124 log lines, with
+`transport = "h2c"` in 245 of 282 health samples (the 37 `unknown` are the
+documented pre-probe fallback). **The descriptor criterion is now met by a wide
+margin**: peak **80 fds / 37 sockets** on pid 1 inside the container against
+run1's 3 003 / 2 961, with `connections_in_use` peaking at 16 (37 ≈ 2 × 16 + 5),
+and the in-flight ceiling sits at the **byte budget** (`max_concurrent_requests`
+2 304, peak in flight 1 017, `refused_requests` 0), not at the 384 descriptor
+clamp. `/proc/1/limits` still reads `Max open files 524288 524288` — run1's F6
+fix re-verified — while `docker exec … ulimit -n` still prints 1 024, run1's
+documented nuance. Nine grants ramp 6 → 384 units and stop because the corpus
+ran out; four early worker clamps of the S4a-A2 shape are harmless.
 
 ### S12 CPU device (Docker CPU image)
 C6 with `mem_limit: 16g`. `tags/wd-vit-tagger-v3` on the `smoke` corpus.
@@ -1064,18 +1145,16 @@ risk.
 **The last column is this host's answer**, with the number that decided it,
 extended once per leg group: run1 (2026-09-03), then run2's Phases A and C on
 `65fd2f82`, then the Phase D1 leg, the ground-truth probes and the fix round,
-then Phase A′ and S4a on `34a591aa`. Evidence is the runlog of the scenario
-named in the third column, under `tools/calibration-protocol/results/`;
-verdicts are collected in the two reports. A row whose leg is **blocked** by
-the user's SGLang restart says so in place of a number (B2's `external_mb`
-latency, W1's pixmix half, and everything Phase D and Phase E would answer);
-blocked is not failed, and §0 holds the resume sequence. A fix that is landed
-and verified but not yet leg-measured never marks a row cleared.
+then Phase A′ and S4a on `34a591aa`, and finally Phase 3 on `63a8ad73`
+(2026-09-05). Evidence is the runlog of the scenario named in the third column,
+under `tools/calibration-protocol/results/`; verdicts are collected in the two
+reports. Every row now has a leg behind it. A fix that is landed and verified
+but not yet leg-measured never marks a row cleared.
 
 | Id | Suspicion (file) | Scenario | Status after run1, then run2 |
 |---|---|---|---|
-| B1 | A full GPU yields `mb = 0` grants; the worker's `clamp_to_live_memory` and `maybe_shrink` treat `grant_mb <= 0` as "no reservation", so pre-fit units are memory-blind exactly when the GPU is fullest (`ledger.rs:2879`, `packing.py:450`). | S1, S4c | **Confirmed.** 51/51 grants `mb = 0` on a full GPU (S1); 4 more at 8 GB free (S4d), where the ledger's own `unit_budget = 1` — 5 512 one-image batches — was the real cost, not the blinded worker. The worker's live clamp kept working throughout. **Run2 (S6-contend, R5): 3 memory-blind grants of 2 610** against run1's 113, and **0** samples at `limit_mb = 0` against 367 — at 4 GB free the grant is now `unit_budget = 60 mb = 3 040 reserve_mb = 1 024 reserve_rule = "capped_default"`. The cost is throughput (finding C6). **Run2, S4a on `34a591aa` (`S4a-v2`): closed at 12 GB free.** `reserve_rule = "capped_default"`, `reserve_mb` **exactly 1 024** against run1's 8 579, `limit_mb` **11 071** against 3 517, **0** memory-blind grants and **0** samples at `limit_mb = 0`; the executed batch is **83 items where run1 ran 11**. What binds instead is the worker's live clamp, which double-counts our own allocator pool (finding **S4a-A2**, §4 S4). S4c/S4d still have to settle the 8 GB and spike cases — **blocked** on an idle GPU. |
-| B2 | External refresh is `nvidia-smi` free/total only, grant-triggered, 10 s staleness, no poller: a quiet GPU's picture can be minutes old (`ledger.rs:865-880`). | S4b, S4d (latency numbers) | **Confirmed, and worse than stated.** `external_mb` is a *window-boundary* quantity: **0** host probes in ~2.5 h of Phase 3 recording, sample ages of 85.5 s with a worker resident and 166.9 s overall, a +30 GB step taking 31.5 s to reach `/health` and a 53 GB/10 s spike never appearing at all. True of busy GPUs with long windows, not just quiet ones (T3). **Run2: the mechanism is in (R5's per-batch `free_mb` ingest), the latency is unmeasured** — S4b is the leg that decides it and is **blocked** until the GPUs are idle. |
+| B1 | A full GPU yields `mb = 0` grants; the worker's `clamp_to_live_memory` and `maybe_shrink` treat `grant_mb <= 0` as "no reservation", so pre-fit units are memory-blind exactly when the GPU is fullest (`ledger.rs:2879`, `packing.py:450`). | S1, S4c | **Confirmed.** 51/51 grants `mb = 0` on a full GPU (S1); 4 more at 8 GB free (S4d), where the ledger's own `unit_budget = 1` — 5 512 one-image batches — was the real cost, not the blinded worker. The worker's live clamp kept working throughout. **Run2 (S6-contend, R5): 3 memory-blind grants of 2 610** against run1's 113, and **0** samples at `limit_mb = 0` against 367 — at 4 GB free the grant is now `unit_budget = 60 mb = 3 040 reserve_mb = 1 024 reserve_rule = "capped_default"`. The cost is throughput (finding C6). **Run2, S4a on `34a591aa` (`S4a-v2`): closed at 12 GB free.** `reserve_rule = "capped_default"`, `reserve_mb` **exactly 1 024** against run1's 8 579, `limit_mb` **11 071** against 3 517, **0** memory-blind grants and **0** samples at `limit_mb = 0`; the executed batch is **83 items where run1 ran 11**. What binds instead is the worker's live clamp, which double-counts our own allocator pool (finding **S4a-A2**, §4 S4). **Run2, S4d on `63a8ad73` (`S4d-v2`): closed at 8 GB free too.** **0 of 18** grants memory-blind (smallest `mb = 53`), `limit_mb` min **6 975** over 1 533 samples with **0** at zero, `reserve_mb` 1 024 while the hog is up and 496–504 after it lets go, and 16 000/16 000 items at 0.92× of S2. S4c (the 10 s spike) is the only profile of this scenario never run. |
+| B2 | External refresh is `nvidia-smi` free/total only, grant-triggered, 10 s staleness, no poller: a quiet GPU's picture can be minutes old (`ledger.rs:865-880`). | S4b, S4d (latency numbers) | **Confirmed, and worse than stated.** `external_mb` is a *window-boundary* quantity: **0** host probes in ~2.5 h of Phase 3 recording, sample ages of 85.5 s with a worker resident and 166.9 s overall, a +30 GB step taking 31.5 s to reach `/health` and a 53 GB/10 s spike never appearing at all. True of busy GPUs with long windows, not just quiet ones (T3). **Run2, S4b on `63a8ad73` (`S4b-v2`): measured, and the mechanism is bounded from below by the window in flight.** R5's per-batch `free_mb` ingest works — the +30 GB step reaches the grant line at **22.4 s** and `/health.external_mb` at 22.5 s (`external_sample_age_ms` 43 840 → **278**), against run1's 31.0 s — but the readings are applied at `token.finish`, and the window here was one 878-image batch lasting **21.3 s**, so 22.4 s = 21.3 s of in-flight batch + 1.1 s of ledger work. The suspicion is therefore **restated, not cleared**: `external_mb` is no longer a *window-boundary* quantity by construction, but it is still published at window granularity, and the fix for the residue is a mid-window publication at a batch boundary (finding **S4b-A1**, a user decision). Every one of the 43 `oracle_agreement` breaches (of 2 366) falls inside that same 22.4 s window, and `grant_safety` is 12/12 against live free memory. |
 | B3 | Deleting `calibration.toml` under a running server can be undone by the next debounced write; a corrupt file is silently replaced (`calibration.rs:586`, `:1219`). | S3 | **Confirmed**, with a nuance: the profile is read at worker *admission*, so a delete before the first load resurrects a **new, worse** profile (anchor 512 → 32, samples 10 → 4, a spurious knee). The write is a whole-profile replacement, not a merge (N6). |
 | B4 | A persisted anchor is a permanent floor across driver/torch patch bumps matched by `major.minor`; the OOM backstop is the only protection (`ledger.rs:2295`). | S3 variant: edit the stored anchor to 4× and observe the first window | **Confirmed on three legs.** The stored anchor is acted on immediately and is a permanent floor: a poisoned slope self-heals by refitting, the anchor never does, and an OOM *caused by* the anchor did not lower it (N5). Never cross-checked against `sample_units`. |
 | B5 | A shipped baseline knee can only ratchet down within a run (frontier guard) | Not testable until baselines ship; note only | Unchanged — **not testable** until a shipped baseline exists. |
@@ -1097,7 +1176,7 @@ and verified but not yet leg-measured never marks a row cleared.
 | B21 | Prewarm-parked workers are invisible to the ledger; a `prepare()` that initialises CUDA becomes margin-inflated external usage. | S6 (compare `external_mb` with and without prewarm) | **Unreachable with shipped impls.** No impl defines `prepare()`, so parked prewarm workers never initialise CUDA and hold **0 MiB** of VRAM; the pool's real cost is ~1.7 GiB of host RAM (~400–455 MiB RSS each). Re-test if a CUDA-touching `prepare()` ever ships. |
 | B22 | `/health` renamed `last_effective_cap` to `last_grant_units`; check the UI submodule and any consumer. | S14 | **Cleared.** `models[].last_grant_units` is present and populated and nothing in the run read `last_effective_cap`. (Unrelated follow-up: the `ui` submodule's generated types need `npm run gen:api` before release, because G7 added a response header.) |
 | B23 | `accelerator_backend(Auto)` keys profiles as `cpu` while the probe behaves as CUDA on the validation-failure path (`http.rs:271-278`). | S1 (inspect the `backend` key written to `calibration.toml`) | **Cleared.** The written profile carries `backend = "cuda"`. |
-| W1 | Pixel pricing uses raw submitted dimensions, not the model's canvas (`packing.py:300`). | S8 | **Confirmed, and it is more than a pricing quirk:** the *fitted slope* becomes a function of the corpus (nemotron fitted **4.33×** the probe's on a mixed corpus), utilization fell to **0.08** of the boundary, and 58 of 110 batches held a single item. The knee moves with it, since it is expressed in priced units. **Run2: the mechanism is in place, the measurement is pending.** R7 prices every pixel item at `min(raw, canvas_pixels)` on **both** sides (`packing.price_inputs` and `dispatch::estimate_input_units`), the canvas is resolved once per load with the registry winning over the impl's own reading, and it is visible in force — `canvas_pixels=1835008` on nemotron in `S6-b18-loadstall`. All seven shipped `pixel` ids carry `epoch = 2`, so their run1 profiles are ignored and re-measured. **S8 pixmix on the rebuilt binary decides the slope** (expect within ~2× of the probe's — better, within ~10 % of the probe of the same image group — no single-item batches for 20 MP items, utilization > 0.3); that leg is **blocked** on an idle GPU. **Run2, after the D1 leg and the probes: the "corpus-dependent slope" is confirmed as a *measurement* rule, and run1's 4.33× is retracted as a group mismatch.** A `pixel`-priced slope is comparable only to a probe of the same image group: run1's `S8-pixmix` fit is **0.907×** the probe of the group its `sample_units` are multiples of, and run2's easyOCR fit matches its group probe **to seventeen digits** (ratio 1.0000). The cap works and is provable from the stored windows (`S8-ocr-C7-calm-b`: `sample_units` = 5 ×, 9 ×, 11 × 6 553 600), and it packs: 49–57 batches capped against 61–64 uncapped. Two residues: the cap flattened the *price* that `plan_batches` sorts on, so a mixed batch was padded to the largest member's raw dimensions (**D1-b**, fixed — raw-size tiebreaker, and the impl bounds its own detector batch); and for a **tiled VLM** the capped per-unit cost still spans **8.35×** over one corpus, because nemotron's memory follows the tile grid its aspect ratio picks, not the pixel count (a 0.3 MP 4:3 thumbnail costs the same seven tiles as a 20 MP 4:3 sheet). Tile-based pricing would be exact and is a user design decision. |
+| W1 | Pixel pricing uses raw submitted dimensions, not the model's canvas (`packing.py:300`). | S8 | **Confirmed, and it is more than a pricing quirk:** the *fitted slope* becomes a function of the corpus (nemotron fitted **4.33×** the probe's on a mixed corpus), utilization fell to **0.08** of the boundary, and 58 of 110 batches held a single item. The knee moves with it, since it is expressed in priced units. **Run2: the mechanism is in place.** R7 prices every pixel item at `min(raw, canvas_pixels)` on **both** sides (`packing.price_inputs` and `dispatch::estimate_input_units`), the canvas is resolved once per load with the registry winning over the impl's own reading, and it is visible in force — `canvas_pixels=1835008` on nemotron in `S6-b18-loadstall`. All seven shipped `pixel` ids carry `epoch = 2`, so their run1 profiles are ignored and re-measured. **Run2, S8 pixmix on `63a8ad73` (`S8-pixmix`): the slope is decided and W1 is cleared as a defect.** The fit lands **+0.07 %** from the probe of the group the corpus is dominated by (0.0012809 against `img-0.3mp`'s 0.0012800) where the same fit against `img-1mp` reads 4.78×, and the 50 × 20 MP items pack into **two windows of 46 and 27** where run1 gave 58 of 110 batches a single item. `utilization` reads 0.07 and FAILs on a corpus that ran out while the ramp was still doubling, not on the pricing. **Run2, after the D1 leg and the probes: the "corpus-dependent slope" is confirmed as a *measurement* rule, and run1's 4.33× is retracted as a group mismatch.** A `pixel`-priced slope is comparable only to a probe of the same image group: run1's `S8-pixmix` fit is **0.907×** the probe of the group its `sample_units` are multiples of, and run2's easyOCR fit matches its group probe **to seventeen digits** (ratio 1.0000). The cap works and is provable from the stored windows (`S8-ocr-C7-calm-b`: `sample_units` = 5 ×, 9 ×, 11 × 6 553 600), and it packs: 49–57 batches capped against 61–64 uncapped. Two residues: the cap flattened the *price* that `plan_batches` sorts on, so a mixed batch was padded to the largest member's raw dimensions (**D1-b**, fixed — raw-size tiebreaker, and the impl bounds its own detector batch); and for a **tiled VLM** the capped per-unit cost still spans **8.35×** over one corpus, because nemotron's memory follows the tile grid its aspect ratio picks, not the pixel count (a 0.3 MP 4:3 thumbnail costs the same seven tiles as a 20 MP 4:3 sheet). Tile-based pricing would be exact and is a user design decision. |
 | W2 | Measurement brackets CPU decode time, so slow-decoding inputs can trip the 0.4 collapse ratio spuriously (`packing.py:622`). | S8 (20 MP PNGs), S4e | **Not reproduced** in 20 legs. The mixed-resolution corpus **disarms** the comparator (4 × "retiring the throughput comparator after 8 non-comparable batches") rather than fooling it, and `throughput_collapse` never fired on decode time. Retires as a suspicion on this evidence; the tier encodes JPEG, so a slower codec is untested. **Run2 (Phase D1): one `throughput_collapse` negative in eleven legs**, in `S8-ocr-C7-calm-b`, inside a single window while the host was reclaiming memory (that leg also carries the run's only `oracle_agreement` breach, 10 249 MiB on 1 of 400 joined samples). Every other leg: 0 negatives, 19 MiB worst disagreement. Not decode time and not the comparator's tier — host pressure, which nothing in `analyze.py` surfaces; the run2 report's instrument-gap list asks for a `host_pressure` row for exactly this reason. A separate, unrelated source of spurious collapse verdicts *was* found and fixed: a batch trimmed by easyOCR's **shape ceiling** runs a fraction of the work and tripped the collapse flag into a deflation on an empty GPU (`37f5c764`). |
 | W3 | After an absorbed OOM the throughput comparator is not reset, so the regrowth batch may be flagged as a collapse (`packing.py`, `utils.py`). | S5 | **Open.** Nothing in run1 produced an impl-side absorbed OOM under real pressure: the fixtures' batches take 0.5 ms and the one real failure was a decode bomb on an empty GPU. Needs a leg that OOMs MobileCLIP for real (hog + large batch), i.e. S4c-style pressure. |
 | W4 | `alloc_delta` uses a fixed 500 MiB context estimate; Blackwell contexts may exceed it. | S11 (C4 base error) | **Open, and unreachable on this platform.** The degraded base tiers were never entered (see B9), so the fixed 500 MiB context estimate against a **measured 666–668 MiB** context is still untested. Live wherever NVML hides the pid: older drivers, WSL, WDDM, ROCm containers, podman with another toolkit. **Run2: the constant is gone, the tier is still unreached.** R8 replaces the fixed 500 MiB with a measurement — the GPU free-memory delta across this process's first CUDA initialisation, minus the allocator pool at that instant, taken by a thread that *watches* `torch.cuda.is_initialized()` rather than calling into CUDA. On this host `base_method` is still `nvml` on every leg, so the new code is exercised by unit tests only; W4 stays open on every platform. |
