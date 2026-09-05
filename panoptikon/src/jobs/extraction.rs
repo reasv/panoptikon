@@ -2977,80 +2977,53 @@ mod tests {
         }
     }
 
-    // Auto is the default and the registry number no longer leaks into it:
-    // with nothing stored and nothing requested the job runs uncapped, and a
-    // stored zero reads as "unset", not as a cap of zero.
-    #[test]
-    fn an_unset_batch_size_resolves_to_auto() {
-        let model = clip_model();
-        assert_eq!(
-            resolve_job_defaults(&config_with(Vec::new()), &model, None, None).batch_size,
-            None
-        );
-        assert_eq!(
-            resolve_job_defaults(&config_with(Vec::new()), &model, Some(0), None).batch_size,
-            None
-        );
-
-        let zeroed = config_with(vec![JobSettings {
-            group_name: "clip".to_string(),
-            inference_id: None,
-            default_batch_size: Some(0),
-            default_threshold: None,
-        }]);
-        assert_eq!(
-            resolve_job_defaults(&zeroed, &model, None, None).batch_size,
-            None
-        );
-    }
-
-    // The cap chain is user intent only, most specific first.
+    // The cap chain is user intent only, most specific first, and auto is the
+    // default: a stored zero reads as "unset", never as a cap of zero, and the
+    // registry's number never leaks into it.
     #[test]
     fn the_cap_chain_prefers_the_request_then_the_model_then_the_group() {
         let model = clip_model();
-        let config = config_with(vec![
-            JobSettings {
-                group_name: "clip".to_string(),
-                inference_id: None,
-                default_batch_size: Some(8),
-                default_threshold: None,
-            },
-            JobSettings {
-                group_name: "clip".to_string(),
-                inference_id: Some("clip/ViT-H-14".to_string()),
-                default_batch_size: Some(4),
-                default_threshold: None,
-            },
-        ]);
-        assert_eq!(
-            resolve_job_defaults(&config, &model, Some(2), None).batch_size,
-            Some(2)
-        );
-        assert_eq!(
-            resolve_job_defaults(&config, &model, None, None).batch_size,
-            Some(4)
-        );
-
-        let group_only = config_with(vec![JobSettings {
+        let group = |batch| JobSettings {
             group_name: "clip".to_string(),
             inference_id: None,
-            default_batch_size: Some(8),
+            default_batch_size: batch,
             default_threshold: None,
-        }]);
-        assert_eq!(
-            resolve_job_defaults(&group_only, &model, None, None).batch_size,
-            Some(8)
-        );
+        };
+        let per_id = |batch| JobSettings {
+            inference_id: Some("clip/ViT-H-14".to_string()),
+            ..group(batch)
+        };
+        // (stored settings, requested cap, resolved cap, label)
+        let cases: [(Vec<JobSettings>, Option<i64>, Option<i64>, &str); 6] = [
+            (vec![], None, None, "nothing stored, nothing requested"),
+            (vec![], Some(0), None, "a requested zero is unset"),
+            (vec![group(Some(0))], None, None, "a stored zero is unset"),
+            (vec![group(Some(8))], None, Some(8), "the group default"),
+            (
+                vec![group(Some(8)), per_id(Some(4))],
+                None,
+                Some(4),
+                "the per-id default outranks the group's",
+            ),
+            (
+                vec![group(Some(8)), per_id(Some(4))],
+                Some(2),
+                Some(2),
+                "the request outranks both",
+            ),
+        ];
+        for (settings, requested, expected, label) in cases {
+            let config = config_with(settings);
+            assert_eq!(
+                resolve_job_defaults(&config, &model, requested, None).batch_size,
+                expected,
+                "{label}"
+            );
+        }
     }
 
-    // The split the design turns on: core-side request sizing is the constant
-    // and never the user's cap, while the cap goes to the inference side
-    // untouched. The job body wires exactly these two: `unit_slots` is a
-    // `UnitBudget` starting at `MIN_IN_FLIGHT_UNITS` and following the
-    // server's figure (no cap term at all),
-    // `unit_capacity` is `request_unit_capacity`, and the value handed to
-    // `pool.predict` is `gpu_batch_cap`'s — not the chunk size, which is what
-    // it used to be.
+    // The split the design turns on: core-side request sizing never involves
+    // the user's cap, while the cap reaches the inference side untouched.
     #[test]
     fn the_request_budget_is_independent_of_the_users_cap() {
         // Auto and every cap at or above the budget chunk at the budget.
@@ -3084,127 +3057,71 @@ mod tests {
     // The in-flight unit budget follows the server's figure (§8 G7)
     // ------------------------------------------------------------------
 
-    /// The ceiling is core's own bound on a number the server chooses, and it
-    /// comes from the two limits core already applies to in-flight work.
+    /// Core's own bound on the server's figure: the larger of the byte-budget
+    /// and loader-slot terms, capped by descriptors over HTTP/1.1 only (run1
+    /// blocker F6), and never below the deadlock floor.
     #[test]
-    fn the_in_flight_ceiling_comes_from_the_byte_budget_and_the_loader_slots() {
-        // A descriptor budget that cannot bind, so the other two terms show.
-        const FDS: u64 = 524_288;
-        for transport in [
-            InFlightTransport::Multiplexed,
-            InFlightTransport::PerRequest,
-        ] {
-            // Defaults: 1024 MB of intermediate budget, 8 loader slots. The
-            // byte budget is the binding term.
+    fn the_in_flight_ceiling_picks_the_binding_term() {
+        use InFlightTransport::{Multiplexed as H2, PerRequest as H1};
+        const MB: u32 = 1024 * 1024;
+        const AMPLE: u64 = 524_288;
+        const UNKNOWN: u64 = crate::rlimit::NOFILE_LIMIT_UNKNOWN;
+        let need = (MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE) as u64;
+        let fds = (1024 - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM;
+        let bytes = MB as usize / 256;
+        let loaders = 8 * REQUEST_UNIT_BUDGET;
+        let floor = MIN_IN_FLIGHT_UNITS;
+        let want = |kib, slots, nofile, transport, expected, term: &str| {
             assert_eq!(
-                in_flight_unit_ceiling(1024 * 1024, 8, FDS, transport),
-                1024 * 1024 / 256,
-                "{transport:?}"
+                in_flight_unit_ceiling(kib, slots, nofile, transport),
+                expected,
+                "{term} must bind at kib={kib} slots={slots} \
+                 nofile={nofile} {transport:?}"
             );
-            // A tiny byte budget falls back to the loader-slot term, which is
-            // the work core can keep in flight regardless.
-            assert_eq!(
-                in_flight_unit_ceiling(1024, 8, FDS, transport),
-                8 * REQUEST_UNIT_BUDGET,
-                "loader_concurrency x REQUEST_UNIT_BUDGET is the floor of the ceiling"
-            );
-            // Never below one request's worth, whatever the configuration says.
-            assert_eq!(
-                in_flight_unit_ceiling(0, 0, FDS, transport),
-                MIN_IN_FLIGHT_UNITS
-            );
-        }
-    }
-
-    /// The descriptor term of the HTTP/1.1 fallback (Phase 6 finding F6).
-    /// There every in-flight unit costs two sockets in this process, so the
-    /// soft `RLIMIT_NOFILE` caps the window however much byte budget and
-    /// however many loader slots the configuration offers.
-    #[test]
-    fn the_in_flight_ceiling_is_capped_by_the_descriptor_budget() {
-        const H1: InFlightTransport = InFlightTransport::PerRequest;
-        // The shipped container's soft limit, and the shape that produced the
-        // regression: the byte budget alone would offer 4096 units, i.e.
-        // ~8192 sockets against 1024 descriptors.
-        let ceiling = in_flight_unit_ceiling(1024 * 1024, 8, 1024, H1);
-        assert_eq!(
-            ceiling,
-            (1024 - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM,
-            "the descriptor budget, not the byte budget, is the binding term"
-        );
+        };
+        want(MB, 8, AMPLE, H1, bytes, "the byte budget");
+        want(MB, 8, AMPLE, H2, bytes, "the byte budget");
+        want(1024, 8, AMPLE, H1, loaders, "the loader slots");
+        want(1024, 8, AMPLE, H2, loaders, "the loader slots");
+        want(0, 0, AMPLE, H1, floor, "the floor");
+        want(0, 0, AMPLE, H2, floor, "the floor");
+        // 1024 descriptors is the shipped container's soft limit and the shape
+        // that produced the regression: the byte budget alone offers 4096
+        // units, i.e. ~8192 sockets against 1024 descriptors.
+        want(MB, 8, 1024, H1, fds, "the descriptor budget");
+        want(MB, 8, 64, H2, bytes, "the byte budget, h2c ignoring fds");
+        want(0, 0, 64, H2, floor, "the floor, h2c");
+        // The no-limit sentinel must never read as a *small* budget.
+        want(MB, 8, UNKNOWN, H1, bytes, "the byte budget");
+        // Below what the floor's own sockets need, the floor still wins: less
+        // than one request's worth would deadlock the job outright.
+        want(MB, 8, 256, H1, floor, "the floor");
+        want(MB, 8, need - 1, H1, floor, "the floor");
+        want(MB, 8, need, H1, floor, "the floor at the boundary");
+        want(MB, 8, 0, H1, floor, "the floor at zero");
         assert!(
-            ceiling * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE <= 1024,
+            fds * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE <= 1024,
             "the window's sockets plus the reserve must fit under the limit"
         );
-
-        // A large budget — the limit after the startup raise on any ordinary
-        // host — leaves the pre-F6 value untouched, so nothing about the
-        // shipped defaults changes on a correctly configured machine.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 524_288, H1),
-            1024 * 1024 / 256
-        );
-        // Including the "no limit to read" sentinel from a non-Unix host,
-        // where the term must not overflow into a *small* number.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, crate::rlimit::NOFILE_LIMIT_UNKNOWN, H1),
-            1024 * 1024 / 256
-        );
-
-        // A descriptor budget too small even for the floor: the floor wins
-        // anyway, because a budget below one request's worth would deadlock
-        // the job outright (`MIN_IN_FLIGHT_UNITS` is a deadlock bound, not a
-        // performance choice). The job logs a WARN and runs at 64.
-        let need = MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE;
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 256, H1),
-            MIN_IN_FLIGHT_UNITS
-        );
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, need as u64 - 1, H1),
-            MIN_IN_FLIGHT_UNITS
-        );
-        // One descriptor more and the fd term is exactly the floor, so the
-        // two paths agree at the boundary.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, need as u64, H1),
-            MIN_IN_FLIGHT_UNITS
-        );
-        // Zero, which `soft_nofile_limit` never returns but arithmetic must
-        // survive.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 0, H1),
-            MIN_IN_FLIGHT_UNITS
-        );
     }
 
-    /// R10': once requests are multiplexed the socket cost stops scaling with
-    /// the window, so the descriptor budget stops being a term of it at all.
-    /// The whole window costs `2 x pool connections` — eight descriptors at
-    /// the shipped pool size — where the HTTP/1.1 fallback would have paid
-    /// two per unit.
-    ///
-    /// This is the finding-F6 shape: at the shipped container's soft limit of
-    /// 1024, the HTTP/1.1 window is clamped to 384 units and the multiplexed
-    /// one keeps the byte budget's full 4096 while using **8** sockets.
+    /// Once requests are multiplexed the socket cost stops scaling with the
+    /// window, so the descriptor budget stops being a term of it: at the
+    /// shipped container's 1024, the HTTP/1.1 window is clamped to 384 units
+    /// and the multiplexed one keeps the byte budget's 4096 on 8 sockets.
     #[test]
     fn multiplexing_takes_the_descriptor_budget_out_of_the_window() {
         const H2: InFlightTransport = InFlightTransport::Multiplexed;
         const H1: InFlightTransport = InFlightTransport::PerRequest;
-
         let multiplexed = in_flight_unit_ceiling(1024 * 1024, 8, 1024, H2);
         let per_request = in_flight_unit_ceiling(1024 * 1024, 8, 1024, H1);
         assert_eq!(multiplexed, 1024 * 1024 / 256, "the byte budget's figure");
-        assert_eq!(per_request, (1024 - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM);
         assert!(
             multiplexed > per_request,
             "multiplexing must not be the more conservative of the two"
         );
-
-        // The whole point: the sockets that window costs no longer scale with
-        // it. A lane is one h2 connection whatever the peer's stream limit
-        // is — hyper's pool shares a connection rather than opening another —
-        // so every lane at once is the worst case, not a best case.
+        // A lane is one h2 connection whatever the peer's stream limit is, so
+        // every lane at once is the worst case, not a best case.
         let worst_case = FDS_PER_POOLED_CONNECTION * INFERENCE_CONNECTION_LANES;
         assert_eq!(worst_case, 128);
         assert!(
@@ -3212,27 +3129,12 @@ mod tests {
             "every connection lane plus the reserve must fit the limit that \
              could not hold the window"
         );
-
-        // A pathological limit does not change the window — there is nothing
-        // to trade — and the floor still holds.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 64, H2),
-            1024 * 1024 / 256
-        );
-        assert_eq!(in_flight_unit_ceiling(0, 0, 64, H2), MIN_IN_FLIGHT_UNITS);
-        // And the sentinel budget behaves like an ample one.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, crate::rlimit::NOFILE_LIMIT_UNKNOWN, H2),
-            1024 * 1024 / 256
-        );
     }
 
-    /// The invariant the clamp exists for, swept rather than sampled: for
-    /// every descriptor budget that can hold the floor at all, the window's
-    /// worst-case sockets plus the reserve fit under the limit, and more
-    /// descriptors never buy a smaller window. Odd limits are the interesting
-    /// ones — the term floors a division, so an off-by-one in the reserve or
-    /// the divisor shows at 385, 387, ... and nowhere else.
+    /// The clamp's invariant, swept rather than sampled: the window's sockets
+    /// plus the reserve fit under every limit that can hold the floor, and
+    /// more descriptors never buy a smaller window. Odd limits are the
+    /// interesting ones, since the term floors a division.
     #[test]
     fn the_descriptor_clamp_always_fits_and_never_regresses() {
         let need = MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE;
@@ -3256,40 +3158,30 @@ mod tests {
         }
     }
 
-    /// Growth: the budget adds permits toward the figure, and stops at the
-    /// ceiling.
+    /// The budget tracks the server's figure in both directions, bounded by
+    /// core's ceiling above and the deadlock floor below.
     #[tokio::test]
-    async fn the_unit_budget_grows_toward_the_servers_figure() {
+    async fn the_unit_budget_tracks_the_servers_figure() {
         let budget = UnitBudget::new(1_000);
         assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
-
-        budget.observe(Some(512));
-        assert_eq!(budget.slots.available_permits(), 512);
-        // Idempotent: the same figure again mints nothing.
-        budget.observe(Some(512));
-        assert_eq!(budget.slots.available_permits(), 512);
-        // Bounded by core's ceiling, never by what the server asked for.
-        budget.observe(Some(1_000_000));
-        assert_eq!(budget.slots.available_permits(), 1_000);
-    }
-
-    /// Shrink, with nothing outstanding: permits are withdrawn immediately.
-    #[tokio::test]
-    async fn the_unit_budget_shrinks_toward_the_servers_figure() {
-        let budget = UnitBudget::new(1_000);
-        budget.observe(Some(512));
-        budget.observe(Some(128));
-        assert_eq!(budget.slots.available_permits(), 128);
-        // The floor is a hard floor: a request may acquire up to
-        // REQUEST_UNIT_BUDGET permits at once, so the budget must never go
-        // under that or a single request could never be served.
-        budget.observe(Some(1));
-        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
+        for (figure, expected, label) in [
+            (512u64, 512usize, "grows toward the figure"),
+            (512, 512, "the same figure again mints nothing"),
+            (
+                1_000_000,
+                1_000,
+                "bounded by core's ceiling, not by the server",
+            ),
+            (128, 128, "shrinks toward the figure"),
+            (1, MIN_IN_FLIGHT_UNITS, "never under one request's worth"),
+        ] {
+            budget.observe(Some(figure));
+            assert_eq!(budget.slots.available_permits(), expected, "{label}");
+        }
     }
 
     /// Shrinking while permits are outstanding never steals them: the
-    /// withdrawal is remembered and applied as they come back, and the count
-    /// never goes negative.
+    /// withdrawal is remembered and applied as they come back.
     #[tokio::test]
     async fn a_shrink_holds_back_permits_instead_of_stealing_them() {
         let budget = UnitBudget::new(1_000);
@@ -3324,23 +3216,16 @@ mod tests {
         assert_eq!(budget.state.lock().unwrap().target, 96);
     }
 
-    /// **S1b: a shrink must land even while the budget is saturated and
-    /// hundreds of item tasks are queued for permits.**
-    ///
-    /// This is the case `forget_permits` cannot reach: there is nothing
-    /// available to forget, and a permit released by `drop` is handed to a
-    /// waiter before any resize can see it. Run2's `S2-wdvit` leg measured the
-    /// consequence — after the knee the published figure fell to core's floor
-    /// of 64, `pending_shrink` became 136, and the job's in-flight count stayed
-    /// at 200 for the whole post-knee phase. Harmless there only because the
-    /// transport was the real bound; live the moment the header is used to
-    /// *reduce* pressure on a squeezed GPU, which is what T5 added it for.
+    /// A shrink must land even while the budget is saturated and hundreds of
+    /// item tasks are queued for permits — the case `forget_permits` cannot
+    /// reach, since a released permit goes to a waiter before any resize sees
+    /// it. See docs/batch-calibration-design.md "Core's in-flight unit
+    /// budget".
     #[tokio::test]
     async fn a_shrink_lands_through_releases_even_with_waiters_queued() {
         const SATURATED: usize = 200;
         const TARGET: usize = 64;
-        /// 200 - 64. The brief's figure, and the arithmetic is exact: each
-        /// release retires one permit until the deficit is repaid.
+        /// Each release retires one permit until the deficit is repaid.
         const DEFICIT: usize = SATURATED - TARGET;
 
         let budget = Arc::new(UnitBudget::new(1_000));
@@ -3419,12 +3304,12 @@ mod tests {
         waiters.abort_all();
     }
 
-    /// A shrink that never landed is cancelled by a later growth instead of
-    /// double-counting: the permits it wanted to withdraw are still in
-    /// existence, so minting more on top would overshoot.
+    /// A shrink that never landed is cancelled by a later growth rather than
+    /// double-counted: its permits are still in existence, so minting the whole
+    /// growth on top would leave the budget permanently above its own target.
     #[tokio::test]
     async fn a_growth_cancels_a_shrink_that_never_landed() {
-        let budget = UnitBudget::new(1_000);
+        let budget = UnitBudget::new(4_096);
         budget.observe(Some(256));
         let held = budget.acquire(256).await.expect("permits");
         assert_eq!(budget.slots.available_permits(), 0);
@@ -3437,102 +3322,63 @@ mod tests {
             0,
             "the growth cancelled the owed withdrawal"
         );
-        drop(held);
-        budget.settle();
-        assert_eq!(
-            budget.slots.available_permits(),
-            256,
-            "and minted nothing extra: 256 in existence, not 384"
-        );
-    }
 
-    /// An absent figure is "no opinion", not a figure of zero: a server that
-    /// never publishes one leaves the job at the floor it started on — which
-    /// is exactly the constant budget core used before this feature — and a
-    /// server that publishes and then goes quiet keeps the last figure it
-    /// stood behind.
-    #[tokio::test]
-    async fn a_never_published_figure_means_the_floor_and_a_missing_one_changes_nothing() {
-        let budget = UnitBudget::new(1_000);
-        assert_eq!(MIN_IN_FLIGHT_UNITS, REQUEST_UNIT_BUDGET);
-
-        // Never published: the budget stays where it started.
-        budget.observe(None);
-        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
-        budget.observe(None);
-        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
-
-        // Published once, then a response with no header: the last figure
-        // stands rather than collapsing to the floor.
-        budget.observe(Some(512));
-        assert_eq!(budget.slots.available_permits(), 512);
-        budget.observe(None);
-        assert_eq!(budget.slots.available_permits(), 512);
-        assert_eq!(budget.state.lock().unwrap().target, 512);
-    }
-
-    /// And a headerless response still drains a shrink that earlier could not
-    /// be satisfied, because permits may have come back in the meantime.
-    #[tokio::test]
-    async fn a_missing_figure_still_settles_an_owed_shrink() {
-        let budget = UnitBudget::new(1_000);
-        budget.observe(Some(256));
-        let held = budget.acquire(256).await.expect("permits");
-        budget.observe(Some(128));
-        assert_eq!(budget.state.lock().unwrap().pending_shrink, 128);
-
-        drop(held);
-        budget.observe(None);
-        assert_eq!(budget.state.lock().unwrap().pending_shrink, 0);
-        assert_eq!(budget.slots.available_permits(), 128);
-    }
-
-    /// Adversarial: a shrink to the floor while *every* permit is
-    /// outstanding, then a growth well above where the target started. The
-    /// withheld permits must be counted once, not twice — minting the full
-    /// growth on top of a shrink that never landed would leave the budget
-    /// permanently larger than its own target.
-    #[tokio::test]
-    async fn a_shrink_under_the_outstanding_permits_then_a_growth_above_them() {
-        let budget = UnitBudget::new(4_096);
-        budget.observe(Some(1_024));
-        let held = budget.acquire(1_024).await.expect("permits");
-        assert_eq!(budget.slots.available_permits(), 0);
-
-        // All the way to the floor with nothing free to withdraw.
+        // All the way to the floor with nothing free to withdraw, then
+        // straight back up past where it started.
         budget.observe(Some(1));
         {
             let state = budget.state.lock().unwrap();
             assert_eq!(state.target, MIN_IN_FLIGHT_UNITS);
-            assert_eq!(state.pending_shrink, 1_024 - MIN_IN_FLIGHT_UNITS);
+            assert_eq!(state.pending_shrink, 256 - MIN_IN_FLIGHT_UNITS);
         }
-        // ... and straight back up, past where it started.
         budget.observe(Some(4_096));
         {
             let state = budget.state.lock().unwrap();
             assert_eq!(state.target, 4_096);
-            assert_eq!(
-                state.pending_shrink, 0,
-                "the owed shrink is cancelled by the growth, not double-counted"
-            );
+            assert_eq!(state.pending_shrink, 0, "cancelled, not double-counted");
         }
         assert_eq!(
             budget.slots.available_permits(),
-            4_096 - 1_024,
-            "4096 permits in existence, 1024 of them still out"
+            4_096 - 256,
+            "4096 permits in existence, 256 of them still out"
         );
         drop(held);
         budget.settle();
         assert_eq!(budget.slots.available_permits(), 4_096);
     }
 
-    /// Adversarial: many in-flight requests observing conflicting figures at
-    /// once — a `u64::MAX` no header could honestly carry, a zero, and
-    /// figures on both sides of the current target — while permits are being
-    /// taken and returned underneath them. Whichever order the observations
-    /// land in, the budget must end consistent (nothing outstanding means
-    /// `available == target`), inside its own bounds, and still able to serve
-    /// one chunked request's worth.
+    /// An absent figure is "no opinion", not a figure of zero: it leaves the
+    /// target where it is — at the floor for a server that never publishes one,
+    /// which is the pre-feedback constant — while still draining a shrink whose
+    /// permits have come back since.
+    #[tokio::test]
+    async fn a_missing_figure_holds_the_target_and_still_settles_a_shrink() {
+        let budget = UnitBudget::new(1_000);
+        assert_eq!(MIN_IN_FLIGHT_UNITS, REQUEST_UNIT_BUDGET);
+
+        budget.observe(None);
+        budget.observe(None);
+        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
+
+        budget.observe(Some(512));
+        budget.observe(None);
+        assert_eq!(budget.slots.available_permits(), 512);
+        assert_eq!(budget.state.lock().unwrap().target, 512);
+
+        let held = budget.acquire(512).await.expect("permits");
+        budget.observe(Some(128));
+        assert_eq!(budget.state.lock().unwrap().pending_shrink, 384);
+        drop(held);
+        budget.observe(None);
+        assert_eq!(budget.state.lock().unwrap().pending_shrink, 0);
+        assert_eq!(budget.slots.available_permits(), 128);
+    }
+
+    /// Many in-flight requests observing conflicting figures at once — a
+    /// `u64::MAX`, a zero, and figures on both sides of the target — while
+    /// permits are taken and returned underneath them. Whatever the order, the
+    /// budget ends consistent, inside its bounds, and able to serve one
+    /// chunked request.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_conflicting_figures_leave_the_budget_consistent() {
         const CEILING: usize = 4_096;
@@ -3583,12 +3429,9 @@ mod tests {
         drop(last);
     }
 
-    // The guard that keeps a boundary unload from landing on a model a newer
-    // job has already loaded: a load bumps the generation under the slot, and
-    // an unload holding an older generation must refuse to run.
-    //
-    // Serial by construction: this is the only test that touches the batch
-    // slot (queue tests record the decision instead of performing it).
+    // A load bumps the generation under the slot, and an unload holding an
+    // older generation must refuse to run. Serial by construction: the only
+    // test that touches the batch slot.
     #[tokio::test]
     async fn a_newer_batch_load_invalidates_a_pending_unload() {
         // What the queue actor captures when it spawns the unload.
@@ -3620,9 +3463,7 @@ mod tests {
         );
     }
 
-    // The /metadata availability overlay must reach the job layer: an id
-    // carrying `unavailable` resolves with its reason (falling back to a
-    // generic one), and untouched ids resolve with none.
+    // The /metadata availability overlay must reach the job layer.
     #[test]
     fn resolve_model_metadata_picks_up_unavailable_reason() {
         let metadata = serde_json::json!({
@@ -3694,12 +3535,9 @@ mod tests {
         );
     }
 
-    // The WAL-growth regression (docs/sqlite-wal-growth.md): the driver must
-    // drain the work query in keyset chunks, each row fetched at most once
-    // across chunk queries, terminating even for models whose predicate never
-    // excludes processed items (skip_processed_items = false — the case where
-    // only the cursor prevents endless re-dispatch). Runs the *real* compiled
-    // job query (WITH clause, GROUP BY partition) against the migrated
+    // The WAL-growth regression (docs/sqlite-wal-growth.md): the keyset driver
+    // must cover every work unit exactly once, across chunk boundaries and
+    // for a GROUP BY whose representative row may move between chunks.
     // schema, so it also proves the wrapper SQL is valid SQLite.
     #[tokio::test]
     async fn chunked_work_query_fetches_each_item_exactly_once() {
@@ -3708,9 +3546,8 @@ mod tests {
             .execute(&mut dbs.index_conn)
             .await
             .unwrap();
-        // Five image items (one with two files, so the GROUP BY partition has
-        // something to collapse) and one non-image item the mime filter must
-        // exclude.
+        // Five image items (one with two files, so the GROUP BY partition
+        // has a choice), against a chunk size of 2.
         sqlx::query(
             r#"
             INSERT INTO items (id, sha256, md5, type, time_added)
@@ -3795,9 +3632,8 @@ mod tests {
         );
     }
 
-    // The completion decision, exhaustively. It is what stands between "12
-    // corrupt files" and a job history full of phantom inference outages, and
-    // between a real outage and a job that quietly reports success.
+    // The completion decision, exhaustively: it separates a real outage from
+    // a job that quietly reports success.
     #[test]
     fn job_failure_classifier_covers_every_combination() {
         use JobFailure::*;
@@ -3898,22 +3734,15 @@ mod tests {
         })
     }
 
-    /// **C4: a job aborted by a load cooldown says which model, for how long
-    /// and why — on the `load_model_all` path too.**
-    ///
-    /// Phase C measured the whole of a job's `failure_reason` as
-    /// `"Failed to load model: model load failed on all 1 inference
-    /// endpoints"`: a sentence that names neither the model nor anything about
-    /// its problem. Two causes, both fixed: `{err}` renders only the outermost
-    /// context, and `load_model_all` used to keep the *last* endpoint's error
-    /// rather than the most informative one.
+    /// A job aborted by a load cooldown says which model, for how long and
+    /// why — on the `load_model_all` path too, where `{err}` used to render
+    /// only the outermost context and the pool kept the *last* endpoint's
+    /// error rather than the most informative one.
     #[test]
     fn a_load_failure_reason_carries_the_cooldown_or_the_whole_chain() {
         use crate::inferio_client::LOAD_COOLDOWN_KIND;
 
-        // A cooldown reaches the record with everything R9 sends, even when
-        // the pool has wrapped it in its own context — which is what the
-        // `load_model_all` path always does.
+        // A cooldown survives the context the pool wraps it in.
         let wrapped = typed_failure(Some(LOAD_COOLDOWN_KIND))
             .context("model group/model-a failed to load on all 1 inference endpoints");
         let reason = load_failure_reason(&wrapped);
@@ -3946,13 +3775,9 @@ mod tests {
         );
     }
 
-    /// **C5: the re-queue summary must state the outcome it is summarising.**
-    ///
-    /// The branch that produces it is reached whenever there is no *partial*
-    /// reason — which includes `JobFailure::Systemic` and an abort. Phase C
-    /// caught it asserting that 2 000 re-queued items "then completed" two
-    /// statements before the same code wrote `outcome: "failed",
-    /// failed_items: 2000`.
+    /// The re-queue summary must state the outcome it is summarising: the
+    /// branch that produces it is reached whenever there is no *partial*
+    /// reason, which includes a systemic failure and an abort.
     #[test]
     fn the_requeue_summary_never_claims_a_failed_job_completed() {
         let completed = requeue_summary(12, 0, 2_000, None, JobFailure::None);
@@ -3989,122 +3814,93 @@ mod tests {
         );
     }
 
-    /// The whole of the F7 policy, on the one function that decides it.
-    ///
-    /// A worker death is the only failure that buys a re-submission, it buys
-    /// exactly one per item, and everything else — including a *second* death
-    /// on the retry — is a plain failure of that item.
+    /// The whole of the F7 policy on the one function that decides it: a
+    /// request whose work was left undone buys exactly one re-submission per
+    /// item, and everything else — a second one on the retry included — is a
+    /// plain failure of that item.
     #[test]
     fn only_a_first_worker_death_buys_an_item_a_second_attempt() {
         use crate::inferio_client::{
-            BODY_BUDGET_KIND, LOAD_COOLDOWN_KIND, REQUEST_INCOMPLETE_KIND, WORKER_DIED_KIND,
+            BODY_BUDGET_KIND, LOAD_COOLDOWN_KIND, REQUEST_INCOMPLETE_KIND, TransportPhase,
+            WORKER_DIED_KIND,
         };
 
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(WORKER_DIED_KIND)), false),
-            InferenceRecovery::Requeue
-        );
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(WORKER_DIED_KIND)), true),
-            InferenceRecovery::Fail,
-            "the one-shot budget is per item, so a second death is a failure"
-        );
-        // Run2 P2: a 400 that says the request body never arrived is not a
-        // verdict about the media, and it spends the same one-shot budget.
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(REQUEST_INCOMPLETE_KIND)), false),
-            InferenceRecovery::Requeue,
-            "a request the server never parsed was never attempted"
-        );
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(REQUEST_INCOMPLETE_KIND)), true),
-            InferenceRecovery::Fail,
-            "one retry per item, whichever way the request went unattempted"
-        );
-        // A 503 that says the server had no room to read the body is the
-        // third way a predict goes unattempted, and it spends the same
-        // budget: it is not a verdict about the media either.
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(BODY_BUDGET_KIND)), false),
-            InferenceRecovery::Requeue,
-            "a body the server never read was never attempted"
-        );
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(BODY_BUDGET_KIND)), true),
-            InferenceRecovery::Fail,
-            "one retry per item, whichever way the request went unattempted"
-        );
-        // Run2 S1 open item 1: a client-side transport failure is the
-        // fourth way an item's work is left undone, and the only one no
-        // server can report. Every phase earns the same single retry out of
-        // the same budget — including `Body`, which earns it on the
-        // idempotence of a predict rather than on a claim that nothing ran.
-        for phase in [
-            crate::inferio_client::TransportPhase::Connect,
-            crate::inferio_client::TransportPhase::Send,
-            crate::inferio_client::TransportPhase::Headers,
-            crate::inferio_client::TransportPhase::Body,
-        ] {
+        // The four ways an item's work is left undone. The typed kinds ride
+        // different statuses on purpose (P2's is a 400), so the retry is
+        // visibly bought by the kind and not by a 5xx; the transport phases are
+        // the client's own, and `Body` earns the retry on a predict's
+        // idempotence rather than on a claim that nothing ran.
+        let undone: Vec<(String, anyhow::Error)> =
+            [WORKER_DIED_KIND, REQUEST_INCOMPLETE_KIND, BODY_BUDGET_KIND]
+                .into_iter()
+                .map(|kind| (kind.to_string(), typed_failure(Some(kind))))
+                .chain(
+                    [
+                        TransportPhase::Connect,
+                        TransportPhase::Send,
+                        TransportPhase::Headers,
+                        TransportPhase::Body,
+                    ]
+                    .into_iter()
+                    .map(|phase| (format!("transport {phase:?}"), transport_failure(phase))),
+                )
+                .collect();
+        for (label, err) in &undone {
             assert_eq!(
-                classify_item_failure(&transport_failure(phase), false),
+                classify_item_failure(err, false),
                 InferenceRecovery::Requeue,
-                "a predict that ended in the {phase:?} phase left its item's work undone"
+                "{label} left the item's work undone"
             );
             assert_eq!(
-                classify_item_failure(&transport_failure(phase), true),
+                classify_item_failure(err, true),
                 InferenceRecovery::Fail,
-                "one retry per item, whichever way the work was left undone ({phase:?})"
+                "{label}: the one-shot budget is per item"
             );
         }
         assert!(
-            !inference_failure(&transport_failure(
-                crate::inferio_client::TransportPhase::Body
-            ))
-            .expect("typed")
-            .is_unattempted(),
-            "and the body phase re-queues without ever claiming nothing ran"
+            !inference_failure(&transport_failure(TransportPhase::Body))
+                .expect("typed")
+                .is_unattempted(),
+            "the body phase re-queues without ever claiming nothing ran"
         );
 
-        // An untyped failure is every pre-existing predict failure in the
-        // world: it must behave exactly as it did before this change.
-        assert_eq!(
-            classify_item_failure(&typed_failure(None), false),
-            InferenceRecovery::Fail
-        );
-        assert_eq!(
-            classify_item_failure(&anyhow::anyhow!("connection reset"), false),
-            InferenceRecovery::Fail
-        );
-        // The retry is bought by the kind, never by the status: an upstream
-        // that answers a plain 400 has told us nothing that makes asking
-        // again any different from asking the first time.
-        assert_eq!(
-            classify_item_failure(&untyped_bad_request(), false),
-            InferenceRecovery::Fail,
-            "an untyped 4xx is not evidence that the request went unattempted"
-        );
+        // Everything else is a plain failure, and the retry is bought by the
+        // kind and never by the status: an untyped 4xx is not evidence that
+        // the request went unattempted.
+        for (label, err) in [
+            ("a typed failure with no kind", typed_failure(None)),
+            ("an untyped error", anyhow::anyhow!("connection reset")),
+            ("an untyped 400", untyped_bad_request()),
+        ] {
+            assert_eq!(
+                classify_item_failure(&err, false),
+                InferenceRecovery::Fail,
+                "{label}"
+            );
+        }
 
         // The cooldown aborts whether or not the item has already been
         // re-queued: it is a statement about the model, not about this item.
         for already in [false, true] {
             match classify_item_failure(&typed_failure(Some(LOAD_COOLDOWN_KIND)), already) {
                 InferenceRecovery::Abort(reason) => {
-                    assert!(reason.contains("group/model-a"), "{reason}");
-                    assert!(reason.contains("2026-09-04T12:00:00Z"), "{reason}");
-                    assert!(reason.contains("3 consecutive load failures"), "{reason}");
-                    assert!(reason.contains("failed fatally"), "{reason}");
+                    for expected in [
+                        "group/model-a",
+                        "2026-09-04T12:00:00Z",
+                        "3 consecutive load failures",
+                        "failed fatally",
+                    ] {
+                        assert!(reason.contains(expected), "{expected} missing: {reason}");
+                    }
                 }
                 other => panic!("a cooldown must abort the job, got {other:?}"),
             }
         }
     }
 
-    /// **A transport failure is never isolated unit by unit.**
-    ///
-    /// A socket knows nothing about any work unit, so an isolation pass can
-    /// only repeat the failure — once per unit, each carrying the client's
-    /// own three transport retries, in front of the single re-queue the
-    /// failure is actually owed.
+    /// A transport failure is never isolated unit by unit: a socket knows
+    /// nothing about any work unit, so isolation could only repeat it once per
+    /// unit, each carrying the client's own three transport retries.
     #[test]
     fn a_transport_failure_is_never_isolated_unit_by_unit() {
         for phase in [
@@ -4124,9 +3920,8 @@ mod tests {
         );
     }
 
-    /// The typed failure has to survive the context the job path wraps it in
-    /// — `run_chunked_inference`'s isolation context, the pool's failover —
-    /// or the policy above silently degrades to "everything is a failure".
+    /// The typed failure has to survive the context the job path wraps it in,
+    /// or the policy above degrades to "everything is a failure".
     #[test]
     fn the_typed_failure_survives_the_context_chain() {
         let err = typed_failure(Some(crate::inferio_client::WORKER_DIED_KIND))
@@ -4138,9 +3933,8 @@ mod tests {
         );
     }
 
-    /// The counter that decides `partial`: only failures with no verdict
-    /// explaining them. A recorded media verdict is a conclusion, not undone
-    /// work, so it never makes a job partial.
+    /// The counter that decides `partial`: only failures with no verdict. A
+    /// recorded media verdict is a conclusion, not undone work.
     #[test]
     fn unsettled_failures_counts_only_the_failures_nothing_explains() {
         assert_eq!(unsettled_failures(0, 0), 0);
@@ -4163,15 +3957,10 @@ mod tests {
         assert!(abort.is_set());
     }
 
-    /// A cancelled job hands its buffered failure records on to be written,
-    /// instead of dropping them with the guard.
-    ///
-    /// The records are counted in `data_log` the moment they are noted, so a
-    /// guard that only stamped the outcome left a cancelled job saying "items
-    /// failed" while the failures endpoint listed none of them — the same
-    /// counted-but-not-listed asymmetry run1 found (Q8/T8) and this surface
-    /// exists to close. Draining the buffer is the observable here; that the
-    /// drained records round trip is
+    /// A cancelled job hands its buffered failure records on to be written
+    /// instead of dropping them with the guard: they are already counted in
+    /// `data_log`, so dropping them is the counted-but-not-listed asymmetry
+    /// this surface exists to close. That they round trip is
     /// `db::job_failures::recorded_failures_come_back_with_their_item_and_path`.
     #[tokio::test]
     async fn cancelling_a_job_still_hands_over_its_failure_records() {
@@ -4188,9 +3977,8 @@ mod tests {
         assert_eq!(counters.lock().await.failures.len(), 1);
 
         let stamp = CancelledJobStamp {
-            // No writer is registered for this name, so the write attempt
-            // WARNs and is swallowed — deliberately, since losing the audit
-            // must never be what fails a job.
+            // No writer is registered here, so the write WARNs and is
+            // swallowed — losing the audit must never fail a job.
             index_db: "cancelled-job-stamp-test".to_string(),
             job_id: 1,
             counters: Arc::clone(&counters),
@@ -4283,13 +4071,17 @@ mod tests {
         ids
     }
 
-    /// A migrated on-disk index database, which is what the writer actor (and
-    /// therefore every ledger write path) needs.
-    async fn ledger_test_db(name: &'static str) -> &'static str {
+    /// A migrated on-disk index database seeded with `files`, which is what the
+    /// writer actor (and so every ledger write path) needs.
+    async fn ledger_test_db(name: &'static str, files: &[(i64, &str, &str)]) -> &'static str {
         let user_db = format!("{name}_user");
         crate::db::migrations::migrate_databases_on_disk(Some(name), Some(&user_db))
             .await
             .expect("migrate test databases");
+        let mut conn = crate::db::open_index_db_write_no_user_data(name)
+            .await
+            .unwrap();
+        seed_ledger_fixture(&mut conn, files).await;
         name
     }
 
@@ -4314,10 +4106,9 @@ mod tests {
         }
     }
 
-    // End to end for the confirmed verdict: a file whose header cannot be
-    // parsed is `input`, the record it owes lands in the ledger with the
-    // item's mime type, and the work query stops offering it — which is the
-    // entire point of the ledger.
+    // End to end for a confirmed verdict: an unparseable header is `input`,
+    // the record lands with the item's mime type, and the work query stops
+    // offering the item.
     #[tokio::test]
     async fn a_corrupt_image_lands_in_the_ledger_and_leaves_the_work_query() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4378,58 +4169,112 @@ mod tests {
         );
     }
 
-    // The ambiguous threshold: a verdict from a tool that did its own file
-    // I/O must cost exactly one confirmation re-attempt, in a later run,
-    // before it suppresses anything.
+    // What the work query's anti-join does with a ledger row: the ambiguous
+    // threshold costs one confirmation re-attempt in a *later* run, a verdict
+    // belongs to one (item, setter) pair, and — since the ledger keys on the
+    // item while a file-target query yields file rows — it takes every file of
+    // that item out. Each phase gets its own database.
     #[tokio::test]
-    async fn an_unconfirmed_verdict_keeps_the_item_for_one_more_run() {
+    async fn the_work_query_anti_join_matches_the_ledger() {
+        // The confirmation ladder. The upsert dedups on `last_job_id`, so a
+        // second failure inside the same job cannot confirm the verdict.
         let mut dbs = crate::db::migrations::setup_test_databases().await;
         let conn = &mut dbs.index_conn;
         seed_ledger_fixture(conn, &[(1, "sha_one", "C:/data/1.png")]).await;
         let model = image_model();
-
         let err = ApiError::input_unconfirmed("ffmpeg exited 1");
         assert_eq!(err.skip_after(), SKIP_AFTER_AMBIGUOUS);
         let mut record = failure_record(&model, 1, STAGE_PREPARE, "sha_one", &err);
-        upsert_extraction_error(conn, &record).await.unwrap();
-        assert_eq!(
-            work_query_items(conn, &model).await,
-            vec![1],
-            "one failure does not settle an ambiguous verdict"
-        );
+        for (job, expected, label) in [
+            (None, vec![1], "one failure does not settle it"),
+            (
+                Some(1),
+                vec![1],
+                "the same job cannot confirm its own verdict",
+            ),
+            (Some(2), vec![], "the second run confirms it"),
+        ] {
+            if let Some(job) = job {
+                record.job_id = Some(job);
+            }
+            upsert_extraction_error(conn, &record).await.unwrap();
+            assert_eq!(work_query_items(conn, &model).await, expected, "{label}");
+        }
 
-        // A *later* job confirms it; a second failure inside the same job
-        // would not (the upsert dedups on last_job_id).
-        record.job_id = Some(1);
-        upsert_extraction_error(conn, &record).await.unwrap();
-        assert_eq!(
-            work_query_items(conn, &model).await,
-            vec![1],
-            "the same job cannot confirm its own verdict"
+        // A verdict belongs to one (item, setter) pair.
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed_ledger_fixture(conn, &[(1, "sha_one", "C:/data/1.png")]).await;
+        sqlx::query("INSERT INTO setters (id, name) VALUES (2, 'test/tagger')")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let mut tagger = image_model();
+        tagger.setter_name = "test/tagger".to_string();
+        let record = failure_record(
+            &tagger,
+            1,
+            STAGE_PREPARE,
+            "sha_one",
+            &ApiError::input("bad"),
         );
-        record.job_id = Some(2);
         upsert_extraction_error(conn, &record).await.unwrap();
         assert!(
-            work_query_items(conn, &model).await.is_empty(),
-            "the second run confirms the verdict"
+            work_query_items(conn, &tagger).await.is_empty(),
+            "the setter that recorded the verdict does stop seeing the item"
+        );
+        assert_eq!(
+            work_query_items(conn, &image_model()).await,
+            vec![1],
+            "another setter's verdict says nothing about this one's work"
+        );
+
+        // One item-keyed verdict removes every file row of that item.
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let files = [
+            (1, "sha_one", "C:/data/1.png"),
+            (2, "sha_two", "C:/data/2.png"),
+        ];
+        seed_ledger_fixture(conn, &files).await;
+        // A second path for the same item (a hardlink or a copy).
+        sqlx::query(
+            "INSERT INTO files (id, sha256, item_id, path, filename, last_modified, \
+             scan_id, available) \
+             VALUES (3, 'sha_one', 1, 'C:/data/1-copy.png', 'f.png', '2026-01-01T00:00:00', 1, 1)",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let mut model = image_model();
+        model.target_entities = vec!["files".to_string()];
+        assert_eq!(
+            work_query_column(conn, &model, "file_id").await,
+            vec![1, 2, 3],
+            "every file row is work before anything failed"
+        );
+        let record = failure_record(&model, 1, STAGE_PREPARE, "sha_one", &ApiError::input("bad"));
+        upsert_extraction_error(conn, &record).await.unwrap();
+        assert_eq!(
+            work_query_column(conn, &model, "file_id").await,
+            vec![2],
+            "both of that item's file rows go, and only that item's"
         );
     }
 
-    // Parity guard: the gateway's own I/O failing says nothing about the
-    // media, so nothing is recorded and the item stays selectable. A missing
-    // file is the cheapest way to provoke exactly that.
+    // Prepare-stage classification against the real toolchain. The gateway's
+    // own I/O failing says nothing about the media, so nothing is recorded and
+    // the item stays selectable; a tool that did its own file I/O produces an
+    // *unconfirmed* payload verdict, never `blocked` — the distinction that
+    // keeps a missing codec from reading as a missing install.
     #[tokio::test]
-    async fn a_missing_file_is_transient_and_records_nothing() {
+    async fn prepare_classifies_io_as_transient_and_a_bad_payload_as_unconfirmed() {
         let dir = tempfile::TempDir::new().unwrap();
-        let missing = dir.path().join("gone.png");
-        let missing_gif = dir.path().join("gone.gif");
         let model = image_model();
 
-        for (path, mime) in [
-            (missing.to_string_lossy().to_string(), "image/png"),
-            (missing_gif.to_string_lossy().to_string(), "image/gif"),
-        ] {
-            let mut item = image_item(1, "sha_one", &path);
+        for mime in ["image/png", "image/gif"] {
+            let missing = dir.path().join(format!("gone.{}", &mime[6..]));
+            let mut item = image_item(1, "sha_one", missing.to_string_lossy().as_ref());
             item.item_type = mime.to_string();
             let err = input_handlers::prepare_item("unused", &model, item, true)
                 .await
@@ -4440,109 +4285,43 @@ mod tests {
                 "{mime}: a read failure is transient and must never be recorded"
             );
         }
-    }
 
-    // The setter predicate inside the FailedFor CTE, which nothing else
-    // covers: a verdict belongs to one (item, setter) pair, so a tagger that
-    // cannot read a file must never take that file away from CLIP.
-    #[tokio::test]
-    async fn a_different_setters_verdict_does_not_hide_the_item() {
-        let mut dbs = crate::db::migrations::setup_test_databases().await;
-        let conn = &mut dbs.index_conn;
-        seed_ledger_fixture(conn, &[(1, "sha_one", "C:/data/1.png")]).await;
-        sqlx::query("INSERT INTO setters (id, name) VALUES (2, 'test/tagger')")
-            .execute(&mut *conn)
+        if !crate::media_tools::ffmpeg_available() {
+            return; // No toolchain here: the ffmpeg half is unobservable.
+        }
+        let _test_env = test_data_dir();
+        let index_db = ledger_test_db("extraction_ffmpeg_classify", &[]).await;
+        let fake_video = dir.path().join("garbage.mp4");
+        std::fs::write(&fake_video, b"nothing here is a container").unwrap();
+        let mut item = image_item(1, "sha_vid", fake_video.to_string_lossy().as_ref());
+        item.item_type = "video/mp4".to_string();
+        item.duration = Some(10.0);
+        item.video_tracks = Some(1);
+
+        let err = input_handlers::prepare_item(index_db, &model, item, true)
             .await
-            .unwrap();
-
-        // A confirmed verdict, recorded by the *other* setter.
-        let mut tagger = image_model();
-        tagger.setter_name = "test/tagger".to_string();
-        let record = failure_record(
-            &tagger,
-            1,
-            STAGE_PREPARE,
-            "sha_one",
-            &ApiError::input("corrupt"),
-        );
-        upsert_extraction_error(conn, &record).await.unwrap();
-        assert!(
-            work_query_items(conn, &tagger).await.is_empty(),
-            "the setter that recorded the verdict does stop seeing the item"
-        );
-
+            .expect_err("ffmpeg must reject a file that is not a container");
+        assert_eq!(err.kind(), ApiErrorKind::Input);
         assert_eq!(
-            work_query_items(conn, &image_model()).await,
-            vec![1],
-            "another setter's verdict says nothing about this one's work"
+            err.skip_after(),
+            SKIP_AFTER_AMBIGUOUS,
+            "a tool that did its own file I/O never settles a verdict alone"
         );
     }
 
-    // The ledger keys on the item, but the work query of a file-target model
-    // yields file rows: a verdict has to take *every* file of that item out,
-    // or the item comes back through its second path and fails again.
-    #[tokio::test]
-    async fn a_verdict_removes_every_file_of_a_multi_file_item() {
-        let mut dbs = crate::db::migrations::setup_test_databases().await;
-        let conn = &mut dbs.index_conn;
-        seed_ledger_fixture(
-            conn,
-            &[
-                (1, "sha_one", "C:/data/1.png"),
-                (2, "sha_two", "C:/data/2.png"),
-            ],
-        )
-        .await;
-        // A second path for the same item (a hardlink or a copy).
-        sqlx::query(
-            "INSERT INTO files (id, sha256, item_id, path, filename, last_modified, \
-             scan_id, available) \
-             VALUES (3, 'sha_one', 1, 'C:/data/1-copy.png', 'f.png', '2026-01-01T00:00:00', 1, 1)",
-        )
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-
-        let mut model = image_model();
-        model.target_entities = vec!["files".to_string()];
-        assert_eq!(
-            work_query_column(conn, &model, "file_id").await,
-            vec![1, 2, 3],
-            "every file row is work before anything failed"
-        );
-
-        let record = failure_record(
-            &model,
-            1,
-            STAGE_PREPARE,
-            "sha_one",
-            &ApiError::input("corrupt"),
-        );
-        upsert_extraction_error(conn, &record).await.unwrap();
-        assert_eq!(
-            work_query_column(conn, &model, "file_id").await,
-            vec![2],
-            "one item-keyed verdict removes both of that item's file rows, \
-             and only that item's"
-        );
-    }
-
-    // The success-path delete gate. An item with an *active* row is not in the
-    // work query at all, so the only row a success can ever clear is the
-    // sub-threshold one a transient blip left behind — which is exactly why
-    // the gate lists all rows rather than the active ones. Without this, that
-    // row survives, and a second blip months later suppresses a healthy file.
-    // The gate is per-sha256: an item that owes nothing must not pay for a
-    // writer round-trip just because some *other* item has a row.
+    // The success-path delete gate, which is why it lists all rows rather
+    // than the active ones: an item with an active row is not in the work
+    // query, so the only row a success can clear is a sub-threshold one. The
+    // gate is per-sha256, so an item that owes nothing pays nothing.
     #[tokio::test]
     async fn a_successful_item_clears_its_unconfirmed_row() {
         let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_clear_unconfirmed").await;
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_clear_unconfirmed", &files).await;
         {
             let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
                 .await
                 .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.png")]).await;
             // One ambiguous failure: attempts = 1, skip_after = 2.
             let record = failure_record(
                 &image_model(),
@@ -4593,18 +4372,12 @@ mod tests {
     }
 
     // A ledger write that fails is a database problem, never a verdict: it
-    // must count systemic and return the error, or a DB outage soft-completes
-    // the job as "all corrupt media".
+    // must count systemic, or a DB outage soft-completes the job.
     #[tokio::test]
     async fn a_ledger_write_failure_is_systemic() {
         let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_ledger_write_fails").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.png")]).await;
-        }
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_ledger_write_fails", &files).await;
 
         // No `setters` row for this name, so the upsert matches nothing.
         let mut model = image_model();
@@ -4631,31 +4404,15 @@ mod tests {
         );
     }
 
-    // A missing dependency is input-side (it must not fail the job) but it is
-    // also the one input-side class the user can fix, so the blocker has to
-    // survive into the counters — a job that completes without naming it is a
-    // silent no-op the user cannot diagnose.
+    // A missing dependency is input-side, but it is also the one input-side
+    // class the user can fix, so the blocker survives into the counters.
     #[tokio::test]
     async fn a_blocked_prepare_failure_counts_input_side() {
         let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_blocked_counts").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.pdf")]).await;
-        }
+        let files = [(1, "sha_one", "C:/data/1.pdf")];
+        let index_db = ledger_test_db("extraction_blocked_counts", &files).await;
         let model = image_model();
-        let job_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddDataLog {
-            scan_time: crate::db::extraction_write::current_iso_timestamp(),
-            threshold: None,
-            types: vec![model.output_type.clone()],
-            setter: model.setter_name.clone(),
-            batch_size: 4,
-            reply,
-        })
-        .await
-        .unwrap();
+        let job_id = data_log_job(index_db, &model).await;
 
         let (outcome, returned) = record_item_failure(
             index_db,
@@ -4716,9 +4473,8 @@ mod tests {
         );
     }
 
-    // The anti-join shape the work query depends on: the failure CTE is
-    // LEFT JOINed and required to be NULL, and it selects only rows whose
-    // verdict is already active.
+    // The anti-join shape the work query depends on: the failure CTE is LEFT
+    // JOINed, required to be NULL, and selects only already-active verdicts.
     #[test]
     fn the_work_query_anti_joins_the_active_ledger_rows() {
         let model = image_model();
@@ -4736,31 +4492,20 @@ mod tests {
         );
     }
 
-    // Auto-heal, minus the probe: installing the dependency clears exactly
-    // its rows and nothing else. The probe half is a real binding/spawn,
-    // which is why the clearing takes its results as an argument.
+    // Auto-heal, minus the probe (a real binding/spawn, which is why the
+    // clearing takes its results as an argument).
     #[tokio::test]
     async fn healing_clears_only_the_dependencies_that_came_back() {
         let _test_env = test_data_dir();
-        let index_db = "extraction_heal_blocked";
-        crate::db::migrations::migrate_databases_on_disk(
-            Some(index_db),
-            Some("extraction_heal_blocked_user"),
-        )
-        .await
-        .expect("migrate test databases");
+        let files = [
+            (1, "sha_pdf", "C:/data/1.pdf"),
+            (2, "sha_vid", "C:/data/2.mp4"),
+        ];
+        let index_db = ledger_test_db("extraction_heal_blocked", &files).await;
         {
             let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
                 .await
                 .unwrap();
-            seed_ledger_fixture(
-                &mut conn,
-                &[
-                    (1, "sha_pdf", "C:/data/1.pdf"),
-                    (2, "sha_vid", "C:/data/2.mp4"),
-                ],
-            )
-            .await;
             for (sha256, blocker) in [("sha_pdf", Blocker::Pdfium), ("sha_vid", Blocker::Ffmpeg)] {
                 let err = ApiError::blocked(blocker, "dependency missing");
                 let record = failure_record(&image_model(), 1, STAGE_PREPARE, sha256, &err);
@@ -4788,49 +4533,6 @@ mod tests {
         );
     }
 
-    // ffmpeg classification against the real toolchain: a file of garbage
-    // bytes claiming to be a video is an *unconfirmed* payload verdict, never
-    // `blocked` — that distinction is what keeps a missing codec from being
-    // mistaken for a missing install. Only ffmpeg runs on this path now: the
-    // frame extractor takes the item's stored duration instead of re-probing
-    // it, so a non-zero ffmpeg exit is the whole classification.
-    #[tokio::test]
-    async fn ffmpeg_rejecting_a_file_is_an_unconfirmed_input_verdict() {
-        // `ffmpeg_available` probes both executables, which is what the
-        // auto-heal relies on and what this test needs.
-        if !crate::media_tools::ffmpeg_available() {
-            // No toolchain on this host; the classification is unobservable.
-            return;
-        }
-        let _test_env = test_data_dir();
-        let index_db = "extraction_ffmpeg_classify";
-        crate::db::migrations::migrate_databases_on_disk(
-            Some(index_db),
-            Some("extraction_ffmpeg_classify_user"),
-        )
-        .await
-        .expect("migrate test databases");
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let fake_video = dir.path().join("garbage.mp4");
-        std::fs::write(&fake_video, b"nothing here is a container").unwrap();
-
-        let mut item = image_item(1, "sha_vid", fake_video.to_string_lossy().as_ref());
-        item.item_type = "video/mp4".to_string();
-        item.duration = Some(10.0);
-        item.video_tracks = Some(1);
-
-        let err = input_handlers::prepare_item(index_db, &image_model(), item, true)
-            .await
-            .expect_err("ffmpeg must reject a file that is not a container");
-        assert_eq!(err.kind(), ApiErrorKind::Input);
-        assert_eq!(
-            err.skip_after(),
-            SKIP_AFTER_AMBIGUOUS,
-            "a tool that did its own file I/O never settles a verdict alone"
-        );
-    }
-
     // ------------------------------------------------------------------
     // Worker-reported per-item errors (docs/failed-media-retry-design.md,
     // "Batch isolation and the worker protocol").
@@ -4844,125 +4546,121 @@ mod tests {
         }
     }
 
-    // The verdict rules, in one place. Note the partial case: the ledger and
-    // the work query key on the *item*, so an item some of whose work units
-    // decoded on `input` grounds is processable media and must keep its
-    // successful outputs — that per-unit verdict can never suppress the item.
+    // The verdict rules, in one place. Class is decided *before* arity:
+    // proceeding past a transient slot would mark the item processed and
+    // delete the retry the worker asked for. And for a text-entity model one
+    // input is one segment while the ledger keys on the item, so the same
+    // all-input verdict stays transient there.
     #[test]
     fn slot_error_classification_covers_the_whole_grid() {
         use SlotErrorClass::{Input, Transient};
-
-        assert_eq!(classify_slot_errors(4, &[], false), SlotVerdict::Proceed);
-        assert_eq!(
-            classify_slot_errors(4, &[slot(1, Input)], false),
-            SlotVerdict::Proceed,
-            "partial input failures keep the item's successful outputs"
+        let want =
+            |total, errors: &[(usize, SlotErrorClass)], text_entity, expected, case: &str| {
+                let errors: Vec<_> = errors.iter().map(|(i, c)| slot(*i, *c)).collect();
+                let got = classify_slot_errors(total, &errors, text_entity);
+                let seen = match &got {
+                    SlotVerdict::Proceed => "proceed",
+                    SlotVerdict::Transient(_) => "transient",
+                    SlotVerdict::InputMedia(_) => "input-media",
+                };
+                assert_eq!(seen, expected, "{case}: got {got:?}");
+            };
+        want(4, &[], false, "proceed", "no errors");
+        want(
+            4,
+            &[(1, Input)],
+            false,
+            "proceed",
+            "a partial input failure",
+        );
+        want(
+            2,
+            &[(0, Input), (1, Input)],
+            false,
+            "input-media",
+            "all input",
+        );
+        want(
+            1,
+            &[(0, Input)],
+            false,
+            "input-media",
+            "one input, same rule",
+        );
+        want(1, &[(0, Input)], true, "transient", "a text-entity model");
+        want(1, &[(0, Transient)], false, "transient", "a lone transient");
+        want(
+            2,
+            &[(0, Transient)],
+            false,
+            "transient",
+            "class before arity",
+        );
+        want(
+            4,
+            &[(1, Transient)],
+            false,
+            "transient",
+            "a partial transient",
+        );
+        want(
+            2,
+            &[(0, Input), (1, Transient)],
+            false,
+            "transient",
+            "mixed",
+        );
+        want(
+            4,
+            &[(1, Input), (2, Transient)],
+            false,
+            "transient",
+            "part mixed",
         );
 
-        // Every input failed, all on the worker's `input` class: a verdict on
-        // the media, which owes a ledger row.
-        let verdict = classify_slot_errors(2, &[slot(0, Input), slot(1, Input)], false);
-        let SlotVerdict::InputMedia(detail) = verdict else {
-            panic!("expected an input-media verdict, got {verdict:?}");
+        // The summary names the scope, the deciding class and the worker's own
+        // text, since it is the ledger's audit line.
+        let SlotVerdict::InputMedia(detail) =
+            classify_slot_errors(2, &[slot(0, Input), slot(1, Input)], false)
+        else {
+            panic!("expected an input-media verdict");
         };
         assert!(detail.contains("all 2 inputs"), "{detail}");
         assert!(
             detail.contains("truncated"),
             "the worker's own text: {detail}"
         );
-
-        // A single-input item, same rule.
-        assert!(matches!(
-            classify_slot_errors(1, &[slot(0, Input)], false),
-            SlotVerdict::InputMedia(_)
-        ));
-
-        // Mixed classes never settle a verdict: `transient` says nothing
-        // about the payload, so the item stays selectable.
-        assert!(matches!(
-            classify_slot_errors(2, &[slot(0, Input), slot(1, Transient)], false),
-            SlotVerdict::Transient(_)
-        ));
-        assert!(matches!(
-            classify_slot_errors(1, &[slot(0, Transient)], false),
-            SlotVerdict::Transient(_)
-        ));
-
-        // Class is decided *before* arity: a `transient` slot among healthy
-        // batch-mates is a request to retry that unit, and proceeding would
-        // write the item's partial outputs and mark it processed — which
-        // deletes the retry the worker asked for. So a partial mix carrying
-        // any non-`input` class fails the whole item transiently.
-        assert!(
-            matches!(
-                classify_slot_errors(2, &[slot(0, Transient)], false),
-                SlotVerdict::Transient(_)
-            ),
-            "a transient slot is never swallowed by its successful batch-mates"
-        );
-        assert!(matches!(
-            classify_slot_errors(4, &[slot(1, Transient)], false),
-            SlotVerdict::Transient(_)
-        ));
-        let verdict = classify_slot_errors(4, &[slot(1, Input), slot(2, Transient)], false);
-        let SlotVerdict::Transient(detail) = verdict else {
-            panic!("a partial mix with a transient slot must stay transient, got {verdict:?}");
+        let SlotVerdict::Transient(detail) =
+            classify_slot_errors(4, &[slot(1, Input), slot(2, Transient)], false)
+        else {
+            panic!("a partial mix with a transient slot must stay transient");
         };
         assert!(
             detail.contains("2 of 4 inputs") && detail.contains("transient"),
-            "the summary names the scope and the class that decided it: {detail}"
+            "the scope and the class that decided it: {detail}"
         );
-    }
-
-    // The granularity caveat: for a text-entity model one input is one
-    // extracted segment, while the ledger and the `failed_for` anti-join key
-    // on the item — persisting would take every *other* segment of that item
-    // out of the work query because a single segment was bad. So the same
-    // all-input verdict stays transient there.
-    #[test]
-    fn a_text_entity_model_never_persists_a_worker_verdict() {
-        let errors = [slot(0, SlotErrorClass::Input)];
-        assert!(matches!(
-            classify_slot_errors(1, &errors, false),
-            SlotVerdict::InputMedia(_)
-        ));
-        let verdict = classify_slot_errors(1, &errors, true);
-        let SlotVerdict::Transient(detail) = verdict else {
-            panic!("a text-entity verdict must not be persisted, got {verdict:?}");
+        let SlotVerdict::Transient(detail) = classify_slot_errors(1, &[slot(0, Input)], true)
+        else {
+            panic!("a text-entity verdict must not be persisted");
         };
         assert!(detail.contains("text-entity"), "{detail}");
 
-        // And the discriminator is the same one the work query uses.
+        // And the text-entity discriminator is the work query's own.
         assert!(targets_text_entity(&test_model("text", true)));
         assert!(!targets_text_entity(&test_model("items", true)));
         assert!(!targets_text_entity(&test_model("files", true)));
     }
 
-    // The inference-stage half of the ledger: a worker verdict on an item's
-    // media lands as `stage = 'inference'`, class `input`, confirmed at one
-    // attempt (the worker decoded bytes it already had), counts input-side,
-    // and takes the item out of the work query.
+    // The inference-stage half of the ledger: a worker verdict lands as
+    // `stage = 'inference'`, class `input`, confirmed at one attempt, counts
+    // input-side, and takes the item out of the work query.
     #[tokio::test]
     async fn a_worker_input_verdict_lands_in_the_ledger_at_the_inference_stage() {
         let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_worker_verdict").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.png")]).await;
-        }
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_worker_verdict", &files).await;
         let model = image_model();
-        let job_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddDataLog {
-            scan_time: crate::db::extraction_write::current_iso_timestamp(),
-            threshold: None,
-            types: vec![model.output_type.clone()],
-            setter: model.setter_name.clone(),
-            batch_size: 4,
-            reply,
-        })
-        .await
-        .unwrap();
+        let job_id = data_log_job(index_db, &model).await;
 
         let SlotVerdict::InputMedia(detail) = classify_slot_errors(
             1,
@@ -5045,12 +4743,14 @@ mod tests {
         InferenceInput::new(serde_json::json!({ "text": text }), None)
     }
 
-    // Layer 2 of the isolation design at the boundary that actually exists in
-    // this process (one item's multi-unit chunk): every unit is re-submitted
-    // alone, in order, exactly once, and the outputs reassemble as if it had
-    // been one request.
+    // Layer 2 of the isolation design at the boundary that exists in this
+    // process (one item's multi-unit chunk): every unit re-submitted alone, in
+    // order, once, reassembling as if it had been one request. A unit that
+    // still fails alone aborts the pass with its own error and is never
+    // promoted to an `input` verdict by pattern-matching its text; a typed
+    // slot survives with its index rebased onto the item's input list.
     #[tokio::test]
-    async fn isolation_retries_each_input_alone_and_keeps_order() {
+    async fn isolation_resubmits_each_input_alone_and_reassembles_the_result() {
         let inputs = [text_input("a"), text_input("b"), text_input("c")];
         let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen = Arc::clone(&calls);
@@ -5059,40 +4759,40 @@ mod tests {
             async move {
                 assert_eq!(single.len(), 1, "isolation submits one input at a time");
                 assert_eq!(
-                    max_batch, 1,
-                    "and says so on the wire: a retry still advertising the \
-                     job's chunk size can be merged straight back into a GPU \
-                     batch with other requests by the dispatcher's effective_cap"
+                    max_batch, ISOLATION_MAX_BATCH,
+                    "and says so on the wire, or the dispatcher merges the \
+                     retry straight back into a window with other requests"
                 );
                 let text = single[0].data["text"].as_str().unwrap().to_string();
                 seen.lock().unwrap().push(text.clone());
+                // The middle input comes back as a typed slot with no output.
+                if text == "b" {
+                    return Ok(json_response(
+                        Vec::new(),
+                        vec![slot(0, SlotErrorClass::Input)],
+                    ));
+                }
                 Ok(json_response(vec![serde_json::json!(text)], Vec::new()))
             }
         })
         .await
-        .expect("every input succeeded alone");
+        .expect("a typed slot is still a successful roundtrip");
 
         assert_eq!(*calls.lock().unwrap(), vec!["a", "b", "c"]);
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(
+            response.errors[0].index, 1,
+            "the slot index is the item's input index, not the sub-request's"
+        );
         match response.outputs {
-            PredictOutput::Json(values) => assert_eq!(
-                values,
-                vec![
-                    serde_json::json!("a"),
-                    serde_json::json!("b"),
-                    serde_json::json!("c")
-                ]
-            ),
-            other => panic!("expected Json outputs, got {other:?}"),
+            PredictOutput::Json(values) => {
+                assert_eq!(values, vec![serde_json::json!("a"), serde_json::json!("c")])
+            }
+            other => panic!("expected the survivors' outputs, got {other:?}"),
         }
-        assert!(response.errors.is_empty());
-    }
 
-    // A unit that still fails alone aborts the pass with its own error and is
-    // never promoted to an `input` verdict by pattern-matching its text (req
-    // 1: the pipeline can never be stricter than the model). The item then
-    // fails transiently, so no partial data is written for it.
-    #[tokio::test]
-    async fn an_input_that_fails_alone_stays_transient() {
+        // A unit that fails outright aborts the pass at that unit, with its
+        // own error text and no invented verdict.
         let inputs = [text_input("a"), text_input("b")];
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&attempts);
@@ -5121,47 +4821,9 @@ mod tests {
         );
     }
 
-    // Typed slots survive isolation with their index rebased onto the item's
-    // input list — the whole point of the retry is that healthy units still
-    // complete while the bad one keeps its verdict.
-    #[tokio::test]
-    async fn isolation_rebases_slot_error_indices() {
-        let inputs = [text_input("a"), text_input("b")];
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let response = isolate_inputs(&inputs, move |_single, _max_batch| {
-            let counted = Arc::clone(&counted);
-            async move {
-                let index = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if index == 1 {
-                    // Every slot of this sub-request failed: no outputs.
-                    return Ok(json_response(
-                        Vec::new(),
-                        vec![slot(0, SlotErrorClass::Input)],
-                    ));
-                }
-                Ok(json_response(vec![serde_json::json!("ok")], Vec::new()))
-            }
-        })
-        .await
-        .expect("a typed slot is a successful roundtrip");
-
-        assert_eq!(response.errors.len(), 1);
-        assert_eq!(
-            response.errors[0].index, 1,
-            "the slot index is the item's input index, not the sub-request's"
-        );
-        match response.outputs {
-            PredictOutput::Json(values) => assert_eq!(values, vec![serde_json::json!("ok")]),
-            other => panic!("expected the survivor's output, got {other:?}"),
-        }
-    }
-
-    // A protocol violation is deterministic, so isolating it would re-ask the
-    // same broken server one input at a time and burn a whole extra pass over
-    // the item's units to learn nothing. The marker has to survive the
-    // context layers the client and the pool wrap around it, which is what
-    // `downcast_ref` gives us and a string match would not.
+    // A protocol violation is deterministic, so isolating it would burn a
+    // whole extra pass to learn nothing. The marker has to survive the context
+    // layers the client and the pool wrap around it.
     #[test]
     fn a_protocol_violation_is_recognisable_through_the_context_chain() {
         let raw = anyhow::Error::new(ProtocolViolation::new(
@@ -5183,117 +4845,66 @@ mod tests {
     }
 
     // The survivor map: `PredictResponse` drops erroring slots, so the n-th
-    // output is not the n-th input. Without a map the identity is used, which
-    // is what every response from a server with no error slots gets.
+    // output is not the n-th input. No map means the identity.
     #[test]
     fn surviving_input_indices_maps_outputs_back_onto_inputs() {
+        let err = |index| slot(index, SlotErrorClass::Input);
         assert_eq!(surviving_input_indices(4, &[]), None);
-        assert_eq!(
-            surviving_input_indices(4, &[slot(1, SlotErrorClass::Input)]),
-            Some(vec![0, 2, 3])
-        );
-        assert_eq!(
-            surviving_input_indices(
-                3,
-                &[
-                    slot(0, SlotErrorClass::Input),
-                    slot(2, SlotErrorClass::Input)
-                ]
-            ),
-            Some(vec![1])
-        );
-        assert_eq!(
-            surviving_input_indices(1, &[slot(0, SlotErrorClass::Input)]),
-            Some(Vec::new())
-        );
+        assert_eq!(surviving_input_indices(4, &[err(1)]), Some(vec![0, 2, 3]));
+        assert_eq!(surviving_input_indices(3, &[err(0), err(2)]), Some(vec![1]));
+        assert_eq!(surviving_input_indices(1, &[err(0)]), Some(Vec::new()));
     }
 
-    /// `item_data.idx` is documented as the page/frame number, and the CLIP
-    /// handler is where a video's frames get theirs. A rejected frame must
-    /// leave a *gap*, not renumber its successors: stored 0,1,2 for frames
-    /// 0,2,3 would silently mis-file every later frame of the item.
+    /// `item_data.idx` is documented as the page/frame number, so a rejected
+    /// input must leave a *gap* rather than renumber its successors — stored
+    /// 0,1,2 for frames 0,2,3 would silently mis-file every later frame of the
+    /// item. With no slot errored the map is the identity and nothing changes.
     #[tokio::test]
-    async fn a_partial_clip_item_stores_the_original_frame_numbers() {
+    async fn the_original_input_numbers_survive_a_partial_item() {
         let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_partial_clip_idx").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_clip", "C:/data/clip.mp4")]).await;
-        }
-        let mut model = image_model();
-        model.output_type = "clip".to_string();
-        let job_id = data_log_job(index_db, &model).await;
-
-        // Four frames, the second of which the worker rejected.
+        let files = [
+            (1, "sha_clip", "C:/data/clip.mp4"),
+            (2, "sha_text", "C:/data/doc.pdf"),
+            (3, "sha_full", "C:/data/full.mp4"),
+        ];
+        let index_db = ledger_test_db("extraction_partial_idx", &files).await;
         let errors = vec![slot(1, SlotErrorClass::Input)];
         let survivors = surviving_input_indices(4, &errors).expect("a slot errored");
-        let outputs = PredictOutput::Json(vec![
-            serde_json::json!([0.0, 1.0]),
-            serde_json::json!([2.0, 3.0]),
-            serde_json::json!([4.0, 5.0]),
-        ]);
 
-        output_handlers::handle_outputs(
+        // Four frames, the second of which the worker rejected.
+        write_item_outputs(
             index_db,
-            &model,
-            job_id,
-            image_item(1, "sha_clip", "C:/data/clip.mp4"),
-            outputs,
+            "clip",
+            (1, "sha_clip", "C:/data/clip.mp4"),
+            PredictOutput::Json(vec![
+                serde_json::json!([0.0, 1.0]),
+                serde_json::json!([2.0, 3.0]),
+                serde_json::json!([4.0, 5.0]),
+            ]),
             Some(&survivors),
         )
-        .await
-        .expect("the surviving frames are written");
-
+        .await;
         assert_eq!(
-            stored_indices(index_db, "clip").await,
+            stored_indices(index_db, "clip", 1).await,
             vec![0, 2, 3],
             "the rejected frame leaves a gap instead of shifting the rest"
         );
-    }
 
-    /// Same for text outputs, where the index is the reading order of the
-    /// page/frame the text came from. (This handler already tolerates gaps —
-    /// its dedup and length filters make them — so the only question is
-    /// whether the surviving rows keep their own numbers.)
-    #[tokio::test]
-    async fn a_partial_text_item_stores_the_original_input_numbers() {
-        let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_partial_text_idx").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_text", "C:/data/doc.pdf")]).await;
-        }
-        let mut model = image_model();
-        model.output_type = "text".to_string();
-        let job_id = data_log_job(index_db, &model).await;
-
-        let errors = vec![slot(1, SlotErrorClass::Input)];
-        let survivors = surviving_input_indices(4, &errors).expect("a slot errored");
-        let outputs = PredictOutput::Json(vec![
-            serde_json::json!({"transcription": "page zero", "confidence": 0.9}),
-            serde_json::json!({"transcription": "page two", "confidence": 0.8}),
-            serde_json::json!({"transcription": "page three", "confidence": 0.7}),
-        ]);
-
-        output_handlers::handle_outputs(
+        // The same for text, where the index is the reading order of the page
+        // the text came from — and the text must stay with its own page.
+        write_item_outputs(
             index_db,
-            &model,
-            job_id,
-            image_item(1, "sha_text", "C:/data/doc.pdf"),
-            outputs,
+            "text",
+            (2, "sha_text", "C:/data/doc.pdf"),
+            PredictOutput::Json(vec![
+                serde_json::json!({"transcription": "page zero", "confidence": 0.9}),
+                serde_json::json!({"transcription": "page two", "confidence": 0.8}),
+                serde_json::json!({"transcription": "page three", "confidence": 0.7}),
+            ]),
             Some(&survivors),
         )
-        .await
-        .expect("the surviving pages are written");
-
-        assert_eq!(stored_indices(index_db, "text").await, vec![0, 2, 3]);
-
-        // And the text itself stayed with its own page: reading order is the
-        // property the index exists to preserve.
+        .await;
+        assert_eq!(stored_indices(index_db, "text", 2).await, vec![0, 2, 3]);
         let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
             .await
             .unwrap();
@@ -5313,31 +4924,14 @@ mod tests {
                 (3, "page three".to_string()),
             ]
         );
-    }
+        drop(conn);
 
-    /// Without a survivor map (no slot errored) the mapping is the identity,
-    /// so every response an inference server without error slots can produce
-    /// is stored exactly as it was before.
-    #[tokio::test]
-    async fn a_complete_clip_item_is_numbered_exactly_as_before() {
-        let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_complete_clip_idx").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_full", "C:/data/full.mp4")]).await;
-        }
-        let mut model = image_model();
-        model.output_type = "clip".to_string();
-        let job_id = data_log_job(index_db, &model).await;
-
+        // No slot errored: the identity map, stored exactly as before.
         assert_eq!(surviving_input_indices(3, &[]), None);
-        output_handlers::handle_outputs(
+        write_item_outputs(
             index_db,
-            &model,
-            job_id,
-            image_item(1, "sha_full", "C:/data/full.mp4"),
+            "clip",
+            (3, "sha_full", "C:/data/full.mp4"),
             PredictOutput::Json(vec![
                 serde_json::json!([0.0]),
                 serde_json::json!([1.0]),
@@ -5345,10 +4939,31 @@ mod tests {
             ]),
             None,
         )
-        .await
-        .expect("every frame is written");
+        .await;
+        assert_eq!(stored_indices(index_db, "clip", 3).await, vec![0, 1, 2]);
+    }
 
-        assert_eq!(stored_indices(index_db, "clip").await, vec![0, 1, 2]);
+    /// Writes one item's outputs through the real handler, as a job would.
+    async fn write_item_outputs(
+        index_db: &str,
+        output_type: &str,
+        item: (i64, &str, &str),
+        outputs: PredictOutput,
+        survivors: Option<&[usize]>,
+    ) {
+        let mut model = image_model();
+        model.output_type = output_type.to_string();
+        let job_id = data_log_job(index_db, &model).await;
+        output_handlers::handle_outputs(
+            index_db,
+            &model,
+            job_id,
+            image_item(item.0, item.1, item.2),
+            outputs,
+            survivors,
+        )
+        .await
+        .expect("the surviving outputs are written");
     }
 
     /// A data_log row to hang the written output off, as a real job would.
@@ -5365,15 +4980,18 @@ mod tests {
         .unwrap()
     }
 
-    /// The `idx` values actually stored for a data type, in ascending order.
-    async fn stored_indices(index_db: &str, data_type: &str) -> Vec<i64> {
+    /// The `idx` values actually stored for one item's data type.
+    async fn stored_indices(index_db: &str, data_type: &str, item_id: i64) -> Vec<i64> {
         let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
             .await
             .unwrap();
-        sqlx::query_scalar("SELECT idx FROM item_data WHERE data_type = ? ORDER BY idx")
-            .bind(data_type)
-            .fetch_all(&mut conn)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT idx FROM item_data WHERE data_type = ? AND item_id = ? ORDER BY idx",
+        )
+        .bind(data_type)
+        .bind(item_id)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap()
     }
 }
