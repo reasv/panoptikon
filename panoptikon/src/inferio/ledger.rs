@@ -3600,17 +3600,15 @@ impl VramLedger {
             responded_negative = negative;
             // Read *after* the ingest: this window's own high-water batches have
             // moved the anchor, and the ramp grows from the exponent that anchor
-            // implies.
-            let anchor = match state.workers.get(&worker) {
-                Some(entry) => Self::anchor_locked(&state, entry),
-                None => 0,
-            };
-            // Read after the ingest for the same reason: this window's own
-            // `index_limit` clamps have already established or retired the
-            // ceiling the ramp is about to be judged against.
-            let ceiling = match state.workers.get(&worker) {
-                Some(entry) => Self::shape_ceiling_locked(&state, entry),
-                None => None,
+            // implies. The ceiling is read here for the same reason — this
+            // window's own `index_limit` clamps have already established or
+            // retired the ceiling the ramp is about to be judged against.
+            let (anchor, ceiling) = match state.workers.get(&worker) {
+                Some(entry) => (
+                    Self::anchor_locked(&state, entry),
+                    Self::shape_ceiling_locked(&state, entry),
+                ),
+                None => (0, None),
             };
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
