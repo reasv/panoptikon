@@ -1203,9 +1203,7 @@ impl Worker {
         };
         match outcome {
             Ok(status) => {
-                if let Some(task) = self.stderr_task.take() {
-                    let _ = timeout(STDERR_JOIN_GRACE, task).await;
-                }
+                self.drain_stderr().await;
                 Ok(status)
             }
             Err(err) => {
@@ -1251,6 +1249,14 @@ impl Worker {
             // the last resort if even this hangs.
             let _ = self.child.kill().await;
         }
+        self.drain_stderr().await;
+    }
+
+    /// Await the stderr forwarder before reading the tail: it ends on the
+    /// child's stderr EOF, so joining it is what completes the tail. Bounded
+    /// by [`STDERR_JOIN_GRACE`]; a forwarder still running after that is
+    /// abandoned rather than waited on.
+    async fn drain_stderr(&mut self) {
         if let Some(task) = self.stderr_task.take() {
             let _ = timeout(STDERR_JOIN_GRACE, task).await;
         }
@@ -1484,10 +1490,7 @@ impl Worker {
             }
             Err(_) => None,
         };
-        // The forwarder ends on stderr EOF; awaiting it completes the tail.
-        if let Some(task) = self.stderr_task.take() {
-            let _ = timeout(STDERR_JOIN_GRACE, task).await;
-        }
+        self.drain_stderr().await;
         let (signal, core_dumped) = status.as_ref().map(signal_of).unwrap_or((None, false));
         let death = WorkerDeath {
             worker: self.label.clone(),
