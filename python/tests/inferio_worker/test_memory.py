@@ -850,8 +850,13 @@ def test_an_unreadable_allocator_keeps_what_the_caller_already_knew(
         free_source="nvml",
         clamped={"from_units": 8, "to_units": 3, "free_mb": 1234},
     )
+    assert isinstance(measurement.pop("duration_ms"), float)
     assert measurement == {
         "items": 4,
+        "reserved_before_mb": None,
+        "peak_reserved_mb": None,
+        "allocated_before_mb": None,
+        "peak_allocated_mb": None,
         "oom": True,
         "oom_class": {"source": "typed_exception", "exception": "OutOfMemoryError"},
         "free_mb": 1234,

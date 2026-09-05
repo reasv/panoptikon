@@ -709,9 +709,7 @@ def fdinfo_own_vram_mb(root: str | None = None) -> int | None:
         return None
     texts = _fdinfo_texts(FDINFO_ROOT if root is None else root)
     vram = fdinfo_vram_by_pdev(texts, _memory_regions()).get(bdf)
-    # `vram <= 0` is redundant with the trailing falsy check, and kept: this is
-    # the never-invent-a-footprint rule at the point of the reading.
-    if vram is None or vram <= 0:
+    if vram is None:
         return None
     own_mb = _mb(vram)
     return own_mb if own_mb else None
@@ -796,9 +794,7 @@ def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | Non
             return (None, None)
         free = max(total - used, 0) + min(max(gtt_total - gtt_used, 0), available)
         return (_mb(free), _mb(total + gtt_total))
-    # The `max(..., 0)` is redundant with `_mb`'s clamp and states the semantic
-    # saturation: the driver updates the two counters independently.
-    return (_mb(max(total - used, 0)), _mb(total))
+    return (_mb(total - used), _mb(total))
 
 
 def amdgpu_device_total_mb(root: str | None = None) -> int | None:
@@ -1265,11 +1261,6 @@ def _free_total_mb(
         free, total = _nvml_memory()
         if free is not None:
             return (free, total, "nvml")
-        # Belt and braces: a pinned source that cannot answer already reaches
-        # the final `(None, None, None)`; kept as a statement of the contract at
-        # the tier that failed. Same for `amdgpu-sysfs` below.
-        if source == "nvml":
-            return (None, None, None)
     if source in (None, "amdgpu-sysfs"):
         # Byte-identical to the Rust `MemoryQuery`'s label for the same files,
         # and it names the *driver*, not the filesystem, so no later
@@ -1277,9 +1268,6 @@ def _free_total_mb(
         free, total = amdgpu_free_total_mb()
         if free is not None:
             return (free, total, "amdgpu-sysfs")
-        # Belt and braces, as above.
-        if source == "amdgpu-sysfs":
-            return (None, None, None)
     if source in (None, "mps"):
         # Byte-identical to the orchestrator's label for the same reading;
         # availability is the platform test again, since `torch.backends.mps` is
@@ -1287,8 +1275,6 @@ def _free_total_mb(
         free, total = mps_free_total_mb()
         if free is not None:
             return (free, total, "mps")
-        if source == "mps":
-            return (None, None, None)
     if source in (None, "torch"):
         torch = _torch_cuda()
         if torch is not None:
@@ -1963,7 +1949,6 @@ def measure_batch(
     items: int,
     units: int | None = None,
     oom: bool = False,
-    throughput_collapse: bool = False,
     oom_class: dict[str, Any] | None = None,
     free_mb: int | None = None,
     free_source: str | None = None,
@@ -1980,51 +1965,38 @@ def measure_batch(
     """
     try:
         _, _, peak_reserved, peak_allocated = _allocator_stats()
-        started = state.get("started")
-        duration_ms = (
-            round((time.perf_counter() - started) * 1000.0, 3)
-            if isinstance(started, float)
-            else None
-        )
-        measurement: dict[str, Any] = {
-            "items": items,
-            "reserved_before_mb": state.get("reserved_before_mb"),
-            "peak_reserved_mb": peak_reserved,
-            "allocated_before_mb": state.get("allocated_before_mb"),
-            "peak_allocated_mb": peak_allocated,
-            "duration_ms": duration_ms,
-        }
-        if free_mb is not None:
-            measurement["free_mb"] = free_mb
-            measurement["free_source"] = free_source
-        if clamped:
-            measurement["clamped"] = clamped
-        if units is not None:
-            measurement["units"] = units
-        if oom:
-            measurement["oom"] = True
-            if oom_class:
-                measurement["oom_class"] = oom_class
-        if throughput_collapse:
-            measurement["throughput_collapse"] = True
-        return measurement
     except Exception as exc:  # pragma: no cover - defensive
+        # The peaks are the only reading here that can fail; everything else was
+        # decided by the caller, and dropping it would discard an OOM or a live
+        # reading.
         logger.debug("batch measurement failed: %s", exc)
-        # The peaks are what failed to read; everything else was decided by the
-        # caller, and dropping it would discard an OOM or a live reading.
-        minimal: dict[str, Any] = {"items": items}
-        if free_mb is not None:
-            minimal["free_mb"] = free_mb
-            minimal["free_source"] = free_source
-        if clamped:
-            minimal["clamped"] = clamped
-        if oom:
-            minimal["oom"] = True
-            if oom_class:
-                minimal["oom_class"] = oom_class
-        if throughput_collapse:
-            minimal["throughput_collapse"] = True
-        return minimal
+        peak_reserved = peak_allocated = None
+    started = state.get("started")
+    duration_ms = (
+        round((time.perf_counter() - started) * 1000.0, 3)
+        if isinstance(started, float)
+        else None
+    )
+    measurement: dict[str, Any] = {
+        "items": items,
+        "reserved_before_mb": state.get("reserved_before_mb"),
+        "peak_reserved_mb": peak_reserved,
+        "allocated_before_mb": state.get("allocated_before_mb"),
+        "peak_allocated_mb": peak_allocated,
+        "duration_ms": duration_ms,
+    }
+    if free_mb is not None:
+        measurement["free_mb"] = free_mb
+        measurement["free_source"] = free_source
+    if clamped:
+        measurement["clamped"] = clamped
+    if units is not None:
+        measurement["units"] = units
+    if oom:
+        measurement["oom"] = True
+        if oom_class:
+            measurement["oom_class"] = oom_class
+    return measurement
 
 
 def finish_batch(state: dict[str, Any], items: int) -> dict[str, Any]:
