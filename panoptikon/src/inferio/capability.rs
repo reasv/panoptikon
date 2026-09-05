@@ -43,11 +43,6 @@ impl HostComputeCaps {
         }
     }
 
-    #[cfg(test)]
-    pub fn known(caps: Vec<(u32, u32)>) -> Self {
-        Self::from_caps(caps)
-    }
-
     /// Whether ANY visible device meets `floor` (e.g. `8.0`); `None` when
     /// the host is unknown. Tenths-integer compare, no float equality.
     pub fn meets_floor(&self, floor: f64) -> Option<bool> {
@@ -333,15 +328,15 @@ mod tests {
 
     #[test]
     fn meets_floor_boundaries() {
-        let caps = HostComputeCaps::known(vec![(7, 5)]);
+        let caps = HostComputeCaps::from_caps(vec![(7, 5)]);
         assert_eq!(caps.meets_floor(7.5), Some(true));
         assert_eq!(caps.meets_floor(8.0), Some(false));
         // ANY device qualifying is enough.
-        let mixed = HostComputeCaps::known(vec![(6, 1), (8, 6)]);
+        let mixed = HostComputeCaps::from_caps(vec![(6, 1), (8, 6)]);
         assert_eq!(mixed.meets_floor(8.0), Some(true));
         assert_eq!(HostComputeCaps::unknown().meets_floor(8.0), None);
         // 10.x majors compare above 9.x, not lexicographically.
-        let blackwell = HostComputeCaps::known(vec![(12, 0)]);
+        let blackwell = HostComputeCaps::from_caps(vec![(12, 0)]);
         assert_eq!(blackwell.meets_floor(8.0), Some(true));
     }
 
@@ -359,7 +354,7 @@ mod tests {
                 }
             }
         });
-        let caps = HostComputeCaps::known(vec![(6, 1)]);
+        let caps = HostComputeCaps::from_caps(vec![(6, 1)]);
         overlay_metadata(&mut body, &caps);
         let gated = &body["doctr"]["inference_ids"]["dots_ocr"];
         assert_eq!(gated["unavailable"], json!(true));
@@ -381,7 +376,7 @@ mod tests {
             }
         });
         let mut satisfied = template.clone();
-        overlay_metadata(&mut satisfied, &HostComputeCaps::known(vec![(8, 9)]));
+        overlay_metadata(&mut satisfied, &HostComputeCaps::from_caps(vec![(8, 9)]));
         assert_eq!(satisfied, template);
 
         let mut unknown = template.clone();
@@ -400,7 +395,7 @@ mod tests {
             }
         });
         let mut body = template.clone();
-        overlay_metadata(&mut body, &HostComputeCaps::known(vec![(6, 1)]));
+        overlay_metadata(&mut body, &HostComputeCaps::from_caps(vec![(6, 1)]));
         assert_eq!(body, template);
     }
 }
