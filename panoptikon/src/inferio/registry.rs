@@ -1,9 +1,7 @@
 //! Model registry: parses the inferio inference TOML registry and resolves
 //! per-inference-id spawn specs (impl class + constructor kwargs).
 //!
-//! This is a faithful port of the legacy Python `inferio/config.py`
-//! (python-legacy branch). The semantics that
-//! matter (verified against the Python source, cited by line):
+//! A port of the legacy Python `inferio/config.py`. The semantics that matter:
 //!
 //! - Config folders are scanned for `*.toml` in alphabetical order, built-in
 //!   folder first, then the user folder (`load_config`, config.py:100-101).
@@ -37,55 +35,27 @@
 //! (`clean_dict` is a no-op for TOML-derived plain data). `ray_config` is
 //! therefore *not* forwarded to workers, matching Python.
 //!
-//! Rust-orchestrator extension (design §8, Phase 3): `config.replicas` and
-//! `config.devices` configure the per-model WorkerSet. Both are stripped
-//! from spawn kwargs exactly like `ray_config` (they are orchestrator
-//! directives, not impl constructor arguments) and, being ordinary config
-//! keys, inherit from group config like everything else. Resolution
+//! Rust-orchestrator extension (design §8): `config.replicas` and
+//! `config.devices` configure the per-model WorkerSet. Both are stripped from
+//! spawn kwargs like `ray_config` — they are orchestrator directives, not impl
+//! constructor arguments — and inherit from group config. Resolution
 //! (`resolve_device_pins`):
 //! - `devices = ["3", "7"]` -> 2 replicas, replica i pinned to
 //!   `devices[i]` (resolved to the backend's pin form by `gpu.rs`);
 //! - `replicas = N` alone -> N replicas pinned `"0"`..`"N-1"`;
 //! - neither -> 1 replica, no pin (today's behavior);
-//! - both with mismatched lengths, a non-positive/non-integer `replicas`,
-//!   or a non-array-of-strings/empty `devices` -> **registry load error**
-//!   (explicit beats silent), validated per id at load time against the
-//!   merged config so the error names the offending inference id.
+//! - both with mismatched lengths, a non-positive/non-integer `replicas`, or
+//!   a non-array-of-strings/empty `devices` -> **registry load error**,
+//!   validated per id so the error names the offending inference id.
 //!
-//! What a `devices` **index** means (batch-calibration step 1a): indices are
-//! interpreted in **NVML/nvidia-smi order** — PCI-bus-stable, the order
-//! `nvidia-smi -L` prints — and are mapped to that GPU's UUID at spawn
-//! (`gpu.rs`), so a pin means the same physical card across reboots and the
-//! ledger key never moves. They are *not* CUDA-runtime indices, which depend
-//! on `CUDA_DEVICE_ORDER` (default `FASTEST_FIRST`) and can name a different
-//! GPU than the same number does here. **On CUDA hosts**, a
-//! `GPU-…`/`MIG-…` UUID in `devices` bypasses the mapping and is passed to
-//! `CUDA_VISIBLE_DEVICES` verbatim, which is the unambiguous form to write
-//! (on ROCm the same string is a GPU *key* and is translated, never
-//! written — see below). When the GPU inventory is unknown (no nvidia-smi, or
-//! an ambient visibility restriction that names indices) the string is passed
-//! through raw exactly as it was before pinning existed — no mapping, no new
-//! environment variables, no behaviour change on those hosts. **MPS and CPU
-//! hosts are a different answer, not that one**: they have a known inventory
-//! and no pin vocabulary at all — one Metal device with no variable that
-//! names it, or no device — so a `devices` entry there is *dropped* with a
-//! warning rather than passed through, since anything written into a
-//! visibility variable could only hide something. Their device keys still
-//! resolve, so per-GPU budgets and load reservations work as anywhere else
-//! (docs/unified-memory-admission.md).
-//!
-//! On a ROCm host the vocabulary flips (docs/rocm-batch-calibration-parity.md,
-//! D2): the pin is written to `HIP_VISIBLE_DEVICES`, which accepts **device
-//! indices only**, so a `devices` entry naming a GPU *key*
-//! (`GPU-<16hex>`/`GPU-BDF-…`) is translated to that GPU's index and an
-//! index is passed through (canonicalised: `"00"` and `" 0 "` both become
-//! `"0"`). Indices there are HIP's own — positions in the openable KFD-node
-//! order the inventory enumerates. A non-numeric entry that matches no GPU
-//! key is dropped with a warning rather than written, because HIP would read
-//! it as "hide every device". A ROCm host whose own probe came back unknown
-//! keeps those HIP rules rather than the raw passthrough above — index-shaped
-//! entries survive, everything else is dropped — and pins nothing at all when
-//! the gateway's own environment already carries a HIP-layer restriction.
+//! A `devices` **index** is a position in NVML/nvidia-smi order, *not* a
+//! CUDA-runtime index: those follow `CUDA_DEVICE_ORDER`, whose default
+//! `FASTEST_FIRST` can put a different card at the same number. `gpu.rs`
+//! resolves each entry into the form the backend's visibility variable takes
+//! (a UUID on CUDA, a device index on ROCm), dropping what it cannot place.
+//! See docs/batch-calibration-design.md "Every worker is pinned to exactly one
+//! GPU", docs/rocm-batch-calibration-parity.md D2 and
+//! docs/unified-memory-admission.md.
 //!
 //! JSON object key order IS semantic here: Python dicts preserve insertion
 //! order, FastAPI serializes `/metadata` in that order, and the web UI
@@ -191,11 +161,9 @@ pub struct SpawnSpec {
     /// and the orchestrator-only `replicas`/`devices` keys
     /// (process_model.py:209-211 for the Python-parity part).
     pub config_kwargs: JsonValue,
-    /// Per-replica device pins (design §8), as written in the registry: one
-    /// entry per replica to spawn, `None` = no pin (inherit the parent env).
-    /// Always non-empty; `vec![None]` is the single-replica default.
-    /// `gpu::GpuInventory::resolve_pin` turns each into the value the
-    /// backend's visibility variable takes.
+    /// Per-replica device pins as written in the registry: one entry per
+    /// replica, `None` = no pin. Always non-empty; `vec![None]` is the
+    /// single-replica default.
     pub device_pins: Vec<Option<String>>,
     /// Declared environment-backed external inputs, resolved immediately
     /// before this worker is spawned and applied explicitly to the child.
@@ -332,10 +300,9 @@ impl Registry {
         // mode; Python strips it before instantiation (process_model.py:211)
         // and it is NOT forwarded to workers.
         kwargs.remove("ray_config");
-        // replicas/devices are orchestrator directives (WorkerSet shape,
-        // design §8), stripped from kwargs exactly like ray_config. Load
-        // already validated them; this re-resolution can only fail if the
-        // registry was constructed without going through load().
+        // Orchestrator directives, stripped from kwargs like ray_config. Load
+        // already validated them, so this can only fail on a Registry built
+        // without going through load().
         let device_pins = resolve_device_pins(&kwargs).with_context(|| {
             format!("invalid replicas/devices config for inference id '{full_inference_id}'")
         })?;
@@ -403,9 +370,8 @@ impl Registry {
 /// to resolve and write at spawn, or `None` for no pin.
 fn resolve_device_pins(config: &JsonMap<String, JsonValue>) -> Result<Vec<Option<String>>> {
     // Hard ceiling on the WorkerSet size: each replica is a full Python
-    // process, so anything past this is a config typo, and the pin vector is
-    // materialized eagerly at registry load (an unbounded value would OOM at
-    // boot instead of producing a load error).
+    // process, and the pin vector is materialized eagerly at registry load, so
+    // an unbounded value would OOM at boot instead of failing the load.
     const MAX_REPLICAS: usize = 64;
     let replicas = match config.get("replicas") {
         None => None,

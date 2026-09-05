@@ -489,6 +489,20 @@ cards therefore share their calibration data but can carry different budgets,
 which is the point: the one driving your monitors wants a bigger margin than
 its twin. An omitted key in an override inherits the section default.
 
+Two details of how these keys are read. **Leaving `margin` commented out is
+not the same as writing `margin = 0.10`.** An absent key means you have
+expressed no opinion, so the orchestrator applies its own default fraction
+*and* caps the resulting reserve at 1 GiB, which stops the margin making the
+last few gigabytes of a busy GPU unusable; a margin written in the file is
+honoured verbatim and uncapped, because it is a statement about your machine.
+That is why the shipped configs carry these keys as comments — an uncommented
+default would freeze on your disk and never track a later change. And UUID
+keys are matched **case-insensitively but exactly**: copy a UUID out of a log
+in any case and it will be found, but there is no prefix matching (unlike the
+abbreviations CUDA itself accepts), and two `[inference_local.vram.gpu."…"]`
+tables naming the same GPU in different cases are rejected at startup rather
+than one of them being silently dropped.
+
 `GET /api/inference/health` reports each GPU's `margin`, `cap_fraction`,
 `limit_mb` and `headroom_mb`, which is the fastest way to check that an
 override was picked up.

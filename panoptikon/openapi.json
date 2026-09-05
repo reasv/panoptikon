@@ -6018,7 +6018,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Inputs in the batch (not cost-dimension units — see the worker\nprotocol's \"Memory sensing\").",
+            "description": "Inputs in the batch, not cost-dimension units.",
             "minimum": 0
           },
           "peak_allocated_mb": {
@@ -6048,7 +6048,7 @@
           "seq": {
             "type": "integer",
             "format": "int64",
-            "description": "Per-worker sequence number; strictly increasing, gaps mean the ring\nevicted samples between reads.",
+            "description": "Per-worker sequence number; a gap means the ring evicted samples.",
             "minimum": 0
           }
         }
@@ -6612,12 +6612,12 @@
               "null"
             ],
             "format": "int32",
-            "description": "The per-item **pixel canvas** this model's inputs are priced against\n(`metadata.cost.canvas_pixels`, or a canvas filled in from the model's\nown load report), or `null` for uncapped. Only `pixel`-priced models\never carry one.\n\nIt is the difference between a grant that means what the operator\nthinks it means and one that does not: under a canvas the worker\nprices every input at `min(raw_pixels, canvas_pixels)`, so the same\n`last_grant_units` describes a very different batch depending on\nwhether a canvas is in force — and the *effective* canvas may be one\nthe registry never stated.",
+            "description": "The per-item **pixel canvas** this model's inputs are priced against\n(`metadata.cost.canvas_pixels`, or one from the model's own load\nreport), or `null` for uncapped. Under a canvas the worker prices every\ninput at `min(raw_pixels, canvas_pixels)`.",
             "minimum": 0
           },
           "degraded": {
             "type": "boolean",
-            "description": "True when the registry declared nothing usable and the conservative\n`(item, count)` fallback is in force."
+            "description": "True when the registry declared nothing usable and `(item, count)` is\nin force."
           },
           "epoch": {
             "type": "integer",
@@ -7981,7 +7981,7 @@
       },
       "HealthReport": {
         "type": "object",
-        "description": "`GET /health` response (design §7, additive — Python has no such\nendpoint, so this shape is ours to define). Serialized as-is by the HTTP\nlayer; `Deserialize` exists so tests can round-trip the wire shape.",
+        "description": "`GET /health` response (design §7). Serialized as-is by the HTTP layer;\n`Deserialize` exists so tests can round-trip the wire shape.",
         "required": [
           "status",
           "shutting_down",
@@ -8001,21 +8001,21 @@
             "items": {
               "$ref": "#/components/schemas/GpuInfo"
             },
-            "description": "Visible GPUs by GPU UUID (batch-calibration step 1a); empty when\nthe host has no GPU inventory, in which case workers are not pinned."
+            "description": "Visible GPUs by UUID; empty when the host has no inventory."
           },
           "inference_clients": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/InferenceTransportHealth"
             },
-            "description": "The inference **client** side: one entry per endpoint this process\nholds a client for, sorted by base URL. Empty on a node that only\nserves inference (`panoptikon inferio`), which has no client — and on a\ngateway that has not yet talked to its endpoints.\n\nThe models above describe what the orchestrator wants; this describes\nwhat the transport under it will actually carry. Run2's S1 was\nprecisely a disagreement between the two that neither half could see."
+            "description": "The inference **client** side: one entry per endpoint this process holds\na client for, sorted by base URL."
           },
           "load_cooldowns": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/LoadCooldownHealth"
             },
-            "description": "Models whose loads are failing (R9), sorted by inference_id. An entry\nexists from the first failed load until a load succeeds or the history\nis pruned; `retry_after_secs` is 0 for one that has cooled down but is\nstill counting (the next failure waits twice as long)."
+            "description": "Models whose loads are failing, sorted by inference_id; an entry lives\nfrom the first failed load until one succeeds or the history is pruned."
           },
           "model_count": {
             "type": "integer",
@@ -8031,15 +8031,15 @@
           },
           "predict_body_budget": {
             "$ref": "#/components/schemas/PredictBodyBudgetHealth",
-            "description": "The inference **server** side's one memory bound that a peer can move:\nhow much of this process's predict-body budget is spoken for, and how\noften it has had to refuse a request. See\n[`crate::inferio::http::PREDICT_INFLIGHT_BODY_BYTES`]."
+            "description": "How much of the predict-body budget is spoken for, and refusals so far."
           },
           "prewarm": {
             "$ref": "#/components/schemas/PrewarmHealth",
-            "description": "Prewarm pool snapshot (design §8): master/lazy switches plus one\nentry per impl class held (state \"warm\" | \"spawning\" |\n\"failed_prepare\")."
+            "description": "Prewarm snapshot: the switches plus one entry per impl class held."
           },
           "registry_ok": {
             "type": "boolean",
-            "description": "Whether the inference registry currently loads (see `health()` docs\nfor exactly what this checks)."
+            "description": "Whether the inference registry currently loads (see `health()`)."
           },
           "shutting_down": {
             "type": "boolean",
@@ -8054,7 +8054,7 @@
             "items": {
               "$ref": "#/components/schemas/GpuBudgetHealth"
             },
-            "description": "Per-GPU VRAM ledger: budgets, footprints, outstanding grants, ramp and\ndeflation state and the fitted cost model (batch-calibration step 1b).\nEmpty on a host with no GPU inventory, where nothing is admitted and\nevery model takes the unpriced dispatch path."
+            "description": "Per-GPU VRAM ledger: budgets, footprints, grants, ramp and deflation\nstate, the fitted cost model. Empty with no GPU inventory."
           }
         }
       },
@@ -8937,7 +8937,7 @@
       },
       "LoadCooldownHealth": {
         "type": "object",
-        "description": "One model's load-failure cooldown in the [`HealthReport`] (R9). This is\nthe only place the state is visible when the model is *not* loaded — and\nit never is, which is why it cannot live in `models[]`.",
+        "description": "One model's load-failure cooldown in the [`HealthReport`]. A cooling-down\nmodel is by construction not loaded, so this cannot live in `models[]`.",
         "required": [
           "inference_id",
           "failures",
@@ -8968,12 +8968,12 @@
           },
           "retry_at": {
             "type": "string",
-            "description": "RFC 3339 wall-clock instant the model may be retried at, rendered from\nthe monotonic deadline when this report was built."
+            "description": "RFC 3339 instant the model may be retried at."
           },
           "window_secs": {
             "type": "integer",
             "format": "int64",
-            "description": "The window this failure count earned, in seconds — `base × 2^(n−1)`\ncapped at the configured maximum.",
+            "description": "The window this failure count earned, in seconds.",
             "minimum": 0
           }
         }
@@ -10071,7 +10071,7 @@
           },
           "cost": {
             "$ref": "#/components/schemas/CostHealth",
-            "description": "Cost dimension resolved from registry metadata at load time\n(batch-calibration step 1a)."
+            "description": "Cost dimension resolved from registry metadata at load time."
           },
           "desired_in_flight_items": {
             "type": [
@@ -10079,7 +10079,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Items the orchestrator is asking callers to keep inside their\nin-flight predict requests for this model — the same figure the\n`x-panoptikon-desired-in-flight-items` response header carries\n(`dispatch.rs`, `desired_in_flight_items`). `null` until a window has\nbeen formed.\n\nIt is here because it was *not*: run2's S1 had to reconstruct this\ncolumn arithmetically from `ramp_step`, `unit_budget` and\n`max_units_measured` in the logs, because the one number that crosses\nthe core/orchestrator boundary was visible on neither side. With it,\n\"the server asked for 1 632 and the job delivered 200\" is a two-field\ncomparison instead of a phase of analysis.",
+            "description": "Items the orchestrator wants callers to keep in flight — the figure\n`x-panoptikon-desired-in-flight-items` carries. `null` before the first\nwindow.",
             "minimum": 0
           },
           "generation": {
@@ -10102,7 +10102,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Unit budget of the grant on the most recently dispatched window;\n`null` until a window carries one (nothing dispatched yet, or this\nmodel is on the unpriced path — see `dispatch.rs`).",
+            "description": "Unit budget of the grant on the most recently dispatched window; `null`\nuntil one carries a grant, and always on the unpriced path.",
             "minimum": 0
           },
           "last_window_items": {
@@ -10111,13 +10111,13 @@
               "null"
             ],
             "format": "int32",
-            "description": "Inputs in the most recently dispatched window; `null` until the first\nwindow dispatches. This is what a user cap bounds on the unpriced path.",
+            "description": "Inputs in the most recently dispatched window; `null` until the first.",
             "minimum": 0
           },
           "queue_bound_windows": {
             "type": "integer",
             "format": "int64",
-            "description": "Of those, the ones formed short of the unit budget the ledger allowed:\nthe queue, not the GPU, decided their size. A ramp that is not\nadvancing while this climbs is being starved, not squeezed.",
+            "description": "Of those, the ones the queue rather than the GPU decided the size of.",
             "minimum": 0
           },
           "queue_depth": {
@@ -10127,14 +10127,14 @@
           },
           "replicas": {
             "$ref": "#/components/schemas/ReplicaHealth",
-            "description": "WorkerSet occupancy: `free < total` means replicas are running\nwindows right now."
+            "description": "WorkerSet occupancy: `free < total` means replicas are running windows."
           },
           "replicas_detail": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ReplicaTelemetryHealth"
             },
-            "description": "One entry per replica: which GPU it sits on and the freshest memory\nsensing it reported. This is the raw material step 1b's per-GPU\nledger is built from."
+            "description": "Per replica: its GPU and the freshest memory sensing it reported."
           },
           "total_batches": {
             "type": "integer",
@@ -11153,7 +11153,7 @@
       },
       "ReplicaTelemetryHealth": {
         "type": "object",
-        "description": "Per-replica GPU placement plus its freshest memory report. Every field\nafter `gpu` is `null` until the worker reports it (no torch, a remote-API\nimpl, or no predict yet). A CPU or MPS host does report: its figures are\ndenominated in system RAM and Metal's budget respectively, not in VRAM\n(docs/unified-memory-admission.md).",
+        "description": "Per-replica GPU placement plus its freshest memory report; every field after\n`gpu` is `null` until the worker reports it. On a CPU or MPS host the figures\nare system RAM and Metal's budget.",
         "required": [
           "measurements_recorded",
           "recent_batches"
@@ -11203,14 +11203,14 @@
               "string",
               "null"
             ],
-            "description": "Which driver reported `free_mb`/`total_mb` (`\"nvml\"` |\n`\"amdgpu-sysfs\"` | `\"torch\"`); they disagree by gigabytes, so a reader\ncomparing samples needs it."
+            "description": "Driver behind `free_mb`/`total_mb`; they disagree by gigabytes."
           },
           "gpu": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Resolved device pin the worker was *spawned* with — a GPU UUID on a\nknown CUDA inventory, a HIP device index on a known ROCm one (the two\nbackends' visibility variables accept different vocabularies; see\n`gpu::pin_env_var`)."
+            "description": "Resolved device pin the worker was *spawned* with — a GPU UUID on CUDA,\na HIP device index on ROCm; the visibility variables differ."
           },
           "gpu_name": {
             "type": [
@@ -11223,12 +11223,12 @@
               "string",
               "null"
             ],
-            "description": "The GPU the worker itself reports being on: the pin above can be an\nindex, absent, or a UUID CUDA reordered, and only the worker can see\nwhat it actually got. `null` on a ROCm replica — torch's HIP-rendered\nUUID is a third vocabulary the worker deliberately suppresses, and\nthose replicas are admitted to the ledger by PCI address instead\n(docs/rocm-batch-calibration-parity.md, D3), which this view does not\nsurface yet."
+            "description": "The GPU the worker itself reports being on; only it can see what it got.\n`null` on ROCm, which the ledger admits by PCI address instead."
           },
           "measurements_recorded": {
             "type": "integer",
             "format": "int64",
-            "description": "Measurements this replica has reported since it loaded, including any\nthe bounded ring has since evicted.",
+            "description": "Measurements reported since load, including ones the ring evicted.",
             "minimum": 0
           },
           "memory_age_ms": {
@@ -11244,7 +11244,7 @@
             "items": {
               "$ref": "#/components/schemas/BatchHealth"
             },
-            "description": "The tail of the measurement ring, oldest first — a sample of what 1b's\ncost fit consumes, not the whole ring (health is a status page)."
+            "description": "The tail of the measurement ring, oldest first — a sample, not all."
           },
           "reserved_at_load_mb": {
             "type": [

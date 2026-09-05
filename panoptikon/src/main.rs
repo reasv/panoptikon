@@ -24,9 +24,8 @@ mod pql;
 mod process_tree;
 mod proxy;
 mod resources;
-/// The process's open-file-descriptor budget: the startup raise of the soft
-/// `RLIMIT_NOFILE` and the reader the extraction job's in-flight ceiling
-/// clamps itself with.
+/// The process's open-file-descriptor budget: the startup `RLIMIT_NOFILE`
+/// raise, and the reader the extraction job clamps itself with.
 mod rlimit;
 mod setup;
 mod shutdown;
@@ -136,16 +135,10 @@ const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
     // Raise the soft open-file-descriptor limit to the hard limit before
-    // anything opens a descriptor, and before the runtime exists: rlimits are
-    // per-process and inherited by every thread and child (inference workers,
-    // the UI server), so this is the one place that fixes all of them. A
-    // typical Linux shell and a containerd container both start the process
-    // at soft 1024 / hard 524 288 while local inference costs two sockets per
-    // in-flight predict (test protocol §8 G7, Phase 6 finding F6). Failure is
-    // never fatal — `jobs::extraction` reads whatever limit survives and
-    // bounds its in-flight window by it. The outcome is logged by
-    // `async_main` once logging has been configured; up here there is nowhere
-    // to log to yet.
+    // anything opens a descriptor and before the runtime exists: rlimits are
+    // per-process and inherited by every thread and child. A shell and a
+    // container both start at soft 1024, while local inference costs two
+    // sockets per in-flight predict. Failure is never fatal.
     rlimit::raise_soft_limit_at_startup();
 
     // Build a custom tokio runtime with a larger worker thread stack size.
@@ -214,8 +207,7 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!("{message}");
     }
     env_template::warn_dotenv_diagnostics(&dotenv_diagnostics);
-    // Same shape as the first-run messages: the descriptor-limit raise
-    // happened in `main`, long before there was a logger to say so.
+    // The raise happened in `main`, before any logger existed.
     rlimit::log_startup_raise();
     settings.log_warnings();
 
@@ -712,14 +704,9 @@ async fn async_main() -> anyhow::Result<()> {
     // difference is the ListenerEndpoint extension the policy layer reads.
     //
     // The serve loop is hyper-util's *auto* connection builder, which sniffs
-    // the HTTP/2 client preface and serves either version on the same port —
-    // so h2c with prior knowledge needs no upgrade handshake and no second
-    // listener. It is gated on axum's `http2` feature, which `Cargo.toml`
-    // therefore names explicitly; the inference client (`inferio_client.rs`)
-    // probes for exactly this and falls back to HTTP/1.1 against a server
-    // without it. `serve_with_stream_limit` drives that builder directly
-    // rather than through `axum::serve` so the stream limit is ours; see
-    // MAX_CONCURRENT_STREAMS.
+    // the HTTP/2 client preface and serves either version on the same port, so
+    // h2c needs no upgrade handshake and no second listener.
+    // `serve_with_stream_limit` drives it directly so the stream limit is ours.
     tracing::info!(
         max_concurrent_streams = MAX_CONCURRENT_STREAMS,
         "serving HTTP/1.1 and HTTP/2 cleartext"
@@ -748,72 +735,28 @@ async fn async_main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Concurrent HTTP/2 streams this server admits **per connection**.
+/// Concurrent HTTP/2 streams this server admits **per connection**, and so the
+/// ceiling on concurrent predicts one peer connection can carry. Set here
+/// rather than inherited: `axum::serve` leaves hyper's config alone, which
+/// advertises 200 — a limit no layer of ours could name, log or account for.
 ///
-/// Every listener this binary opens serves `/api/inference` (the gateway
-/// nests it; `panoptikon inferio` is only that), so this number is the
-/// ceiling on concurrent predicts one peer connection can carry — which is
-/// exactly why it is written down here instead of being inherited.
+/// 512 = 8 x `inferio_client::H2_STREAMS_PER_CONNECTION`, the budget our own
+/// client offers a peer, times eight because the limit is per *connection* and
+/// a reverse proxy fans several clients onto one. It also sits above every
+/// common server default, so this server is never the tightest in a chain.
 ///
-/// **Why it was not written down before, and what that cost.** `axum::serve`
-/// builds hyper-util's auto connection builder and leaves its HTTP/2 config
-/// alone, so the advertised `SETTINGS_MAX_CONCURRENT_STREAMS` was hyper's
-/// default of **200**. Run2's `S2-wdvit` leg published a desired-in-flight
-/// figure of 1 632 items, the client's log line claimed a concurrency of 256,
-/// and the number that actually applied was 200 — named nowhere, logged
-/// nowhere, absent from `/health`, and absent from the descriptor arithmetic
-/// in `jobs::extraction::in_flight_unit_ceiling`. Window formation then
-/// degenerated into the involution `W -> 200 - W`, and the calibration ramp
-/// froze at an anchor of 136 units for the rest of the job. A ceiling no
-/// layer can name is not a policy.
-///
-/// **The number.** 512 = 8 x `inferio_client::H2_STREAMS_PER_CONNECTION`
-/// (64), which is the per-connection stream budget our own client offers a
-/// peer. Eight times it, because the limit is per *connection* and the
-/// clients on the other side are not all ours:
-///
-/// - our own gateway spreads its concurrency over independent connections and
-///   never offers one of them more than 64 streams, so a single gateway is
-///   covered eight times over;
-/// - several gateways are covered without arithmetic: each brings its own
-///   connections, each with its own budget of 512;
-/// - a reverse proxy in front of the inference server — the NAS-to-GPU-box
-///   deployment grows one easily — *does* fan several clients onto one
-///   upstream connection, and that is the case the factor of eight is for;
-/// - it stays under what a generous peer would consider hostile, and above
-///   every common server default (nginx 128, Envoy 100, hyper 200), so this
-///   server is never the tightest limit in a chain it is part of.
-///
-/// **The bound in the other direction is not this number.** A stream is not
-/// free: since `7e96de62` the predict handler buffers the whole multipart
-/// body before parsing it, so an open predict stream can hold up to
-/// [`inferio::http::PREDICT_BODY_LIMIT`] of server memory. It is tempting to
-/// read `512 x 2 GiB` as the memory statement that follows, and that would be
-/// wrong twice over: nothing limits how many *connections* a peer opens, so
-/// the product bounds nothing, and a terabyte is not a budget anybody can
-/// act on. What actually bounds the memory is
-/// [`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`], which is charged across
-/// every stream and every peer and answers `503` when it is out. This number
-/// is a *concurrency* policy, and it is written down for the reason run2's S1
-/// exists: a ceiling no layer can name is not a policy.
+/// It is a *concurrency* policy, not a memory one: nothing limits how many
+/// connections a peer opens, so `streams x body limit` bounds nothing. Memory
+/// is bounded by [`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`].
 pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 512;
 
 /// Serve `app` on `listener` until `shutdown` resolves, then drain.
 ///
-/// This is `axum::serve(...).with_graceful_shutdown(...)` re-implemented on
-/// hyper-util's own auto builder, for one reason: `axum::serve` exposes no
-/// hook onto that builder, and [`MAX_CONCURRENT_STREAMS`] has to be set on
-/// it. Everything else here mirrors axum 0.8's loop deliberately — accept,
-/// spawn per connection, `serve_connection_with_upgrades` (websockets),
-/// `enable_connect_protocol` (HTTP/2 websockets), `graceful_shutdown` on the
-/// signal, and a `watch` channel whose last receiver dropping is what "every
-/// connection task has finished" means.
-///
-/// The one simplification: axum threads the peer address through a
-/// `MakeService` so `ConnectInfo` can be extracted. There is exactly one
-/// connect-info type in this binary (`SocketAddr`), so the extension is
-/// inserted directly per request instead, which is what
-/// `IntoMakeServiceWithConnectInfo` does at the end of its own chain.
+/// `axum::serve(...).with_graceful_shutdown(...)` re-implemented on
+/// hyper-util's auto builder, because axum exposes no hook onto it and
+/// [`MAX_CONCURRENT_STREAMS`] has to be set there. Everything else mirrors
+/// axum 0.8's loop, except that the one connect-info type is inserted per
+/// request rather than through a `MakeService`.
 pub(crate) async fn serve_with_stream_limit<F>(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -825,10 +768,7 @@ where
     serve_with_streams(listener, app, shutdown, MAX_CONCURRENT_STREAMS).await
 }
 
-/// [`serve_with_stream_limit`] with the limit as a parameter. Production
-/// always passes [`MAX_CONCURRENT_STREAMS`]; the parameter exists so tests can
-/// stand in for a peer — or a proxy in front of one — that advertises less,
-/// which is the case a client cannot detect and must survive.
+/// [`serve_with_stream_limit`] with the limit as a parameter, for tests.
 pub(crate) async fn serve_with_streams<F>(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -842,26 +782,21 @@ where
     use hyper_util::server::conn::auto::Builder;
     use tower::ServiceExt as _;
 
-    // Dropping the only receiver is the signal; `closed()` on the sender is
-    // how every connection task learns about it. Same shape as axum's.
+    // Dropping the only receiver is the signal, as in axum's own loop.
     let (signal_tx, signal_rx) = tokio::sync::watch::channel(());
     tokio::spawn(async move {
         shutdown.await;
         drop(signal_rx);
     });
-    // Held by every live connection task; `closed()` on the sender is the
-    // drain.
+    // Held by every live connection task; the sender's `closed()` is the drain.
     let (close_tx, close_rx) = tokio::sync::watch::channel(());
 
     loop {
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
-                // Per-connection errors (a peer that vanished between the
-                // SYN and the accept, a momentary descriptor shortage) must
-                // not take the listener down; the sleep keeps a persistent
-                // one from spinning the CPU. This is what axum's `Listener`
-                // impl for `TcpListener` does.
+                // A per-connection error must not take the listener down; the
+                // sleep keeps a persistent one from spinning the CPU.
                 Err(err) => {
                     tracing::debug!(error = %err, "failed to accept a connection");
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -890,8 +825,7 @@ where
                 .http2()
                 // The whole reason this function exists.
                 .max_concurrent_streams(max_concurrent_streams)
-                // CONNECT protocol, needed for HTTP/2 websockets (axum sets
-                // it too; dropping it would be a silent regression).
+                // CONNECT protocol: HTTP/2 websockets, as axum sets it too.
                 .enable_connect_protocol();
             let mut conn = std::pin::pin!(builder.serve_connection_with_upgrades(io, service));
             let mut draining = false;
@@ -989,16 +923,9 @@ async fn inferio_main(
 mod route_tests {
     use super::*;
 
-    /// `serve_with_stream_limit` replaces `axum::serve` at both listener
-    /// sites, so the three things `axum::serve` gave us for free are
-    /// asserted here rather than assumed: it answers, the `ConnectInfo`
-    /// extension the policy layer and the access log read is populated, and
-    /// the graceful shutdown both stops accepting and lets the serve future
-    /// return.
-    ///
-    /// The stream limit itself is measured end to end in
-    /// `inferio_client::tests::the_server_and_the_pool_bound_concurrent_predicts`,
-    /// which drives this same loop.
+    /// What `axum::serve` gave us for free, asserted rather than assumed now
+    /// that `serve_with_stream_limit` replaces it: it answers, `ConnectInfo` is
+    /// populated, and graceful shutdown stops accepting and returns.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_serve_loop_answers_with_connect_info_and_then_drains() {
         use axum::extract::ConnectInfo;
@@ -1015,8 +942,7 @@ mod route_tests {
             let _ = stop_rx.await;
         }));
 
-        // Over h2c with prior knowledge: the version the inference client
-        // speaks, and the one the stream limit applies to.
+        // Over h2c with prior knowledge: what the inference client speaks.
         let client = reqwest::Client::builder()
             .http2_prior_knowledge()
             .build()

@@ -1170,7 +1170,24 @@ window is in flight per worker either way, so a trim never races a batch.
   inference id, an external input the environment does not provide,
   unparseable registry TOML — are deliberately excluded: they cost nothing,
   they are deterministic, and the fix is a config edit the user expects to be
-  able to retry at once.
+  able to retry at once. Three details of the refusal: `last_error` is a
+  traceback plus a stderr tail, so the copy repeated on every refused request
+  and every `/health` poll is clamped to 2000 bytes (the full text is in the
+  log); `Retry-After` is rounded up and never below 1, because
+  `Retry-After: 0` invites the hammering the cooldown exists to stop; and the
+  refusal leaves no cache entry behind — the LRU entry the request had just
+  renewed is removed again, or a cooling-down model would accumulate
+  cache-key references it can never serve. The configured seconds are clamped
+  to a year, because a window becomes an `Instant + Duration` deadline under
+  the manager's state mutex and that panics rather than saturating.
+- **Shutdown waits for the loads that are still spawning.** A load past its
+  fast path holds a read guard on the manager's shutdown barrier for its whole
+  slow phase, and `shutdown` write-locks that barrier after flipping the
+  shutting-down flag. So a load in flight finishes its spawn, sees the flag,
+  and parks a task that runs the graceful stop ladder on the workers it just
+  created; the second drain — taken after the write lock — awaits that task
+  instead of abandoning a worker mid-stop. A load that has not reached its
+  slow phase queues behind the write lock and then bails without spawning.
 - `predict` has no fixed deadline in v1 (arbitrary models); cancellation =
   kill the worker (it is the model — there is nothing softer to cancel).
 - `trim` has a fixed 60 s deadline, and timing out is fatal. The operation is a
