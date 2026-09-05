@@ -13,8 +13,10 @@
 //! come out of one `nvidia-smi --query-gpu` call, positionally matched. This
 //! module owns the type, the floor comparison and the overlay.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::Value as JsonValue;
@@ -178,8 +180,6 @@ pub(super) fn output_with_timeout(
     mut cmd: Command,
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    use std::io::Read;
-
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -187,26 +187,8 @@ pub(super) fn output_with_timeout(
     // the give-up below can take the whole probe down and not this process.
     crate::process_tree::detach_from_console(&mut cmd);
     let mut child = cmd.spawn().ok()?;
-    let stdout = {
-        let mut pipe = child.stdout.take();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(pipe) = pipe.as_mut() {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
-    let stderr = {
-        let mut pipe = child.stderr.take();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(pipe) = pipe.as_mut() {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -231,9 +213,30 @@ pub(super) fn output_with_timeout(
     };
     Some(std::process::Output {
         status,
-        stdout: stdout.join().ok()?,
-        stderr: stderr.join().ok()?,
+        stdout: drained(stdout),
+        stderr: drained(stderr),
     })
+}
+
+/// Read one of the child's pipes to EOF on a thread of its own, so a child
+/// that fills a pipe cannot deadlock the wait. No pipe (already taken) reads
+/// as empty, as does a read that failed: the caller decides on the status.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+/// What a finished [`drain`] read. A thread that **panicked** costs the stream
+/// it was reading and nothing else: the child answered, so this is a probe
+/// with one empty stream, not an unknown host. (It used to be `join().ok()?`,
+/// which turned a successful probe into `None`.)
+fn drained(pipe: JoinHandle<Vec<u8>>) -> Vec<u8> {
+    pipe.join().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -252,6 +255,27 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"out");
         assert_eq!(output.stderr, b"err");
+    }
+
+    /// A drain thread that panicked costs only the stream it was reading:
+    /// the child answered, so the probe stands with that stream empty. It
+    /// used to be `join().ok()?`, which reported the whole probe — and so
+    /// the host's capabilities — as unknown.
+    #[test]
+    fn a_panicking_drain_thread_costs_only_its_own_stream() {
+        struct PanicsOnRead;
+        impl Read for PanicsOnRead {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("the drain thread died");
+            }
+        }
+        // The panic is the point; keep it off the test log.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let handle = drain(Some(PanicsOnRead));
+        let read = drained(handle);
+        std::panic::set_hook(hook);
+        assert!(read.is_empty(), "the stream is empty, and the probe stands");
     }
 
     /// F13: giving up on a probe must *end* the probe. An abandoned child
