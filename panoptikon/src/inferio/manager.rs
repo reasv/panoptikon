@@ -35,9 +35,9 @@
 //! sorted key order. RAII guards throughout, so cancellation strands nothing.
 //!
 //! A model whose loads keep failing is put in a doubling per-model cooldown
-//! ([`LoadCooldowns`]) and refused with a 503 until it expires. Deviations from
-//! the Python semantics are noted inline. See docs/inferio-worker-protocol.md
-//! "Lifecycle and timeouts (orchestrator side)".
+//! ([`LoadCooldowns`]) and refused with a 503 until it expires. The deliberate
+//! deviations from the Python manager are listed in
+//! docs/inferio-worker-protocol.md "Lifecycle and timeouts (orchestrator side)".
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
