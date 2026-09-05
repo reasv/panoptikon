@@ -13,8 +13,10 @@
 //! come out of one `nvidia-smi --query-gpu` call, positionally matched. This
 //! module owns the type, the floor comparison and the overlay.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::Value as JsonValue;
@@ -39,11 +41,6 @@ impl HostComputeCaps {
             tracing::info!(compute_caps = %join_caps(&caps), "detected GPU compute capabilities");
             Self(Some(caps))
         }
-    }
-
-    #[cfg(test)]
-    pub fn known(caps: Vec<(u32, u32)>) -> Self {
-        Self::from_caps(caps)
     }
 
     /// Whether ANY visible device meets `floor` (e.g. `8.0`); `None` when
@@ -178,8 +175,6 @@ pub(super) fn output_with_timeout(
     mut cmd: Command,
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    use std::io::Read;
-
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -187,26 +182,8 @@ pub(super) fn output_with_timeout(
     // the give-up below can take the whole probe down and not this process.
     crate::process_tree::detach_from_console(&mut cmd);
     let mut child = cmd.spawn().ok()?;
-    let stdout = {
-        let mut pipe = child.stdout.take();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(pipe) = pipe.as_mut() {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
-    let stderr = {
-        let mut pipe = child.stderr.take();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(pipe) = pipe.as_mut() {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -231,9 +208,30 @@ pub(super) fn output_with_timeout(
     };
     Some(std::process::Output {
         status,
-        stdout: stdout.join().ok()?,
-        stderr: stderr.join().ok()?,
+        stdout: drained(stdout),
+        stderr: drained(stderr),
     })
+}
+
+/// Read one of the child's pipes to EOF on a thread of its own, so a child
+/// that fills a pipe cannot deadlock the wait. No pipe (already taken) reads
+/// as empty, as does a read that failed: the caller decides on the status.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+/// What a finished [`drain`] read. A thread that **panicked** costs the stream
+/// it was reading and nothing else: the child answered, so this is a probe
+/// with one empty stream, not an unknown host. (It used to be `join().ok()?`,
+/// which turned a successful probe into `None`.)
+fn drained(pipe: JoinHandle<Vec<u8>>) -> Vec<u8> {
+    pipe.join().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -252,6 +250,27 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"out");
         assert_eq!(output.stderr, b"err");
+    }
+
+    /// A drain thread that panicked costs only the stream it was reading:
+    /// the child answered, so the probe stands with that stream empty. It
+    /// used to be `join().ok()?`, which reported the whole probe — and so
+    /// the host's capabilities — as unknown.
+    #[test]
+    fn a_panicking_drain_thread_costs_only_its_own_stream() {
+        struct PanicsOnRead;
+        impl Read for PanicsOnRead {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("the drain thread died");
+            }
+        }
+        // The panic is the point; keep it off the test log.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let handle = drain(Some(PanicsOnRead));
+        let read = drained(handle);
+        std::panic::set_hook(hook);
+        assert!(read.is_empty(), "the stream is empty, and the probe stands");
     }
 
     /// F13: giving up on a probe must *end* the probe. An abandoned child
@@ -309,15 +328,15 @@ mod tests {
 
     #[test]
     fn meets_floor_boundaries() {
-        let caps = HostComputeCaps::known(vec![(7, 5)]);
+        let caps = HostComputeCaps::from_caps(vec![(7, 5)]);
         assert_eq!(caps.meets_floor(7.5), Some(true));
         assert_eq!(caps.meets_floor(8.0), Some(false));
         // ANY device qualifying is enough.
-        let mixed = HostComputeCaps::known(vec![(6, 1), (8, 6)]);
+        let mixed = HostComputeCaps::from_caps(vec![(6, 1), (8, 6)]);
         assert_eq!(mixed.meets_floor(8.0), Some(true));
         assert_eq!(HostComputeCaps::unknown().meets_floor(8.0), None);
         // 10.x majors compare above 9.x, not lexicographically.
-        let blackwell = HostComputeCaps::known(vec![(12, 0)]);
+        let blackwell = HostComputeCaps::from_caps(vec![(12, 0)]);
         assert_eq!(blackwell.meets_floor(8.0), Some(true));
     }
 
@@ -335,7 +354,7 @@ mod tests {
                 }
             }
         });
-        let caps = HostComputeCaps::known(vec![(6, 1)]);
+        let caps = HostComputeCaps::from_caps(vec![(6, 1)]);
         overlay_metadata(&mut body, &caps);
         let gated = &body["doctr"]["inference_ids"]["dots_ocr"];
         assert_eq!(gated["unavailable"], json!(true));
@@ -357,7 +376,7 @@ mod tests {
             }
         });
         let mut satisfied = template.clone();
-        overlay_metadata(&mut satisfied, &HostComputeCaps::known(vec![(8, 9)]));
+        overlay_metadata(&mut satisfied, &HostComputeCaps::from_caps(vec![(8, 9)]));
         assert_eq!(satisfied, template);
 
         let mut unknown = template.clone();
@@ -376,7 +395,7 @@ mod tests {
             }
         });
         let mut body = template.clone();
-        overlay_metadata(&mut body, &HostComputeCaps::known(vec![(6, 1)]));
+        overlay_metadata(&mut body, &HostComputeCaps::from_caps(vec![(6, 1)]));
         assert_eq!(body, template);
     }
 }

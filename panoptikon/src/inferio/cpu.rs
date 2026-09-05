@@ -100,6 +100,9 @@ fn free_mb(ram_mb: u64, ram_available_mb: u64) -> u64 {
 }
 
 /// Physical RAM in MiB. `None` with no reader, or on a reader that failed.
+/// Linux is the only platform that reads `roots`; the rest answer from a
+/// syscall, hence the `unused_variables` allow.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -107,17 +110,14 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = roots;
         sys::total_mb()
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = roots;
         return super::mps::physical_ram_mb();
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        let _ = roots;
         None
     }
 }
@@ -126,6 +126,7 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
 /// worker's `psutil.virtual_memory().available` gives, under the same
 /// `"ram"` label. Over-stating availability would under-state external
 /// pressure, so the tighter figure wins where a platform offers both.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -133,17 +134,14 @@ fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = roots;
         sys::available_mb()
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = roots;
         return super::mps::ram_available_mb();
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        let _ = roots;
         None
     }
 }

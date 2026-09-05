@@ -139,37 +139,34 @@ fn hip_worker_env() -> Vec<(String, String)> {
                 joined.to_string_lossy().into_owned(),
             ));
         }
-        if env::var_os("ROCM_PATH").is_none() && Path::new("/opt/rocm").is_dir() {
-            out.push(("ROCM_PATH".to_owned(), "/opt/rocm".to_owned()));
-        }
-        if env::var_os("HIP_PATH").is_none() {
-            if let Ok(rocm) = env::var("ROCM_PATH") {
-                out.push(("HIP_PATH".to_owned(), rocm));
-            } else if Path::new("/opt/rocm").is_dir() {
-                out.push(("HIP_PATH".to_owned(), "/opt/rocm".to_owned()));
+        // Every default below is a default: an operator who set the variable
+        // already keeps it.
+        fn push_if_unset(out: &mut Vec<(String, String)>, key: &str, value: String) {
+            if env::var_os(key).is_none() {
+                out.push((key.to_owned(), value));
             }
         }
-        // MIOpen defaults (only if unset so operators can override):
-        // FAST (2): FindDb hit or immediate fallback — avoids exhaustive
-        // GemmFwdRest evaluation with workspace ptr=0 that stalls OCR for
-        // tens of seconds until the unload grace kills the worker.
-        // See ROCm/TheRock#3077, rocm-libraries#4071.
-        if env::var_os("MIOPEN_FIND_MODE").is_none() {
-            out.push(("MIOPEN_FIND_MODE".to_owned(), "FAST".to_owned()));
+        let opt_rocm = Path::new("/opt/rocm").is_dir();
+        if opt_rocm {
+            push_if_unset(&mut out, "ROCM_PATH", "/opt/rocm".to_owned());
         }
+        // HIP_PATH keeps its two-step fallback: the ambient ROCM_PATH first,
+        // then /opt/rocm.
+        if let Some(hip) = env::var("ROCM_PATH")
+            .ok()
+            .or_else(|| opt_rocm.then(|| "/opt/rocm".to_owned()))
+        {
+            push_if_unset(&mut out, "HIP_PATH", hip);
+        }
+        // MIOpen defaults. FAST (2): FindDb hit or immediate fallback —
+        // avoids exhaustive GemmFwdRest evaluation with workspace ptr=0 that
+        // stalls OCR for tens of seconds until the unload grace kills the
+        // worker. See ROCm/TheRock#3077, rocm-libraries#4071.
+        push_if_unset(&mut out, "MIOPEN_FIND_MODE", "FAST".to_owned());
         if let Some(cache) = miopen_cache_dir() {
-            if env::var_os("MIOPEN_USER_DB_PATH").is_none() {
-                out.push((
-                    "MIOPEN_USER_DB_PATH".to_owned(),
-                    cache.join("db").to_string_lossy().into_owned(),
-                ));
-            }
-            if env::var_os("MIOPEN_CUSTOM_CACHE_DIR").is_none() {
-                out.push((
-                    "MIOPEN_CUSTOM_CACHE_DIR".to_owned(),
-                    cache.join("cache").to_string_lossy().into_owned(),
-                ));
-            }
+            let path = |leaf: &str| cache.join(leaf).to_string_lossy().into_owned();
+            push_if_unset(&mut out, "MIOPEN_USER_DB_PATH", path("db"));
+            push_if_unset(&mut out, "MIOPEN_CUSTOM_CACHE_DIR", path("cache"));
         }
         out
     }
