@@ -1,7 +1,7 @@
 import re
 import logging
 from io import BytesIO
-from typing import List, Sequence, Type
+from typing import List, Sequence
 import numpy as np
 from PIL import Image as PILImage
 from inferio.impl.utils import (
@@ -165,6 +165,12 @@ def max_detector_batch(
     is known.
     """
     dims = detector_tensor_dims(shapes, canvas_size, mag_ratio)
+    return max_batch_for_dims(dims)
+
+
+def max_batch_for_dims(dims: tuple[int, int] | None) -> int | None:
+    """[`max_detector_batch`] for a tensor whose padded dims are already
+    known, so a caller holding them does not price them twice."""
     if dims is None:
         return None
     per_item = detector_pool_elements(*dims)
@@ -507,22 +513,12 @@ class EasyOCRModel(InferenceModel):
         # headers: the authoritative one, the harness's `max_batch_for`
         # pre-cap being the same arithmetic run early enough to price it.
         tensor_dims = detector_tensor_dims(
-            [
-                (int(array.shape[0]), int(array.shape[1]))
-                for array in bounded
-            ],
+            [(int(array.shape[0]), int(array.shape[1])) for array in bounded],
             canvas_size,
             self._batch_mag_ratio(batch_params),
         )
         chunk_cap = (
-            max_detector_batch(
-                [
-                    (int(array.shape[0]), int(array.shape[1]))
-                    for array in bounded
-                ],
-                canvas_size,
-                self._batch_mag_ratio(batch_params),
-            )
+            max_batch_for_dims(tensor_dims)
             if self._index_ceiling_applies()
             else None
         )

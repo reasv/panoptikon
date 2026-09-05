@@ -128,10 +128,6 @@ def proc_comm(pid: int) -> Optional[str]:
     return raw.strip() if raw is not None else None
 
 
-def proc_env(pid: int, keys: Iterable[str]) -> Dict[str, str]:
-    return proc_env_read(pid, keys)[0]
-
-
 def proc_env_read(pid: int, keys: Iterable[str]) -> Tuple[Dict[str, str], bool]:
     """`(matched vars, environ was readable)`.
 
