@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """hog.py - controllable external memory pressure (GPU via torch, RAM via numpy).
 
-The "external world" of `docs/batch-calibration-test-protocol.md` §2: it takes
-memory the gateway does not own, on a schedule, and gives it back so the driver
-sees the release (`torch.cuda.empty_cache()` after every shrink). Every byte it
-claims is *touched*, so the pages are real and NVML/`MemAvailable` see them.
+It takes memory the gateway does not own, on a schedule, and gives it back so
+the driver sees the release (`torch.cuda.empty_cache()` after every shrink).
+Every byte it claims is *touched*, so NVML and `MemAvailable` see real pages.
 
 Usage
 -----
     hog.py [common options] <schedule> [schedule args]
-
     hog.py hold 10240                       # take 10 GiB and keep it
     hog.py step 4096,60 16384,60 0,30       # (MiB, seconds) pairs, then stop
     hog.py ramp 0 40960 600                 # 0 -> 40 GiB over 10 minutes
@@ -18,52 +16,26 @@ Usage
     hog.py leave-free 12288                 # hold whatever leaves 12 GiB free
     hog.py idle                             # allocate nothing; drive it over HTTP
 
-Common options:
-    --target gpu|ram    what to pressure                    (default: gpu)
-    --device N          CUDA device index for --target gpu  (default: 0)
-    --chunk-mb N        allocation granularity              (default: 128)
-    --tick S            schedule/apply period in seconds    (default: 0.5)
-    --duration S        exit after S seconds (default: run until signalled)
-    --port N            HTTP control endpoint on 127.0.0.1:N (default: off)
-    --out PATH          JSONL state log (default: stdout)
-    --hold-at-end       keep the memory until signalled instead of exiting when
-                        a finite schedule (step/ramp) runs out
-    --reeval S          how often `leave-free` re-reads free memory (default: 2)
-
-HTTP control (when --port is given, bound to 127.0.0.1)
--------------------------------------------------------
-    GET  /state              -> the same JSON object as a log line
-    POST /set?mb=N           -> override the schedule with a fixed N MiB
-    POST /set?leave_free=N   -> override with a leave-free N MiB target
-    POST /resume             -> drop the override, return to the schedule
-    POST /stop               -> release everything and exit
+Common options are in `--help`; `--port N` adds an HTTP control endpoint on
+127.0.0.1 (`GET /state`, `POST /set?mb=N|leave_free=N`, `/resume`, `/stop`).
 
 Output schema (JSONL)
 ---------------------
 Header: {"schema": "hog/1", "kind": "header", "target": "gpu"|"ram",
-         "device": int|null, "gpu_uuid": str|null, "gpu_name": str|null,
-         "schedule": {...}, "argv": [...], "pid": int, "t_wall": float,
-         "iso": str, "chunk_mb": int, "torch": str|null,
-         "context_mb": int|null}
+         "device", "gpu_uuid", "gpu_name", "schedule", "argv", "pid",
+         "t_wall", "iso", "chunk_mb", "torch", "context_mb"}
 
-Samples: {"schema": "hog/1", "kind": "state", "seq": int, "t_mono": float,
-          "t_wall": float, "iso": str, "pid": int,
-          "target_mb": int,      # what the schedule (or override) asked for
-          "held_mb": int,        # what is actually allocated and touched
-          "chunks": int,
-          "free_mb": int|null,   # GPU (or MemAvailable) free right now
-          "total_mb": int|null,
-          "own_mb": int|null,    # NVML own-PID usage (GPU) or RSS (RAM)
+Samples: {"schema": "hog/1", "kind": "state", "seq", "t_mono", "t_wall",
+          "iso", "pid", "chunks", "total_mb", "last_error", "phase",
           "override": "mb"|"leave_free"|null,
-          "phase": str,          # schedule-defined label
-          "oom": int,            # cumulative failed allocation attempts
-          "last_error": str|null}
+          "target_mb" (asked for), "held_mb" (allocated and touched),
+          "free_mb" (GPU, or MemAvailable), "own_mb" (NVML own-PID, or RSS),
+          "oom" (cumulative failed allocation attempts)}
 
 `held_mb` is the payload only; on a GPU the process also holds a CUDA context
 (reported once as `context_mb` in the header), so GPU `used` rises by
-`held_mb + context_mb` when the hog starts from nothing. Oracle calibration
-should compare *deltas of `held_mb`* against deltas of GPU `used` and of the
-hog PID's NVML usage.
+`held_mb + context_mb` from nothing. Compare *deltas of `held_mb`* against
+deltas of GPU `used` and of the hog PID's NVML usage (`oracle_calibrate.py`).
 """
 
 from __future__ import annotations
@@ -93,9 +65,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# --------------------------------------------------------------------------
-# Backends
-# --------------------------------------------------------------------------
+# --- Backends --------------------------------------------------------------
 
 
 class Backend:
@@ -144,8 +114,8 @@ class GpuBackend(Backend):
         self.device = torch.device(f"cuda:{device}")
         self.index = device
         self._chunk_bytes = chunk_mb * MIB
-        # Realise the context before the first measurement so `context_mb`
-        # separates the fixed cost of being a CUDA process from the payload.
+        # Realise the context before the first measurement, so `context_mb`
+        # separates the cost of being a CUDA process from the payload.
         before_free, _ = self._nvml_free_total()
         torch.zeros(1, dtype=torch.uint8, device=self.device).fill_(1)
         torch.cuda.synchronize(self.device)
@@ -155,8 +125,7 @@ class GpuBackend(Backend):
             else max(0, before_free - after_free)
         )
 
-    # -- NVML (GPU-level truth; torch.cuda.mem_get_info agrees but is
-    #    process-scoped for the "own" figure) --------------------------------
+    # -- NVML: GPU-level truth; mem_get_info is process-scoped for "own" ---
     def _nvml(self):  # noqa: ANN202
         if getattr(self, "_nvml_handle", "unset") == "unset":
             self._nvml_handle = None
@@ -210,7 +179,7 @@ class GpuBackend(Backend):
 
     def reclaim(self) -> None:
         # Hand the pages back to the driver, not just to torch's caching
-        # allocator: otherwise nothing outside this process sees the release.
+        # allocator, or nothing outside this process sees the release.
         try:
             self.torch.cuda.empty_cache()
             self.torch.cuda.synchronize(self.device)
@@ -318,9 +287,7 @@ def _meminfo() -> Dict[str, int]:
     return out
 
 
-# --------------------------------------------------------------------------
-# Schedules: elapsed seconds -> (target MiB or None for leave-free, phase)
-# --------------------------------------------------------------------------
+# --- Schedules: elapsed s -> (target MiB, or None for leave-free; phase) --
 
 
 class Schedule:
@@ -328,8 +295,8 @@ class Schedule:
     finite = False
 
     def target(self, elapsed: float) -> Tuple[Optional[int], Optional[int], str]:
-        """Return (absolute_mb, leave_free_mb, phase); exactly one of the
-        first two is not None, or both are None meaning "release everything"."""
+        """(absolute_mb, leave_free_mb, phase): one of the first two is set,
+        or both are None, meaning "release everything"."""
         raise NotImplementedError
 
     def describe(self) -> Dict[str, Any]:
@@ -447,9 +414,7 @@ class Oscillate(Schedule):
                 "half_period_s": self.period}
 
 
-# --------------------------------------------------------------------------
-# Hog
-# --------------------------------------------------------------------------
+# --- Hog -------------------------------------------------------------------
 
 
 class Hog:
@@ -502,19 +467,17 @@ class Hog:
     def apply(self, want_mb: int, emit=None) -> None:  # noqa: ANN001
         """Move the held amount towards `want_mb`.
 
-        `emit`, when given, is called with a `"progress"` state record every
-        `--progress-every` seconds while a large allocation is in flight: on a
-        memory-pressured host one chunk can take seconds, and a schedule that
-        only logged after the whole target was reached would leave a gap in the
-        recording exactly where the interesting part is.
+        `emit`, when given, gets a `"progress"` state record every
+        `--progress-every` seconds while an allocation is still in flight, so
+        a slow ramp-up is recorded rather than being a gap.
         """
         chunk_mb = max(1, self.backend.chunk_bytes() // MIB)
         want_chunks = max(0, int(round(want_mb / chunk_mb)))
         last_emit = time.monotonic()
         with self.lock:
             if want_chunks < len(self.chunks):
-                # Shrink: drop the excess, then hand the pages back so the
-                # driver (not just torch's caching allocator) sees the release.
+                # Drop the excess, then hand the pages back so the driver
+                # sees the release.
                 del self.chunks[want_chunks:]
                 self.backend.reclaim()
                 return
@@ -567,16 +530,13 @@ class Hog:
         if free_mb is None:
             self._leave_free_target = self.held_mb
             return self._leave_free_target
-        # Everything but us is out of our control, so re-solve from where we
-        # actually are: hold what we hold, plus whatever free memory exceeds
-        # the amount we were told to leave.
+        # Re-solve from where we actually are: hold what we hold, plus
+        # whatever free memory exceeds the amount we were told to leave.
         self._leave_free_target = max(0, self.held_mb + (free_mb - leave_mb))
         return self._leave_free_target
 
 
-# --------------------------------------------------------------------------
-# HTTP control
-# --------------------------------------------------------------------------
+# --- HTTP control ----------------------------------------------------------
 
 
 def make_handler(hog: Hog):  # noqa: ANN201
@@ -633,9 +593,7 @@ def make_handler(hog: Hog):  # noqa: ANN201
     return Handler
 
 
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
+# --- CLI -------------------------------------------------------------------
 
 
 def parse_steps(values: List[str]) -> List[Tuple[int, float]]:

@@ -73,6 +73,26 @@ whose cmdline matches `--filter`. Runs until SIGINT/SIGTERM or `--duration`.
 A per-process `used_mb` of `null` means NVML answered N/A (WDDM, or a container
 without `--pid=host`) — it is never silently turned into 0.
 
+**Why a PID's identity is re-read rather than memoised on sight.** NVML lists a
+PID as soon as it touches the driver, and a worker touches it *inside* its
+fork/exec window, when `/proc/<pid>/cmdline` still reads empty and
+`/proc/<pid>/environ` is not yet the child's. Reading then yields the `[comm]`
+fallback (`[panoptikon-spaw]`) and an empty env, and memoising that negative
+pins it for the process's whole life: run1's S9 lost a nemotron worker that
+way — 815 of 815 samples carried `"cmdline": "[panoptikon-spaw]", "env": {}`,
+so `analyze.py` never recognised it as ours, counted it as external, and
+compared its `base_mb` against a different worker's process (a 346.7 %
+`base_accuracy` FAIL that was purely a recorder artefact). `ProcCache`
+therefore memoises only a *complete* identity — a real argv, plus a readable
+environ when env capture is on — and re-reads anything less on the next
+sample, which costs three small `/proc` reads per unresolved PID per sample
+and resolves within one sample of the exec. A PID that is *permanently*
+unidentifiable (a kernel thread, another user's process) settles into the
+cache after `MAX_ATTEMPTS` reads **and** `MIN_RETRY_S` of wall clock. Both
+bounds are needed: an attempt count alone measures the retry window in
+samples, so 64 attempts is 16 s at the default 4 Hz but only 3.2 s at 20 Hz,
+and raising the cadence would silently reintroduce the fault.
+
 ### `hog.py` — the external world
 
 ```

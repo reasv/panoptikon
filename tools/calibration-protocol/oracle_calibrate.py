@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 """oracle_calibrate.py - the mandatory instrument calibration of protocol §2.
 
-Before any scenario, the oracle must be shown to see a *known* allocation:
+Before any scenario, the oracle must be shown to see a *known* allocation, or
+nothing downstream is trustworthy and the run stops. This runs that check end
+to end: it starts `vramrec.py`, then `hog.py` at each requested size in turn,
+and compares what the oracle saw against what the hog says it actually held.
 
-    "`hog.py hold 10240` on GPU 0 must show +10 240 MiB (+/-64) in `vramrec.py`
-     for the hog's PID and in GPU `used`; the same for 40 GB; a RAM hog of
-     16 GB must show as -16 GB MemAvailable. If the oracle cannot see a known
-     allocation, nothing downstream is trustworthy and the run stops."
-
-This runs that check end to end: it starts `vramrec.py`, then `hog.py` at each
-requested size in turn, and compares what the oracle saw against what the hog
-says it actually held.
-
-- **GPU**: the GPU `used` delta and the hog PID's NVML per-process delta,
-  both minus the CUDA context the hog measured, are each required to match the
-  held amount within `--tolerance-mb`.
-- **RAM**: the hog PID's **RSS**, and the **`MemAvailable` recovery at the
-  moment of release**, are each required to match within `--ram-tolerance-mb`.
-  The release is the honest edge: the hog frees everything in microseconds, so
-  whatever the kernel hands back within a second is the hog's. The
-  before-vs-during `MemAvailable` delta is *reported but not judged* -- a
-  multi-GB RAM hog takes minutes to fill on a slow host, and everything else on
-  the machine moves during it (that comparison was off by 5 GiB in the Phase 0
-  run; see `results/phase0/oracle-calibration.md`).
+- **GPU**: the GPU `used` delta and the hog PID's NVML per-process delta, each
+  minus the CUDA context the hog measured, must match the held amount within
+  `--tolerance-mb`.
+- **RAM**: the hog PID's **RSS** and the **`MemAvailable` recovery at the
+  moment of release** must each match within `--ram-tolerance-mb`. The
+  before-vs-during `MemAvailable` delta is *reported, never judged*: a
+  multi-GB hog takes minutes to fill and everything else on the host moves
+  meanwhile.
 
 Usage
 -----
@@ -32,61 +23,27 @@ Usage
     # RAM
     oracle_calibrate.py --target ram --sizes 16384 --hold 60 --settle 20
 
-Options:
-    --target gpu|ram      what to pressure                     (default: gpu)
-    --device N            CUDA/NVML GPU index for --target gpu    (default 0)
-    --sizes A,B,...       hold sizes in MiB                (default 10240,40960)
-    --hold S              seconds to hold each size at target          (default 25)
-    --settle S            seconds of baseline before, and gap between, holds
-                                                                      (default 10)
-    --tolerance-mb N      pass band around the held amount             (default 64)
-    --ram-tolerance-mb N  pass band for the RSS and release deltas    (default 512)
-    --chunk-mb N          hog chunk size                              (default 128)
-    --alloc-timeout S     budget for the allocation phase: how long a slow
-                          allocation may take to reach the target before the
-                          hold window is measured. The driver watches the hog's
-                          own state log and ends the hold `--hold` seconds after
-                          the target is actually reached, so a generous budget
-                          costs nothing when allocation turns out to be fast.
-                          On a host where touching fresh pages runs at
-                          ~10 MiB/s (see `results/phase0/
-                          oracle-calibration.md`), an 8 GiB RAM hog needs
-                          ~700 s here.                                 (default 0)
-    --out DIR             results directory
-                          (default: results/phase0/oracle-<target>)
-    --hog-port N          give each hog an HTTP control port on 127.0.0.1, so a
-                          long hold can be ended early with `POST /stop`
-    --json                print the result object instead of the table
+Options are in `--help`. `--alloc-timeout S` bounds the allocation phase only:
+the hold starts when the target is actually reached, so a generous budget
+costs nothing on a fast host and a slow RAM hog still gets its full `--hold`.
 
 Exit code is 1 if any size failed its tolerance, so it can gate a run.
 
-The GPU comparison is on *deltas*, not absolutes: a CUDA process also holds a
-context (600-700 MiB on this driver), which `hog.py` reports once as
-`context_mb` in its header. GPU `used` and the PID's NVML usage both include
-it, so `used_during - used_before` is what must equal `held_mb`.
-
 Output (`<out>/oracle-calibration.json`)
 ---------------------------------------
-    {"schema": "oraclecal/1", "target": "gpu"|"ram", "device": int|null,
-     "started_at": str, "tolerance_mb": int,
-     "sizes": [{"requested_mb": int, "held_mb": int,
-                "gpu_used_before_mb": int|null, "gpu_used_during_mb": int|null,
-                "gpu_used_delta_mb": int|null,
-                "gpu_used_payload_delta_mb": int|null,   # minus context_mb
-                "pid_nvml_before_mb": int|null, "pid_nvml_during_mb": int|null,
-                "pid_nvml_delta_mb": int|null,
-                "pid_nvml_payload_delta_mb": int|null, "context_mb": int|null,
-                "mem_available_before_mb": int|null,
-                "mem_available_during_mb": int|null,
-                "mem_available_delta_mb": int|null,
-                "pid_rss_before_mb": int|null, "pid_rss_during_mb": int|null,
-                "pid_rss_delta_mb": int|null,
-                "mem_available_release_delta_mb": int|null,  # the RAM verdict
-                "gpu_used_release_delta_mb": int|null,
-                "oom_attempts": int, "last_error": str|null,
-                "alloc_rate_mb_per_s": float|null,
-                "verdict": "PASS"|"FAIL", "note": str}],
-     "verdict": "PASS"|"FAIL"}
+    {"schema": "oraclecal/1", "target": "gpu"|"ram", "device", "started_at",
+     "tolerance_mb", "verdict": "PASS"|"FAIL",
+     "sizes": [{"requested_mb", "held_mb", "context_mb", "oom_attempts",
+                "last_error", "alloc_rate_mb_per_s", "note",
+                "verdict": "PASS"|"FAIL",
+                "gpu_used_{before,during,delta}_mb",
+                "gpu_used_payload_delta_mb",        # delta minus context_mb
+                "pid_nvml_{before,during,delta}_mb",
+                "pid_nvml_payload_delta_mb",
+                "mem_available_{before,during,delta}_mb",
+                "pid_rss_{before,during,delta}_mb",
+                "mem_available_release_delta_mb",   # the RAM verdict
+                "gpu_used_release_delta_mb"}]}
 """
 
 from __future__ import annotations
@@ -237,11 +194,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[{size} MiB] running hog (budget {duration:.0f}s) ...",
                   file=sys.stderr)
             hog = subprocess.Popen(cmd)
-            # `duration` is the hog's own safety net. The hold we actually want
-            # is `--hold` seconds *after the target is reached*, so watch the
-            # hog's state log and end it there: otherwise a generous
-            # --alloc-timeout is spent holding, not allocating, and a 16 GiB RAM
-            # leg that filled in 107 s would still sit there for 40 minutes.
+            # `duration` is the hog's own safety net. The hold we want is
+            # `--hold` seconds *after the target is reached*, so watch the
+            # hog's state log and end it there, or a generous --alloc-timeout
+            # is spent holding rather than allocating.
             reached_at: Optional[float] = None
             deadline = time.monotonic() + duration + 30.0
             while hog.poll() is None and time.monotonic() < deadline:
@@ -293,11 +249,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         before = [s for s in samples if s["t_wall"] < first - 0.5]
         during = [s for s in samples if t_start + 1.0 <= s["t_wall"] <= t_end]
         # The cleanest attribution is the *release*: the hog drops everything
-        # in microseconds, so whatever the kernel hands back within a second or
-        # two is the hog's and nothing else's. Comparing a baseline taken
-        # minutes earlier against the hold instead folds in every other process
-        # that grew meanwhile -- on this host that was a 5 GiB error over a
-        # 9-minute ramp (results/phase0/oracle-calibration.md).
+        # in microseconds, so whatever the kernel hands back within a second
+        # or two is the hog's. A baseline taken minutes before the hold folds
+        # in every other process that grew meanwhile.
         after = [s for s in samples
                  if t_release + 0.3 <= s["t_wall"] <= t_release + args.settle]
         if not before or not during:
@@ -316,9 +270,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         b_avail = (before[-1].get("mem") or {}).get("mem_available_mb")
         d_avail = min((s.get("mem") or {}).get("mem_available_mb") or 0
                       for s in during) or None
-        # Second RAM oracle: the hog PID's own RSS, from /proc. MemAvailable is
-        # a kernel *estimate* that also moves with everything else on the host,
-        # so on a busy machine it is worth a cross-check that cannot drift.
+        # Second RAM oracle: the hog PID's own RSS, from /proc. MemAvailable
+        # is a kernel estimate that moves with everything else on the host.
         b_rss = _rss(before[-1], pid)
         d_rss = max((_rss(s, pid) or 0) for s in during) or None
         alloc_seconds = max(1e-6, t_start - first)
@@ -349,11 +302,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             "last_error": states[-1].get("last_error"),
             "alloc_rate_mb_per_s": round(held / alloc_seconds, 2),
         })
-        # The baseline is taken before the hog process exists, so both GPU
-        # deltas also contain its CUDA context. `hog.py` measures that context
-        # once (free-memory delta across its first 1-byte allocation) and
-        # reports it in its header; subtracting it leaves the payload, which is
-        # what must equal `held_mb`.
+        # The baseline predates the hog process, so both GPU deltas also
+        # contain its CUDA context (600-700 MiB on this driver). `hog.py`
+        # measures it once and reports it in its header; subtracting it leaves
+        # the payload, which is what must equal `held_mb`.
         context = row.get("context_mb") or 0
         row["gpu_used_payload_delta_mb"] = (
             None if row["gpu_used_delta_mb"] is None

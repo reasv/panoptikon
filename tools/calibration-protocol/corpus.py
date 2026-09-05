@@ -1,73 +1,48 @@
 #!/usr/bin/env python3
 """corpus.py - deterministic media corpus with a per-item unit-cost manifest.
 
-Ground truth for what the packer should have priced
-(`docs/batch-calibration-test-protocol.md` §2). Everything is generated from a
-seed, so the same command on any platform produces byte-identical inputs and an
-identical manifest; the manifest carries, per item, the units each of the
-feature's four cost dimensions would charge it
-(`python/inferio_worker/packing.py: price_inputs`).
+Ground truth for what the packer should have priced. Everything is generated
+from a seed, so the same command on any platform produces byte-identical
+inputs and an identical manifest, which carries per item the units each of the
+four cost dimensions would charge it (`packing.py: price_inputs`).
 
 Usage
 -----
-    corpus.py --tier smoke --out results/corpus/smoke
-    corpus.py --tier ramp  --out results/corpus/ramp [--seed 20260903] [--jobs 8]
+    corpus.py --tier ramp --out results/corpus/ramp [--seed 20260903] [--jobs 8]
     corpus.py --list-tiers
     corpus.py --tier ramp --out /tmp/x --dry-run     # plan + size estimate only
 
-Options:
-    --tier NAME       one of the tiers below (required unless --list-tiers)
-    --out DIR         destination directory (created; must be empty or --force)
-    --seed N          master seed                              (default: 20260903)
-    --scale F         multiply every group's count by F         (default: 1.0)
-    --jobs N          worker processes                          (default: cpu/2)
-    --force           write into a non-empty directory
-    --manifest PATH   manifest location (default: <out>/manifest.json)
-    --dry-run         print the plan without generating anything
+Other options (`--help`): --scale, --jobs, --force, --manifest.
 
 Tiers
 -----
-    smoke   ~200 items, a little of everything (images incl. RGBA PNG and a
-            few 8000x6000 JPEGs, text, audio, PDFs).
+    smoke   ~200 items, a little of everything (RGBA PNG and 8000x6000 JPEGs
+            included, text, audio, PDFs).
     ramp    ~2000 uniform 1024x1024 JPEGs -- the S2 cold-ramp corpus.
     text    ~2000 text files, 40 B .. 8 kB, incl. CJK (token pricing).
-    pixmix  ~600 images at 0.3 / 1 / 4 / 20 MP (S8 pixel/sum).
-    ocr     ~400 images from 256px thumbnails to 8000x6000 scans
-            (S8 pixel/max-times-count, the easyOCR acceptance test).
-    audio   ~200 WAV/MP3 clips of 5 .. 120 s.
-    pdf     ~120 PDFs of 1 .. 40 pages.
+    pixmix  ~600 images at 0.3 / 1 / 4 / 20 MP.
+    ocr     ~400 images, 256px thumbnails to 8000x6000 scans.
+    audio   ~200 WAV/MP3 clips of 5 .. 120 s.   pdf  ~120 PDFs of 1 .. 40 pages.
     soak    ~12000 items: ramp + pixmix + text + audio + pdf, mixed.
-    poison  deliberate failure inputs for S5: a truncated JPEG, a zero-byte
-            file, a truncated PNG literally named `out of memory.png` (B11:
-            it must fail, so that its error text carries those words), and
-            one very large PNG (see --poison-side; the default already costs
-            ~1 GB of RAM to encode).
+    poison  deliberate failure inputs: a truncated JPEG, a zero-byte file, a
+            truncated PNG named `out of memory.png`, one very large PNG.
 
-Output
-------
-`<out>/manifest.json`:
+Output -- `<out>/manifest.json`:
 
-    {"schema": "corpus/1", "tier": str, "seed": int, "root": "<abs out dir>",
-     "generated_at": "<ISO-8601 UTC>", "scale": float,
-     "counts": {"image": int, "text": int, "audio": int, "pdf": int, ...},
-     "total_bytes": int, "elapsed_s": float,
+    {"schema": "corpus/1", "tier", "seed", "scale", "generated_at",
+     "root" (abs out dir), "counts" (per kind), "total_bytes", "elapsed_s",
      "items": [
-       {"id": str, "path": "<relative to root>", "abspath": str,
-        "kind": "image"|"text"|"audio"|"pdf"|"junk",
-        "group": "<tier group label>",
+       {"id", "path" (relative to root), "abspath", "mime", "bytes",
+        "kind": "image"|"text"|"audio"|"pdf"|"junk", "group" (tier label),
         "format": "JPEG"|"PNG"|"WEBP"|"WAV"|"MP3"|"PDF"|"TXT"|null,
-        "mime": str, "bytes": int,
-        "width": int|null, "height": int|null, "pixels": int|null,
-        "seconds": float|null, "pages": int|null,
-        "text_bytes": int|null, "script": "latin"|"cjk"|null,
-        "units": {"item": 1, "pixel": int|null, "token": int|null,
-                  "audio-second": int|null}}
-     ]}
+        "width", "height", "pixels", "seconds", "pages", "text_bytes",
+        "script": "latin"|"cjk"|null,
+        "units": {"item", "pixel", "token", "audio-second"}}]}
 
-`units.pixel` is `width*height` of the *submitted* file, which is what
-`price_inputs` charges (raw dimensions, finding W1). `units.token` is
-`max(1, utf8_bytes // 4)`. `units["audio-second"]` is the flat 30 the harness
-charges every audio item, not the real duration (`seconds` holds that).
+`units.pixel` is `width*height` of the *submitted* file (raw dimensions), which
+is what `price_inputs` charges. `units.token` is `max(1, utf8_bytes // 4)`.
+`units["audio-second"]` is the flat 30 the harness charges every audio item,
+not the real duration (`seconds` holds that).
 """
 
 from __future__ import annotations
@@ -101,9 +76,7 @@ MIME = {
 }
 
 
-# --------------------------------------------------------------------------
-# Plan
-# --------------------------------------------------------------------------
+# --- Plan ------------------------------------------------------------------
 
 
 @dataclass
@@ -210,9 +183,7 @@ def tier_groups(tier: str) -> List[Group]:
 TIERS = ("smoke", "ramp", "text", "pixmix", "ocr", "audio", "pdf", "soak", "poison")
 
 
-# --------------------------------------------------------------------------
-# Generators (run in worker processes; must be importable at module level)
-# --------------------------------------------------------------------------
+# --- Generators: run in worker processes, so importable at module level ---
 
 
 def _rng(seed: int, index: int) -> random.Random:
@@ -230,8 +201,7 @@ def _base_image(width: int, height: int, rnd: random.Random, alpha: bool,
     from PIL import Image, ImageDraw
 
     if text_page:
-        # A "scanned page": light ground with dark ruled text lines. Cheap to
-        # encode and it exercises OCR-ish preprocessing paths.
+        # A "scanned page": light ground, dark ruled lines, cheap to encode.
         image = Image.new("RGB", (width, height), (238, 236, 230))
         draw = ImageDraw.Draw(image)
         margin = max(4, width // 16)
@@ -248,9 +218,8 @@ def _base_image(width: int, height: int, rnd: random.Random, alpha: bool,
         return image
 
     # Two orthogonal gradients plus a low-amplitude ripple, per-item phased.
-    # Above ~2 MP the gradient is computed small and resized up: it is smooth
-    # by construction, and a full-resolution float32 meshgrid for a 48 MP scan
-    # would cost ~1 GB of RAM per worker process.
+    # Above ~2 MP it is computed small and resized up: a full-resolution
+    # float32 meshgrid for a 48 MP scan would cost ~1 GB of RAM per process.
     GRADIENT_MAX = 1024
     gw = min(width, GRADIENT_MAX)
     gh = max(1, min(height, int(round(height * gw / max(1, width)))))
@@ -330,8 +299,7 @@ def gen_image(spec: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# A deterministic word pool: the text has to be stable across platforms, so it
-# is built from a fixed vocabulary rather than from any system dictionary.
+# A fixed vocabulary, not a system dictionary: the text must be portable.
 _WORDS = (
     "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi "
     "omicron pi rho sigma tau upsilon phi chi psi omega vector tensor batch "
@@ -427,9 +395,8 @@ def gen_pdf(spec: Dict[str, Any]) -> Dict[str, Any]:
         for page in range(pages)
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Pillow stamps /CreationDate and /ModDate from the wall clock, which
-    # would make every regeneration a different file. Pin them to the epoch so
-    # the corpus is byte-reproducible.
+    # Pillow stamps /CreationDate and /ModDate from the wall clock, so pin
+    # them to the epoch to keep the corpus byte-reproducible.
     epoch = time.gmtime(0)
     try:
         images[0].save(path, "PDF", resolution=150.0, save_all=True,
@@ -467,11 +434,9 @@ def gen_junk(spec: Dict[str, Any]) -> Dict[str, Any]:
         buffer.unlink()
         path.write_bytes(blob[: len(blob) // 2])
     elif style == "named_oom":
-        # The point of this item (protocol §4 S5, finding B11) is a *failing*
-        # input whose error text carries the words "out of memory" only because
-        # of its file name. A valid PNG decodes fine and never reaches the
-        # ledger's `message_reports_oom` classifier, so the file is written
-        # truncated: the impl rejects it, and the rejection message names it.
+        # A *failing* input whose error text carries the words "out of
+        # memory" only because of its file name, so it must be truncated: a
+        # valid PNG never reaches the ledger's `message_reports_oom`.
         buffer = Path(str(path) + ".full")
         image = _base_image(256, 256, _rng(spec["seed"], spec["index"]), False, False)
         image.save(buffer, "PNG")
@@ -524,9 +489,7 @@ def generate_one(spec: Dict[str, Any]) -> Dict[str, Any]:
     return item
 
 
-# --------------------------------------------------------------------------
-# Planning and driving
-# --------------------------------------------------------------------------
+# --- Planning and driving --------------------------------------------------
 
 
 EXT = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp", "WAV": "wav", "MP3": "mp3",

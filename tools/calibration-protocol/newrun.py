@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """newrun.py - create a results directory and record the host facts.
 
-`docs/batch-calibration-test-protocol.md` §3 fixes the layout:
-
-    tools/calibration-protocol/results/<run-id>/<scenario>/{panoptikon.log,
-        worker.log, vramrec.jsonl, healthrec.jsonl, hog.jsonl,
-        calibration.before.toml, calibration.after.toml, jobs.json, runlog.md}
-
-This creates `<run-id>/<scenario>/`, drops a filled-in `runlog.md` from
-`runlog.md` beside this script, and writes `<run-id>/host.json` the first time
-a run id is used, so every recording can be traced back to a driver, a commit
-and a GPU inventory.
+Creates `results/<run-id>/<scenario>/` (the layout
+`docs/batch-calibration-test-protocol.md` §3 fixes), drops a filled-in
+`runlog.md` from the template beside this script, and writes
+`<run-id>/host.json` the first time a run id is used, so every recording can
+be traced back to a driver, a commit and a GPU inventory.
 
 Usage
 -----
@@ -20,9 +15,8 @@ Usage
     newrun.py --run-id 20260903-c1 --host-only     # refresh host.json only
     newrun.py --latest                             # print the newest run id
 
-It prints the absolute scenario directory on stdout, so a shell can do:
-
-    DIR=$(python3 newrun.py --scenario S2 --run-id "$RUN")
+It prints the absolute scenario directory on stdout:
+`DIR=$(python3 newrun.py --scenario S2 --run-id "$RUN")`.
 
 host.json
 ---------
@@ -194,8 +188,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     results = Path(args.results).resolve()
     if args.latest:
-        # Only directories this tool created count as runs: `results/` also
-        # holds `corpus/` and `phase0/`, which are not runs.
+        # `results/` also holds `corpus/` and `phase0/`, which are not runs.
         runs = sorted((path for path in results.glob("*")
                        if path.is_dir() and (path / "host.json").is_file()),
                       key=lambda path: path.stat().st_mtime)
