@@ -407,21 +407,42 @@ Phase A′ (S2/S3 wd-vit re-run) and S4a are measured and reported in
 up on both GPUs; the remaining legs are blocked on idle GPUs, not
 failed.
 
-After deslopping, and only when the user says the GPUs are free
-(never stop SGLang unasked), on a binary rebuilt from the deslopped
-tip (rebuild both the release binary and `panoptikon:calib-cuda`; the
-suites must be green first):
+**Steps 1–4 are done (2026-09-05).** The user authorised stopping
+SGLang; it was stopped 05:13 UTC and restarted at 10:18:13. Both
+artefacts were rebuilt from the deslopped tip first: binary
+`63a8ad73` (86 303 120 B, 04:53 UTC) and image `panoptikon:calib-cuda`
+`5b2b3ed166c0` (04:59 UTC, clean detached worktree), with
+`0b2261f94c8f` retagged `panoptikon:calib-cuda-run2b`.
 
-1. S4b, S4d, S4g (report §4.5 has the commands and seed stores).
-2. Phase D: S8 pixmix (nemotron; compare the fit against the probe of
-   the same image group, `results/run2/probes/summary.md`), S11-C4
-   (Docker, the shipped `docker.toml` policy over h2c, sockets counted
-   in the container), the easyOCR C7 shape-ceiling leg (needs ~93 GB
-   free; expect the ceiling at 28 items ≈ 183 500 800 units).
-3. Phase E: the 4 h S9 soak on both GPUs.
-4. Finalise report §4.5–4.8 and the plan's §4/§5 from the runlogs; the
-   commit appendix; `results/run2/README.md`.
-5. Decisions still owed by the user (report §6 options table): the
+1. **Done 2026-09-05 05:13–05:43.** S4g, S4d, S4b — all PASS
+   (`results/run2/S4g-v2`, `S4d-v2`, `S4b-v2`). S4g closes run1's F1
+   and F2; S4d recovers the budget in 2 windows / 6.1 s with 0
+   memory-blind grants; S4b tracks the +30 GB step in **22.4 s** but
+   **21.3 s of that is the in-flight batch**, so "within a few
+   seconds" is unreachable while readings apply at `token.finish`.
+2. **Done 2026-09-05 05:44–05:57.** S8 pixmix (fit **+0.07 %** off its
+   own group's probe; the 20 MP items pack 46 and 27 to a window),
+   S11-C4 (**80 fds / 37 sockets** in the container; the shipped
+   `docker.toml` over h2c is the real P1 test and passes), and the
+   easyOCR C7 shape-ceiling leg — the ceiling is **not reachable
+   through a job on a 98 GB GPU**: the ledger prices the 28-item batch
+   at **272 313 MiB** against **94 070** measured (~2.9×).
+3. **Done 2026-09-05 06:01–10:04.** The 4 h S9 soak: 29/29 jobs
+   `completed`, 0 deaths, no persisted knee, store 5 550 B, peak 271
+   descriptors. `oracle_agreement` improved only 14.12 % → 13.53 %.
+4. **Done 2026-09-05.** Report §4.5–4.8, §1, §2, §3, §5, §6, §9, §11,
+   §12 and the commit appendix; the protocol's §0, §4 and §5;
+   `results/run2/README.md`. No product defect was found, so there are
+   no product commits; two tool fixes landed (`555213ac`,
+   `176f6ad9`).
+5. Decisions still owed by the user (report §6 options table), now
+   including the three Phase 3 items: **S4b's expectation** — restate
+   it as "within one in-flight window" or publish a reading mid-window
+   (a product change); **the shape ceiling** — restate the expectation
+   or revisit large-batch pricing, since the fit extrapolates a line
+   through a curve that flattens (a product change); **the soak's
+   `oracle_agreement`** — an open finding needing the remaining breach
+   population analysed. And, from before: the
    worker clamp double-counting our own allocator pool (44 % of a grant
    unused at 12 GB free); nemotron's aspect-ratio pricing spread (tile-
    based pricing); easyOCR `enable_batching = false` on the shipped
