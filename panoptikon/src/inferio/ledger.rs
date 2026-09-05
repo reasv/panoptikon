@@ -9028,133 +9028,73 @@ mod tests {
         ledger.health()[0].total_mb
     }
 
-    /// DP-4: the worker's `recommended_max_memory` is **authoritative**, and the join
-    /// that follows is cross-checked against the figure it just supplied rather than
-    /// against the seed it replaced.
+    /// The unified-memory total's whole state machine: adopted from the first
+    /// worker (and the registration join that follows is cross-checked against
+    /// the figure it just supplied, not the seed it replaced), unmoved by an
+    /// agreeing second report, re-adopted when the wired limit moves, and
+    /// refused outside the sanity bound `0 < reported <= host RAM` both before
+    /// and after adoption.
     #[test]
-    fn a_unified_devices_total_is_adopted_from_the_first_worker() {
-        let ledger = mps_ledger();
+    fn a_unified_devices_total_is_adopted_re_adopted_and_sanity_bounded() {
+        let seed = MAC_RAM_MB / 4 * 3;
         let raised = MAC_RAM_MB / 10 * 9;
-        assert_eq!(gpu_total_mb(&ledger), MAC_RAM_MB / 4 * 3, "the seed");
-        let handle = loaded_mps(Some(raised));
-        let _admission = ledger
-            .register_worker("g/a", item_cost(4), &handle, None)
-            .expect("admitted: the cross-check runs against the adopted total");
-        assert_eq!(
-            gpu_total_mb(&ledger),
-            raised,
-            "the figure allocations are actually judged against wins"
-        );
-        assert_eq!(
-            admitted_gpu(&ledger, 0),
-            (MPS_GPU.to_owned(), "g/a".to_owned())
-        );
-    }
-
-    /// The adoption's only test is a sanity bound, `0 < reported ≤ host RAM`.
-    #[test]
-    fn an_implausible_unified_total_is_ignored() {
-        for reported in [0, MAC_RAM_MB + 1] {
+        // (label, the loads in order as (reported total, admits), total in force)
+        for (label, loads, expected) in [
+            (
+                "the figure allocations are actually judged against wins",
+                vec![(Some(raised), true)],
+                raised,
+            ),
+            (
+                "zero is not a total, and the seed is what keeps budgets defined",
+                vec![(Some(0), false)],
+                seed,
+            ),
+            (
+                "more than the machine has is not this GPU's budget either",
+                vec![(Some(MAC_RAM_MB + 1), false)],
+                seed,
+            ),
+            (
+                "a report with no MPS facts at all — no torch, a remote-API \
+                 impl — registers nothing and adopts nothing",
+                vec![(None, false)],
+                seed,
+            ),
+            (
+                "a second report inside the cross-check tolerance is admitted \
+                 and is not a second opinion to average in",
+                vec![(Some(raised), true), (Some(raised - 100), true)],
+                raised,
+            ),
+            (
+                "a raised wired limit lands far outside that tolerance, and \
+                 re-adopts rather than refusing every replica until a restart",
+                vec![(Some(seed), true), (Some(raised), true)],
+                raised,
+            ),
+            (
+                "the sanity bound still holds after adoption, and the total in \
+                 force is untouched",
+                vec![(Some(raised), true), (Some(MAC_RAM_MB + 1), false)],
+                raised,
+            ),
+        ] {
             let ledger = mps_ledger();
-            let handle = loaded_mps(Some(reported));
-            assert!(
-                ledger
-                    .register_worker("g/a", item_cost(4), &handle, None)
-                    .is_none(),
-                "a total of {reported} MiB on a {MAC_RAM_MB} MiB machine is \
-                 not this GPU's budget"
-            );
-            assert_eq!(
-                gpu_total_mb(&ledger),
-                MAC_RAM_MB / 4 * 3,
-                "the seed is what keeps budgets defined; a bad report cannot \
-                 move it"
-            );
+            assert_eq!(gpu_total_mb(&ledger), seed, "the probe's seed");
+            let mut admitted = vec![];
+            for (index, (reported, admits)) in loads.into_iter().enumerate() {
+                let handle = loaded_mps(reported);
+                let admission =
+                    ledger.register_worker(&format!("g/{index}"), item_cost(4), &handle, None);
+                assert_eq!(admission.is_some(), admits, "{label}");
+                admitted.extend(admission);
+            }
+            assert_eq!(gpu_total_mb(&ledger), expected, "{label}");
+            if !admitted.is_empty() {
+                assert_eq!(admitted_gpu(&ledger, 0).0, MPS_GPU, "{label}");
+            }
         }
-    }
-
-    /// A second replica agreeing with the adopted figure is not a second opinion to
-    /// average in: within the cross-check tolerance the two sources are measuring the
-    /// same thing with different rounding, and a GPU whose total drifted on every load
-    /// would re-price every outstanding grant for nothing.
-    #[test]
-    fn an_agreeing_second_report_does_not_move_the_unified_total() {
-        let ledger = mps_ledger();
-        let adopted = MAC_RAM_MB / 10 * 9;
-        let first = loaded_mps(Some(adopted));
-        let _first = ledger
-            .register_worker("g/a", item_cost(4), &first, None)
-            .expect("admitted");
-        // Within the cross-check tolerance of the adopted figure, so this
-        // replica is admitted too — it simply does not move the total.
-        let second = loaded_mps(Some(adopted - 100));
-        let _second = ledger
-            .register_worker("g/b", item_cost(4), &second, None)
-            .expect("admitted");
-        assert_eq!(gpu_total_mb(&ledger), adopted);
-    }
-
-    /// The wired limit is a live sysctl, so the adopted figure is not final: a user who
-    /// raises `iogpu.wired_limit_mb` and reloads a model produces replicas whose total
-    /// is 20 % away from the adopted one — far outside the cross-check tolerance.
-    #[test]
-    fn a_raised_memory_limit_re_adopts_the_unified_total() {
-        let ledger = mps_ledger();
-        let seeded = MAC_RAM_MB / 4 * 3;
-        let first = loaded_mps(Some(seeded));
-        let _first = ledger
-            .register_worker("g/a", item_cost(4), &first, None)
-            .expect("admitted");
-        assert_eq!(gpu_total_mb(&ledger), seeded);
-
-        let raised = MAC_RAM_MB / 10 * 9;
-        let second = loaded_mps(Some(raised));
-        let _second = ledger
-            .register_worker("g/b", item_cost(4), &second, None)
-            .expect("admitted: the cross-check runs against the re-adopted total");
-        assert_eq!(
-            gpu_total_mb(&ledger),
-            raised,
-            "the figure this replica's allocations are judged against wins, \
-             exactly as the first report's did"
-        );
-    }
-
-    /// Re-adoption is still only a sanity bound: a figure above physical RAM
-    /// describes something other than this GPU's share of the machine, and
-    /// it is refused after adoption exactly as before it.
-    #[test]
-    fn an_impossible_report_is_refused_after_adoption_too() {
-        let ledger = mps_ledger();
-        let adopted = MAC_RAM_MB / 4 * 3;
-        let _first = ledger
-            .register_worker("g/a", item_cost(4), &loaded_mps(Some(adopted)), None)
-            .expect("admitted");
-        assert!(
-            ledger
-                .register_worker("g/b", item_cost(4), &loaded_mps(Some(MAC_RAM_MB + 1)), None)
-                .is_none(),
-            "more than the machine has is not this GPU's budget"
-        );
-        assert_eq!(
-            gpu_total_mb(&ledger),
-            adopted,
-            "and the total in force is untouched"
-        );
-    }
-
-    /// A report with no MPS facts at all — no torch, a remote-API impl — stays
-    /// unregistered, exactly as on every other backend, and adopts nothing.
-    #[test]
-    fn a_report_without_mps_facts_registers_nothing() {
-        let ledger = mps_ledger();
-        let handle = loaded_mps(None);
-        assert!(
-            ledger
-                .register_worker("g/a", item_cost(4), &handle, None)
-                .is_none()
-        );
-        assert_eq!(gpu_total_mb(&ledger), MAC_RAM_MB / 4 * 3);
     }
 
     /// DP-2: a replica that dies with a granted window in flight on a unified-memory
@@ -9922,60 +9862,14 @@ mod tests {
         );
     }
 
-    /// Free readings from `mem_get_info` describe one CUDA context's view and read
-    /// gigabytes apart from NVML's whole-GPU figure.
+    /// Source precedence: a whole-GPU reading outranks a context-scoped one and
+    /// is never overwritten by it, on both backends that have an authoritative
+    /// source. `mem_get_info` describes one CUDA context and reads gigabytes
+    /// apart from NVML's whole-GPU figure, so alternating them would swing
+    /// `external` — and every grant — for no physical reason.
     #[test]
-    fn nvml_readings_outrank_torch_readings() {
-        let ledger = ledger(32_768, no_margin());
-        let handle = loaded(Some(1024), Some(0));
-        let _admission = ledger
-            .register_worker("g/a", item_cost(4), &handle, None)
-            .unwrap();
-
-        let push = |free_mb: u64, source: &str| {
-            let mut telemetry = handle.lock().unwrap();
-            telemetry.memory = Some(Timestamped::now(MemorySample {
-                free_mb: Some(free_mb),
-                total_mb: Some(32_768),
-                free_source: Some(source.to_owned()),
-                reserved_mb: Some(0),
-                allocated_mb: Some(0),
-            }));
-        };
-
-        // Only torch has answered so far, so its reading is used.
-        push(28_000, "torch");
-        ledger.ingest_all_for_test();
-        assert_eq!(ledger.health()[0].external_source.as_deref(), Some("torch"));
-        let torch_only_limit = ledger.health()[0].limit_mb;
-
-        // NVML answers: it wins, and the limit moves to the whole-GPU truth.
-        push(24_500, "nvml");
-        ledger.ingest_all_for_test();
-        let gpu = &ledger.health()[0];
-        assert_eq!(gpu.external_source.as_deref(), Some("nvml"));
-        let nvml_limit = gpu.limit_mb;
-        assert_ne!(nvml_limit, torch_only_limit);
-
-        // A later torch reading is recorded as telemetry but must not move the
-        // GPU's free figure back.
-        push(28_000, "torch");
-        ledger.ingest_all_for_test();
-        let gpu = &ledger.health()[0];
-        assert_eq!(
-            gpu.external_source.as_deref(),
-            Some("nvml"),
-            "NVML has precedence once it has answered"
-        );
-        assert_eq!(
-            gpu.limit_mb, nvml_limit,
-            "no gigabyte swing on source alone"
-        );
-    }
-
-    /// The ROCm half of the same rule.
-    #[test]
-    fn amdgpu_sysfs_readings_outrank_torch_readings() {
+    fn a_whole_gpu_reading_outranks_a_torch_one_on_every_backend() {
+        assert!(free_source_is_authoritative("nvml"));
         assert!(free_source_is_authoritative("amdgpu-sysfs"));
         assert!(
             !free_source_is_authoritative("sysfs"),
@@ -9993,35 +9887,52 @@ mod tests {
             "the label the refresh actually records under"
         );
 
-        let ledger = ledger(32_768, no_margin());
-        let handle = loaded(Some(1024), Some(0));
-        let _admission = ledger
-            .register_worker("g/a", item_cost(4), &handle, None)
-            .unwrap();
-        let push = |free_mb: u64, source: &str| {
-            let mut telemetry = handle.lock().unwrap();
-            telemetry.memory = Some(Timestamped::now(MemorySample {
-                free_mb: Some(free_mb),
-                total_mb: Some(32_768),
-                free_source: Some(source.to_owned()),
-                reserved_mb: Some(0),
-                allocated_mb: Some(0),
-            }));
-        };
-        push(24_500, "amdgpu-sysfs");
-        ledger.ingest_all_for_test();
-        let gpu = &ledger.health()[0];
-        assert_eq!(gpu.external_source.as_deref(), Some("amdgpu-sysfs"));
-        let sysfs_limit = gpu.limit_mb;
-        push(28_000, "torch");
-        ledger.ingest_all_for_test();
-        let gpu = &ledger.health()[0];
-        assert_eq!(
-            gpu.external_source.as_deref(),
-            Some("amdgpu-sysfs"),
-            "a whole-GPU reading is not overwritten by a torch one"
-        );
-        assert_eq!(gpu.limit_mb, sysfs_limit);
+        for authoritative in ["nvml", "amdgpu-sysfs"] {
+            let ledger = ledger(32_768, no_margin());
+            let handle = loaded(Some(1024), Some(0));
+            let _admission = ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .unwrap();
+            let push = |free_mb: u64, source: &str| {
+                let mut telemetry = handle.lock().unwrap();
+                telemetry.memory = Some(Timestamped::now(MemorySample {
+                    free_mb: Some(free_mb),
+                    total_mb: Some(32_768),
+                    free_source: Some(source.to_owned()),
+                    reserved_mb: Some(0),
+                    allocated_mb: Some(0),
+                }));
+            };
+
+            // Only torch has answered so far, so its reading is used.
+            push(28_000, "torch");
+            ledger.ingest_all_for_test();
+            assert_eq!(ledger.health()[0].external_source.as_deref(), Some("torch"));
+            let torch_only_limit = ledger.health()[0].limit_mb;
+
+            // The whole-GPU source answers: it wins, and the limit moves with it.
+            push(24_500, authoritative);
+            ledger.ingest_all_for_test();
+            let gpu = &ledger.health()[0];
+            assert_eq!(gpu.external_source.as_deref(), Some(authoritative));
+            let authoritative_limit = gpu.limit_mb;
+            assert_ne!(authoritative_limit, torch_only_limit);
+
+            // A later torch reading is still recorded as telemetry, but must not
+            // move the GPU's free figure back.
+            push(28_000, "torch");
+            ledger.ingest_all_for_test();
+            let gpu = &ledger.health()[0];
+            assert_eq!(
+                gpu.external_source.as_deref(),
+                Some(authoritative),
+                "{authoritative} has precedence once it has answered"
+            );
+            assert_eq!(
+                gpu.limit_mb, authoritative_limit,
+                "no gigabyte swing on source alone"
+            );
+        }
     }
 
     /// A replica that leaves the GPU must not have its memory reattributed to
@@ -11503,145 +11414,109 @@ mod tests {
         }
     }
 
-    /// A flat curve has **no** knee, and this is the whole of run2 finding F1 (run2
-    /// change R1e).
+    /// The knee estimator's gates and rules, each shown binding on a hand-built
+    /// curve, and each with the control that shows the same series answering
+    /// once the rule is satisfied. See [`fit_knee`].
     #[test]
-    fn a_flat_throughput_curve_has_no_knee() {
-        let samples = curve(&[(4, 100.0), (8, 100.0), (16, 100.0), (32, 100.0)], 4);
-        assert_eq!(
-            knee_of(&samples),
-            None,
-            "bucket 2 is the smallest measured, so a plateau starting there is \
-             the absence of a bend and not one"
-        );
-
-        // Nothing about flatness *per se* refuses a knee: the same curve with
-        // one genuinely slower bucket below it bends, and knees there.
-        let bends = curve(&[(2, 40.0), (4, 100.0), (8, 100.0), (16, 100.0)], 4);
-        assert_eq!(
-            knee_of(&bends),
-            Some(7),
-            "the top of bucket 2 (units 4..=7)"
-        );
-    }
-
-    /// The shape the knee exists for: throughput climbs, then flattens.
-    #[test]
-    fn a_plateau_knees_at_its_start() {
-        let samples = curve(
-            &[
-                (4, 100.0),
-                (8, 180.0),
-                (16, 200.0),
-                (32, 205.0),
-                (64, 206.0),
-            ],
-            4,
-        );
-        assert_eq!(
-            knee_of(&samples),
-            Some(31),
-            "bucket 4 (units 16..=31) is already within 90% of the best"
-        );
-    }
-
-    /// [`KNEE_PLATEAU_BUCKETS`]: the plateau has to be established *above* the
-    /// knee, not merely reached at it (run2 change R1e).
-    #[test]
-    fn a_plateau_one_bucket_wide_is_not_established_yet() {
-        // The same curve one bucket short: 16..=31 is on the plateau, but the
-        // only thing above it is the frontier itself.
-        let short = curve(&[(4, 100.0), (8, 180.0), (16, 200.0), (32, 205.0)], 4);
-        assert_eq!(
-            knee_of(&short),
-            None,
-            "one bucket above the candidate is one comparison, not a plateau"
-        );
-
-        // One more bucket of the same flat run, and the same candidate answers.
-        let mut established = short;
-        established.extend(curve(&[(64, 206.0)], 2));
-        assert_eq!(knee_of(&established), Some(31));
-    }
-
-    /// The frontier guard.
-    #[test]
-    fn a_curve_still_climbing_at_the_frontier_has_no_knee() {
-        let samples = curve(&[(4, 100.0), (8, 200.0), (16, 400.0), (32, 800.0)], 4);
-        assert_eq!(knee_of(&samples), None);
-    }
-
-    /// Both minimum-sample gates, each shown binding on its own.
-    #[test]
-    fn a_thin_series_never_knees() {
-        let thin = curve(&[(4, 100.0), (8, 100.0), (16, 100.0)], 3);
-        assert_eq!(thin.len(), 9);
-        assert_eq!(knee_of(&thin), None, "9 observations is under the gate");
-
-        let narrow = curve(&[(4, 100.0), (8, 100.0)], 8);
-        assert_eq!(narrow.len(), 16);
-        assert_eq!(
-            knee_of(&narrow),
-            None,
-            "16 observations across 2 buckets describe a point, not a curve"
-        );
-
-        // The same series, one bucket wider *and* with a slower bucket below
-        // it to bend away from, does answer.
-        let wide = curve(&[(2, 40.0), (4, 100.0), (8, 100.0), (16, 100.0)], 4);
-        assert_eq!(knee_of(&wide), Some(7));
-    }
-
-    /// A bucket holding one observation is dropped from the fit outright — its
-    /// dispersion is zero by construction, so it would otherwise carry exactly the
-    /// evidence the variance filter exists to reject ([`MIN_KNEE_BUCKET_SAMPLES`]).
-    #[test]
-    fn singleton_buckets_do_not_count_towards_the_knee_gates() {
-        // Twelve observations across two buckets: enough samples, one bucket short.
-        let two_buckets = curve(&[(4, 100.0), (8, 100.0)], 6);
-        assert_eq!(two_buckets.len(), 12);
-        assert_eq!(knee_of(&two_buckets), None);
-
-        // A third bucket holding one observation does not make it three.
-        let mut with_singleton = two_buckets.clone();
-        with_singleton.extend(curve(&[(16, 100.0)], 1));
-        assert_eq!(with_singleton.len(), 13);
-        assert_eq!(
-            knee_of(&with_singleton),
-            None,
-            "a bucket whose dispersion cannot be measured takes no part"
-        );
-
-        // The same third size measured twice does — on a curve that bends,
-        // so that the rules past the gates have something to answer.
-        let mut honest = curve(&[(2, 40.0), (4, 100.0), (8, 100.0)], 4);
-        honest.extend(curve(&[(16, 100.0)], 2));
-        assert_eq!(honest.len(), 14);
-        assert_eq!(knee_of(&honest), Some(7));
-    }
-
-    /// The bucket-variance filter (R1, the user's addition).
-    #[test]
-    fn a_noisy_bucket_refuses_the_whole_knee_fit() {
-        let quiet = curve(&[(2, 40.0), (4, 100.0), (8, 100.0), (16, 100.0)], 4);
-        assert_eq!(knee_of(&quiet), Some(7), "the control");
-
-        // Bucket 3 (units 8..=15) alternating 100 and 200: median 150, MAD 50,
-        // relative MAD 0.333 — past the 0.20 threshold.
+    fn the_knee_estimator_answers_a_curve_by_its_rules() {
+        // A bucket alternating 100 and 200 has median 150, MAD 50, relative
+        // MAD 0.333 — past KNEE_MAX_BUCKET_DISPERSION; 100 and 120 gives
+        // 0.0909, which is inside it.
         let mut noisy = curve(&[(2, 40.0), (4, 100.0), (16, 100.0)], 4);
         noisy.extend(curve(&[(8, 100.0), (8, 200.0)], 2));
-        assert_eq!(noisy.len(), 16);
-        assert_eq!(
-            knee_of(&noisy),
-            None,
-            "one bucket that disagrees with itself refuses the fit"
-        );
-
-        // The same bucket alternating 100 and 120: median 110, MAD 10,
-        // relative MAD 0.0909 — inside the threshold, so the fit proceeds.
         let mut mild = curve(&[(2, 40.0), (4, 100.0), (16, 100.0)], 4);
         mild.extend(curve(&[(8, 100.0), (8, 120.0)], 2));
-        assert_eq!(knee_of(&mild), Some(7));
+        let mut with_singleton = curve(&[(4, 100.0), (8, 100.0)], 6);
+        with_singleton.extend(curve(&[(16, 100.0)], 1));
+        let mut honest = curve(&[(2, 40.0), (4, 100.0), (8, 100.0)], 4);
+        honest.extend(curve(&[(16, 100.0)], 2));
+        let mut established = curve(&[(4, 100.0), (8, 180.0), (16, 200.0), (32, 205.0)], 4);
+        established.extend(curve(&[(64, 206.0)], 2));
+
+        for (label, samples, expected) in [
+            (
+                "a flat curve has no knee: a plateau starting at the smallest \
+                 bucket measured is the absence of a bend, not one",
+                curve(&[(4, 100.0), (8, 100.0), (16, 100.0), (32, 100.0)], 4),
+                None,
+            ),
+            (
+                "the same flat run with a genuinely slower bucket below it does \
+                 bend, and knees at the top of bucket 2 (units 4..=7)",
+                curve(&[(2, 40.0), (4, 100.0), (8, 100.0), (16, 100.0)], 4),
+                Some(7),
+            ),
+            (
+                "a plateau knees at its start: bucket 4 (units 16..=31) is \
+                 already within KNEE_RATIO of the best",
+                curve(
+                    &[
+                        (4, 100.0),
+                        (8, 180.0),
+                        (16, 200.0),
+                        (32, 205.0),
+                        (64, 206.0),
+                    ],
+                    4,
+                ),
+                Some(31),
+            ),
+            (
+                "one bucket above the candidate is one comparison, not a \
+                 plateau (KNEE_PLATEAU_BUCKETS)",
+                curve(&[(4, 100.0), (8, 180.0), (16, 200.0), (32, 205.0)], 4),
+                None,
+            ),
+            (
+                "one more bucket of the same flat run, and the same candidate \
+                 answers",
+                established,
+                Some(31),
+            ),
+            (
+                "the frontier guard: a curve still climbing where it was last \
+                 measured has no knee",
+                curve(&[(4, 100.0), (8, 200.0), (16, 400.0), (32, 800.0)], 4),
+                None,
+            ),
+            (
+                "9 observations is under MIN_KNEE_SAMPLES",
+                curve(&[(4, 100.0), (8, 100.0), (16, 100.0)], 3),
+                None,
+            ),
+            (
+                "16 observations across 2 buckets describe a point, not a curve \
+                 (MIN_KNEE_BUCKETS)",
+                curve(&[(4, 100.0), (8, 100.0)], 8),
+                None,
+            ),
+            (
+                "a third bucket holding one observation does not make it three: \
+                 a bucket whose dispersion cannot be measured takes no part \
+                 (MIN_KNEE_BUCKET_SAMPLES)",
+                with_singleton,
+                None,
+            ),
+            (
+                "the same third size measured twice does, on a curve that bends",
+                honest,
+                Some(7),
+            ),
+            (
+                "one bucket that disagrees with itself refuses the whole fit \
+                 (the bucket-variance filter)",
+                noisy,
+                None,
+            ),
+            (
+                "the same bucket inside the dispersion threshold lets the fit \
+                 proceed",
+                mild,
+                Some(7),
+            ),
+        ] {
+            assert_eq!(knee_of(&samples), expected, "{label}");
+        }
     }
 
     // ------------------------------------------------------------------
