@@ -1,47 +1,14 @@
-//! HTTP surface of the local inferio orchestrator: a wire-compatible port
-//! of the legacy Python `inferio/router.py` + `inferio/utils.py`
-//! (python-legacy branch; design doc §7).
+//! HTTP surface of the local inferio orchestrator: a wire-compatible port of
+//! the legacy Python `inferio/router.py` + `inferio/utils.py`.
 //!
-//! Mounted (via `nest_service`) under `/api/inference`, exactly where the
-//! proxy used to forward these paths, and *behind the same policy layer*
-//! (which strips `index_db`/`user_data_db` for inference paths). The
-//! gateway's own `InferenceApiClient` (`inferio_client.rs`) is the parity
-//! oracle: everything encoded here must round-trip through that client
-//! unchanged.
+//! Mounted (via `nest_service`) under `/api/inference`, behind the same policy
+//! layer as the proxy path it replaced. The gateway's own `InferenceApiClient`
+//! (`inferio_client.rs`) is the parity oracle: everything encoded here must
+//! round-trip through it unchanged.
 //!
-//! Wire formats replicated exactly from Python:
-//! - predict request: multipart form with a `data` field holding a JSON
-//!   string `{"inputs": [...]}` (entries: object | string | null) and
-//!   `files` parts whose *filenames* are integer batch indices.
-//! - predict response: single binary output -> `application/octet-stream`;
-//!   all-binary -> `multipart/mixed; boundary=multipart-boundary` with
-//!   Python's exact part headers (`Content-Type: application/octet-stream`,
-//!   `Content-Disposition: attachment; filename="output{i}.bin"`); anything
-//!   else -> JSON `{"outputs": [...]}` where bytes entries become
-//!   `{"__type__": "base64", "content": ...}`.
-//! - `GET /cache/{key}` renders a never-expiring entry as Python's
-//!   `datetime.max.isoformat()` literal `9999-12-31T23:59:59.999999`.
-//! - errors use FastAPI's `{"detail": ...}` shape (`ApiError`), with
-//!   router.py's exact detail strings for the 500s.
-//!
-//! - predict response, additive: a batch containing a typed per-item error
-//!   slot always uses the JSON envelope, with those slots rendered as
-//!   `{"__error__": {"class": ..., "message": ...}}` (see
-//!   `super::slot_error` and the worker-protocol doc). Batches without error
-//!   slots keep the byte-identical Python encoding above.
-//!
-//! Additive (design §7/§8): optional `max_batch` query param on predict
-//! (forwarded to the dispatcher's merge cap), optional `prewarm` query
-//! param on load AND predict (the lazy-warm hint, absent = true — see
-//! `prewarm.rs`), and `GET /health`
-//! (orchestrator + per-model liveness, queue depths, batch caps — see
-//! [`ModelManager::health`]). `/health` lives on the nested router, so it
-//! is `/api/inference/health` in gateway mode and subcommand mode alike;
-//! standalone mode additionally keeps the original bare `/health` path
-//! (same handler) for anything already probing the subcommand there.
-//! When `inference_local` is disabled, `/api/inference/health` proxies
-//! upstream like every other inference path (a Python upstream 404s it —
-//! fine, the endpoint has no Python counterpart).
+//! The wire formats, the additive query params and `/health`, the transport
+//! constants, the buffered body extractor and the failure table are all in
+//! docs/inferio-transport.md, "Inference server (http.rs)".
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -77,180 +44,80 @@ use crate::config::Settings;
 const NEVER_EXPIRES: &str = "9999-12-31T23:59:59.999999";
 
 /// Response header carrying the orchestrator's desired in-flight figure, in
-/// **items**, for the model that just answered (test protocol §8 G7, brief
-/// (b); `docs/inferio-worker-protocol.md`, "Desired in-flight items").
-///
-/// A header rather than a body field because a predict answers in three
-/// encodings — raw `application/octet-stream`, `multipart/mixed` and the JSON
-/// `{"outputs": ...}` envelope — and only one of them has anywhere to put a
-/// scalar. A header is additive in all three, is ignored by every existing
-/// client, and is absent from a Python-era inference server, which is exactly
-/// the "no opinion" case the caller must already handle.
-///
-/// It is a *response* header, so the policy layer's inbound
-/// `x-panoptikon-*` strip (`policy.rs`) does not touch it.
+/// **items**, for the model that just answered. A *response* header, so the
+/// policy layer's inbound `x-panoptikon-*` strip does not touch it. See
+/// docs/inferio-transport.md, "Inference server (http.rs)".
 pub(crate) const DESIRED_IN_FLIGHT_HEADER: &str = "x-panoptikon-desired-in-flight-items";
 
-/// Machine-readable `kind` of a predict that failed because the inference
-/// **worker process died** while the request was in flight, as opposed to
-/// the model failing to load or the worker answering with an error.
-///
-/// It exists because the blast radius of one death is a whole in-flight
-/// window (run1 finding F7: 1 542 items lost to a single death, on a job that
-/// still reported *completed*), and the only sane response — re-queue the
-/// window's items once rather than record them as errors — needs the caller
-/// to be able to *tell*. Matching on the human message would put a job's
-/// retry policy at the mercy of a log string, so the kind rides in the body.
+/// `detail.kind` of a predict that failed because the inference **worker
+/// process died** with the request in flight. The blast radius is a whole
+/// window, so the caller has to be able to tell in order to re-queue those
+/// items rather than record them as errors.
 pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
 
-/// `detail.kind` of a predict whose **request body never arrived in full**,
-/// so the batch was never parsed and never reached a model.
-///
-/// It is the same assertion [`WORKER_DIED_KIND`] makes — the request's items
-/// are untouched, so re-submitting them is correct — for the one other way a
-/// predict can end without being attempted: the body stream failing under
-/// the handler. It is a *separate* token because the two are separate facts,
-/// and a log line that blames a worker for a broken request body sends the
-/// next reader to the wrong place.
-///
-/// The status stays 400: a request body that stops early is a malformed
-/// request, and that is what every intermediary in the path will call it.
-/// The kind is what lets the *caller* tell "your bytes were wrong" (retrying
-/// changes nothing) from "your bytes did not all get here" (retrying is the
-/// whole answer) — a distinction the status alone cannot carry.
+/// `detail.kind` of a predict whose **request body never arrived in full**, so
+/// the batch was never parsed. Same assertion as [`WORKER_DIED_KIND`], a
+/// separate token because the causes are. The 400 stays; the kind tells "your
+/// bytes were wrong" from "they did not all get here".
 pub(crate) const REQUEST_INCOMPLETE_KIND: &str = "request_incomplete";
 
-/// `detail.kind` of a predict this server **declined to read**, because it is
-/// already holding [`PREDICT_INFLIGHT_BODY_BYTES`] of other predict bodies in
-/// memory.
-///
-/// The third way a predict can end without being attempted, and the only one
-/// of the three that is a statement about *this server* rather than about a
-/// worker or a connection: nothing is wrong with the request, there was
-/// simply no room to buffer it. It rides on a `503` with a `Retry-After`,
-/// which is what a temporarily-full server owes a caller, and it is a
-/// separate token from the other two for the same reason they are separate
-/// from each other — a log line that blames a broken body for an overloaded
-/// server sends the next reader to the wrong place.
+/// `detail.kind` of a predict this server **declined to read**, being already
+/// at [`PREDICT_INFLIGHT_BODY_BYTES`] of other bodies. Nothing is wrong with
+/// the request; there was no room to buffer it. `503`.
 pub(crate) const BODY_BUDGET_KIND: &str = "body_budget_exhausted";
 
 /// Every rendering that means **this predict never reached a model**, so the
-/// request's items are untouched and re-submitting them is the correct answer.
-///
-/// **The documented fallback, not the primary signal.** Since run2 the six
-/// sites that produce these strings attach a typed
+/// request's items are untouched and re-submitting them is correct. **The
+/// fallback, not the primary signal**: these sites also attach a typed
 /// [`Unattempted`](crate::inferio::slot_error::Unattempted) marker, which
-/// [`classify_predict_failure`] downcasts *first*; this list still runs after
-/// that downcast so an error raised by code that predates the marker — or by
-/// a path nobody has typed yet — classifies exactly as it did before. It is
-/// kept, and kept tested, for that reason alone: deleting it would make the
-/// classification silently narrower for any such path.
-///
-/// This is the condition [`WORKER_DIED_KIND`] actually names — the kind is
-/// named for the case that produces it in practice, but what it *asserts* is
-/// only that the request never reached a model, which is the thing a caller
-/// can act on. One worker death does not produce one error: it produces five
-/// *different* strings depending on where each affected request was standing
-/// when the model went down, and only the first of them says "failed fatally".
-/// Matching that one alone — which is what this handler did before — left most
-/// of a death's blast radius classified as an ordinary prediction failure,
-/// which is run1 finding F7 in miniature: the items were recorded as errors
-/// even though nothing had been attempted.
-///
-/// Each entry is cited to the single place that formats it. **If one of those
-/// renderings changes, the unit tests below fail** — they assert on the exact
-/// literals, so the coupling is checked rather than hoped for.
-///
-/// The typed marker each of these renderings now carries lives at three
-/// places, covering all six shapes: `Worker::fatal` and the poisoned
-/// `Worker::roundtrip` (`worker.rs`), `dispatch::fail_requests` — every
-/// queue-failing path funnels through it, so the fatal arm, the graceful
-/// unload, the tail of a died-on window and an isolation pass's remainder are
-/// one change — and `ModelManager::predict`'s two arms. The marker carries
-/// the message rather than wrapping it, so each of the literals below is
-/// still produced byte for byte and these tests still mean something.
+/// [`classify_predict_failure`] downcasts *first*, so an untyped path still
+/// classifies as before. One worker death produces five *different* strings
+/// depending on where each affected request stood, and only the first says
+/// "failed fatally". Each entry is cited to the place that formats it, and the
+/// unit tests assert on the exact literals.
 const UNATTEMPTED_REQUEST_MARKERS: [&str; 5] = [
-    // `Worker::fatal` (`worker.rs`): the window that was executing on the
-    // replica that died, and — re-raised verbatim by `dispatch::fail_requests`
-    // — every request still queued behind it.
+    // `Worker::fatal`: the window on the replica that died and, re-raised by
+    // `dispatch::fail_requests`, everything queued behind it.
     "failed fatally",
-    // `dispatch::reap_idle_replicas`: the liveness sweep found an idle
-    // replica's process gone, so the whole model is taken down and the queue
-    // is failed with this instead. Never contains "failed fatally".
+    // `dispatch::reap_idle_replicas`: an idle replica found gone by the
+    // liveness sweep. Never contains "failed fatally".
     "exited while idle",
     // `Worker::roundtrip` refusing to write to an already-poisoned worker.
     "is dead after a previous fatal error",
-    // `ModelManager::predict`, when its reply oneshot is dropped without an
-    // answer. This is how a window running on a *surviving* replica learns
-    // that a sibling died: `dispatch`'s `End::Fatal` arm calls
-    // `in_flight.shutdown()`, which aborts those window tasks and drops their
-    // senders, so the fatal message never reaches them at all.
+    // `ModelManager::predict` when its reply oneshot is dropped: how a window
+    // on a *surviving* replica learns a sibling died.
     "dropped the request",
-    // Two sites, one substring. `ModelManager::predict` when `tx.send` fails
-    // ("model {id} was unloaded before the request could be queued"), and
-    // `dispatch`'s `End::Graceful` arm failing the queue ("model {id} was
-    // unloaded").
-    //
-    // The first of those *is* a death: the fatal arm calls `rx.close()` and
-    // then the dispatch task ends, so every request that reaches `tx.send` a
-    // moment late — the tail of the same window — gets this instead of the
-    // fatal message. The second is a real unload (an explicit one, or the
-    // manager shutting down), which is not a death but is the same fact about
-    // the request: it never reached a model, its items are untouched, and one
-    // re-submission is the correct answer (the next predict reloads the
-    // model). Both are bounded by the caller's one-retry budget either way.
+    // Two sites: `ModelManager::predict` when `tx.send` fails (a death, for
+    // the tail of a window reaching it after the fatal arm closed the channel)
+    // and `dispatch`'s `End::Graceful` arm (a real unload).
     "was unloaded",
 ];
 
-/// The context `ModelManager::ensure_loaded` puts on a load failure, minus the
-/// model id it interpolates.
+/// The context `ensure_loaded` puts on a load failure, minus the model id.
 const LOAD_FAILURE_MARKER: &str = "failed to load model";
 
-/// What a failed `ModelManager::predict` was, as far as the wire is concerned.
+/// What a failed `ModelManager::predict` was, as far as the wire cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PredictFailure {
-    /// The model could not be brought up. router.py's `Failed to load model`.
+    /// Could not be brought up: router.py's `Failed to load model`.
     LoadFailed,
-    /// The request never reached a model — [`UNATTEMPTED_REQUEST_MARKERS`].
+    /// Never reached a model — [`UNATTEMPTED_REQUEST_MARKERS`].
     Unattempted,
     /// Anything else: the model ran and the attempt failed.
     Other,
 }
 
 /// Classify a failed predict: the typed marker first, then its rendered
-/// `anyhow` chain.
-///
-/// Pure, so the coupling to four other modules' message formats is pinned by
-/// unit tests rather than by a live worker death per case.
-///
-/// **The downcast is the primary signal** and runs before the substring list
-/// (`UNATTEMPTED_REQUEST_MARKERS`, whose docs say why the list survives it).
-/// It walks the whole context chain, so the `.context` the inference pool and
-/// the job runner add on the way out cannot hide it.
-///
-/// **The load check keeps its precedence**, deliberately: a worker that dies
-/// *while loading* renders both, and re-queueing is the answer to an
-/// established worker dying mid-window, not to a model that will not come up
-/// (which R9's cooldown answers). Getting that order wrong would make every
-/// dies-on-load model cost each item a second full attempt.
-///
-/// But it is checked **anchored on this model's id** first, because the chain
-/// this reads includes a fatal error's *stderr tail* — a ring buffer of
-/// whatever the worker logged over its recent life. An unanchored
-/// `contains("failed to load model")` therefore lets a line a model's own code
-/// printed minutes ago silently reclassify a real mid-window death as a load
-/// failure, costing the window its re-queue. `ensure_loaded` always renders
-/// `failed to load model {inference_id}`, so the anchored form is exact, and a
-/// worker would have to print this gateway's own context string *with this
-/// model's id* to forge it. The unanchored form is still honoured last, so
-/// every chain that answered `Failed to load model` before still does
-/// (router.py parity) unless a death marker outranks it.
+/// `anyhow` chain. Pure, so the coupling to four other modules' message
+/// formats is pinned by unit tests rather than by a live worker death; the
+/// downcast walks the whole chain, so added `.context` cannot hide it.
+/// **The load check keeps its precedence** over both unattempted signals — a
+/// model that will not come up must not cost each item a second attempt — but
+/// anchored on this model's id, because the chain includes a fatal error's
+/// stderr tail and an unanchored `contains("failed to load model")` would let
+/// an old line reclassify a real mid-window death. The unanchored form is
+/// honoured last, for router.py parity.
 fn classify_predict_failure(err: &anyhow::Error, chain: &str, full_id: &str) -> PredictFailure {
-    // The load check keeps its precedence over *both* unattempted signals,
-    // for the reason above: a model that will not come up must not cost each
-    // item a second full attempt. A worker that dies while loading renders
-    // the anchored load context, and `ensure_loaded` wraps whatever the
-    // spawn produced — typed marker included.
     if chain.contains(&format!("{LOAD_FAILURE_MARKER} {full_id}")) {
         return PredictFailure::LoadFailed;
     }
@@ -269,40 +136,27 @@ fn classify_predict_failure(err: &anyhow::Error, chain: &str, full_id: &str) -> 
     PredictFailure::Other
 }
 
-/// The `{"detail": …}` body of an inference error, in the two shapes this
-/// surface answers with.
-///
-/// The string form is the original one and stays byte-identical for every
-/// failure that already had a detail string (router.py parity, see the module
-/// docs). The object form is additive and exists for the failures a *caller*
-/// has to act on differently — today a worker death (a job re-queues) and,
-/// for the load-failure cooldown, an "unavailable until" answer — so the
-/// machine-readable half never has to be recovered by pattern-matching prose.
+/// The `{"detail": …}` body of an inference error, in two shapes: the string
+/// form byte-identical for router.py parity, the object form additive.
 #[derive(serde::Serialize, ToSchema)]
 #[serde(untagged)]
 pub(crate) enum InferenceErrorDetail {
-    /// router.py's plain detail strings. Never constructed here — the plain
-    /// failures keep going through [`crate::api_error::ErrorBody`], byte for
-    /// byte — but it is half of the wire contract and half of the generated
-    /// client's type, so it is documented rather than inferred from absence.
+    /// router.py's plain detail strings. Never constructed here (those go
+    /// through [`crate::api_error::ErrorBody`]) but half of the wire contract.
     #[allow(dead_code)]
     Message(String),
-    /// A failure with a machine-readable [`InferenceErrorDetail::Message`]
-    /// replacement: `kind` names it, the rest is per-kind context.
+    /// Machine-readable: `kind` names the failure, the rest is its context.
     Structured(InferenceErrorFields),
 }
 
-/// The fields a structured [`InferenceErrorDetail`] can carry. One flat,
-/// wholly-optional-but-`kind` struct rather than a variant per kind: every
-/// consumer dispatches on `kind` first, and a single shape keeps the wire
-/// contract (and the generated client type) from growing a case per failure
-/// mode.
+/// The fields a structured [`InferenceErrorDetail`] can carry — one flat
+/// struct, since every consumer dispatches on `kind` first.
 #[derive(serde::Serialize, ToSchema, Default)]
 pub(crate) struct InferenceErrorFields {
-    /// What went wrong, as a stable token: [`WORKER_DIED_KIND`], or
-    /// `load_cooldown` for the per-model load-failure backoff.
+    /// A stable token: [`WORKER_DIED_KIND`], [`REQUEST_INCOMPLETE_KIND`],
+    /// [`BODY_BUDGET_KIND`], `load_cooldown`.
     pub kind: String,
-    /// Human-readable summary; the string the plain form would have carried.
+    /// Human-readable summary: the string the plain form would carry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// The model the failure is about, `group/name`.
@@ -319,17 +173,14 @@ pub(crate) struct InferenceErrorFields {
     pub failures: Option<u32>,
 }
 
-/// The body every inference error path serializes. Same `{"detail": …}`
-/// envelope as [`crate::api_error::ErrorBody`]; only the detail is allowed to
-/// be an object.
+/// The body every inference error path serializes: `{"detail": …}` as in
+/// [`crate::api_error::ErrorBody`], with an object detail permitted.
 #[derive(serde::Serialize, ToSchema)]
 pub(crate) struct InferenceErrorBody {
     pub detail: InferenceErrorDetail,
 }
 
-/// Build an error response whose detail is the structured form. Kept beside
-/// the types so every structured failure — this file's worker death, and the
-/// load-failure cooldown — answers in exactly one shape.
+/// Build an error response with a structured detail, in one place.
 pub(crate) fn structured_error(status: StatusCode, fields: InferenceErrorFields) -> Response {
     (
         status,
@@ -340,38 +191,29 @@ pub(crate) fn structured_error(status: StatusCode, fields: InferenceErrorFields)
         .into_response()
 }
 
-/// Shared state of the local inference service: the model manager plus the
-/// mtime-cached registry used by `/metadata`.
+/// Shared state: the model manager plus the registry `/metadata` reads.
 pub struct InferioState {
     pub manager: Arc<ModelManager>,
     pub registry: Arc<StdMutex<RegistryCache>>,
-    /// Probed once at startup; drives the `/metadata` availability overlay.
+    /// Probed at startup; drives the `/metadata` availability overlay.
     pub compute_caps: super::capability::HostComputeCaps,
-    /// Calibration profiles (shipped baselines + the local store), for the
-    /// `/metadata` calibration overlay. The ledger holds the same store.
+    /// Calibration profiles for the `/metadata` overlay; also the ledger's.
     pub calibration: Option<Arc<super::calibration::CalibrationStore>>,
-    /// Model name of the GPU a model would load on by default — the one
-    /// GPU the calibration overlay can answer for unambiguously. `None` on
-    /// a host with no GPU inventory, where the overlay is omitted entirely.
+    /// Model name of the GPU a model loads on by default — the one the
+    /// calibration overlay can answer for unambiguously. `None`, and no
+    /// overlay, on a host with no inventory.
     pub default_gpu_name: Option<String>,
 }
 
 impl InferioState {
-    /// Build the manager + registry from `[inference_local]` config.
-    /// Requires a running tokio runtime (the manager spawns its TTL
-    /// sweeper). Workers spawn lazily, so a missing interpreter or impl dir
-    /// only surfaces on the first model load.
+    /// Build the manager + registry from `[inference_local]` config. Needs a
+    /// running tokio runtime; workers spawn lazily, so a missing interpreter
+    /// surfaces on the first load.
     pub fn from_settings(settings: &Settings) -> Result<Arc<Self>> {
         let local = &settings.inference_local;
         let registry_config = if local.config_dirs.is_empty() {
             RegistryConfig::default_dirs().unwrap_or_else(|err| {
-                // A missing built-in config folder must not hard-fail
-                // gateway boot: Python only surfaces it when the registry
-                // is actually read, and broken registry TOML already
-                // degrades lazily here too (/metadata and loads error per
-                // call). Warn and continue with the user dir only — a
-                // missing dir is skipped with a warning at load time, so
-                // the worst case is an empty registry.
+                // A missing built-in config folder must not hard-fail boot.
                 tracing::warn!(
                     error = %format!("{err:#}"),
                     "built-in inference config folder not found; serving with \
@@ -386,8 +228,8 @@ impl InferioState {
                 config_dirs: local.config_dirs.clone(),
             }
         };
-        // Shipped calibration baselines live in a `calibration/` subdirectory
-        // of each registry dir (the registry loader itself never recurses).
+        // Shipped baselines live in a `calibration/` subdirectory of each
+        // registry dir; the loader itself never recurses.
         let registry_dirs = registry_config.config_dirs.clone();
         let registry = Arc::new(StdMutex::new(RegistryCache::new(registry_config)));
 
@@ -406,13 +248,10 @@ impl InferioState {
         }
 
         // Worker env follows the wheels actually installed (the setup
-        // sentinel), not a re-probe of the hardware: config `auto` on a
-        // host with /opt/rocm must not inject HIP paths into a venv that
-        // was deliberately synced as cpu/cuda. Config resolution remains
-        // the fallback for user-managed interpreters and legacy venvs,
-        // which have no sentinel. The same answer is the `backend`
-        // component of every calibration profile key — a profile measured
-        // against ROCm wheels says nothing about a CUDA build.
+        // sentinel), not a re-probe of the hardware: `auto` on a host with
+        // /opt/rocm must not inject HIP paths into a venv synced as cpu/cuda.
+        // Config resolution is the fallback for user-managed interpreters, and
+        // the answer is also every profile key's `backend` component.
         let accelerator = if local.python.is_some() {
             crate::setup::effective_accelerator(local.python_env.accelerator)
         } else {
@@ -428,29 +267,19 @@ impl InferioState {
             env_remove: Vec::new(),
             cwd: None,
             deadlines,
-            // The pin *variable* follows the same resolved accelerator as the
-            // worker env and the profile keys — not the inventory: a ROCm
-            // host whose inventory came back unknown (ambient restriction,
-            // probe failure) still writes the operator's registry pin into
-            // HIP's own variable, where an index is the only thing that means
-            // anything — so `resolve_pin` canonicalises numeric pins there,
-            // drops anything HIP could not read as an index, and writes no
-            // pin at all under a HIP-layer ambient restriction
-            // (docs/rocm-batch-calibration-parity.md, D2).
+            // The pin *variable* follows the resolved accelerator, not the
+            // inventory: a ROCm host with an unknown inventory still writes
+            // the registry pin into HIP's own variable, where only an index
+            // means anything (docs/rocm-batch-calibration-parity.md, D2).
             pin_env_var: super::gpu::pin_env_var(accelerator),
         };
-        // One probe answers both hardware questions: which GPUs exist
-        // (worker→GPU pinning, the per-GPU ledger) and what they can do (the
-        // /metadata availability overlay). Probed once at startup, against
-        // the interface the installed wheels actually talk to — the same
-        // resolved accelerator the worker env and profile keys use, so a
-        // ROCm host is never asked about NVIDIA GPUs or vice versa.
+        // One probe answers both hardware questions: which GPUs exist (for
+        // pinning and the ledger) and what they can do (the /metadata
+        // overlay), against the same resolved accelerator.
         let host = super::gpu::probe(accelerator);
         // The calibration store: shipped baselines beside the registry, the
-        // generated file in the data folder. The environment half of every
-        // profile key is resolved once, here — it cannot change while the
-        // process runs, and a caller that got it wrong would mis-key every
-        // profile it wrote.
+        // generated file in the data folder. Every profile key's environment
+        // half resolves once, here.
         let calibration = super::calibration::CalibrationStore::new(
             super::calibration::StorePaths::beside_registry(
                 &registry_dirs,
@@ -490,8 +319,8 @@ impl InferioState {
     }
 
     /// Resolve external-input declarations from this local Inferio registry.
-    /// Desktop management uses this directly so an explicitly configured
-    /// remote primary upstream cannot be mistaken for the local instance.
+    /// Desktop management uses it directly, so a configured remote upstream
+    /// cannot be mistaken for the local instance.
     pub fn external_inputs_json(&self) -> Result<JsonValue> {
         self.registry
             .lock()
@@ -501,13 +330,10 @@ impl InferioState {
     }
 }
 
-/// `[inference_local.vram]` → the ledger's budget table.
-///
-/// One shape change across the seam: the config expresses a per-GPU override
-/// as "fields that may be absent, meaning inherit", while the ledger wants a
-/// resolved [`VramBudget`] per GPU. Resolving here rather than in the ledger
-/// keeps the inheritance rule in one place — `VramConfig::for_gpu` — and
-/// keeps the ledger's hot path a plain map lookup.
+/// `[inference_local.vram]` → the ledger's budget table. The config expresses
+/// a per-GPU override as absent-means-inherit and the ledger wants a resolved
+/// [`VramBudget`] per GPU; resolving here keeps the inheritance rule in
+/// `VramConfig::for_gpu` alone, and the ledger's hot path a map lookup.
 fn vram_budgets(config: &crate::config::VramConfig) -> super::ledger::VramBudgets {
     let (margin, cap_fraction) = (config.margin, config.cap_fraction);
     let mut budgets = super::ledger::VramBudgets::uniform(super::ledger::VramBudget {
@@ -527,18 +353,11 @@ fn vram_budgets(config: &crate::config::VramConfig) -> super::ledger::VramBudget
     budgets
 }
 
-/// The `backend` component of a calibration profile key: which torch build
-/// the measurements were taken against. `Auto` reaching this point means
-/// resolution failed outright (a validation error), and `cpu` is the label
-/// that promises the least.
-///
-/// Apple Silicon keys as `mps`, which is the split this comment used to
-/// reserve: the wheels are the same default-PyPI ones a macOS `cpu` host
-/// installs, but the measurements are of a Metal device against a
-/// unified-memory budget and describe nothing a CPU-wheel box would measure
-/// (docs/unified-memory-admission.md, "Calibration keying summary"). Nothing
-/// on a Mac ever registered with the ledger before that design, so no
-/// existing profile changes meaning.
+/// The `backend` component of a calibration profile key: which torch build the
+/// measurements were taken against. `Auto` here means resolution failed, and
+/// `cpu` promises the least. Apple Silicon keys as `mps` — same default-PyPI
+/// wheels as a macOS `cpu` host, but the measurements are of a Metal device
+/// against a unified-memory budget (docs/unified-memory-admission.md).
 fn accelerator_backend(accelerator: crate::config::Accelerator) -> &'static str {
     match accelerator {
         crate::config::Accelerator::Cuda => "cuda",
@@ -548,85 +367,18 @@ fn accelerator_backend(accelerator: crate::config::Accelerator) -> &'static str 
     }
 }
 
-/// Bytes one predict request body may carry.
-///
-/// The route used to run under `DefaultBodyLimit::disable()` — no limit at
-/// all — inherited from the proxy path it replaced. Since `7e96de62` the
-/// handler buffers the whole body before parsing it (a streamed parse
-/// answered with the request stream still open, which cost the connection an
-/// `ENHANCE_YOUR_CALM` GOAWAY every ~65 000 streams), so "no limit" now means
-/// "a peer decides how much of this server's memory one stream holds". That
-/// has to be a number, and the number has to be one nothing legitimate can
-/// hit.
-///
-/// [`MAX_FRAME_BYTES`] is that number: it is the orchestrator's own wall on
-/// one worker-protocol frame, and it already bounds the *inputs* on the way
-/// in — `jobs::extraction`'s `check_frame_budget` refuses a single input
-/// above `FRAME_INPUT_BYTES_BUDGET` (this figure minus the envelope) before
-/// any predict is attempted, as a persisted `resource` verdict. So a body
-/// above it carries either one input this machine has already decided it
-/// cannot infer, or a batch larger than the largest object either side of
-/// the worker protocol ever holds. Refusing it at the door with a `413` is
-/// strictly better than buffering it and failing later.
-///
-/// **It bounds one request, and it is sized for the largest legitimate one:
-/// a request carrying a single input.** `check_frame_budget` admits an input
-/// up to `FRAME_INPUT_BYTES_BUDGET` (this figure minus 8 MiB), and multipart
-/// adds only a couple of hundred bytes of envelope per part, so a one-input
-/// predict can legitimately come within that margin of this limit. Anything
-/// lower would refuse a request the job builds and has already committed to;
-/// anything higher would admit a body the worker frame could not carry. It is
-/// deliberately **not** derived from "64 inputs per request", which is the
-/// other legitimate shape: 64 x the largest input is 128 GiB, a number that
-/// bounds nothing.
-///
-/// **It is not, on its own, a memory bound**, and it never was. There is no
-/// limit on how many connections a peer opens, so
-/// `MAX_CONCURRENT_STREAMS x PREDICT_BODY_LIMIT` is not a ceiling either —
-/// it is one connection's worth of an unbounded number. The ceiling is
-/// [`PREDICT_INFLIGHT_BODY_BYTES`], which bounds the sum across every stream
-/// and every peer; this limit's job is to decide *per request* what is
-/// plausible, and to answer `413` rather than `503` when it is not.
+/// Bytes one predict request body may carry: [`MAX_FRAME_BYTES`], the
+/// orchestrator's wall on one worker-protocol frame, which already bounds the
+/// inputs on the way in. Over it is a `413`. It bounds one request, not this
+/// process's memory — that is [`PREDICT_INFLIGHT_BODY_BYTES`]. Derivation:
+/// docs/inferio-transport.md.
 pub(crate) const PREDICT_BODY_LIMIT: usize = MAX_FRAME_BYTES;
 
-/// **Predict request bytes this process holds in memory at once**, summed
-/// across every connection, every stream and every peer.
-///
-/// This is the bound [`PREDICT_BODY_LIMIT`] cannot be. A per-request limit
-/// multiplied by a stream limit is not a memory budget when nothing bounds
-/// the number of connections — and even against one connection,
-/// `512 x 2 GiB` is a terabyte, which is a statement about arithmetic rather
-/// than about this machine. Since `7e96de62` the handler buffers each body
-/// before parsing it, so "how much can arrive at once" is a question with a
-/// real answer, and it has one.
-///
-/// **The number, derived from what the shipped client can legitimately
-/// offer.** A gateway job holds at most `[jobs] intermediate_data_budget_mb`
-/// (1 GiB by default) of loaded item data at a time — `jobs::extraction`
-/// takes that byte budget *before* a unit permit, so it bounds the item bytes
-/// in flight, which are exactly the bytes its predict bodies carry. Four
-/// times it covers four gateways at the shipped default running against one
-/// inference server, which is more than the deployment this exists for (a NAS
-/// and a GPU box) ever has. It is also `2 x PREDICT_BODY_LIMIT`, which is the
-/// property that keeps the budget from being a trap: the largest request this
-/// server will accept can always be admitted beside another one of the same
-/// size, so no legitimate request is ever permanently unadmittable.
-///
-/// **The worst case, honestly.** The budget counts bytes as they arrive. A
-/// body being *parsed* is briefly resident twice — the collected buffer, plus
-/// the per-field copies `parse_input_request` takes out of it — so the
-/// resident peak this admits is up to twice the budget, ~8 GiB, and only if
-/// every admitted byte is mid-parse at the same instant. Steady state for the
-/// job this serves is a few hundred KiB per request over a few hundred
-/// concurrent requests: two orders of magnitude below it.
-///
-/// **What happens at the wall.** The request is refused with `503` and a
-/// `Retry-After`, typed so the caller knows the batch was never parsed
-/// ([`crate::inferio_client::BODY_BUDGET_KIND`]) — the same assertion
-/// `worker_died` and `request_incomplete` make, and it earns the same
-/// recovery. It is never a wait: waiting would hold the stream open, which is
-/// the very thing `7e96de62` is about, and it would convert an overload into
-/// an unbounded latency instead of an answer.
+/// **Predict request bytes this process holds in memory at once**, across
+/// every connection, stream and peer — the bound [`PREDICT_BODY_LIMIT`] cannot
+/// be. At the wall a request is refused `503` with a `Retry-After`, typed
+/// [`crate::inferio_client::BODY_BUDGET_KIND`], never queued. Derivation:
+/// docs/inferio-transport.md.
 pub(crate) const PREDICT_INFLIGHT_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 const _: () = assert!(
@@ -635,45 +387,33 @@ const _: () = assert!(
      can be refused for as long as another one is in flight"
 );
 
-/// The budget itself. Process-wide because the resource is: both listener
-/// modes (gateway and `panoptikon inferio`) mount this router, and a bound
-/// that is per-router is not a bound on the machine's memory.
+/// The budget. Process-wide because the resource is: both listener modes
+/// mount this router, and a per-router bound bounds no memory.
 static PREDICT_BODY_BYTES: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(PREDICT_INFLIGHT_BODY_BYTES);
 
-/// Predict bodies refused for want of budget, ever. Reported on `/health`,
-/// because a bound nobody can see is indistinguishable from a bug — which is
-/// the whole lesson of run2 S1.
+/// Predict bodies ever refused for want of budget. Reported on `/health`: a
+/// bound nobody can see is indistinguishable from a bug.
 static PREDICT_BODY_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
-/// What this process's predict-body budget is doing right now, for
-/// `/health`.
-///
-/// A refusal is a `503` an operator will see in a job's logs, so the state
-/// that produced it has to be readable somewhere that is not a guess. The
-/// pair to watch is `in_flight_bytes` against `budget_bytes`: a job that is
-/// being refused while the first is far below the second is being refused by
-/// a *burst* rather than by a level, and the answer is the caller's request
-/// sizing, not this number.
+/// What this process's predict-body budget is doing, for `/health`. A caller
+/// refused while `in_flight_bytes` is far below `budget_bytes` is hitting a
+/// *burst*, and the answer is its own request sizing.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct PredictBodyBudgetHealth {
-    /// [`PREDICT_BODY_LIMIT`]: the largest single predict body this server
-    /// will read, past which it answers `413`.
+    /// [`PREDICT_BODY_LIMIT`]: the largest body read, then `413`.
     pub request_limit_bytes: u64,
-    /// [`PREDICT_INFLIGHT_BODY_BYTES`]: predict body bytes this process will
-    /// hold at once, across every connection and peer.
+    /// [`PREDICT_INFLIGHT_BODY_BYTES`]: predict body bytes held at once.
     pub budget_bytes: u64,
-    /// Of those, how many are reserved right now — bodies arriving, plus
-    /// bodies being parsed.
+    /// Of those, how many are reserved now: arriving plus being parsed.
     pub in_flight_bytes: u64,
-    /// Predict requests refused for want of budget since this process
-    /// started. `0` is the number an operator should expect to see.
+    /// Predict requests refused for want of budget since startup; `0` is
+    /// what an operator should expect.
     pub refused_requests: u64,
 }
 
-/// The budget's current state, read off the semaphore itself rather than off
-/// a counter kept beside it — there is only ever one truth about how much is
-/// reserved.
+/// The budget's state, read off the semaphore rather than a counter beside
+/// it: there is only one truth about how much is reserved.
 pub(crate) fn predict_body_budget_health() -> PredictBodyBudgetHealth {
     budget_health(
         PREDICT_BODY_BYTES.available_permits(),
@@ -681,9 +421,8 @@ pub(crate) fn predict_body_budget_health() -> PredictBodyBudgetHealth {
     )
 }
 
-/// The mapping from "what the semaphore says" to what `/health` reports, as
-/// a pure function so it can be asserted without racing the process-wide
-/// budget every other test in this binary is also using.
+/// "What the semaphore says" mapped to what `/health` reports, pure so it can
+/// be asserted without racing the process-wide budget.
 fn budget_health(available: usize, refusals: u64) -> PredictBodyBudgetHealth {
     PredictBodyBudgetHealth {
         request_limit_bytes: PREDICT_BODY_LIMIT as u64,
@@ -693,23 +432,18 @@ fn budget_health(available: usize, refusals: u64) -> PredictBodyBudgetHealth {
     }
 }
 
-/// Bytes the budget hands out at a time when the body declares no length.
-///
-/// A body with a `Content-Length` reserves once, exactly. A chunked one has
-/// to be charged as it arrives, and charging per frame would take the
-/// semaphore thousands of times for one body; a 1 MiB granularity makes it a
-/// handful, and over-reserves by less than one granule.
+/// Bytes the budget hands out at a time when the body declares no length; one
+/// with a `Content-Length` reserves once, exactly. Charging a chunked body per
+/// frame would take the semaphore thousands of times.
 const PREDICT_BODY_RESERVE_GRANULE: usize = 1024 * 1024;
 
 /// The inference routes, path-relative so they can be nested under
 /// `/api/inference` (gateway and standalone mode mount the same router).
 ///
-/// axum's own body limit stays disabled, as it has been since this replaced
-/// the streaming proxy path: it is enforced by `Bytes::from_request`, and the
-/// one route with a large body ([`predict`]) collects its body itself so that
-/// a truncated one can be told apart from a malformed one. That route applies
-/// [`PREDICT_BODY_LIMIT`] in its own extractor instead, which is where the
-/// limit can also produce the right status.
+/// axum's own body limit stays disabled: it is enforced by
+/// `Bytes::from_request`, while [`predict`] collects its body itself so a
+/// truncated one can be told apart from a malformed one, applying
+/// [`PREDICT_BODY_LIMIT`] in its own extractor.
 pub fn router(state: Arc<InferioState>) -> Router {
     Router::new()
         .route("/predict/{group}/{inference_id}", post(predict))
@@ -730,10 +464,8 @@ pub fn router(state: Arc<InferioState>) -> Router {
         .with_state(state)
 }
 
-/// Router for the `inferio` subcommand (design §3 "GPU lender" mode): the
-/// inference surface (which includes `/api/inference/health`) plus the
-/// original bare `/health` path — same handler, kept so existing probes of
-/// the subcommand keep working.
+/// Router for the `inferio` subcommand: the inference surface plus the bare
+/// `/health` path, same handler, kept for existing probes.
 pub fn standalone_router(state: Arc<InferioState>) -> Router {
     Router::new()
         .nest_service("/api/inference", router(Arc::clone(&state)))
@@ -747,9 +479,7 @@ struct LoadParams {
     cache_key: String,
     lru_size: i64,
     ttl_seconds: i64,
-    /// Additive over Python: lazy prewarm hint (design §8). Absent = true;
-    /// `prewarm=false` suppresses keeping a warm worker of this model's
-    /// impl class after the load.
+    /// Additive: lazy prewarm hint (absent = true); false keeps no warm worker.
     prewarm: Option<bool>,
 }
 
@@ -759,18 +489,14 @@ struct PredictParams {
     cache_key: String,
     lru_size: i64,
     ttl_seconds: i64,
-    /// Additive over Python: per-request cap on dispatch-time batch merging.
+    /// Additive: per-request cap on dispatch-time batch merging.
     max_batch: Option<u32>,
-    /// Additive over Python: lazy prewarm hint, as on load (absent = true).
+    /// Additive: lazy prewarm hint, as on load (absent = true).
     prewarm: Option<bool>,
 }
 
-// ----------------------------------------------------------------------
-// Doc-only OpenAPI shapes. The predict request/response wire formats are
-// hand-rolled above the serde layer (multipart parsing, three response
-// encodings), so these structs exist purely to document them — none of
-// them are ever (de)serialized by the handlers.
-// ----------------------------------------------------------------------
+// Doc-only OpenAPI shapes: the predict wire formats are hand-rolled above the
+// serde layer, so none of these is (de)serialized by the handlers.
 
 /// A raw binary payload (schema: string, format binary).
 #[derive(ToSchema)]
@@ -781,23 +507,20 @@ struct BinaryBlob(#[allow(dead_code)] String);
 #[derive(ToSchema)]
 #[allow(dead_code)]
 struct InferencePredictRequest {
-    /// JSON string of the batch: `{"inputs": [...]}` where each entry is an
-    /// object, a string, or null (null = file-only input).
+    /// JSON string of the batch: `{"inputs": [...]}`, each entry an object,
+    /// a string, or null (file-only).
     data: String,
-    /// Binary batch inputs. Each part's *filename* must be the integer
-    /// index of the `inputs` entry it attaches to.
+    /// Binary batch inputs; each part's *filename* is its `inputs` index.
     files: Option<Vec<BinaryBlob>>,
 }
 
-/// JSON envelope of a predict response (used whenever the outputs are not
-/// all binary).
+/// JSON envelope of a predict response, unless every output is binary.
 #[derive(ToSchema)]
 #[allow(dead_code)]
 struct PredictJsonResponse {
-    /// One output per input; binary outputs are wrapped as
-    /// `{"__type__": "base64", "content": "<base64>"}`, and an input the
-    /// model rejected on its own is
-    /// `{"__error__": {"class": "input" | "transient", "message": "..."}}`.
+    /// One output per input; binary ones wrapped as
+    /// `{"__type__": "base64", "content": ...}`, a rejected input as
+    /// `{"__error__": {"class": ..., "message": ...}}`.
     outputs: Vec<JsonValue>,
 }
 
@@ -812,8 +535,7 @@ struct StatusResponse {
 #[derive(ToSchema)]
 #[allow(dead_code)]
 struct CacheKeyResponse {
-    /// inference_id -> ISO-8601 expiration; never-expiring entries
-    /// (ttl -1) render as `9999-12-31T23:59:59.999999`.
+    /// inference_id -> ISO-8601 expiry; ttl -1 is `9999-12-31T23:59:59.999999`.
     expirations: std::collections::BTreeMap<String, String>,
 }
 
@@ -825,75 +547,31 @@ struct CacheListResponse {
     cache: std::collections::BTreeMap<String, Vec<String>>,
 }
 
-/// The predict body, read to its end *before* it is parsed.
-///
-/// Two separate things depend on the whole body being collected first, and
-/// both of them are run2 defect P2:
-///
-/// * **The request stream has to reach its end.** A server that answers
-///   while the request body is still open must reset the stream
-///   (RFC 9113 §8.1), and hyper does. The client's terminal DATA frame then
-///   lands on a stream this end has already closed, which h2 reports as a
-///   STREAM_CLOSED *stream error* and counts against
-///   `max_local_error_resets` — a counter that only ever rises, for the
-///   whole life of the connection. At 1 024 of them h2 stops the connection
-///   with `GOAWAY(ENHANCE_YOUR_CALM, "too_many_internal_resets")`, and
-///   **every** request body still being read on it fails at once. multer
-///   stops at the closing boundary and never polls the frame after it, so
-///   the streamed parse this handler used left that reset behind on every
-///   predict, on the one connection the gateway's h2c self-call keeps for a
-///   whole job. Measured against this router over h2c with the real client:
-///   381 of 300 032 predicts failed their parse, every one of them with
-///   `hyper::Error(Body, GoAway(b"too_many_internal_resets",
-///   ENHANCE_YOUR_CALM, Library))` under axum's fixed sentence — the exact
-///   `400 invalid multipart body` run2 P2 reported. Collecting the body
-///   first is what makes the stream end normally; the same 300 032 then
-///   fail none.
-///
-/// * **A transport failure stops looking like a malformed body.** Streamed,
-///   "the connection broke under me" and "these bytes are not multipart"
-///   both arrive as `axum::extract::multipart::MultipartError`, whose
-///   `Display` is one fixed sentence with no cause attached — which is why
-///   P2 reached the operator as `400 invalid multipart body` and nothing
-///   else. Collected, the two are different code paths: a failed `collect`
-///   is the body not arriving ([`REQUEST_INCOMPLETE_KIND`], the caller
-///   re-submits), and anything multer says afterwards is genuinely about the
-///   bytes.
-///
-/// What it costs is one extra resident copy of the body: `predict` already
-/// copies every field into a `Vec` before the batch runs, and the collected
-/// bytes now stay alive beside those copies until the parse is done. That
-/// cost is what [`PREDICT_INFLIGHT_BODY_BYTES`] bounds, per request through
-/// [`PREDICT_BODY_LIMIT`] and in aggregate through the reservation this
-/// holds.
+/// The predict body, read to its end *before* it is parsed, so the request
+/// stream ends normally (a streamed parse leaves an h2 stream reset behind on
+/// every predict, and 1 024 of them GOAWAY the connection) and a transport
+/// failure stops looking like a malformed body. It costs one extra resident
+/// copy, which [`PREDICT_INFLIGHT_BODY_BYTES`] bounds. See
+/// docs/inferio-transport.md.
 struct BufferedMultipart {
     multipart: Multipart,
-    /// The collected body, kept so a failed parse can say *why* it failed.
-    /// Free to keep: multer holds slices of this same buffer.
+    /// The collected body, so a failed parse can say *why*; multer holds
+    /// slices of it anyway.
     body: axum::body::Bytes,
-    /// The boundary the request's `Content-Type` declared, when it declared
-    /// a usable one.
+    /// The boundary the request's `Content-Type` declared, if usable.
     boundary: Option<String>,
-    /// The bytes this body holds out of the process-wide budget, returned
-    /// when the parse is done and this is dropped. Not read; owned.
+    /// This body's claim on the process-wide budget, returned on drop.
     _reservation: BodyReservation,
 }
 
-/// One request's claim on [`PREDICT_INFLIGHT_BODY_BYTES`], returned by
-/// `Drop` so every exit path — a refusal, a stream failure, a parse failure,
-/// a cancelled request — accounts for itself without a single explicit
-/// release.
-///
-/// It grows: a body that declares its length reserves once, and one that
-/// does not is charged in [`PREDICT_BODY_RESERVE_GRANULE`] steps as it
-/// arrives. Growth is always **try**, never a wait, so two half-reserved
-/// bodies can never wait on each other — an exhausted budget is answered,
-/// not queued.
+/// One request's claim on [`PREDICT_INFLIGHT_BODY_BYTES`], returned by `Drop`
+/// so every exit path accounts for itself. It grows: a body declaring its
+/// length reserves once, one that does not in
+/// [`PREDICT_BODY_RESERVE_GRANULE`] steps — always **try**, never a wait, so
+/// two half-reserved bodies can never wait on each other.
 struct BodyReservation {
-    /// The budget this draws on. A parameter rather than a reference to the
-    /// static, so a test can exercise exhaustion without starving every other
-    /// request in the process (which is the same class of cross-test
-    /// interference the `/health` client section's `try_lock` caused).
+    /// The budget drawn on. A parameter rather than the static, so a test
+    /// can exercise exhaustion without starving the whole process.
     budget: &'static tokio::sync::Semaphore,
     permit: Option<tokio::sync::SemaphorePermit<'static>>,
 }
@@ -912,8 +590,7 @@ impl BodyReservation {
             .map_or(0, |permit| permit.num_permits())
     }
 
-    /// Reserve up to `wanted` bytes in total for this body, or say the budget
-    /// is out. Idempotent below what is already held.
+    /// Reserve up to `wanted` bytes, or say the budget is out; idempotent.
     fn reserve(&mut self, wanted: usize) -> Result<(), PredictBodyError> {
         let held = self.held();
         let Some(extra) = wanted.checked_sub(held).filter(|extra| *extra > 0) else {
@@ -946,28 +623,20 @@ impl BodyReservation {
     }
 }
 
-/// Why a predict body could not be read as a batch. Typed and small so the
-/// *decision* (below) and the *rendering* (in `IntoResponse`) stay separate
-/// — and so the one distinction a caller acts on is made in one place.
+/// Why a predict body could not be read as a batch — typed, so the decision
+/// and the rendering stay separate.
 #[derive(Debug)]
 enum PredictBodyError {
-    /// Every byte arrived and they are not a valid batch. An ordinary 400:
-    /// asking again produces the same answer.
+    /// Every byte arrived and they are not a valid batch. An ordinary 400.
     Malformed(String),
-    /// The bytes did not all arrive, so nothing was parsed and nothing was
-    /// attempted. See [`REQUEST_INCOMPLETE_KIND`].
+    /// The bytes did not all arrive; see [`REQUEST_INCOMPLETE_KIND`].
     Incomplete(String),
-    /// No `data` field. FastAPI answers a missing required Form field 422,
-    /// and so does this.
+    /// No `data` field. FastAPI answers a missing required Form field 422.
     MissingData,
-    /// The body is larger than [`PREDICT_BODY_LIMIT`]. A `413`, and a verdict
-    /// about the request rather than about the media: the caller has to send
-    /// a smaller batch, and re-sending the same one will not help.
+    /// Larger than [`PREDICT_BODY_LIMIT`]. A `413`: send a smaller batch.
     TooLarge,
-    /// This process is already holding [`PREDICT_INFLIGHT_BODY_BYTES`] of
-    /// predict bodies. A `503` with a `Retry-After`: nothing about this
-    /// request is wrong, there is simply no room to read it right now, and
-    /// re-sending it *is* the answer.
+    /// Already at [`PREDICT_INFLIGHT_BODY_BYTES`]. A `503` with a
+    /// `Retry-After`; re-sending is the answer.
     Overloaded,
 }
 
@@ -1017,9 +686,8 @@ impl IntoResponse for PredictBodyError {
                         ..Default::default()
                     },
                 );
-                // A figure the caller can act on rather than a bare 503: the
-                // budget is released by requests that are already being
-                // parsed, so the wait is short and bounded by them.
+                // A figure the caller can act on: the budget is released by
+                // requests already parsing.
                 response
                     .headers_mut()
                     .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
@@ -1029,23 +697,13 @@ impl IntoResponse for PredictBodyError {
     }
 }
 
-/// Collect a request body under a per-request ceiling **and** the
-/// process-wide byte budget, keeping the four outcomes distinct.
-///
-/// The `DefaultBodyLimit` layer cannot do this job for [`predict`]: it is
-/// enforced by `Bytes::from_request`, and this route deliberately collects the
-/// raw body itself so a *truncated* body can be told apart from a *malformed*
-/// one (`7e96de62`). "Whole, and larger than we will hold" and "whole, and
-/// there is no room to hold it right now" are two further things, and each
-/// earns its own status rather than being reported as one of the others: the
-/// first says shrink the batch, the second says send the same batch again in
-/// a moment.
-///
-/// The budget is charged **before the bytes are read**, from
-/// `Content-Length` where there is one and in
-/// [`PREDICT_BODY_RESERVE_GRANULE`] steps where there is not, so a body is
-/// never admitted into memory the process has not already accounted for. A
-/// declared length over `limit` is refused without reading a byte of it.
+/// Collect a request body under a per-request ceiling **and** the process-wide
+/// byte budget, keeping the four outcomes distinct: truncated, malformed, too
+/// large, and no room right now. The budget is charged **before the bytes are
+/// read** — from `Content-Length`, or in [`PREDICT_BODY_RESERVE_GRANULE`]
+/// steps where there is none — so a body is never admitted into memory the
+/// process has not accounted for; a declared length over `limit` is refused
+/// unread.
 async fn collect_within(
     body: Body,
     limit: usize,
@@ -1054,10 +712,7 @@ async fn collect_within(
     use axum::body::HttpBody as _;
 
     let mut reservation = BodyReservation::new(budget);
-    // The declared length, when the body declares one — every request the
-    // shipped client builds does, because `reqwest`'s multipart form is
-    // assembled from in-memory parts and sizes itself. A declared length is
-    // charged once and exactly; only an undeclared body pays the granule.
+    // Every request the shipped client builds declares a length.
     let declared = body.size_hint().exact();
     let granule = if declared.is_some() {
         1
@@ -1076,8 +731,7 @@ async fn collect_within(
     while let Some(frame) = body.frame().await {
         let frame = match frame {
             Ok(frame) => frame,
-            // The body stream itself failed: nothing was parsed, so nothing
-            // was attempted.
+            // The body stream itself failed: nothing was attempted.
             Err(err) => {
                 return Err(PredictBodyError::Incomplete(format!(
                     "the request body stream failed: {}",
@@ -1093,9 +747,8 @@ async fn collect_within(
         if wanted > limit {
             return Err(PredictBodyError::TooLarge);
         }
-        // A no-op when the declared length already covered this, and the
-        // real charge when there was none — or when a peer sent more than it
-        // said it would.
+        // A no-op when the declared length covered this; the real charge
+        // otherwise, or when a peer oversent.
         reservation.reserve(wanted.next_multiple_of(granule).min(limit))?;
         collected.extend_from_slice(&data);
     }
@@ -1127,9 +780,7 @@ where
                 _reservation: reservation,
             })
             .map_err(|rejection| {
-                // No usable boundary in the content type. Nothing about the
-                // body can be judged without one, so it is the header that
-                // is wrong, and that is an ordinary bad request.
+                // No usable boundary: the header is what is wrong.
                 PredictBodyError::Malformed(format!(
                     "invalid multipart body: {}",
                     rejection.body_text()
@@ -1140,12 +791,9 @@ where
 
 impl BufferedMultipart {
     /// The `data` field and the file parts, by index — or why the body could
-    /// not be read as a batch.
-    ///
-    /// All three places a multipart parse can fail are here, in one piece,
-    /// because they all need the same two things: the cause underneath
-    /// axum's fixed sentence, and [`Self::classify`]'s verdict on whether
-    /// the body was wrong or merely incomplete.
+    /// not be read as a batch. All three places a multipart parse can fail are
+    /// here, because they all need the cause underneath axum's fixed sentence
+    /// and [`Self::classify`]'s verdict.
     async fn into_fields(
         mut self,
     ) -> Result<(String, Vec<(Option<i64>, Vec<u8>)>), PredictBodyError> {
@@ -1166,8 +814,7 @@ impl BufferedMultipart {
                 }
                 Some("files") => {
                     // Python maps each file to its batch slot via the
-                    // filename, which must be an integer index
-                    // (utils.py:19-31).
+                    // filename, which must be an integer index.
                     let index = field
                         .file_name()
                         .and_then(|name| name.trim().trim_matches('"').parse::<i64>().ok());
@@ -1186,24 +833,12 @@ impl BufferedMultipart {
     }
 
     /// A failed parse, split by the only distinction that changes what the
-    /// caller should do.
-    ///
-    /// The whole body is in hand, so the question is asked of the bytes
-    /// rather than inferred from a parser's error variant: **does what
-    /// arrived carry the closing delimiter of the boundary this request
-    /// declared?**
-    ///
-    /// * It does not → what arrived is not a whole `multipart/form-data`
-    ///   body for these headers. Either it stopped early or it is not the
-    ///   body they describe; either way the batch was never parsed and never
-    ///   reached a model, so its items are untouched and re-submitting them
-    ///   is the right answer ([`REQUEST_INCOMPLETE_KIND`]).
-    /// * It does → the delimiters are all here and something *inside* them
-    ///   is wrong. That is a bad request in the ordinary sense.
-    ///
-    /// Asked only after the parse has already rejected the body, so a valid
-    /// request is never held against it and the scan costs nothing in the
-    /// case that matters.
+    /// caller should do. The whole body is in hand, so the question is asked
+    /// of the bytes rather than inferred from a parser's error variant: does
+    /// what arrived carry the closing delimiter of the declared boundary? If
+    /// not, nothing was parsed and re-submitting is right
+    /// ([`REQUEST_INCOMPLETE_KIND`]); if so, something *inside* them is wrong.
+    /// Asked only after the parse has already rejected the body.
     fn classify(
         &self,
         prose: &str,
@@ -1225,18 +860,10 @@ impl BufferedMultipart {
     }
 }
 
-/// The `boundary` parameter of the request's `Content-Type`.
-///
-/// Read through `mime`, because that is how the parser underneath reads it
-/// (multer 3.1 `parse_boundary`: parse the header as a `Mime`, take
-/// `get_param(BOUNDARY).as_str()`). The verdict below turns on whether the
-/// body carries *this* boundary's closing delimiter, so it has to be the
-/// same string multer parsed with; a second, hand-rolled reading of the
-/// header would eventually disagree with it about some header neither of us
-/// thought about, and disagreeing here means answering the wrong thing.
-///
-/// `None` when the header carries none — a different failure, and one
-/// axum's own extractor rejects before this file sees it.
+/// The `boundary` parameter of the request's `Content-Type`, read through
+/// `mime` because that is how multer reads it: the verdict above turns on the
+/// body carrying *this* boundary's closing delimiter, so it must be the string
+/// multer parsed with. `None` when the header carries none.
 fn multipart_boundary(content_type: &str) -> Option<String> {
     let content_type = content_type.parse::<mime_guess::mime::Mime>().ok()?;
     let boundary = content_type
@@ -1246,9 +873,9 @@ fn multipart_boundary(content_type: &str) -> Option<String> {
     (!boundary.is_empty()).then_some(boundary)
 }
 
-/// Whether `body` contains `--<boundary>--`, the delimiter that ends a
-/// `multipart/form-data` body (RFC 2046 §5.1.1). Searched rather than
-/// required at the end, because an epilogue after it is legal.
+/// Whether `body` contains `--<boundary>--`, the delimiter ending a
+/// `multipart/form-data` body (RFC 2046 §5.1.1). Searched rather than required
+/// at the end, because an epilogue after it is legal.
 fn body_carries_closing_delimiter(body: &[u8], boundary: &str) -> bool {
     let needle = format!("--{boundary}--").into_bytes();
     if body.len() < needle.len() {
@@ -1257,10 +884,7 @@ fn body_carries_closing_delimiter(body: &[u8], boundary: &str) -> bool {
     body.windows(needle.len()).any(|window| window == needle)
 }
 
-/// An error rendered with everything under it. The one-line `Display` of
-/// `MultipartError` (and of a body error) names the layer, never the cause,
-/// so the cause has to be walked out of the source chain by hand — without
-/// this, a parse failure is a sentence that fits every parse failure.
+/// An error rendered with everything under it: a `Display` names the layer.
 fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     let mut rendered = err.to_string();
     let mut source = err.source();
@@ -1275,11 +899,9 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     rendered
 }
 
-/// `POST /predict/{group}/{inference_id}` — router.py `predict`.
-/// Parses the multipart request, auto-loads the model (pinned for the
-/// duration, TTL restored afterwards — the manager owns those semantics),
-/// runs the batch, and encodes the response exactly like
-/// `utils.encode_output_response`.
+/// `POST /predict/{group}/{inference_id}` — router.py `predict`. Parses the
+/// multipart request, auto-loads the model (pinned for the duration), runs
+/// the batch, and encodes the response like `utils.encode_output_response`.
 #[utoipa::path(
     post,
     operation_id = "predict",
@@ -1368,12 +990,9 @@ async fn predict(
         Ok(outputs) => outputs,
         Err(err) => return predict_failure_response(err, &full_id),
     };
-    // Read straight after the predict. Deliberately not this request's own
-    // window: it is whatever window this model formed most recently, which
-    // under concurrent predicts may be a later one. That is the point — the
-    // figure is a running opinion about the model, not a receipt for one
-    // request, so stale by a window is exactly as useful. A model unloaded in
-    // the gap answers `None`, which omits the header for that one response.
+    // Deliberately not this request's own window but whatever this model
+    // formed most recently: a running opinion, not a receipt. A model gone in
+    // the gap answers `None` and omits the header.
     let desired = state.manager.desired_in_flight_items(&full_id);
     Ok(with_desired_in_flight(
         encode_output_response(outputs),
@@ -1381,27 +1000,23 @@ async fn predict(
     ))
 }
 
-/// The answer to a failed `ModelManager::predict`, in one place so the shape
-/// a caller sees is decided by [`classify_predict_failure`] and nothing else
-/// — and so a test can drive each rendering of a worker death through the
-/// exact code the handler runs, rather than through a copy of it.
+/// The answer to a failed `ModelManager::predict`, in one place so
+/// [`classify_predict_failure`] alone decides the shape a caller sees.
 fn predict_failure_response(err: anyhow::Error, full_id: &str) -> Result<Response, ApiError> {
-    // R9's cooldown first: it is a *refusal to try*, so it is neither of the
-    // two failures below and carries its own status.
+    // The cooldown first: a *refusal to try*, with its own status.
     if let Some(response) = load_cooldown_response(&err) {
         return Ok(response);
     }
     let chain = format!("{err:#}");
     tracing::error!(model = %full_id, error = %chain, "prediction failed");
-    // router.py detail strings: load failures vs. predict failures.
     match classify_predict_failure(&err, &chain, full_id) {
         PredictFailure::LoadFailed => Err(ApiError::internal("Failed to load model")),
         PredictFailure::Unattempted => Ok(structured_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             InferenceErrorFields {
                 kind: WORKER_DIED_KIND.to_owned(),
-                // Same string the plain form carries, so a client that only
-                // renders prose is unaffected by the shape change.
+                // The string the plain form carries, so a prose-only client
+                // is unaffected.
                 message: Some("Prediction failed".to_owned()),
                 model: Some(full_id.to_owned()),
                 last_error: Some(clamp_detail(&chain)),
@@ -1412,11 +1027,9 @@ fn predict_failure_response(err: anyhow::Error, full_id: &str) -> Result<Respons
     }
 }
 
-/// Bound on the error text a structured detail carries. A fatal worker error
-/// renders its stderr tail, which is a ring buffer of whatever the worker
-/// logged over its recent life and can be tens of kilobytes; the full text is
-/// already in the log line above, and the caller persists this one per failed
-/// item. 2000 bytes matches the extraction ledger's own audit clamp.
+/// Bound on a structured detail's error text: a fatal worker error renders
+/// tens of kilobytes of stderr ring and the caller persists it per failed
+/// item. Matches extraction's audit clamp.
 const MAX_DETAIL_BYTES: usize = 2000;
 
 /// Clamp an error chain to [`MAX_DETAIL_BYTES`], on a char boundary.
@@ -1431,16 +1044,11 @@ fn clamp_detail(text: &str) -> String {
     format!("{}…", &text[..end])
 }
 
-/// The pinned 503 of the per-model load-failure cooldown (R9), when this
-/// error is one: `Retry-After: <seconds>` plus
-/// `{"detail": {"kind": "load_cooldown", "model", "last_error", "retry_at",
-/// "failures"}}`. The whole chain is searched rather than the outermost
-/// error, so a caller that adds context to it still gets the right answer.
-///
-/// 503 rather than 500 because it is exactly what 503 means — the model is
-/// temporarily unavailable and the response says for how long — and because
-/// a job's client must be able to tell "do not bother retrying this now" from
-/// "this attempt failed".
+/// The pinned 503 of the per-model load-failure cooldown, when this error is
+/// one: `Retry-After: <seconds>` plus a `load_cooldown` detail carrying
+/// `model`, `last_error`, `retry_at` and `failures`. The whole chain is
+/// searched, so added context still gets the right answer. 503 so a job's
+/// client can tell "do not retry now" from "this attempt failed".
 fn load_cooldown_response(err: &anyhow::Error) -> Option<Response> {
     let cooldown = err
         .chain()
@@ -1468,9 +1076,8 @@ fn load_cooldown_response(err: &anyhow::Error) -> Option<Response> {
     Some(response)
 }
 
-/// Attach [`DESIRED_IN_FLIGHT_HEADER`] to an already-encoded predict
-/// response, leaving the body and every other header byte-identical. `None`
-/// (or a value that will not fit a header) omits it.
+/// Attach [`DESIRED_IN_FLIGHT_HEADER`] to an encoded predict response, body
+/// and other headers byte-identical. `None` omits it.
 fn with_desired_in_flight(mut response: Response, desired: Option<u64>) -> Response {
     if let Some(value) = desired
         && let Ok(value) = header::HeaderValue::from_str(&value.to_string())
@@ -1484,8 +1091,8 @@ fn with_desired_in_flight(mut response: Response, desired: Option<u64>) -> Respo
 }
 
 /// `PUT /load/{group}/{inference_id}` — router.py `load_model`:
-/// `{"status": "loaded"}` on success, 500 `"Failed to load model"` on any
-/// error (details go to the log, like Python's `logger.error`).
+/// `{"status": "loaded"}`, or 500 `"Failed to load model"` with the details
+/// logged as Python's `logger.error`.
 #[utoipa::path(
     put,
     operation_id = "load_model",
@@ -1519,8 +1126,8 @@ async fn load_model(
         )
         .await
     {
-        // The same cooldown answer the predict path gives (R9): an explicit
-        // load request is the one path that would otherwise keep asking.
+        // The predict path's cooldown answer: an explicit load is the one
+        // path that would otherwise keep asking.
         if let Some(response) = load_cooldown_response(&err) {
             return Ok(response);
         }
@@ -1530,9 +1137,8 @@ async fn load_model(
     Ok(Json(json!({"status": "loaded"})).into_response())
 }
 
-/// `DELETE /cache/{cache_key}/{group}/{inference_id}` — router.py
-/// `unload_model`: always `{"status": "unloaded"}` (Python doesn't report
-/// whether the entry existed).
+/// `DELETE /cache/{key}/{group}/{id}` — router.py `unload_model`: always
+/// `{"status": "unloaded"}`.
 #[utoipa::path(
     delete,
     operation_id = "unload_model",
@@ -1562,8 +1168,7 @@ async fn unload_model(
     Ok(Json(json!({"status": "unloaded"})))
 }
 
-/// `DELETE /cache/{cache_key}` — router.py `clear_cache`:
-/// `{"status": "cleared"}`.
+/// `DELETE /cache/{cache_key}` — router.py `clear_cache`, `"cleared"`.
 #[utoipa::path(
     delete,
     operation_id = "clear_cache",
@@ -1589,7 +1194,7 @@ async fn clear_cache(
 }
 
 /// `GET /cache/{cache_key}` — router.py `get_cache_expiration`:
-/// `{"expirations": {id: isoformat}}`, with `datetime.max` for ttl -1.
+/// `{"expirations": {id: isoformat}}`, `datetime.max` for ttl -1.
 #[utoipa::path(
     get,
     operation_id = "get_cache_expiration",
@@ -1619,8 +1224,7 @@ async fn get_cache_expiration(
     Json(json!({"expirations": expirations}))
 }
 
-/// `GET /cache` — router.py `get_cached_models`:
-/// `{"cache": {inference_id: [cache_keys]}}`.
+/// `GET /cache` — router.py `get_cached_models`, `{inference_id: [keys]}`.
 #[utoipa::path(
     get,
     operation_id = "get_cached_models",
@@ -1635,9 +1239,8 @@ async fn get_cached_models(State(state): State<Arc<InferioState>>) -> Json<JsonV
     Json(json!({"cache": state.manager.cached_models()}))
 }
 
-/// `GET /metadata` — router.py `get_metadata`: mtime-gated registry reload
-/// (RegistryCache mirrors `load_config(config, mtime)`), then the
-/// `list_inference_ids` shape.
+/// `GET /metadata` — router.py `get_metadata`: mtime-gated reload, then
+/// `list_inference_ids`.
 #[utoipa::path(
     get,
     operation_id = "get_metadata",
@@ -1658,9 +1261,6 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
         Ok(registry) => {
             let mut body = registry.metadata_json();
             super::capability::overlay_metadata(&mut body, &state.compute_caps);
-            // Additive and read-only, exactly like the availability overlay
-            // above: what the calibration store knows about each priced model
-            // on the GPU it would load on.
             if let Some(store) = state.calibration.as_ref() {
                 super::calibration::overlay_metadata(
                     &mut body,
@@ -1704,11 +1304,9 @@ async fn get_external_inputs(
     }
 }
 
-/// `GET /health` (additive, design §7; no Python counterpart): orchestrator
-/// + per-model liveness, loaded models, queue depths, and batch caps — the
-/// serde shape is [`HealthReport`], assembled by [`ModelManager::health`].
-/// Supersedes the earlier standalone-only `{"status": "ok", "loaded": ...}`
-/// body: the loaded-model map is now the richer `models` array.
+/// `GET /health` (additive; no Python counterpart): orchestrator and per-model
+/// liveness, loaded models, queue depths and batch caps. Shape:
+/// [`HealthReport`], from [`ModelManager::health`].
 #[utoipa::path(
     get,
     operation_id = "health",
@@ -1726,12 +1324,8 @@ async fn health(State(state): State<Arc<InferioState>>) -> Json<HealthReport> {
     Json(state.manager.health())
 }
 
-/// Port of `utils.parse_input_request`: the `data` form field is a JSON
-/// string whose `inputs` array defines the batch (missing key -> empty ->
-/// 400 "No inputs provided"); each uploaded file is attached to the batch
-/// slot named by its integer filename, anything unmappable is Python's
-/// exact 400 `Invalid index {index} in Content-Disposition header` (with
-/// `None` for a missing/non-integer filename).
+/// Port of `utils.parse_input_request`. Wire details and the exact 400s: see
+/// docs/inferio-transport.md, "Wire formats (Python parity)".
 fn parse_input_request(
     data: &str,
     files: Vec<(Option<i64>, Vec<u8>)>,
@@ -1771,19 +1365,11 @@ fn parse_input_request(
     Ok(inputs)
 }
 
-/// Port of `utils.encode_output_response`, byte-for-byte:
-/// - exactly one binary output -> raw `application/octet-stream` body;
-/// - all outputs binary -> `multipart/mixed; boundary=multipart-boundary`
-///   with Python's literal part framing (see module docs);
-/// - otherwise JSON `{"outputs": [...]}` with bytes entries wrapped as
-///   `{"__type__": "base64", "content": ...}`.
-///
-/// Additive: a batch containing a typed per-item error slot always takes the
-/// JSON envelope (the binary encodings have nowhere to put a typed failure),
-/// with the erroring slots rendered as `{"__error__": {class, message}}` and
-/// the surviving binary payloads keeping the existing base64 wrapper. Absent
-/// error slots the encoding is bit-for-bit what it always was, so existing
-/// consumers see no change.
+/// Port of `utils.encode_output_response`, byte-for-byte: one binary output
+/// renders raw, all-binary as `multipart/mixed`, anything else as the JSON
+/// `{"outputs": [...]}` envelope — which a batch carrying a typed per-item
+/// error slot always takes, since the binary encodings have nowhere to put
+/// one. See docs/inferio-transport.md, "Wire formats (Python parity)".
 fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
     let has_error_slot = outputs
         .iter()
@@ -1800,8 +1386,8 @@ fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
             .iter()
             .all(|output| matches!(output, WorkerOutput::Bytes(_)))
     {
-        // Python uses this fixed boundary (utils.py:44); the client's
-        // parser reads it back out of the Content-Type header either way.
+        // Python uses this fixed boundary; the client's parser reads it back
+        // out of the Content-Type header either way.
         const BOUNDARY: &str = "multipart-boundary";
         let mut body: Vec<u8> = Vec::new();
         for (idx, output) in outputs.iter().enumerate() {
@@ -1844,10 +1430,9 @@ fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
 }
 
 /// OpenAPI subdocument for the inference surface, nested under
-/// `/api/inference` by the gateway's main doc (`openapi.rs`). Paths here
-/// are router-relative, matching how [`router`] is mounted. Documented
-/// regardless of `inference_local`: when disabled, the same paths proxy to
-/// an upstream serving the same contract (minus `/health` on Python).
+/// `/api/inference` by the gateway's main doc; paths are router-relative.
+/// Documented regardless of `inference_local`, since when it is disabled the
+/// same paths proxy to an upstream serving the same contract.
 #[derive(OpenApi)]
 #[openapi(
     paths(

@@ -1454,7 +1454,7 @@
           {
             "name": "prewarm",
             "in": "query",
-            "description": "Additive over Python: lazy prewarm hint (design §8). Absent = true;\n`prewarm=false` suppresses keeping a warm worker of this model's\nimpl class after the load.",
+            "description": "Additive: lazy prewarm hint (absent = true); false keeps no warm worker.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -1573,7 +1573,7 @@
           {
             "name": "max_batch",
             "in": "query",
-            "description": "Additive over Python: per-request cap on dispatch-time batch merging.",
+            "description": "Additive: per-request cap on dispatch-time batch merging.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -1584,7 +1584,7 @@
           {
             "name": "prewarm",
             "in": "query",
-            "description": "Additive over Python: lazy prewarm hint, as on load (absent = true).",
+            "description": "Additive: lazy prewarm hint, as on load (absent = true).",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -6121,7 +6121,7 @@
         "properties": {
           "expirations": {
             "type": "object",
-            "description": "inference_id -> ISO-8601 expiration; never-expiring entries\n(ttl -1) render as `9999-12-31T23:59:59.999999`.",
+            "description": "inference_id -> ISO-8601 expiry; ttl -1 is `9999-12-31T23:59:59.999999`.",
             "additionalProperties": {
               "type": "string"
             },
@@ -8150,7 +8150,7 @@
       },
       "InferenceErrorBody": {
         "type": "object",
-        "description": "The body every inference error path serializes. Same `{\"detail\": …}`\nenvelope as [`crate::api_error::ErrorBody`]; only the detail is allowed to\nbe an object.",
+        "description": "The body every inference error path serializes: `{\"detail\": …}` as in\n[`crate::api_error::ErrorBody`], with an object detail permitted.",
         "required": [
           "detail"
         ],
@@ -8164,18 +8164,18 @@
         "oneOf": [
           {
             "type": "string",
-            "description": "router.py's plain detail strings. Never constructed here — the plain\nfailures keep going through [`crate::api_error::ErrorBody`], byte for\nbyte — but it is half of the wire contract and half of the generated\nclient's type, so it is documented rather than inferred from absence."
+            "description": "router.py's plain detail strings. Never constructed here (those go\nthrough [`crate::api_error::ErrorBody`]) but half of the wire contract."
           },
           {
             "$ref": "#/components/schemas/InferenceErrorFields",
-            "description": "A failure with a machine-readable [`InferenceErrorDetail::Message`]\nreplacement: `kind` names it, the rest is per-kind context."
+            "description": "Machine-readable: `kind` names the failure, the rest is its context."
           }
         ],
-        "description": "The `{\"detail\": …}` body of an inference error, in the two shapes this\nsurface answers with.\n\nThe string form is the original one and stays byte-identical for every\nfailure that already had a detail string (router.py parity, see the module\ndocs). The object form is additive and exists for the failures a *caller*\nhas to act on differently — today a worker death (a job re-queues) and,\nfor the load-failure cooldown, an \"unavailable until\" answer — so the\nmachine-readable half never has to be recovered by pattern-matching prose."
+        "description": "The `{\"detail\": …}` body of an inference error, in two shapes: the string\nform byte-identical for router.py parity, the object form additive."
       },
       "InferenceErrorFields": {
         "type": "object",
-        "description": "The fields a structured [`InferenceErrorDetail`] can carry. One flat,\nwholly-optional-but-`kind` struct rather than a variant per kind: every\nconsumer dispatches on `kind` first, and a single shape keeps the wire\ncontract (and the generated client type) from growing a case per failure\nmode.",
+        "description": "The fields a structured [`InferenceErrorDetail`] can carry — one flat\nstruct, since every consumer dispatches on `kind` first.",
         "required": [
           "kind"
         ],
@@ -8191,7 +8191,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "What went wrong, as a stable token: [`WORKER_DIED_KIND`], or\n`load_cooldown` for the per-model load-failure backoff."
+            "description": "A stable token: [`WORKER_DIED_KIND`], [`REQUEST_INCOMPLETE_KIND`],\n[`BODY_BUDGET_KIND`], `load_cooldown`."
           },
           "last_error": {
             "type": [
@@ -8205,7 +8205,7 @@
               "string",
               "null"
             ],
-            "description": "Human-readable summary; the string the plain form would have carried."
+            "description": "Human-readable summary: the string the plain form would carry."
           },
           "model": {
             "type": [
@@ -8232,7 +8232,7 @@
         "properties": {
           "data": {
             "type": "string",
-            "description": "JSON string of the batch: `{\"inputs\": [...]}` where each entry is an\nobject, a string, or null (null = file-only input)."
+            "description": "JSON string of the batch: `{\"inputs\": [...]}`, each entry an object,\na string, or null (file-only)."
           },
           "files": {
             "type": [
@@ -8242,7 +8242,7 @@
             "items": {
               "$ref": "#/components/schemas/BinaryBlob"
             },
-            "description": "Binary batch inputs. Each part's *filename* must be the integer\nindex of the `inputs` entry it attaches to."
+            "description": "Binary batch inputs; each part's *filename* is its `inputs` index."
           }
         }
       },
@@ -10902,7 +10902,7 @@
       },
       "PredictBodyBudgetHealth": {
         "type": "object",
-        "description": "What this process's predict-body budget is doing right now, for\n`/health`.\n\nA refusal is a `503` an operator will see in a job's logs, so the state\nthat produced it has to be readable somewhere that is not a guess. The\npair to watch is `in_flight_bytes` against `budget_bytes`: a job that is\nbeing refused while the first is far below the second is being refused by\na *burst* rather than by a level, and the answer is the caller's request\nsizing, not this number.",
+        "description": "What this process's predict-body budget is doing, for `/health`. A caller\nrefused while `in_flight_bytes` is far below `budget_bytes` is hitting a\n*burst*, and the answer is its own request sizing.",
         "required": [
           "request_limit_bytes",
           "budget_bytes",
@@ -10913,32 +10913,32 @@
           "budget_bytes": {
             "type": "integer",
             "format": "int64",
-            "description": "[`PREDICT_INFLIGHT_BODY_BYTES`]: predict body bytes this process will\nhold at once, across every connection and peer.",
+            "description": "[`PREDICT_INFLIGHT_BODY_BYTES`]: predict body bytes held at once.",
             "minimum": 0
           },
           "in_flight_bytes": {
             "type": "integer",
             "format": "int64",
-            "description": "Of those, how many are reserved right now — bodies arriving, plus\nbodies being parsed.",
+            "description": "Of those, how many are reserved now: arriving plus being parsed.",
             "minimum": 0
           },
           "refused_requests": {
             "type": "integer",
             "format": "int64",
-            "description": "Predict requests refused for want of budget since this process\nstarted. `0` is the number an operator should expect to see.",
+            "description": "Predict requests refused for want of budget since startup; `0` is\nwhat an operator should expect.",
             "minimum": 0
           },
           "request_limit_bytes": {
             "type": "integer",
             "format": "int64",
-            "description": "[`PREDICT_BODY_LIMIT`]: the largest single predict body this server\nwill read, past which it answers `413`.",
+            "description": "[`PREDICT_BODY_LIMIT`]: the largest body read, then `413`.",
             "minimum": 0
           }
         }
       },
       "PredictJsonResponse": {
         "type": "object",
-        "description": "JSON envelope of a predict response (used whenever the outputs are not\nall binary).",
+        "description": "JSON envelope of a predict response, unless every output is binary.",
         "required": [
           "outputs"
         ],
@@ -10948,7 +10948,7 @@
             "items": {
               "$ref": "#/components/schemas/Value"
             },
-            "description": "One output per input; binary outputs are wrapped as\n`{\"__type__\": \"base64\", \"content\": \"<base64>\"}`, and an input the\nmodel rejected on its own is\n`{\"__error__\": {\"class\": \"input\" | \"transient\", \"message\": \"...\"}}`."
+            "description": "One output per input; binary ones wrapped as\n`{\"__type__\": \"base64\", \"content\": ...}`, a rejected input as\n`{\"__error__\": {\"class\": ..., \"message\": ...}}`."
           }
         }
       },
