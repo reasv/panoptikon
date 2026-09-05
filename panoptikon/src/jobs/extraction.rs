@@ -462,6 +462,36 @@ struct JobCounters {
     inference_time: PhaseTimer,
 }
 
+impl JobCounters {
+    /// The `data_log` row these counters make. Every writer of that row goes
+    /// through here, so the eight counted fields cannot drift between the
+    /// per-item progress updates and the two endings; the four the call site
+    /// owns are what is left, whether the job is over, its own word for how
+    /// it ended and why.
+    fn data_log_update(
+        &self,
+        total_remaining: i64,
+        finished: bool,
+        outcome: &'static str,
+        failure_reason: Option<String>,
+    ) -> DataLogUpdate {
+        DataLogUpdate {
+            image_files: self.image_files,
+            video_files: self.video_files,
+            other_files: self.other_files,
+            total_segments: self.total_segments,
+            errors: self.errors,
+            input_errors: self.input_errors,
+            total_remaining,
+            data_load_time: self.data_load_time.busy_secs(),
+            inference_time: self.inference_time.busy_secs(),
+            finished,
+            outcome,
+            failure_reason,
+        }
+    }
+}
+
 /// How many of a job's unexplained item failures are recorded individually.
 /// The count in `data_log` stays exact; this bounds only the *listing*, which
 /// would otherwise be one row per item whenever the inference server is down.
@@ -738,24 +768,16 @@ async fn finalize_unfinished_job(
         let mut guard = counters.lock().await;
         let failures = std::mem::take(&mut guard.failures);
         let dropped = guard.failures_dropped;
-        let update = DataLogUpdate {
-            image_files: guard.image_files,
-            video_files: guard.video_files,
-            other_files: guard.other_files,
-            total_segments: guard.total_segments,
-            errors: guard.errors,
-            input_errors: guard.input_errors,
-            // Best available: the job stopped before it could re-run its own
-            // work query, so what is left is what it never got to.
-            total_remaining: total_remaining.saturating_sub(guard.processed),
-            data_load_time: guard.data_load_time.busy_secs(),
-            inference_time: guard.inference_time.busy_secs(),
-            // Not finished: `data_jobs.completed` must stay 0 so the
-            // atomic cleanup can do its work.
-            finished: false,
-            outcome: OUTCOME_FAILED,
-            failure_reason: Some(reason.to_string()),
-        };
+        // `total_remaining` is the best available: the job stopped before it
+        // could re-run its own work query, so what is left is what it never
+        // got to. Not finished, so `data_jobs.completed` stays 0 and the
+        // atomic cleanup can do its work.
+        let update = guard.data_log_update(
+            total_remaining.saturating_sub(guard.processed),
+            false,
+            OUTCOME_FAILED,
+            Some(reason.to_string()),
+        );
         (update, failures, dropped)
     };
     write_job_failures(index_db, job_id, failures, dropped).await;
@@ -1179,20 +1201,12 @@ async fn run_extraction_job_inner(
         } else {
             (OUTCOME_COMPLETED, None)
         };
-        let update = DataLogUpdate {
-            image_files: guard.image_files,
-            video_files: guard.video_files,
-            other_files: guard.other_files,
-            total_segments: guard.total_segments,
-            errors: guard.errors,
-            input_errors: guard.input_errors,
-            total_remaining: remaining_after,
-            data_load_time: guard.data_load_time.busy_secs(),
-            inference_time: guard.inference_time.busy_secs(),
-            finished: failure != JobFailure::Systemic && !abort.is_set(),
+        let update = guard.data_log_update(
+            remaining_after,
+            failure != JobFailure::Systemic && !abort.is_set(),
             outcome,
             failure_reason,
-        };
+        );
         // The stored times are phase wall-clock (busy); aggregate worker time
         // only goes to the log, where work / busy reads as average parallelism.
         tracing::info!(
@@ -2301,21 +2315,12 @@ async fn finalize_item(
             }
         }
 
-        let remaining = total_remaining.saturating_sub(guard.processed);
-        DataLogUpdate {
-            image_files: guard.image_files,
-            video_files: guard.video_files,
-            other_files: guard.other_files,
-            total_segments: guard.total_segments,
-            errors: guard.errors,
-            input_errors: guard.input_errors,
-            total_remaining: remaining,
-            data_load_time: guard.data_load_time.busy_secs(),
-            inference_time: guard.inference_time.busy_secs(),
-            finished: false,
-            outcome: OUTCOME_RUNNING,
-            failure_reason: None,
-        }
+        guard.data_log_update(
+            total_remaining.saturating_sub(guard.processed),
+            false,
+            OUTCOME_RUNNING,
+            None,
+        )
     };
     let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
         job_id,
