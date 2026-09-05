@@ -152,7 +152,7 @@ Normal spawn flow: `handshake` → `configure` → `load`. Pooled flow:
 |---|---|---|
 | `ok` | request-specific payload (below) | Success for the echoed `id`. |
 | `error` | `message` (str), `traceback` (str, may be empty) | Failure for the echoed `id`. The worker stays alive and serviceable after an `error` (a failed predict/load must not require a respawn) — except a failed `handshake`, after which it exits non-zero. |
-| `memory` | `memory` (a memory sample map) | **Not a response.** Telemetry for the request whose `id` it echoes, written *before* that request's `ok`/`error` — the only frame that may precede a terminal reply. Sent only from inside a granted `predict`, and only when the orchestrator set `batch_memory_frames` in the handshake. See "Per-batch memory frames". |
+| `memory` | `memory` (a memory sample map) | **Not a response.** Telemetry for the request whose `id` it echoes, written *before* that request's `ok`/`error` — the only frame that may precede a terminal reply. Sent only from inside a granted `predict`, and only when the orchestrator set `batch_memory_frames` in the handshake. Host tolerance is wider than worker behaviour: the reference orchestrator accepts such a frame for the id in flight on **any** request type, not only `predict`, so an impl that emits one elsewhere is absorbed rather than killed — but the frame is still specified as `predict`-only and nothing in tree sends one otherwise. See "Per-batch memory frames". |
 
 ### Memory grants (optional `predict` request fields)
 
