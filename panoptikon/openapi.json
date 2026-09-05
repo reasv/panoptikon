@@ -7875,7 +7875,7 @@
           "reserve_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "The VRAM withheld from the budget on top of `external_mb` itself: the\nreserve **actually applied** to this GPU, in MiB (run2 change R5).",
+            "description": "The VRAM withheld from the budget on top of `external_mb` itself: the\nreserve **actually applied** to this GPU, in MiB.",
             "minimum": 0
           },
           "reserve_rule": {
