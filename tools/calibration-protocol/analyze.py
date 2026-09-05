@@ -4,68 +4,21 @@
 Implements the verdict table of `docs/batch-calibration-test-protocol.md` §6.
 It joins, by wall-clock timestamp:
 
-    vramrec.jsonl         the independent NVML/RAM oracle
-    healthrec.jsonl       the gateway's own ledger view
-    hog.jsonl             what the external pressure generator actually held
-    fds.jsonl             optional descriptor recording for the gateway pid
-                          (`{"t_wall"|"iso", "fds", "sockets"[, "limit"]}`;
-                          the plain `<iso> fds=N sockets=M` form Phase 6 used
-                          is read too)
-    panoptikon.log        the ledger's structured log lines (commit 49822c8b)
-    calibration.before/after.toml   the persisted cost profiles
-    jobs.json             `/api/jobs/data/history` (LogRecord) and/or
-                          `/api/jobs/queue` output
-    probe*.json           one or more ceiling_probe.py results
+    vramrec.jsonl (the independent NVML/RAM oracle), healthrec.jsonl (the
+    gateway's own ledger view), hog.jsonl, fds.jsonl (optional), the ledger's
+    structured lines in panoptikon.log, calibration.before/after.toml,
+    jobs.json (jobs history and/or queue) and ceiling_probe.py's probe*.json.
 
 Usage
 -----
-    analyze.py --scenario results/<run>/<scenario>
-    analyze.py --scenario DIR --checks oracle_agreement,grant_safety,failures
-    analyze.py --scenario DIR --json verdicts.json --plot timeline.png
-    analyze.py --list-checks
-
-    # any file can be overridden individually
+    analyze.py --scenario results/<run>/<scenario> [--checks a,b,c]
+               [--json verdicts.json] [--plot timeline.png] | --list-checks
+    # or override any file individually:
     analyze.py --vramrec a.jsonl --healthrec b.jsonl --log c.log --probe p.json
 
-Options:
-    --scenario DIR        directory holding the standard file names
-    --checks LIST         comma-separated check names, or `all` (default: all
-                          checks whose inputs are present). A scenario declares
-                          which verdicts apply by passing this list.
-    --learning            this leg is a learning / cold-ramp scenario: it is
-                          *meant* to end with a fitted profile on disk. Naming
-                          `calibration_learned` in `--checks` declares the same
-                          thing. Under that declaration `calibration_learned`
-                          FAILs (rather than reporting) when nothing was
-                          learned, and the "no store was written" branch of
-                          `slope_accuracy`, `utilization` and `persistence`
-                          FAILs rather than WARNs. See "Declaring a learning
-                          leg" below.
-    --expect-ooms N       the scenario deliberately provokes N OOMs   (default 0)
-    --expect-deaths N     ... and N worker deaths                     (default 0)
-    --expect-failures N   ... and N failed items                      (default 0)
-    --expect-failed-jobs N  ... and N whole *jobs* that end not-`completed`.
-                          A scenario whose job is supposed to fail as a whole
-                          (S4g's "no room to load", a load-failure fixture)
-                          would otherwise FAIL `job_outcome` for succeeding at
-                          its own point                                (default 0)
-    --baseline-jobs PATH  a C0 `jobs.json` for the throughput comparison
-    --baseline-items-per-s F   or the number directly
-    --idle-window S       trailing seconds treated as "idle" for the
-                          liveness/recovery checks                  (default 60)
-    --join-tolerance S    max |dt| when joining two recordings      (default 1.5)
-    --base-window S       max |dt| between a worker's admission and the oracle
-                          sample `base_accuracy` compares it against (default 10)
-    --throughput-floor F  ratio of the C0 baseline that passes      (default 0.9)
-    --utilization-floor F ratio of the probe boundary that passes  (default 0.25)
-    --worker-pattern RE   which vramrec PIDs are ours
-                          (default `inferio_worker`)
-    --json PATH           machine-readable verdicts
-    --plot PATH           PNG timeline (skipped, with a note, if matplotlib is
-                          not importable -- it is never required)
-    --quiet               table only
-
-Exit code is 1 if any selected check FAILs, else 0.
+Options are in `--help`. A scenario declares which verdicts apply by naming
+them in `--checks`; a cold-ramp leg must add `--learning`. Exit code 1 if any
+selected check FAILs.
 
 Verdicts
 --------
@@ -74,37 +27,18 @@ Verdicts
     INFO  measured and reported, never judged (report-only rows in §6)
     SKIP  the inputs for this check were not present
 
-Every row prints the numbers behind the verdict, so a threshold that is missed
-by a small margin can be adjudicated by a human rather than by this script.
+Every row prints the numbers behind the verdict, so a threshold missed by a
+small margin can be adjudicated by a human rather than by this script.
 
-SKIP is never a result
-----------------------
-`SKIP` means *the harness did not record the input*. It must never be the
-answer to "the run produced no measurement", because a fault that destroys the
-measurement usually destroys the evidence with it, and a SKIP never sets the
-exit code. Run1's S15 mutation 1 (the worker halving its reported
-`peak_reserved_mb`) learned nothing at all, wrote no store, and reported
-`slope_accuracy SKIP` + `persistence SKIP` -- all green but for one row that
-only existed because that leg happened to be run with `--probe`. So:
+`SKIP` means *the harness did not record the input*, never "the run produced
+no measurement" -- and a SKIP never sets the exit code. So "the store was
+never written" is a **result** (WARN, or FAIL under `--learning`), while "no
+probe file / no log was given to me" is a **harness omission** (SKIP, with a
+pointer to what to pass). `grant_safety` is the check that decides safety, and
+it reports WARN, never PASS, without `vramrec.jsonl`.
 
-* "the store was never written" is a **result**: WARN, or FAIL under
-  `--learning`.
-* "no probe file / no log / no recording was given to me" is a **harness
-  omission**: SKIP, with a pointer to what to pass.
-* `calibration_learned` turns the three numbers `ramp_progress` already prints
-  into a verdict, so a leg that stopped measuring cannot come back green.
-
-The check that decides safety
------------------------------
-It is `grant_safety`, and specifically its **second clause**: every
-`issued a memory grant` line is joined to the vramrec oracle and the grant is
-compared with the GPU's *live free memory* at that instant. That clause needs
-`vramrec.jsonl`; without it `grant_safety` reports **WARN**, never PASS, so the
-silently-skipped clause is visible in the table. `ledger_invariant`'s strict
-form is not a substitute: it passes on a completely broken ledger (run1 S15
-mutation 2 zeroed `external`, making `limit_mb == total_mb`, and 0 of 498
-GPU-samples were over the limit while 335 of 335 grants exceeded the oracle's
-live free memory).
+See tools/calibration-protocol/README.md: "`analyze.py` - the verdict table",
+"Checks, one by one", "How a replica is tied to a process".
 """
 
 from __future__ import annotations
@@ -120,9 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# --------------------------------------------------------------------------
-# Loading
-# --------------------------------------------------------------------------
+# --- Loading ---------------------------------------------------------------
 
 
 def read_jsonl(path: Optional[Path]) -> List[Dict[str, Any]]:
@@ -147,22 +79,15 @@ LOG_LINE = re.compile(
 )
 FIELD_START = re.compile(r"(?<![\w.])([a-z_][a-z0-9_]*)=")
 FIELD = re.compile(r'([a-z_][a-z0-9_]*)=("(?:[^"\\]|\\.)*"|\S+)')
-# `docker logs` hands back exactly what the process wrote, and the gateway
-# writes ANSI colour to a terminal-less stdout, so a container leg's log is
-# full of `\x1b[32m` runs that break LOG_LINE on the very first field (the
-# level). Stripping them here rather than in every caller is what keeps a
-# Docker scenario from silently reporting `log 0 events` and three green
-# SKIPs where it should have three PASSes (run1 Phase 7b, S11-C4-fixed).
+# The gateway colours a terminal-less stdout, so a `docker logs` capture is
+# full of escapes that break LOG_LINE on its first field.
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def parse_log(path: Optional[Path]) -> List[Dict[str, Any]]:
-    """Parse `tracing_subscriber`'s default text format.
-
-    A line is `<rfc3339> <LEVEL> <target>: <message> k=v k="v" ...`; the
-    message is everything before the first `k=` token. ANSI escapes are
-    stripped first, so a raw `docker logs` capture parses like a file sink.
-    """
+    """Parse `tracing_subscriber`'s text format
+    `<rfc3339> <LEVEL> <target>: <message> k=v k="v" ...`; the message is
+    everything before the first `k=`. ANSI escapes are stripped first."""
     if path is None or not path.is_file():
         return []
     events: List[Dict[str, Any]] = []
@@ -221,12 +146,9 @@ FDREC_LINE = re.compile(
 def read_fds(path: Optional[Path]) -> List[Dict[str, Any]]:
     """Descriptor samples for the gateway process, if anything recorded them.
 
-    No tool in this directory records them: Phase 6 needed the number after
-    the fact (finding F6, the container `nofile` blocker) and sampled
-    `/proc/<pid>/fd` from a shell loop into `fdrec.txt`. Both that plain form
-    (`<iso> fds=N sockets=M [limit=N]`) and a JSONL form with the same keys
-    are accepted, so a scenario can produce whichever is cheaper. See the
-    README's "Recording file descriptors" for the recipe and the gap.
+    No tool in this directory records them; both the plain
+    `<iso> fds=N sockets=M [limit=N]` form and a JSONL form with the same keys
+    are read. See the README's "Recording file descriptors".
     """
     if path is None or not path.is_file():
         return []
@@ -282,9 +204,7 @@ def read_json(path: Optional[Path]) -> Optional[Any]:
         return None
 
 
-# --------------------------------------------------------------------------
-# Context
-# --------------------------------------------------------------------------
+# --- Context ---------------------------------------------------------------
 
 
 @dataclass
@@ -319,7 +239,6 @@ class Context:
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
         self._pid_first_seen: Optional[Dict[int, float]] = None
 
-    # -- joining ----------------------------------------------------------
     def vram_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
         return _nearest(self.vram_samples, self._vram_times, t_wall,
                         self.args.join_tolerance)
@@ -328,7 +247,6 @@ class Context:
         return _nearest(self.hog_samples, self._hog_times, t_wall,
                         self.args.join_tolerance)
 
-    # -- oracle -----------------------------------------------------------
     def oracle_gpu(self, sample: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
         for gpu in sample.get("gpus", []):
             if gpu.get("uuid") == uuid:
@@ -338,24 +256,11 @@ class Context:
     def our_pids_mb(self, gpu: Dict[str, Any]) -> Tuple[int, List[int]]:
         """Sum of NVML per-process usage for PIDs that are our workers.
 
-        A PID is ours on any of three routes: the gateway's own
-        `spawned an inferio worker ... pid=Some(N)` line named it; its recorded
-        cmdline matches `--worker-pattern`; or its recorded environ carries
-        BOTH `INFERIO_WORKER` and `PANOPTIKON_DEVICE_PIN` -- the pair the
-        orchestrator sets on a spawned worker (`worker.rs:597-681`).
-        `ceiling_probe.py` sets the pin alone, and `hog.py` neither, so neither
-        is mistaken for a resident.
-
-        The log route exists because the other two believe the recording. A
-        worker first sighted by NVML inside its own fork/exec window used to be
-        recorded with the `[comm]` cmdline of the spawning helper and an empty
-        env for its whole life (run1/S9: `"[panoptikon-spaw]"`, 815 of 815
-        samples), which made a resident nemotron worker holding up to 66 GiB
-        count as *external* here and, in `base_accuracy`, handed the row a
-        different worker's process. `vramrec.py`'s `ProcCache` no longer
-        memoizes that negative, but the log route is what lets a recording
-        already on disk -- run1's included -- be re-analysed correctly, and it
-        is the route that survives any future `/proc` read failure.
+        A PID is ours on any of three routes: a `spawned an inferio worker`
+        line named it; its cmdline matches `--worker-pattern`; or its environ
+        carries BOTH `INFERIO_WORKER` and `PANOPTIKON_DEVICE_PIN` (the pair
+        the orchestrator sets, which `ceiling_probe.py` and `hog.py` lack).
+        See the README's "How a replica is tied to a process".
         """
         total = 0
         pids: List[int] = []
@@ -377,18 +282,10 @@ class Context:
     def pid_first_seen(self) -> Dict[int, float]:
         """The first oracle sample in which each PID held memory on any GPU.
 
-        NVML lists a process from its first allocation, so this is the earliest
-        moment the recording can prove the process existed -- which is what
-        makes it a usable lower bound on "was this PID already there before the
-        replica under test was spawned?".
-
-        "Each PID" is really each *residency*: a pid number that vanishes from
-        every GPU for longer than `PID_REUSE_GAP_S` and comes back is read
-        as a new process, so a recycled pid cannot make a fresh worker look
-        decades old and lose its row. A live worker holds its base for as long
-        as it is resident, so it never gaps; run1 has no such gap in any of
-        its 61 recordings, and this host's `pid_max` is 4 194 304, so the
-        guard is insurance rather than a correction.
+        NVML lists a process from its first allocation, so this is a lower
+        bound on "was this PID there before the replica under test was
+        spawned?". "Each PID" is really each *residency*: a pid absent from
+        every GPU for longer than `PID_REUSE_GAP_S` and back is a new process.
         """
         if self._pid_first_seen is None:
             first: Dict[int, float] = {}
@@ -409,17 +306,9 @@ class Context:
                       admitted_t: float) -> Optional[Dict[str, Any]]:
         """The spawn record of the worker process behind this replica, if known.
 
-        The latest `spawned an inferio worker` line that `_worker_spawns` could
-        tie to this model and that precedes the admission. `None` when the log
-        carries no spawn line for the model, which is the normal case for a
-        recording made before `c8d64a5a` added the line (run1 has it in 9 of
-        its 61 legs) and for one logged below `panoptikon::inferio=debug`. The
+        The latest such line `_worker_spawns` could tie to this model and that
+        precedes the admission; `None` when the log carries none, and the
         caller must then say so rather than pretend the cross-check ran.
-
-        The record carries both `t_wall` and `pid`. Since run2 the line states
-        the inference id in the same event as the pid, so for those recordings
-        the pid *is* the answer to "which process is this replica" and no
-        heuristic is needed; see `attribute_replica_pid`.
         """
         best: Optional[Dict[str, Any]] = None
         for spawn in self.worker_spawns:
@@ -440,37 +329,10 @@ class Context:
     ) -> Tuple[Optional[int], Optional[str]]:
         """Which of our PIDs on the GPU is the replica that was just admitted.
 
-        **The pid the log states, when it states one.** A run2 spawn line
-        carries `inference_id=` and `pid=` as two fields of one event, so
-        `_worker_spawns` can name this replica's process outright; there is
-        nothing to infer and nothing that can be wrong about it. It is taken
-        as soon as the oracle has sighted that pid anywhere, whether or not
-        the pid is in the anchor sample's roster.
-
-        Otherwise the freshest one. A replica is admitted the instant *its own*
-        worker finishes loading, so among our processes already holding memory
-        at that moment, the one the oracle sighted last is the one that just
-        came up; every older PID is a resident that was already there. The one
-        hard constraint is the spawn line, when the log carries it: a PID first
-        sighted *before* this replica's worker was forked cannot be that
-        worker -- run1/S9's 346.7% FAIL was an older worker being the only PID
-        the recording could see.
-
-        A sighting after the admission is not disqualifying, only unhelpful:
-        the oracle samples at 1-4 Hz and a worker allocates a few hundred
-        milliseconds before its load returns, so on a slow cadence a replica's
-        own PID is routinely first seen in the sample *after* the admission
-        (14 of run1's legs). With one PID on the GPU that costs nothing --
-        it is the only thing it can be. With several it is genuinely
-        ambiguous, and the row is declined rather than guessed. That last case
-        is what the stated pid closes: run2's S2-base loaded four models onto
-        one GPU 7 s apart, and MiniLM's own worker was first sighted 5 ms
-        *after* its admission, so the freshest resident pid was the MobileCLIP
-        worker and the row compared MiniLM's 654 MiB `base_mb` against
-        MobileCLIP's 732 MiB process (10.66%, a FAIL that was pure
-        attribution).
-
-        Returns `(pid, None)`, or `(None, why)`.
+        The pid the spawn line states, when it states one. Otherwise the
+        freshest sighting inside [spawn, admission]; several equally plausible
+        candidates decline the row rather than guess. Returns `(pid, None)` or
+        `(None, why)`. See the README's "How a replica is tied to a process".
         """
         first = self.pid_first_seen()
         if spawn_pid is not None and (spawn_pid in pids
@@ -499,14 +361,10 @@ class Context:
                            admitted_t: float) -> Optional[float]:
         """When this model's replica left the GPU, if the recording says.
 
-        Two independent signals, whichever comes first: the ledger's own
-        `credited a departed replica's footprint ...` line for this
-        model/GPU, and the first health sample at or after the admission
-        that no longer lists a replica of this model on it. Either marks the
-        end of residency, and with it the end of any window in which the
-        worker's per-process figure is still `base_mb`: the process is tearing
-        its model down, and its NVML reading falls to the bare CUDA context on
-        the way out (run1/S6-b18-loadstall: 3 788 MiB for 178.5 s, then 550).
+        Whichever comes first of the `credited a departed replica's footprint`
+        line for this model/GPU and the first health sample at or after the
+        admission that no longer lists it. Either ends the window in which the
+        per-process figure is still `base_mb`.
         """
         end: Optional[float] = None
         for event in self.log:
@@ -549,68 +407,30 @@ class Context:
 
 SPAWN_PID = re.compile(r"(\d+)")
 CONFIGURED_AS = "Configured as "
-# What the spawn line carries in place of an inference id when the worker is
-# not being spawned for one -- the prewarm path (`worker.rs`,
-# `UNCONFIGURED_WORKER`).
+# What the spawn line carries when the worker is prewarmed, not claimed.
 UNCONFIGURED_WORKER = "<unconfigured>"
 DEPARTED_REPLICA = "credited a departed replica's footprint"
-# The ledger's per-negative out-of-memory tier line (run2 defect C2,
-# `ledger.rs::OomNegative::emit`): one INFO per window settled as an OOM
-# negative, carrying `source`, `trust`, `exception`, `free_mb_at_failure`,
-# `grant_mb` and `oom_samples`. Matched as a prefix of the message, whose
-# tail is the reason the line exists.
+# One INFO per window settled as an OOM negative, carrying `source`, `trust`,
+# `exception`, `free_mb_at_failure`, `grant_mb`, `oom_samples`; prefix match.
 OOM_TIER_LINE = "classified this window as an out-of-memory negative"
 
-# A pid number absent from every GPU for longer than this and then back is
-# read as a different process (`Context.pid_first_seen`).
+# A pid absent this long and then back is read as a different process.
 PID_REUSE_GAP_S = 60.0
 
-# Slack on "this PID was sighted before its own worker was forked". The
-# gateway's log clock and the recorder's are the same system clock, and a
-# worker needs hundreds of milliseconds of CUDA init before NVML lists it, so
-# the true margin is large and positive; the slack only absorbs a clock step
-# (an NTP correction mid-recording) turning a legitimate replica into a
-# decline. A *wrong*, older PID predates the spawn by many seconds -- run1/S9's
-# was minutes older -- so nothing this small can wave one through.
+# Slack on "sighted before its own worker was forked": enough for an NTP step,
+# far too little for a genuinely older PID.
 SPAWN_CLOCK_SLACK_S = 2.0
 
 
 def _worker_spawns(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Every `spawned an inferio worker` line, with the model it went on to be.
 
-    Since run2 the spawn line **states the inference id itself**
-    (`inference_id=tags/wd-vit-tagger-v3`, beside `worker=` and `pid=`), which
-    is the only pairing that cannot be wrong: the id and the pid are two
-    fields of one event. When it is present it is used and the queue below can
-    no longer overwrite it. `inference_id=<unconfigured>` is the prewarm path,
-    which really has no model at spawn, and is read as absent.
-
-    The queue is otherwise untouched, and a prewarmed worker is why: it is
-    spawned by impl class and only configured later, when something claims
-    it, so its `Configured as` line still has to be attributed the old way
-    even in a run where every other spawn states its id.
-
-    The fallback below is for recordings made before that -- run1's included.
-    The older line names the impl class (`worker=nemotron-embed-vl`) and the
-    OS pid (`pid=Some(1998478)`), not the inference id. The worker itself logs
-    `Configured as <inference id>` a moment later under the same `worker=`
-    field, so pairing the two in order -- FIFO per impl class -- names the
-    model behind each pid. A spawn with no such line stays `model: None` and
-    is only ever used as "this pid is one of ours", never as evidence about
-    which model it is.
-
-    The pairing is fail-closed, because the log cannot settle it. One impl
-    class serves many inference ids (`sentence_transformers` is every
-    sentence-transformer model), the `Configured as` line is the *worker's*
-    own stderr relayed under a label fixed at spawn, so it carries no pid --
-    the only lines that carry both a pid and an inference id are the death
-    and kill lines, long after the fact -- and two workers of one class that
-    are both mid-configure can finish in either order. So whenever a
-    `Configured as` line arrives with more than one spawn of its class still
-    pending, every spawn in that queue is marked ambiguous and none of them
-    ever takes a model: an unattributed pid costs a cross-check, a
-    cross-paired one would put a *wrong* spawn time on a replica. run1 has no
-    such case (56 spawns in S9, 0 ambiguous configures).
+    A spawn line stating `inference_id=` beside `pid=` is the only pairing
+    that cannot be wrong, and is used as-is. The `Configured as` queue below
+    is the fallback, FIFO per impl class and fail-closed: such a line arriving
+    with more than one spawn of its class pending marks the whole queue
+    ambiguous, and an ambiguous spawn never takes a model. See the README's
+    "How a replica is tied to a process".
     """
     spawns: List[Dict[str, Any]] = []
     pending: Dict[str, List[Dict[str, Any]]] = {}
@@ -636,9 +456,7 @@ def _worker_spawns(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not queue:
             continue
         if len(queue) > 1:
-            # Two of this class are up in the air at once: this line belongs
-            # to one of them and the log does not say which, and neither will
-            # the next one, so the whole queue loses its claim to a model.
+            # Two of this class in the air and the log cannot say which.
             for spawn in queue:
                 spawn["ambiguous"] = True
         head = queue.pop(0)
@@ -668,13 +486,10 @@ def _at_or_after(rows: List[Dict[str, Any]], times: List[float], target: float,
                  tolerance: float) -> Optional[Dict[str, Any]]:
     """The first sample at or after `target`, else the nearest one before it.
 
-    `_nearest` is wrong for a quantity that is still *rising* at `target`.
-    NVML's per-process figure climbs throughout a model load and the worker
-    reports `base_mb` only once the load has finished, so an oracle sample
-    taken 60 ms *before* the admission line can be hundreds of MiB short while
-    the sample 190 ms after it agrees to within the driver's own 8-10 MiB
-    per-process offset. Measured in run1/S1: 812 MiB at 05:53:38.108 against a
-    reported 964, and 974 MiB at 05:53:38.353.
+    `_nearest` is wrong for a quantity still *rising* at `target`: NVML's
+    per-process figure climbs throughout a load while `base_mb` is reported
+    only once it finished, so a sample just before the admission can be
+    hundreds of MiB short where one just after agrees.
     """
     if not rows:
         return None
@@ -691,10 +506,9 @@ def _pct(value: float, of: float) -> float:
 def health_gpus(health: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The per-GPU ledger rows of one `healthrec.py` sample.
 
-    `"vram"` (the server's own name for the section) since the 2026-09-05
-    vocabulary rename; `"boards"` is the same list under its old name, kept so
-    `results/run1` and `results/run2` stay analysable. Not `"gpus"`, which is
-    the GPU *inventory* in the same sample.
+    `"vram"` is the server's own name for the section; `"boards"` is the same
+    list under an older name, read so `results/run1` and `results/run2` stay
+    analysable. Not `"gpus"`, which is the GPU *inventory* in the same sample.
     """
     health = health or {}
     return health.get("vram") or health.get("boards") or []
@@ -708,28 +522,17 @@ def _pid_mb(gpu: Dict[str, Any], pid: int) -> Optional[int]:
     return None
 
 
-# The hog is judged to have been held "long enough for the ledger to have no
-# excuse" after this many seconds. `ledger.rs` refreshes `external` at grant
-# time with a 10 s staleness window and nothing polls, so the honest bound is
-# the staleness window plus one admission window; a window can be tens of
-# seconds under load (run1 measured `external_sample_age_ms` of 85.5 s with a
-# resident and 166.9 s overall, finding B2/T3). 60 s is the practical
-# threshold: it is far above any staleness window seen in run1 and far below
-# the length of any hog hold a scenario sets up, so a *late* update still
-# reports INFO and only a GPU that never moved at all FAILs.
+# How long a hog must hold, and how much, before `external_mb` not moving at
+# all is a fault rather than staleness. See the README's "Checks, one by one".
 HOG_STALL_SECONDS = 60.0
-
-# A hold this large is unambiguous pressure: no allocator jitter reaches it.
 HOG_STALL_MB = 1024
 
 
 def _declared_learning(ctx: "Context") -> bool:
     """Did this leg declare itself a learning / cold-ramp scenario?
 
-    Two equivalent declarations, so a scenario need not repeat itself: the
-    explicit `--learning` flag, or naming `calibration_learned` in `--checks`
-    (`--checks all` does not count -- it is the default and declares nothing).
-    """
+    Either `--learning`, or naming `calibration_learned` in `--checks`
+    (`--checks all` is the default and declares nothing)."""
     if getattr(ctx.args, "learning", False):
         return True
     return "calibration_learned" in getattr(ctx.args, "explicit_checks", set())
@@ -746,11 +549,8 @@ NO_STORE_HINT = ("this is a *result*, not a missing input: WARN, or FAIL when "
 
 
 def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]], Dict[str, int]]:
-    """Per-model `unit_budget` over time and the best `fit_samples` seen.
-
-    The single source for `ramp_progress` and `calibration_learned`, so the
-    verdict and the report-only row can never disagree about the numbers.
-    """
+    """Per-model `unit_budget` over time and the best `fit_samples` seen: one
+    source for `ramp_progress` and `calibration_learned`, so they agree."""
     series: Dict[str, List[int]] = {}
     fits: Dict[str, int] = {}
     for sample in ctx.health_samples:
@@ -771,9 +571,7 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
     }
 
 
-# --------------------------------------------------------------------------
-# Checks
-# --------------------------------------------------------------------------
+# --- Checks ----------------------------------------------------------------
 
 
 def check_oracle_agreement(ctx: Context) -> Verdict:
@@ -836,28 +634,19 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
 def check_base_accuracy(ctx: Context) -> Verdict:
     """`base_mb` vs the oracle's per-process usage at load time: +/-10% (nvml).
 
-    The comparison is anchored at the moment the worker was admitted, not at an
-    arbitrary later sample: NVML's per-process figure includes allocator pool
-    growth, so after the first window it measures base + pool, and only the
-    load-time reading is comparable to `base_mb`.
-
-    "At load time" has a hard right-hand edge: the replica's first grant or
-    first predict. From that instant the process holds the batch's cuBLAS and
-    cuDNN workspace as well as its base, and no sample taken later measures the
-    same quantity `base_mb` does. The reading is therefore the *minimum* over
-    the samples in [admission, first work), and a replica that starts its first
-    batch inside one sample period leaves that window empty -- run1/S9 predicted
-    46 ms after the load ok against a 1 Hz oracle. That is a fact about the
-    cadence, not about the ledger, so such a row is reported and not judged.
+    The reading is the *minimum* over [admission, first grant or predict):
+    past that edge the process holds the batch's workspace too. A replica that
+    starts its first batch inside one sample period leaves the window empty --
+    the oracle's cadence, not the ledger -- so the row is reported, not judged.
+    See the README's "How a replica is tied to a process".
     """
     if not ctx.health_samples or not ctx.vram_samples:
         return Verdict("base_accuracy", "SKIP", "needs healthrec and vramrec")
 
-    # When was each replica admitted? The ledger's own log line is exact; the
-    # first health sample that shows it is the fallback.
+    # When was each replica admitted? The log line is exact, the first health
+    # sample that shows it is the fallback.
     admitted: Dict[Tuple[str, str], float] = {}
-    # Both spellings: the message said "board" before the 2026-09-05
-    # vocabulary rename, and the run1/run2 recordings still carry it.
+    # Both spellings: older recordings carry the pre-rename message.
     for event in (ctx.log_events("admitted a worker to a GPU's ledger")
                   + ctx.log_events("admitted a worker to a board's ledger")):
         key = (str(event["fields"].get("model")), str(event["fields"].get("gpu")))
@@ -883,9 +672,7 @@ def check_base_accuracy(ctx: Context) -> Verdict:
     if not seen:
         return Verdict("base_accuracy", "SKIP", "no replica reported a base_mb")
 
-    # When did each model first do work? Either log line marks the end of the
-    # clean window: the grant is issued as the window opens, and the predict is
-    # the batch itself.
+    # When did each model first do work? Either line ends the clean window.
     work: Dict[str, List[float]] = {}
     for message in ("issued a memory grant", "processing local inference predict"):
         for event in ctx.log_events(message):
@@ -916,16 +703,7 @@ def check_base_accuracy(ctx: Context) -> Verdict:
                          "note": "no worker PID of ours on the GPU at the "
                                  "admission"})
             continue
-        # Which of them is this replica? Not "the only one", which is what the
-        # check used to require: a worker whose identity the recording missed
-        # is invisible to `our_pids_mb`, and then some *other*, older worker is
-        # the only PID left standing and gets waved through -- run1/S9 measured
-        # nemotron's `base_mb` against the MiniLM worker's process and reported
-        # 346.7%. `attribute_replica_pid` takes the pid the run2 spawn line
-        # states for this inference id, and failing that the freshest sighting
-        # inside [spawn, admission], so a GPU carrying several of our workers
-        # is resolved rather than declined, and a GPU carrying none that fits
-        # the replica is declined rather than guessed.
+        # Which of them is this replica -- never "the only one on the GPU".
         spawn = ctx.replica_spawn(model, info["t_wall"])
         spawn_t = None if spawn is None else spawn["t_wall"]
         spawn_pid = None if spawn is None else spawn["pid"]
@@ -947,13 +725,7 @@ def check_base_accuracy(ctx: Context) -> Verdict:
                            "freshest sighting at the admission, not "
                            "cross-checked against a spawn")
         # The window in which the process holds its base and nothing else:
-        # from the load `ok` (the admission line is 0.2 ms later) to the
-        # replica's first grant or predict -- or, if it never works, to the
-        # moment it leaves the GPU. Both edges matter: past the first grant
-        # the reading carries the batch's workspace, and past the departure it
-        # is a process tearing its model down, which is *below* base and would
-        # win the minimum outright (S6-b18-loadstall: 3 788 for 178.5 s, then
-        # 550).
+        # the load `ok` to the first grant or predict, or to its departure.
         times = work.get(model, [])
         index = bisect.bisect_left(times, info["t_wall"])
         busy_t = times[index] if index < len(times) else None
@@ -981,12 +753,8 @@ def check_base_accuracy(ctx: Context) -> Verdict:
             sample_t, reading = min(window, key=lambda pair: pair[1])
             cadence = None
         else:
-            # No sample landed in the window. The `_at_or_after` reading is
-            # still reported -- it is the nearest thing the recording has --
-            # but it provably contains the first batch's workspace, so it is
-            # not evidence about `base_mb` and the row is not judged. It is
-            # this PID's figure, never the GPU's sum over our workers: with
-            # more than one of ours resident the sum is several models.
+            # No sample in the window: report the nearest reading but do not
+            # judge it, and take this PID's figure, never the GPU's sum.
             sample_t = vram["t_wall"]
             reading = _pid_mb(oracle, pid)
             if reading is None:
@@ -1083,10 +851,9 @@ def check_footprint_agreement(ctx: Context) -> Verdict:
 def check_slope_accuracy(ctx: Context) -> Verdict:
     """Persisted slope vs ceiling_probe's: -30% .. +100%.
 
-    The two ways this check cannot run are *not* the same thing and no longer
-    share a verdict (run1 S15 hole H2). "No store was written" is what the run
-    did; "no probe file was passed" is what the harness forgot.
-    """
+    The two ways this check cannot run do not share a verdict: "no store was
+    written" is what the run did, "no probe file was passed" what the harness
+    forgot."""
     profiles = (ctx.after or {}).get("profile") or []
     if not profiles:
         return Verdict(
@@ -1145,17 +912,10 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
 def check_grant_safety(ctx: Context) -> Verdict:
     """THE safety check: grants vs their priced headroom AND the oracle's free memory.
 
-    The second clause is the one with teeth, and it is the only one: it joins
-    each grant to `vramrec.jsonl` and asks whether the grant exceeded the
-    GPU's *live free memory*. `ledger_invariant`'s strict form cannot stand
-    in for it -- run1's S15 mutation 2 zeroed `external`, so `limit_mb` became
-    `total_mb`, `ledger_invariant` passed on 0 of 498 breaches, and this clause
-    caught 335 of 335 grants over the oracle's free memory.
-
-    Without `vramrec.jsonl` that clause silently does not run, so the check
-    reports **WARN** rather than PASS: a scenario must never read as "safety
-    verified" on the priced-headroom clause alone, which only re-checks the
-    ledger's own arithmetic against itself.
+    The second clause is the one with teeth: it joins each grant to
+    `vramrec.jsonl` and asks whether it exceeded the GPU's *live* free memory.
+    Without that file the check reports WARN, never PASS -- the priced-headroom
+    clause alone only re-checks the ledger's arithmetic against itself.
     """
     grants = ctx.log_events("issued a memory grant")
     if not grants:
@@ -1186,8 +946,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
     if over_headroom or over_free:
         verdict = "FAIL"
     elif joined == 0:
-        # The oracle clause never ran. This is the clause that decides safety,
-        # so the row must not read PASS (run1 S15 hole H4).
+        # The clause that decides safety never ran, so this must not read PASS.
         verdict = "WARN"
     else:
         verdict = "PASS"
@@ -1216,12 +975,9 @@ def check_grant_safety(ctx: Context) -> Verdict:
 def check_failures(ctx: Context) -> Verdict:
     """OOM negatives, worker deaths and merged-window fallbacks in the log.
 
-    Each OOM negative also names the tier that classified it (run2 defect C2,
-    `ledger.rs::OomNegative::emit`), tallied here as `source/trust`. A
-    recording made before that line existed carries none, so the clause and
-    the `oom_tiers` number are added only when there is something to say --
-    an older scenario's verdicts are unchanged.
-    """
+    Where the log names the tier that classified each negative, it is tallied
+    as `source/trust`; a recording predating that line carries none, and the
+    clause is then omitted rather than reported empty."""
     if not ctx.log:
         return Verdict("failures", "SKIP", "no panoptikon.log")
     negatives = [
@@ -1248,8 +1004,7 @@ def check_failures(ctx: Context) -> Verdict:
     tier_clause = ""
     if tiers:
         named = ", ".join(f"{key}={count}" for key, count in sorted(tiers.items()))
-        # A negative with no tier line is a hole in the attribution, not a
-        # rounding error: say so rather than letting the tally look complete.
+        # A negative with no tier line is a hole in the attribution: say so.
         unnamed = ooms - sum(tiers.values())
         tier_clause = f"; tiers {named}"
         if unnamed:
@@ -1344,9 +1099,8 @@ def check_idle_liveness(ctx: Context) -> Verdict:
 def check_utilization(ctx: Context) -> Verdict:
     """Admitted units vs the probe's OOM boundary (or knee).
 
-    Same H2 split as `slope_accuracy`: "no worker was ever admitted" is a
-    result, "no probe boundary was passed" is a harness omission.
-    """
+    Same split as `slope_accuracy`: "no worker was ever admitted" is a result,
+    "no probe boundary was passed" a harness omission."""
     if not ctx.health_samples:
         return Verdict("utilization", "SKIP",
                        "no healthrec.jsonl in the scenario -- record the "
@@ -1393,8 +1147,7 @@ def check_utilization(ctx: Context) -> Verdict:
         for row in rows
     )
     if not any(row.get("boundary_units") for row in rows):
-        # Nothing to divide by: a missing input, so SKIP with the pointer --
-        # never a green row that looks like a measurement.
+        # Nothing to divide by: a missing input, so SKIP, never a green row.
         return Verdict("utilization", "SKIP",
                        detail + "  -- no probe boundary for any model: pass "
                        "--probe bisect-<model>.json (preferred: the check uses "
@@ -1464,9 +1217,8 @@ def _items_per_s(records: List[Dict[str, Any]]) -> float:
 def check_persistence(ctx: Context) -> Verdict:
     """The store must be written within 30 s of an anchor advance.
 
-    Same H2 split again: an absent or empty store is a result (WARN, FAIL under
-    `--learning`); an absent *log* is a harness omission (SKIP with a pointer).
-    """
+    Same split again: an absent or empty store is a result (WARN, FAIL under
+    `--learning`), an absent *log* a harness omission (SKIP)."""
     queued = ctx.log_events("queued a calibration profile update for the store")
     writes = ctx.log_events("wrote the local calibration store")
     after = ctx.after
@@ -1559,11 +1311,8 @@ def check_job_outcome(ctx: Context) -> Verdict:
     bad_outcomes = [row for row in queue_outcomes
                     if row.get("status") not in (None, "completed")]
     over = failed > ctx.args.expect_failures
-    # A scenario can declare that a whole job is *meant* to fail -- S4g asks a
-    # 2.5 GB model to load onto a GPU with 1 GB free, and the correct
-    # behaviour is a failed job with a readable per-model error. Without this
-    # knob such a scenario reports `job_outcome FAIL` for doing exactly what it
-    # set out to do (Phase 3, tool note 1).
+    # A scenario can declare that a whole job is *meant* to fail, or it would
+    # report `job_outcome FAIL` for doing exactly what it set out to do.
     expected_bad = ctx.args.expect_failed_jobs
     over_jobs = len(bad_outcomes) > expected_bad
     verdict = "FAIL" if (over or over_jobs) else "PASS"
@@ -1583,26 +1332,14 @@ def check_job_outcome(ctx: Context) -> Verdict:
 
 
 def check_ledger_invariant(ctx: Context) -> Verdict:
-    """The admission invariant, in both of the forms run1 showed it has.
+    """The admission invariant, in both of the forms it has.
 
-    **Strict form** (as §6 states it): on every GPU sample, the sum of our
-    charges plus our load reservations is at most `limit_mb`.
-
-    **"Our own residents" form** (findings T6 and P5-2): the strict form
-    *cannot* hold once the GPU is nearly full, and not because anything
-    over-committed. `limit = total - external x (1 + margin)` charges the
-    margin against the neighbour's level, so the limit reaches **0** while a
-    model we already loaded legitimately holds gigabytes -- measured at
-    `limit_mb = 2813` with 10 GB free and `0` with 4 GB free, with our own
-    residents holding 1.2-3.8 GB, and nothing in the design would unload
-    them. What still has to hold there is the form the ledger actually
-    enforces: **a grant never exceeds the headroom it was priced against, nor
-    the oracle's live free memory** (that is `grant_safety`, reported here
-    too so the two are read together).
-
-    So a breach in a sample whose `limit_mb` is 0 is arithmetic, not
-    over-commitment, and this check reports it as **WARN**; a breach against a
-    non-zero limit is a real violation and FAILs.
+    Strict form (§6): on every GPU sample, our charges plus our load
+    reservations are at most `limit_mb`. It cannot hold on a nearly-full GPU,
+    where `limit_mb` reaches 0 while our own residents legitimately hold
+    gigabytes, so a zero-limit breach reports WARN while one against a
+    non-zero limit FAILs. The form that must always hold is `grant_safety`'s,
+    restated on this row. See the README's "Checks".
     """
     if not ctx.health_samples:
         return Verdict("ledger_invariant", "SKIP", "no healthrec.jsonl")
@@ -1669,15 +1406,10 @@ def check_ledger_invariant(ctx: Context) -> Verdict:
 def check_hog_tracking(ctx: Context) -> Verdict:
     """`external_mb` must follow what hog.py actually holds (INFO, but see the FAIL form).
 
-    Report-only in general, because `external` is a window-boundary quantity
-    with a real staleness (finding B2/T3) and a GPU that updates *late* is
-    behaving as designed. There is exactly one shape that is not staleness at
-    all, and it FAILs: a hog that held at least `HOG_STALL_MB` for longer than
-    `HOG_STALL_SECONDS` while `external_mb` never moved by a single MiB across
-    the whole recording. That is not a late update, it is no update -- run1's
-    S15 mutation 2 (`external_locked` patched to return 0) reported
-    `external_mb 0..0 MiB` against a hog holding 30 720 MiB, and this row
-    reported it as an observation.
+    Report-only in general: `external` is a window-boundary quantity with a
+    real staleness, so a GPU that updates *late* is behaving as designed. One
+    shape is not staleness and FAILs: a hog held at `HOG_STALL_MB` or more for
+    `HOG_STALL_SECONDS` while `external_mb` never moved. See the README.
     """
     if not ctx.hog_samples or not ctx.health_samples:
         return Verdict("hog_tracking", "SKIP", "needs hog.jsonl and healthrec.jsonl")
@@ -1723,11 +1455,8 @@ def check_hog_tracking(ctx: Context) -> Verdict:
             deltas.append({"iso": current["iso"], "d_hog_mb": d_hog,
                            "d_external_mb": d_ext})
 
-    # --- the FAIL form (run1 S15 hole H3) --------------------------------
-    # How long did the hog hold real pressure, counting only the wall time
-    # between two consecutive joined samples that were *both* above the
-    # threshold? (A single spike between two idle samples buys no time, and an
-    # oscillating hog is charged only for the intervals it was actually up.)
+    # The FAIL form: wall time between two consecutive joined samples that
+    # were *both* above the threshold, so a spike buys no time.
     held_seconds = 0.0
     for previous, current in zip(rows, rows[1:]):
         if ((previous["hog_held_mb"] or 0) >= HOG_STALL_MB
@@ -1793,30 +1522,11 @@ def check_ramp_progress(ctx: Context) -> Verdict:
 def check_calibration_learned(ctx: Context) -> Verdict:
     """A learning leg must end having learned something: fit samples, a store, a moved anchor.
 
-    This is `ramp_progress`'s three numbers promoted to a verdict, and it exists
-    because of run1's S15 hole H1: a fault that destroys the *measurement* also
-    destroys the *evidence the other checks read*, and `analyze.py` turned that
-    into SKIP, which never sets the exit code. Mutation 1 (the worker halving
-    its reported `peak_reserved_mb`) put the high-water below the post-load
-    baseline, so the `grew` test never fired: `high_water_samples = 0` on all 96
-    grants, no fit ever formed, `unit_budget` never left the seed of 8 and no
-    store was ever written. `slope_accuracy` and `persistence` both SKIPped and
-    the leg was caught only by `utilization`, and only because it happened to
-    have been run with `--probe`.
-
-    FAILs -- rather than reporting -- only for a leg that declares itself a
-    learning scenario (`--learning`, or `calibration_learned` in `--checks`),
-    because a seeded or short leg legitimately learns nothing new. Three
-    conditions, any one of which is a failure:
-
-      * `fit samples == 0` for some model,
-      * no `[[profile]]` in `calibration.after.toml`,
-      * peak `unit_budget` never rose above the first value recorded.
-
-    The third reads the first health sample as "the seed". At healthrec's
-    default 500 ms that is within a sample of admission, and a leg that ramps
-    at all leaves it far behind (run1 S2: 8 -> 1024); a leg whose peak equals
-    its first sample never moved.
+    `ramp_progress`'s three numbers promoted to a verdict, so a leg that
+    stopped measuring cannot come back green on SKIPs alone. FAILs only for a
+    leg that declares itself a learning scenario, on any one of: `fit samples
+    == 0` for some model, no `[[profile]]` in `calibration.after.toml`, a peak
+    `unit_budget` no higher than the first recorded. See the README's "Checks".
     """
     learning = _declared_learning(ctx)
     profiles = (ctx.after or {}).get("profile") or []
@@ -1868,18 +1578,10 @@ def check_calibration_learned(ctx: Context) -> Verdict:
 def check_peak_fds(ctx: Context) -> Verdict:
     """Peak open descriptors for the gateway process, if anything recorded them.
 
-    Report-only, and it exists because of Phase 6's F6: with local inference
-    every in-flight predict is loopback HTTP inside one process, so it costs
-    **two** sockets in one descriptor table, and the in-flight budget now
-    follows the ledger's grant. In the shipped container (`nofile` soft 1024)
-    a 2000-item job reached 983 sockets, `accept` began failing with EMFILE,
-    SQLite could not open its files and 1849 items went unprocessed. The
-    branch raises its own soft limit at startup and clamps the in-flight
-    ceiling by the descriptor budget, so this row is how a platform pass
-    re-verifies that on its own deployment shape.
-
-    No recorder in this directory produces the input; see the README's
-    "Recording file descriptors".
+    Report-only: with local inference every in-flight predict is loopback HTTP
+    inside one process and so costs *two* sockets in one descriptor table. No
+    recorder here produces the input; see the README's "Recording file
+    descriptors".
     """
     rows = ctx.fds
     if not rows:
@@ -1944,9 +1646,7 @@ CHECKS: Dict[str, Callable[[Context], Verdict]] = {
 }
 
 
-# --------------------------------------------------------------------------
-# Plot (optional)
-# --------------------------------------------------------------------------
+# --- Plot (optional) -------------------------------------------------------
 
 
 def make_plot(ctx: Context, path: Path) -> str:
@@ -2025,9 +1725,7 @@ def make_plot(ctx: Context, path: Path) -> str:
     return f"wrote {path}"
 
 
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
+# --- CLI -------------------------------------------------------------------
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -2077,8 +1775,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
     # Which checks did the scenario name for itself? `all` is the default and
-    # declares nothing, so it must not count as a declaration (see
-    # `_declared_learning`).
+    # declares nothing (see `_declared_learning`).
     args.explicit_checks = (
         set()
         if args.checks.strip() == "all"
