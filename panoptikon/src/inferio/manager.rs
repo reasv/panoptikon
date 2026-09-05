@@ -2014,17 +2014,14 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    // ------------------------------------------------------------------
     // Pure state-machine tests (no workers, injected clock).
-    // ------------------------------------------------------------------
 
     fn at(now: DateTime<Local>, seconds: i64) -> DateTime<Local> {
         now + chrono::Duration::seconds(seconds)
     }
 
-    /// LRU eviction is oldest-first on insert: with lru_size 2, loading a
-    /// third model evicts the first-inserted one, and since that was its
-    /// only cache-key reference it is reported for unload.
+    /// Eviction is oldest-first, a repeated load renews the position, and the
+    /// evicted model is reported for unload.
     #[test]
     fn lru_evicts_oldest_first() {
         let now = Local::now();
@@ -2032,35 +2029,18 @@ mod tests {
         assert!(cache.touch_load("g/a", "k", 2, -1, now).is_empty());
         assert!(cache.touch_load("g/b", "k", 2, -1, now).is_empty());
         let unloads = cache.touch_load("g/c", "k", 2, -1, now);
-        assert_eq!(
-            unloads,
-            vec!["g/a".to_string()],
-            "oldest entry evicted and unloaded"
-        );
+        assert_eq!(unloads, vec!["g/a".to_string()], "oldest evicted");
         assert!(!cache.refs_non_empty("g/a"));
         assert!(cache.refs_non_empty("g/b") && cache.refs_non_empty("g/c"));
-    }
 
-    /// Repeated load renews the LRU position (Python move_to_end,
-    /// manager.py:73-74): after re-loading `a`, adding a third model evicts
-    /// `b` — the now-oldest — not `a`.
-    #[test]
-    fn reload_moves_entry_to_most_recent() {
-        let now = Local::now();
-        let mut cache = CacheState::default();
-        cache.touch_load("g/a", "k", 2, -1, now);
+        // Renewing `b` makes `c` the oldest, so the next insert evicts it.
         cache.touch_load("g/b", "k", 2, -1, now);
-        cache.touch_load("g/a", "k", 2, -1, now); // renew: a becomes most recent
-        let unloads = cache.touch_load("g/c", "k", 2, -1, now);
-        assert_eq!(
-            unloads,
-            vec!["g/b".to_string()],
-            "b was oldest after a's renewal"
-        );
+        let unloads = cache.touch_load("g/d", "k", 2, -1, now);
+        assert_eq!(unloads, vec!["g/c".to_string()], "renewal reorders");
     }
 
-    /// A model referenced by two cache keys survives eviction/removal from
-    /// one of them; it is unloaded only when the last reference disappears.
+    /// A model unloads only when its last cache-key reference goes, whether
+    /// that happens through `remove` or through `clear` of a whole key.
     #[test]
     fn model_unloads_only_when_last_ref_removed() {
         let now = Local::now();
@@ -2071,41 +2051,23 @@ mod tests {
         let outcome = cache.remove("k1", "g/a");
         assert!(outcome.was_present);
         assert_eq!(outcome.unload, None, "still referenced by k2");
-        assert!(cache.refs_non_empty("g/a"));
-
         let outcome = cache.remove("k2", "g/a");
         assert_eq!(outcome.unload, Some("g/a".to_string()), "last ref gone");
         assert!(!cache.refs_non_empty("g/a"));
-
-        // Removing a non-existent entry reports absence (unload_model's
-        // `false if not cached` contract).
+        // Removing a non-existent entry reports absence.
         assert!(!cache.remove("k2", "g/a").was_present);
-    }
 
-    /// clear() drops a whole cache key: models whose only reference lived
-    /// there are unloaded, models still referenced elsewhere survive; the
-    /// returned count is the number of entries removed.
-    #[test]
-    fn clear_cache_respects_other_refs() {
-        let now = Local::now();
-        let mut cache = CacheState::default();
         cache.touch_load("g/only", "k1", 10, -1, now);
         cache.touch_load("g/shared", "k1", 10, -1, now);
         cache.touch_load("g/shared", "k2", 10, -1, now);
-
         let (count, unloads) = cache.clear("k1");
-        assert_eq!(count, 2);
-        assert_eq!(unloads, vec!["g/only".to_string()]);
-        assert!(cache.refs_non_empty("g/shared"));
-
+        assert_eq!((count, unloads), (2, vec!["g/only".to_string()]));
+        assert!(cache.refs_non_empty("g/shared"), "k2 still references it");
         let (count, unloads) = cache.clear("nope");
         assert_eq!((count, unloads.len()), (0, 0), "unknown key clears nothing");
     }
 
-    /// TTL expiry semantics: strictly-past finite expirations are removed,
-    /// ttl -1 (never) survives any amount of time, and pinned models are
-    /// skipped entirely even when their expiration is past (a model can't
-    /// expire mid-predict/mid-load).
+    /// Expiry removes past finite entries, skips ttl -1, and skips pinned ones.
     #[test]
     fn expire_honors_never_and_pins() {
         let now = Local::now();
@@ -2123,42 +2085,37 @@ mod tests {
             "pinned skipped while expired"
         );
 
-        // Unpinning with a fresh TTL restores the window: not expired right
-        // after, expired once the restored TTL passes.
+        // Unpinning with a fresh TTL restores the window.
         cache.unpin_restore("g/pinned", "k", 10, at(now, 5));
         assert!(cache.expire(at(now, 6)).is_empty());
         let unloads = cache.expire(at(now, 16));
         assert_eq!(unloads, vec!["g/pinned".to_string()]);
     }
 
-    /// The pin is a refcount (design §5): with two overlapping predicts the
-    /// first unpin must not expose the model to expiry — only after the
-    /// last unpin does the sweeper see it again.
+    /// The pin is a refcount: the first of two unpins must not expose the model.
     #[test]
     fn overlapping_pins_do_not_unpin_each_other() {
         let now = Local::now();
         let mut cache = CacheState::default();
         cache.touch_load("g/a", "k", 10, 1, now);
-        cache.pin("g/a"); // predict 1 (via key k)
-        cache.pin("g/a"); // predict 2 (via another path)
+        cache.pin("g/a");
+        cache.pin("g/a");
 
         cache.unpin_restore("g/a", "k", 1, now);
         assert!(
             cache.expire(at(now, 60)).is_empty(),
             "still pinned by the second predict"
         );
-
         cache.unpin_restore("g/a", "k", 1, at(now, 60));
         assert!(
             cache.expire(at(now, 61)).is_empty(),
-            "restored ttl not yet past"
+            "restored ttl not past"
         );
         assert_eq!(cache.expire(at(now, 62)), vec!["g/a".to_string()]);
     }
 
-    /// Expiration rendering matches Python datetime.isoformat(): six
-    /// fractional digits when microseconds are non-zero, none when zero,
-    /// and `None` for never (datetime.max on the wire).
+    /// Rendering matches the wire's isoformat, `None` is never, and a ttl chrono
+    /// cannot represent saturates to Never instead of panicking.
     #[test]
     fn expiration_renders_like_python_isoformat() {
         use chrono::TimeZone;
@@ -2167,15 +2124,7 @@ mod tests {
         let with_micros = base + chrono::Duration::microseconds(123456);
         assert_eq!(isoformat(&with_micros), "2026-07-05T12:34:56.123456");
         assert_eq!(Expiration::Never.render(), None);
-    }
 
-    /// Expiration::new must never panic on huge ttl_seconds (a raw i64
-    /// query param under attacker control — a panic here poisons the state
-    /// mutex and bricks the manager): values chrono cannot represent
-    /// saturate to Never, while ordinary TTLs still yield finite
-    /// expirations.
-    #[test]
-    fn huge_ttl_saturates_to_never_instead_of_panicking() {
         let now = Local::now();
         assert_eq!(Expiration::new(i64::MAX, now), Expiration::Never);
         assert_eq!(Expiration::new(9_000_000_000_000, now), Expiration::Never);
@@ -2183,9 +2132,7 @@ mod tests {
         assert_eq!(Expiration::new(-1, now), Expiration::Never);
     }
 
-    /// registry default_batch_size resolution follows the Python consumers'
-    /// merge (group metadata overlaid by id metadata, id wins); missing or
-    /// non-positive values yield None.
+    /// default_batch_size: group metadata overlaid by id, non-positive absent.
     #[test]
     fn registry_default_batch_merges_group_and_id_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -2224,18 +2171,14 @@ config.impl_class = "cls"
         assert_eq!(registry_default_batch(&registry, "missing/x"), None);
     }
 
-    // ------------------------------------------------------------------
     // Integration tests with real worker subprocesses.
-    // ------------------------------------------------------------------
 
-    /// Repo root = CARGO_MANIFEST_DIR/.. (the panoptikon crate lives one level
-    /// below the workspace root).
+    /// Repo root: the crate lives one level below the workspace root.
     fn workspace_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
     }
 
-    /// Test interpreter default: the managed venv (`python/.venv`) if
-    /// present, else the legacy root `.venv` (pre-restructure installs).
+    /// The managed venv if present, else the legacy root `.venv`.
     fn test_venv_python(root: &Path, rel: &str) -> PathBuf {
         let managed = root.join("python/.venv").join(rel);
         if managed.is_file() {
@@ -2245,13 +2188,11 @@ config.impl_class = "cls"
         }
     }
 
-    /// Same spawn setup as the worker.rs tests: repo venv python, cwd =
-    /// repo root, PYTHONPATH=python, NO_CUDNN, fixture impl dir.
+    /// The same spawn setup as the worker.rs tests.
     fn test_spawn_config() -> WorkerSpawnConfig {
         let root = workspace_root();
-        // PANOPTIKON_TEST_PYTHON overrides the repo-venv interpreter (any
-        // python with msgpack works), e.g. running the suite under WSL
-        // against a Windows checkout, whose .venv is a Windows venv.
+        // PANOPTIKON_TEST_PYTHON overrides the repo venv (any python with
+        // msgpack works), e.g. running the suite under WSL.
         let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
             Some(explicit) => PathBuf::from(explicit),
             None if cfg!(windows) => test_venv_python(&root, "Scripts/python.exe"),
@@ -2271,14 +2212,12 @@ config.impl_class = "cls"
             env_remove: Vec::new(),
             cwd: Some(root),
             deadlines: WorkerDeadlines::default(),
-            // The fixture impls echo `CUDA_VISIBLE_DEVICES`, which is also
-            // what every non-ROCm host writes.
+            // The fixtures echo `CUDA_VISIBLE_DEVICES`.
             pin_env_var: crate::inferio::gpu::CUDA_PIN_ENV_VAR,
         }
     }
 
-    /// Synthetic registry covering every fixture impl, so the manager path
-    /// exercises RegistryCache -> spawn_spec for real.
+    /// Synthetic registry covering every fixture impl.
     const TEST_REGISTRY_TOML: &str = r#"
 [external_inputs.manager_test_value]
 label = "Manager test value"
@@ -2296,9 +2235,7 @@ config.impl_class = "echo_test"
 config.impl_class = "slow_test"
 [group.slow.inference_ids.test]
 
-# Slow *load* (R6): the phase the retired global load lock was held across.
-# Two ids so a test can load two different models concurrently and watch the
-# device-admission gate decide whether they overlap.
+# Slow *load*: two ids so a test can load two models concurrently.
 [group.slowload]
 config.impl_class = "slow_load_test"
 config.load_seconds = 3.0
@@ -2321,7 +2258,7 @@ config.impl_class = "failbatch_test"
 config.impl_class = "dying_test"
 [group.dying.inference_ids.test]
 
-# Dies while idle, a second after load: the liveness-sweep fixture (P5-6).
+# Dies while idle, a second after load: the liveness-sweep fixture.
 [group.idledeath]
 config.impl_class = "idle_death_test"
 config.die_after_seconds = 1.0
@@ -2339,8 +2276,7 @@ config.impl_class = "external_env_test"
 config.impl_class = "does_not_exist"
 [group.missing.inference_ids.test]
 
-# Multi-replica WorkerSets (design §8 / Phase 3). devices pins are just env
-# strings the device_test fixture reads back — no GPU involved.
+# Multi-replica WorkerSets; the device pins are env strings the fixture echoes.
 [group.device]
 config.impl_class = "device_test"
 config.devices = ["3", "7"]
@@ -2350,8 +2286,7 @@ metadata.cost.epoch = 4
 metadata.cost.seed_units = 1000000
 [group.device.inference_ids.test]
 
-# Same fixture with no devices pin: the universal-pinning path (resolved to
-# the default GPU's UUID when a GPU inventory is known).
+# Same fixture with no devices pin: the universal-pinning path.
 [group.devplain]
 config.impl_class = "device_test"
 [group.devplain.inference_ids.test]
@@ -2372,88 +2307,39 @@ config.replicas = 2
         _registry_dir: tempfile::TempDir,
     }
 
-    /// Default setup: unknown GPU inventory, i.e. exactly the pre-pinning
-    /// behaviour (no `CUDA_VISIBLE_DEVICES` unless the registry pins one).
-    /// [`test_manager_with_gpus`] covers resolved pinning.
-    fn test_manager(sweep_interval: Duration, default_max_batch: u32) -> TestSetup {
-        test_manager_with_deadlines(
-            sweep_interval,
-            default_max_batch,
-            WorkerDeadlines::default(),
-        )
-    }
-
-    fn test_manager_with_deadlines(
-        sweep_interval: Duration,
-        default_max_batch: u32,
-        deadlines: WorkerDeadlines,
-    ) -> TestSetup {
-        test_manager_full(
-            sweep_interval,
-            default_max_batch,
-            deadlines,
-            GpuInventory::unknown(),
-            None,
-            LoadPolicy::default(),
-        )
-    }
-
-    /// A manager whose load-path policy is not the shipped default (R6/R9).
-    fn test_manager_with_loads(loads: LoadPolicy) -> TestSetup {
-        test_manager_full(
-            Duration::from_secs(60),
-            32,
-            WorkerDeadlines::default(),
-            GpuInventory::unknown(),
-            None,
-            loads,
-        )
-    }
-
-    fn test_manager_with_gpus(gpus: GpuInventory) -> TestSetup {
-        test_manager_full(
-            Duration::from_secs(60),
-            32,
-            WorkerDeadlines::default(),
-            gpus,
-            None,
-            LoadPolicy::default(),
-        )
-    }
-
-    fn test_manager_with_calibration(calibration: Arc<dyn CalibrationProfiles>) -> TestSetup {
-        test_manager_full(
-            Duration::from_secs(60),
-            32,
-            WorkerDeadlines::default(),
-            GpuInventory::unknown(),
-            Some(calibration),
-            LoadPolicy::default(),
-        )
-    }
-
-    fn test_manager_with_gpus_and_calibration(
-        gpus: GpuInventory,
-        calibration: Arc<dyn CalibrationProfiles>,
-    ) -> TestSetup {
-        test_manager_full(
-            Duration::from_secs(60),
-            32,
-            WorkerDeadlines::default(),
-            gpus,
-            Some(calibration),
-            LoadPolicy::default(),
-        )
-    }
-
-    fn test_manager_full(
+    /// Overrides for [`test_manager_with`]. The defaults are the shipped
+    /// policies with an unknown GPU inventory, i.e. no pinning.
+    struct ManagerOpts {
         sweep_interval: Duration,
         default_max_batch: u32,
         deadlines: WorkerDeadlines,
         gpus: GpuInventory,
         calibration: Option<Arc<dyn CalibrationProfiles>>,
         loads: LoadPolicy,
-    ) -> TestSetup {
+    }
+
+    impl Default for ManagerOpts {
+        fn default() -> Self {
+            Self {
+                sweep_interval: Duration::from_secs(60),
+                default_max_batch: 32,
+                deadlines: WorkerDeadlines::default(),
+                gpus: GpuInventory::unknown(),
+                calibration: None,
+                loads: LoadPolicy::default(),
+            }
+        }
+    }
+
+    fn test_manager(sweep_interval: Duration, default_max_batch: u32) -> TestSetup {
+        test_manager_with(ManagerOpts {
+            sweep_interval,
+            default_max_batch,
+            ..Default::default()
+        })
+    }
+
+    fn test_manager_with(opts: ManagerOpts) -> TestSetup {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("registry.toml"), TEST_REGISTRY_TOML).unwrap();
         let registry = Arc::new(StdMutex::new(RegistryCache::new(RegistryConfig {
@@ -2461,24 +2347,22 @@ config.replicas = 2
         })));
         let cfg = ManagerConfig {
             spawn: WorkerSpawnConfig {
-                deadlines,
+                deadlines: opts.deadlines,
                 ..test_spawn_config()
             },
-            default_max_batch,
-            sweep_interval,
-            loads,
-            // Pool disabled: these tests cover the manager's Python-parity
-            // semantics; the prewarm pool has its own suite (prewarm.rs).
+            default_max_batch: opts.default_max_batch,
+            sweep_interval: opts.sweep_interval,
+            loads: opts.loads,
+            // Pool disabled: prewarm.rs has its own suite.
             prewarm: PrewarmConfig {
                 enabled: false,
                 lazy: false,
                 always_warm: Vec::new(),
             },
-            gpus,
+            gpus: opts.gpus,
             vram: VramBudgets::default(),
-            // Usually no calibration store: these tests assert manager
-            // semantics, and a store would make them write a profile file.
-            calibration,
+            // Usually no store: it would write a profile file.
+            calibration: opts.calibration,
         };
         TestSetup {
             manager: ModelManager::new(cfg, registry),
@@ -2493,6 +2377,54 @@ config.replicas = 2
         }
     }
 
+    /// `load_model` with lru_size 10 and no prewarm hint.
+    async fn load(
+        manager: &ModelManager,
+        inference_id: &str,
+        cache_key: &str,
+        ttl_seconds: i64,
+    ) -> Result<()> {
+        manager
+            .load_model(inference_id, cache_key, 10, ttl_seconds, None)
+            .await
+    }
+
+    /// A load onto `keys` must not get a permit within 250 ms.
+    async fn admission_blocks(manager: &ModelManager, keys: &[Option<String>], label: &str) {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                manager.acquire_load_admission("m/blocked", keys),
+            )
+            .await
+            .is_err(),
+            "{label}"
+        );
+    }
+
+    /// `predict` with the arguments these tests never vary: lru_size 10, no
+    /// prewarm hint, one data input.
+    async fn predict_one(
+        manager: &ModelManager,
+        inference_id: &str,
+        cache_key: &str,
+        ttl_seconds: i64,
+        max_batch: Option<u32>,
+        value: serde_json::Value,
+    ) -> Result<Vec<WorkerOutput>> {
+        manager
+            .predict(
+                inference_id,
+                cache_key,
+                10,
+                ttl_seconds,
+                max_batch,
+                None,
+                vec![data_input(value)],
+            )
+            .await
+    }
+
     /// Batch size reported by a batchsize_test output.
     fn reported_batch(output: &WorkerOutput) -> u64 {
         match output {
@@ -2501,82 +2433,17 @@ config.replicas = 2
         }
     }
 
-    /// predict auto-loads the model (spawn + handshake + load) and returns
-    /// outputs; a second predict reuses the same worker — the load
-    /// generation is unchanged, proving no respawn happened.
-    #[tokio::test]
-    async fn predict_auto_loads_and_reuses_worker() {
-        let setup = test_manager(Duration::from_secs(60), 32);
-        let manager = &setup.manager;
-
-        let outputs = manager
-            .predict(
-                "echo/test",
-                "key",
-                10,
-                60,
-                None,
-                None,
-                vec![data_input(json!({"text": "a"}))],
-            )
-            .await
-            .expect("first predict auto-loads");
-        assert_eq!(
-            outputs,
-            vec![WorkerOutput::Json(json!({"echo": {"text": "a"}}))]
-        );
-        let generation = manager.loaded_generation("echo/test").expect("loaded");
-        assert_eq!(
-            manager.cached_models(),
-            BTreeMap::from([("echo/test".to_string(), vec!["key".to_string()])])
-        );
-
-        let outputs = manager
-            .predict(
-                "echo/test",
-                "key",
-                10,
-                60,
-                None,
-                None,
-                vec![data_input(json!(2))],
-            )
-            .await
-            .expect("second predict");
-        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": 2}))]);
-        assert_eq!(
-            manager.loaded_generation("echo/test"),
-            Some(generation),
-            "same worker: no respawn between predicts"
-        );
-
-        manager.shutdown().await;
-    }
-
     #[tokio::test]
     async fn declared_external_input_is_resolved_and_passed_at_worker_spawn() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = &setup.manager;
         assert!(
-            manager
-                .load_model("externalenv/test", "key", 10, 60, None)
-                .await
-                .is_err(),
+            load(manager, "externalenv/test", "key", 60).await.is_err(),
             "missing required input prevents worker creation"
         );
 
         unsafe { std::env::set_var("INFERIO_MANAGER_EXTERNAL_INPUT_XYZ", "latest-value") };
-        let output = manager
-            .predict(
-                "externalenv/test",
-                "key",
-                10,
-                60,
-                None,
-                None,
-                vec![data_input(json!(null))],
-            )
-            .await;
+        let output = predict_one(manager, "externalenv/test", "key", 60, None, json!(null)).await;
         unsafe { std::env::remove_var("INFERIO_MANAGER_EXTERNAL_INPUT_XYZ") };
         assert_eq!(
             output.expect("worker receives current input"),
@@ -2587,21 +2454,17 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// Cache-key refcounting: a model loaded under two keys survives losing
-    /// one (still serves predicts on the same worker); removing the last
-    /// key unloads it (cache empty), and the next predict auto-loads a
-    /// fresh worker (generation increases).
+    /// predict auto-loads the model; losing one of two cache keys keeps that
+    /// worker, and losing the last unloads it.
     #[tokio::test]
     async fn cache_key_refcount_governs_unload() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = &setup.manager;
 
-        manager
-            .load_model("echo/test", "a", 10, -1, None)
+        load(manager, "echo/test", "a", -1)
             .await
             .expect("load via a");
-        manager
-            .load_model("echo/test", "b", 10, -1, None)
+        load(manager, "echo/test", "b", -1)
             .await
             .expect("load via b");
         let generation = manager.loaded_generation("echo/test").expect("loaded");
@@ -2612,16 +2475,7 @@ config.replicas = 2
             BTreeMap::from([("echo/test".to_string(), vec!["b".to_string()])]),
             "still referenced by b"
         );
-        let outputs = manager
-            .predict(
-                "echo/test",
-                "b",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!("x"))],
-            )
+        let outputs = predict_one(manager, "echo/test", "b", -1, None, json!("x"))
             .await
             .expect("still serves");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": "x"}))]);
@@ -2636,16 +2490,7 @@ config.replicas = 2
         // Removing again reports "not cached".
         assert!(!manager.unload_model("b", "echo/test").await.unwrap());
 
-        let outputs = manager
-            .predict(
-                "echo/test",
-                "b",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!(1))],
-            )
+        let outputs = predict_one(manager, "echo/test", "b", -1, None, json!(1))
             .await
             .expect("respawns after unload");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": 1}))]);
@@ -2660,12 +2505,13 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// lru_size = 1: loading a second model under the same cache key evicts
-    /// the first (oldest), which unloads because no other key references
-    /// it; only the second stays cached.
+    /// End to end over the whole cache lifecycle on the echo fixture:
+    /// `lru_size = 1` evicts and unloads the previous model under the same key,
+    /// and a ttl=1s model is swept away while a ttl=-1 one loaded alongside it
+    /// survives.
     #[tokio::test]
-    async fn lru_size_one_evicts_previous_model() {
-        let setup = test_manager(Duration::from_secs(60), 32);
+    async fn ttl_expiry_unloads_but_never_survives() {
+        let setup = test_manager(Duration::from_millis(200), 32);
         let manager = &setup.manager;
 
         manager
@@ -2676,37 +2522,21 @@ config.replicas = 2
             .load_model("echo/second", "k", 1, -1, None)
             .await
             .expect("load second");
-
         assert_eq!(
             manager.cached_models(),
             BTreeMap::from([("echo/second".to_string(), vec!["k".to_string()])]),
-            "first model evicted and unloaded"
+            "lru_size 1: the first model was evicted and unloaded"
         );
         assert_eq!(manager.loaded_generation("echo/test"), None);
         assert!(manager.loaded_generation("echo/second").is_some());
 
-        manager.shutdown().await;
-    }
-
-    /// End-to-end TTL: with a short sweeper interval, a ttl=1s model is
-    /// unloaded after expiry while a ttl=-1 model loaded alongside it
-    /// survives.
-    #[tokio::test]
-    async fn ttl_expiry_unloads_but_never_survives() {
-        let setup = test_manager(Duration::from_millis(200), 32);
-        let manager = &setup.manager;
-
-        manager
-            .load_model("echo/second", "k", 10, -1, None)
+        load(manager, "echo/second", "k", -1)
             .await
             .expect("load never");
-        manager
-            .load_model("echo/test", "k", 10, 1, None)
+        load(manager, "echo/test", "k", 1)
             .await
             .expect("load short ttl");
-
         tokio::time::sleep(Duration::from_millis(2500)).await;
-
         let cached = manager.cached_models();
         assert!(
             !cached.contains_key("echo/test"),
@@ -2721,31 +2551,18 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// Predict pins the model against TTL expiry: a 1.5s predict with
-    /// ttl=1s and a 100ms sweeper completes successfully and the model is
-    /// still cached right after (with a restored finite expiration), then
-    /// expires normally once the restored TTL passes.
+    /// A predict outlives its own TTL, then expires on the restored one.
     #[tokio::test]
     async fn predict_pins_model_against_expiry() {
         let setup = test_manager(Duration::from_millis(100), 32);
         let manager = &setup.manager;
 
-        let outputs = manager
-            .predict(
-                "slow/test",
-                "k",
-                10,
-                1,
-                None,
-                None,
-                vec![data_input(json!(null))],
-            )
+        let outputs = predict_one(manager, "slow/test", "k", 1, None, json!(null))
             .await
             .expect("predict outlives its ttl thanks to the pin");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"slow": true}))]);
 
-        // Immediately after completion the model is still cached and its
-        // expiration was restored to a finite timestamp (not never).
+        // Still cached, with a restored *finite* expiration.
         let expirations = manager.cache_expirations("k");
         assert!(
             expirations
@@ -2764,35 +2581,18 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// Dispatch-time batching: while the worker is busy with the first
-    /// (solo) request, concurrently fired single-input predicts queue up
-    /// and merge into one batch — the batchsize_test impl reports the batch
-    /// size it saw, so the first response reports 1 and the rest report a
-    /// merged batch > 1 (and never above the server default cap).
+    /// Requests queued behind a busy worker merge into one window, under the cap.
     #[tokio::test]
     async fn concurrent_predicts_merge_into_batches() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
-        manager
-            .load_model("batch/test", "k", 10, -1, None)
-            .await
-            .expect("load");
+        load(&manager, "batch/test", "k", -1).await.expect("load");
 
         let first = {
             let manager = manager.clone();
             tokio::spawn(async move {
-                manager
-                    .predict(
-                        "batch/test",
-                        "k",
-                        10,
-                        -1,
-                        None,
-                        None,
-                        vec![data_input(json!(0))],
-                    )
-                    .await
+                predict_one(&manager, "batch/test", "k", -1, None, json!(0)).await
             })
         };
         // Let the first request dispatch alone (worker sleeps 300ms).
@@ -2802,17 +2602,7 @@ config.replicas = 2
         for i in 0..5 {
             let manager = manager.clone();
             rest.push(tokio::spawn(async move {
-                manager
-                    .predict(
-                        "batch/test",
-                        "k",
-                        10,
-                        -1,
-                        None,
-                        None,
-                        vec![data_input(json!(i))],
-                    )
-                    .await
+                predict_one(&manager, "batch/test", "k", -1, None, json!(i)).await
             }));
         }
 
@@ -2836,74 +2626,20 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// Explicit max_batch caps merging: many queued single-input requests
-    /// all carrying max_batch=2 are dispatched in batches of at most 2 —
-    /// no response may report a larger batch.
-    #[tokio::test]
-    async fn explicit_max_batch_caps_merged_batches() {
-        let setup = test_manager(Duration::from_secs(60), 32);
-        let manager = setup.manager.clone();
-
-        manager
-            .load_model("batch/test", "k", 10, -1, None)
-            .await
-            .expect("load");
-
-        let mut tasks = Vec::new();
-        for i in 0..6 {
-            let manager = manager.clone();
-            tasks.push(tokio::spawn(async move {
-                manager
-                    .predict(
-                        "batch/test",
-                        "k",
-                        10,
-                        -1,
-                        Some(2),
-                        None,
-                        vec![data_input(json!(i))],
-                    )
-                    .await
-            }));
-        }
-        for task in tasks {
-            let outputs = task.await.unwrap().expect("capped predict");
-            let batch = reported_batch(&outputs[0]);
-            assert!(batch <= 2, "batch {batch} exceeds the explicit cap of 2");
-        }
-
-        manager.shutdown().await;
-    }
-
-    /// Port of the batch-failure fallback (process_model.py
-    /// `_batch_predict`): the failbatch_test impl rejects any merged batch
-    /// (>1 input) but serves singles, so queued requests that got merged
-    /// still all succeed — the dispatcher falls back to per-request
-    /// prediction instead of failing the whole window.
+    /// A window a worker rejects falls back to per-request prediction.
     #[tokio::test]
     async fn merged_batch_failure_falls_back_to_per_request() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
-        manager
-            .load_model("failbatch/test", "k", 10, -1, None)
+        load(&manager, "failbatch/test", "k", -1)
             .await
             .expect("load");
 
         let first = {
             let manager = manager.clone();
             tokio::spawn(async move {
-                manager
-                    .predict(
-                        "failbatch/test",
-                        "k",
-                        10,
-                        -1,
-                        None,
-                        None,
-                        vec![data_input(json!(0))],
-                    )
-                    .await
+                predict_one(&manager, "failbatch/test", "k", -1, None, json!(0)).await
             })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2912,17 +2648,7 @@ config.replicas = 2
         for i in 0..3 {
             let manager = manager.clone();
             rest.push(tokio::spawn(async move {
-                manager
-                    .predict(
-                        "failbatch/test",
-                        "k",
-                        10,
-                        -1,
-                        None,
-                        None,
-                        vec![data_input(json!(i))],
-                    )
-                    .await
+                predict_one(&manager, "failbatch/test", "k", -1, None, json!(i)).await
             }));
         }
 
@@ -2936,32 +2662,16 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// P5-6: a replica that dies while **idle** is found by the sweeper.
-    ///
-    /// Nothing reads an idle worker's pipe, so the EOF a death produces is
-    /// never noticed by a request — a grantless model can be advertised in
-    /// `/health` for as long as nobody predicts against it. The fixture dies
-    /// a second after load with no request in flight; only the sweeper's
-    /// `ReapIdle` tick can discover it, and when it does the model takes the
-    /// normal death route: dropped from `/health`, dropped from every cache.
+    /// A replica that dies while **idle** is found by the sweeper's `ReapIdle`
+    /// tick — nothing reads an idle worker's pipe, so no request ever sees the
+    /// EOF — and then takes the normal death route.
     #[tokio::test]
     async fn an_idle_replica_that_dies_is_found_by_the_liveness_sweep() {
         let setup = test_manager(Duration::from_millis(100), 32);
         let manager = &setup.manager;
 
-        // One predict to make it resident (and to prove it was healthy).
-        // ttl -1: it must stay loaded, so a disappearance is the sweep's
-        // doing and never a TTL expiry.
-        let outputs = manager
-            .predict(
-                "idledeath/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!(1))],
-            )
+        // Resident at ttl -1, so a disappearance is the sweep and not expiry.
+        let outputs = predict_one(manager, "idledeath/test", "k", -1, None, json!(1))
             .await
             .expect("the fixture serves normally before it dies");
         assert_eq!(outputs.len(), 1);
@@ -2972,9 +2682,8 @@ config.replicas = 2
             "its replica is advertised"
         );
 
-        // Now the worker exits under the manager, idle. Poll rather than
-        // sleep a fixed span: without the reap tick this never happens and
-        // the test fails on the bound instead of flaking on timing.
+        // Poll: without the reap tick this never happens, so the test fails on
+        // the bound rather than flaking on timing.
         let mut found = false;
         for _ in 0..200 {
             if manager.health().model_count == 0 {
@@ -2997,25 +2706,13 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// Fatal worker death: a predict against a worker that dies mid-request
-    /// fails with the supervision error, the model is dropped from all
-    /// caches (no phantom /cache entries), and the next predict auto-loads
-    /// a fresh worker instead of hitting a poisoned one.
+    /// A worker that dies mid-predict drops the model everywhere and respawns.
     #[tokio::test]
     async fn worker_death_cleans_up_and_next_predict_respawns() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = &setup.manager;
 
-        let err = manager
-            .predict(
-                "dying/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!(1))],
-            )
+        let err = predict_one(manager, "dying/test", "k", -1, None, json!(1))
             .await
             .expect_err("worker exits mid-predict");
         assert!(
@@ -3023,8 +2720,7 @@ config.replicas = 2
             "error surfaces the failed predict: {err:#}"
         );
 
-        // Death cleanup runs in the dispatcher task right after the reply;
-        // give it a beat.
+        // Death cleanup runs in the dispatcher right after the reply.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             manager.cached_models().is_empty(),
@@ -3032,19 +2728,9 @@ config.replicas = 2
         );
         assert_eq!(manager.loaded_generation("dying/test"), None);
 
-        // The next predict spawns a fresh worker (which also dies — but the
-        // fatal error proves a new process served it rather than a closed
-        // queue or a poisoned handle).
-        let err = manager
-            .predict(
-                "dying/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!(2))],
-            )
+        // The next predict spawns a fresh worker, which also dies — but a
+        // *predict* failure proves a new process served it.
+        let err = predict_one(manager, "dying/test", "k", -1, None, json!(2))
             .await
             .expect_err("fresh worker also dies");
         assert!(
@@ -3055,35 +2741,7 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// Load failure (unknown impl class): the error propagates with the
-    /// worker's own message, and no LRU entry or cache reference is left
-    /// behind — Python leaves a phantom id in /cache here; we don't.
-    #[tokio::test]
-    async fn failed_load_leaves_no_cache_entry() {
-        let setup = test_manager(Duration::from_secs(60), 32);
-        let manager = &setup.manager;
-
-        let err = manager
-            .load_model("missing/test", "k", 10, -1, None)
-            .await
-            .expect_err("impl class does not exist");
-        assert!(
-            format!("{err:#}").contains("does_not_exist"),
-            "worker's handshake error is preserved: {err:#}"
-        );
-        assert!(manager.cached_models().is_empty(), "no phantom cache entry");
-        assert!(
-            manager.cache_expirations("k").is_empty(),
-            "no LRU entry left behind"
-        );
-
-        manager.shutdown().await;
-    }
-
-    /// Shutdown flushes the calibration store. A window that landed inside
-    /// the write debounce is exactly the desktop case — quitting a few
-    /// seconds after a ramp step — and losing it would silently mean
-    /// re-ramping on the next run.
+    /// Shutdown flushes a calibration update still inside the write debounce.
     #[tokio::test]
     async fn shutdown_flushes_the_calibration_store() {
         use super::super::calibration::{CalibrationStore, ProfileUpdate, StoreEnv, StorePaths};
@@ -3103,8 +2761,10 @@ config.replicas = 2
             },
             Duration::from_secs(3600),
         );
-        let setup =
-            test_manager_with_calibration(Arc::clone(&store) as Arc<dyn CalibrationProfiles>);
+        let setup = test_manager_with(ManagerOpts {
+            calibration: Some(Arc::clone(&store) as Arc<dyn CalibrationProfiles>),
+            ..Default::default()
+        });
         let update = |slope: f64| ProfileUpdate {
             inference_id: "echo/test".to_owned(),
             epoch: 1,
@@ -3130,8 +2790,7 @@ config.replicas = 2
             }],
         };
 
-        // The first update has no previous write to wait behind, so it lands
-        // on its own and primes the debounce.
+        // The first update lands on its own and primes the debounce.
         store.record(update(0.25));
         let mut waited = Duration::ZERO;
         while !path.exists() && waited < Duration::from_secs(5) {
@@ -3154,76 +2813,47 @@ config.replicas = 2
         );
     }
 
-    /// Graceful manager shutdown: workers are unloaded via the graceful
-    /// ladder, the cache empties, and subsequent loads/predicts are
-    /// refused.
+    /// A fresh manager reports "ok" and no models; shutdown unloads gracefully,
+    /// empties the cache, flips both status fields and refuses new work.
     #[tokio::test]
     async fn shutdown_unloads_workers_and_refuses_new_requests() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = &setup.manager;
 
-        manager
-            .load_model("echo/test", "k", 10, -1, None)
-            .await
-            .expect("load");
+        let health = manager.health();
+        assert_eq!(health.status, "ok");
+        assert!(!health.shutting_down);
+        assert!(health.registry_ok, "the temp registry TOML parses");
+        assert_eq!(health.model_count, 0);
+        assert!(health.models.is_empty());
+
+        load(manager, "echo/test", "k", -1).await.expect("load");
         manager.shutdown().await;
 
         assert!(manager.cached_models().is_empty());
-        let err = manager
-            .load_model("echo/test", "k", 10, -1, None)
+        let err = load(manager, "echo/test", "k", -1)
             .await
             .expect_err("loads refused after shutdown");
         assert!(format!("{err:#}").contains("shutting down"));
-        let err = manager
-            .predict(
-                "echo/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!(1))],
-            )
+        let err = predict_one(manager, "echo/test", "k", -1, None, json!(1))
             .await
             .expect_err("predicts refused after shutdown");
         assert!(format!("{err:#}").contains("shutting down"));
     }
 
-    /// An output the orchestrator cannot convert to JSON (the nan_test
-    /// fixture returns float NaN on demand) is a per-request error, not a
-    /// fatal supervision error: the requesting caller gets the error, the
-    /// worker survives (load generation unchanged — no respawn), and a
-    /// follow-up normal predict on the very same worker succeeds.
+    /// An unconvertible output is a per-request error, not a fatal one.
     #[tokio::test]
     async fn unconvertible_output_fails_one_request_but_worker_survives() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = &setup.manager;
 
-        let outputs = manager
-            .predict(
-                "nan/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!("ok"))],
-            )
+        let outputs = predict_one(manager, "nan/test", "k", -1, None, json!("ok"))
             .await
             .expect("normal predict");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": true}))]);
         let generation = manager.loaded_generation("nan/test").expect("loaded");
 
-        let err = manager
-            .predict(
-                "nan/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!("nan"))],
-            )
+        let err = predict_one(manager, "nan/test", "k", -1, None, json!("nan"))
             .await
             .expect_err("NaN output has no JSON form");
         assert!(
@@ -3231,8 +2861,7 @@ config.replicas = 2
             "error names the unconvertible output: {err:#}"
         );
 
-        // If this were (wrongly) classified fatal, death cleanup would drop
-        // the model shortly after; give that a beat to prove it doesn't.
+        // A beat to prove death cleanup does *not* run.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             manager.loaded_generation("nan/test"),
@@ -3240,16 +2869,7 @@ config.replicas = 2
             "same worker: the conversion failure must not kill it"
         );
 
-        let outputs = manager
-            .predict(
-                "nan/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!("ok"))],
-            )
+        let outputs = predict_one(manager, "nan/test", "k", -1, None, json!("ok"))
             .await
             .expect("worker still serves after the failed request");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": true}))]);
@@ -3257,40 +2877,23 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// A predict future dropped mid-flight (client disconnect) must release
-    /// its TTL pin via the RAII guard: after aborting a slow predict, the
-    /// model still expires and unloads once the restored TTL passes. With a
-    /// leaked pin the model would be exempt from expiry forever and this
-    /// poll would time out.
+    /// A predict dropped mid-flight releases its pin through [`PinGuard`]'s
+    /// Drop, so the model still expires; with a leaked pin it never would.
     #[tokio::test]
     async fn aborted_predict_releases_pin_and_model_still_expires() {
         let setup = test_manager(Duration::from_millis(100), 32);
         let manager = setup.manager.clone();
 
         // Load first so the abort lands mid-predict, not mid-spawn.
-        manager
-            .load_model("slow/test", "k", 10, 1, None)
-            .await
-            .expect("load");
+        load(&manager, "slow/test", "k", 1).await.expect("load");
 
         let task = {
             let manager = manager.clone();
             tokio::spawn(async move {
-                manager
-                    .predict(
-                        "slow/test",
-                        "k",
-                        10,
-                        1,
-                        None,
-                        None,
-                        vec![data_input(json!(null))],
-                    )
-                    .await
+                predict_one(&manager, "slow/test", "k", 1, None, json!(null)).await
             })
         };
-        // Let the predict enqueue and pin (the fixture predict takes 1.5s),
-        // then drop it mid-flight.
+        // Let the predict enqueue and pin, then drop it mid-flight.
         tokio::time::sleep(Duration::from_millis(400)).await;
         task.abort();
         let _ = task.await;
@@ -3312,42 +2915,28 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// A worker wedged in predict (the stuck-CUDA case) must never need a
-    /// manual process kill: predict has no deadline — how long a model
-    /// legitimately takes is unknowable — so the bound sits on the unload
-    /// drain instead. Shutdown gives the in-flight window `unload_grace`,
-    /// then kills the stuck worker, so Ctrl-C always converges. The hang
-    /// fixture sleeps 600s; without the bounded drain this test would hang
-    /// until the fixture returns.
+    /// A worker wedged in predict never needs a manual kill: predict has no
+    /// deadline, so the bound sits on the unload drain — shutdown gives the
+    /// in-flight window `unload_grace` and then kills it.
     #[tokio::test]
     async fn shutdown_kills_worker_wedged_in_predict() {
         let deadlines = WorkerDeadlines {
             unload_grace: Duration::from_secs(1),
             ..WorkerDeadlines::default()
         };
-        let setup = test_manager_with_deadlines(Duration::from_secs(60), 32, deadlines);
+        let setup = test_manager_with(ManagerOpts {
+            deadlines,
+            ..Default::default()
+        });
         let manager = setup.manager.clone();
 
         // Load first so shutdown lands mid-predict, not mid-spawn.
-        manager
-            .load_model("hang/test", "k", 10, 60, None)
-            .await
-            .expect("load");
+        load(&manager, "hang/test", "k", 60).await.expect("load");
 
         let task = {
             let manager = manager.clone();
             tokio::spawn(async move {
-                manager
-                    .predict(
-                        "hang/test",
-                        "k",
-                        10,
-                        60,
-                        None,
-                        None,
-                        vec![data_input(json!(null))],
-                    )
-                    .await
+                predict_one(&manager, "hang/test", "k", 60, None, json!(null)).await
             })
         };
         // Let the window dispatch to the worker before shutting down.
@@ -3378,67 +2967,7 @@ config.replicas = 2
         }
     }
 
-    /// Multi-replica device pinning end to end (design §8): a model with
-    /// `devices = ["3", "7"]` spawns two replicas, each seeing its own
-    /// CUDA_VISIBLE_DEVICES, and both serve the one shared FIFO queue —
-    /// enough concurrent single predicts (max_batch 1 so windows never
-    /// merge) must be answered by BOTH pins, proving the set has exactly
-    /// the two replicas and the dispatcher actually spreads windows across
-    /// them.
-    ///
-    /// This is also the **unknown-inventory passthrough** case for
-    /// universal pinning: with no GPU inventory and CUDA's pin vocabulary
-    /// (which is what a default `GpuInventory` carries, as here) the
-    /// registry's raw index strings reach the child unchanged, exactly as
-    /// before pinning existed. The claim is scoped to that vocabulary: an
-    /// uninventoried *ROCm* host canonicalises index pins and drops
-    /// non-numeric ones instead (`gpu.rs::resolve_hip_pin_uninventoried`).
-    #[tokio::test]
-    async fn multi_replica_devices_serve_shared_queue() {
-        let setup = test_manager(Duration::from_secs(60), 32);
-        let manager = setup.manager.clone();
-
-        manager
-            .load_model("device/test", "k", 10, -1, None)
-            .await
-            .expect("load spawns both replicas");
-
-        // 4 concurrent singles against 0.5s predicts: the first two windows
-        // occupy both replicas, the rest queue and go to whichever frees.
-        let mut tasks = Vec::new();
-        for i in 0..4 {
-            let manager = manager.clone();
-            tasks.push(tokio::spawn(async move {
-                manager
-                    .predict(
-                        "device/test",
-                        "k",
-                        10,
-                        -1,
-                        Some(1),
-                        None,
-                        vec![data_input(json!(i))],
-                    )
-                    .await
-            }));
-        }
-        let mut devices = std::collections::BTreeSet::new();
-        for task in tasks {
-            let outputs = task.await.unwrap().expect("predict on a pinned replica");
-            devices.insert(reported_device(&outputs[0]));
-        }
-        assert_eq!(
-            devices,
-            std::collections::BTreeSet::from(["3".to_string(), "7".to_string()]),
-            "both configured device pins served requests (and no third replica exists)"
-        );
-
-        manager.shutdown().await;
-    }
-
-    /// Inventory for the pinning tests: two GPUs whose indices (0 and 3)
-    /// cover both the default-placement and the index-mapping paths. Equal
-    /// compute capability, so the default pin is decided by index (GPU 0).
+    /// Two GPUs (indices 0 and 3) of equal capability, so index 0 is default.
     fn test_gpus() -> GpuInventory {
         GpuInventory::known(vec![
             GpuInfo {
@@ -3466,86 +2995,69 @@ config.replicas = 2
         ])
     }
 
-    /// Universal pinning (batch-calibration design): a replica the registry
-    /// left unpinned is spawned on the default GPU *by UUID*, not left
-    /// seeing every device. The fixture echoes its CUDA_VISIBLE_DEVICES, so
-    /// the reported value is the proof.
+    /// The two replicas of `device/test` serve one shared FIFO queue and both
+    /// answer, and each one's `CUDA_VISIBLE_DEVICES` says how its registry pin
+    /// resolved: with no inventory the raw index strings reach the child
+    /// unchanged, and with one, index 3 becomes its GPU's UUID while the
+    /// invisible index 7 passes through rather than being guessed at. A replica
+    /// the registry left unpinned lands on the default GPU, also by UUID.
     #[tokio::test]
-    async fn unpinned_replica_is_pinned_to_the_default_gpu() {
-        let setup = test_manager_with_gpus(test_gpus());
-        let manager = &setup.manager;
+    async fn index_device_pins_map_to_gpu_uuids() {
+        for (label, gpus, expected) in [
+            ("no inventory", GpuInventory::unknown(), ["3", "7"]),
+            ("known inventory", test_gpus(), ["GPU-3333", "7"]),
+        ] {
+            let setup = test_manager_with(ManagerOpts {
+                gpus,
+                ..Default::default()
+            });
+            let manager = setup.manager.clone();
+            load(&manager, "device/test", "k", -1)
+                .await
+                .expect("load spawns both replicas");
 
-        let outputs = manager
-            .predict(
-                "devplain/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!(1))],
-            )
+            // 4 singles against 0.5s predicts: two occupy both replicas, two
+            // queue and go to whichever frees first.
+            let mut tasks = Vec::new();
+            for i in 0..4 {
+                let manager = manager.clone();
+                tasks.push(tokio::spawn(async move {
+                    predict_one(&manager, "device/test", "k", -1, Some(1), json!(i)).await
+                }));
+            }
+            let mut devices = std::collections::BTreeSet::new();
+            for task in tasks {
+                let outputs = task.await.unwrap().expect("predict on a pinned replica");
+                devices.insert(reported_device(&outputs[0]));
+            }
+            assert_eq!(
+                devices,
+                expected.map(str::to_owned).into_iter().collect(),
+                "{label}: both pins served, and no third replica exists"
+            );
+            manager.shutdown().await;
+        }
+
+        let setup = test_manager_with(ManagerOpts {
+            gpus: test_gpus(),
+            ..Default::default()
+        });
+        let manager = &setup.manager;
+        let outputs = predict_one(manager, "devplain/test", "k", -1, None, json!(1))
             .await
-            .expect("predict on the pinned replica");
+            .expect("predict on the unpinned replica");
         assert_eq!(
             reported_device(&outputs[0]),
             "GPU-0000",
             "an unpinned replica resolves to the default GPU's UUID"
         );
-
         manager.shutdown().await;
     }
 
-    /// An explicit index pin (`devices = ["3", "7"]`) is mapped to that
-    /// GPU's UUID so the ledger key is stable across reboots; an index no
-    /// GPU reports (7 here) passes through unchanged rather than being
-    /// guessed at.
-    #[tokio::test]
-    async fn index_device_pins_map_to_gpu_uuids() {
-        let setup = test_manager_with_gpus(test_gpus());
-        let manager = setup.manager.clone();
-
-        manager
-            .load_model("device/test", "k", 10, -1, None)
-            .await
-            .expect("load spawns both replicas");
-
-        let mut tasks = Vec::new();
-        for i in 0..4 {
-            let manager = manager.clone();
-            tasks.push(tokio::spawn(async move {
-                manager
-                    .predict(
-                        "device/test",
-                        "k",
-                        10,
-                        -1,
-                        Some(1),
-                        None,
-                        vec![data_input(json!(i))],
-                    )
-                    .await
-            }));
-        }
-        let mut devices = std::collections::BTreeSet::new();
-        for task in tasks {
-            let outputs = task.await.unwrap().expect("predict on a pinned replica");
-            devices.insert(reported_device(&outputs[0]));
-        }
-        assert_eq!(
-            devices,
-            std::collections::BTreeSet::from(["GPU-3333".to_string(), "7".to_string()]),
-            "index 3 became its UUID; the invisible index 7 passed through"
-        );
-
-        manager.shutdown().await;
-    }
-
-    /// A calibration store that answers nothing and records which *GPU*
-    /// each question was keyed by. `expected_base_mb` has exactly one caller
-    /// — the load reservation in `spawn_model` — and it is reached only after
-    /// `VramLedger::reserve_load` has found the GPU in its map, so a
-    /// recorded name is proof the reservation resolved to a real GPU.
+    /// A store that answers nothing and records which *GPU* each question was
+    /// keyed by. `expected_base_mb` is reached only once `reserve_load` has
+    /// found the GPU in its map, so a recorded name proves the reservation
+    /// resolved.
     #[derive(Default)]
     struct RecordingProfiles {
         reservation_gpus: StdMutex<Vec<String>>,
@@ -3567,12 +3079,9 @@ config.replicas = 2
         fn record(&self, _update: ProfileUpdate) {}
     }
 
-    /// R7's precedence rule, in the one place it is decided: the registry's
-    /// declaration beats the canvas a worker read off the loaded impl, the
-    /// report fills in for a model the registry cannot state statically
-    /// (`doctr/dots_ocr`, whose ceiling lives in a downloaded processor
-    /// config), and neither means uncapped — what every model did before
-    /// run2.
+    /// Canvas precedence: the registry's declaration beats the worker's report,
+    /// the report fills in when the registry states nothing, and neither means
+    /// uncapped.
     #[test]
     fn the_registry_canvas_beats_the_one_a_worker_reported() {
         let pixels = |canvas_pixels| CostDimension {
@@ -3600,8 +3109,7 @@ config.replicas = 2
             canvas_in_force("clip/vit", pixels(None), None).canvas_pixels,
             None
         );
-        // An area prices nothing outside pixel pricing, and a worker reports
-        // what it found without knowing its own unit — so the gate is here.
+        // An area prices nothing outside pixel pricing.
         let tokens = CostDimension {
             unit: CostUnit::Token,
             ..pixels(Some(1_835_008))
@@ -3612,9 +3120,8 @@ config.replicas = 2
         );
     }
 
-    /// A ROCm-shaped inventory whose row indices are the registry's own
-    /// device pins (`device/test` pins "3" and "7"), so the pin vocabulary
-    /// and the ledger's key vocabulary are guaranteed to differ.
+    /// A ROCm-shaped inventory whose row indices are the registry's own pins,
+    /// so the pin and ledger-key vocabularies are guaranteed to differ.
     fn rocm_test_gpus() -> GpuInventory {
         let gpu = |index: u32, bdf: &str| GpuInfo {
             index,
@@ -3630,27 +3137,20 @@ config.replicas = 2
         GpuInventory::known_rocm(vec![gpu(3, "0000:03:00.0"), gpu(7, "0000:0c:00.0")])
     }
 
-    /// D3's manager half: the load reservation is keyed by the device key,
-    /// never by the resolved pin. On ROCm the two are never the same string —
-    /// the pin is a HIP device index — so keying by the pin misses the
-    /// ledger's GPU map entirely and reserves nothing, which is precisely
-    /// the gap D2 left open. The recording store is the probe: a reservation
-    /// that found its GPU consults it, one that missed never gets that far.
-    ///
-    /// Venv-gated like the rest of this suite (it spawns real fixture
-    /// workers via the repo interpreter), so it runs on the dev box and in
-    /// CI rather than on every checkout.
+    /// The load reservation is keyed by the device key, never by the resolved
+    /// pin: on ROCm the two are different strings, and keying by the pin misses
+    /// the ledger's GPU map entirely. The recording store is the probe.
     #[tokio::test]
     async fn load_reservations_are_keyed_by_gpu_not_by_the_hip_pin() {
         let profiles = Arc::new(RecordingProfiles::default());
-        let setup = test_manager_with_gpus_and_calibration(
-            rocm_test_gpus(),
-            Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>,
-        );
+        let setup = test_manager_with(ManagerOpts {
+            gpus: rocm_test_gpus(),
+            calibration: Some(Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>),
+            ..Default::default()
+        });
         let manager = &setup.manager;
 
-        manager
-            .load_model("device/test", "k", 10, -1, None)
+        load(manager, "device/test", "k", -1)
             .await
             .expect("load spawns both pinned replicas");
 
@@ -3667,25 +3167,19 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// `/health` carries the batch-calibration bookkeeping: the resolved
-    /// cost dimension per model (declared for the `device` group, degraded
-    /// for `echo`, which declares nothing), the GPU inventory, and one
-    /// telemetry row per replica carrying its resolved pin. The memory
-    /// fields stay null here — the fixtures have no torch, which is exactly
-    /// the old-worker tolerance the wire contract promises.
+    /// `/health` carries the resolved cost dimension per model, the GPU
+    /// inventory, and one telemetry row per replica with its pin. The memory
+    /// fields stay null: the fixtures have no torch, which the wire tolerates.
     #[tokio::test]
     async fn health_reports_cost_dimension_gpus_and_replica_pins() {
-        let setup = test_manager_with_gpus(test_gpus());
+        let setup = test_manager_with(ManagerOpts {
+            gpus: test_gpus(),
+            ..Default::default()
+        });
         let manager = &setup.manager;
 
-        manager
-            .load_model("device/test", "k", 10, -1, None)
-            .await
-            .expect("load");
-        manager
-            .load_model("echo/test", "k", 10, -1, None)
-            .await
-            .expect("load");
+        load(manager, "device/test", "k", -1).await.expect("load");
+        load(manager, "echo/test", "k", -1).await.expect("load");
 
         let health = manager.health();
         assert_eq!(
@@ -3726,9 +3220,8 @@ config.replicas = 2
                 .all(|replica| replica.base_mb.is_none()
                     && replica.dtype.is_none()
                     && replica.reserved_mb.is_none()
-                    // The reported identity is absent too: only a worker with
-                    // a live CUDA device can name its GPU, and the spawn pin
-                    // above is deliberately not copied into it.
+                    // Absent too: only a worker with a live CUDA device can
+                    // name its GPU, and the spawn pin is not copied into it.
                     && replica.gpu_uuid.is_none()
                     && replica.torch_version.is_none()),
             "a torch-less worker reports no memory, and that is not an error: {:?}",
@@ -3747,11 +3240,9 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// A predict must record the measurement plumbing even with no torch in
-    /// the worker: the harness always times the call and counts its inputs,
-    /// so every batch lands in the telemetry ring (sequence-numbered, oldest
-    /// first) while the memory columns stay null. Two predicts must produce
-    /// two retained samples — the cost fit needs the set, not the last one.
+    /// Every batch lands in the telemetry ring even with no torch: the harness
+    /// times the call and counts its inputs. Two predicts, two retained samples
+    /// — the cost fit needs the set, not the last one.
     #[tokio::test]
     async fn predict_records_batch_measurements_without_torch() {
         let setup = test_manager(Duration::from_secs(60), 32);
@@ -3769,16 +3260,7 @@ config.replicas = 2
             )
             .await
             .expect("predict");
-        manager
-            .predict(
-                "echo/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!(3))],
-            )
+        predict_one(manager, "echo/test", "k", -1, None, json!(3))
             .await
             .expect("second predict");
 
@@ -3822,19 +3304,14 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// Throughput proof that replicas run windows concurrently: slow_test
-    /// predicts take 1.5s each; with 2 replicas and 4 single-input predicts
-    /// capped at max_batch 1 (so nothing merges), the work is 2 rounds of 2
-    /// parallel predicts — ~3s wall, vs ~6s if the set were serialized like
-    /// a single replica. Asserted generously (< 5s) to avoid flake; the
-    /// single-replica behavior would need >= 6s and cannot pass.
+    /// Replicas run windows concurrently: 4 uncapped-merge predicts of 1.5 s on
+    /// 2 replicas are two rounds (~3 s), where a serialized set would need ~6 s.
     #[tokio::test]
     async fn multi_replica_predicts_run_concurrently() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
-        manager
-            .load_model("slowpair/test", "k", 10, -1, None)
+        load(&manager, "slowpair/test", "k", -1)
             .await
             .expect("load");
 
@@ -3843,17 +3320,7 @@ config.replicas = 2
         for i in 0..4 {
             let manager = manager.clone();
             tasks.push(tokio::spawn(async move {
-                manager
-                    .predict(
-                        "slowpair/test",
-                        "k",
-                        10,
-                        -1,
-                        Some(1),
-                        None,
-                        vec![data_input(json!(i))],
-                    )
-                    .await
+                predict_one(&manager, "slowpair/test", "k", -1, Some(1), json!(i)).await
             }));
         }
         for task in tasks {
@@ -3869,42 +3336,33 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// The Phase 3 death policy: ANY replica dying fatally kills the whole
-    /// model. One poison request hard-kills its replica (os._exit) while a
-    /// normal request is in flight on the other replica and more are
-    /// queued; every outstanding request errors (queued ones are failed,
-    /// the in-flight window on the healthy replica is aborted), the model
-    /// vanishes from all caches, and the next predict auto-loads a fresh
-    /// 2-replica set (new generation) that serves normally.
+    /// ANY replica dying fatally kills the whole model: every outstanding
+    /// request errors, the model vanishes from all caches, and the next predict
+    /// auto-loads a fresh set that serves normally.
     #[tokio::test]
     async fn replica_death_kills_whole_set_and_next_predict_respawns() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
-        manager
-            .load_model("dieflag/test", "k", 10, -1, None)
+        load(&manager, "dieflag/test", "k", -1)
             .await
             .expect("load spawns both replicas");
         let generation = manager.loaded_generation("dieflag/test").expect("loaded");
 
-        // The poison request dispatches first (FIFO) and holds replica A for
-        // 200ms before dying; the normal requests sent right after land on
-        // replica B (1s predict) and the queue — all still outstanding when
-        // the death is detected.
+        // The poison request dispatches first and holds replica A for 200 ms;
+        // the rest land on replica B and the queue, still outstanding at the death.
         let die = {
             let manager = manager.clone();
             tokio::spawn(async move {
-                manager
-                    .predict(
-                        "dieflag/test",
-                        "k",
-                        10,
-                        -1,
-                        Some(1),
-                        None,
-                        vec![data_input(json!({"die": true}))],
-                    )
-                    .await
+                predict_one(
+                    &manager,
+                    "dieflag/test",
+                    "k",
+                    -1,
+                    Some(1),
+                    json!({"die": true}),
+                )
+                .await
             })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3912,17 +3370,7 @@ config.replicas = 2
         for i in 0..3 {
             let manager = manager.clone();
             normals.push(tokio::spawn(async move {
-                manager
-                    .predict(
-                        "dieflag/test",
-                        "k",
-                        10,
-                        -1,
-                        Some(1),
-                        None,
-                        vec![data_input(json!(i))],
-                    )
-                    .await
+                predict_one(&manager, "dieflag/test", "k", -1, Some(1), json!(i)).await
             }));
         }
 
@@ -3949,16 +3397,7 @@ config.replicas = 2
         assert_eq!(manager.loaded_generation("dieflag/test"), None);
 
         // A fresh predict auto-loads a brand new 2-replica set and works.
-        let outputs = manager
-            .predict(
-                "dieflag/test",
-                "k",
-                10,
-                -1,
-                Some(1),
-                None,
-                vec![data_input(json!("ok"))],
-            )
+        let outputs = predict_one(&manager, "dieflag/test", "k", -1, Some(1), json!("ok"))
             .await
             .expect("fresh worker set serves after the death");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": "ok"}))]);
@@ -3970,19 +3409,14 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// Whole-set unload: unloading a multi-replica model removes it from
-    /// the cache as one unit and gracefully stops BOTH replicas (the
-    /// graceful ladders run concurrently in the dispatcher's shutdown
-    /// path; the drained task is awaited by manager shutdown, so a leaked
-    /// replica would hang this test). A re-load spawns a fresh set —
-    /// generation bump proves nothing from the old set was reused.
+    /// Unloading a multi-replica model removes it as one unit and gracefully
+    /// stops both replicas; a re-load spawns a fresh set.
     #[tokio::test]
     async fn unload_tears_down_whole_replica_set() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = &setup.manager;
 
-        manager
-            .load_model("device/test", "k", 10, -1, None)
+        load(manager, "device/test", "k", -1)
             .await
             .expect("load spawns both replicas");
         let generation = manager.loaded_generation("device/test").expect("loaded");
@@ -3994,8 +3428,7 @@ config.replicas = 2
         );
         assert_eq!(manager.loaded_generation("device/test"), None);
 
-        manager
-            .load_model("device/test", "k", 10, -1, None)
+        load(manager, "device/test", "k", -1)
             .await
             .expect("re-load spawns a fresh set");
         assert!(
@@ -4003,161 +3436,30 @@ config.replicas = 2
             "fresh generation: no worker from the unloaded set survived"
         );
 
-        // shutdown() awaits the draining dispatcher task of the unloaded
-        // set as well — completing without a hang is the no-leak assertion.
+        // shutdown() awaits the drained task too: no hang is the assertion.
         manager.shutdown().await;
     }
 
-    /// Unit test of the guard itself, covering the spawn-phase pin (which
-    /// flows through the same PinGuard type as the predict pin): while the
-    /// guard is alive the pinned entry cannot expire; dropping the guard
-    /// releases the pin and the stale entry expires normally.
-    #[tokio::test]
-    async fn pin_guard_drop_releases_pin() {
-        let setup = test_manager(Duration::from_secs(60), 32);
-        let manager = &setup.manager;
-        let now = Local::now();
-        {
-            let mut state = manager.state.lock().unwrap();
-            state.cache.touch_load("g/x", "k", 10, 0, now);
-            state.cache.pin("g/x");
-        }
-        let guard = PinGuard::adopt(manager, "g/x", None);
-        {
-            let mut state = manager.state.lock().unwrap();
-            assert!(
-                state.cache.expire(at(now, 5)).is_empty(),
-                "pinned entries are exempt from expiry"
-            );
-        }
-        drop(guard);
-        let mut state = manager.state.lock().unwrap();
-        assert_eq!(
-            state.cache.expire(at(now, 5)),
-            vec!["g/x".to_string()],
-            "the drop released the pin"
-        );
-    }
+    // GET /health snapshots.
 
-    // ------------------------------------------------------------------
-    // GET /health snapshots (design §7): ModelManager::health() over the
-    // shared ModelStats atomics.
-    // ------------------------------------------------------------------
-
-    /// Health of a fresh manager: status "ok", not shutting down, the test
-    /// registry parses (registry_ok), and no models are reported. After
-    /// shutdown() the same manager flips to status "shutting_down" with
-    /// the flag set — the two fields always agree.
-    #[tokio::test]
-    async fn health_reports_empty_state_then_shutdown() {
-        let setup = test_manager(Duration::from_secs(60), 32);
-        let manager = &setup.manager;
-
-        let health = manager.health();
-        assert_eq!(health.status, "ok");
-        assert!(!health.shutting_down);
-        assert!(health.registry_ok, "the temp registry TOML parses");
-        assert_eq!(health.model_count, 0);
-        assert!(health.models.is_empty());
-
-        manager.shutdown().await;
-        let health = manager.health();
-        assert_eq!(health.status, "shutting_down");
-        assert!(health.shutting_down);
-        assert_eq!(health.model_count, 0, "shutdown emptied the model map");
-    }
-
-    /// After a completed predict on the echo fixture the health snapshot
-    /// shows the loaded model with its cache key, a single fully-free
-    /// replica, an empty queue, and last_effective_cap = the server default
-    /// (32) — neither the request nor the echo registry entry expressed a
-    /// batch opinion, so the fallback chain bottoms out at the server
-    /// default. The replica returns to the free pool only when the
-    /// dispatcher reaps the finished window (after the reply is sent), so
-    /// the idle counters are polled rather than asserted immediately.
+    /// One slow predict, watched from both sides. While it is outstanding health
+    /// shows it as an in-flight window, a busy replica or a queued request — any
+    /// of the three, since the sample can land before dispatch. Once it
+    /// completes, the same snapshot shows the loaded model with its cache key, a
+    /// fully free single-replica set, an empty queue and the counters the one
+    /// request produced. The replica returns to the free pool only when the
+    /// dispatcher reaps the window, so both phases are polled.
     #[tokio::test]
     async fn health_reports_loaded_model_after_predict() {
         let setup = test_manager(Duration::from_secs(60), 32);
-        let manager = &setup.manager;
-
-        manager
-            .predict(
-                "echo/test",
-                "key",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!({"text": "hi"}))],
-            )
-            .await
-            .expect("predict");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let model = loop {
-            let health = manager.health();
-            assert_eq!(health.status, "ok");
-            assert_eq!(health.model_count, 1);
-            let model = health.models.into_iter().next().expect("one model");
-            assert_eq!(model.inference_id, "echo/test");
-            if model.replicas.free == model.replicas.total && model.in_flight_windows == 0 {
-                break model;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "replica never returned to the free pool: {model:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        };
-        assert_eq!(model.cache_keys, vec!["key".to_string()]);
-        assert_eq!(model.replicas.total, 1, "echo has a single-replica set");
-        assert_eq!(model.queue_depth, 0, "nothing left queued");
-        assert_eq!(
-            model.last_window_items,
-            Some(1),
-            "one single-input request formed the window"
-        );
-        assert_eq!(
-            model.last_grant_units, None,
-            "an unknown GPU inventory means the unpriced path: no grant"
-        );
-        assert_eq!(model.total_predict_requests, 1);
-        assert_eq!(model.total_batches, 1);
-
-        manager.shutdown().await;
-    }
-
-    /// While a slow predict is outstanding, health shows the activity:
-    /// an in-flight window, a replica out of the free pool, or (if we
-    /// sample before dispatch) a non-empty queue. The assertion is
-    /// race-tolerant — any of the three proves the request is visible —
-    /// and polls while the predict (1.5s in the slow_test fixture) runs.
-    #[tokio::test]
-    async fn health_shows_activity_during_slow_predict() {
-        let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
-        // Load first so the observation window is the predict itself, not
-        // the spawn.
-        manager
-            .load_model("slow/test", "k", 10, -1, None)
-            .await
-            .expect("load");
-
+        // Load first: the observation window is the predict, not the spawn.
+        load(&manager, "slow/test", "key", -1).await.expect("load");
         let task = {
             let manager = manager.clone();
             tokio::spawn(async move {
-                manager
-                    .predict(
-                        "slow/test",
-                        "k",
-                        10,
-                        -1,
-                        None,
-                        None,
-                        vec![data_input(json!(null))],
-                    )
-                    .await
+                predict_one(&manager, "slow/test", "key", -1, None, json!(null)).await
             })
         };
 
@@ -4179,49 +3481,64 @@ config.replicas = 2
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-
         task.await
             .unwrap()
             .expect("the slow predict still completes normally");
+
+        let model = loop {
+            let health = manager.health();
+            assert_eq!(health.status, "ok");
+            assert_eq!(health.model_count, 1);
+            let model = health.models.into_iter().next().expect("one model");
+            assert_eq!(model.inference_id, "slow/test");
+            if model.replicas.free == model.replicas.total && model.in_flight_windows == 0 {
+                break model;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "replica never returned to the free pool: {model:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(model.cache_keys, vec!["key".to_string()]);
+        assert_eq!(model.replicas.total, 1, "a single-replica set");
+        assert_eq!(model.queue_depth, 0, "nothing left queued");
+        assert_eq!(
+            model.last_window_items,
+            Some(1),
+            "one single-input request formed the window"
+        );
+        assert_eq!(
+            model.last_grant_units, None,
+            "an unknown GPU inventory means the unpriced path: no grant"
+        );
+        assert_eq!(model.total_predict_requests, 1);
+        assert_eq!(model.total_batches, 1);
+
         manager.shutdown().await;
     }
 
-    /// The user cap is observable (design §10: "health endpoint exposes
-    /// it"): after traffic where every request carries max_batch=2, no
-    /// dispatched window held more than 2 inputs. This is the rewrite of the
-    /// old `last_effective_cap` assertion — the cap now bounds the window
-    /// itself (unpriced path) or the worker's packed batches (priced path),
-    /// never a max-over-caps rule. Six singles capped at 2 need at least 3
-    /// windows, which total_batches must reflect.
+    /// The user cap bounds every window and is observable in `/health`: with
+    /// every request at max_batch=2 no worker saw a larger batch and no window
+    /// held more than 2 inputs, and six singles need at least three windows.
     #[tokio::test]
     async fn health_reports_the_capped_window_size() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
-        manager
-            .load_model("batch/test", "k", 10, -1, None)
-            .await
-            .expect("load");
+        load(&manager, "batch/test", "k", -1).await.expect("load");
 
         let mut tasks = Vec::new();
         for i in 0..6 {
             let manager = manager.clone();
             tasks.push(tokio::spawn(async move {
-                manager
-                    .predict(
-                        "batch/test",
-                        "k",
-                        10,
-                        -1,
-                        Some(2),
-                        None,
-                        vec![data_input(json!(i))],
-                    )
-                    .await
+                predict_one(&manager, "batch/test", "k", -1, Some(2), json!(i)).await
             }));
         }
         for task in tasks {
-            task.await.unwrap().expect("capped predict");
+            let outputs = task.await.unwrap().expect("capped predict");
+            let batch = reported_batch(&outputs[0]);
+            assert!(batch <= 2, "batch {batch} exceeds the explicit cap of 2");
         }
 
         let health = manager.health();
@@ -4244,46 +3561,25 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    // ------------------------------------------------------------------
-    // R6: per-model load locks and the device-admission gate.
-    // ------------------------------------------------------------------
+    // Per-model load locks and the device-admission gate.
 
-    /// The B18/P5-3 regression test. A load of one model must not delay a
-    /// predict to a *different*, already resident model: under the retired
-    /// global load lock the predict below waited out the whole 3 s load (run1
-    /// measured 11.885 s of stall for an 11.865 s load, 28x the p50, with a
-    /// 600 s load deadline behind it).
-    ///
-    /// Two assertions, deliberately: the wall-clock bound, and the fact that
-    /// the slow load was *still in flight* when the predict came back — the
-    /// second one cannot be satisfied by a fast machine.
+    /// A load of one model must not delay a predict to a *different*, already
+    /// resident one. Two assertions: the wall-clock bound, and that the slow
+    /// load was still in flight when the predict came back — a fast machine
+    /// cannot satisfy the second.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_slow_load_does_not_delay_predicts_to_a_resident_model() {
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = Arc::clone(&setup.manager);
-        manager
-            .predict(
-                "echo/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!(1))],
-            )
+        predict_one(&manager, "echo/test", "k", -1, None, json!(1))
             .await
             .expect("the resident model loads");
 
         let loader = {
             let manager = Arc::clone(&manager);
-            tokio::spawn(async move {
-                manager
-                    .load_model("slowload/test", "k2", 10, -1, None)
-                    .await
-            })
+            tokio::spawn(async move { load(&manager, "slowload/test", "k2", -1).await })
         };
-        // Let the load get past its bookkeeping and into the fixture's 3 s
-        // `load()`; a spawn + handshake is well under this on any host.
+        // Past the bookkeeping and into the fixture's 3 s `load()`.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
             !loader.is_finished(),
@@ -4291,16 +3587,7 @@ config.replicas = 2
         );
 
         let started = Instant::now();
-        manager
-            .predict(
-                "echo/test",
-                "k",
-                10,
-                -1,
-                None,
-                None,
-                vec![data_input(json!(2))],
-            )
+        predict_one(&manager, "echo/test", "k", -1, None, json!(2))
             .await
             .expect("predict to the resident model");
         let elapsed = started.elapsed();
@@ -4320,25 +3607,32 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// The gate is keyed by **GPU** and is `max_concurrent_loads` permits
-    /// wide. Asserted on the gate itself rather than through two real loads:
-    /// the alternative is a wall-clock race whose failure mode is a flaky
-    /// test on a busy host, and the thing under test here is the keying.
+    /// The gate is keyed by **GPU** and is `max_concurrent_loads` permits wide,
+    /// and a replica whose device key did not resolve takes the shared bucket
+    /// *and* every GPU's permit: the pin still reaches the visibility variable,
+    /// so the worker lands on some GPU the ledger cannot name, and letting it
+    /// stream its weights beside an unpinned load onto that GPU is exactly the
+    /// collision the retired host-wide lock did prevent.
+    ///
+    /// Asserted on the gate itself rather than through two real loads: the
+    /// alternative is a wall-clock race whose failure mode is a flaky test.
     #[tokio::test]
     async fn the_load_admission_gate_is_per_gpu() {
-        let setup = test_manager_with_loads(LoadPolicy {
-            max_concurrent_loads: 1,
-            ..LoadPolicy::default()
-        });
-        let manager = Arc::clone(&setup.manager);
         let gpu_a = [Some("GPU-0000".to_owned())];
         let gpu_b = [Some("GPU-3333".to_owned())];
         let unresolved = [None];
-
+        let one_load = LoadPolicy {
+            max_concurrent_loads: 1,
+            ..LoadPolicy::default()
+        };
+        // One GPU's permit blocks only that GPU.
+        let setup = test_manager_with(ManagerOpts {
+            loads: one_load,
+            ..Default::default()
+        });
+        let manager = Arc::clone(&setup.manager);
         let held = manager.acquire_load_admission("m/a", &gpu_a).await;
         assert_eq!(held.len(), 1, "one distinct GPU, one permit");
-
-        // Another GPU, and the unresolved bucket, are not blocked by it.
         let other = tokio::time::timeout(
             Duration::from_millis(250),
             manager.acquire_load_admission("m/b", &gpu_b),
@@ -4351,23 +3645,17 @@ config.replicas = 2
         )
         .await
         .expect("the unresolved bucket is its own gate");
-
-        // The same GPU is.
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(250),
-                manager.acquire_load_admission("m/d", &gpu_a),
-            )
-            .await
-            .is_err(),
-            "a second load onto GPU A must wait at max_concurrent_loads = 1"
-        );
+        admission_blocks(&manager, &gpu_a, "a second load onto GPU A must wait").await;
         drop((held, other, none_gpu));
 
-        // A multi-GPU set takes one permit per distinct GPU, deduped.
-        let setup = test_manager_with_loads(LoadPolicy {
-            max_concurrent_loads: 2,
-            ..LoadPolicy::default()
+        // A multi-GPU set takes one permit per distinct GPU, deduped, and
+        // `max_concurrent_loads = 2` admits a second load onto both.
+        let setup = test_manager_with(ManagerOpts {
+            loads: LoadPolicy {
+                max_concurrent_loads: 2,
+                ..LoadPolicy::default()
+            },
+            ..Default::default()
         });
         let manager = Arc::clone(&setup.manager);
         let spread = [
@@ -4377,101 +3665,54 @@ config.replicas = 2
         ];
         let held = manager.acquire_load_admission("m/e", &spread).await;
         assert_eq!(held.len(), 2, "two distinct GPUs out of three replicas");
-        // Two permits per GPU: a second load of the same spread still fits.
         tokio::time::timeout(
             Duration::from_millis(250),
             manager.acquire_load_admission("m/f", &spread),
         )
         .await
-        .expect("max_concurrent_loads = 2 admits a second load onto both GPUs");
-    }
+        .expect("two permits per GPU admit a second load onto both");
 
-    /// A pin the ledger cannot place still spawns a worker that lands on
-    /// *some* GPU — `resolve_pin` passes an ambiguous UUID prefix, an
-    /// invisible index or a device list straight to the visibility variable
-    /// even though `resolve_device_key` answers `None` for all three. So an
-    /// unresolved replica must exclude every GPU's loads, not just other
-    /// unresolved ones: otherwise it streams its weights beside an unpinned
-    /// load onto the GPU it landed on, which is a collision the retired
-    /// host-wide lock did prevent.
-    #[tokio::test]
-    async fn an_unresolved_device_key_blocks_every_gpu() {
-        let setup = test_manager_full(
-            Duration::from_secs(60),
-            32,
-            WorkerDeadlines::default(),
-            test_gpus(),
-            None,
-            LoadPolicy {
-                max_concurrent_loads: 1,
-                ..LoadPolicy::default()
-            },
-        );
+        // With an inventory, an unresolved key blocks every GPU and vice versa.
+        let setup = test_manager_with(ManagerOpts {
+            gpus: test_gpus(),
+            loads: one_load,
+            ..Default::default()
+        });
         let manager = Arc::clone(&setup.manager);
-        let unresolved = [None];
-        let gpu_a = [Some("GPU-0000".to_owned())];
-        let gpu_b = [Some("GPU-3333".to_owned())];
-
         let held = manager.acquire_load_admission("m/a", &unresolved).await;
-        assert_eq!(
-            held.len(),
-            3,
-            "the shared bucket plus both GPUs of the inventory"
-        );
-        for (label, keys) in [("A", &gpu_a), ("B", &gpu_b)] {
-            assert!(
-                tokio::time::timeout(
-                    Duration::from_millis(250),
-                    manager.acquire_load_admission("m/b", keys),
-                )
-                .await
-                .is_err(),
-                "an unresolved load must block GPU {label}"
-            );
-        }
+        assert_eq!(held.len(), 3, "the shared bucket plus both GPUs");
+        admission_blocks(&manager, &gpu_a, "an unresolved load must block GPU A").await;
+        admission_blocks(&manager, &gpu_b, "an unresolved load must block GPU B").await;
         drop(held);
-
-        // And the other way round: one resolved GPU is enough to make an
-        // unresolved load wait.
         let held = manager.acquire_load_admission("m/c", &gpu_a).await;
         assert_eq!(held.len(), 1);
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(250),
-                manager.acquire_load_admission("m/d", &unresolved),
-            )
-            .await
-            .is_err(),
-            "a load onto a known GPU must block an unresolved one"
-        );
+        admission_blocks(
+            &manager,
+            &unresolved,
+            "a known GPU must block an unresolved load",
+        )
+        .await;
         drop(held);
 
-        // A host with no inventory has no GPUs to add, so the shared
-        // bucket alone is the host-wide serialization it has today.
-        let setup = test_manager_with_loads(LoadPolicy {
-            max_concurrent_loads: 1,
-            ..LoadPolicy::default()
+        // With no inventory the shared bucket alone is the serialization.
+        let setup = test_manager_with(ManagerOpts {
+            loads: one_load,
+            ..Default::default()
         });
         let manager = Arc::clone(&setup.manager);
         let held = manager.acquire_load_admission("m/e", &unresolved).await;
         assert_eq!(held.len(), 1, "no inventory: just the shared bucket");
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(250),
-                manager.acquire_load_admission("m/f", &unresolved),
-            )
-            .await
-            .is_err(),
-            "a GPU-less host still serializes every load"
-        );
+        admission_blocks(
+            &manager,
+            &unresolved,
+            "a GPU-less host still serializes every load",
+        )
+        .await;
+        drop(held);
     }
 
-    /// Two callers racing to use a model that is not loaded must produce one
-    /// worker set, not two: that is the invariant the global lock existed for
-    /// and the per-model lock now carries. The lock table must also be empty
-    /// again afterwards — its keys come off the URL, so an entry that
-    /// outlived its load would be an unbounded allocation any client can
-    /// drive.
+    /// Racing callers produce one worker set, not two, and the lock table is
+    /// empty again afterwards.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_predicts_load_one_model_once() {
         let setup = test_manager(Duration::from_secs(60), 32);
@@ -4481,17 +3722,7 @@ config.replicas = 2
         for i in 0..3 {
             let manager = Arc::clone(&manager);
             tasks.push(tokio::spawn(async move {
-                manager
-                    .predict(
-                        "slowload/test",
-                        "k",
-                        10,
-                        -1,
-                        None,
-                        None,
-                        vec![data_input(json!(i))],
-                    )
-                    .await
+                predict_one(&manager, "slowload/test", "k", -1, None, json!(i)).await
             }));
         }
         for task in tasks {
@@ -4515,35 +3746,50 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    // ------------------------------------------------------------------
-    // R9: per-model load-failure cooldown.
-    // ------------------------------------------------------------------
+    // Per-model load-failure cooldown.
 
-    /// The schedule, on the injected clock: `base × 2^(n−1)`, capped, and the
-    /// cap is a ceiling on the *window*, not on the counter.
+    /// The ladder on the injected clock, in one pass over the rules it obeys:
+    /// `base × 2^(n−1)` capped at `max`; the cap is a floor once reached (the
+    /// regression is an overflowing `1u32 << 32`, which dropped the 33rd
+    /// consecutive failure straight back to the base window); a configured
+    /// value too large to represent is clamped rather than overflowing the
+    /// `Instant + Duration` deadlines, which run under the state mutex where a
+    /// panic would poison the manager; a successful load clears the history and
+    /// a zero base disables the cooldown outright; and a history nobody has
+    /// retried within window + cap is forgotten, so the table cannot grow
+    /// unbounded on ids that come off the URL.
     #[test]
     fn cooldown_windows_double_and_cap() {
-        let policy = LoadPolicy {
-            max_concurrent_loads: 1,
-            cooldown_base: Duration::from_secs(2),
-            cooldown_max: Duration::from_secs(300),
-        };
+        let policy = LoadPolicy::default();
         let mut cooldowns = LoadCooldowns::default();
         let now = Instant::now();
-        let windows: Vec<u64> = (0..12)
-            .map(|_| {
-                cooldowns
-                    .note_failure("g/a", "boom", &policy, now)
-                    .expect("cooldowns are enabled")
-                    .as_secs()
-            })
-            .collect();
+
+        // The shipped ladder: nine failures and 8.5 minutes to the cap, and
+        // well past both the cap and the 32-bit shift width it never falls off.
+        let mut windows = Vec::new();
+        for failure in 1..=64u32 {
+            let window = cooldowns
+                .note_failure("g/a", "boom", &policy, now)
+                .expect("cooldowns are enabled");
+            if failure <= 12 {
+                windows.push(window.as_secs());
+            }
+            assert!(
+                window >= policy.cooldown_base && window <= policy.cooldown_max,
+                "failure {failure} armed a {window:?} window, outside [base, max]"
+            );
+            if failure >= 9 {
+                assert_eq!(
+                    window, policy.cooldown_max,
+                    "failure {failure} must still be at the cap"
+                );
+            }
+        }
         assert_eq!(
             windows,
-            vec![2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300, 300],
-            "the shipped ladder: nine failures and 8.5 minutes to the cap"
+            vec![2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300, 300]
         );
-        assert_eq!(cooldowns.entries["g/a"].failures, 12);
+        assert_eq!(cooldowns.entries["g/a"].failures, 64);
         assert_eq!(cooldowns.entries["g/a"].last_error, "boom");
         // The deadline is monotonic and the window is what set it.
         assert!(
@@ -4560,47 +3806,31 @@ config.replicas = 2
             cooldowns.active("g/b", now).is_none(),
             "other models untouched"
         );
-    }
 
-    /// The cap is a *floor* on the wait once it is reached: the window must
-    /// never come back down, however long the model stays broken.
-    ///
-    /// The regression this pins: `1u32 << doublings` with `doublings` clamped
-    /// at 32 is an overflowing shift, so the 33rd consecutive failure dropped
-    /// the window from 300 s straight back to the 2 s base — and every
-    /// failure after it. At the shipped ladder a model that keeps failing
-    /// reaches 33 in under three hours, which is exactly how a run long
-    /// enough to matter got finding B15's hammering back.
-    #[test]
-    fn the_cooldown_window_never_falls_back_off_the_cap() {
-        let policy = LoadPolicy::default();
+        // A successful load clears the ladder; the next failure starts over.
+        cooldowns.clear("g/a");
+        assert!(cooldowns.active("g/a", now).is_none());
+        assert_eq!(
+            cooldowns.note_failure("g/a", "boom", &policy, now),
+            Some(Duration::from_secs(2))
+        );
+
+        // The history survives window + cap, and is forgotten past it.
+        cooldowns.prune(&policy, now + Duration::from_secs(120));
+        assert_eq!(cooldowns.entries.len(), 1, "still inside window + cap");
+        cooldowns.prune(&policy, now + Duration::from_secs(303));
+        assert!(cooldowns.entries.is_empty(), "the ladder resets");
+
+        // A zero base records nothing at all.
+        let off = LoadPolicy {
+            cooldown_base: Duration::ZERO,
+            ..LoadPolicy::default()
+        };
         let mut cooldowns = LoadCooldowns::default();
-        let now = Instant::now();
-        // Well past both the cap (9 failures) and the shift width (33).
-        for failure in 1..=64u32 {
-            let window = cooldowns
-                .note_failure("g/a", "boom", &policy, now)
-                .expect("cooldowns are enabled");
-            assert!(
-                window >= policy.cooldown_base && window <= policy.cooldown_max,
-                "failure {failure} armed a {window:?} window, outside [base, max]"
-            );
-            if failure >= 9 {
-                assert_eq!(
-                    window, policy.cooldown_max,
-                    "failure {failure} must still be at the cap"
-                );
-            }
-        }
-        assert_eq!(cooldowns.entries["g/a"].failures, 64);
-    }
+        assert_eq!(cooldowns.note_failure("g/a", "boom", &off, now), None);
+        assert!(cooldowns.active("g/a", now).is_none());
 
-    /// Neither the deadline nor the pruning may overflow the monotonic clock,
-    /// whatever the operator wrote in the TOML. `Instant + Duration` panics,
-    /// and both additions run under the state mutex — a panic there would
-    /// poison the manager, not just lose a cooldown.
-    #[test]
-    fn an_absurd_configured_cooldown_is_clamped_rather_than_overflowing() {
+        // An absurd configured value is clamped, and nothing overflows.
         let local = crate::config::InferenceLocalConfig {
             load_failure_cooldown_secs: u64::MAX,
             load_failure_cooldown_max_secs: u64::MAX,
@@ -4609,90 +3839,34 @@ config.replicas = 2
         let policy = LoadPolicy::from(&local);
         assert_eq!(policy.cooldown_base.as_secs(), MAX_COOLDOWN_SECS);
         assert_eq!(policy.cooldown_max.as_secs(), MAX_COOLDOWN_SECS);
-
         let mut cooldowns = LoadCooldowns::default();
-        let now = Instant::now();
         let window = cooldowns
             .note_failure("g/a", "boom", &policy, now)
             .expect("cooldowns are enabled");
         assert_eq!(window.as_secs(), MAX_COOLDOWN_SECS);
         assert!(cooldowns.active("g/a", now).is_some());
-        // The `until + cooldown_max` a year past a deadline a year out.
         cooldowns.prune(&policy, now);
         assert_eq!(cooldowns.entries.len(), 1, "nowhere near forgettable yet");
     }
 
-    /// A successful load clears the ladder, and a zero base disables it.
-    #[test]
-    fn a_successful_load_clears_the_cooldown_and_zero_disables_it() {
-        let policy = LoadPolicy::default();
-        let mut cooldowns = LoadCooldowns::default();
-        let now = Instant::now();
-        cooldowns.note_failure("g/a", "boom", &policy, now);
-        cooldowns.note_failure("g/a", "boom", &policy, now);
-        assert_eq!(cooldowns.entries["g/a"].failures, 2);
-        cooldowns.clear("g/a");
-        assert!(cooldowns.active("g/a", now).is_none());
-        // The next failure starts the ladder over at the base window.
-        assert_eq!(
-            cooldowns.note_failure("g/a", "boom", &policy, now),
-            Some(Duration::from_secs(2))
-        );
-
-        let off = LoadPolicy {
-            cooldown_base: Duration::ZERO,
-            ..LoadPolicy::default()
-        };
-        let mut cooldowns = LoadCooldowns::default();
-        assert_eq!(cooldowns.note_failure("g/a", "boom", &off, now), None);
-        assert!(
-            cooldowns.active("g/a", now).is_none(),
-            "a zero base records nothing at all"
-        );
-    }
-
-    /// The history of a model nobody is retrying is forgotten, so the table
-    /// cannot grow without bound on ids that come off the URL.
-    #[test]
-    fn an_untouched_cooldown_is_pruned_after_the_cap() {
-        let policy = LoadPolicy::default();
-        let mut cooldowns = LoadCooldowns::default();
-        let now = Instant::now();
-        cooldowns.note_failure("g/a", "boom", &policy, now);
-        cooldowns.prune(&policy, now + Duration::from_secs(120));
-        assert_eq!(cooldowns.entries.len(), 1, "still inside window + cap");
-        cooldowns.prune(&policy, now + Duration::from_secs(303));
-        assert!(
-            cooldowns.entries.is_empty(),
-            "expired for longer than the ceiling: the ladder resets"
-        );
-    }
-
     /// End to end on a model that cannot load: the first request pays a real
     /// spawn, the second is refused without one, `/health` says so, and the
-    /// ladder escalates once the window passes. Under the old code every one
-    /// of these requests spawned a worker (run1 B15: 93 loads in 182 s).
+    /// ladder escalates once the window passes.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_load_puts_the_model_in_a_cooldown() {
-        let setup = test_manager_with_loads(LoadPolicy {
-            max_concurrent_loads: 1,
-            // Short enough to watch the ladder inside a test, long enough
-            // that the refusal below cannot be a race.
-            cooldown_base: Duration::from_millis(600),
-            cooldown_max: Duration::from_secs(300),
+        let setup = test_manager_with(ManagerOpts {
+            loads: LoadPolicy {
+                max_concurrent_loads: 1,
+                // Short enough to watch, long enough that the refusal is not a
+                // race.
+                cooldown_base: Duration::from_millis(600),
+                cooldown_max: Duration::from_secs(300),
+            },
+            ..Default::default()
         });
         let manager = Arc::clone(&setup.manager);
         let predict = |manager: Arc<ModelManager>| async move {
-            manager
-                .predict(
-                    "missing/test",
-                    "k",
-                    10,
-                    -1,
-                    None,
-                    None,
-                    vec![data_input(json!(1))],
-                )
+            predict_one(&manager, "missing/test", "k", -1, None, json!(1))
                 .await
                 .expect_err("this model has no impl class")
         };
@@ -4701,8 +3875,14 @@ config.replicas = 2
         let first = predict(Arc::clone(&manager)).await;
         let spawn_attempt = attempt_started.elapsed();
         assert!(
-            format!("{first:#}").contains("failed to load model"),
-            "the first request pays a real load attempt: {first:#}"
+            format!("{first:#}").contains("failed to load model")
+                && format!("{first:#}").contains("does_not_exist"),
+            "the first request pays a real load attempt, and the worker's own \
+             message survives: {first:#}"
+        );
+        assert!(
+            manager.cached_models().is_empty() && manager.cache_expirations("k").is_empty(),
+            "a failed load leaves neither a cache entry nor an LRU entry"
         );
         assert!(
             first
@@ -4750,8 +3930,7 @@ config.replicas = 2
             reported.retry_at
         );
 
-        // Past the window the model is tried again — and the second real
-        // failure doubles the wait.
+        // Past the window one attempt gets through, and doubles the wait.
         tokio::time::sleep(Duration::from_millis(700)).await;
         let third = predict(Arc::clone(&manager)).await;
         assert!(
@@ -4768,10 +3947,8 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// The wire contract Track E's job side matches on (pinned in the run2
-    /// brief): the kind token, an RFC 3339 `retry_at`, and a `Retry-After`
-    /// that is never 0. `http.rs` assembles these into
-    /// `{"detail": {"kind": "load_cooldown", …}}` with status 503.
+    /// The wire contract the job side matches on: the kind token, an RFC 3339
+    /// `retry_at`, and a `Retry-After` that is never 0.
     #[test]
     fn the_cooldown_error_carries_the_pinned_wire_fields() {
         assert_eq!(LOAD_COOLDOWN_KIND, "load_cooldown");
