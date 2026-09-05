@@ -181,6 +181,11 @@ fn submit(job: SpawnJob) -> std::io::Result<()> {
     })
 }
 
+/// What both supervised spawns report when the spawner thread answered
+/// nothing at all.
+const NO_ANSWER: &str =
+    "the supervised spawn produced no answer (it panicked, or the spawner thread is gone)";
+
 /// Spawn a `std` child from the permanent spawner thread, blocking the caller
 /// for one `fork`+`exec`. For every std command armed with
 /// [`die_with_parent`].
@@ -193,11 +198,8 @@ pub(crate) fn spawn_supervised(
         // No cancelled-caller case: this receiver is waited on below.
         let _ = tx.send(command.spawn());
     }))?;
-    rx.recv().unwrap_or_else(|_| {
-        Err(std::io::Error::other(
-            "the supervised spawn produced no answer (it panicked, or the spawner thread is gone)",
-        ))
-    })
+    rx.recv()
+        .unwrap_or_else(|_| Err(std::io::Error::other(NO_ANSWER)))
 }
 
 /// Spawn a `tokio` child from the permanent spawner thread — the async
@@ -230,11 +232,8 @@ pub(crate) async fn spawn_supervised_tokio(
             let _ = child.start_kill();
         }
     }))?;
-    rx.await.unwrap_or_else(|_| {
-        Err(std::io::Error::other(
-            "the supervised spawn produced no answer (it panicked, or the spawner thread is gone)",
-        ))
-    })
+    rx.await
+        .unwrap_or_else(|_| Err(std::io::Error::other(NO_ANSWER)))
 }
 
 /// SIGKILL the child's whole process group. The spawn made the child its own
