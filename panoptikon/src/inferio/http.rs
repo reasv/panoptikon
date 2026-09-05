@@ -39,6 +39,7 @@ use super::worker::{
 };
 use crate::api_error::ApiError;
 use crate::config::Settings;
+use crate::db::ledger::truncate_error;
 
 /// Python renders "never expires" as `datetime.max.isoformat()`.
 const NEVER_EXPIRES: &str = "9999-12-31T23:59:59.999999";
@@ -655,7 +656,7 @@ impl IntoResponse for PredictBodyError {
                     InferenceErrorFields {
                         kind: REQUEST_INCOMPLETE_KIND.to_owned(),
                         message: Some("Request body did not arrive in full".to_owned()),
-                        last_error: Some(clamp_detail(&detail)),
+                        last_error: Some(truncate_error(&detail).into_owned()),
                         ..Default::default()
                     },
                 )
@@ -1019,29 +1020,12 @@ fn predict_failure_response(err: anyhow::Error, full_id: &str) -> Result<Respons
                 // is unaffected.
                 message: Some("Prediction failed".to_owned()),
                 model: Some(full_id.to_owned()),
-                last_error: Some(clamp_detail(&chain)),
+                last_error: Some(truncate_error(&chain).into_owned()),
                 ..Default::default()
             },
         )),
         PredictFailure::Other => Err(ApiError::internal("Prediction failed")),
     }
-}
-
-/// Bound on a structured detail's error text: a fatal worker error renders
-/// tens of kilobytes of stderr ring and the caller persists it per failed
-/// item. Matches extraction's audit clamp.
-const MAX_DETAIL_BYTES: usize = 2000;
-
-/// Clamp an error chain to [`MAX_DETAIL_BYTES`], on a char boundary.
-fn clamp_detail(text: &str) -> String {
-    if text.len() <= MAX_DETAIL_BYTES {
-        return text.to_owned();
-    }
-    let mut end = MAX_DETAIL_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
 }
 
 /// The pinned 503 of the per-model load-failure cooldown, when this error is
@@ -1065,7 +1049,7 @@ fn load_cooldown_response(err: &anyhow::Error) -> Option<Response> {
             kind: super::manager::LOAD_COOLDOWN_KIND.to_owned(),
             message: Some(cooldown.to_string()),
             model: Some(cooldown.model.clone()),
-            last_error: Some(clamp_detail(&cooldown.last_error)),
+            last_error: Some(truncate_error(&cooldown.last_error).into_owned()),
             retry_at: Some(cooldown.retry_at.to_rfc3339()),
             failures: Some(cooldown.failures),
         },
@@ -1474,6 +1458,7 @@ pub struct InferioApiDoc;
 mod tests {
     use super::super::slot_error::{SlotError, SlotErrorClass};
     use super::*;
+    use crate::db::ledger::MAX_ERROR_BYTES;
     use crate::inferio_client::{
         InferenceApiClient, InferenceFile, InferenceInput, PredictOutput, parse_predict_response,
     };
@@ -2060,7 +2045,7 @@ metadata.description = "kills its worker on predict"
         let last_error = failure.last_error.as_deref().unwrap_or_default();
         assert!(last_error.contains("failed fatally"), "{failure}");
         assert!(
-            last_error.len() <= MAX_DETAIL_BYTES + 4,
+            last_error.len() <= MAX_ERROR_BYTES + 4,
             "{}",
             last_error.len()
         );

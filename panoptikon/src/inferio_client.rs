@@ -855,30 +855,28 @@ impl InferenceApiClient {
         transport
     }
 
-    /// One h2c probe: `GET /cache`, sent with prior knowledge. The body is
-    /// never read — any status is already proof that the frames parsed.
-    async fn probe_h2c(&self) -> reqwest::Result<()> {
-        // Lane 0: the lane the first real requests will land on anyway.
-        self.endpoint
-            .h2_seed
-            .raw
+    /// One `GET /cache` probe on the given client. The body is never read —
+    /// any status is already proof that the frames parsed. The caller owns
+    /// the verdict: h2c wants the error, HTTP/1.1 only wants an answer.
+    async fn probe_cache(&self, client: &reqwest::Client) -> reqwest::Result<()> {
+        client
             .get(format!("{}/cache", self.base_url))
             .send()
             .await
             .map(|_| ())
     }
 
+    /// One h2c probe, sent with prior knowledge on lane 0: the lane the first
+    /// real requests will land on anyway.
+    async fn probe_h2c(&self) -> reqwest::Result<()> {
+        self.probe_cache(&self.endpoint.h2_seed.raw).await
+    }
+
     /// Whether the peer answers the same request over HTTP/1.1 — the proof
     /// that it is alive, so its refusal of the h2 preface was about the
     /// protocol rather than the network. Any status counts.
     async fn peer_answers_http11(&self) -> bool {
-        self.endpoint
-            .h1
-            .raw
-            .get(format!("{}/cache", self.base_url))
-            .send()
-            .await
-            .is_ok()
+        self.probe_cache(&self.endpoint.h1.raw).await.is_ok()
     }
 
     /// Whether a failed probe *could* be the peer refusing HTTP/2 rather than
@@ -908,20 +906,17 @@ impl InferenceApiClient {
     }
 
     /// Every non-predict call's send result, funnelled through one place so
-    /// that a transport-level failure invalidates the memo here too
-    /// (`predict` does the same inline). Without it a memo can go stale
-    /// *upward* forever: a job that fails at `load_model` never reaches the
-    /// predict that would clear it.
+    /// that a transport-level failure invalidates the memo here too, by the
+    /// same rule `predict` applies. Without it a memo can go stale *upward*
+    /// forever: a job that fails at `load_model` never reaches the predict
+    /// that would clear it.
     async fn checked_send(
         &self,
         result: std::result::Result<reqwest::Response, reqwest_middleware::Error>,
         context: &'static str,
     ) -> Result<reqwest::Response> {
         if let Err(reqwest_middleware::Error::Reqwest(err)) = &result
-            && (err.is_connect() || err.is_request())
-            // Same exception as in `predict`: only an HTTP/2 peer can refuse
-            // a stream, so it is evidence *for* the memo, not against it.
-            && !is_refused_stream(err)
+            && invalidates_transport_memo(err)
         {
             self.forget_transport().await;
         }
@@ -1110,12 +1105,7 @@ impl InferenceApiClient {
                     return Err(anyhow::Error::new(failure));
                 }
                 Err(err) => {
-                    // A transport failure invalidates what the probe learned.
-                    // A refused stream is the exception and the memo is
-                    // *kept*: only an h2 peer can send RST_STREAM, so it is
-                    // positive proof, and forgetting it would make a peer
-                    // with a small stream limit re-probe on every burst.
-                    if !is_refused_stream(&err) && (err.is_connect() || err.is_request()) {
+                    if invalidates_transport_memo(&err) {
                         self.forget_transport().await;
                     }
                     if should_retry_error(&err)
@@ -1372,6 +1362,15 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
         source = current.source();
     }
     rendered
+}
+
+/// Whether a failed send invalidates the transport memo. A connect or request
+/// error is transport-level evidence that what the probe learned is stale,
+/// with one exception: only an HTTP/2 peer can refuse a stream, so a refused
+/// stream is positive proof *for* the memo, and forgetting it would make a
+/// peer with a small stream limit re-probe on every burst.
+fn invalidates_transport_memo(err: &reqwest::Error) -> bool {
+    (err.is_connect() || err.is_request()) && !is_refused_stream(err)
 }
 
 /// Whether the peer refused to *open* the stream — HTTP/2 `REFUSED_STREAM`,
