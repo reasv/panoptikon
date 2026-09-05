@@ -2009,10 +2009,10 @@ mod tests {
     use super::super::calibration::{ProfileQuery, ProfileSeed, ProfileUpdate};
     use super::super::registry::RegistryConfig;
     use super::super::worker::WorkerDeadlines;
+    use super::super::worker::testing::test_spawn_config;
     use super::*;
     use serde_json::json;
     use std::fs;
-    use std::path::{Path, PathBuf};
 
     // Pure state-machine tests (no workers, injected clock).
 
@@ -2172,50 +2172,6 @@ config.impl_class = "cls"
     }
 
     // Integration tests with real worker subprocesses.
-
-    /// Repo root: the crate lives one level below the workspace root.
-    fn workspace_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
-    }
-
-    /// The managed venv if present, else the legacy root `.venv`.
-    fn test_venv_python(root: &Path, rel: &str) -> PathBuf {
-        let managed = root.join("python/.venv").join(rel);
-        if managed.is_file() {
-            managed
-        } else {
-            root.join(".venv").join(rel)
-        }
-    }
-
-    /// The same spawn setup as the worker.rs tests.
-    fn test_spawn_config() -> WorkerSpawnConfig {
-        let root = workspace_root();
-        // PANOPTIKON_TEST_PYTHON overrides the repo venv (any python with
-        // msgpack works), e.g. running the suite under WSL.
-        let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
-            Some(explicit) => PathBuf::from(explicit),
-            None if cfg!(windows) => test_venv_python(&root, "Scripts/python.exe"),
-            None => test_venv_python(&root, "bin/python"),
-        };
-        if !python.is_file() {
-            panic!(
-                "inferio manager tests need the repo venv interpreter at {} — create the dev venv first",
-                python.display()
-            );
-        }
-        WorkerSpawnConfig {
-            python,
-            impl_dirs: vec![root.join("python/tests/inferio_worker/fixture_impls")],
-            pythonpath: vec![root.join("python")],
-            env: vec![("NO_CUDNN".to_owned(), "true".to_owned())],
-            env_remove: Vec::new(),
-            cwd: Some(root),
-            deadlines: WorkerDeadlines::default(),
-            // The fixtures echo `CUDA_VISIBLE_DEVICES`.
-            pin_env_var: crate::inferio::gpu::CUDA_PIN_ENV_VAR,
-        }
-    }
 
     /// Synthetic registry covering every fixture impl.
     const TEST_REGISTRY_TOML: &str = r#"
