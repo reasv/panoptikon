@@ -6364,8 +6364,8 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Every grant this replica is issued states the model's per-item pixel canvas
-    /// carried from the cost dimension the manager resolved at load.
+    /// Every grant this replica is issued states the model's per-item pixel
+    /// canvas, carried from the cost dimension the manager resolved at load.
     #[test]
     fn a_grant_states_the_models_pixel_canvas() {
         let pixel_cost = |canvas_pixels| CostDimension {
