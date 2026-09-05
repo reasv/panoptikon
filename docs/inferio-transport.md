@@ -242,13 +242,41 @@ pass.
 
 ### Request authority (policy.rs)
 
-`policy::request_authority` picks the host a request's policy is resolved
-against: the request target's authority when the URI carries one, otherwise
-the `Host` header. HTTP/2 puts the authority in `:authority` and leaves `Host`
-absent, so reading `Host` alone would resolve an h2c request against no host
-at all — the same request must select the same policy over both transports.
-The desktop guard resolves its effective host through the same function, so
-its allow/deny decision and the server's policy lookup cannot diverge.
+`policy::request_authority` is the single definition of "the host this request
+is for": the request target's authority when the URI carries one, otherwise the
+`Host` header, verbatim — no case folding, no port stripping, and any
+deprecated `userinfo@` prefix left in place so a caller that must refuse one
+still sees it. `None` means neither source named an authority, and every caller
+reads that as unknown rather than as a match.
+
+The order is what both HTTP versions say the authority *is*. An HTTP/2 request
+carries its authority in `:authority` and normally sends no `Host` header at
+all (RFC 9113 §8.3.1); hyper puts that on the request URI, so `Uri::authority`
+returns it. The same field carries an HTTP/1.1 absolute-form request target,
+which RFC 9112 §3.2.2 likewise makes override `Host`. Reading `Host` alone
+would leave an h2c request hostless, and the same request must select the same
+policy over both transports.
+
+Reading the authority introduces no new trust: `:authority` is exactly as
+client-controlled as `Host`, and any client that can set one can set the other.
+The precedence only decides which of two client-chosen names picks a policy in
+the malformed case where both are present and disagree (RFC 9113 §8.3.1
+requires them to be consistent). Non-spoofable routing remains the listener
+endpoint (`ListenerEndpoint`).
+
+`resolve_effective_host` normalizes that authority for `[policies.match]
+hosts` comparison (userinfo, port and IPv6 brackets removed, lowercased) and
+layers the trusted forwarded headers on top: `Forwarded` /`X-Forwarded-Host`
+win, but only when `[server] trust_forwarded_headers` is set — the
+reverse-proxy deployment, where the front proxy rather than the request's own
+framing is the authority on the name the client used. A request with neither an
+authority nor a `Host` stays hostless, and `select_policy` then matches only
+policies that state no `hosts`.
+
+Both consumers go through the same function, so the same request cannot be
+judged by two different names: the policy layer selects `[policies.match]
+hosts` with it, and the Desktop bridge guard (`api::desktop`) checks browser
+same-origin with it.
 
 ### Health
 

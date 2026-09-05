@@ -223,10 +223,8 @@ fn apply_policy(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    // Policy token first: the header is consumed (removed) here whether or
-    // not it verifies — it is gateway-internal and must never travel
-    // upstream or reach local handlers. Verification runs on the inbound
-    // value, before the general hygiene strip below.
+    // Policy token first: the header is consumed whether or not it verifies,
+    // and verification runs on the inbound value, before the hygiene strip.
     let token_policy = consume_policy_token(req, settings, token_key);
     // Ingress hygiene: drop every other client-supplied `x-panoptikon-*`
     // header at this choke point so clients cannot smuggle gateway-internal
@@ -259,11 +257,10 @@ fn apply_policy(
     let is_api = is_api_surface(&path);
     let is_db_info = is_db_info_path(&path);
     let is_db_create = is_db_create_path(&path);
-    // Desktop-managed routes include secret reveal and installation-wide
-    // mutations. They are mounted only in managed mode, and additionally
-    // require the matched policy to opt into the Desktop client. Endpoint
-    // matching therefore keeps a future LAN listener from inheriting local
-    // Desktop authority even if its ruleset otherwise allows every route.
+    // Desktop-managed routes (secret reveal, installation-wide mutations) are
+    // mounted only in managed mode and additionally require the matched policy
+    // to opt into the Desktop client, so a future LAN listener cannot inherit
+    // local Desktop authority even if its ruleset allows every route.
     if path.starts_with("/api/desktop/")
         && policy
             .client
@@ -277,11 +274,9 @@ fn apply_policy(
         });
     }
     // GET /api/client-config is exempt from ruleset enforcement: a client
-    // must always be able to ask what it may do — it is how restricted UIs
-    // learn which controls to hide, so gating it behind the ruleset would
-    // defeat its purpose. Local API only: the endpoint exists solely as a
-    // local route, and in proxied-API mode the exemption would forward the
-    // path to the upstream past a restrictive ruleset.
+    // must always be able to ask what it may do, which is how restricted UIs
+    // learn which controls to hide. Local API only — in proxied-API mode the
+    // exemption would forward the path upstream past a restrictive ruleset.
     let is_client_config =
         settings.upstreams.api.local && method == Method::GET && is_client_config_path(&path);
     // Relay pairing bootstrap is capability-discovery state, not an action.
@@ -321,15 +316,13 @@ fn apply_policy(
     } else if is_api {
         needs_db_params(&path)
     } else {
-        // UI-bound requests (pages, assets, HMR) are forwarded with their
-        // query string untouched. Injecting the policy's DB defaults here
-        // makes the Next.js server SSR against a URL the browser never had:
-        // every nuqs-serialized link href then carries index_db/user_data_db
-        // that the client-side render omits, and React fails hydration
-        // (error #418) on every page load. DB scoping for SSR does not need
-        // the page URL — the UI's SSR API calls come back through the
-        // gateway with the echoed policy token, and this same enforcement
-        // resolves the DB params on that API hop.
+        // UI-bound requests (pages, assets, HMR) keep their query string
+        // untouched. Injecting the policy's DB defaults here makes the Next.js
+        // server SSR against a URL the browser never had, so every
+        // nuqs-serialized href carries db params the client-side render omits
+        // and React fails hydration on every page load. SSR does not need
+        // them: the UI's own API calls come back through this gateway with the
+        // echoed policy token, and this enforcement resolves them on that hop.
         false
     };
 
@@ -361,13 +354,11 @@ fn apply_policy(
     })
 }
 
-/// Remove the `x-panoptikon-policy` header and, when it carries a valid
-/// token naming a configured policy, return that policy. Any failure
-/// (malformed, bad HMAC, expired, unknown policy name) is logged at debug
-/// and yields `None` — selection then falls back to listener/host matching.
-/// The header is consumed in every case: it authenticates the *gateway's
-/// own* mint (see policy_token.rs) and must never proceed upstream or into
-/// local handlers.
+/// Remove the `x-panoptikon-policy` header and, when it carries a valid token
+/// naming a configured policy, return that policy. Any failure yields `None`
+/// and selection falls back to listener/host matching. The header is consumed
+/// in every case: it authenticates the gateway's *own* mint (policy_token.rs)
+/// and must never proceed upstream or into local handlers.
 fn consume_policy_token<'a>(
     req: &mut Request<Body>,
     settings: &'a Settings,
@@ -381,11 +372,10 @@ fn consume_policy_token<'a>(
             return None;
         }
     };
-    // Only the policy claim matters here. The origin claim is routing
-    // advice for the UI server (policy_token.rs); a legitimate SSR call may
-    // well arrive on a different listener than the one the claim names
-    // (`[upstreams.ui] api_endpoint`, or a PANOPTIKON_API_URL naming any
-    // listener), so it is neither compared nor acted on.
+    // Only the policy claim matters here. The origin claim is routing advice
+    // for the UI server (policy_token.rs), and a legitimate SSR call may
+    // arrive on a different listener than the one it names, so it is neither
+    // compared nor acted on.
     let name = match token_key.verify(token) {
         Ok(claims) => claims.policy,
         Err(err) => {
@@ -408,16 +398,14 @@ fn consume_policy_token<'a>(
 
 /// Strip inbound `x-panoptikon-*` headers from client requests at the
 /// policy-layer choke point, so gateway-internal metadata can only ever be
-/// set by the gateway itself. One deliberate exemption:
-/// `x-panoptikon-hops` is PRESERVED — it counts how many panoptikon
-/// gateways a request has already passed through and is the self-proxy loop
-/// guard (see proxy.rs MAX_PROXY_HOPS and the 2026-07-07 port-exhaustion
-/// incident). Legitimate gateway→gateway forwarding re-enters this layer on
-/// the next gateway, so stripping the count here would reset it every hop
-/// and disable loop detection entirely. Its semantics stay exactly as
-/// before: clients sending a bogus value can only *lower* their own hop
-/// budget, never bypass the guard.
-/// (`x-panoptikon-policy` is not handled here: consume_policy_token has
+/// set by the gateway itself.
+///
+/// `x-panoptikon-hops` is the one exemption and is PRESERVED: it is the
+/// self-proxy loop guard (see `proxy.rs` `MAX_PROXY_HOPS`), and gateway to
+/// gateway forwarding re-enters this layer on the next gateway, so stripping
+/// it would reset the count every hop. A client sending a bogus value can
+/// only lower its own hop budget, never bypass the guard.
+/// (`x-panoptikon-policy` is not handled here: `consume_policy_token` has
 /// already verified-then-removed it before this runs.)
 fn strip_inbound_panoptikon_headers(headers: &mut header::HeaderMap) {
     let doomed: Vec<header::HeaderName> = headers
@@ -470,30 +458,17 @@ fn needs_db_params(path: &str) -> bool {
 }
 
 /// The authority a request claims for itself: `host[:port]`, verbatim — no
-/// case folding, no port stripping, and any (deprecated) `userinfo@` prefix
-/// left in place so a caller that must refuse one still sees it.
+/// case folding, no port stripping, and any deprecated `userinfo@` prefix left
+/// in place so a caller that must refuse one still sees it.
 ///
-/// Sources, in order:
+/// The request target's authority first (an HTTP/2 `:authority`, or an
+/// HTTP/1.1 absolute-form target), then the `Host` header; `None` when the
+/// request named one in neither place, which every caller reads as unknown
+/// rather than as a match. The single definition of "the host this request is
+/// for", shared by the policy layer and the Desktop bridge guard so that one
+/// request cannot be judged by two different names.
 ///
-/// 1. The **request target's authority**. An HTTP/2 request carries its
-///    authority in the `:authority` pseudo-header and normally sends no
-///    `Host` header at all (RFC 9113 §8.3.1); hyper puts that authority on
-///    the request URI, so it is what `Uri::authority` returns. The same
-///    field carries an HTTP/1.1 absolute-form request target, which RFC 9112
-///    §3.2.2 likewise makes override `Host`.
-/// 2. The `Host` header — the ordinary HTTP/1.1 origin-form request, whose
-///    URI has no authority at all, so this is the only source there.
-///
-/// `None` means the request named an authority in neither place; every
-/// caller treats that as unknown, never as a match.
-///
-/// This is the single definition of "the host this request is for", shared
-/// so that the same request cannot be judged by two different names: the
-/// policy layer selects `[policies.match] hosts` with it (through
-/// `resolve_effective_host`, which layers the trusted forwarded headers on
-/// top), and the Desktop bridge guard (`api::desktop`) checks browser
-/// same-origin with it. Both therefore see an HTTP/2 request's `:authority`
-/// exactly where they see an HTTP/1.1 request's `Host`.
+/// See docs/inferio-transport.md "Request authority (policy.rs)".
 pub(crate) fn request_authority<'a>(
     uri: &'a Uri,
     headers: &'a header::HeaderMap,
@@ -510,30 +485,17 @@ pub(crate) fn request_authority<'a>(
 }
 
 /// The host a request claims for itself, normalized (userinfo, port and any
-/// IPv6 brackets removed, lowercased) for `[policies.match] hosts`
-/// comparison.
+/// IPv6 brackets removed, lowercased) for `[policies.match] hosts` comparison.
 ///
-/// Sources, highest precedence first:
+/// `Forwarded` / `X-Forwarded-Host` win, but only when `[server]
+/// trust_forwarded_headers` is set — the reverse-proxy deployment; otherwise
+/// whatever [`request_authority`] found. Reading the authority introduces no
+/// new trust, and non-spoofable routing remains the listener endpoint
+/// ([`ListenerEndpoint`]). A request with neither an authority nor a `Host`
+/// stays hostless, and `select_policy` then matches only policies that state
+/// no `hosts`.
 ///
-/// 1. `Forwarded` / `X-Forwarded-Host`, but only when `[server]
-///    trust_forwarded_headers` is set — the reverse-proxy deployment, where
-///    the front proxy, not this request's own framing, is the authority on
-///    the name the client used.
-/// 2. The request target's authority, then the `Host` header — whichever
-///    `request_authority` finds, in that order and for the reasons given
-///    there.
-///
-/// Reading the authority introduces no new trust: `:authority` is exactly as
-/// client-controlled as `Host`, and any client that can set one can set the
-/// other. The precedence only decides which of two client-chosen names picks
-/// a policy in the malformed case where both are present and disagree (RFC
-/// 9113 §8.3.1 requires them to be consistent); the request target wins,
-/// matching what both HTTP versions say the authority *is*. Non-spoofable
-/// routing remains the listener endpoint (`ListenerEndpoint`), as before.
-///
-/// A request with neither an authority nor a `Host` is still hostless
-/// (`None`), and `select_policy` then matches only policies that state no
-/// `hosts`.
+/// See docs/inferio-transport.md "Request authority (policy.rs)".
 fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<String> {
     if trust_forwarded {
         if let Some(value) = header_to_str(req.headers().get("forwarded"))
@@ -574,10 +536,9 @@ fn parse_forwarded_host(value: &str) -> Option<String> {
 
 pub(crate) fn normalize_host(value: &str) -> String {
     let value = value.trim();
-    // An authority may carry a deprecated `userinfo@` prefix (RFC 3986
-    // §3.2.1; forbidden outright in an HTTP/2 `:authority`). It is not part
-    // of the host, and the host is what follows the last `@` — the same
-    // split `http::uri::Authority::host` makes.
+    // A deprecated `userinfo@` prefix (RFC 3986 §3.2.1) is not part of the
+    // host; the host follows the last `@`, the split
+    // `http::uri::Authority::host` makes.
     let value = match value.rfind('@') {
         Some(at) => &value[at + 1..],
         None => value,
@@ -635,14 +596,9 @@ fn rule_matches(rule: &RuleConfig, method: &Method, path: &str) -> bool {
 }
 
 /// First policy (config order) matching the effective host and the listener
-/// endpoint. An empty `hosts`/`endpoints` list matches anything, including
-/// an unknown host/endpoint (`None`); a non-empty list requires a known
-/// value that matches.
-///
-/// `host` is what `resolve_effective_host` resolved, which is the HTTP/2
-/// `:authority` for an HTTP/2 request just as it is the `Host` header for an
-/// HTTP/1.1 one — a request is hostless (`None`) only when it carries
-/// neither, at which point every policy that states any `hosts` declines it.
+/// endpoint. An empty `hosts`/`endpoints` list matches anything, including an
+/// unknown host/endpoint (`None`); a non-empty list requires a known value
+/// that matches. `host` is what [`resolve_effective_host`] resolved.
 pub(crate) fn select_policy<'a>(
     settings: &'a Settings,
     host: Option<&str>,
