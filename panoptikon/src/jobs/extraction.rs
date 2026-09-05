@@ -2994,7 +2994,7 @@ mod tests {
             ..group(batch)
         };
         // (stored settings, requested cap, resolved cap, label)
-        let cases: [(Vec<JobSettings>, Option<i64>, Option<i64>, &str); 6] = [
+        let cases = [
             (vec![], None, None, "nothing stored, nothing requested"),
             (vec![], Some(0), None, "a requested zero is unset"),
             (vec![group(Some(0))], None, None, "a stored zero is unset"),

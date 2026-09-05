@@ -387,48 +387,24 @@ mod tests {
     use crate::db::migrations::setup_test_databases;
 
     async fn seed(conn: &mut sqlx::SqliteConnection) {
-        sqlx::query(
-            r#"
-            INSERT INTO items (id, sha256, md5, type, time_added)
-            VALUES
-                (1, 'sha_one', 'md5_one', 'image/png', '2026-01-01T00:00:00'),
-                (2, 'sha_two', 'md5_two', 'video/mp4', '2026-01-01T00:00:00')
-            "#,
-        )
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO setters (id, name) VALUES (1, 'test/clip'), (2, 'test/tagger')")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        sqlx::query(
+        for sql in [
+            "INSERT INTO items (id, sha256, md5, type, time_added) VALUES \
+             (1, 'sha_one', 'md5_one', 'image/png', '2026-01-01T00:00:00'), \
+             (2, 'sha_two', 'md5_two', 'video/mp4', '2026-01-01T00:00:00')",
+            "INSERT INTO setters (id, name) VALUES (1, 'test/clip'), (2, 'test/tagger')",
             "INSERT INTO file_scans (id, start_time, path) \
              VALUES (1, '2026-01-01T00:00:00', '/media')",
-        )
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO files (
-                id, sha256, item_id, path, filename, last_modified, scan_id, available
-            )
-            VALUES (1, 'sha_one', 1, '/media/one.png', 'one.png', '2026-01-01T00:00:00', 1, 1)
-            "#,
-        )
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO data_jobs (id, completed) VALUES (7, 1), (8, 1)")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
+            "INSERT INTO files (id, sha256, item_id, path, filename, last_modified, \
+             scan_id, available) VALUES \
+             (1, 'sha_one', 1, '/media/one.png', 'one.png', '2026-01-01T00:00:00', 1, 1)",
+            "INSERT INTO data_jobs (id, completed) VALUES (7, 1), (8, 1)",
+        ] {
+            sqlx::query(sql).execute(&mut *conn).await.unwrap();
+        }
     }
 
-    /// When the job says the item failed — deliberately not "now", so the
-    /// round trip proves the record's own stamp is what is stored rather than
-    /// the moment of the batched write.
+    /// When the job says the item failed — deliberately not "now", so the round
+    /// trip proves the record's own stamp is what is stored.
     const FAILED_AT: &str = "2026-09-04T11:22:33";
 
     fn record(sha256: &str, stage: &str, requeued: bool) -> JobItemFailureRecord {
@@ -443,8 +419,7 @@ mod tests {
     }
 
     /// The write path, the audit read and the representative-path join, on one
-    /// job. `sha_two` has no file row, which is the "every file has gone away"
-    /// case the retry ledger's audit surface also has to survive.
+    /// job. `sha_two` has no file row: the "every file has gone away" case.
     #[tokio::test]
     async fn recorded_failures_come_back_with_their_item_and_path() {
         let mut dbs = setup_test_databases().await;
@@ -502,8 +477,7 @@ mod tests {
         };
         assert_eq!(count_job_failures(conn, &by_setter).await.unwrap(), 0);
 
-        // A record whose item is gone writes nothing and is not an error: an
-        // audit row must never be able to fail a job.
+        // A record whose item is gone writes nothing and is not an error.
         let missing = JobItemFailureRecord {
             item_sha256: "sha_gone".to_string(),
             ..record("sha_one", "inference", false)
@@ -539,9 +513,9 @@ mod tests {
         assert_eq!(rows[0].job_id, 7);
     }
 
-    /// The unsuccessful-job list, and the fields run1 found missing: a real
-    /// `end_time`, the unexplained-failure count and the reason. A `completed`
-    /// job must not appear at all.
+    /// The unsuccessful-job list and the fields it carries: a real `end_time`,
+    /// the unexplained-failure count and the reason. A `completed` job must not
+    /// appear at all.
     #[tokio::test]
     async fn the_failed_job_list_carries_the_counts_and_the_reason() {
         let mut dbs = setup_test_databases().await;
@@ -575,13 +549,8 @@ mod tests {
         // Newest first.
         assert_eq!(jobs[0].log_id, 2);
         assert_eq!(jobs[0].outcome, OUTCOME_FAILED);
-        assert!(
-            jobs[0]
-                .failure_reason
-                .as_deref()
-                .unwrap_or_default()
-                .contains("load-failure cooldown")
-        );
+        let reason = jobs[0].failure_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("load-failure cooldown"), "{reason}");
         assert_ne!(
             jobs[0].end_time, jobs[0].start_time,
             "a failed job must carry a real end_time (run1 finding T8)"

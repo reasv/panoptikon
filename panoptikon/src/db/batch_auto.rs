@@ -188,60 +188,51 @@ mod tests {
             .unwrap();
     }
 
-    const CONFIG_WITH_CAPS: &str = concat!(
-        "# hand-written database settings\n",
-        "scan_images = true\n",
-        "\n",
-        "[[job_settings]]\n",
-        "group_name = \"clip\"\n",
-        "# the cap the user picked back when it was a target\n",
-        "default_batch_size = 8\n",
-        "default_threshold = 0.5\n",
-        "\n",
-        "[[cron_jobs]]\n",
-        "inference_id = \"clip/ViT-H-14\"\n",
-        "batch_size = 4\n",
-        "threshold = 0.2\n",
-    );
-
-    // A database created after the upgrade is stamped at creation and its
-    // config is never touched -- in particular, never seeded.
-    #[tokio::test]
-    async fn fresh_database_is_stamped_without_seeding_a_config() {
-        let tmp = TempDir::new().unwrap();
-        let path = index_db_file(tmp.path(), "fresh");
+    /// A migrated index database with its stamp removed — a database that
+    /// predates the upgrade — and the path its config would live at.
+    async fn pre_upgrade_db(tmp: &TempDir) -> (PathBuf, PathBuf) {
+        let path = index_db_file(tmp.path(), "default");
         migrate_index_db_file(&path).await.unwrap();
+        unstamp(&path).await;
+        let config = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("default");
+        (path, config)
+    }
 
-        assert!(stamped(&path).await);
-        let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("fresh");
+    const CONFIG_WITH_CAPS: &str = r#"# hand-written database settings
+scan_images = true
+
+[[job_settings]]
+group_name = "clip"
+# the cap the user picked back when it was a target
+default_batch_size = 8
+default_threshold = 0.5
+
+[[cron_jobs]]
+inference_id = "clip/ViT-H-14"
+batch_size = 4
+threshold = 0.2
+"#;
+
+    fn has_no_caps(rewritten: &str) {
         assert!(
-            !config_path.exists(),
-            "the migration must not create a config file"
+            !rewritten.contains("default_batch_size") && !rewritten.contains("batch_size = 4"),
+            "both caps must be gone from the file, not set to something: {rewritten}"
         );
     }
 
     // The load-bearing case: an existing database with stored caps loses both
-    // of them, physically, while the rest of the file survives verbatim.
+    // of them, physically, while the rest of the file survives verbatim — and
+    // once stamped, a later sweep must not touch a cap entered afterwards.
     #[tokio::test]
     async fn existing_caps_are_removed_from_the_config_and_the_database_is_stamped() {
         let tmp = TempDir::new().unwrap();
-        let path = index_db_file(tmp.path(), "default");
-        migrate_index_db_file(&path).await.unwrap();
-        unstamp(&path).await;
-        let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("default");
+        let (path, config_path) = pre_upgrade_db(&tmp).await;
         fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
 
         migrate_index_db_file(&path).await.unwrap();
 
         let rewritten = fs::read_to_string(&config_path).unwrap();
-        assert!(
-            !rewritten.contains("default_batch_size"),
-            "the stored default must be gone from the file, not set to something: {rewritten}"
-        );
-        assert!(
-            !rewritten.contains("batch_size = 4"),
-            "the cron cap must be gone from the file: {rewritten}"
-        );
+        has_no_caps(&rewritten);
         assert!(
             rewritten.contains("# hand-written database settings")
                 && rewritten.contains("inference_id = \"clip/ViT-H-14\"")
@@ -250,27 +241,11 @@ mod tests {
             "comments, layout and every other value must survive: {rewritten}"
         );
         assert!(stamped(&path).await);
-    }
 
-    // Once stamped, a later sweep must not touch a cap entered afterwards.
-    #[tokio::test]
-    async fn a_second_run_leaves_a_newly_entered_cap_alone() {
-        let tmp = TempDir::new().unwrap();
-        let path = index_db_file(tmp.path(), "default");
-        migrate_index_db_file(&path).await.unwrap();
-        unstamp(&path).await;
-        let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("default");
-        fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
-        migrate_index_db_file(&path).await.unwrap();
-
-        // The user re-enters a cap after the upgrade.
-        let after_upgrade = fs::read_to_string(&config_path)
-            .unwrap()
-            .replace("default_threshold = 0.5", "default_batch_size = 16");
+        // The user re-enters a cap after the upgrade; the next run leaves it.
+        let after_upgrade = rewritten.replace("default_threshold = 0.5", "default_batch_size = 16");
         fs::write(&config_path, &after_upgrade).unwrap();
-
         migrate_index_db_file(&path).await.unwrap();
-
         assert_eq!(
             fs::read_to_string(&config_path).unwrap(),
             after_upgrade,
@@ -278,15 +253,26 @@ mod tests {
         );
     }
 
-    // Crash between the rewrite and the stamp: the re-run finds nothing to
-    // null and simply stamps.
+    // Nothing to null still stamps, on the three shapes that produce it: a
+    // database created after the upgrade, a crash between the rewrite and the
+    // stamp, and a database with no config file. The file must stay absent in
+    // the two cases that have none, since loading it would have seeded one.
     #[tokio::test]
-    async fn a_crash_before_the_stamp_is_harmless_on_re_run() {
+    async fn a_database_with_nothing_to_null_is_stamped_and_no_file_appears() {
+        // Created after the upgrade: stamped at creation, no config written.
         let tmp = TempDir::new().unwrap();
-        let path = index_db_file(tmp.path(), "default");
+        let path = index_db_file(tmp.path(), "fresh");
         migrate_index_db_file(&path).await.unwrap();
-        unstamp(&path).await;
-        let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("default");
+        assert!(stamped(&path).await);
+        assert!(
+            !SystemConfigStore::new(tmp.path().to_path_buf())
+                .config_path("fresh")
+                .exists(),
+            "the migration must not create a config file"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let (path, config_path) = pre_upgrade_db(&tmp).await;
         let already_nulled = CONFIG_WITH_CAPS
             .replace("default_batch_size = 8\n", "")
             .replace("batch_size = 4\n", "");
@@ -296,62 +282,42 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&config_path).unwrap(), already_nulled);
         assert!(stamped(&path).await);
-    }
 
-    // An existing database that never got a config file is stamped, and the
-    // file stays absent (loading it would have seeded one).
-    #[tokio::test]
-    async fn a_database_without_a_config_is_stamped_and_no_file_appears() {
         let tmp = TempDir::new().unwrap();
-        let path = index_db_file(tmp.path(), "default");
-        migrate_index_db_file(&path).await.unwrap();
-        unstamp(&path).await;
+        let (path, config_path) = pre_upgrade_db(&tmp).await;
+        fs::remove_file(&config_path).ok();
 
         migrate_index_db_file(&path).await.unwrap();
 
         assert!(stamped(&path).await);
-        assert!(
-            !SystemConfigStore::new(tmp.path().to_path_buf())
-                .config_path("default")
-                .exists()
-        );
+        assert!(!config_path.exists(), "load must not have seeded a config");
     }
 
-    // An unparseable config cannot be migrated, so the database is stamped
-    // anyway (with a warning) rather than retried forever: a retry landing
-    // after the user entered a new cap would delete it. The broken file is
-    // left exactly as it was, and startup survives.
-    #[tokio::test]
-    async fn an_unreadable_config_warns_stamps_and_is_left_untouched() {
-        let tmp = TempDir::new().unwrap();
-        let path = index_db_file(tmp.path(), "default");
-        migrate_index_db_file(&path).await.unwrap();
-        unstamp(&path).await;
-        let store = SystemConfigStore::new(tmp.path().to_path_buf());
-        let config_path = store.config_path("default");
-        let broken = "[[job_settings]]\ngroup_name = \"clip\"\ndefault_batch_size = ";
-        fs::write(&config_path, broken).unwrap();
-
-        // The failure the warning is made of.
-        assert!(clear_config_batch_sizes(&store, "default").is_err());
-
-        migrate_index_db_file(&path)
-            .await
-            .expect("a broken config must not fail startup");
-
-        assert_eq!(fs::read_to_string(&config_path).unwrap(), broken);
-        assert!(stamped(&path).await);
-    }
-
-    // The same for a config that reads fine but cannot be written back.
+    // A config that cannot be read, parsed or written back is stamped anyway
+    // (with a warning) rather than retried forever: a retry landing after the
+    // user entered a new cap would delete it. The file is left exactly as it
+    // was, and startup survives.
+    // See docs/batch-calibration-design.md, "Batch size UX".
     #[tokio::test]
     async fn an_unwritable_config_warns_stamps_and_is_left_intact() {
         let tmp = TempDir::new().unwrap();
-        let path = index_db_file(tmp.path(), "default");
-        migrate_index_db_file(&path).await.unwrap();
-        unstamp(&path).await;
+        let (path, config_path) = pre_upgrade_db(&tmp).await;
         let store = SystemConfigStore::new(tmp.path().to_path_buf());
-        let config_path = store.config_path("default");
+
+        // Unparseable.
+        let broken = "[[job_settings]]\ngroup_name = \"clip\"\ndefault_batch_size = ";
+        fs::write(&config_path, broken).unwrap();
+        assert!(clear_config_batch_sizes(&store, "default").is_err());
+        migrate_index_db_file(&path)
+            .await
+            .expect("a broken config must not fail startup");
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), broken);
+        assert!(stamped(&path).await);
+
+        // Readable, but not writable back.
+        let tmp = TempDir::new().unwrap();
+        let (path, config_path) = pre_upgrade_db(&tmp).await;
+        let store = SystemConfigStore::new(tmp.path().to_path_buf());
         fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
         let writable = fs::metadata(&config_path).unwrap().permissions();
         let mut readonly = writable.clone();
@@ -359,11 +325,9 @@ mod tests {
         fs::set_permissions(&config_path, readonly).unwrap();
 
         assert!(clear_config_batch_sizes(&store, "default").is_err());
-
         migrate_index_db_file(&path)
             .await
             .expect("an unwritable config must not fail startup");
-
         assert_eq!(fs::read_to_string(&config_path).unwrap(), CONFIG_WITH_CAPS);
         assert!(stamped(&path).await);
 
@@ -378,23 +342,18 @@ mod tests {
         }
     }
 
-    // The rewrite must not reformat anything it is not there for. Folder
-    // lists are the sharp case: `load`/`save` normalize them, so an
-    // un-normalized stored path would be rewritten if the migration diffed a
-    // normalized value against the raw file.
+    // The rewrite must not reformat anything it is not there for. Folder lists
+    // are the sharp case: `load`/`save` normalize them, so an un-normalized
+    // stored path would be rewritten if the diff used a normalized value.
     #[tokio::test]
     async fn folder_lists_survive_the_rewrite_byte_for_byte() {
         let tmp = TempDir::new().unwrap();
-        let path = index_db_file(tmp.path(), "default");
-        migrate_index_db_file(&path).await.unwrap();
-        unstamp(&path).await;
-        let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("default");
+        let (path, config_path) = pre_upgrade_db(&tmp).await;
         let folders = concat!(
             "included_folders = [\"/data/pictures\", \"/data/videos/\"]\n",
             "excluded_folders = [\"/data/pictures/thumbs\"]\n",
         );
-        let raw = format!("{folders}{CONFIG_WITH_CAPS}");
-        fs::write(&config_path, &raw).unwrap();
+        fs::write(&config_path, format!("{folders}{CONFIG_WITH_CAPS}")).unwrap();
 
         migrate_index_db_file(&path).await.unwrap();
 
@@ -403,12 +362,12 @@ mod tests {
             rewritten.starts_with(folders),
             "folder lists must round-trip byte-identically: {rewritten}"
         );
-        assert!(!rewritten.contains("default_batch_size") && !rewritten.contains("batch_size = 4"));
+        has_no_caps(&rewritten);
     }
 
-    // A database directory whose name is not UTF-8 can never be an
-    // `index_db` value, so no config the server could have written exists for
-    // it: skip and stamp, rather than fail and retry on every startup.
+    // A database directory whose name is not UTF-8 can never be an `index_db`
+    // value, so no config the server could have written exists for it: skip
+    // and stamp, rather than fail and retry on every startup.
     #[test]
     fn a_non_utf8_database_directory_is_skipped_not_retried() {
         #[cfg(windows)]
@@ -428,61 +387,36 @@ mod tests {
         clear_stored_batch_sizes(&path);
     }
 
-    // The production callers, not just the test hook: a custom-named index DB
-    // created through `migrate_databases_on_disk` has its caps cleared, which
-    // proves the `<data>/index/<name>/index.db` derivation against a real
-    // data folder.
-    #[tokio::test]
-    async fn the_named_migrator_clears_caps_for_a_custom_index_db() {
-        let test_env = crate::test_utils::test_data_dir();
-        let root = test_env.path().to_path_buf();
-        let name = "batch-auto-named";
-        crate::db::migrations::migrate_databases_on_disk(Some(name), None)
-            .await
-            .expect("create the custom index db");
-        let path = root.join("index").join(name).join("index.db");
-        unstamp(&path).await;
-        let config_path = SystemConfigStore::new(root.clone()).config_path(name);
-        fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
-
-        crate::db::migrations::migrate_databases_on_disk(Some(name), None)
-            .await
-            .expect("re-open the custom index db");
-
-        let rewritten = fs::read_to_string(&config_path).unwrap();
-        assert!(
-            !rewritten.contains("default_batch_size") && !rewritten.contains("batch_size = 4"),
-            "{rewritten}"
-        );
-        assert!(stamped(&path).await);
-    }
-
-    // The other production caller: the startup sweep reaches a database
-    // nobody selected, which is the only thing that gets to a DB the user
+    // Both production callers against a real data folder, which is what proves
+    // the `<data>/index/<name>/index.db` derivation: the per-DB open path, and
+    // the startup sweep — the only thing that reaches a database the user
     // never opens after upgrading.
     #[tokio::test]
-    async fn the_startup_sweep_clears_caps_for_a_never_opened_index_db() {
+    async fn both_production_callers_clear_the_stored_caps() {
         let test_env = crate::test_utils::test_data_dir();
         let root = test_env.path().to_path_buf();
-        let name = "batch-auto-swept";
-        crate::db::migrations::migrate_databases_on_disk(Some(name), None)
-            .await
-            .expect("create the swept index db");
-        let path = root.join("index").join(name).join("index.db");
-        unstamp(&path).await;
-        let config_path = SystemConfigStore::new(root.clone()).config_path(name);
-        fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
+        for (name, sweep) in [("batch-auto-named", false), ("batch-auto-swept", true)] {
+            crate::db::migrations::migrate_databases_on_disk(Some(name), None)
+                .await
+                .expect("create the index db");
+            let path = root.join("index").join(name).join("index.db");
+            unstamp(&path).await;
+            let config_path = SystemConfigStore::new(root.clone()).config_path(name);
+            fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
 
-        crate::db::migrations::migrate_all_databases_on_disk()
-            .await
-            .expect("the startup sweep must succeed");
+            if sweep {
+                crate::db::migrations::migrate_all_databases_on_disk()
+                    .await
+                    .expect("the startup sweep must succeed");
+            } else {
+                crate::db::migrations::migrate_databases_on_disk(Some(name), None)
+                    .await
+                    .expect("re-open the index db");
+            }
 
-        let rewritten = fs::read_to_string(&config_path).unwrap();
-        assert!(
-            !rewritten.contains("default_batch_size") && !rewritten.contains("batch_size = 4"),
-            "{rewritten}"
-        );
-        assert!(stamped(&path).await);
+            has_no_caps(&fs::read_to_string(&config_path).unwrap());
+            assert!(stamped(&path).await, "{name}");
+        }
     }
 
     // Only the index migrator carries the hook: the sibling databases in the
