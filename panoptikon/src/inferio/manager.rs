@@ -189,23 +189,9 @@ impl std::error::Error for LoadCooldownError {}
 /// Why a `spawn_model` failed, in the one dimension the cooldown cares about.
 struct LoadFailure {
     error: anyhow::Error,
+    /// Whether a worker was actually spawned before the failure, and so cost
+    /// something; a configuration error costs nothing.
     costed_worker: bool,
-}
-
-impl LoadFailure {
-    fn config(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            costed_worker: false,
-        }
-    }
-
-    fn worker(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            costed_worker: true,
-        }
-    }
 }
 
 /// One model's load-failure history.
@@ -1727,7 +1713,12 @@ impl ModelManager {
                 });
             match resolved {
                 Ok(resolved) => resolved,
-                Err(error) => return Err(LoadFailure::config(error)),
+                Err(error) => {
+                    return Err(LoadFailure {
+                        error,
+                        costed_worker: false,
+                    });
+                }
             }
         };
         tracing::debug!(
@@ -1890,7 +1881,10 @@ impl ModelManager {
             // Whole-set atomicity: kill the replicas that came up, un-charge.
             drop(admissions);
             futures_util::future::join_all(workers.into_iter().map(Worker::kill)).await;
-            return Err(LoadFailure::worker(err));
+            return Err(LoadFailure {
+                error: err,
+                costed_worker: true,
+            });
         }
         Ok(SpawnedModel {
             workers,
