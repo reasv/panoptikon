@@ -1,39 +1,21 @@
 """Fixture impl that OOMs on its *second* GPU batch, on a real CUDA GPU.
 
-CUDA-touching variant of the torch-free fixture of the same name
-(`python/tests/inferio_worker/fixture_impls/`), built for Phase 0 of
-`docs/batch-calibration-test-protocol.md` §3 (fixture note): a torch-free
-fixture reports no `gpu_uuid`/`base_mb`, so on a multi-GPU CUDA host the
-ledger cannot resolve it to a GPU and it runs unpriced. This variant
-allocates and touches one small CUDA tensor inside `load()`, which
-(a) initialises CUDA so `memory.py` can read `get_device_properties(0)` and
-report `gpu_uuid`/`gpu_name`/`gpu_total_mb`, and (b) moves the torch
-allocator's reserved/allocated counters across the load window so the
-`touched_gpu` gate in `_finish_load` opens and a `base_mb` is resolved
-(`nvml` own-PID tier on bare Linux).
+CUDA-touching variant of the torch-free fixture of the same name in
+`python/tests/inferio_worker/fixture_impls/`: it holds one CUDA tensor for the
+model's lifetime, which is what makes the worker report a `gpu_uuid` and a
+`base_mb` and the ledger price it. Unlike the original it bounds the OOMs, so
+one negative settle is what the scenario actually sees.
 
-Deliberate deviation from the torch-free original, found in Phase 4: the
-shipped fixture's test is `self.batches >= 2`, so it OOMs on the second batch
-**and on every batch after it, forever**. Under a real gateway that is not
-"one OOM": the harness falls back to per-request prediction, each retry is
-its own batch, each raises, and the ledger books a negative settle for every
-one — `deflation` reached 2 227 in 40 s in the first S5 leg. That is the
-`oom_cuda` fixture's job. Here the OOM count is bounded by `oom_batches`
-(default 1), so the scenario the protocol describes — one negative,
-`deflation = 1`, recovery after three clean windows — is what actually
-happens.
-
-Config keys (from the registry TOML, passed as **kwargs):
-  load_mb: MiB of device memory to hold for the model's lifetime (default 64).
+Config keys (registry TOML, passed as **kwargs):
+  load_mb: MiB held for the model's lifetime (default 64).
   device:  torch device string (default "cuda"); the worker is pinned with
-           CUDA_VISIBLE_DEVICES so "cuda" is always the intended GPU.
+           CUDA_VISIBLE_DEVICES, so "cuda" is always the intended GPU.
   oom_batches: how many batches OOM, starting with the second (default 1).
-           0 disables the OOM; a large value reproduces the shipped
-           torch-free behaviour.
+           0 disables the OOM; a large value reproduces the torch-free
+           behaviour.
 
-Keep this stdlib+torch only and self-contained: the worker's discovery
-(`inferio_worker/discovery.py`) loads each file as a standalone module, so
-relative imports between fixture files do not work.
+See tools/calibration-protocol/fixtures/README.md "Why a CUDA-touching
+variant exists".
 """
 
 import torch

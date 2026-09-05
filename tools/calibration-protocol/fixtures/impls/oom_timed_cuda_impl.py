@@ -1,26 +1,18 @@
 """Fixture impl that OOMs for the first N seconds after load, then recovers.
 
-`oom_cuda_impl.py` OOMs forever, which measures how far `deflation` climbs
-(finding B8: unbounded) but can never measure the other half of the question
-the protocol asks in §4 S5 — **how long recovery takes once the OOMs stop**.
-Deflation recovers one level per three clean windows, so a model that has
-deflated to N needs ~3N clean windows to come back; nothing in the shipped
-fixture set can produce that transition on one resident worker.
+Every predict raises the classified batch-1 OOM error until `oom_secs` have
+elapsed since `load()`, and succeeds after that. The worker is never killed
+and the profile is never reloaded, so the deflation counter that climbed
+during the OOM phase is the one whose recovery is timed afterwards -- which
+is what `oom_cuda_impl.py` (OOMs forever) cannot measure.
 
-This fixture does: every `predict` raises the classified batch-1 OOM error
-until `oom_secs` have elapsed since `load()`, and succeeds after that. The
-worker is never killed and the profile is never reloaded, so the deflation
-counter that climbed during the OOM phase is the same one whose recovery is
-timed during the healthy phase.
-
-Config keys (from the registry TOML, passed as **kwargs):
+Config keys (registry TOML, passed as **kwargs):
   oom_secs: seconds after load during which every predict OOMs (default 120).
-  load_mb:  MiB of device memory to hold for the model's lifetime (default 64).
+  load_mb:  MiB held for the model's lifetime (default 64).
   device:   torch device string (default "cuda").
 
-Keep this stdlib+torch only and self-contained: the worker's discovery
-(`inferio_worker/discovery.py`) loads each file as a standalone module, so
-relative imports between fixture files do not work.
+See tools/calibration-protocol/fixtures/README.md "Why a CUDA-touching
+variant exists".
 """
 
 import time
