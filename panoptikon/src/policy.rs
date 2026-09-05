@@ -1254,10 +1254,9 @@ allow = "*"
 
     /// Every source `resolve_effective_host` reads, and their precedence.
     /// The authority case is the HTTP/2 one: hyper builds the request URI
-    /// from `:authority`, and an HTTP/2 request sends no `Host` header at
-    /// all (RFC 9113 §8.3.1), so a gateway that only read `Host` saw every
-    /// HTTP/2 request as hostless — including its own h2c self-calls to the
-    /// local inference surface (run2 defect P1).
+    /// from `:authority` and an HTTP/2 request sends no `Host` header at all
+    /// (RFC 9113 §8.3.1), so reading `Host` alone makes every HTTP/2 request
+    /// hostless — including the gateway's own h2c inference self-calls.
     #[test]
     fn effective_host_reads_authority_host_and_forwarded() {
         let resolve = |req: Request<Body>, trust: bool| resolve_effective_host(&req, trust);
@@ -1358,13 +1357,10 @@ allow = "*"
         );
     }
 
-    /// `request_authority` is the shared source rule — the policy layer and
-    /// the Desktop bridge guard both resolve a request's host through it, so
-    /// an HTTP/2 request cannot be judged by one name here and another
-    /// there. It is pinned separately from `resolve_effective_host` because
-    /// it returns the authority *verbatim*: the Desktop guard compares a
-    /// whole browser origin (scheme, host **and port**) against it and must
-    /// still be able to refuse a userinfo prefix.
+    /// `request_authority` is the shared source rule, pinned separately from
+    /// `resolve_effective_host` because it returns the authority *verbatim*:
+    /// the Desktop guard compares a whole browser origin (scheme, host **and
+    /// port**) against it and must still be able to refuse a userinfo prefix.
     #[test]
     fn request_authority_prefers_the_request_target_over_host() {
         let req = |build: fn(axum::http::request::Builder) -> axum::http::request::Builder| {
@@ -1479,11 +1475,10 @@ allow = "*"
 
     /// The real PolicyLayer over a real `axum::serve` socket, reached by a
     /// real HTTP client on both versions: HTTP/1.1 with a `Host` header and
-    /// HTTP/2 cleartext with prior knowledge (`:authority`, no `Host`) must
-    /// resolve the same policy for the same URL. This is the gateway's own
-    /// inference self-call shape (`inferio_client.rs`), which run2 turned
-    /// h2c and which every `Host`-only host resolution answered 403
-    /// `no_policy`.
+    /// h2c with prior knowledge (`:authority`, no `Host`) must resolve the
+    /// same policy for the same URL. This is the gateway's own inference
+    /// self-call shape (`inferio_client.rs`), which a `Host`-only host
+    /// resolution answers 403 `no_policy`.
     #[tokio::test]
     async fn h2c_authority_selects_the_same_policy_as_http1_host() {
         async fn echo_policy(axum::Extension(context): axum::Extension<PolicyContext>) -> String {
