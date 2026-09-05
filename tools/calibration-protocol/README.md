@@ -234,6 +234,66 @@ ceiling_probe.py --model calibfixture/oom_second_batch_cuda \
 (After installation the shipped scan of `config/inference/` and
 `inferio_custom/` finds both on its own.)
 
+#### The probe's output
+
+`<out>.json` is `{"schema": "ceiling_probe/1", "model", "impl_class",
+"config", "torch", "dtype", "python"}` plus these blocks:
+
+| block | fields |
+|---|---|
+| `cost` | `unit`, `aggregation`, `seed_units`, `epoch`, `canvas_pixels`, `canvas_pixels_in_force` |
+| `device` | `index`, `uuid`, `name`, `total_mb`, `cuda_visible_devices` |
+| `load` | `seconds`, `base_nvml_mb`, `base_free_delta_mb`, `reserved_at_load_mb`, `allocated_at_load_mb`, `free_before_mb`, `free_after_mb` |
+| `batches[]` | `batch`, `repeat`, `units`, `items`, `ok`, `oom`, `error`, `absorbed_halvings`, `index_limit_events`, `duration_ms`, `peak_reserved_mb`, `peak_allocated_mb`, `delta_mb`, `reserved_before_mb`, `reserved_after_mb`, `nvml_own_mb`, `gpu_free_mb`, and `oom_class` (`source`, `exception`, `device`, `free_mb_at_failure`) or `null` |
+| `fit` | `slope_mb_per_unit`, `intercept_mb`, `residual_mb`, `samples` — or `null` |
+| `bisect` | `free_mb_at_start`, `reserved_at_bisect_start_mb`, `largest_ok_units`, `largest_ok_items`, `first_oom_items`, `first_index_limit_items`, `low_items`, `high_items`, `stopped_early`, `trace[]` — or `null` |
+
+`bisect.free_mb_at_start` is measured *after* the `--batches` sweep, whose
+reservations the caching allocator still holds, so the memory a bisect probe
+can actually use is `free_mb_at_start + reserved_at_bisect_start_mb`. Compare
+a boundary against that sum, never against `free_mb_at_start` alone.
+
+#### A shape ceiling is not an out-of-memory condition
+
+A batch can be refused because a kernel's 32-bit element index cannot address
+the tensor the batch builds — with the whole GPU free. The impl then falls
+back to smaller work and the probe sees a *slow success*, so a bisect that
+only looked at `oom` would report a boundary well above the true one: run2's
+S4 had both easyOCR bisects reporting `largest_ok_items: 37` against a true
+28, because at 29 and above CRAFT's pooling kernel overflowed its index and
+easyOCR fell back to per-image processing. `ceiling_probe.py` therefore diffs
+`inferio.impl.utils.total_index_limit_events()` across every call, treats such
+a batch as not `ok` for both the sweep and the bisect, and records its
+boundary as `first_index_limit_items` rather than `first_oom_items` — the two
+are different facts about a model and the ledger acts on them differently.
+The same diffing catches `total_oom_halvings()`, the OOMs an impl's own
+`run_with_oom_retry` swallowed.
+
+#### Registry and canvas resolution
+
+Two rules the probe copies from the orchestrator rather than approximating:
+
+* An `[group.G.inference_ids.ID]` table **replaces** an earlier definition of
+  that id wholesale; only group-level `config` and `metadata` merge key by key
+  (`registry.rs: load_file`). Deep-merging the id tables lets a shipped key
+  survive an override that deliberately omits it —
+  `config/registry-C7nc/` exists precisely to run easyOCR *without*
+  `metadata.cost.canvas_pixels`, and under a deep merge the shipped `6553600`
+  leaked back in and priced the uncapped control at the cap.
+* `metadata.cost.canvas_pixels` is **scale-bound**: `cost.rs:
+  canvas_from_tables` reads it only for a `pixel` unit and never inherits a
+  group's value into an id that redeclares the unit. `[group.clip]` is
+  `item`-priced while its VLM ids are not, so inheriting the CLIP tower's
+  canvas there would cap a tiled VLM at 378² and under-price every item.
+
+The canvas actually in force is resolved through the worker's own
+`packing.resolve_canvas_pixels` (declaration, then the loaded impl's
+attribute, then uncapped) and reported as `cost.canvas_pixels_in_force`.
+Pricing raw pixels here while the ledger prices capped ones would put the two
+slopes over different denominators, and two slopes in different denominations
+cannot be compared at all — the shape of run1's spurious 4.33x disagreement on
+nemotron, with the sides swapped.
+
 ### `oracle_calibrate.py` — the mandatory instrument calibration (§2)
 
 ```
