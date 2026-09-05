@@ -1131,21 +1131,18 @@ fn clamp_log_field(clamps: &[Option<String>]) -> String {
 /// (docs/inferio-worker-protocol.md, measurement fields).
 const CLAMP_REASON_MEMORY: &str = "memory";
 
-/// The one clamp reason this host acts on beyond the log (run2 S1): a
-/// size-dependent, **non-memory** kernel ceiling — an int32 index limit in a
-/// CUDA/HIP pooling kernel — cut the batch. Unlike the memory clamp it is a
-/// permanent property of the impl at a padded tensor shape, so it feeds the
-/// per-(model, GPU) [`ShapeCeiling`]. Any other reason a worker names is
-/// printed verbatim and otherwise treated exactly like the memory clamp: the
-/// host never invents a meaning for a word it does not know.
+/// The one clamp reason this host acts on beyond the log: a size-dependent,
+/// **non-memory** kernel ceiling — an int32 index limit in a CUDA/HIP pooling
+/// kernel — cut the batch, so it feeds the per-(model, GPU) [`ShapeCeiling`].
+/// Any other reason a worker names is printed verbatim and otherwise treated
+/// exactly like the memory clamp: the host never invents a meaning for a word
+/// it does not know.
 const CLAMP_REASON_INDEX_LIMIT: &str = "index_limit";
 
-/// Whether this measurement was cut by a clamp naming `reason`.
-///
-/// A clamp that names **no** reason is the defensive memory clamp — the wire's
-/// absence is pinned to it (docs/inferio-worker-protocol.md, measurement
-/// fields) — so it never answers `true` for a named reason, and a host that
-/// does not recognise a reason simply gets `false` rather than a guess.
+/// Whether this measurement was cut by a clamp naming `reason`. A clamp that
+/// names **no** reason is the defensive memory clamp — the wire's absence is
+/// pinned to it — so it never answers `true` for a named reason, and an
+/// unrecognised reason gets `false` rather than a guess.
 fn clamp_reason_is(measurement: &BatchMeasurement, reason: &str) -> bool {
     measurement
         .clamped
@@ -1154,9 +1151,8 @@ fn clamp_reason_is(measurement: &BatchMeasurement, reason: &str) -> bool {
         .is_some_and(|named| named == reason)
 }
 
-/// The throughput knee reached its expiry and was re-widened (or withdrawn)
-/// (run2 change R1d). Owns its strings so the line is formatted after the lock
-/// is dropped.
+/// The throughput knee reached its expiry and was re-widened (or withdrawn).
+/// Owns its strings so the line is formatted after the lock is dropped.
 struct KneeExpired {
     inference_id: String,
     gpu: String,
@@ -1198,9 +1194,9 @@ impl KneeExpired {
     }
 }
 
-/// A replica died mid-window on a unified-memory device and the ledger halved its
-/// model's budget for it (DP-2). Owns its strings so the line is formatted
-/// after the lock is dropped.
+/// A replica died mid-window on a unified-memory device and the ledger halved
+/// its model's budget for it. Owns its strings so the line is formatted after
+/// the lock is dropped.
 struct DeathNegative {
     inference_id: String,
     gpu: String,
@@ -1227,9 +1223,9 @@ impl DeathNegative {
     }
 }
 
-/// One measurement's out-of-memory classification, as the ingest believed it
-/// (run2 defect C2). Carried out of the ingest so the settle path can name the
-/// tier on the negative it records.
+/// One measurement's out-of-memory classification, as the ingest believed it.
+/// Carried out of the ingest so the settle path can name the tier on the
+/// negative it records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OomEvidence {
     /// The worker's `oom_class.source`, or `unclassified` for a pre-run2
@@ -1257,45 +1253,34 @@ struct Ingested {
     oom: bool,
     throughput_collapse: bool,
     /// The **first** trusted out-of-memory classification this window carried,
-    /// and how many of its measurements carried one (run2 defect C2). The
-    /// first, because one line per settled window is what the log wants and a
-    /// window's batches fail the same way; the count says how many there were.
+    /// and how many of its measurements carried one. The first, because one
+    /// line per settled window is what the log wants and a window's batches
+    /// fail the same way; the count says how many there were.
     oom_evidence: Option<OomEvidence>,
     oom_samples: usize,
     /// One entry per measurement that ran **smaller than the budget it was
-    /// granted**, carrying that clamp's `reason` (`None` = the defensive
-    /// memory clamp, which is what a worker that names no reason means).
-    ///
-    /// The reasons and not just the count, because a clamp's count alone
-    /// cannot say whether the size will come back: a memory clamp is a
-    /// transient of a busy GPU, a shape ceiling is permanent for these
-    /// shapes. Rendered for the settle line by [`clamp_log_field`].
+    /// granted**, carrying that clamp's `reason` (`None` = the defensive memory
+    /// clamp, which is what a worker that names no reason means). The reasons
+    /// and not just the count, because a count cannot say whether the size will
+    /// come back: a memory clamp is a transient of a busy GPU, a shape ceiling
+    /// is permanent for these shapes. Rendered by [`clamp_log_field`].
     clamps: Vec<Option<String>>,
-    /// This window moved the (model, GPU)'s [`ShapeCeiling`] (run2 S1).
-    /// `None` — the overwhelmingly common case — is "nothing changed", which
-    /// is why the line is emitted from here rather than per window.
+    /// This window moved the (model, GPU)'s [`ShapeCeiling`]. `None` — the
+    /// overwhelmingly common case — is "nothing changed", which is why the line
+    /// is emitted from here rather than per window.
     shape_ceiling: Option<ShapeCeilingEvent>,
 }
 
 /// Whether this GPU's free reading is worth a live driver query right now.
 ///
 /// Three reasons not to: a probe for this GPU is already in flight, the last
-/// probe came back with nothing recently, or the reading simply is not stale.
-/// The middle one is the one that matters on a host where `nvidia-smi` is
-/// missing, broken, or does not list the GPU — without it every grant request
-/// would spawn a blocking subprocess that answers nothing, forever. One failed
-/// attempt buys the same quiet period a successful sample would have. The first
-/// is a *latch*, and a latch that is never released disables this GPU's
-/// refreshes for the life of the process, so [`ProbeGuard`] clears it on every
-/// exit from a probe — panic included.
-///
-/// One reason to probe ahead of the staleness clock: the reading has been
-/// *adjusted* for a resident that left the GPU
-/// ([`VramLedger::forget_worker`]). That arithmetic keeps `external` honest
-/// across the departure, but it is bookkeeping standing in for a measurement,
-/// and the driver can settle the question. The two suppressions above still
-/// apply — a probe already in flight will answer it, and a host whose probe
-/// answers nothing must not be asked again on every grant.
+/// probe came back with nothing recently, or the reading is not stale. The
+/// middle one is what matters on a host where `nvidia-smi` is missing, broken
+/// or does not list the GPU — without it every grant request would spawn a
+/// blocking subprocess that answers nothing, forever. One reason to probe ahead
+/// of the staleness clock: the reading has been *adjusted* for a resident that
+/// left ([`VramLedger::forget_worker`]), which is bookkeeping standing in for a
+/// measurement the driver could settle.
 fn refresh_due(gpu: &GpuLedger) -> bool {
     if gpu.refreshing {
         return false;
@@ -1315,20 +1300,14 @@ fn refresh_due(gpu: &GpuLedger) -> bool {
 }
 
 /// Clears a GPU's in-flight `refreshing` flag on *every* exit from a host
-/// probe, a panic included. A blocking task that never ran at all constructs
-/// no guard, so that one case is not this type's:
-/// [`VramLedger::settle_abandoned_probe`] covers it from the join side.
+/// probe, a panic included, and stamps the failure backoff. A blocking task
+/// that never ran at all constructs no guard;
+/// [`VramLedger::settle_abandoned_probe`] covers that case from the join side.
 ///
-/// The flag is set before the query runs and settled by
-/// [`VramLedger::record_external_probe`] when the answer lands; the normal path
-/// says so with [`ProbeGuard::settled`], and this guard then does nothing at
-/// all — the flag is cleared and the backoff stamped at exactly the point they
-/// always were. It exists for the exit nobody writes code for: if the query
-/// unwinds, the flag stays `true` for the life of the process, [`refresh_due`]
-/// answers false for that GPU forever, and every future refresh is silently
-/// disabled. A probe that unwound also buys the failure backoff a probe that
-/// answered nothing would, so the very next request does not walk straight back
-/// into a query that is panicking on this host.
+/// The normal path says so with [`ProbeGuard::settled`] and the drop then does
+/// nothing. This exists for the exit nobody writes code for: a flag left `true`
+/// by an unwind makes [`refresh_due`] answer false for that GPU for the life of
+/// the process, silently disabling every future refresh.
 struct ProbeGuard<'a> {
     ledger: &'a VramLedger,
     /// The GPU the probe was started *for* — the one whose flag it set.
@@ -1410,12 +1389,10 @@ struct ModelCalibration {
     transients: VecDeque<(u64, u64)>,
     fit: Option<FitSnapshot>,
     /// This fit is **this machine's own, under this software environment**:
-    /// either computed here from this run's sample ring, or seeded from a
-    /// local profile matched on the exact torch string. Only such a fit may
-    /// be written back into the local store — writing a shipped baseline's
-    /// slope (or one measured under another torch build) back out under our
-    /// own generator stamp would launder a foreign measurement into local
-    /// provenance, and `/metadata` would then report it as this machine's own.
+    /// computed here from this run's sample ring, or seeded from a local
+    /// profile matched on the exact torch string. Only such a fit may be
+    /// written back into the local store — writing a foreign slope out under
+    /// our own generator stamp would launder its provenance.
     fit_is_local: bool,
     /// Largest locally measured clean high-water batch, in units.
     max_units_measured: u64,
@@ -1432,112 +1409,74 @@ struct ModelCalibration {
     /// runtime-only.
     throughput: VecDeque<ThroughputSample>,
     /// The best bucket median this model has *ever* shown here, as
-    /// `(log2 bucket, units/sec)` — the reference the [`KNEE_RATIO`]
-    /// threshold is taken against, alongside the live ring's own best.
+    /// `(log2 bucket, units/sec)` — the reference the [`KNEE_RATIO`] threshold
+    /// is taken against, alongside the live ring's own best.
     ///
     /// The ring ages by eviction, so its best decays: once the knee caps the
-    /// budget, the fastest sizes stop being run and the peak that *defined*
-    /// the knee falls out of the window. Re-fitting against the decayed peak
-    /// would then find a lower plateau start, cap harder, decay further —
-    /// a descent with no bottom but `knee_units = 1`, and no way back up
-    /// because [`MIN_KNEE_BUCKETS`] can never be met again inside a cap that
-    /// tight. Anchoring the threshold to the historical peak makes the knee
-    /// what its doc comment already claims: sticky, and a frontier that only
-    /// ever moves outward.
-    ///
-    /// Runtime-only, like the ring behind it: a new run re-earns its peak
-    /// from the ramp on the way up, and the persisted `knee_units` caps it
-    /// meanwhile.
+    /// budget the fastest sizes stop being run, and re-fitting against the
+    /// decayed peak would find a lower plateau start, cap harder and decay
+    /// further, with no bottom but `knee_units = 1`. Runtime-only, like the ring
+    /// behind it: a new run re-earns its peak from the ramp on the way up.
     knee_best: Option<(u32, f64)>,
     /// The throughput knee in force: the largest batch size worth admitting,
     /// whatever memory would allow. Either fitted here from
     /// [`Self::throughput`] or seeded from a profile — **including a shipped
-    /// one**, which is the one authority a foreign profile has beyond
-    /// pricing. A knee is a throughput hint, not a growth authority: it can
-    /// only ever make a grant smaller (see [`admitted_units`]), and capping
-    /// is the safe direction, so there is nothing to protect a fresh install
-    /// from by ignoring it. (Contrast the ratchet anchor, which *grows*
-    /// budgets and is therefore local-only.)
+    /// one**, which is the one authority a foreign profile has beyond pricing,
+    /// because a knee can only ever make a grant smaller. (Contrast the ratchet
+    /// anchor, which *grows* budgets and is therefore local-only.)
     knee_units: Option<u64>,
-    /// This knee was fitted here, from this machine's own observations, and
-    /// may therefore travel back into the local store. A seeded one may not:
-    /// writing a baseline's knee out under our own generator stamp would
-    /// launder it into local provenance, exactly as with the fit. The store
-    /// preserves whatever knee an entry already carries when an update
-    /// brings none, so this never erases a knee we wrote in a previous run.
+    /// This knee was fitted here, from this machine's own observations, and may
+    /// therefore travel back into the local store; a seeded one may not,
+    /// exactly as with the fit. The store preserves whatever knee an entry
+    /// already carries when an update brings none, so this never erases a knee
+    /// we wrote in a previous run.
     knee_is_local: bool,
-    /// Clean windows run **at** the knee with ample headroom since the knee
-    /// last moved: the knee's expiry counter (run2 change R1d). At
-    /// [`KNEE_EXPIRY_CLEAN_WINDOWS`] the cap widens by one log2 bucket and
-    /// this resets.
-    ///
-    /// Per (model, GPU) rather than per replica, deliberately: F-A's damage
-    /// was done *across* 56 worker spawns, each of them reseeded from the same
-    /// persisted knee, so a counter that died with the replica would never
-    /// reach its threshold on a model the manager keeps cycling. Persisted
-    /// alongside the knee for the same reason, one restart out.
+    /// Clean windows run **at** the knee with ample headroom since the knee last
+    /// moved: the knee's expiry counter. At [`KNEE_EXPIRY_CLEAN_WINDOWS`] the
+    /// cap widens by one log2 bucket and this resets. Per (model, GPU) rather
+    /// than per replica, and persisted, because a counter that died with the
+    /// replica would never reach its threshold on a model the manager keeps
+    /// cycling.
     knee_clean_windows: u32,
-    /// After a re-widening, the log2 bucket the old knee sat in, and the
+    /// After a re-widening, the log2 bucket the old knee sat in and the
     /// observation sequence number the widening happened at: the frontier the
     /// model has been let out to explore, and the line between the evidence
-    /// that was spent on the expired knee and the evidence that has not been.
+    /// spent on the expired knee and the evidence that has not been.
     ///
     /// A refit may put the knee back at or below `bucket` only when **every**
     /// quiet bucket above the candidate carries [`MIN_KNEE_BUCKET_SAMPLES`]
-    /// observations from at or after `from_seq` (see [`fit_knee`]). Without
-    /// some such rule the expiry never takes effect: the ring is unchanged by
-    /// the widening, so the very next settle re-fits the number that just
-    /// expired and the model never actually runs at the wider size.
+    /// observations from at or after `from_seq` (see [`fit_knee`]). Keying on
+    /// per-sample sequence numbers rather than on the ring's contents is what
+    /// makes "taken after the widening" mean what it says; a ring test clears
+    /// immediately, because the ring still holds the pre-knee ramp, and the
+    /// next settle re-fits the number that just expired.
     ///
-    /// **This is not the original R1d guard, and the difference is the whole
-    /// of finding F1.** R1d cleared the flag in
-    /// [`VramLedger::ingest_locked`] as soon as *one* warm batch above the
-    /// bucket landed, and then let the refit read the whole ring — which still
-    /// held the pre-knee ramp's samples from above the cap, the very evidence
-    /// the expiry had just declared spent, plus a hundred samples taken
-    /// *under* the cap at the capped size. Run2's S2-wdvit recording shows
-    /// that losing the race five times: widen 3 → 7, refit back to 3 within
-    /// 0.5 s, five times in eighteen seconds, and the run persisted the
-    /// result. Keying on per-sample sequence numbers instead of on the ring's
-    /// contents makes "taken after the widening" mean what it says.
-    ///
-    /// Note what this still does *not* do: once the fresh evidence really is
-    /// in, a refit may re-establish the same knee, and on a genuinely flat
-    /// curve it will. That is the expiry working — one probing window in every
-    /// [`KNEE_EXPIRY_CLEAN_WINDOWS`] + 1, at twice the capped size, in
-    /// exchange for a cap that can never again outlive its evidence.
-    ///
-    /// Runtime-only. A restart re-earns it: the knee it restores is seeded,
-    /// therefore provisional, and its first expiry is
-    /// [`KNEE_SEED_REVALIDATION_WINDOWS`] windows away.
+    /// Runtime-only: a restart re-earns it, since the knee it restores is
+    /// seeded and therefore provisional. See docs/batch-calibration-design.md
+    /// "Throughput knee: what run2 changed again (R1e)", rule 5.
     knee_widened: Option<KneeWidening>,
     /// A knee that was in force on this GPU has **expired past the point of
-    /// capping anything and been withdrawn**, and the calibration store has
-    /// not been told yet (run2 change R1d).
+    /// capping anything and been withdrawn**, and the calibration store has not
+    /// been told yet.
     ///
-    /// Explicit, and set where the withdrawal happens, because neither of the
-    /// quantities the write policy watches can express it. The store's merge
-    /// reads an absent knee as "this run fitted none" and keeps what is on
-    /// disk — correct for every case but this one — and `knee_units` alone
-    /// cannot distinguish them either, since the knee most in need of
-    /// withdrawing is a **seeded** one (`knee_is_local == false`, so it was
-    /// never in `persisted` to disappear from). That is F-A's own shape: the
-    /// stored knee is reseeded on every restart, and without this flag the
-    /// file keeps it forever however often the run retires it.
-    ///
-    /// Cleared once an update carrying it has been produced.
+    /// Explicit, and set where the withdrawal happens, because neither quantity
+    /// the write policy watches can express it: the store's merge reads an
+    /// absent knee as "this run fitted none" and keeps what is on disk, and
+    /// `knee_units` alone cannot distinguish the two either, since the knee most
+    /// in need of withdrawing is a **seeded** one (`knee_is_local == false`, so
+    /// it was never in `persisted` to disappear from). Cleared once an update
+    /// carrying it has been produced.
     knee_withdrawn: bool,
     /// `(anchor, fit version, locally fitted knee)` as last handed to the
     /// calibration store. The write policy is "the ratchet anchor advanced or
-    /// the fit meaningfully changed" — and `FitSnapshot::version` only moves
-    /// when the refit actually differed, so comparing these numbers *is* that
-    /// policy. The knee joins them because it is persisted state that moves
-    /// on its own schedule; it is quantized to a bucket edge, so any change
-    /// at all is a material one.
+    /// the fit meaningfully changed", and `FitSnapshot::version` only moves when
+    /// the refit actually differed, so comparing these numbers *is* that policy.
+    /// The knee joins them because it is persisted state that moves on its own
+    /// schedule, quantized to a bucket edge.
     persisted: Option<(u64, u64, Option<u64>)>,
-    /// The batch size this model's own kernels have said they cannot execute
-    /// at this corpus's shapes (run2 S1). See [`ShapeCeiling`] — including why
-    /// it is **runtime-only** and appears in no `ProfileUpdate`.
+    /// The batch size this model's own kernels have said they cannot execute at
+    /// this corpus's shapes. See [`ShapeCeiling`] — including why it is
+    /// **runtime-only** and appears in no `ProfileUpdate`.
     shape_ceiling: Option<ShapeCeiling>,
     /// Next [`ThroughputSample::seq`]. Counts observations *offered* to the
     /// ring, not ones still in it, so eviction never rewinds it and a
@@ -1545,55 +1484,39 @@ struct ModelCalibration {
     throughput_seq: u64,
 }
 
-/// Where a knee expiry left the model: the bucket it was widened away from,
-/// and the point in the observation stream it was widened at (run2 change
-/// R1e). See [`ModelCalibration::knee_widened`] and [`fit_knee`].
+/// Where a knee expiry left the model: the bucket it was widened away from and
+/// the point in the observation stream it was widened at. See
+/// [`ModelCalibration::knee_widened`] and [`fit_knee`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KneeWidening {
     /// The log2 bucket the expired knee sat in. A refit may not put the knee
     /// back at or below this bucket on evidence older than `from_seq`.
     bucket: u32,
-    /// [`ModelCalibration::throughput_seq`] as it stood at the widening —
-    /// i.e. the `seq` the *next* observation will take, since the settle
-    /// ingests before it expires. Every sample whose `seq` is at or past this
-    /// was taken after the model was let out.
+    /// [`ModelCalibration::throughput_seq`] as it stood at the widening — the
+    /// `seq` the *next* observation will take, since the settle ingests before
+    /// it expires. Every sample at or past this was taken after the widening.
     from_seq: u64,
 }
 
-/// A batch size the **impl itself** has said it cannot execute at this
-/// corpus's shapes (run2 S1): the third brake on the budget, beside the
-/// throughput knee and the extrapolation ratchet.
+/// A batch size the **impl itself** has said it cannot execute at this corpus's
+/// shapes: the third brake on the budget, beside the throughput knee and the
+/// extrapolation ratchet. The signal is a `clamped` report whose `reason` is
+/// [`CLAMP_REASON_INDEX_LIMIT`] — a size-dependent, *non-memory* kernel ceiling,
+/// and a permanent property of that impl at that padded tensor shape.
 ///
-/// The signal is a `clamped` report whose `reason` is
-/// [`CLAMP_REASON_INDEX_LIMIT`] — a size-dependent, *non-memory* kernel
-/// ceiling. easyOCR's is the one that was measured: CRAFT's first
-/// `MaxPool2d` (`vgg16_bn.features[6]`) launches over its output element
-/// count as a signed `int32`, so `64 × ⌊H/2⌋ × ⌊W/2⌋ × B` may not exceed
-/// `2^31 − 1` whatever the GPU has free. Nothing about it is transient —
-/// on CUDA/HIP it is a permanent property of that impl at that padded tensor
-/// shape, and it will bind again on every batch of similar pages, forever.
-///
-/// **Runtime-only, and deliberately never persisted.** Two of its three
-/// inputs are not properties of the machine at all:
-///
-/// * the padded dims come from *this corpus* (a library of A4 scans and one
-///   of thumbnails put the ceiling decades apart), and
-/// * `units` is denominated in the pixel canvas and cost epoch the clamped
-///   window was priced under (run2 R7), so the same physical ceiling is a
-///   different number after a canvas change.
-///
-/// Writing it into a calibration profile would therefore hand the next run —
-/// or, worse, another machine via a shipped baseline — a cap measured against
-/// a corpus it will never see. It lives here, beside the throughput ring and
-/// [`ModelCalibration::knee_best`], and a restart re-learns it from the first
-/// clamped window.
+/// **Runtime-only, and deliberately never persisted**: the padded dims come
+/// from *this corpus*, and `units` is denominated in the pixel canvas and cost
+/// epoch the clamped window was priced under, so the same physical ceiling is a
+/// different number after a canvas change. A restart re-learns it from the
+/// first clamped window. See docs/batch-calibration-design.md "Shape ceiling:
+/// the third brake".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShapeCeiling {
-    /// The largest batch the impl has been observed to actually execute
-    /// before its own ceiling cut one: the `to_units` of an `index_limit`
-    /// clamp, and the **smallest** such figure seen while this ceiling stood
-    /// (a wider report describes a batch of smaller pages and says nothing
-    /// about the frame that bound).
+    /// The largest batch the impl has been observed to actually execute before
+    /// its own ceiling cut one: the `to_units` of an `index_limit` clamp, and
+    /// the **smallest** such figure seen while this ceiling stood (a wider
+    /// report describes a batch of smaller pages and says nothing about the
+    /// frame that bound).
     units: u64,
     /// The canvas the clamped window was priced under
     /// ([`WorkerEntry::canvas_pixels`]). A ceiling in units means nothing
@@ -1664,32 +1587,21 @@ const CEILING_CAUSE_PROFILE: &str = "canvas_or_epoch_changed";
 const CEILING_CAUSE_RAN_WIDER: &str = "ran_wider_uncut";
 
 /// Fold this window's `index_limit` evidence into a (model, GPU)'s shape
-/// ceiling, returning what changed (`None` = nothing did).
-///
-/// Four rules, in this order, because a single window can carry more than one
-/// of them:
+/// ceiling, returning what changed (`None` = nothing did). Four rules, in this
+/// order, because one window can carry more than one of them:
 ///
 /// 1. **Invalidate on identity.** A ceiling recorded under another canvas or
-///    cost epoch is a number in another currency. Dropped, not converted:
-///    the conversion would need the padded dims, which the ledger never sees.
+///    cost epoch is a number in another currency. Dropped, not converted: the
+///    conversion would need the padded dims, which the ledger never sees.
 /// 2. **Clear when contradicted.** A batch larger than the ceiling that ran
-///    *without* an `index_limit` clamp proves the impl's frame moved (the
-///    corpus's pages got smaller), so the recorded figure is no longer that
-///    impl's ceiling for this work.
-/// 3. **Record, or lower.** A clamp establishes a ceiling where there is
-///    none, and replaces a standing one only when it is **smaller** — several
-///    reports over a mixed corpus are all true, and the binding frame is the
-///    element-wise max of the batch, so the smallest observation is the one
-///    that holds for every batch this model is handed.
-/// 4. **Never raise in place.** Rule 2 clears rather than raising to the size
-///    that was demonstrated, and that is not timidity — it is the only
-///    non-deadlocking choice. A ceiling *caps admission*, so raising it to
-///    the largest batch seen would pin the budget at exactly the size that
-///    was last demonstrated and make the next, larger demonstration
-///    impossible: the cap would lock itself in at the first number it ever
-///    saw. Clearing costs at most one over-wide window — the impl trims it,
-///    reports the clamp, and rule 3 re-establishes the ceiling from the
-///    fresh observation — and that window is priced, not failed.
+///    *without* an `index_limit` clamp proves the impl's frame moved.
+/// 3. **Record, or lower.** The binding frame is the element-wise max of the
+///    batch, so the smallest observation is the one that holds for every batch
+///    this model is handed.
+/// 4. **Never raise in place.** Raising to the size just demonstrated would pin
+///    the budget at exactly that size and make the next, larger demonstration
+///    impossible. Clearing costs at most one over-wide window, which the impl
+///    trims and reports — priced, not failed.
 fn update_shape_ceiling(
     cal: &mut ModelCalibration,
     canvas_pixels: Option<u32>,
@@ -1721,11 +1633,10 @@ fn update_shape_ceiling(
     let reported = reported.filter(|units| *units > 0);
     let standing = cal.shape_ceiling;
     match (reported, standing) {
-        // A clamp with nothing standing — either nothing was ever recorded, or
-        // this same window's evidence just retired what was. Both are a `set`:
-        // no ceiling was in force at the instant the clamp landed. The dropped
-        // figure is still reported beside it, so a composite settle reads as
-        // one event rather than none.
+        // A clamp with nothing standing — either nothing was ever recorded,
+        // or this same window's evidence just retired what was. Both are a
+        // `set`. The dropped figure is still reported beside it, so a composite
+        // settle reads as one event rather than none.
         (Some(units), None) => {
             cal.shape_ceiling = Some(ShapeCeiling {
                 units,
@@ -1761,8 +1672,7 @@ fn update_shape_ceiling(
             })
         }
         // A clamp at or above the one in force teaches nothing: a batch of
-        // smaller pages fits more of them under the same element limit, and
-        // the ceiling already in force is the stricter true statement.
+        // smaller pages fits more of them under the same element limit.
         (Some(_), Some(_)) => None,
         (None, _) => cleared.map(|(cause, units, age)| ShapeCeilingChange {
             action: "cleared",
@@ -1789,15 +1699,12 @@ struct ShapeCeilingChange {
     previous_age_secs: Option<u64>,
 }
 
-/// The shape ceiling this replica's batches are actually subject to, or
-/// `None` where the recorded one does not describe it.
-///
-/// The identity check is on the **read** side as well as in
-/// [`update_shape_ceiling`] because the two answer different questions: the
-/// update path clears a stale ceiling when a window settles, and this one
-/// guarantees that a replica loaded under a different canvas — one that has
-/// settled no window yet, and may never settle one — is never priced against
-/// another canvas's number.
+/// The shape ceiling this replica's batches are actually subject to, or `None`
+/// where the recorded one does not describe it. The identity check is on the
+/// **read** side as well as in [`update_shape_ceiling`] because a replica
+/// loaded under a different canvas may have settled no window yet, and may
+/// never settle one, and must still never be priced against another canvas's
+/// number.
 fn shape_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Option<u64> {
     cal.and_then(|cal| cal.shape_ceiling)
         .filter(|ceiling| {
@@ -1818,32 +1725,16 @@ struct FreeSample {
 /// context's view of it.
 ///
 /// NVML (and `nvidia-smi`, which is NVML with a CLI) answer for the GPU;
-/// torch's `mem_get_info` answers for the calling context and read 3.4 GB apart
-/// from NVML on the dev box. The external term is `total − free − Σ our
-/// footprints`, so alternating the two sources makes `external` — and therefore
-/// every grant — swing by gigabytes for no physical reason. Once a GPU has
-/// produced one authoritative reading, torch-sourced ones stop overwriting it;
-/// a GPU that has only ever seen torch readings keeps using them, which is
-/// consistent even if it is offset.
-/// `"amdgpu-sysfs"` is the ROCm equivalent of `"nvml"`/`"nvidia-smi"`:
-/// amdgpu's own per-GPU `mem_info_vram_*` counters, device-wide rather
-/// than process-local, and the very files both the staleness refresh and
-/// the worker's free/total tier read (docs/rocm-batch-calibration-parity.md,
-/// D4/D5). The label names the *driver*, not the filesystem, so that a
-/// future generic sysfs-derived reporter cannot inherit authority here by
-/// string collision. `"torch"` stays non-authoritative everywhere — doubly
-/// so on HIP, where `hipMemGetInfo`'s "free" was historically process-local.
-/// `"mps"` is the unified-memory equivalent: the host's RAM statistics, which
-/// see every process on the machine by construction and are the *only*
-/// reading on that GPU with any claim to whole-device authority (Metal
-/// exposes no free-memory counter of its own). The orchestrator's refresh and
-/// the worker's sample read the same statistics under the same label, so the
-/// consistency rule holds there as it does on ROCm
-/// (docs/unified-memory-admission.md, backend A).
-/// `"ram"` is the same thing again on a host with no accelerator at all
-/// (backend C), where the machine's RAM statistics are not merely the best
-/// whole-device reading but the *only* one there is: `pool_free` does not
-/// exist, so `free = ram_available` and both sides read it from the OS.
+/// torch's `mem_get_info` answers for the calling context. `external` is
+/// `total − free − Σ our footprints`, so alternating the two sources makes it —
+/// and therefore every grant — swing by gigabytes for no physical reason. Once
+/// a GPU has produced one authoritative reading, torch-sourced ones stop
+/// overwriting it. `"amdgpu-sysfs"` is the ROCm equivalent: amdgpu's own
+/// device-wide counters, the label naming the *driver* so that a future generic
+/// sysfs reporter cannot inherit authority by string collision. `"mps"` and
+/// `"ram"` are the unified-memory and CPU-only equivalents, where the host's
+/// RAM statistics are the only whole-device reading there is. See
+/// docs/rocm-batch-calibration-parity.md and docs/unified-memory-admission.md.
 fn free_source_is_authoritative(source: &str) -> bool {
     matches!(
         source,
@@ -1855,29 +1746,25 @@ struct GpuLedger {
     name: String,
     total_mb: u64,
     /// Host RAM this GPU is carved out of, in MiB, on a **unified** GPU
-    /// (`GpuInfo::unified_ram_mb`); `None` on a GPU with private VRAM.
-    ///
-    /// Two things read it, both of them things that are only true when the
-    /// GPU's memory is the machine's: DP-2's death-as-negative-sample, and
-    /// DP-4's bound on the authoritative total below.
+    /// (`GpuInfo::unified_ram_mb`); `None` on a GPU with private VRAM. Read by
+    /// the death-as-negative-sample rule and by the bound on the authoritative
+    /// total below — both true only where the GPU's memory is the machine's.
     unified_ram_mb: Option<u64>,
     /// The device-local VRAM carve-out of a unified ROCm GPU
-    /// (`GpuInfo::vram_carveout_mb`); `None` everywhere else. The
-    /// registration cross-check accepts a worker total matching **either**
-    /// this or [`Self::total_mb`], because what HIP reports as an APU's
-    /// `total_memory` — the carve-out, the carve+GTT sum, or something else
-    /// again — is unverified until a BC-250 field pass, and a mismatch must
-    /// not refuse admission while the answer is unknown.
+    /// (`GpuInfo::vram_carveout_mb`); `None` everywhere else. The registration
+    /// cross-check accepts a worker total matching **either** this or
+    /// [`Self::total_mb`], because what HIP reports as an APU's `total_memory`
+    /// is unverified, and a mismatch must not refuse admission meanwhile.
     vram_carveout_mb: Option<u64>,
-    /// This GPU's `total_mb` is the figure a worker reported rather than
-    /// the probe's seed (DP-4). Once true it stays true: the first report
-    /// wins, and a later replica's identical figure has nothing to add.
+    /// This GPU's `total_mb` is a figure a worker reported rather than the
+    /// probe's seed. Once true it stays true: the first report wins, and a
+    /// later replica's identical figure has nothing to add.
     total_adopted: bool,
-    /// The GPU's PCI address, lower-cased, when the inventory carries one
-    /// (ROCm only today). It is the fallback registration join for a worker
-    /// that cannot report a UUID the inventory would recognise — every ROCm
-    /// worker — and, being the address amdgpu names its own sysfs directory
-    /// with, the one string both sides derive independently.
+    /// The GPU's PCI address, lower-cased, when the inventory carries one (ROCm
+    /// only today). The fallback registration join for a worker that cannot
+    /// report a UUID the inventory would recognise — every ROCm worker — and,
+    /// being the address amdgpu names its own sysfs directory with, the one
+    /// string both sides derive independently.
     bdf: Option<String>,
     free: Option<FreeSample>,
     /// This GPU has produced at least one whole-GPU free reading, so
@@ -1888,32 +1775,30 @@ struct GpuLedger {
     /// A live driver refresh for **this GPU** is already in flight; do not
     /// start another.
     refreshing: bool,
-    /// When the last refresh attempt for this GPU came back with nothing.
-    /// A host where `nvidia-smi` is missing or broken would otherwise spawn a
+    /// When the last refresh attempt for this GPU came back with nothing. A
+    /// host where `nvidia-smi` is missing or broken would otherwise spawn a
     /// blocking task on every single grant request, forever.
     last_refresh_failed_at: Option<Instant>,
-    /// When [`VramLedger::forget_worker`] last adjusted this GPU's free
-    /// sample for a departed resident's footprint, if no real reading has
-    /// landed since. Two things read it, both in
-    /// [`VramLedger::record_free_locked`]'s neighbourhood: the next grant
-    /// request re-reads the driver instead of waiting out
-    /// [`EXTERNAL_SAMPLE_MAX_AGE`] ([`refresh_due`]), and a reading *captured
-    /// before* the departure is refused — it counted the departed footprint as
-    /// in use, and that footprint has already left the `external` sum.
+    /// When [`VramLedger::forget_worker`] last adjusted this GPU's free sample
+    /// for a departed resident's footprint, if no real reading has landed since.
+    /// Two readers: the next grant request re-reads the driver instead of
+    /// waiting out [`EXTERNAL_SAMPLE_MAX_AGE`] ([`refresh_due`]), and a reading
+    /// *captured before* the departure is refused, since it counted the
+    /// departed footprint as in use.
     free_adjusted_at: Option<Instant>,
 }
 
 #[derive(Default)]
 struct LedgerState {
-    /// Whether a worker's own total-memory report may replace this host's
-    /// GPU total (DP-4), from `GpuInventory::adopts_worker_total` — i.e.
-    /// MPS and nothing else. A host fact rather than a per-GPU one, because
-    /// it is a property of *which interface read the total*, not of a GPU.
+    /// Whether a worker's own total-memory report may replace this host's GPU
+    /// total, from `GpuInventory::adopts_worker_total` — i.e. MPS and nothing
+    /// else. A host fact rather than a per-GPU one: it is a property of which
+    /// interface read the total.
     adopts_worker_total: bool,
     gpus: HashMap<String, GpuLedger>,
     workers: HashMap<WorkerId, WorkerEntry>,
     calibration: HashMap<(String, String), ModelCalibration>,
-    /// What loads during *this run* reported for (inference_id, GPU UUID):
+    /// What loads during *this run* reported for (inference_id, GPU UUID).
     /// `Some(mb)` is the first tier of load-reservation sizing, ahead of
     /// profiles; `None` records that a load of this model on this GPU
     /// demonstrably put nothing of its own on the device, so future loads of it
@@ -1931,18 +1816,17 @@ struct LedgerState {
     /// that WARN (see [`VramLedger::record_free_locked`]).
     free_total_mismatch_logged: HashSet<(String, String)>,
     /// `(model, gpu key, reason)` triples whose calibration-store skip has
-    /// already been explained: the once-per-reason guard on those DEBUG
-    /// lines (see [`VramLedger::note_unpersistable_locked`]). The write
-    /// policy is evaluated on every settled window, so without it a model
-    /// that can never be keyed would explain itself a few times a second.
+    /// already been explained: the once-per-reason guard on those DEBUG lines
+    /// (see [`VramLedger::note_unpersistable_locked`]). The write policy runs on
+    /// every settled window, so without it a model that can never be keyed would
+    /// explain itself a few times a second.
     profile_skip_logged: HashSet<(String, String, &'static str)>,
     next_id: u64,
     next_fit_version: u64,
     /// Test seam for the host probe. Production always shells out through
     /// [`VramLedger::memory_query`]; the ledger's own tests install a fixed
-    /// answer (and count the calls) so the load-path probe can be exercised
-    /// without a driver — `probe_external` is off in those ledgers precisely
-    /// so their free readings are exactly what they fed in.
+    /// answer and count the calls, so the load-path probe can be exercised
+    /// without a driver.
     #[cfg(test)]
     probe_stub: Option<ProbeStub>,
 }
@@ -1966,13 +1850,12 @@ impl LedgerState {
     }
 }
 
-/// What resolving a load report to a ledger GPU decided, and — separately
-/// — what to say about it.
-///
-/// The two are apart because [`VramLedger::resolve_gpu`] runs under the
-/// ledger mutex, and formatting a `tracing` event there would hold every
-/// concurrent grant request behind a log write (review F8). The resolution
+/// What resolving a load report to a ledger GPU decided, and — separately —
+/// what to say about it. The two are apart because [`VramLedger::resolve_gpu`]
+/// runs under the ledger mutex, and formatting a `tracing` event there would
+/// hold every concurrent grant request behind a log write. The resolution
 /// carries owned strings; [`VramLedger::register_worker`] drops the lock and
+/// only then calls [`GpuLog::emit`].
 /// only then calls [`GpuLog::emit`].
 struct GpuResolution {
     /// `(gpu key, gpu name)` to admit the replica under, or `None` for
@@ -2012,24 +1895,23 @@ enum GpuLog {
         gpu: String,
         gpu_bdf: Option<String>,
         gpu_total_mb: u64,
-        /// The other figure a unified ROCm GPU's total was allowed to
-        /// match (its carve-out); `None` on every discrete GPU. Named in
-        /// the refusal so a field report shows both candidates rather than
-        /// leaving an APU mismatch looking like a single-figure disagreement.
+        /// The other figure a unified ROCm GPU's total was allowed to match
+        /// (its carve-out); `None` on every discrete GPU. Named in the refusal
+        /// so a field report shows both candidates rather than leaving an APU
+        /// mismatch looking like a single-figure disagreement.
         gpu_carveout_mb: Option<u64>,
         worker_bdf: Option<String>,
         worker_uuid: Option<String>,
         worker_total_mb: Option<u64>,
         tolerance_mb: u64,
-        /// The GPU the orchestrator's *pin* named for this replica, when
-        /// the caller knew it, and that GPU's PCI address.
+        /// The GPU the orchestrator's *pin* named for this replica, when the
+        /// caller knew it, and that GPU's PCI address.
         ///
-        /// Carried on a **refusal** because this is where a mis-ordered
-        /// enumeration surfaces on a host whose GPUs are *unequal*: the
-        /// cross-check runs before admission, so the replica never reaches
-        /// [`Self::PinDiverged`] and the "the pin believed GPU A" half of
-        /// the alarm would otherwise be missing exactly where the totals are
-        /// discriminating enough to prove it.
+        /// Carried on a **refusal** because the cross-check runs before
+        /// admission: a replica on a mis-ordered enumeration never reaches
+        /// [`Self::PinDiverged`], so the "the pin believed GPU A" half of the
+        /// alarm would be missing exactly where the totals are discriminating
+        /// enough to prove it.
         expected_gpu: Option<String>,
         expected_bdf: Option<String>,
     },
@@ -2049,7 +1931,7 @@ enum GpuLog {
         ram_mb: u64,
     },
     /// A later replica reported a *different* — and sane — total for an
-    /// already-adopted unified-memory device: the GPU memory limit moved under a
+    /// already-adopted unified-memory device: the memory limit moved under a
     /// running gateway. The new figure wins, rather than the cross-check
     /// refusing every replica until a restart.
     UnifiedTotalReadopted {
@@ -2066,12 +1948,11 @@ enum GpuLog {
         reported_total_mb: u64,
         ram_mb: u64,
     },
-    /// The replica was admitted, but under a **different** GPU than the one
-    /// the orchestrator's pin believed it had placed it on (review F1): the
-    /// enumeration-order diagnostic. Not a refusal — the replica is
-    /// physically on the resolved GPU, so charging it there is the correct
-    /// pricing — but the one signal that the row order the pin was derived
-    /// from is not HIP's device order.
+    /// The replica was admitted, but under a **different** GPU than the one the
+    /// orchestrator's pin believed it had placed it on: the enumeration-order
+    /// diagnostic. Not a refusal — the replica is physically on the resolved
+    /// GPU, so charging it there is the correct pricing — but the one signal
+    /// that the row order the pin was derived from is not HIP's device order.
     PinDiverged {
         expected: String,
         expected_bdf: Option<String>,
@@ -2243,10 +2124,8 @@ impl GpuLog {
 pub struct VramLedger {
     budgets: VramBudgets,
     /// The calibration store: load-reservation bases, fit/anchor seeding at
-    /// registration, and the persistence side of the write policy. `None` on
-    /// a host with no store configured, which is the pre-1c behaviour (every
-    /// first load reserves the conservative constant and nothing survives a
-    /// restart).
+    /// registration, and the persistence side of the write policy. `None` on a
+    /// host with no store configured, where nothing survives a restart.
     profiles: Option<Arc<dyn CalibrationProfiles>>,
     state: StdMutex<LedgerState>,
     /// The interface a staleness refresh reads, resolved from the inventory
@@ -2321,45 +2200,26 @@ impl VramLedger {
 
     /// Charge a load's *expected* base against the GPU from load-start.
     ///
-    /// Concurrent loads on one GPU are bounded by that GPU's admission
-    /// gate (`[inference_local] max_concurrent_loads`, default 1), but
-    /// dispatch is not gated at all: without this charge, windows granted to
-    /// *other* models during a multi-second load collide with the incoming
-    /// weights. The charge is correct however many reservers the gate admits
-    /// — reservations are keyed per load and summed, so two concurrent loads
-    /// hold two bases against the GPU rather than overwriting one another.
+    /// Dispatch is not gated on loads, so without this charge windows granted
+    /// to *other* models during a multi-second load collide with the incoming
+    /// weights. Reservations are keyed per load and summed, so two concurrent
+    /// loads hold two bases rather than overwriting one another.
     ///
     /// The expected base is the **larger** of what this run already measured
-    /// for this (model, GPU) and what the calibration store knows, falling
-    /// back to [`CONSERVATIVE_BASE_MB`] when neither answers.
+    /// for this (model, GPU) and what the calibration store knows, falling back
+    /// to [`CONSERVATIVE_BASE_MB`] when neither answers: the two are
+    /// measurements of the same thing, and over-reserving is the cheap
+    /// direction of error.
     ///
-    /// Taking the max rather than ranking the two sources is deliberate. They
-    /// are measurements of the same thing (a local profile *is* a persisted
-    /// remembered base), they disagree only when one of them is stale or
-    /// foreign, and the design is explicit about which direction of error is
-    /// cheap: "over-reserving is cheap: loads are serialized, the reservation
-    /// lives only for the seconds the load takes... Under-reserving is not
-    /// cheap — that is a collision with incoming weights."
+    /// Returns `None` — no charge at all — for a GPU the ledger does not know,
+    /// for a **`none`-class** model (never granted a window, so reserving would
+    /// squeeze its neighbours to protect memory we cannot see), and for a model
+    /// a previous load in this run showed puts nothing of its own on the device.
     ///
-    /// Returns `None` — no charge at all — in three cases:
-    ///
-    /// - a GPU the ledger does not know (nothing to charge against);
-    /// - a **`none`-class** model: it will never be granted a window, so
-    ///   reserving 4 GB against the GPU for the seconds its load takes
-    ///   squeezes its neighbours' windows to their contention floor to protect
-    ///   memory it does not allocate through anything we can see (remote APIs,
-    ///   network lookups, a CTranslate2 engine);
-    /// - a model a previous load *in this run* showed puts nothing of its own on
-    ///   the device — the same reasoning, reached by measurement rather than by
-    ///   declaration (a CPU-fallback impl, a torch-importing engine outside the
-    ///   allocator).
-    ///
-    /// Expected base exceeding headroom logs a warning — that is item 8's
-    /// evict-before-load *trigger* arriving early; the eviction response itself
-    /// waits for step 2. The GPU is probed first when its free reading is
-    /// missing or stale, because that trigger is otherwise unreachable on a
-    /// GPU no worker has ever been resident on
-    /// ([`Self::refresh_external_for_load`]).
+    /// Expected base exceeding headroom logs a warning: the evict-before-load
+    /// trigger. The GPU is probed first when its free reading is missing or
+    /// stale, or that trigger is unreachable on a GPU no worker has ever been
+    /// resident on ([`Self::refresh_external_for_load`]).
     pub async fn reserve_load(
         self: &Arc<Self>,
         inference_id: &str,
@@ -2373,9 +2233,8 @@ impl VramLedger {
     }
 
     /// [`Self::reserve_load`], also answering whether the expected base
-    /// exceeded the GPU's headroom — the evict-before-load signal, returned
-    /// so a test can assert on the decision itself rather than on the warning
-    /// it logs.
+    /// exceeded the GPU's headroom — the evict-before-load signal, returned so
+    /// a test can assert on the decision rather than on the warning it logs.
     async fn reserve_load_signalling(
         self: &Arc<Self>,
         inference_id: &str,
@@ -2396,11 +2255,10 @@ impl VramLedger {
             );
             None
         };
-        // Everything the store needs is snapshotted under a *short* lock and
-        // the lock is then dropped, exactly as `register_worker` does: the
-        // store stats (and may parse) files, and holding the ledger lock
-        // across that would put file I/O on the critical path of every
-        // concurrent grant request.
+        // Everything the store needs is snapshotted under a *short* lock, as
+        // `register_worker` does: the store stats and may parse files, and
+        // holding the ledger lock across that would put file I/O on the
+        // critical path of every concurrent grant request.
         let (gpu_name, dtype, remembered) = {
             let state = self.lock();
             let gpu_name = state.gpus.get(gpu).map(|gpu| gpu.name.clone())?;
@@ -2429,18 +2287,16 @@ impl VramLedger {
         });
         // Measure the GPU before pricing the load against it. `request_grant`
         // is the only other probe trigger and it needs a resident worker, so a
-        // GPU that has never had one has no reading at all and would be
-        // priced as empty — which is exactly how a GPU holding 95 GB of
-        // someone else's memory took four 4 GB reservations against a headroom
-        // of its full total and launched four loads into a torch OOM (T2).
+        // GPU that has never had one has no reading at all and would be priced
+        // as empty — which is how a GPU holding someone else's 95 GB took four
+        // 4 GB reservations and launched four loads into a torch OOM.
         self.refresh_external_for_load(inference_id, gpu).await;
         let (id, expected, headroom) = {
             let mut state = self.lock();
-            // Re-read both facts under the retaken lock. A load that finished
+            // Re-read both facts under the retaken lock: a load that finished
             // while the store was being consulted may have taught us this pair
-            // puts nothing on the device — reserving against it would squeeze
-            // its neighbours for memory it does not allocate — or taught us a
-            // measured base, which is the number we would rather charge.
+            // puts nothing on the device, or taught us a measured base, which
+            // is the number we would rather charge.
             let remembered = state.remembered_bases.get(&key).copied();
             if matches!(remembered, Some(None)) {
                 return no_footprint();
@@ -2496,61 +2352,39 @@ impl VramLedger {
     // Worker registration
     // ------------------------------------------------------------------
 
-    /// Which ledger GPU a load report belongs to — plus the line to log
-    /// about it, which the caller emits once the lock is dropped (F8).
+    /// Which ledger GPU a load report belongs to — plus the line to log about
+    /// it, which the caller emits once the lock is dropped.
     ///
-    /// The report carries up to three independent facts about the GPU —
-    /// a UUID, a PCI address, and torch's own total-memory figure — and the
-    /// arms below are ordered by how much each can be trusted to *identify*:
+    /// The report carries up to three independent facts about the GPU — a UUID,
+    /// a PCI address, and torch's own total-memory figure — and the arms below
+    /// are ordered by how much each can be trusted to *identify*:
     ///
-    /// 1. **UUID matching a GPU.** The CUDA path, unchanged, and no
-    ///    memory check: NVML UUIDs are globally unique and byte-identical on
-    ///    both sides, so a match is proof, and adding a check could only
-    ///    refuse a correct identification.
-    /// 2. **PCI address matching a GPU's.** The ROCm path (and the CUDA
-    ///    fall-through when a UUID was reported that matches *nothing* —
-    ///    review F5). A BDF match alone is not proof, because it is only as
-    ///    good as the assumption that the inventory's row order is HIP's
-    ///    device order: get that wrong and a worker pinned to GPU A
-    ///    reports GPU B's row. So the match must survive a **plausibility
-    ///    cross-check** against an independent source — the worker's
-    ///    `gpu_total_mb`, which came from torch/HIP, never from the sysfs
-    ///    file the inventory's own total was read from. Agreement within
-    ///    ±5% or ±512 MB (whichever is larger — driver reserves and
-    ///    carve-outs shave a little off both sides) admits; disagreement, or
-    ///    a report with no total at all, refuses with a warning naming both
-    ///    identities and both totals. Refusing on an absent total is the
-    ///    point of the whole mechanism: admitting without it would trust the
-    ///    enumeration assumption D2 cannot verify.
-    /// 3. **The single-GPU fallback.** Nothing matched, this host has
-    ///    exactly one GPU, the report says *something* about a GPU, no BDF
-    ///    could have matched (either the worker reported none, or no GPU
-    ///    carries one — a CUDA inventory never does), **and the worker
-    ///    reported no UUID at all** (review F3). Then the only GPU is the
-    ///    only candidate, and the same total-memory check decides. This is
-    ///    the twin of the worker's own NVML single-GPU fallback. A UUID that
-    ///    is *present* and matches nothing is positive evidence of a GPU
-    ///    this inventory does not describe — a MIG instance outside the
-    ///    enumeration, a restricted inventory — and never reaches this arm;
-    ///    ROCm workers suppress the UUID entirely, so their path is
-    ///    unaffected.
+    /// 1. **UUID matching a GPU.** The CUDA path, and no memory check: NVML
+    ///    UUIDs are globally unique and byte-identical on both sides, so a
+    ///    match is proof and a check could only refuse a correct one.
+    /// 2. **PCI address matching a GPU's.** The ROCm path, and the CUDA
+    ///    fall-through when a reported UUID matches *nothing*. A BDF match is
+    ///    only as good as the assumption that the inventory's row order is
+    ///    HIP's device order, so it must survive a plausibility cross-check
+    ///    against the worker's `gpu_total_mb` — an independent source, since
+    ///    the inventory's own total came from sysfs ([`total_tolerance_mb`]).
+    ///    A report with no total at all refuses: admitting without it would
+    ///    trust the enumeration assumption nothing here can verify.
+    /// 3. **The single-GPU fallback**: nothing matched, this host has exactly
+    ///    one GPU, the report says *something* about a GPU, no BDF could have
+    ///    matched, and the worker reported **no UUID at all**. The same total
+    ///    check decides. A UUID that is present and matches nothing is positive
+    ///    evidence of a GPU this inventory does not describe.
     ///
-    /// Everything else refuses: a `none`-class worker with no GPU at all, a
-    /// GPU outside the inventory, and — deliberately — a BDF that matches
-    /// no row on a host whose rows *do* carry addresses. That last case is
-    /// the enumeration-order alarm: the worker is demonstrably on a GPU
-    /// this inventory does not describe, so the safe answer is unpriced
-    /// dispatch plus a log line a field report can be read off.
+    /// Everything else falls to unpriced dispatch, including — deliberately — a
+    /// BDF matching no row on a host whose rows *do* carry addresses: the
+    /// worker is demonstrably on a GPU this inventory does not describe.
     ///
-    /// `expected_gpu` is the device key the orchestrator's *pin* named for
-    /// this replica (`GpuInventory::resolve_device_key`), when the caller
-    /// knows it. It never decides anything: resolving against what the
-    /// worker itself reports is the whole point. It exists so that a
-    /// divergence between the two — the row order the pin was derived from
-    /// not being the device order the backend enumerated — produces the
-    /// [`GpuLog::PinDiverged`] alarm instead of passing silently. The
-    /// replica is still admitted under the *resolved* GPU, because that is
-    /// where it physically is and therefore where its memory must be priced.
+    /// `expected_gpu` is the device key the orchestrator's *pin* named for this
+    /// replica, when the caller knows it. It never decides anything; it exists
+    /// so a divergence produces the [`GpuLog::PinDiverged`] alarm instead of
+    /// passing silently. The replica is still admitted under the *resolved*
+    /// GPU, which is where it physically is and where it must be priced.
     fn resolve_gpu(
         state: &LedgerState,
         report: &LoadReport,
@@ -2592,15 +2426,15 @@ impl VramLedger {
             }
         }
         // A report with nothing to say about a GPU at all is the CPU/MPS/
-        // remote-API worker, not a failed identification: it falls to the
-        // debug line below rather than through a check it was never a
-        // candidate for, which would warn on every CPU model this host loads.
+        // remote-API worker, not a failed identification: it falls to the debug
+        // line below rather than through a check it was never a candidate for,
+        // which would warn on every CPU model this host loads.
         let claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some();
         if state.gpus.len() == 1 && claims_a_gpu && report.gpu_uuid.is_none() {
             let (key, gpu) = state.gpus.iter().next().expect("length checked");
-            // No divergence check here, and none is possible: with one GPU
-            // in the ledger, an `expected_gpu` resolved from the same
-            // inventory can only be that GPU.
+            // No divergence check here, and none is possible: with one GPU in
+            // the ledger, an `expected_gpu` resolved from the same inventory
+            // can only be that GPU.
             return match Self::cross_check_total(
                 state,
                 report,
@@ -2655,31 +2489,21 @@ impl VramLedger {
         }
     }
 
-    /// `None` when the worker's own total-memory reading agrees with the
-    /// GPU it is about to be admitted under, within ±5% or ±512 MB —
-    /// whichever is larger, because the two sources shave different amounts
-    /// off the same silicon (firmware carve-outs, ECC reserves, the driver's
-    /// own allocations) and the absolute floor covers the small GPUs where
-    /// 5% is a couple of hundred MB. Otherwise the refusal's log line.
+    /// `None` when the worker's own total-memory reading agrees with the GPU it
+    /// is about to be admitted under ([`total_tolerance_mb`]); otherwise the
+    /// refusal's log line.
     ///
     /// An **absent** total fails. This check is the only evidence that a
-    /// non-UUID identification is the right GPU at all, so "unknown"
-    /// cannot pass it; the cost of a false refusal is one unpriced replica,
-    /// the cost of a false admission is every grant on that GPU.
+    /// non-UUID identification is the right GPU at all, so "unknown" cannot
+    /// pass it: the cost of a false refusal is one unpriced replica, the cost
+    /// of a false admission is every grant on that GPU.
     ///
-    /// # Unified ROCm GPUs: either figure passes
-    ///
-    /// An APU's admission total is its BIOS carve-out **plus** GTT, and what
-    /// HIP reports as that device's `total_memory` is not known: it may be
-    /// the carve-out alone, the sum, or something else again, and no fixture
-    /// can settle it — only a BC-250 field pass can. So a report matching
-    /// *either* figure, each within its own tolerance, is accepted
-    /// (docs/unified-memory-admission.md, backend B). The alternative would
-    /// be refusing admission on every APU host over an unknown, which is the
-    /// unpriced path this whole backend exists to leave. It costs nothing on
-    /// a discrete GPU, where there is no second figure to match, and the
-    /// carve-out is far enough below the sum on any real APU that the two
-    /// tolerances cannot overlap into "anything passes".
+    /// On a **unified ROCm GPU** a report matching *either* the admission total
+    /// or the BIOS carve-out, each within its own tolerance, is accepted: what
+    /// HIP reports as an APU's `total_memory` is unverified, and refusing every
+    /// APU host over an unknown would leave them all on the unpriced path
+    /// (docs/unified-memory-admission.md, backend B). It costs nothing on a
+    /// discrete GPU, which has no second figure.
     fn cross_check_total(
         state: &LedgerState,
         report: &LoadReport,
@@ -2689,10 +2513,9 @@ impl VramLedger {
         expected_gpu: Option<&str>,
     ) -> Option<GpuLog> {
         let tolerance = total_tolerance_mb(gpu.total_mb);
-        // A reported **zero** is refused on every GPU and never reaches the
-        // window arithmetic: it is the shape of a driver that answered
-        // without knowing, not of a GPU, and on a small enough figure a
-        // tolerance window would otherwise reach down to it.
+        // A reported **zero** is refused on every GPU: it is the shape of a
+        // driver that answered without knowing, not of a GPU, and on a small
+        // enough figure a tolerance window would otherwise reach down to it.
         if let Some(total) = report.gpu_total_mb.filter(|total| *total > 0) {
             let agrees = |figure: u64| totals_agree(figure, total);
             if agrees(gpu.total_mb) || gpu.vram_carveout_mb.is_some_and(agrees) {
@@ -2709,12 +2532,10 @@ impl VramLedger {
             worker_uuid: report.gpu_uuid.clone(),
             worker_total_mb: report.gpu_total_mb,
             tolerance_mb: tolerance,
-            // The pin's belief travels with the refusal. On a host of
-            // *unequal* GPUs a mis-ordered enumeration lands here and
-            // never on `PinDiverged` — the cross-check runs first and the
-            // replica is refused before it can be admitted — so without
-            // this the loudest evidence of a wrong row order would name
-            // only the GPU the worker turned out to be on.
+            // The pin's belief travels with the refusal: on a host of unequal
+            // GPUs a mis-ordered enumeration is refused here and never reaches
+            // `PinDiverged`, so without this the loudest evidence of a wrong
+            // row order would name only the GPU the worker turned out to be on.
             expected_gpu: expected_gpu.map(str::to_owned),
             expected_bdf: Self::gpu_bdf(state, expected_gpu),
         })
@@ -2725,61 +2546,35 @@ impl VramLedger {
         state.gpus.get(key?).and_then(|gpu| gpu.bdf.clone())
     }
 
-    /// Adopt a unified-memory device's **authoritative** total from the first load
-    /// report that carries one (DP-4), and say so.
+    /// Adopt a unified-memory device's **authoritative** total from the first
+    /// load report that carries one, and say so.
     ///
-    /// On a unified-memory device `total` is a *policy* number, not a device fact:
-    /// on Apple Silicon it is Metal's `recommendedMaxWorkingSetSize`, which
-    /// defaults to ≈75 % of RAM — the probe's seed — but moves when the user
-    /// raises the GPU wired limit, a standard tweak on Macs used for local
-    /// ML. The moved figure is precisely the one admission has to budget
-    /// against, and only the worker can read it (it is what torch reports
-    /// and what the allocator's own ceiling is set from), so the worker's
-    /// number wins outright.
+    /// On a unified-memory device `total` is a *policy* number, not a device
+    /// fact: on Apple Silicon it is Metal's `recommendedMaxWorkingSetSize`,
+    /// which defaults to about 75% of RAM — the probe's seed — but moves when
+    /// the user raises the GPU wired limit. The moved figure is the one
+    /// admission has to budget against and only the worker can read it, so the
+    /// worker's number wins outright. The check is a **sanity bound and nothing
+    /// else**: `0 < reported ≤ host RAM`, with no proximity window around the
+    /// seed, since a raised limit legitimately sits well away from it.
     ///
-    /// The check is a **sanity bound and nothing else**: `0 < reported ≤
-    /// host RAM`. There is deliberately no proximity window around the seed
-    /// — a raised limit legitimately puts the real figure 20 % away from it,
-    /// and rejecting exactly the tuned machines would be backwards.
+    /// It runs **before** [`Self::resolve_gpu`], which is the whole reason it is
+    /// a separate step: the same report is then cross-checked against the total
+    /// it just supplied. A later sane figure out of tolerance **re-adopts** (the
+    /// wired limit is a live sysctl, and refusing would leave a tuned host
+    /// unpriced until a restart); one inside tolerance changes nothing, or the
+    /// two sources' noise would rewrite the total on every load.
     ///
-    /// It runs **before** [`Self::resolve_gpu`], and that ordering is the
-    /// whole reason this is a separate step: the same report is then
-    /// cross-checked against the total it just supplied, so the registration
-    /// join cannot refuse a legitimate figure for disagreeing with a seed it
-    /// has already replaced.
-    ///
-    /// **Re-adoption.** The same argument outlives the first report. The
-    /// wired limit is a live sysctl: a user who raises it and restarts a
-    /// model — the tuned machines this exists for — produces replicas whose
-    /// figure disagrees with the adopted one by far more than
-    /// [`Self::cross_check_total`]'s tolerance, and refusing them would leave
-    /// the host unpriced until the gateway is restarted. So a *sane* figure
-    /// (still `0 < reported ≤ host RAM`) that is out of tolerance replaces the
-    /// adopted one and says so; one inside tolerance changes nothing, because
-    /// the two sources shave slightly different amounts off the same pool and
-    /// re-adopting on that noise would rewrite the GPU's total on every
-    /// load.
-    ///
-    /// Scoped as tightly as the facts allow: exactly one GPU in the
-    /// ledger, that GPU unified, that GPU carrying **no PCI address**,
-    /// and a report that names **no other GPU** (no UUID, no PCI address).
-    /// A report carrying positive evidence of some other device is not this
-    /// GPU's total, whatever else is true.
-    ///
-    /// The backend condition is what keeps this an MPS mechanism, and the
-    /// address condition backs it up. A unified **ROCm** GPU (an APU) has
-    /// an address, and its total is read from amdgpu's own counters rather
-    /// than being a policy number only the worker can see — while what HIP
-    /// reports for it may well be the BIOS carve-out, a figure that passes
-    /// the sanity bound and would replace a 96 GB budget with 512 MB. A
-    /// **CPU** device matches every structural condition here — one device, no
-    /// address, a worker reporting neither UUID nor BDF — and must still not
-    /// adopt: its total is physical RAM, read from the kernel at probe time,
-    /// and the worker's psutil figure is a second reading of that same fact
-    /// rather than new information (`GpuInventory::adopts_worker_total`).
-    /// Adoption is for the GPU whose real total *nothing else can read*;
-    /// the APU is instead cross-checked against either figure (see
-    /// [`Self::cross_check_total`]), and the CPU device against the one.
+    /// Scoped as tightly as the facts allow: exactly one GPU in the ledger,
+    /// unified, carrying **no PCI address**, and a report naming **no other
+    /// GPU**. A unified **ROCm** GPU has an address and a total read from
+    /// amdgpu's own counters, and what HIP reports for it may be the BIOS
+    /// carve-out — a figure that passes the sanity bound and would replace a
+    /// 96 GB budget with 512 MB. A **CPU** device matches every structural
+    /// condition and must still not adopt: its total is physical RAM read from
+    /// the kernel, and the worker's psutil figure is a second reading of that
+    /// same fact (`GpuInventory::adopts_worker_total`). Adoption is for the GPU
+    /// whose real total *nothing else can read*.
     fn adopt_unified_total_locked(state: &mut LedgerState, report: &LoadReport) -> Option<GpuLog> {
         if !state.adopts_worker_total {
             return None;
@@ -2825,20 +2620,16 @@ impl VramLedger {
     }
 
     /// Register a freshly loaded replica and return its admission handle, or
-    /// `None` when the replica is not admissible: a `none`-class model, a
-    /// worker that reported no GPU at all (no torch, CPU/MPS, remote API), or
-    /// a GPU the ledger does not know (no nvidia-smi inventory, a MIG
-    /// instance outside the enumeration). All of those take the unpriced
-    /// dispatch path plus the Package-1 OOM backstop, per the design's
-    /// "backends without a free-memory query" rule. [`Self::resolve_gpu`]
-    /// holds the exact table — which identity is matched in which order, and
-    /// which failures are refusals rather than fallbacks.
+    /// `None` when the replica is not admissible: a `none`-class model, a worker
+    /// that reported no GPU at all, or a GPU the ledger does not know. All of
+    /// those take the unpriced dispatch path plus the OOM backstop.
+    /// [`Self::resolve_gpu`] holds the exact table.
     ///
-    /// The GPU is whatever the *worker* reported — its UUID, or on ROCm
-    /// its PCI address — which is authoritative: the spawn pin may be an
-    /// index, absent, or a UUID CUDA reordered. `expected_gpu` is the
-    /// device key that pin named, when the caller has it; it is a
-    /// **diagnostic input only** (the mis-order alarm), never a filter.
+    /// The GPU is whatever the *worker* reported — its UUID, or on ROCm its PCI
+    /// address — which is authoritative: the spawn pin may be an index, absent,
+    /// or a UUID CUDA reordered. `expected_gpu` is the device key that pin
+    /// named, when the caller has it; a **diagnostic input only**, never a
+    /// filter.
     pub fn register_worker(
         self: &Arc<Self>,
         inference_id: &str,
@@ -2861,28 +2652,27 @@ impl VramLedger {
         let loaded_at = stamped.captured_at;
         let report = stamped.value;
         // The device key, plus its *model name* — the profile keyspace. The
-        // name is taken from the inventory rather than from the worker's
-        // `gpu_name`, so every profile this host writes is keyed by the same
-        // string the probe derived, whatever torch calls the card.
+        // name comes from the inventory rather than from the worker's
+        // `gpu_name`, so every profile this host writes is keyed by the string
+        // the probe derived, whatever torch calls the card.
         let (adoption, resolution) = {
             let mut state = self.lock();
-            // Before the join, not after: on a unified-memory device the total the
-            // join cross-checks against is the one this call adopts (DP-4).
+            // Before the join, not after: on a unified-memory device the total
+            // the join cross-checks against is the one this call adopts.
             let adoption = Self::adopt_unified_total_locked(&mut state, &report);
             let resolution = Self::resolve_gpu(&state, &report, expected_gpu);
             (adoption, resolution)
         };
-        // Emitted with the lock **dropped**: formatting a `tracing` event
-        // under the ledger mutex would put every concurrent grant request
-        // behind a log write (review F8). It happens before the `?` below so
-        // a refusal still says why.
+        // Emitted with the lock **dropped**: formatting a `tracing` event under
+        // the ledger mutex would put every concurrent grant request behind a
+        // log write. Before the `?` below, so a refusal still says why.
         for log in adoption.into_iter().chain(resolution.log) {
             log.emit(inference_id);
         }
         let (gpu, gpu_name) = resolution.admit?;
-        // Consulted **outside** the ledger lock: the store stats (and may
-        // parse) files, and blocking every concurrent grant request behind
-        // that would put file I/O on the dispatch path by the back door.
+        // Consulted **outside** the ledger lock: the store stats and may parse
+        // files, and blocking every concurrent grant request behind that would
+        // put file I/O on the dispatch path by the back door.
         let seed = self.profiles.as_ref().and_then(|profiles| {
             profiles.lookup(&ProfileQuery {
                 inference_id,
@@ -2899,11 +2689,10 @@ impl VramLedger {
         });
         let mut state = self.lock();
         let key = (inference_id.to_owned(), gpu.clone());
-        // Record-once semantics, and never downgrade: a later load that reports
-        // no base at all (an unmeasurable reload, a claimed prewarmed worker)
-        // must not erase a footprint expectation an earlier measured load
-        // taught us — `reserve_load` would fall back to the conservative
-        // constant, or to nothing, for a model whose real base is known.
+        // Record-once semantics, and never downgrade: a later load reporting no
+        // base at all must not erase a footprint expectation an earlier
+        // measured load taught us, or `reserve_load` would fall back to the
+        // conservative constant for a model whose real base is known.
         let known_base = state.remembered_bases.get(&key).copied().flatten();
         if report.base_mb.is_some() || known_base.is_none() {
             state.remembered_bases.insert(key.clone(), report.base_mb);
@@ -2914,8 +2703,7 @@ impl VramLedger {
         // The load response carries a memory sample, and it is the *only*
         // reading this GPU may have for a while: samples otherwise arrive on
         // predict responses, so without this the first window after a load
-        // prices `external` as 0 — i.e. hands out the whole card as if nothing
-        // else were on it — until the staleness refresh happens to land.
+        // prices `external` as 0 until the staleness refresh happens to land.
         if let Some(sample) = report.memory.as_ref()
             && let (Some(free), Some(source)) = (sample.free_mb, sample.free_source.clone())
         {
@@ -2997,44 +2785,29 @@ impl VramLedger {
 
     /// Forget a replica: its footprint stops being charged and any grant it
     /// still holds disappears with it. Runs from [`Admission`]'s `Drop`, so a
-    /// dying worker's grants are released with the handle the dispatcher
-    /// owned — the same lifetime as the aborted windows themselves.
+    /// dying worker's grants are released with the handle the dispatcher owned.
     ///
-    /// The GPU's free reading is adjusted by the departed footprint at the
-    /// same moment. `external = total − free − Σ footprint(residents)`, and
-    /// the freshest free sample predates the unload by construction — nothing
-    /// samples the GPU *because* a worker left. Dropping the footprint from
-    /// the sum while the sample still counts that memory as in use
-    /// reattributes every megabyte the replica held to *external* usage, which
-    /// is then margin-inflated against the next model to load: a 27 GB resident
-    /// unloads and the GPU reports 27 GB of phantom foreign memory until some
-    /// grant request happens to trigger a staleness refresh — never, on an idle
-    /// gateway. Crediting the footprint to `free` — the memory did become free
-    /// — holds `external` at exactly the value it had while the replica was
-    /// resident, which is the physical truth about everyone else's usage.
+    /// The GPU's free reading is adjusted by the departed footprint at the same
+    /// moment. `external = total − free − Σ footprint(residents)`, and the
+    /// freshest free sample predates the unload by construction, so dropping
+    /// the footprint from the sum while the sample still counts that memory as
+    /// in use would reattribute every megabyte the replica held to *external*
+    /// usage — and margin-inflate it against the next model to load. Crediting
+    /// the footprint to `free` holds `external` at the value it had while the
+    /// replica was resident.
     ///
     /// It is arithmetic standing in for a measurement, so the departure is
     /// stamped on the GPU: the next grant request refreshes immediately
-    /// rather than waiting out the staleness window ([`refresh_due`]), and a
-    /// worker sample captured *before* the departure — one settled after it,
-    /// which the per-worker ingest makes reachable — is refused rather than
-    /// allowed to undo the credit ([`Self::record_free_locked`]). The stamp
-    /// clears when a reading from after the departure lands. The sample's own
-    /// `at` is left alone: it still says truthfully when the GPU was last
-    /// *read*, which is what `/health`'s `external_sample_age_ms` and the
-    /// refresh log's `recorded`/`previous_age` bookkeeping report.
+    /// ([`refresh_due`]), and a worker sample captured *before* the departure is
+    /// refused rather than allowed to undo the credit
+    /// ([`Self::record_free_locked`]). The sample's own `at` is left alone: it
+    /// still says truthfully when the GPU was last *read*.
     ///
-    /// The credit is only right if the reading it adjusts actually *counted*
-    /// the footprint — i.e. was taken after this replica loaded — so that is
-    /// checked rather than assumed. A GPU whose freshest reading predates the
-    /// load is reachable: the replica's own load response carried no free
-    /// figure, or the reading was dropped by the currency check or the
-    /// source-precedence rule, and nothing has landed since. Crediting there
-    /// would subtract memory the reading never saw as in use and *under*-state
-    /// `external` — phantom headroom, the one direction this ledger cannot
-    /// absorb. So the credit is skipped and only the refresh is forced:
-    /// `external` stays over-stated (the conservative direction, and exactly
-    /// what it read before the departure) until the probe settles it.
+    /// The credit is only right if the reading it adjusts actually counted the
+    /// footprint — i.e. was taken after this replica loaded — so that is checked
+    /// rather than assumed. Crediting a reading that predates the load would
+    /// *under*-state `external`, which is the one direction this ledger cannot
+    /// absorb; there the credit is skipped and only the refresh is forced.
     fn forget_worker(&self, worker: WorkerId) {
         let mut state = self.lock();
         let Some(entry) = state.workers.remove(&worker) else {
@@ -3049,25 +2822,21 @@ impl VramLedger {
         };
         let total_mb = gpu.total_mb;
         let Some(sample) = gpu.free.as_mut() else {
-            // Nothing to adjust and nothing to flag: a GPU with no reading
-            // at all is already due a refresh, and reports no `external`.
+            // Nothing to adjust and nothing to flag: a GPU with no reading at
+            // all is already due a refresh, and reports no `external`.
             return;
         };
         // A reading from before this replica loaded never counted its
-        // footprint, so there is nothing of it to give back — force the
-        // refresh and leave the figure alone (see above).
+        // footprint, so there is nothing of it to give back — force the refresh
+        // and leave the figure alone (see above).
         let credited = sample.at >= entry.loaded_at;
-        // Bounded by the GPU's total so the credit cannot walk a reading
-        // arbitrarily far past the memory that exists. It is inert wherever it
-        // could change `external`: `external > 0` means `free + Σ ours <
-        // total`, and this resident's footprint is one term of that `Σ`, so
-        // `free + footprint < total` and the bound never binds. It binds only
-        // where `external` is already pinned at 0 — including on a unified
-        // GPU, where a stored free reading legitimately *exceeds* the
-        // GPU's policy total (`mps::query_memory`, `cpu::query_memory`
-        // deliberately do not clamp, and `external`'s own saturation is what
-        // makes that safe). Truncating there costs nothing: `external_locked`
-        // is the only reader of this figure, and it saturates.
+        // Bounded by the GPU's total so the credit cannot walk a reading past
+        // the memory that exists. Inert wherever it could change `external`:
+        // `external > 0` means `free + Σ ours < total`, and this footprint is
+        // one term of that `Σ`. It binds only where `external` is already
+        // pinned at 0 — including on a unified GPU, where a stored free reading
+        // legitimately exceeds the policy total — and truncating there costs
+        // nothing, since `external_locked` saturates.
         if credited {
             sample.free_mb = sample.free_mb.saturating_add(footprint_mb).min(total_mb);
         }
@@ -3075,7 +2844,7 @@ impl VramLedger {
         gpu.free_adjusted_at = Some(Instant::now());
         let (model, gpu) = (entry.inference_id, entry.gpu);
         // Snapshotted under the lock, emitted with it dropped, as every other
-        // ledger log line is (review F8).
+        // ledger log line is.
         drop(state);
         if credited {
             tracing::debug!(
@@ -3107,47 +2876,32 @@ impl VramLedger {
 
     /// Prime a (model, GPU)'s calibration from a matched profile, once.
     ///
-    /// What a profile may confer and what it may not is the crux of the whole
-    /// design:
+    /// What a profile may confer and what it may not is the crux of the design:
     ///
-    /// - **Pricing** — the fit — always. That is what a profile is for: it
-    ///   prices mixed compositions against live free memory from the first
-    ///   window instead of after a dozen.
+    /// - **Pricing** — the fit — always. That is what a profile is for.
     /// - **Growth** — the ratchet anchor and the sample ring — only when the
-    ///   profile is **local**. "The ratchet counts only local samples, so a
-    ///   fresh install ramps from seed even with a shipped profile: profiles
-    ///   govern pricing, `base` accounting, and the knee cap — not growth."
-    ///   Handing a stranger's anchor to a fresh install would let the first
-    ///   window ask for a batch nothing on this machine has ever run.
-    /// - **Confidence** — `local_samples` — likewise only when local, *and*
-    ///   only when the match was on the exact torch string. A local profile
-    ///   reached through the `major.minor` fallback tier was measured on a
-    ///   different torch build than the one now running, so its anchor and
-    ///   ring are still this machine's own evidence (the silicon did not
-    ///   change) but its *confirmation* is not: the machine re-earns those
-    ///   samples under the new build, and until it does the model runs under
-    ///   the widened margin. That is the same rule the design states for
-    ///   shipped profiles, applied to the one other way a foreign software
-    ///   environment gets in.
+    ///   profile is **local**. Handing a stranger's anchor to a fresh install
+    ///   would let the first window ask for a batch nothing on this machine has
+    ///   ever run.
+    /// - **Confidence** — `local_samples` — only when local *and* matched on
+    ///   the exact torch string. A local profile reached through the
+    ///   `major.minor` fallback was measured under a different build, so its
+    ///   anchor and ring are still this machine's evidence but its confirmation
+    ///   is not: the model runs under the widened margin until it re-earns them.
     ///
-    /// Seeding happens once per (model, GPU) per run — and the flag is set
-    /// on the first **attempt**, not on the first match. Setting it only on a
-    /// match is how a re-seed duplicates the ring: this run writes its own
-    /// profile, a TTL unload drops the replica, the reload looks the model up
-    /// again, and now the store *does* answer — with the very samples still
-    /// sitting in memory, which then get appended a second time, evicting
-    /// older distinct samples and making the persisted evidence a lie.
+    /// Seeding happens once per (model, GPU) per run, and the flag is set on the
+    /// first **attempt**, not on the first match. Setting it only on a match is
+    /// how a re-seed duplicates the ring: this run writes its own profile, a TTL
+    /// unload drops the replica, the reload looks the model up again, and the
+    /// store answers with the samples still in memory, which are then appended a
+    /// second time.
     ///
-    /// The corollary: a first attempt that could not be *keyed* — the load
-    /// report arrived without a torch version or a negotiated dtype, so
-    /// [`CalibrationProfiles::lookup`] refused the incomplete key — still
-    /// consumes the pair's one seed attempt, and a later replica that does
-    /// report both will not be seeded. That is deliberate and harmless: a
-    /// worker reports these consistently (they are properties of the venv and
-    /// of Package-1 negotiation, not of the individual load), so the two cases
-    /// in practice are "every load of this model keys" and "none of them do".
-    /// The cost of being wrong is one run priced from scratch; the cost of
-    /// re-attempting would be the duplicated ring above, on every reload.
+    /// The corollary is that a first attempt that could not be *keyed* still
+    /// consumes the pair's one seed attempt. That is deliberate: a worker
+    /// reports its torch version and dtype consistently, so in practice either
+    /// every load of a model keys or none do. The cost of being wrong is one run
+    /// priced from scratch; re-attempting would duplicate the ring on every
+    /// reload.
     fn seed_calibration_locked(
         state: &mut LedgerState,
         key: &(String, String),
@@ -3161,8 +2915,8 @@ impl VramLedger {
         }
         let Some(seed) = seed else {
             // The store was consulted and had nothing (or the key was
-            // incomplete). Still an attempt: whatever this run measures from
-            // here is the only truth for this pair, and a later reload must
+            // incomplete). Still an attempt: whatever this run measures is the
+            // only truth for this pair, and a reload must not re-import it.
             // not re-import it on top of itself.
             state.calibration.entry(key.clone()).or_default().seeded = true;
             return;
