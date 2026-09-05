@@ -7804,7 +7804,7 @@
           "charges_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "What the residents actually cost the GPU: `Σ` per-worker\n`footprint + max(0, grants − pool growth)`. This — not\n`footprints_mb + grants_mb` — is what `headroom_mb` is derived from: a\npost-fit grant is denominated in the same memory the footprint's\npool-growth term already counts, so the two overlap per worker.",
+            "description": "What the residents actually cost the GPU: `Σ` per-worker\n`footprint + max(0, grants − pool growth)`. This, not\n`footprints_mb + grants_mb`, is what `headroom_mb` derives from: a grant\nis denominated in the same memory the pool-growth term already counts.",
             "minimum": 0
           },
           "external_known": {
@@ -7875,12 +7875,12 @@
           "reserve_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "The VRAM withheld from the budget on top of `external_mb` itself: the\nreserve **actually applied** to this GPU, in MiB (run2 change R5).",
+            "description": "The VRAM withheld from the budget on top of `external_mb` itself: the\nreserve **actually applied** to this GPU, in MiB.",
             "minimum": 0
           },
           "reserve_rule": {
             "type": "string",
-            "description": "Which rule produced `reserve_mb`: `\"user_margin\"` (the GPU's\nconfigured margin, honoured verbatim and uncapped) or\n`\"capped_default\"` (nobody configured this GPU, so the default\nfraction applies and is clamped to 1 GiB)."
+            "description": "Which rule produced `reserve_mb`: `\"user_margin\"` (the GPU's configured\nmargin, honoured verbatim and uncapped) or `\"capped_default\"` (nobody\nconfigured this GPU, so the default fraction applies and is clamped)."
           },
           "total_mb": {
             "type": "integer",
@@ -8826,7 +8826,7 @@
           "effective_margin": {
             "type": "number",
             "format": "double",
-            "description": "The margin this model's windows are actually priced under: the\nGPU's configured margin, widened while the fit is unconfirmed or\nscattered."
+            "description": "The margin this model's windows are actually priced under: the GPU's\nconfigured margin, widened while the fit is unconfirmed or scattered."
           },
           "fit": {
             "oneOf": [
@@ -8872,7 +8872,7 @@
           "local_samples": {
             "type": "integer",
             "format": "int32",
-            "description": "Local clean high-water samples behind this model's fit, including any\na local calibration profile restored. Below\n`LOCAL_CONFIRMATION_SAMPLES` the effective margin is widened.",
+            "description": "Local clean high-water samples behind this model's fit, including any a\nlocal calibration profile restored. Below `LOCAL_CONFIRMATION_SAMPLES`\nthe effective margin is widened.",
             "minimum": 0
           },
           "max_units_measured": {
@@ -8919,7 +8919,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Shape ceiling (run2 S1): a batch size this model's own kernels have\nsaid they cannot execute at the shapes this corpus is feeding them —\nan int32 index limit in a CUDA/HIP pooling kernel, reported as\n`clamped.reason = \"index_limit\"`. `None` until one is reported.\n\nIt caps `unit_budget` and stops the ramp, and it is **not** a memory\ncondition: it never deflates anything. Runtime-only and denominated in\nthe canvas and cost epoch shown for this replica — it is re-learned\nafter a restart and dropped when the canvas, the epoch or the corpus\nmoves, so it appears in no calibration profile.",
+            "description": "Shape ceiling: a batch size this model's own kernels have said they cannot\nexecute at the shapes this corpus feeds them, reported as\n`clamped.reason = \"index_limit\"`. It caps `unit_budget` and stops the\nramp, never deflates anything, and is runtime-only.",
             "minimum": 0
           },
           "throughput_samples": {
