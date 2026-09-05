@@ -45,12 +45,10 @@ use crate::process_tree::{JobGuard, detach_from_console, die_with_parent, spawn_
 /// `runtime/uv/<version>/`, keyed by version so a pin bump re-downloads.
 pub const UV_VERSION: &str = "0.11.28";
 
-/// Official SHA-256 checksums for the [`UV_VERSION`] release assets,
-/// verified after download and before extraction. To refresh when bumping
-/// `UV_VERSION`: every asset on the GitHub release has a companion
-/// `<asset>.sha256` file — fetch
-/// `https://github.com/astral-sh/uv/releases/download/<version>/<asset>.sha256`
-/// for each asset listed in [`uv_asset_name`] and copy the hex digest here.
+/// Official SHA-256 checksums for the [`UV_VERSION`] release assets, verified
+/// after download and before extraction. To refresh when bumping `UV_VERSION`,
+/// fetch the companion `<asset>.sha256` file for each asset in
+/// [`uv_asset_name`] from the GitHub release and copy the digest here.
 const UV_ASSET_SHA256: &[(&str, &str)] = &[
     (
         "uv-x86_64-pc-windows-msvc.zip",
@@ -74,11 +72,9 @@ const UV_ASSET_SHA256: &[(&str, &str)] = &[
     ),
 ];
 
-/// Oldest PATH uv accepted — the empirically verified floor: 0.6.13 was
-/// tested to read, re-resolve (`uv lock --check`), and sync the current
-/// revision-3 lockfile with its `[tool.uv] conflicts` + per-extra sources.
-/// Anything older falls through to the pinned download instead of failing
-/// mid-sync.
+/// Oldest PATH uv accepted: 0.6.13 is the verified floor for reading,
+/// re-resolving and syncing the current revision-3 lockfile. Anything older
+/// falls through to the pinned download instead of failing mid-sync.
 const UV_MIN_VERSION: (u64, u64, u64) = (0, 6, 13);
 
 /// Where managed uv downloads live, relative to the CWD.
@@ -95,12 +91,10 @@ const DOWNLOAD_LOG_STEP: u64 = 8 * 1024 * 1024;
 /// stderr lines kept for error reporting when a uv child fails.
 const STDERR_TAIL_LINES: usize = 20;
 
-/// Completion sentinel written inside the managed venv after every
-/// successful sync. `uv venv` creates the interpreter *before* the multi-GB
-/// sync, so interpreter existence alone cannot distinguish a complete
-/// environment from an interrupted first setup — the sentinel (recording
-/// the synced extra and the uv.lock hash) does. Deleted along with the venv
-/// by `--force`.
+/// Completion sentinel written inside the managed venv after every successful
+/// sync. `uv venv` creates the interpreter *before* the multi-GB sync, so only
+/// the sentinel — recording the synced extra and the uv.lock hash — tells a
+/// complete environment from an interrupted first setup.
 const SETUP_SENTINEL: &str = ".panoptikon-setup-complete";
 
 /// The legacy pre-restructure venv at the repo root. Setup NEVER touches
@@ -201,17 +195,12 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
     let extra = accelerator_extra(accelerator);
     let wheels = wheel_extra(accelerator);
 
-    // A converged venv only counts when it also holds the right wheels: an
-    // explicit `--accelerator X --if-needed` must re-sync a venv installed
-    // for a different extra (the sentinel records which one). Without an
-    // explicit request (the startup auto-trigger, config-driven runs) the
-    // installed extra is left alone — auto-setup must never silently swap
-    // the torch build a user deliberately synced.
-    //
-    // Compared in **wheel** extras rather than in sentinel labels, so an
-    // existing Mac carrying `extra=cpu` satisfies a resolved `mps` and is not
-    // re-synced for a label change: the two install the same wheels (DP-3's
-    // "no forced re-setup for existing Macs").
+    // A converged venv only counts when it holds the right wheels: an explicit
+    // `--accelerator X --if-needed` re-syncs a venv installed for a different
+    // extra, while an auto-triggered run leaves the installed extra alone —
+    // auto-setup must never swap a torch build the user chose. Compared in
+    // **wheel** extras, not sentinel labels, so an existing Mac carrying
+    // `extra=cpu` satisfies a resolved `mps` without a re-sync.
     if options.skip_if_converged && auto_setup_needed().is_none() {
         let installed = sentinel_accelerator().map(wheel_extra);
         if options.accelerator.is_none() || installed == Some(wheels) {
@@ -285,10 +274,9 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort prefetch of static-ffmpeg's platform binaries (ffmpeg +
-/// ffprobe) so the one-time download happens here, not in the middle of
-/// the first video scan. Failure is non-fatal: media jobs fall back to
-/// PATH ffmpeg/ffprobe at resolution time (see `media_tools`).
+/// Best-effort prefetch of static-ffmpeg's binaries, so the one-time download
+/// happens here and not mid-scan. Failure is non-fatal: media jobs fall back to
+/// PATH ffmpeg/ffprobe at resolution time.
 async fn prefetch_static_ffmpeg(interpreter: &Path) {
     tracing::info!("fetching the ffmpeg/ffprobe binaries (static-ffmpeg)");
     match tokio::process::Command::new(interpreter)
@@ -449,11 +437,9 @@ fn guard_managed_venv(venv: &Path) -> Result<()> {
 }
 
 /// `uv venv` argument construction (separated for tests). The venv path is
-/// passed positionally: `UV_PROJECT_ENVIRONMENT` (pinned by the runner) is
-/// honored by `uv sync` but not reliably by `uv venv`, and in extracted
-/// bundled mode the managed venv (`runtime/venv`) is NOT the project-dir
-/// default. Both spellings come from the same guarded absolute path, so
-/// they cannot disagree.
+/// passed positionally because `UV_PROJECT_ENVIRONMENT` is not reliably honored
+/// by `uv venv`, and in extracted bundled mode the managed venv is not the
+/// project-dir default. Both spellings come from the same guarded path.
 fn uv_venv_args(venv: &Path) -> Vec<String> {
     vec![
         "venv".into(),
@@ -476,17 +462,11 @@ fn uv_sync_args(extra: &str) -> Vec<String> {
     ]
 }
 
-/// The sentinel **label** for each resolved accelerator — what `extra=`
-/// records and what [`extra_accelerator`] reads back.
-/// [`Accelerator::Auto`] must be resolved first (see
-/// [`resolve_accelerator`]).
-///
-/// Not always the pyproject extra that is synced: see [`wheel_extra`], which
-/// is what `uv sync --extra` is actually given. The two differ for `mps`
-/// alone, and deliberately — an Apple Silicon host runs the same wheels a
-/// `cpu` one does there, but it is not a CPU host, and the sentinel is what
-/// every runtime decision (profile keys, the worker env, the GPU probe)
-/// reads the host's accelerator back out of.
+/// The sentinel **label** for each resolved accelerator — what `extra=` records
+/// and what [`extra_accelerator`] reads back ([`Accelerator::Auto`] must be
+/// resolved first). Not always the extra that is synced: [`wheel_extra`] is
+/// what `uv sync --extra` gets, and the two differ for `mps` alone, because an
+/// Apple Silicon host runs `cpu`'s wheels but is not a CPU host.
 fn accelerator_extra(accelerator: Accelerator) -> &'static str {
     match accelerator {
         Accelerator::Cpu => "cpu",
@@ -497,12 +477,9 @@ fn accelerator_extra(accelerator: Accelerator) -> &'static str {
     }
 }
 
-/// The pyproject extra `uv sync` installs for a resolved accelerator.
-///
-/// On macOS the source markers route every extra to the default PyPI wheels,
-/// and those wheels are the ones that carry MPS — so `mps` is not a
-/// dependency set of its own (there is no `mps` extra in pyproject.toml) and
-/// syncs `cpu`'s. Everything else installs the extra it is named after.
+/// The pyproject extra `uv sync` installs for a resolved accelerator. On macOS
+/// every extra routes to the default PyPI wheels, which are the ones carrying
+/// MPS, so `mps` is not a dependency set of its own and syncs `cpu`'s.
 fn wheel_extra(accelerator: Accelerator) -> &'static str {
     match accelerator {
         Accelerator::Mps => "cpu",
@@ -510,12 +487,9 @@ fn wheel_extra(accelerator: Accelerator) -> &'static str {
     }
 }
 
-/// What `auto` resolves to on macOS: MPS on Apple Silicon, CPU on the Intel
-/// Macs that are out of scope (releases build macOS aarch64 only, and setup
-/// itself refuses x86_64 macOS outright — but `effective_accelerator` runs
-/// at gateway startup too, where nothing has refused anything, and a
-/// synthetic MPS device on a machine with no Metal-capable GPU would be a
-/// fabricated ledger).
+/// What `auto` resolves to on macOS: MPS on Apple Silicon, CPU on the
+/// out-of-scope Intel Macs — `effective_accelerator` also runs at gateway
+/// startup, where a synthetic MPS device would be a fabricated ledger.
 fn macos_default(arch: &str) -> Accelerator {
     if arch == "aarch64" {
         Accelerator::Mps
@@ -524,16 +498,14 @@ fn macos_default(arch: &str) -> Accelerator {
     }
 }
 
-/// Resolve an accelerator request into a concrete choice plus the evidence
-/// for logging. Explicit choices are validated (ROCm is Linux-only, MPS is
-/// Apple Silicon-only); `auto` runs the platform probes.
+/// Resolve an accelerator request into a concrete choice plus the evidence for
+/// logging. Explicit choices are validated (ROCm is Linux-only, MPS is Apple
+/// Silicon-only); `auto` runs the platform probes.
 ///
 /// **Apple Silicon always resolves to the accelerator**
-/// (docs/unified-memory-admission.md, DP-3): `auto` lands on MPS through
-/// [`decide_accelerator`], and an explicit `cuda` — which macOS has never
-/// had wheels for — is coerced there too rather than left naming a backend
-/// this host cannot have. The one and only way such a host runs
-/// unaccelerated is an explicit `accelerator = "cpu"`, which is left alone.
+/// (docs/unified-memory-admission.md): even an explicit `cuda`, which macOS has
+/// never had wheels for, is coerced there. Only an explicit `cpu` runs such a
+/// host unaccelerated.
 pub(crate) fn resolve_accelerator(requested: Accelerator) -> Result<(Accelerator, String)> {
     match requested {
         Accelerator::Auto => Ok(decide_accelerator(&DetectionProbes::gather())),
@@ -569,24 +541,18 @@ pub(crate) fn effective_accelerator(requested: Accelerator) -> Accelerator {
         .unwrap_or(requested)
 }
 
-/// The accelerator actually installed in the managed venv, read from the
-/// setup sentinel's `extra=` line — the ground truth for which torch build
-/// `uv sync` put there. `None` when no completed setup is recorded (user-
-/// managed interpreter, legacy venv, interrupted sync, or an unknown extra).
-///
-/// Runtime decisions that depend on the *installed* wheels (the ROCm worker
-/// env) must use this over [`effective_accelerator`]: config `auto` re-probes
-/// the hardware, and on a host with `/opt/rocm` that would inject HIP paths
-/// into workers even when the venv was deliberately synced as `cpu`/`cuda`.
+/// The accelerator actually installed in the managed venv, from the sentinel's
+/// `extra=` line; `None` when no completed setup is recorded. Runtime decisions
+/// that depend on the *installed* wheels must use this over
+/// [`effective_accelerator`]: config `auto` re-probes the hardware, and on a
+/// host with `/opt/rocm` that would inject HIP paths into workers whose venv
+/// was deliberately synced as `cpu`/`cuda`.
 pub(crate) fn installed_accelerator() -> Option<Accelerator> {
-    // On macOS the sentinel carries no accelerator information to read: every
-    // extra routes to the same default-PyPI wheels there, so `extra=cpu` was
-    // written by an `auto` run and by a deliberate CPU run alike. The one
-    // distinction that matters on that platform is therefore a *config*
-    // choice, not a wheel choice, and it is left to the config
-    // (docs/unified-memory-admission.md, DP-3) — which is also what keeps
-    // every existing Mac, whose sentinel predates the `mps` label, on the
-    // accelerator instead of pinning it to CPU forever.
+    // On macOS the sentinel says nothing: every extra routes to the same
+    // wheels, so `extra=cpu` was written by an `auto` run and a deliberate CPU
+    // run alike. MPS-vs-CPU is a config choice there, left to the config —
+    // which is also what keeps an existing Mac, whose sentinel predates the
+    // `mps` label, on the accelerator.
     if cfg!(target_os = "macos") {
         return None;
     }
@@ -594,8 +560,7 @@ pub(crate) fn installed_accelerator() -> Option<Accelerator> {
 }
 
 /// The accelerator the sentinel's `extra=` line names, with no platform rule
-/// applied. Only [`installed_accelerator`] (which applies one) and the
-/// convergence check in [`run`] read this.
+/// applied — only [`installed_accelerator`] and [`run`]'s convergence check.
 fn sentinel_accelerator() -> Option<Accelerator> {
     let managed = ManagedPython::active();
     let content = std::fs::read_to_string(managed.venv.join(SETUP_SENTINEL)).ok()?;
@@ -625,9 +590,8 @@ fn extra_accelerator(extra: &str) -> Option<Accelerator> {
 /// the decision itself is a pure function (tested against the full table).
 struct DetectionProbes {
     os: &'static str,
-    /// `std::env::consts::ARCH`. Only macOS reads it: Apple Silicon
-    /// (`aarch64`) is the platform that has MPS, and an Intel Mac must not
-    /// be handed a synthetic Metal device it does not have.
+    /// `std::env::consts::ARCH`, read on macOS only: Apple Silicon has MPS and
+    /// an Intel Mac must not be handed a synthetic Metal device.
     arch: &'static str,
     /// `nvidia-smi` on PATH (any platform).
     nvidia_smi_on_path: bool,
@@ -662,10 +626,8 @@ impl DetectionProbes {
 }
 
 /// The auto-detection decision table: macOS always takes the default PyPI
-/// wheels — labelled `mps` on Apple Silicon, which is what those wheels
-/// actually give it (DP-3), and `cpu` on the out-of-scope Intel Macs —
-/// NVIDIA evidence wins over ROCm evidence, ROCm only exists on Linux, and
-/// no evidence means CPU.
+/// wheels (labelled `mps` on Apple Silicon, `cpu` on Intel), NVIDIA evidence
+/// beats ROCm, ROCm is Linux-only, and no evidence means CPU.
 fn decide_accelerator(probes: &DetectionProbes) -> (Accelerator, String) {
     if probes.os == "macos" {
         return (
@@ -1099,11 +1061,9 @@ fn extract_uv_archive(archive: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Spawn a uv child in `cwd` with stdout/stderr streamed line-by-line into
-/// tracing (mirrors ui.rs `run_logged`; uv writes its progress to stderr).
-/// `UV_PROJECT_ENVIRONMENT` is pinned to the guarded managed venv so no
-/// ambient uv configuration (env vars, user-level uv.toml) can redirect the
-/// operation to another environment. On failure the error carries the exit
-/// status and the last stderr lines.
+/// tracing. `UV_PROJECT_ENVIRONMENT` is pinned to the guarded managed venv so
+/// no ambient uv configuration can redirect the operation. On failure the error
+/// carries the exit status and the last stderr lines.
 async fn run_uv_logged(
     uv: &Path,
     args: &[String],
@@ -1133,8 +1093,7 @@ async fn run_uv_logged(
         .kill_on_drop(true);
     detach_from_console(&mut command);
     die_with_parent(&mut command);
-    // Armed with `die_with_parent`, so it is forked from the permanent
-    // spawner thread and not from whichever runtime thread got here (F11).
+    // Armed with `die_with_parent`, so it forks from the permanent thread.
     let mut child = spawn_supervised_tokio(command)
         .await
         .with_context(|| format!("failed to spawn {what} ('{}')", uv.display()))?;
@@ -1199,18 +1158,12 @@ async fn forward_lines(
 }
 
 /// Startup auto-trigger (gateway and `inferio` modes): run setup before the
-/// orchestrator starts when local inference is enabled, `auto_setup` is on,
-/// no explicit interpreter is configured (a user-specified interpreter is
-/// never auto-managed), and [`auto_setup_needed`] says the managed
-/// environment is missing, incomplete (interrupted first sync — the
-/// completion sentinel is absent), or stale (uv.lock changed). A legacy
-/// root `.venv` without a managed venv suppresses the trigger
-/// (pre-restructure installs keep working untouched). Failures are logged,
-/// not fatal: the server comes up with inference unavailable rather than
-/// dying.
-///
-/// `inference_enabled` is passed by the caller because the `inferio`
-/// subcommand implies local inference regardless of the config flag.
+/// orchestrator starts when local inference is enabled, `auto_setup` is on, no
+/// explicit interpreter is configured, and [`auto_setup_needed`] finds the
+/// managed environment missing, incomplete or stale. A legacy root `.venv`
+/// suppresses it. Failures are logged, not fatal: the server comes up with
+/// inference unavailable rather than dying. `inference_enabled` is passed in
+/// because the `inferio` subcommand implies it regardless of the config flag.
 pub async fn maybe_auto_setup(settings: &Settings, inference_enabled: bool) {
     let local = &settings.inference_local;
     if !inference_enabled || !local.python_env.auto_setup || local.python.is_some() {
@@ -1279,14 +1232,12 @@ mod tests {
     /// evidence only counts on Linux, and no evidence means CPU.
     #[test]
     fn accelerator_decision_table() {
-        // macOS: always PyPI wheels, even if probes claim GPUs — and on
-        // Apple Silicon those wheels *are* the accelerator (DP-3).
+        // macOS: always PyPI wheels, which on Apple Silicon carry Metal.
         let mut mac = probes("macos");
         mac.nvidia_smi_on_path = true;
         mac.rocm_smi_on_path = true;
         assert_eq!(decide_accelerator(&mac).0, Accelerator::Mps);
-        // An Intel Mac has no Metal backend we price; it is out of scope and
-        // must not be handed a synthetic device.
+        // An Intel Mac has no Metal backend we price.
         let mut intel_mac = probes("macos");
         intel_mac.arch = "x86_64";
         assert_eq!(decide_accelerator(&intel_mac).0, Accelerator::Cpu);

@@ -149,23 +149,18 @@ pub struct InferenceLocalConfig {
     /// Serve inference locally instead of proxying. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Python interpreter used to spawn workers. Default: auto-detect the
-    /// managed venv (`python/.venv` relative to the working directory,
-    /// falling back to the legacy root `.venv` of pre-restructure installs;
-    /// `runtime/venv` when a `bundled` build runs from its extracted set —
-    /// see `resources::py_source_mode`).
+    /// Python interpreter used to spawn workers. Default: the managed venv
+    /// (`python/.venv`, or `runtime/venv` in extracted bundled mode; the legacy
+    /// root `.venv` of pre-restructure installs is the fallback).
     #[serde(default)]
     pub python: Option<PathBuf>,
-    /// Directories searched (in order) for impl-class modules; forwarded to
+    /// Directories searched in order for impl-class modules, forwarded to
     /// workers in the spawn handshake. Empty (default) means the mode's
-    /// built-in impl dir plus `inferio_custom` (dev:
-    /// `["python/inferio/impl", "inferio_custom"]`).
+    /// built-in impl dir plus `inferio_custom`.
     #[serde(default)]
     pub impl_dirs: Vec<PathBuf>,
     /// Registry TOML directories, built-in first. Empty (default) means the
-    /// mode's built-in registry dir plus `config/inference` (dev:
-    /// `["python/inferio/config", "config/inference"]`); this key is the
-    /// only override (the old env fallbacks are gone).
+    /// built-in registry dir plus `config/inference`; the only override.
     #[serde(default)]
     pub config_dirs: Vec<PathBuf>,
     /// Entries prepended to the workers' PYTHONPATH so the `inferio_worker`
@@ -180,43 +175,21 @@ pub struct InferenceLocalConfig {
     /// TTL sweeper period in seconds (Python: 10).
     #[serde(default = "default_inference_sweep_interval_secs")]
     pub sweep_interval_secs: u64,
-    /// How many models may be spawning and streaming their weights into
-    /// **one GPU** at the same time (R6). Loads of one model are always
-    /// serialized by that model's own lock, and since R6 no load blocks
-    /// predicts to other models at all — this bounds the only thing left,
-    /// how much VRAM can be in flight into a GPU at once. Default: 1,
-    /// which is what the retired host-wide load lock gave every GPU that
-    /// had a load in flight (and, since every unpinned model resolves to the
-    /// same default GPU, is the same thing on the shipped configuration).
-    /// Raising it shortens a cold start that touches several models on one
-    /// GPU, at the cost of several sets of weights landing against one
-    /// headroom reading — safe, because each load charges its expected base
-    /// as a reservation inside the same ledger critical section that prices
-    /// it. 0 is read as 1.
+    /// How many models may stream their weights into **one GPU** at a time;
+    /// default 1, and 0 is read as 1. See docs/inferio-worker-protocol.md.
     #[serde(default = "default_max_concurrent_loads")]
     pub max_concurrent_loads: usize,
-    /// First window, in seconds, of the per-model load-failure cooldown
-    /// (R9). After a load fails, further loads of that model are refused for
-    /// this long; each consecutive failure doubles the window up to
-    /// `load_failure_cooldown_max_secs`, and a successful load clears it.
-    /// While a model is cooling down, predicts to it fail immediately with
-    /// 503 + `Retry-After` instead of spawning another worker (run1 finding
-    /// Q5/B15: a model dying on load was reloaded once per request with no
-    /// counter, backoff or cap — 93 loads in 182 s). Default: 2.
-    /// **0 disables the cooldown**, restoring the unbounded retry.
+    /// First window of the per-model load-failure cooldown, in seconds, which
+    /// doubles per consecutive failure. Default 2; **0 disables it**.
     #[serde(default = "default_load_failure_cooldown_secs")]
     pub load_failure_cooldown_secs: u64,
-    /// Ceiling on that window, in seconds. Default: 300 — a model that is
-    /// broken until an operator fixes something must not be retried forever,
-    /// and five minutes bounds how long a model that has *been* fixed stays
-    /// refused. Reaching it takes nine failures and about 8.5 minutes.
+    /// Ceiling on that window, in seconds. Default: 300.
     #[serde(default = "default_load_failure_cooldown_max_secs")]
     pub load_failure_cooldown_max_secs: u64,
-    /// Optional worker lifecycle deadline overrides (protocol doc defaults:
-    /// handshake 30 s, load 600 s, unload grace 10 s, terminate grace 5 s).
-    /// The unload grace also bounds how long an unload waits for in-flight
-    /// predicts before killing their workers (predict itself has no
-    /// deadline; this is what lets a wedged GPU worker be reclaimed).
+    /// Optional worker lifecycle deadline overrides (handshake 30 s, load
+    /// 600 s, unload grace 10 s, terminate grace 5 s). The unload grace also
+    /// bounds an unload's wait on in-flight predicts, which have no deadline
+    /// of their own — that is what reclaims a wedged GPU worker.
     #[serde(default)]
     pub handshake_secs: Option<u64>,
     #[serde(default)]
@@ -234,8 +207,7 @@ pub struct InferenceLocalConfig {
     /// per impl class; no TTL by design).
     #[serde(default)]
     pub prewarm: PrewarmSettings,
-    /// `[inference_local.vram]`: the per-GPU admission budget levers
-    /// (docs/batch-calibration-design.md, "Budget configuration").
+    /// `[inference_local.vram]`: the per-GPU admission budget levers.
     #[serde(default)]
     pub vram: VramConfig,
     /// `[inference_local.python_env]`: managed-venv policy for
@@ -244,21 +216,18 @@ pub struct InferenceLocalConfig {
     pub python_env: PythonEnvConfig,
 }
 
-/// `[inference_local.python_env]`: how the binary manages the Python
-/// inference environment. Only ever applies to the managed venv
-/// (`python/.venv` in the dev layout, `runtime/venv` in extracted bundled
-/// mode) — a user-configured `[inference_local].python` interpreter is
-/// never touched (setup refuses to operate on any other path).
+/// `[inference_local.python_env]`: how the binary manages the Python inference
+/// environment. Only ever the managed venv — a user-configured
+/// `[inference_local].python` interpreter is never touched.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PythonEnvConfig {
-    /// Accelerator variant for the locked sync: "auto" (detect CUDA/ROCm/MPS
-    /// at setup time), "cuda", "rocm", "mps", or "cpu". Default: "auto".
+    /// Accelerator for the locked sync: "auto" (default), "cuda", "rocm",
+    /// "mps" or "cpu".
     #[serde(default)]
     pub accelerator: Accelerator,
-    /// Run `panoptikon setup` automatically at startup (gateway and
-    /// `inferio` modes) when `[inference_local]` is enabled, no explicit
-    /// `python` interpreter is configured, and the managed interpreter does
-    /// not exist yet. Default: true.
+    /// Run `panoptikon setup` at startup when `[inference_local]` is enabled,
+    /// no explicit `python` is configured, and the managed interpreter does not
+    /// exist yet. Default: true.
     #[serde(default = "default_true")]
     pub auto_setup: bool,
 }
@@ -285,12 +254,8 @@ pub enum Accelerator {
     Cuda,
     Rocm,
     Cpu,
-    /// Apple Silicon's Metal backend. The wheels are the default-PyPI ones
-    /// `cpu` installs on macOS — this is a label, not a different torch
-    /// build — but it is a *different accelerator*: it has its own
-    /// calibration keyspace and its own (unified-memory) admission
-    /// (docs/unified-memory-admission.md, backend A). Explicit `cpu` on an
-    /// Apple Silicon host is the one way to run unaccelerated there.
+    /// Apple Silicon's Metal backend: the same wheels `cpu` installs on macOS,
+    /// but a different accelerator (docs/unified-memory-admission.md).
     Mps,
 }
 
@@ -312,50 +277,20 @@ pub struct PrewarmSettings {
     pub always_warm: Vec<String>,
 }
 
-/// `[inference_local.vram]`: how much of each GPU the inference orchestrator
-/// may admit work into (docs/batch-calibration-design.md, "Budget
-/// configuration"). Two composable limits; when both are set the admission
-/// budget is the `min`:
-///
-/// ```text
-/// limit = min(total × cap_fraction,            # server lever, default off
-///             total − other_used × (1 + margin)) # desktop lever, default on
-/// ```
-///
-/// Per-server defaults with **per-GPU-instance** overrides. The override
-/// keyspace is the GPU UUID (`GPU-…` as nvidia-smi/NVML print it), never the
-/// CUDA device index: an index is not stable across reboots or
-/// `CUDA_VISIBLE_DEVICES` changes, while two identical cards on one host share
-/// a calibration profile and can still want different budgets (the one driving
-/// the monitors gets a bigger margin).
+/// `[inference_local.vram]`: how much of each GPU the orchestrator may admit
+/// work into. See panoptikon/README.md "VRAM budgets".
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct VramConfig {
-    /// Margin over *other processes'* usage — the desktop lever, on by
-    /// default. Our own workers are never margin-inflated; their footprints
-    /// are measured.
-    ///
-    /// **Absent is not the same as `0.10`** (run2 change R5). Absent means the
-    /// user has expressed no opinion, and the ledger then applies its own
-    /// default fraction *and* caps the resulting reserve at 1 GiB, so the
-    /// margin cannot make the last several gigabytes of a busy GPU
-    /// unusable (findings P5-2 / T4). A margin written in the file is honoured
-    /// verbatim and uncapped — it is a statement about this machine, and the
-    /// ledger has no standing to overrule it. Keeping the two distinguishable
-    /// is what lets the default's *behaviour* change later without overriding
-    /// somebody's deliberate `margin = 0.10`; see the config-authoring rules
-    /// in `CLAUDE.md`.
+    /// Headroom over *other processes'* usage; default 0.10. **Absent is
+    /// deliberately not a written `0.10`** — see panoptikon/README.md.
     #[serde(default)]
     pub margin: Option<f64>,
-    /// Hard ceiling as a fraction of total VRAM — the server lever, off by
-    /// default. Server operators partitioning one card between services set
-    /// this and are encouraged to leave `margin` alone.
+    /// Hard ceiling as a fraction of total VRAM; off by default.
     #[serde(default)]
     pub cap_fraction: Option<f64>,
-    /// Per-GPU overrides, keyed by GPU UUID. An absent key inherits the
-    /// section default; an explicit `null` is not expressible in TOML, so
-    /// "inherit" and "unset" are the same thing here — which is why
-    /// `cap_fraction` cannot be turned *off* for one GPU once it is on
-    /// server-wide. Set it per GPU instead of globally if you need that.
+    /// Per-GPU overrides, keyed by GPU UUID; an absent key inherits the section
+    /// default. TOML has no explicit `null`, so `cap_fraction` cannot be turned
+    /// off for a single GPU once it is on server-wide.
     #[serde(default)]
     pub gpu: BTreeMap<String, VramOverride>,
 }
@@ -371,20 +306,8 @@ pub struct VramOverride {
 }
 
 impl VramConfig {
-    /// The `(margin, cap_fraction)` in force for one GPU.
-    ///
-    /// UUID matching is case-insensitive, and has to be twice over: NVML
-    /// renders its UUIDs in lower-case hex and `nvidia-smi -L` prints the same,
-    /// so a user copying one out of a log or a Desktop label must not have a
-    /// budget silently ignored — *and* the `config` crate lower-cases every key
-    /// it merges, so the keys in this map are lower-case whatever the file
-    /// said. (Two file keys differing only in case therefore collapse into one
-    /// before we ever see them, which is why that collision is rejected on the
-    /// raw document — see `reject_case_duplicate_gpu_keys`.)
-    /// Matching is otherwise exact — no prefix matching, unlike
-    /// the abbreviations CUDA itself accepts in `CUDA_VISIBLE_DEVICES`: a
-    /// prefix that matched two GPUs would have to pick one, and applying the
-    /// wrong GPU's margin is a memory decision made on a typo.
+    /// The `(margin, cap_fraction)` in force for one GPU. UUID matching folds
+    /// case but is otherwise exact: no prefix matching, unlike CUDA.
     pub fn for_gpu(&self, uuid: &str) -> (Option<f64>, Option<f64>) {
         let over = self.gpu.get(uuid).or_else(|| {
             self.gpu
@@ -1402,12 +1325,7 @@ impl Settings {
         Ok(())
     }
 
-    /// `[inference_local.vram]`: both levers are memory decisions, so a bad
-    /// number is rejected rather than clamped — matching how every other
-    /// `validate_*` here treats a value it cannot honour. Silently clamping a
-    /// negative margin to 0 would hand the user the *least* protective reading
-    /// of what they wrote, and a NaN would propagate into the ledger's
-    /// arithmetic, where it is defended against but never intended.
+    /// `[inference_local.vram]`: a bad number is rejected, not clamped.
     fn validate_inference_vram(&self) -> Result<()> {
         let vram = &self.inference_local.vram;
         let check = |where_: &str, margin: Option<f64>, cap: Option<f64>| -> Result<()> {
@@ -1430,8 +1348,7 @@ impl Settings {
             Ok(())
         };
         check("inference_local.vram", vram.margin, vram.cap_fraction)?;
-        // Two device keys differing only in case are rejected too, but that
-        // check cannot live here: see `reject_case_duplicate_gpu_keys`.
+        // Case-duplicate keys: see `reject_case_duplicate_gpu_keys`.
         for (uuid, over) in &vram.gpu {
             if uuid.trim().is_empty() {
                 anyhow::bail!(
@@ -1793,17 +1710,9 @@ fn templated_file_source(
     )))
 }
 
-/// Reject two `[inference_local.vram.gpu."…"]` tables naming the same GPU in
-/// different cases — checked on the **raw** document, which is the only place
-/// the collision is still visible.
-///
-/// The `config` crate lower-cases every key it merges, so by the time a
-/// `Settings` exists the two blocks have already collapsed into one and the
-/// loser is simply gone: no error, no warning, and no way for the user to tell
-/// which of their two budgets is in force. (That folding is also why
-/// [`VramConfig::for_gpu`] matches case-insensitively — the stored keys are
-/// lower-case whatever the file said.) So this cannot be a `validate_*` method
-/// on `Settings`; it has to run here, before the merge.
+/// Reject two `[inference_local.vram.gpu."…"]` tables naming one GPU in
+/// different cases. On the **raw** document: the `config` crate folds the keys
+/// before a `Settings` exists, so a `validate_*` could not see the collision.
 fn reject_case_duplicate_gpu_keys(value: &toml::Value, path: &std::path::Path) -> Result<()> {
     let Some(gpu) = value
         .get("inference_local")
