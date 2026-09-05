@@ -1,120 +1,34 @@
-//! Dispatch-time batching for one loaded model (design doc §6, reworked by
-//! batch-calibration step 1b).
+//! Dispatch-time batching for one loaded model.
 //!
 //! Each loaded model owns one dispatcher task fed by an mpsc queue of predict
-//! requests. Whenever a worker replica is free, the task drains the queue
-//! into a **window** and sends it to that replica as one merged `predict`.
-//! Outputs are split back per request by input counts, so FIFO order is
-//! preserved end to end.
+//! requests. Whenever a replica is free the task drains a FIFO prefix of the
+//! queue into a **window** and sends it as one merged `predict`; outputs are
+//! split back per request by input counts, so order is preserved end to end.
 //!
-//! ## Windows, grants and the deleted cap rule
+//! On the **priced** path the replica has an [`Admission`]: the ledger sizes
+//! the window in units, bounded also by payload bytes ([`MAX_WINDOW_BYTES`])
+//! and, under a user cap, by items ([`priced_item_bound`]); the window takes a
+//! **grant** out of the GPU's headroom and the worker packs batches inside it.
+//! On the **unpriced** path (`none`-class models, no inventory, an
+//! unenumerated GPU) there is no worker-side packer, so the frame *is* the GPU
+//! batch, bounded in items by `min(user cap, ctx.unpriced_window_items)`.
 //!
-//! The old effective-cap rule (max over the explicit `max_batch` values in
-//! the window; else registry `default_batch_size`; else the server default)
-//! existed to reconcile "inferio doesn't know what is safe" with
-//! heterogeneously-capped requests. Grant-based admission removes that job,
-//! so the rule is **deleted, not adapted** (docs/batch-calibration-design.md,
-//! "Dispatcher windows and the batch cap"). What replaces it:
+//! Windows are partitioned by user cap value, and a cap bounds items, never
+//! units. Dispatcher-side unit counts are estimates ([`estimate_input_units`])
+//! and safety never depends on them: the worker reprices after decode. There
+//! is no time bound — `predict` keeps its no-deadline semantics.
 //!
-//! - **Priced path** (the replica has an [`Admission`] handle, i.e. a known
-//!   GPU and a cost dimension that scales): window size comes from the
-//!   ledger — a few admitted GPU batches' worth of units — additionally
-//!   bounded by payload bytes ([`MAX_WINDOW_BYTES`], well under the frame
-//!   limit [`MAX_FRAME_BYTES`]). Before dispatch the window takes a **grant** out of the
-//!   GPU's headroom and forwards it on the request frame; the worker's
-//!   packing harness splits the window into GPU batches within that budget
-//!   and enforces the user cap as an item count at pack time. Payload bytes are
-//!   still the dispatcher's job here: window formation always takes the first
-//!   request whether or not it fits, and a frame over the limit is refused by
-//!   the transport, so a lone over-budget request is split across frames
-//!   ([`frame_chunks`]). When
-//!   the requests carry a user cap the window is additionally bounded in items,
-//!   to the same batch depth the unit budget uses ([`priced_item_bound`]).
-//! - **Unpriced path** (`none`-class models, any host with no inventory, a
-//!   GPU outside the enumeration): there is no worker-side
-//!   packer, so the frame the worker receives *is* the GPU batch. Every frame is
-//!   bounded in **items** by `min(user cap, ctx.unpriced_window_items)` —
-//!   including a merged window's, not just an oversized lone request's — minus
-//!   the max-over-caps rule, since windows are now partitioned by cap value so a
-//!   cap-less request can never re-inflate a capped one. The design's phrase
-//!   for this path is "seed-sized fixed batches"; using the configured
-//!   `default_max_batch` (or the registry's `default_batch_size`) instead of
-//!   `seed_units` is a deliberate deviation: a host with no free-memory query
-//!   has no VRAM budget to protect, and `none`-class models do not scale with
-//!   batch size at all, so shrinking those hosts' batches to a calibration
-//!   seed would be a throughput regression with no safety benefit. The
-//!   Package-1 OOM backstop still applies.
+//! A merged window failing with a per-request [`WorkerError`] falls back to
+//! predicting each request individually; a fatal error (process death,
+//! protocol desync) fails the window and everything queued, then reports the
+//! death to the manager. Every exit settles the window's grant
+//! ([`fatal_settlement`]), `GrantToken`'s `Drop` backstopping abort paths.
 //!
-//! **The user cap travels per request.** Windows are partitioned by cap value
-//! — capped jobs are the exception under auto, so mixed-cap queues are rare
-//! and the partition costs nothing — and the cap is enforced as an item-count
-//! constraint (worker-side on the priced path, dispatcher-side on the
-//! unpriced one), never converted to units.
-//!
-//! **Dispatcher-side unit counts are estimates, and safety never depends on
-//! them** ([`estimate_input_units`]). Window sizing and grant pricing need
-//! per-item units before any worker has decoded anything. A mis-estimate only
-//! mis-sizes windows: an over-estimate yields a larger grant still clamped by
-//! headroom, an under-estimate yields more GPU batches per window, because the
-//! worker packs within the grant using exact post-decode counts.
-//!
-//! There is no time bound anywhere: `predict` keeps its no-deadline semantics.
-//!
-//! ## Failure semantics (port of process_model.py `_batch_predict`)
-//!
-//! - merged batch of more than one request fails with a per-request
-//!   [`WorkerError`] -> fall back to predicting each request individually;
-//!   individual errors go only to that request's reply;
-//! - fatal worker errors (process death, protocol desync) fail every request
-//!   in the window and everything still queued, then report the death to the
-//!   manager so the model is dropped from all LRUs.
-//!
-//! A typed per-item error slot (`WorkerOutput::Error`, protocol doc) is an
-//! ordinary output as far as this layer is concerned: the worker still
-//! returns one slot per input, so the count-based split below keeps every
-//! slot with its own request ([`split_window_outputs`]). This layer never
-//! inspects or acts on them — only the caller that owns the item does.
-//!
-//! Every exit path settles the window's grant: a response (success or a
-//! per-request error) counts as a real window and feeds the ledger's ramp,
-//! deflation and cost fit; a fatal error or an aborted task settles as
-//! `Aborted`, which teaches the ledger nothing — except when the replica
-//! itself stopped answering, which settles as `WorkerDied` and is a memory
-//! signal on unified-memory devices ([`fatal_settlement`]). The `Drop` on
-//! [`GrantToken`] is the backstop for the abort paths that never run code
-//! (`JoinSet::shutdown`).
-//!
-//! Multi-replica WorkerSet (design §8, Phase 3): the dispatcher owns N
-//! replicas (shape from registry `config.replicas`/`config.devices`, resolved
-//! in `registry.rs`) serving ONE shared FIFO queue. Free replicas live in a
-//! pool; each in-flight window runs as a task in a `JoinSet` that returns its
-//! replica to the pool on completion. Windows on different replicas run
-//! concurrently; *request pickup* stays strictly FIFO (windows are always
-//! queue prefixes), while completion order across replicas may differ —
-//! harmless, since every request replies through its own oneshot.
-//!
-//! Death policy (deliberate for Phase 3; degradation to a smaller set is
-//! future work): ANY replica failing fatally kills the whole model. Queued
-//! requests are failed, windows in flight on other replicas are aborted
-//! (their callers see errors; the dropped workers are reaped by kill_on_drop
-//! plus the Job Object), idle replicas get the ladder-less `kill()`, and
-//! `handle_worker_death` runs once under the generation guard. Graceful
-//! shutdown is the opposite: in-flight windows finish, then every replica
-//! gets the graceful unload ladder, concurrently.
-//!
-//! A death is normally discovered by a request failing on the pipe, which
-//! leaves an *idle* replica's death invisible: a model nobody predicts
-//! against reads nothing, so EOF is never noticed. [`DispatchMsg::ReapIdle`]
-//! closes that hole — the manager's sweeper ticks it, and every free replica
-//! is `try_wait`ed. A replica found gone takes the same path as one that
-//! died mid-request, minus the window settlement it has no window for.
-//!
-//! The in-flight drain on graceful shutdown is bounded by `unload_grace`:
-//! `predict` itself has no deadline (how long a model legitimately takes is
-//! unknowable), so a worker wedged in a GPU kernel would otherwise hang the
-//! unload — and the manager's shutdown — forever. Once an unload has been
-//! decided the model is gone either way, so past the grace the stuck windows
-//! are aborted and their workers killed like the fatal path.
+//! The dispatcher owns N replicas serving ONE shared FIFO queue: free replicas
+//! live in a pool, each in-flight window is a `JoinSet` task returning its
+//! replica on completion, and any replica failing fatally kills the whole
+//! model. See docs/batch-calibration-design.md, "Dispatcher windows and the
+//! batch cap" onwards.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -138,102 +52,70 @@ use super::worker::{
     MAX_FRAME_BYTES, Worker, WorkerError, WorkerInput, WorkerOutput, estimate_input_bytes,
 };
 
-/// Payload-byte ceiling for one window. [`MAX_FRAME_BYTES`] is the hard
-/// wall; half of it leaves ample room for the msgpack map overhead around the
-/// inputs and for the grant/fit maps, and a window that big is already far
-/// past the point where deeper batching buys anything. Per-input sizes come
-/// from the worker's own [`estimate_input_bytes`], the same estimator
-/// extraction's frame-budget check uses, so the two never disagree about
-/// what fits.
+/// Payload-byte ceiling for one window; [`MAX_FRAME_BYTES`] is the hard wall
+/// and this leaves room for the msgpack envelope. Per-input sizes come from
+/// [`estimate_input_bytes`], as extraction's frame-budget check does.
 pub(crate) const MAX_WINDOW_BYTES: usize = MAX_FRAME_BYTES / 2;
 const _: () = assert!(
     MAX_WINDOW_BYTES < MAX_FRAME_BYTES,
     "the window bound must stay under the hard frame limit"
 );
 
-/// Estimated units for a `pixel`-priced input whose image header could not be
-/// read at dispatch (missing bytes, an encoding `image` cannot sniff). ~2 MP,
-/// the same figure the pixel unit class seeds with: it must be large enough
-/// that an unreadable input is not silently treated as free, and the worker
-/// reprices it exactly after decode anyway.
+/// Estimated units for a `pixel`-priced input whose image header is
+/// unreadable: ~2 MP, the pixel class's seed, so it is not treated as free.
 const PIXEL_FALLBACK_UNITS: u64 = 2_000_000;
 
-/// Bytes per token for the dispatcher's `token` estimate. The dispatcher
-/// cannot tokenize (that needs the model's tokenizer, which lives in the
-/// worker's venv); ~4 bytes/token is the standard rule of thumb for
-/// English-dominant text in UTF-8.
+/// Bytes per token for the dispatcher's `token` estimate; it has no tokenizer
+/// (that lives in the worker's venv).
 const BYTES_PER_TOKEN: u64 = 4;
 
-/// Estimated seconds per input for `audio-second` pricing. Nothing in the
-/// shipped registry is priced this way today (CLAP pads to a fixed window and
-/// is `item`/`count`), and the dispatcher cannot read audio durations without
-/// a decoder, so one clip is charged a conservative half-minute.
+/// Estimated seconds per input for `audio-second` pricing: the dispatcher has
+/// no decoder, so one clip is charged a conservative half-minute.
 const AUDIO_FALLBACK_SECONDS: u64 = 30;
 
-/// Lightweight per-model dispatcher statistics for `GET /health` (design
-/// §7). One `Arc` is shared between the dispatcher task (sole writer) and
-/// the manager's `health()` (reader); every field is a Relaxed atomic —
-/// health reads are advisory snapshots, never synchronization points, so
-/// the hot dispatch path pays one uncontended atomic store per event and
-/// takes no locks beyond what already exists.
+/// Per-model dispatcher statistics for `GET /health`, shared between the
+/// dispatcher task (sole writer) and the manager's `health()`. Every field is
+/// a Relaxed atomic: health reads are advisory, never synchronization points.
 #[derive(Debug, Default)]
 pub(crate) struct ModelStats {
-    /// Requests currently waiting in the FIFO queue (stored on every
-    /// push/drain).
+    /// Requests waiting in the FIFO queue.
     pub queue_len: AtomicUsize,
     /// Windows currently running on replicas.
     pub in_flight_windows: AtomicUsize,
-    /// Replica count of the WorkerSet (constant after load; initialized by
-    /// the manager before the dispatcher task starts).
+    /// Replica count, constant after load and set by the manager.
     pub replicas_total: AtomicUsize,
     /// Replicas currently idle in the free pool.
     pub replicas_free: AtomicUsize,
-    /// Unit budget of the grant attached to the most recently dispatched
-    /// window. 0 = no grant yet (nothing dispatched, or this model is on the
-    /// unpriced path) — a real budget is always >= 1.
+    /// Unit budget of the last dispatched window's grant. 0 = none yet
+    /// (nothing dispatched, or the unpriced path); a real budget is >= 1.
     pub last_grant_units: AtomicU64,
-    /// Inputs in the most recently dispatched window. 0 = none dispatched
-    /// yet. This is what a user cap bounds on the unpriced path.
+    /// Inputs in the last dispatched window (0 = none yet). This is what a
+    /// user cap bounds on the unpriced path.
     pub last_window_items: AtomicU32,
-    /// Items the orchestrator would like its callers to keep inside in-flight
-    /// predict requests for this model ([`desired_in_flight_items`]). 0 = not
-    /// computed yet (nothing dispatched), which the HTTP layer reports as an
-    /// absent field. Stored on every window formation.
+    /// Items callers should keep in flight ([`desired_in_flight_items`]);
+    /// 0 = not computed yet, reported as an absent field.
     pub desired_in_flight_items: AtomicU64,
     /// Predict requests ever queued on this dispatcher.
     pub total_predict_requests: AtomicU64,
-    /// Windows ever dispatched to a replica. Counts merged dispatches, not
-    /// worker `predict` frames: per-request fallback retries and
-    /// oversized-request sub-batches stay within their window's count.
+    /// Windows ever dispatched. Counts merged dispatches, not `predict`
+    /// frames: retries and sub-batches stay inside their window's count.
     pub total_batches: AtomicU64,
-    /// Of those, the ones formed **short of the unit budget the ledger
-    /// allowed** — the queue, not the GPU, decided their size.
-    ///
-    /// It is the one number that separates "this model is memory-bound" from
-    /// "this model is starved", and its absence is why run2's S1 took a phase
-    /// to diagnose rather than a log read: the ledger already computed the
-    /// comparison (`wanted < capped` in `request_grant`) and threw it away.
-    /// A ramp that is not advancing while this keeps climbing is being
-    /// starved by its caller or its transport, and no amount of freed VRAM
-    /// will move it.
-    ///
-    /// Priced windows only; the unpriced path has no unit budget to fall
-    /// short of.
+    /// Of those, the ones formed short of the unit budget the ledger allowed
+    /// — starved rather than memory-bound. Priced windows only.
     pub queue_bound_windows: AtomicU64,
 }
 
-/// One queued predict: the request's inputs, its optional user cap, and the
-/// oneshot the caller is awaiting.
+/// One queued predict: inputs, optional user cap, and the caller's oneshot.
 pub(crate) struct DispatchRequest {
     pub inputs: Vec<WorkerInput>,
-    /// The user's "max batch size" for this request. Windows are partitioned
-    /// by this value and it bounds item counts, never units.
+    /// The user's "max batch size": windows are partitioned by it and it
+    /// bounds item counts, never units.
     pub max_batch: Option<u32>,
     pub reply: oneshot::Sender<Result<Vec<WorkerOutput>>>,
 }
 
 /// A queued request with its dispatch-time estimates, computed once on the
-/// way into the queue rather than on every window-formation pass.
+/// way in rather than on every window-formation pass.
 struct Queued {
     request: DispatchRequest,
     shape: WindowItem,
@@ -248,8 +130,7 @@ pub(crate) struct WindowItem {
     pub bytes: usize,
     /// Inputs in the request.
     pub items: usize,
-    /// The request's user cap, normalised by [`effective_cap`]; windows
-    /// never mix cap values.
+    /// User cap, normalised by [`effective_cap`]; windows never mix values.
     pub cap: Option<u32>,
 }
 
@@ -259,7 +140,7 @@ pub(crate) struct WindowBounds {
     /// Total priced units; `u64::MAX` = no unit bound (the unpriced path).
     pub units: u64,
     /// Total inputs; `usize::MAX` = no item bound (the priced path, where the
-    /// worker's packer enforces the user cap).
+    /// worker's packer holds the cap).
     pub items: usize,
     /// Total payload bytes.
     pub bytes: usize,
@@ -268,29 +149,14 @@ pub(crate) struct WindowBounds {
 /// Messages accepted by a model's dispatcher task.
 pub(crate) enum DispatchMsg {
     Predict(DispatchRequest),
-    /// The ledger wants one of this model's replicas to release its allocator
-    /// pool (`Worker::trim`). Carries the ledger's replica id
-    /// ([`Admission::worker_id`]) — a model can have several replicas and only
-    /// one of them is the idle resident holding the slack.
-    ///
-    /// Best-effort and never queued: it is only acted on if that replica is in
-    /// the free pool when the message is processed. A **busy** replica is
-    /// skipped by design — it is not idle, so it is not what this exists for,
-    /// its own reactive-shrink path covers it, and a trim between the frames
-    /// of an in-flight window is not something the one-request-at-a-time
-    /// protocol allows anyway.
+    /// The ledger wants the replica with this [`Admission::worker_id`] to
+    /// release its allocator pool. Best-effort and never queued: acted on only
+    /// if that replica is in the free pool ([`try_trim`]).
     Trim(u64),
-    /// Liveness sweep for the replicas that are **idle**: `try_wait` each one
-    /// in the free pool and, if any child has already exited, take the
-    /// model down the normal death path (P5-6).
-    ///
-    /// Ticked by the manager's sweeper. Only the free pool is checked, and
-    /// deliberately: a busy replica's death is discovered by the window
-    /// running on it (EOF on the pipe), which is prompter and carries the
-    /// request context. It is the replicas nobody is talking to that go
-    /// unnoticed — a `none`-cost model that is loaded and never predicted
-    /// against advertises a replica in `/health` indefinitely after its
-    /// worker is gone.
+    /// Liveness sweep for the **idle** replicas, ticked by the manager's
+    /// sweeper: `try_wait` each one in the free pool and take the model down
+    /// the normal death path if a child has exited. A busy replica's death is
+    /// found by the window running on it.
     ReapIdle,
     /// Graceful unload: fail anything still queued, then run the worker's
     /// unload -> terminate -> kill ladder and exit the task.
@@ -298,8 +164,7 @@ pub(crate) enum DispatchMsg {
 }
 
 /// One replica: the supervised worker plus its ledger handle. `admission` is
-/// `None` on the unpriced path, and dropping it is what un-charges the
-/// replica's footprint and releases anything it still held.
+/// `None` on the unpriced path; dropping it un-charges the replica's footprint.
 pub(crate) struct Replica {
     pub worker: Worker,
     pub admission: Option<Admission>,
@@ -308,16 +173,14 @@ pub(crate) struct Replica {
 /// Everything the dispatcher task needs besides the replicas and the queue.
 pub(crate) struct DispatcherContext {
     pub inference_id: String,
-    /// Load generation of this model entry; guards the death cleanup so a
-    /// dispatcher that lost a race with a respawn can't remove the newer
-    /// entry's state.
+    /// Load generation of this model entry; guards the death cleanup against
+    /// a dispatcher that lost a race with a respawn.
     pub generation: u64,
-    /// The model's cost dimension, resolved at load. Drives the dispatcher's
-    /// unit estimates; the ledger owns everything the estimates feed.
+    /// The model's cost dimension, resolved at load; drives the unit
+    /// estimates.
     pub cost: CostDimension,
     /// Item bound for the **unpriced** path: registry `default_batch_size`
-    /// when declared, else the server-wide `default_max_batch`. Never used on
-    /// the priced path, where the ledger sizes windows and the worker packs.
+    /// when declared, else the server-wide `default_max_batch`.
     pub unpriced_window_items: u32,
     /// Back-reference for fatal-death cleanup. Weak: the manager owns the
     /// dispatcher task, not the other way around.
@@ -325,40 +188,22 @@ pub(crate) struct DispatcherContext {
     /// Shared health counters; the manager keeps the other Arc and reads
     /// them in `health()` without touching this task.
     pub stats: Arc<ModelStats>,
-    /// Bound on the graceful-unload drain of in-flight windows (the same
-    /// `unload_grace` the worker ladder uses). Predicts have no deadline of
-    /// their own, so this is what guarantees unload/shutdown converge when
-    /// a worker is wedged mid-predict (the stuck-CUDA case).
+    /// Bound on the graceful-unload drain of in-flight windows (the worker
+    /// ladder's `unload_grace`); predicts have no deadline, so this is what
+    /// makes unload converge on a wedged worker.
     pub unload_grace: Duration,
 }
 
 /// Dispatch-time unit estimate for one input, in the model's cost unit.
-///
-/// **Estimates only.** Pixel dims come from the image *header* (no decode —
-/// core's `image_frames` handler re-encodes slices, so headers describe what
-/// the worker will actually decode); token counts from a bytes-per-token
-/// heuristic, because the dispatcher has no tokenizer; audio from a flat
-/// per-clip allowance. Whatever this returns, the worker prices the batch
-/// exactly after decode and packs within its grant.
-///
-/// **The per-item pixel canvas is applied here too** (run2 change R7). The
-/// worker prices every input at `min(raw_pixels, canvas_pixels)`
-/// (`packing.price_inputs`); if the host did not, the window bound and the
-/// grant it asks the ledger for would be denominated in raw submitted pixels
-/// while the batch that runs inside them is denominated in capped ones — the
-/// two sides pricing different quantities, which is what produced run1's
-/// 23-94 GB easyOCR grants (report §4, F-B). It matters most for the models
-/// that ship `enable_batching = false` (the three `doctr/easyocr_*` ids): a
-/// worker on the grantless compatibility path applies no cap of its own, so
-/// this is the only cap there is.
-///
-/// The unreadable-header fallback is capped for the same reason the reading
-/// is — it stands in for the same quantity — mirroring `price_inputs`, which
-/// caps its own fallback.
+/// **Estimates only**: pixel dims from the image *header* (no decode), tokens
+/// from a bytes-per-token heuristic, audio from a flat per-clip allowance.
+/// The per-item pixel canvas is applied here too, fallback included, so this
+/// side and `packing.price_inputs` price the window bound and the grant in the
+/// same quantity — and under `enable_batching = false` it is the only cap.
 pub(crate) fn estimate_input_units(input: &WorkerInput, cost: &CostDimension) -> u64 {
     match cost.unit {
         // The `none` class never reaches admission; one unit per item keeps
-        // any accidental caller's arithmetic sane.
+        // an accidental caller's arithmetic sane.
         CostUnit::None | CostUnit::Item => 1,
         CostUnit::Pixel => input
             .file
@@ -374,8 +219,8 @@ pub(crate) fn estimate_input_units(input: &WorkerInput, cost: &CostDimension) ->
     }
 }
 
-/// Decoded pixel count from an image header, or `None` when the header is
-/// unreadable. Header-only: `into_dimensions` never touches pixel data.
+/// Pixel count from an image header, or `None` when it is unreadable.
+/// Header-only: `into_dimensions` never touches pixel data.
 fn image_pixels(bytes: &[u8]) -> Option<u64> {
     let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -386,8 +231,8 @@ fn image_pixels(bytes: &[u8]) -> Option<u64> {
 }
 
 /// Bytes of text in an input's JSON-like `data`, for the token heuristic. A
-/// bare string is the common shape (`extracted_text` handler); anything else
-/// is charged its serialized length.
+/// bare string is the common shape; anything else is charged its serialized
+/// length.
 fn text_bytes(input: &WorkerInput) -> usize {
     match input.data.as_ref() {
         None => 0,
@@ -396,12 +241,9 @@ fn text_bytes(input: &WorkerInput) -> usize {
     }
 }
 
-/// The window's priced content, per the model's aggregation.
-///
-/// `max-times-count` uses the **sum-of-units approximation**: true `max ×
-/// count` is undefined before the worker buckets, and a sum is the right
-/// shape for *depth* (how much material to hand the bucketer) even though it
-/// is not the batch's price.
+/// The window's priced content, per the model's aggregation. `max-times-count`
+/// uses the **sum-of-units approximation**: true `max × count` is undefined
+/// before the worker buckets, and a sum is the right shape for *depth*.
 fn request_units(inputs: &[WorkerInput], cost: &CostDimension) -> u64 {
     let per_item = inputs.iter().map(|input| estimate_input_units(input, cost));
     match cost.aggregation {
@@ -412,8 +254,7 @@ fn request_units(inputs: &[WorkerInput], cost: &CostDimension) -> u64 {
     }
 }
 
-/// Estimated wire bytes for a request: the worker's per-input estimate,
-/// summed.
+/// Estimated wire bytes for a request, summed over its inputs.
 fn request_bytes(inputs: &[WorkerInput]) -> usize {
     inputs
         .iter()
@@ -421,14 +262,10 @@ fn request_bytes(inputs: &[WorkerInput]) -> usize {
         .fold(0usize, usize::saturating_add)
 }
 
-/// How many requests of the FIFO prefix go into one window.
-///
-/// Takes requests in order while every bound still holds, and stops at the
-/// first request carrying a **different user cap** — windows never mix cap
-/// values, so a cap-less request can never ride inside a capped one (nor the
-/// reverse). The first request is always taken: an oversized lone request is
-/// split downstream (by the worker's packer on the priced path, by
-/// [`run_single`] on the unpriced one) rather than starving.
+/// How many requests of the FIFO prefix go into one window: requests in order
+/// while every bound holds, stopping at the first **different user cap**. The
+/// first is always taken — an oversized lone request is split downstream
+/// rather than starving.
 pub(crate) fn window_take_count(queued: &[WindowItem], bounds: WindowBounds) -> usize {
     let Some(first) = queued.first() else {
         return 0;
@@ -457,9 +294,8 @@ pub(crate) fn window_take_count(queued: &[WindowItem], bounds: WindowBounds) -> 
     taken
 }
 
-/// The user cap as an opinion: `0` means "no cap" on the wire (the API
-/// accepts it as auto), so it is folded into `None` here, once, before the
-/// value partitions windows or bounds anything.
+/// The user cap as an opinion: `0` means "no cap" on the wire, folded into
+/// `None` here, once, before the value partitions or bounds anything.
 fn effective_cap(max_batch: Option<u32>) -> Option<u32> {
     max_batch.filter(|cap| *cap > 0)
 }
@@ -472,18 +308,9 @@ fn unpriced_item_bound(cap: Option<u32>, fixed: u32) -> usize {
 }
 
 /// Item bound for the **priced** path: unbounded unless the user pinned a max
-/// batch size, in which case the window carries at most
-/// [`WINDOW_DEPTH_MULTIPLIER`] batches' worth of items — the same depth the unit
-/// budget is scaled by.
-///
-/// The units bound is the real admission control here, so normally there is no
-/// item bound at all. A user cap breaks that: the worker's packer honours the cap
-/// as a hard item count, so a cap of 1 turns a window sized for thousands of
-/// units into thousands of one-item GPU batches — thousands of measurements in
-/// one response (overflowing the telemetry ring, so the fit reads a hole), one
-/// driver query per item, and a window that runs for minutes before its grant is
-/// re-evaluated. Bounding items by the cap keeps a capped window the same *shape*
-/// as an uncapped one: a few batches deep.
+/// batch size, in which case at most [`WINDOW_DEPTH_MULTIPLIER`] batches'
+/// worth of items — the depth the unit budget is scaled by, so a capped window
+/// keeps the shape of an uncapped one.
 fn priced_item_bound(cap: Option<u32>) -> usize {
     match effective_cap(cap) {
         Some(cap) => usize::try_from(u64::from(cap).saturating_mul(WINDOW_DEPTH_MULTIPLIER))
@@ -493,79 +320,27 @@ fn priced_item_bound(cap: Option<u32>) -> usize {
 }
 
 // ----------------------------------------------------------------------
-// The desired in-flight figure (test protocol §8 G7)
+// The desired in-flight figure and the window settle.
+// See docs/batch-calibration-design.md, "The window settle" and "The
+// in-flight items figure".
 // ----------------------------------------------------------------------
 
-/// Slack on [`desired_in_flight_items`].
-///
-/// The figure exists so a caller keeps enough work inside in-flight requests
-/// for the dispatcher to *fill* a window; with exactly one window's worth in
-/// flight the queue is empty the instant a window is formed, so consecutive
-/// windows can never merge and the window target can never be reached. Two
-/// windows' worth is the smallest value that lets the next window be formed
-/// out of requests that were already queued while the current one runs.
-/// How long a freed replica waits for the caller's refills to land before it
-/// forms a window that is short of the budget it is allowed.
-///
-/// **The 2-cycle this removes.** `run_dispatcher` forms a window out of
-/// whatever is queued at the instant a replica frees — and a replica frees as
-/// soon as `run_batch` hands the replies to the waiting oneshots, *before* the
-/// caller's item tasks have released their permits, read the header and
-/// re-submitted. A closed-loop caller of depth `C` therefore leaves `C - W_k`
-/// queued behind window `W_k`, and the next window is exactly that:
-///
-/// ```text
-/// W_{k+1} = C - W_k
-/// ```
-///
-/// which is an involution: every value sits on a period-2 orbit and none of
-/// them is attracting. Run2's `S2-wdvit` leg entered it at 136 and ran
-/// `136 -> 64 -> 136 -> ...` for seventy windows. The consequences are
-/// structural, not incidental: the largest window the system can ever form is
-/// `C - W_min` rather than `C`, the mean is `C/2`, and half of all windows are
-/// the small phase — which is also why `high_water_samples` alternated 1, 0,
-/// 1, 0 and the ramp advanced a step every *two* windows.
-///
-/// **Why a wait is the right shape of fix.** `IN_FLIGHT_SLACK = 2` exists so
-/// that "consecutive windows can merge"; merging requires the arrivals to be
-/// *visible* when the window forms, and the dispatcher was outrunning the
-/// responses it had itself just sent. This is not a batching timer (design §6
-/// forbids one): it never applies to a model that is idle, it never applies
-/// when the queue already carries the budget, and it ends the moment arrivals
-/// stop.
-///
-/// **The numbers.** A refill is a caller task that is already parked on its
-/// unit semaphore with its item's bytes already loaded (`jobs::extraction`
-/// takes the byte budget *before* a unit permit), so its latency is a wake, a
-/// multipart build and a send — sub-millisecond on the loopback self-call,
-/// one RTT more from a gateway on another machine. [`WINDOW_SETTLE_QUIET`] of
-/// 2 ms covers that with margin while still ending promptly when the caller
-/// genuinely has nothing more to send.
+/// Quiet gap that ends a settle: how long a freed replica waits for the
+/// caller's refills before forming a window short of its unit budget.
 const WINDOW_SETTLE_QUIET: Duration = Duration::from_millis(2);
 
-/// The absolute bound on one settle, however the arrivals are spaced.
-///
-/// 20 ms against the 2-4 s windows the `S2-wdvit` leg measured is under 1 % of
-/// a window, and it is only ever paid when the dispatcher would otherwise have
-/// formed a window *below the budget it was granted* — i.e. exactly when the
-/// replica was about to run an under-sized batch anyway. It also bounds the
-/// pathological case a quiet-gap rule alone would not: a caller trickling
-/// arrivals every 1 ms forever.
+/// Absolute bound on one settle, measured from the moment the last window
+/// finished, however the arrivals are spaced.
 const WINDOW_SETTLE_MAX: Duration = Duration::from_millis(20);
 
+/// Windows' worth of items a caller is asked to keep in flight, so consecutive
+/// windows can merge.
 pub(crate) const IN_FLIGHT_SLACK: u64 = 2;
 
-/// Estimated units one item costs before any window of this model has been
-/// formed — the seed the ratio in [`desired_in_flight_items`] falls back to.
-///
-/// It mirrors [`request_units`] exactly: a `count`-aggregated model prices a
-/// window by its item count whatever its unit is, so its ratio is 1 by
-/// construction, and only the summing aggregations need the per-item unit
-/// estimate. The per-unit figures are the dispatcher's own fallbacks
-/// ([`PIXEL_FALLBACK_UNITS`], [`AUDIO_FALLBACK_SECONDS`],
-/// [`TOKEN_SEED_UNITS`]), the pixel one capped at the model's canvas exactly
-/// as the estimate it seeds is; the first dispatched window replaces all of
-/// this with a measured ratio.
+/// Estimated units one item costs before any window has been formed — the seed
+/// [`desired_in_flight_items`] falls back to. Mirrors [`request_units`]: a
+/// `count`-aggregated model prices a window by its item count whatever its
+/// unit is, so its ratio is 1 by construction.
 fn seed_units_per_item(cost: &CostDimension) -> u64 {
     match cost.aggregation {
         Some(CostAggregation::Count) | None => 1,
@@ -581,15 +356,13 @@ fn seed_units_per_item(cost: &CostDimension) -> u64 {
 }
 
 /// Pre-fit per-item token estimate: ~2 KiB of text at [`BYTES_PER_TOKEN`].
-/// Only ever used for the very first window of a `token`-priced, summing
-/// model, and only to convert a unit target into an item count — never to
-/// price anything.
+/// Converts a unit target into an item count for a `token`-priced summing
+/// model's first window; it never prices anything.
 const TOKEN_SEED_UNITS: u64 = 512;
 
-/// The shape of one dispatched window, kept so the next one can convert the
-/// ledger's unit target into an item count with a *measured* ratio instead of
-/// a seed. All three fields are the dispatcher's own estimates, which is all
-/// this needs: it sizes a caller's pipelining, never a grant.
+/// The shape of one dispatched window, kept so the next converts the ledger's
+/// unit target into an item count with a *measured* ratio. All three fields are
+/// estimates, which is all this needs: it sizes pipelining, never a grant.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct WindowShape {
     pub items: u64,
@@ -597,34 +370,16 @@ pub(crate) struct WindowShape {
     pub bytes: u64,
 }
 
-/// How many **items** the orchestrator would like the caller to keep inside
-/// in-flight predict requests for this model.
+/// How many **items** the caller should keep inside in-flight predict requests
+/// for this model: `target_units` projected through the last window's
+/// items-per-unit ratio (`seed_units_per_item` before the first window), times
+/// [`IN_FLIGHT_SLACK`], then bounded by [`MAX_WINDOW_BYTES`] converted through
+/// that window's bytes-per-item — the byte bound without the slack, since past
+/// the byte wall a window cannot merge another request anyway.
 ///
-/// Core sizes its requests "by keeping the server fed" and must not learn
-/// about VRAM (`docs/batch-calibration-design.md`, "Batch size UX", split
-/// #2), so the one number that crosses the boundary is an item count — items
-/// and PDF pages are the only unit core counts. Everything VRAM-shaped (the
-/// ramp, the anchor, the knee, the GPU's headroom) stays on this side and
-/// reaches core only through this projection of the window target.
-///
-/// - `target_units` is the dispatcher's current window target
-///   ([`Admission::window_target_units`]), i.e. [`WINDOW_DEPTH_MULTIPLIER`]
-///   admitted GPU batches' worth of units.
-/// - `last` is the most recently formed window. Its `items / units` is the
-///   recent items-per-unit ratio; a window that priced nothing (or the very
-///   first one) falls back to `seed_units_per_item`.
-/// - The result is multiplied by [`IN_FLIGHT_SLACK`] so consecutive windows
-///   can merge, then bounded by the byte wall the dispatcher already applies
-///   ([`MAX_WINDOW_BYTES`]) converted through the same window's bytes-per-item.
-///   The byte bound is applied *without* the slack on purpose: past it no
-///   amount of extra in-flight work can make a window any bigger, because a
-///   window that hits the byte wall cannot merge another request anyway.
-///
-/// Always at least 1. The caller (core) applies its own floor and ceiling —
-/// this side deliberately knows nothing about core's memory budgets.
-///
-/// `target_units` itself comes from [`in_flight_target_units`], which is where
-/// a **squeezed** grant is accounted for.
+/// An item count is the only thing that crosses the boundary to core; always
+/// at least 1, and core applies its own floor and ceiling. `target_units`
+/// comes from [`in_flight_target_units`].
 pub(crate) fn desired_in_flight_items(
     target_units: u64,
     last: WindowShape,
@@ -651,34 +406,10 @@ pub(crate) fn desired_in_flight_items(
 }
 
 /// The unit target the in-flight figure is published from: the **granted**
-/// budget's own window depth when the ledger squeezed this window, and the
-/// anchor-derived window target otherwise.
-///
-/// `target` is what the dispatcher *asked* for: `admitted_units` times
-/// [`WINDOW_DEPTH_MULTIPLIER`], derived from the ramp anchor and the knee.
-/// When the GPU cannot afford that, the ledger issues a smaller
-/// `unit_budget` and flags the grant `squeezed`; publishing the target anyway
-/// tells the caller to keep feeding us windows sized for memory the GPU does
-/// not have. The window then runs for as long as it takes to chew through them
-/// at the squeezed batch size — 1 936 requests over 49 s on one 11-unit grant
-/// in the Phase 3 S4a run — with no grant, no high-water sample and no
-/// re-pricing in between, which is the opposite of what a tight GPU needs.
-///
-/// The result is never below `WINDOW_DEPTH_MULTIPLIER` batches' worth of the
-/// budget the worker was actually given, and [`IN_FLIGHT_SLACK`] doubles it
-/// again downstream, so the caller is always asked to keep several batches in
-/// flight: this shortens the blind window, it does not starve the worker. And
-/// it is bounded above by `target`, so it can only ever *lower* the figure —
-/// an unsqueezed grant restores it on the very next window, because the
-/// dispatcher always applies this to the anchor-derived target and the grant
-/// in hand, never to a bound that already carries an earlier window's clamp.
-///
-/// Two callers, deliberately: the figure published to core, and the unit bound
-/// on the next window the dispatcher forms. They are not redundant. Core
-/// clamps what it is told to at least `MIN_IN_FLIGHT_UNITS` (64 items), so
-/// below about 11 granted units at one unit per item the header stops moving
-/// core's pipelining at all and the window bound — which has no floor — is the
-/// only thing keeping a hard-squeezed window from running blind.
+/// budget's window depth when the ledger squeezed this window, the
+/// anchor-derived `target` otherwise, so it can only lower the figure. Two
+/// callers, and not redundant: core clamps what it is told to its own floor,
+/// the next window's unit bound has none.
 pub(crate) fn in_flight_target_units(target: u64, grant: Option<&Grant>) -> u64 {
     match grant {
         Some(grant) if grant.squeezed => grant
@@ -691,8 +422,7 @@ pub(crate) fn in_flight_target_units(target: u64, grant: Option<&Grant>) -> u64 
 
 /// Why the dispatcher loop ended.
 enum End {
-    /// Channel closed or an explicit [`DispatchMsg::Shutdown`]: unload the
-    /// workers gracefully.
+    /// Channel closed or [`DispatchMsg::Shutdown`]: unload gracefully.
     Graceful,
     /// A worker died fatally (message kept for failing queued requests).
     Fatal(String),
@@ -701,9 +431,8 @@ enum End {
 /// Outcome of dispatching one window.
 enum BatchOutcome {
     Continue,
-    /// A [`DispatchMsg::Trim`] finished (successfully or not) — no window ran,
-    /// so the replica returns to the free pool without touching the window
-    /// counters.
+    /// A [`DispatchMsg::Trim`] finished: no window ran, so the replica goes
+    /// back to the pool without touching the window counters.
     Trimmed,
     Fatal(String),
 }
@@ -712,10 +441,9 @@ enum BatchOutcome {
 struct WindowPlan {
     grant: Option<GrantToken>,
     fit: Option<FitSnapshot>,
-    /// Item bound for the unpriced path, where the dispatcher itself bounds
-    /// every frame it sends (there is no worker-side packer to enforce the user
-    /// cap). `None` on the priced path, where the worker packs inside the grant
-    /// — the payload-byte bound in [`frame_chunks`] applies either way.
+    /// Item bound for the unpriced path, where the dispatcher bounds every
+    /// frame itself; `None` on the priced path. [`frame_chunks`]'s
+    /// payload-byte bound applies either way.
     item_bound: Option<usize>,
 }
 
@@ -728,16 +456,10 @@ enum SettleOutcome {
 }
 
 /// Wait, briefly and conditionally, for the arrivals the window that just
-/// finished will provoke.
-///
-/// Ends on the first of: the queue reaching `bounds.units` (there is nothing
-/// left to wait for), [`WINDOW_SETTLE_QUIET`] with no arrival (the caller has
-/// nothing more to send), or `deadline` — which the caller sets to
-/// [`WINDOW_SETTLE_MAX`] past the moment the last window finished, so the wait
-/// is bounded from the *reply* rather than from each entry here, and a model
-/// nothing has answered recently is not waited on at all. Every message kind
-/// is handled exactly as the main loop's drain handles it, so a `Trim`, a
-/// `ReapIdle` or a shutdown arriving inside the settle is not delayed by it.
+/// finished will provoke. Ends on the first of: the queue reaching
+/// `bounds.units`, [`WINDOW_SETTLE_QUIET`] with no arrival, or `deadline`
+/// ([`WINDOW_SETTLE_MAX`] past the last window's completion). Every message
+/// kind is handled as the main loop's drain handles it.
 async fn settle_refills(
     ctx: &DispatcherContext,
     queue: &mut VecDeque<Queued>,
@@ -787,16 +509,11 @@ async fn settle_refills(
     }
 }
 
-/// Per-model dispatcher task body. Owns the WorkerSet (all replicas of this
-/// model entry); exits after graceful shutdown or fatal worker death.
-///
-/// Structure: `free` holds idle replicas, `in_flight` is a JoinSet of
-/// running `(replica, window)` predict tasks; each task returns its replica
-/// so it re-enters the pool. The loop top forms as many windows as there
-/// are free replicas and queued requests, then waits for either a new
-/// message or a completed window. All queue access happens here, so pickup
-/// order is FIFO by construction — a later request can never overtake an
-/// earlier one into a window.
+/// Per-model dispatcher task body. Owns every replica of this model entry and
+/// exits after graceful shutdown or fatal worker death. The loop top forms as
+/// many windows as there are free replicas and queued requests, then waits for
+/// a message or a completed window; all queue access happens here, so pickup
+/// order is FIFO by construction.
 pub(crate) async fn run_dispatcher(
     ctx: DispatcherContext,
     replicas: Vec<Replica>,
@@ -805,49 +522,33 @@ pub(crate) async fn run_dispatcher(
     let mut queue: VecDeque<Queued> = VecDeque::new();
     let mut free: Vec<Replica> = replicas;
     let mut in_flight: JoinSet<(Replica, BatchOutcome)> = JoinSet::new();
-    // Shape of the most recently formed window, for the units->items
-    // conversion behind `desired_in_flight_items`. Owned by this loop, which
-    // is the only place windows are formed.
+    // Last window's shape, for `desired_in_flight_items`' units->items ratio.
     let mut last_shape = WindowShape::default();
-    // The grant the last window was formed under, kept for the same reason:
-    // when it was squeezed it, not the anchor-derived target, is what the next
-    // window's batches will be sized by.
+    // The grant the last window was formed under: when it was squeezed, it and
+    // not the anchor-derived target sizes the next window's batches.
     let mut last_grant: Option<Grant> = None;
     let seed_ratio = seed_units_per_item(&ctx.cost);
-    // When the refills of the window that just finished stop being expected.
-    // Set on every completed window and consulted by the settle below; a model
-    // that has been quiet for longer than that has `None` (or a deadline in
-    // the past), so a request arriving at an idle model is dispatched with no
-    // added latency whatsoever.
+    // When the last window's refills stop being expected. `None` or past on a
+    // quiet model, so an idle model adds no latency to the next request.
     let mut refill_deadline: Option<tokio::time::Instant> = None;
 
     let end = 'main: loop {
-        // Dispatch: while any replica is free and requests are queued, that
-        // replica drains a window. Bounds and grant are computed per window
-        // and per replica — different replicas can sit on different GPUs
-        // with different headroom.
+        // Bounds and grant are per window and per replica: replicas can sit
+        // on different GPUs with different headroom.
         while !queue.is_empty() && !free.is_empty() {
             let replica = free.pop().expect("checked non-empty");
-            // Read before the settle below, which can only append to the
-            // queue: windows never mix cap values, and the head is what fixes
-            // the cap for this one.
+            // Read before the settle, which can only append: the head fixes
+            // this window's cap.
             let cap = queue.front().expect("checked non-empty").shape.cap;
-            // The anchor-derived target, read once so window formation and the
-            // published figure below cannot see two different values of it (it
-            // is a ledger read, and a neighbour's window can move it).
+            // Read once: a neighbour's window can move it.
             let window_target = replica
                 .admission
                 .as_ref()
                 .map(Admission::window_target_units);
             let bounds = match &replica.admission {
                 Some(_) => WindowBounds {
-                    // The published figure shortens the *caller's* pipelining,
-                    // which cannot shorten a window that is already formed —
-                    // and nothing obliges a caller to honour it at all. So the
-                    // same clamp applies here: after a squeezed grant the next
-                    // window is formed against the budget the GPU could
-                    // afford, keeping it the intended few batches deep instead
-                    // of hundreds, and each of those windows re-prices.
+                    // The same squeeze clamp as the published figure, which
+                    // cannot shorten a window already formed.
                     units: in_flight_target_units(
                         window_target.expect("the priced arm has an admission"),
                         last_grant.as_ref(),
@@ -861,19 +562,9 @@ pub(crate) async fn run_dispatcher(
                     bytes: MAX_WINDOW_BYTES,
                 },
             };
-            // Let the refills the *previous* window provoked land before this
-            // one is formed. See [`WINDOW_SETTLE_QUIET`]: without it a
-            // closed-loop caller of depth C yields windows of mean C/2
-            // forever. Three guards, in the order they matter:
-            //
-            // - `refill_expected` is set only when a window has just
-            //   completed, so a model that has been idle dispatches its next
-            //   request with no added latency at all;
-            // - the priced path only, because `bounds.units` is `u64::MAX` on
-            //   the unpriced one and "short of the budget" has no meaning
-            //   there;
-            // - and only while the queue is genuinely short of the budget —
-            //   a queue that already fills the window is dispatched at once.
+            // Let the refills the *previous* window provoked land first: only
+            // after a window completed, only on the priced path (`bounds.units`
+            // is `u64::MAX` otherwise), only while the queue is short.
             if let Some(deadline) = refill_deadline.take()
                 && replica.admission.is_some()
             {
@@ -890,8 +581,6 @@ pub(crate) async fn run_dispatcher(
                 {
                     SettleOutcome::Continue => {}
                     SettleOutcome::End(end) => {
-                        // The replica is still ours; hand it back so the
-                        // teardown below shuts it down with the rest.
                         free.push(replica);
                         break 'main end;
                     }
@@ -912,11 +601,9 @@ pub(crate) async fn run_dispatcher(
                 .iter()
                 .map(|queued| queued.shape.bytes)
                 .fold(0usize, usize::saturating_add);
-            // The window just formed is the freshest sample of this model's
-            // items-per-unit and bytes-per-item, so it — not the one before
-            // it — converts the target below. A window that priced nothing
-            // (every request estimated at zero units) says nothing about the
-            // ratio and leaves the last usable sample standing.
+            // The freshest items-per-unit and bytes-per-item sample, so it
+            // converts the target below; one that priced nothing says nothing
+            // and leaves the last sample standing.
             let shape = WindowShape {
                 items: window_items as u64,
                 units: window_units,
@@ -932,11 +619,9 @@ pub(crate) async fn run_dispatcher(
                     let grant =
                         admission.request_grant(window_units, cap, window.len(), queue.len());
                     if grant.is_none() {
-                        // The ledger no longer knows this replica (it was
-                        // forgotten out from under us). The window was sized
+                        // The ledger forgot this replica. The window was sized
                         // for a grant, so it must not go out ungranted *and*
-                        // unbounded — fall back to the unpriced item bound,
-                        // which the dispatcher enforces itself.
+                        // unbounded: fall back to the unpriced item bound.
                         tracing::debug!(
                             model = %ctx.inference_id,
                             "the ledger refused a grant; dispatching this window \
@@ -958,32 +643,24 @@ pub(crate) async fn run_dispatcher(
                     item_bound: Some(bounds.items),
                 },
             };
-            // Computed *after* the grant, so a squeezed one is what the caller
-            // is told about: the figure follows the memory the GPU actually
-            // had, not the target the ledger was asked for.
+            // After the grant, so the figure follows the memory the GPU
+            // actually had rather than the target the ledger was asked for.
             last_grant = plan.grant.as_ref().map(|token| *token.grant());
             let desired = match window_target {
-                // Priced: project the ledger's unit target into items. The
-                // clamp is applied to the *anchor-derived* target and this
-                // window's own grant, not to `bounds.units` — that one already
-                // carries the previous window's clamp, and composing the two
-                // would keep publishing a squeezed figure for a window whose
-                // grant came back unsqueezed (and, under an alternating
-                // squeeze, would never publish the target again).
+                // Priced: project the unit target into items. The clamp goes
+                // on the *anchor-derived* target and this window's own grant,
+                // never on `bounds.units` — that already carries the previous
+                // window's clamp, and composing the two would never unsqueeze.
                 Some(target) => desired_in_flight_items(
                     in_flight_target_units(target, last_grant.as_ref()),
                     last_shape,
                     seed_ratio,
                 ),
-                // Unpriced: there is no unit target and no worker-side
-                // packer, so the frame the worker gets *is* the GPU batch and
-                // its size is the fixed `unpriced_window_items`. The same
-                // slack applies, and the user's own cap is deliberately not
-                // folded in: a cap bounds GPU batches, never how much work
-                // the caller keeps in flight.
+                // Unpriced: the frame *is* the GPU batch, of the fixed
+                // `unpriced_window_items`. The user's cap is deliberately left
+                // out — it bounds batches, not what the caller keeps in flight.
                 None => u64::from(ctx.unpriced_window_items.max(1)).saturating_mul(IN_FLIGHT_SLACK),
             };
-            // Health counters (Relaxed stores; see ModelStats docs).
             ctx.stats.queue_len.store(queue.len(), Relaxed);
             ctx.stats.replicas_free.store(free.len(), Relaxed);
             ctx.stats.last_grant_units.store(
@@ -998,10 +675,9 @@ pub(crate) async fn run_dispatcher(
                 .store(u32::try_from(window_items).unwrap_or(u32::MAX), Relaxed);
             ctx.stats.desired_in_flight_items.store(desired, Relaxed);
             ctx.stats.total_batches.fetch_add(1, Relaxed);
-            // Queue-bound: the window carries less than the ledger would have
-            // admitted, so what limited it was the work in hand. After the
-            // settle above this is a real signal rather than an artefact of
-            // looking too early.
+            // Queue-bound: less than the ledger would have admitted, so the
+            // work in hand is what limited it (a real signal only after the
+            // settle above).
             if window_target.is_some() && window_units < bounds.units {
                 ctx.stats.queue_bound_windows.fetch_add(1, Relaxed);
             }
@@ -1010,17 +686,14 @@ pub(crate) async fn run_dispatcher(
             in_flight.spawn(async move { run_batch(&inference_id, replica, window, plan).await });
         }
         // Demand signal for the ledger's contention split: an idle model must
-        // stop counting as hungry, or its neighbours keep splitting headroom
-        // with a queue that is empty.
+        // stop counting as hungry to its neighbours.
         for replica in &free {
             if let Some(admission) = &replica.admission {
                 admission.note_demand(queue.len());
             }
         }
 
-        // Wait for work or a freed replica. Block only when nothing is
-        // dispatchable; a queued backlog with a free replica never sits idle
-        // (the while loop above ran until one side was exhausted).
+        // Wait for work or a freed replica.
         tokio::select! {
             msg = rx.recv() => match msg {
                 None | Some(DispatchMsg::Shutdown) => break End::Graceful,
@@ -1044,22 +717,19 @@ pub(crate) async fn run_dispatcher(
                         free.push(replica);
                         ctx.stats.in_flight_windows.fetch_sub(1, Relaxed);
                         ctx.stats.replicas_free.store(free.len(), Relaxed);
-                        // Replies have just gone out, so refills are coming —
-                        // but only for as long as it takes them to arrive.
+                        // Replies have just gone out, so refills are coming.
                         refill_deadline = Some(tokio::time::Instant::now() + WINDOW_SETTLE_MAX);
                     }
                     Ok((replica, BatchOutcome::Trimmed)) => {
                         // No window ran, so `in_flight_windows` was never
-                        // incremented for this task and must not be decremented.
+                        // incremented and must not be decremented.
                         free.push(replica);
                         ctx.stats.replicas_free.store(free.len(), Relaxed);
                     }
                     Ok((replica, BatchOutcome::Fatal(message))) => {
-                        // The fatal path in Worker already killed and reaped
-                        // the child; kill() is idempotent and completes the
-                        // bookkeeping for this replica before the whole-set
-                        // teardown below. Dropping the Replica's admission
-                        // handle un-charges it in the ledger.
+                        // Worker's fatal path already reaped the child and
+                        // kill() is idempotent; dropping the Replica's
+                        // admission handle un-charges it in the ledger.
                         replica.worker.kill().await;
                         break End::Fatal(message);
                     }
@@ -1070,9 +740,7 @@ pub(crate) async fn run_dispatcher(
                 }
             }
         }
-        // Drain everything already queued without blocking — batches form
-        // naturally while the replicas were busy, no batching timer
-        // (design §6).
+        // Drain what is already queued without blocking; no batching timer.
         loop {
             match rx.try_recv() {
                 Ok(DispatchMsg::Predict(request)) => {
@@ -1104,19 +772,10 @@ pub(crate) async fn run_dispatcher(
                     fail_requests(std::iter::once(request), &reason);
                 }
             }
-            // In-flight windows finish first (explicit unload lets running
-            // batches complete — the Phase 1 semantic, per replica). A
-            // replica going fatal *during* this drain is killed here; the
-            // manager entry is already gone, so no death cleanup is needed
-            // (and the generation guard would reject it anyway).
-            //
-            // The drain is bounded by `unload_grace`: with no deadline on
-            // predict, a worker wedged in a GPU kernel would hang the drain
-            // — and manager shutdown — forever. Past the grace the stuck
-            // windows are aborted like the fatal path: their reply oneshots
-            // drop (callers observe an error), their grants settle as
-            // aborted via GrantToken's Drop, and the dropped Workers are
-            // reaped by kill_on_drop + the Job Object.
+            // In-flight windows finish first: an explicit unload lets running
+            // batches complete. Bounded by `unload_grace`, since a worker
+            // wedged in a GPU kernel would otherwise hang shutdown forever;
+            // past it the stuck windows are aborted like a fatal.
             let drain = async {
                 while let Some(finished) = in_flight.join_next().await {
                     match finished {
@@ -1146,11 +805,10 @@ pub(crate) async fn run_dispatcher(
                 );
                 in_flight.shutdown().await;
             }
-            // Then every replica gets the graceful unload -> terminate ->
-            // kill ladder, concurrently (design §8: the LRU/TTL treats the
-            // set as one unit, so the set shuts down as one unit). Moving
-            // `worker` out of each Replica drops its admission handle, which
-            // is how the ledger stops charging a model that has unloaded.
+            // Then the graceful unload -> terminate -> kill ladder on every
+            // replica concurrently: the LRU/TTL treats the set as one unit.
+            // Moving `worker` out drops the admission handle, which is how the
+            // ledger stops charging an unloaded model.
             let results = join_all(free.into_iter().map(|replica| replica.worker.shutdown())).await;
             for result in results {
                 if let Err(err) = result {
@@ -1162,12 +820,9 @@ pub(crate) async fn run_dispatcher(
             }
         }
         End::Fatal(message) => {
-            // Phase 3 death policy: any replica fatal -> the whole model
-            // dies (degradation to a smaller set is future work).
-            // Zero the stats first: a health probe can land while the
-            // teardown below runs (the manager entry is removed only in
-            // handle_worker_death), and the counters must not report
-            // requests/windows that are already being failed.
+            // Any replica fatal -> the whole model dies. Zero the stats first:
+            // a health probe can land while the teardown runs and must not
+            // report requests already being failed.
             ctx.stats.queue_len.store(0, Relaxed);
             ctx.stats.in_flight_windows.store(0, Relaxed);
             ctx.stats.replicas_free.store(0, Relaxed);
@@ -1178,13 +833,10 @@ pub(crate) async fn run_dispatcher(
                     fail_requests(std::iter::once(request), &message);
                 }
             }
-            // Abort windows still in flight on other replicas: their reply
-            // oneshots drop (callers observe an error), their grants settle
-            // as aborted through GrantToken's Drop, and the dropped Workers
-            // are reaped by kill_on_drop + the Job Object — the ladder-less
-            // kill for busy replicas.
+            // Abort windows in flight on other replicas: reply oneshots drop,
+            // grants settle as aborted via GrantToken's Drop, and the dropped
+            // Workers are reaped by kill_on_drop plus the Job Object.
             in_flight.shutdown().await;
-            // Ladder-less kill for the idle replicas, concurrently.
             join_all(free.into_iter().map(|replica| replica.worker.kill())).await;
             if let Some(manager) = ctx.manager.upgrade() {
                 manager.handle_worker_death(&ctx.inference_id, ctx.generation);
@@ -1194,24 +846,10 @@ pub(crate) async fn run_dispatcher(
 }
 
 /// Act on a [`DispatchMsg::ReapIdle`]: `try_wait` every replica in the free
-/// pool and answer with a fatal message if one of them is already gone.
-///
-/// Returning the message rather than tearing down here keeps a death found
-/// while idle on **exactly** the request-path death route: the caller breaks
-/// with [`End::Fatal`], so the queue is failed, sibling replicas are killed,
-/// and `handle_worker_death` drops the model from every cache — one code
-/// path, one policy.
-///
-/// What it deliberately does *not* do is settle a window. On unified-memory devices
-/// a death mid-window is a synthetic negative sample about batch size
-/// (docs/unified-memory-admission.md, DP-2); an idle replica has no window
-/// and no grant in flight, so there is nothing to settle and nothing this
-/// death could honestly say about a batch size. It stays a liveness fact.
-/// (On discrete GPUs a death is never a memory negative at all.)
-///
-/// Only one death is reported per tick: the first one already condemns the
-/// whole set under the Phase 3 policy, and the survivors are killed by the
-/// teardown moments later.
+/// pool and answer with a fatal message if one is already gone. Returning it
+/// rather than tearing down here keeps an idle death on the request-path death
+/// route. It settles no window — an idle replica holds no grant — and reports
+/// one death per tick, which already condemns the set.
 async fn reap_idle_replicas(ctx: &DispatcherContext, free: &mut [Replica]) -> Option<String> {
     for replica in free.iter_mut() {
         let Some(death) = replica.worker.reap_if_exited().await else {
@@ -1231,24 +869,11 @@ async fn reap_idle_replicas(ctx: &DispatcherContext, free: &mut [Replica]) -> Op
     None
 }
 
-/// Act on a [`DispatchMsg::Trim`], or decline it.
-///
-/// Three ways to decline, all of them silent and all of them correct:
-///
-/// - **the replica is not free** — it is running a window, so it is not the
-///   idle resident the ledger meant, its own reactive-shrink path covers it,
-///   and the one-request-at-a-time protocol has no room for a trim mid-window
-///   anyway;
-/// - **this model has work queued** — the replica is about to be busy for the
-///   same reasons, and spending its next ten seconds on hygiene would delay
-///   real work. (At the select point the queue is empty by construction — the
-///   dispatch loop above runs until the queue or the free pool is exhausted —
-///   so this only bites on the post-select drain);
-/// - **no such replica here** — the ledger id belongs to a replica this
-///   dispatcher no longer owns (a respawn, a model mid-teardown).
-///
-/// The ledger re-flags a still-squeezing resident after its debounce, so a
-/// declined trim costs a delay, never the outcome.
+/// Act on a [`DispatchMsg::Trim`], or decline it silently: the replica is busy
+/// (not the idle resident the ledger meant, and the one-request-at-a-time
+/// protocol has no room for a mid-window trim), this model has work queued, or
+/// no such replica is here any more. A declined trim costs a delay, never the
+/// outcome — the ledger re-flags a still-squeezing resident after its debounce.
 fn try_trim(
     ctx: &DispatcherContext,
     free: &mut Vec<Replica>,
@@ -1274,20 +899,14 @@ fn try_trim(
 }
 
 /// Ask one idle replica to release its allocator pool and fold the fresh
-/// memory sample back into the ledger.
-///
-/// A per-request `error` — an older worker that does not know the message
-/// type, or an impl whose torch cannot answer — is not a failure of anything:
-/// the trim was hygiene, the worker is alive, and the replica goes back in the
-/// pool. A *fatal* error is different and is treated exactly as a fatal
-/// predict: the response stream is desynchronized or the process is gone, and
-/// there is nothing left to reuse.
+/// memory sample back into the ledger. A per-request `error` (an older worker,
+/// an impl whose torch cannot answer) is hygiene declined, not a failure; a
+/// *fatal* error is treated exactly as a fatal predict.
 async fn run_trim(inference_id: &str, mut replica: Replica) -> (Replica, BatchOutcome) {
     match replica.worker.trim().await {
         Ok(()) => {
-            // The sample the reply carried is in the shared telemetry; this is
-            // what makes the ledger stop charging the released slack to a
-            // resident that will not run a window for a while.
+            // The reply's sample is already in the shared telemetry; this
+            // stops the ledger charging the released slack to the resident.
             if let Some(admission) = &replica.admission {
                 admission.note_trimmed();
             }
@@ -1315,14 +934,10 @@ fn enqueue(request: DispatchRequest, cost: &CostDimension) -> Queued {
     Queued { request, shape }
 }
 
-/// Dispatch one window to one replica. Replies are delivered here on every
-/// path; `Fatal` is returned only after the failing request got its error.
-/// Owns the replica for the duration (it runs as a JoinSet task, potentially
-/// concurrent with windows on other replicas) and returns it so the
-/// dispatcher can put it back in the free pool.
-///
-/// This is also the one place the window's grant is settled, so every exit —
-/// success, per-request fallback, fatal — accounts for exactly one window.
+/// Dispatch one window to one replica, then return the replica to the free
+/// pool. Replies go out here on every path and `Fatal` only after the failing
+/// request got its error. Also the one place the window's grant is settled, so
+/// every exit accounts for exactly one window.
 async fn run_batch(
     inference_id: &str,
     mut replica: Replica,
@@ -1363,12 +978,9 @@ async fn run_batch_inner(
         return run_single(inference_id, worker, request, grant, fit, item_bound).await;
     }
 
-    // Merged window: move all inputs into one contiguous run, remembering
-    // per-request counts so outputs (or, on fallback, the inputs themselves)
-    // can be split back in FIFO order. The run goes out in one frame unless the
-    // bounds say otherwise — [`predict_chunked`] applies the unpriced path's
-    // item bound and the payload-byte bound here exactly as it does to a lone
-    // request, which the merged path used to skip entirely.
+    // Merged window: all inputs into one run, with per-request counts so
+    // outputs (or, on fallback, the inputs) split back in FIFO order. One
+    // frame unless [`predict_chunked`]'s bounds say otherwise.
     let counts: Vec<usize> = window
         .iter()
         .map(|queued| queued.request.inputs.len())
@@ -1382,7 +994,6 @@ async fn run_batch_inner(
 
     match predict_chunked(inference_id, worker, &combined, grant, fit, item_bound).await {
         Ok(outputs) => {
-            // Split outputs back per request, preserving request order.
             for (request, slice) in window
                 .into_iter()
                 .zip(split_window_outputs(outputs, &counts))
@@ -1395,10 +1006,8 @@ async fn run_batch_inner(
             )
         }
         Err(err) if err.downcast_ref::<WorkerError>().is_some() => {
-            // Port of process_model.py `_batch_predict`: the merged batch
-            // failed but the worker is alive — retry each request
-            // individually so one poisoned input only fails its own
-            // request.
+            // The merged batch failed but the worker is alive: retry each
+            // request individually so one poisoned input only fails its own.
             let mut oom = error_reports_oom(&err);
             tracing::warn!(
                 model = %inference_id,
@@ -1406,11 +1015,9 @@ async fn run_batch_inner(
                 "merged batch of {} requests failed, falling back to per-request prediction: {err:#}",
                 window.len()
             );
-            // The grant is still held for this window, so the individual
-            // retries dispatch inside the same reservation — but if the merged
-            // batch died of an out-of-memory condition, re-offering the same
-            // unit budget invites the worker's packer to rebuild the batch size
-            // that just failed.
+            // The retries dispatch inside this window's reservation, but after
+            // an out-of-memory the same unit budget would let the packer
+            // rebuild the batch size that just failed.
             let retry_grant = if oom.is_some() {
                 halved_for_retry(grant)
             } else {
@@ -1428,9 +1035,8 @@ async fn run_batch_inner(
                     }
                     Err(individual_err) => {
                         let fatal = individual_err.downcast_ref::<WorkerError>().is_none();
-                        // Read while the error is fresh: what settles the
-                        // window is whether the *worker* went away, not
-                        // whether this call failed.
+                        // Read while the error is fresh: the window settles on
+                        // whether the *worker* went away, not on this failure.
                         let settle = fatal_settlement(worker);
                         oom = oom.or(error_reports_oom(&individual_err));
                         let message = format!("{individual_err:#}");
@@ -1445,8 +1051,8 @@ async fn run_batch_inner(
             (BatchOutcome::Continue, WindowOutcome::Responded { oom })
         }
         Err(err) => {
-            // Fatal: the model is going down either way. Whether the *worker*
-            // died is a separate question — see [`fatal_settlement`].
+            // Fatal: the model is going down either way; whether the *worker*
+            // died is a separate question ([`fatal_settlement`]).
             let settle = fatal_settlement(worker);
             let message = format!("{err:#}");
             fail_requests(window.into_iter(), &message);
@@ -1455,24 +1061,12 @@ async fn run_batch_inner(
     }
 }
 
-/// Whether a dispatch error reports an out-of-memory condition, and which
-/// tier said so — the project's own `INFERENCE_OOM_*` marker or the host's
-/// reading of the prose (run2 defect C2). The verdict is unchanged; the tier
-/// travels on [`WindowOutcome::Responded`] so the ledger's negative can name
-/// its classifier.
-///
-/// Deliberately narrower than [`message_oom_tier`] over the error's whole
-/// `Display`. A [`WorkerError`] renders its **stderr tail** as well as its
-/// message and traceback, and that tail is a ring of whatever the worker
-/// logged over its recent life — including an out-of-memory it caught, halved
-/// and recovered from several requests ago. Classifying it would let a stale
-/// line flip an unrelated later failure into a negative sample, deflating a
-/// model and halving its grants over a batch that never failed. Only the two
-/// fields that describe *this* failure are read.
-///
-/// Anything that is not a `WorkerError` carries no such envelope — it is a
-/// supervision error the orchestrator itself formatted — so its full
-/// rendering is the message.
+/// Whether a dispatch error reports an out-of-memory condition and which tier
+/// said so; the tier travels on [`WindowOutcome::Responded`] so the ledger's
+/// negative can name its classifier. Deliberately narrower than
+/// [`message_oom_tier`] over the whole `Display`: a [`WorkerError`] also
+/// renders its **stderr tail**, a ring of whatever the worker logged recently,
+/// so only the message and traceback — describing *this* failure — are read.
 fn error_reports_oom(err: &anyhow::Error) -> Option<ErrorFrameOom> {
     match err.downcast_ref::<WorkerError>() {
         Some(worker) => {
@@ -1482,20 +1076,13 @@ fn error_reports_oom(err: &anyhow::Error) -> Option<ErrorFrameOom> {
     }
 }
 
-/// How a fatal dispatch failure settles with the ledger.
-///
-/// "Not a [`WorkerError`]" means the model is going down; it does **not**
-/// mean the replica died. The stream can have been torn down for a desync
-/// the dispatcher itself caused by dropping a request future — the path a
-/// user cancel produces — and the process was alive and answering.
-/// [`WindowOutcome::WorkerDied`] is read as evidence about memory
-/// on unified-memory devices (DP-2's synthetic negative sample), so it is reserved
-/// for a worker that actually stopped answering; everything else is an
-/// abort, which teaches the ledger nothing.
-///
-/// The death is **claimed**, not read ([`Worker::take_death`]): one death may
-/// settle at most one window as one, however many windows a future dispatcher
-/// change might route to an already-dead replica.
+/// How a fatal dispatch failure settles with the ledger. "Not a
+/// [`WorkerError`]" means the model is going down, not that the replica died:
+/// the stream can have been torn down by the dispatcher dropping a request
+/// future (the user-cancel path). [`WindowOutcome::WorkerDied`] is read as
+/// memory evidence on unified-memory devices, so it is reserved for a worker
+/// that really stopped answering, and is **claimed** ([`Worker::take_death`])
+/// so it settles at most one window.
 fn fatal_settlement(worker: &mut Worker) -> WindowOutcome {
     if worker.take_death() {
         WindowOutcome::WorkerDied
@@ -1504,21 +1091,11 @@ fn fatal_settlement(worker: &mut Worker) -> WindowOutcome {
     }
 }
 
-/// Dispatch a lone request.
-///
-/// On the **unpriced** path (`item_bound` set) a request larger than the
-/// bound is split into sequential frames and its outputs reassembled in order,
-/// so the worker never sees an oversized batch and the user cap still holds
-/// without a worker-side packer. On the priced path the whole request normally
-/// goes in one frame and the worker's harness does the splitting inside the
-/// grant — but it is still split on **payload bytes**, because window formation
-/// always takes the first request whether or not it fits and an oversized frame
-/// is refused by the transport (see [`frame_chunks`]).
-///
-/// A [`WorkerError`] on any sub-batch fails the whole request (no fallback:
-/// there is nothing smaller than one request's sub-batch to fall back to,
-/// matching Python where an oversized message was processed individually and
-/// its error was final).
+/// Dispatch a lone request, split into frames by [`frame_chunks`] where the
+/// bounds require it: by items on the unpriced path (no worker-side packer to
+/// hold the cap) and by payload bytes on either, since window formation always
+/// takes the first request whether or not it fits. A [`WorkerError`] on any
+/// sub-batch fails the whole request; there is nothing smaller to retry.
 async fn run_single(
     inference_id: &str,
     worker: &mut Worker,
@@ -1559,23 +1136,12 @@ async fn run_single(
     }
 }
 
-/// Where one frame's worth of inputs ends inside a larger slice.
-///
-/// Two bounds, both of them the dispatcher's own responsibility on every path:
-///
-/// - **items**, when an `item_bound` is set. That is the unpriced path's batch
-///   size and the user cap it enforces itself, and it applies to *every* frame
-///   the dispatcher sends — including the merged window, which used to ignore it
-///   entirely and hand an unbounded batch to a worker with no packer.
-/// - **payload bytes**, always (`byte_bound`, [`MAX_WINDOW_BYTES`] in
-///   production). A window is byte-bounded at formation, but the at-least-one
-///   rule means a *single* request can exceed the bound on its own, and
-///   `encode_frame` refuses a frame over [`MAX_FRAME_BYTES`] outright — a
-///   per-request [`WorkerError`], so the model survives but the request fails.
-///   Chunking here turns "one huge request fails" into "one huge request is
-///   sent in pieces". A single input larger than the bound still goes alone and
-///   may still fail: that is the frame limit doing its job, and there is nothing
-///   smaller to split into.
+/// Where one frame's worth of inputs ends inside a larger slice: at
+/// `item_bound` when one is set (the unpriced path's batch size and the user
+/// cap it holds itself, applied to every frame including a merged window's),
+/// and always at `byte_bound`, because window formation's at-least-one rule
+/// lets a single request exceed it and `encode_frame` refuses a frame over
+/// [`MAX_FRAME_BYTES`] outright.
 fn frame_chunks(
     inputs: &[WorkerInput],
     item_bound: Option<usize>,
@@ -1604,11 +1170,9 @@ fn frame_chunks(
 }
 
 /// Send `inputs` to the worker, split into as many frames as the bounds
-/// require, and return the outputs concatenated in input order.
-///
-/// The `fit` snapshot rides only the first frame: it is pricing information the
-/// worker keeps, not per-frame state, and the ledger already tracks "sent" per
-/// worker rather than per frame.
+/// require, and return the outputs concatenated in input order. The `fit`
+/// snapshot rides only the first frame: it is pricing information the worker
+/// keeps, not per-frame state.
 async fn predict_chunked(
     inference_id: &str,
     worker: &mut Worker,
@@ -1639,14 +1203,10 @@ async fn predict_chunked(
     Ok(outputs)
 }
 
-/// A grant for the per-request retries after a merged window failed with an
-/// out-of-memory condition.
-///
-/// The merged batch is gone, but the same grant would let the worker's packer
-/// rebuild batches of the same size that just failed. Halving the unit budget is
-/// the same move the impl's own OOM loop makes, one level up; the MB reservation
-/// is untouched because it is still held either way (this window's reservation
-/// covers the retries).
+/// The grant for the per-request retries after a merged window failed with an
+/// out-of-memory condition: the unit budget halved, so the packer cannot
+/// rebuild the batch size that just failed. The MB reservation is untouched —
+/// this window's reservation covers the retries either way.
 fn halved_for_retry(grant: Option<&Grant>) -> Option<Grant> {
     grant.map(|grant| Grant {
         unit_budget: (grant.unit_budget / 2).max(1),
@@ -1654,17 +1214,11 @@ fn halved_for_retry(grant: Option<&Grant>) -> Option<Grant> {
     })
 }
 
-/// Cut a merged window's outputs back into one slice per request, in the
-/// order the requests were merged.
-///
-/// Purely positional, and that is the point: the worker returns exactly one
-/// slot per input whether that slot is a payload or a typed per-item error
-/// (protocol doc), so the same count-based cut keeps every error slot with
-/// the request whose input produced it. Sending someone else's error slot to
-/// a request would attach an "undecodable media" verdict to the wrong item.
-///
-/// The worker's count check (`Worker::predict`) guarantees
-/// `outputs.len() == counts.iter().sum()`, which this relies on.
+/// Cut a merged window's outputs back into one slice per request, in merge
+/// order. Purely positional, and that is the point: the worker returns one
+/// slot per input whether it is a payload or a typed per-item error, so the
+/// cut keeps every error slot with the request whose input produced it.
+/// Relies on `Worker::predict`'s `outputs.len() == counts.iter().sum()` check.
 fn split_window_outputs(
     mut outputs: Vec<WorkerOutput>,
     counts: &[usize],
@@ -1678,16 +1232,12 @@ fn split_window_outputs(
     slices
 }
 
-/// Fail every request with a copy of the same error message (anyhow errors
-/// are not Clone; the message is what matters to the callers).
+/// Fail every request with a copy of the same message (anyhow errors are not
+/// Clone).
 fn fail_requests(requests: impl Iterator<Item = DispatchRequest>, message: &str) {
     for request in requests {
-        // Every caller of this fails requests that **never reached a model**:
-        // the queue behind a dead replica, the queue of a model being
-        // unloaded, the tail of a window whose merged predict died, and the
-        // requests an isolation pass had not got to yet. So the typed marker
-        // belongs here rather than at each of them (R2a) — one place, and the
-        // rendering each caller composed is passed through unchanged.
+        // Every caller of this fails requests that **never reached a model**,
+        // so the typed marker belongs here rather than at each of them.
         let _ = request.reply.send(Err(Unattempted::error(message)));
     }
 }

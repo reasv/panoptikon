@@ -754,6 +754,117 @@ Under auto:
   each, overflowing the telemetry ring and deferring the grant's
   re-evaluation for minutes.
 
+### The unpriced path
+
+`none`-class models, a host with no GPU inventory and a GPU outside the
+enumeration get no admission handle and therefore no grant, and the worker
+runs no packing harness: the frame the worker receives *is* the GPU batch.
+Every frame — a merged window's as much as an oversized lone request's — is
+bounded in items by `min(user cap, default_batch_size or default_max_batch)`.
+Using the configured batch size rather than the calibration seed is a
+deliberate deviation from "seed-sized fixed batches": a host with no
+free-memory query has no VRAM budget to protect, and `none`-class models do
+not scale with batch size, so seeding those hosts' batches would be a
+throughput regression with no safety benefit. The impl's own OOM-halving loop
+remains the backstop.
+
+### The window settle
+
+The dispatcher forms a window out of whatever is queued at the instant a
+replica frees — and a replica frees when the replies go out, *before* a
+closed-loop caller has released its permits and re-submitted. A caller of
+depth `C` therefore leaves `C - W_k` queued behind window `W_k`, so
+`W_{k+1} = C - W_k`: an involution, every value on a period-2 orbit and none
+of them attracting. The largest window the system can form is `C - W_min`
+rather than `C`, the mean is `C/2`, and half of all windows are the small
+phase — which also halves the rate at which the ramp advances.
+
+The fix is to wait, briefly and conditionally, for the refills the window
+that just completed will provoke. The wait ends on the first of: the queue
+reaching the unit budget, a quiet gap of 2 ms with no arrival, or 20 ms past
+the moment the last window finished. A refill is a caller task already parked
+on its unit semaphore with its bytes loaded, so its latency is a wake, a
+multipart build and a send — sub-millisecond on a loopback self-call, one RTT
+more from a gateway elsewhere; 2 ms covers that with margin. The 20 ms bound
+is under 1 % of the seconds-long windows this applies to, and it bounds the
+case a quiet gap alone does not: a caller trickling arrivals every 1 ms
+forever.
+
+This is not the batching timer the dispatcher section forbids. It never
+applies to an idle model (it is armed only by a window that just completed),
+never applies on the unpriced path (there is no unit budget to fall short
+of), never applies when the queue already fills the window, and it ends as
+soon as arrivals stop.
+
+### The in-flight items figure
+
+Core must not learn about VRAM, so the one number that crosses the boundary
+is an item count: the window's unit target projected through the most recent
+window's items-per-unit ratio (a seed ratio before the first window), times a
+slack of 2, and bounded by the payload-byte wall converted through the same
+window's bytes-per-item. The slack of 2 is the smallest value that lets the
+next window be formed out of requests queued while the current one runs: at
+exactly one window's worth in flight the queue is empty the instant a window
+forms, so consecutive windows can never merge. The byte bound is applied
+without the slack, because past the byte wall no amount of extra in-flight
+work can make a window bigger.
+
+When the ledger squeezes a grant, the figure and the next window's unit bound
+both follow the **granted** budget's own window depth rather than the
+anchor-derived target: publishing the target anyway asks the caller to keep
+feeding windows sized for memory the GPU does not have, and the window then
+runs for as long as it takes to chew through them at the squeezed batch size,
+with no grant, no high-water sample and no re-pricing in between. Both
+callers are needed: core clamps what it is told to a floor of 64 items, so
+under a hard squeeze the window bound — which has no floor — is the only
+thing keeping a window from running blind. The clamp is always applied to the
+anchor-derived target and the grant in hand, never to a bound that already
+carries an earlier window's clamp, so an unsqueezed grant restores the figure
+on the very next window.
+
+`queue_bound_windows` on `/health` counts the priced windows formed short of
+the unit budget the ledger allowed. It is what separates "this model is
+memory-bound" from "this model is starved": a ramp that is not advancing
+while this counter climbs will not move for any amount of freed VRAM.
+
+### Replicas, deaths and the OOM fallback
+
+The dispatcher owns the model's replicas and serves them from one shared FIFO
+queue; free replicas sit in a pool and each in-flight window is a task that
+returns its replica when it completes. Pickup is FIFO by construction
+(windows are queue prefixes); completion order across replicas may differ,
+which is harmless because every request replies through its own oneshot.
+
+Death policy: any replica failing fatally kills the whole model (degrading to
+a smaller set is future work). Queued requests are failed, windows in flight
+on other replicas are aborted, idle replicas get a ladder-less kill, and the
+manager's death handler runs once under the load-generation guard. A death is
+normally discovered by a request failing on the pipe, which leaves an *idle*
+replica's death invisible — a model nobody predicts against reads nothing —
+so the manager's sweeper ticks a liveness message that `try_wait`s every free
+replica and takes the same path, minus the window settlement it has no window
+for. An idle replica's death settles nothing on purpose: a death mid-window
+is a synthetic memory negative on unified-memory devices, and a replica with
+no window in flight can say nothing honest about a batch size.
+
+A fatal failure settles as `WorkerDied` only when the worker actually stopped
+answering; a torn-down stream the dispatcher itself caused by dropping a
+request future (the user-cancel path) settles as `Aborted`, which teaches the
+ledger nothing. The death is claimed rather than read, so one death settles
+at most one window.
+
+When a merged window fails with a per-request error the requests are retried
+individually inside the same reservation, but if the failure was an
+out-of-memory condition the retries carry a **halved** unit budget: the same
+grant would let the worker's packer rebuild the batch size that just failed.
+The MB reservation is untouched, since this window's reservation covers the
+retries either way. Classifying that out-of-memory reads only the failure's
+own message and traceback, never the worker's stderr tail: the tail is a ring
+of whatever the worker logged over its recent life, including an
+out-of-memory it caught, halved and recovered from requests ago, and letting
+a stale line flip an unrelated failure into a negative sample would deflate
+the model and halve its grants over a batch that never failed.
+
 ## Grant sizing and packing
 
 Orchestrator, per GPU, when dispatching a window:
