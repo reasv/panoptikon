@@ -2013,6 +2013,7 @@ impl VramLedger {
         self.refresh_external_for_load(inference_id, gpu).await;
         let (id, expected, headroom) = {
             let mut state = self.lock();
+            Self::refresh_pools_locked(&mut state);
             // Re-read both facts under the retaken lock: a load that finished
             // while the store was being consulted may have taught us this pair
             // puts nothing on the device, or taught us a measured base, which
@@ -2969,6 +2970,78 @@ impl VramLedger {
         });
     }
 
+    /// Pull every resident's freshest memory sample off its telemetry handle,
+    /// so the pool figures `external` is about to be netted against are no
+    /// older than the free reading it nets them against.
+    ///
+    /// `free` is device-wide and refreshes from *any* worker's batch or reply,
+    /// while a resident's own pool figure moves only at load, at its window
+    /// settle and on trim. So a replica an hour into a window contributes its
+    /// pool figure from before that window while its neighbour's replies keep
+    /// `free` current, and the difference — up to the whole of the grant it is
+    /// spending — is booked as another process's memory: `external` swells,
+    /// `limit` collapses, `headroom` pins at 0, and the same MB is subtracted
+    /// twice (once as external, once as its own charge). The worker now reports
+    /// a memory sample per GPU batch (protocol doc, "Per-batch memory frames"),
+    /// which lands in that shared handle mid-request; this is where the ledger
+    /// picks it up, at the `&mut state` entry points, because `external_locked`
+    /// itself holds only a `&LedgerState`.
+    ///
+    /// Freshness-guarded exactly as [`Self::note_trimmed`] is: an older sample
+    /// never overwrites a newer pool reading, and `record_free_locked` keeps
+    /// its own source-precedence, currency and departed-worker rules. Not an
+    /// ingest — no measurement is read and no watermark moves, so the cost fit
+    /// is untouched.
+    fn refresh_pools_locked(state: &mut LedgerState) {
+        let residents: Vec<(WorkerId, String, String, TelemetryHandle, Option<Instant>)> = state
+            .workers
+            .iter()
+            .map(|(id, entry)| {
+                (
+                    *id,
+                    entry.inference_id.clone(),
+                    entry.gpu.clone(),
+                    Arc::clone(&entry.telemetry),
+                    entry.reserved_seen_at,
+                )
+            })
+            .collect();
+        for (worker, model, gpu, telemetry, seen_at) in residents {
+            let memory = {
+                let telemetry = match telemetry.lock() {
+                    Ok(telemetry) => telemetry,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                telemetry.memory.clone()
+            };
+            let Some(stamped) = memory else {
+                continue;
+            };
+            if seen_at.is_some_and(|at| stamped.captured_at <= at) {
+                continue;
+            }
+            if let Some(reserved) = stamped.value.reserved_mb
+                && let Some(entry) = state.workers.get_mut(&worker)
+            {
+                entry.reserved_mb = Some(reserved);
+                entry.reserved_seen_at = Some(stamped.captured_at);
+            }
+            if let (Some(free), Some(source)) =
+                (stamped.value.free_mb, stamped.value.free_source.clone())
+            {
+                Self::record_free_locked(
+                    state,
+                    &gpu,
+                    free,
+                    source,
+                    stamped.captured_at,
+                    stamped.value.total_mb,
+                    Some(&model),
+                );
+            }
+        }
+    }
+
     /// `external = max(0, total − free − Σ footprints)`, clamped at 0: `free` and
     /// the per-worker samples come from different moments, and sampling skew must
     /// never manufacture phantom headroom. `None` when no free reading is known.
@@ -3312,6 +3385,11 @@ impl VramLedger {
     ) -> Option<GrantToken> {
         self.maybe_refresh_external(worker);
         let mut state = self.lock();
+        // Before anything prices against `headroom`: a neighbour mid-window has
+        // been growing its pool since its last reply, and until that growth is
+        // charged to it, it is charged to "some other process" and this window
+        // is priced against a GPU that reads full.
+        Self::refresh_pools_locked(&mut state);
         // Before anything reads the deflation counter to size this window.
         Self::repay_deflation_locked(&mut state, worker);
         let gpu = state.workers.get(&worker)?.gpu.clone();
@@ -4008,6 +4086,24 @@ impl VramLedger {
                     reported_total_mb,
                     model.as_deref(),
                 );
+            }
+            // And this replica's own pool beside it, from the same measurement.
+            // The caching allocator never returns blocks between batches, so a
+            // batch's `peak_reserved` is a floor for the pool at the moment its
+            // free reading was taken — and netting a free reading against an
+            // older pool figure is what books our own growth as somebody else's
+            // memory. The response-level sample below supersedes this, so the
+            // case it actually moves is the reply that carried measurements but
+            // no `memory` map (a worker whose allocator answers and whose
+            // driver does not). Freshness-guarded as `note_trimmed` is.
+            if let Some(peak) = measurement.peak_reserved_mb
+                && let Some(entry) = state.workers.get_mut(&worker)
+                && entry
+                    .reserved_seen_at
+                    .is_none_or(|at| sample.captured_at > at)
+            {
+                entry.reserved_mb = Some(peak);
+                entry.reserved_seen_at = Some(sample.captured_at);
             }
             // A throughput collapse is a *comparison* between two of this
             // window's batches, and a comparison is only meaningful inside one
@@ -4846,6 +4942,10 @@ impl VramLedger {
     /// Read-only ledger snapshot for `GET /health`.
     pub fn health(&self) -> Vec<GpuBudgetHealth> {
         let mut state = self.lock();
+        // Every in-flight resident's pool figure first: `external_mb` is the
+        // reported number, and reporting it against pool readings older than
+        // the free reading is the whole of the defect.
+        Self::refresh_pools_locked(&mut state);
         // `/health` reads the deflation counter, so it settles the time repayment
         // first rather than reporting a level the next grant is about to hand
         // back.
@@ -6468,9 +6568,187 @@ mod tests {
         token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0].external_mb,
-            32_000 - 20_000 - 1_000,
-            "the last measurement of the response is the freshest reading in it"
+            32_000 - 20_000 - 1_030,
+            "the last measurement of the response is the freshest reading in it, \
+             and our own footprint against it is that batch's pool (1000 base \
+             + 30) rather than the one from before the window"
         );
+    }
+
+    /// The run2/S9 soak signature, reproduced and then closed.
+    ///
+    /// Two residents on one GPU. A holds a grant and grows its pool through a
+    /// long window while B's replies keep the device-wide free reading fresh.
+    /// Before A's pool figure is refreshed, A's growth is booked as another
+    /// process's memory: `external` rises by it, `limit` collapses, `headroom`
+    /// pins at 0, and the same MB is subtracted twice — once as external, once
+    /// as A's own charge — so `external + charges` exceeds the whole card.
+    /// After A's per-batch memory frame lands in its telemetry, none of that
+    /// happens: `external` reads what the *hog* holds, and `headroom` stays
+    /// positive.
+    #[test]
+    fn an_in_flight_replicas_pool_growth_is_not_another_processs_memory() {
+        const TOTAL: u64 = 100_000;
+        let ledger = ledger(TOTAL, no_margin());
+        let big = loaded(Some(1_000), Some(0));
+        let small = loaded(Some(500), Some(0));
+        let a = ledger
+            .register_worker("g/big", item_cost(4), &big, None)
+            .expect("registers");
+        let b = ledger
+            .register_worker("g/small", item_cost(4), &small, None)
+            .expect("registers");
+        // A quiet card: 500 MB of somebody else's, our two bases, nothing more.
+        push_memory_with_total(&big, TOTAL - 1_000 - 500 - 500, 0, Some(TOTAL), "nvml");
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].external_mb, 500, "the hog, and only it");
+
+        // A takes a grant and starts a long window. Its pool climbs to 52 GB —
+        // the soak's median grant — and the card's free reading falls with it,
+        // but nothing of A's reaches the ledger until its reply.
+        big.lock().unwrap().memory = None;
+        let window = a.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        const GROWTH: u64 = 52_000;
+        let free_now = TOTAL - 1_000 - 500 - 500 - GROWTH;
+
+        // B settles a window of its own, which is what refreshes `free`.
+        let neighbour = b.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        small
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement_with_free(4, 0, 0, free_now, "nvml")]);
+        neighbour.finish(WindowOutcome::Responded { oom: None });
+
+        // The defect, in the four figures the soak reported it in.
+        let before = &ledger.health()[0];
+        assert_eq!(
+            before.external_mb,
+            500 + GROWTH,
+            "S4: /health books our own in-flight pool as somebody else's"
+        );
+        assert_eq!(
+            before.footprints_mb, 1_500,
+            "A's pool is from before the window"
+        );
+        assert_eq!(before.headroom_mb, 0, "S3: admission stalls against it");
+        assert!(
+            before.external_mb + before.charges_mb > TOTAL,
+            "S2: the granted pool is subtracted twice — {} + {} > {TOTAL}",
+            before.external_mb,
+            before.charges_mb
+        );
+
+        // The per-batch memory frame: A's pool as of its last batch, with the
+        // free reading taken beside it.
+        push_memory_with_total(&big, free_now, GROWTH, Some(TOTAL), "nvml");
+
+        let after = &ledger.health()[0];
+        assert_eq!(after.external_mb, 500, "the hog, and only it, again");
+        assert_eq!(
+            after.footprints_mb,
+            1_500 + GROWTH,
+            "A's growth is charged to A"
+        );
+        assert!(after.headroom_mb > 0, "S3: admission is not stalled");
+        assert!(
+            after.external_mb + after.charges_mb <= TOTAL,
+            "S2: nothing is subtracted twice — {} + {} <= {TOTAL}",
+            after.external_mb,
+            after.charges_mb
+        );
+        // And the grant it is spending is unchanged by any of this: the fix is
+        // about what the memory is *called*, not about what was handed out.
+        assert_eq!(after.grants_outstanding, 1);
+        window.finish(WindowOutcome::Responded { oom: None });
+    }
+
+    /// The pull is freshness-guarded, as the trim path's is: a sample older
+    /// than the pool figure already charged is not a newer reading of it, and
+    /// the departed-replica credit still stands in front of the free half.
+    #[test]
+    fn a_stale_frame_never_overwrites_a_newer_pool_reading() {
+        let ledger = ledger(32_000, no_margin());
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory_with_total(&handle, 25_000, 4_000, Some(32_000), "nvml");
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].footprints_mb, 5_000);
+
+        // A sample captured before the one already charged: the pool figure
+        // holds, and so does the free reading it arrived with.
+        {
+            let mut telemetry = handle.lock().unwrap();
+            let older = telemetry
+                .memory
+                .as_ref()
+                .expect("a sample is charged")
+                .captured_at
+                - Duration::from_secs(5);
+            telemetry.memory = Some(Timestamped {
+                value: MemorySample {
+                    free_mb: Some(31_000),
+                    total_mb: Some(32_000),
+                    free_source: Some("nvml".to_owned()),
+                    reserved_mb: Some(0),
+                    allocated_mb: Some(0),
+                },
+                captured_at: older,
+            });
+        }
+        let health = &ledger.health()[0];
+        assert_eq!(
+            health.footprints_mb, 5_000,
+            "the older pool figure is refused"
+        );
+        assert_eq!(health.external_mb, 32_000 - 25_000 - 5_000);
+
+        // A newer one lands, both halves.
+        push_memory_with_total(&handle, 20_000, 9_000, Some(32_000), "nvml");
+        let health = &ledger.health()[0];
+        assert_eq!(health.footprints_mb, 10_000);
+        assert_eq!(health.external_mb, 32_000 - 20_000 - 10_000);
+        drop(admission);
+    }
+
+    /// Within one response, our own pool is contemporaneous with the free
+    /// readings it is netted against: a reply that carried measurements but no
+    /// response-level `memory` map — a worker whose allocator answers and whose
+    /// driver does not — still advances this replica's pool from the batches'
+    /// own `peak_reserved`.
+    #[test]
+    fn a_windows_batches_carry_its_pool_when_the_reply_carries_none() {
+        let ledger = ledger(32_000, no_margin());
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory_with_total(&handle, 30_000, 0, Some(32_000), "nvml");
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].external_mb, 1_000);
+
+        handle.lock().unwrap().memory = None;
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        handle.lock().unwrap().record_measurements(vec![
+            measurement_with_free(4, 0, 500, 29_000, "nvml"),
+            measurement_with_free(4, 500, 1_500, 28_000, "nvml"),
+        ]);
+        token.finish(WindowOutcome::Responded { oom: None });
+
+        let health = &ledger.health()[0];
+        assert_eq!(
+            health.footprints_mb, 2_500,
+            "1000 base + the 1500 it grew to"
+        );
+        assert_eq!(
+            health.external_mb,
+            32_000 - 28_000 - 2_500,
+            "our own growth comes out of external, not out of the hog"
+        );
+        drop(admission);
     }
 
     /// The rules the per-batch readings inherit, each shown binding: source precedence,
@@ -6494,7 +6772,12 @@ mod tests {
             .unwrap()
             .record_measurements(vec![measurement_with_free(4, 0, 10, 5_000, "torch")]);
         token.finish(WindowOutcome::Responded { oom: None });
-        assert_eq!(ledger.health()[0].external_mb, 1_000, "unmoved");
+        assert_eq!(
+            ledger.health()[0].external_mb,
+            990,
+            "the free reading is unmoved; what moved is our own footprint, by \
+             the 10 MB of pool the batch reported, which comes out of external"
+        );
 
         // An authoritative reading whose response claims a total that does not
         // describe this GPU is in a different currency, and is refused with
@@ -6515,7 +6798,8 @@ mod tests {
         assert_eq!(
             ledger.health()[0].external_mb,
             1_000,
-            "a reading of some other GPU is not a reading of this one"
+            "a reading of some other GPU is not a reading of this one; its \
+             response-level sample still states our own pool, and states it 0"
         );
 
         // And an honest one lands.
@@ -6526,7 +6810,7 @@ mod tests {
             telemetry.record_measurements(vec![measurement_with_free(4, 0, 10, 25_000, "nvml")]);
         }
         token.finish(WindowOutcome::Responded { oom: None });
-        assert_eq!(ledger.health()[0].external_mb, 32_000 - 25_000 - 1_000);
+        assert_eq!(ledger.health()[0].external_mb, 32_000 - 25_000 - 1_010);
     }
 
     /// A window that ended in an OOM still refreshes the GPU: the reading
@@ -6556,7 +6840,7 @@ mod tests {
         });
         assert_eq!(
             ledger.health()[0].external_mb,
-            32_000 - 2_000 - 1_000,
+            32_000 - 2_000 - 1_010,
             "the GPU is nearly full, which is what the OOM was about"
         );
         assert_eq!(ledger.health()[0].workers[0].deflation, 1);
