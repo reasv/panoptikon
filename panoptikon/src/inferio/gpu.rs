@@ -248,6 +248,13 @@ fn probe_rocm() -> HostGpus {
         meminfo: roots.meminfo.clone(),
         ambient_hip_restriction,
     };
+    let host = |gpus: Option<Arc<[GpuInfo]>>| HostGpus {
+        caps: HostComputeCaps::unknown(),
+        inventory: GpuInventory {
+            gpus,
+            backend: backend.clone(),
+        },
+    };
     let gpus = match inventory {
         Some(Ok(gpus)) => gpus,
         // Unpriced is safe but indistinguishable from "the feature is not
@@ -255,23 +262,9 @@ fn probe_rocm() -> HostGpus {
         // WARN unless the deciding site already logged the detail.
         Some(Err(failure)) => {
             failure.log();
-            return HostGpus {
-                caps: HostComputeCaps::unknown(),
-                inventory: GpuInventory {
-                    gpus: None,
-                    backend,
-                },
-            };
+            return host(None);
         }
-        None => {
-            return HostGpus {
-                caps: HostComputeCaps::unknown(),
-                inventory: GpuInventory {
-                    gpus: None,
-                    backend,
-                },
-            };
-        }
+        None => return host(None),
     };
     for gpu in &gpus {
         tracing::info!(
@@ -285,13 +278,7 @@ fn probe_rocm() -> HostGpus {
             "detected GPU"
         );
     }
-    HostGpus {
-        caps: HostComputeCaps::unknown(),
-        inventory: GpuInventory {
-            gpus: Some(gpus.into()),
-            backend,
-        },
-    }
+    host(Some(gpus.into()))
 }
 
 /// One synthetic unified-memory device from macOS kernel facts (`mps.rs`);
