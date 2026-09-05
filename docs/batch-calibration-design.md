@@ -978,8 +978,8 @@ execute at this corpus's shapes.
   footprint would be reattributed to `external` and margin-inflated
   against the next model to load — and the adjusted reading is flagged
   for a live re-read on the next grant. Samples arrive
-  only on response frames, so after a long idle gap the first window
-  prices `external` from a stale sample; the shrink clamp makes that
+  only while a worker is answering, so after a long idle gap the first
+  window prices `external` from a stale sample; the shrink clamp makes that
   safe, and the orchestrator refreshes via NVML (the Package-1 probe
   machinery) when the freshest sample exceeds an age threshold — a
   single coherent snapshot (total/free/per-process in one read),
@@ -1025,7 +1025,15 @@ execute at this corpus's shapes.
   sample is coherent too. Two cases remain out of reach by construction — the
   first batch of a window, which has reported nothing yet, and an ungranted
   `predict`, which has no batch boundaries — and both are bounded by a single
-  batch's growth rather than by a whole grant.
+  batch's growth rather than by a whole grant. Measured on a 45-minute soak
+  segment against its own comparand: the external-usage breaches fall 6.5×
+  (15.78 % → 2.41 %) and the invariant breaches 3.0× (6.87 % → 2.26 %), the p95
+  footprint shortfall 160× (39 568 → 248 MiB), and `external_mb` is inside the
+  allowance for 95.2 % of grant-in-flight samples against 66.3 % before, with
+  grant sizes, throughput and wall times unchanged. The residual is the
+  predicted one: the median time from the most recent grant to a remaining
+  breach is 2.4 s in both legs — the start of a window, before its first
+  frame.
 - **Contention policy** when several models are hungry at once: demand
   first (queue depth; an idle model consumes no new grants, though it
   holds its pool until trimmed — see Reactive shrink), then split by
