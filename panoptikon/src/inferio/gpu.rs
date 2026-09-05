@@ -704,38 +704,35 @@ impl GpuInventory {
         self.gpus.as_deref()
     }
 
+    /// The one unified-memory device's key and RAM figure, for the two
+    /// backends whose whole inventory is that device. The RAM comes off the
+    /// GPU itself — the same fact that flags it unified — so the refresh and
+    /// the flag can never disagree about which memory this GPU is made of.
+    /// `None` where there is no GPU at all (off macOS, or a reader that said
+    /// nothing) or no RAM figure: nothing to refresh either way.
+    fn first_unified_ram_mb(&self) -> Option<(String, u64)> {
+        let gpu = self.gpus().and_then(<[GpuInfo]>::first)?;
+        Some((gpu.uuid.clone(), gpu.unified_ram_mb?))
+    }
+
     /// The live-memory interface for these GPUs, resolved once so the
     /// ledger's refresh can never ask nvidia-smi about an AMD GPU. The ROCm
     /// arm is **total or nothing**: every row must carry the PCI address the
     /// counters are keyed by, or the refresh is withdrawn entirely.
     pub(super) fn memory_query(&self) -> MemoryQuery {
         if let MemoryBackend::Cpu { meminfo } = &self.backend {
-            // As on MPS, the RAM figure comes off the GPU itself — the same
-            // fact that flags it unified — so the refresh and the flag can
-            // never disagree about which memory this GPU is made of.
-            return match self.gpus().and_then(<[GpuInfo]>::first) {
-                Some(gpu) => match gpu.unified_ram_mb {
-                    Some(ram_mb) => MemoryQuery::Cpu {
-                        key: gpu.uuid.clone(),
-                        ram_mb,
-                        meminfo: meminfo.clone(),
-                    },
-                    None => MemoryQuery::Unavailable,
+            return match self.first_unified_ram_mb() {
+                Some((key, ram_mb)) => MemoryQuery::Cpu {
+                    key,
+                    ram_mb,
+                    meminfo: meminfo.clone(),
                 },
                 None => MemoryQuery::Unavailable,
             };
         }
         if matches!(self.backend, MemoryBackend::Mps) {
-            return match self.gpus().and_then(<[GpuInfo]>::first) {
-                Some(gpu) => match gpu.unified_ram_mb {
-                    Some(ram_mb) => MemoryQuery::Mps {
-                        key: gpu.uuid.clone(),
-                        ram_mb,
-                    },
-                    None => MemoryQuery::Unavailable,
-                },
-                // No GPU (off macOS, or sysctl said nothing): nothing to
-                // refresh, and not nvidia-smi's business.
+            return match self.first_unified_ram_mb() {
+                Some((key, ram_mb)) => MemoryQuery::Mps { key, ram_mb },
                 None => MemoryQuery::Unavailable,
             };
         }
