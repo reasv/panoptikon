@@ -621,18 +621,12 @@ pub(crate) async fn run_dispatcher(
             let shapes: Vec<WindowItem> = queue.iter().map(|queued| queued.shape).collect();
             let take = window_take_count(&shapes, bounds);
             let window: Vec<Queued> = queue.drain(..take).collect();
-            let window_units: u64 = window
-                .iter()
-                .map(|queued| queued.shape.units)
-                .fold(0u64, u64::saturating_add);
-            let window_items: usize = window
-                .iter()
-                .map(|queued| queued.shape.items)
-                .fold(0usize, usize::saturating_add);
-            let window_bytes: usize = window
-                .iter()
-                .map(|queued| queued.shape.bytes)
-                .fold(0usize, usize::saturating_add);
+            let (mut window_units, mut window_items, mut window_bytes) = (0u64, 0usize, 0usize);
+            for queued in &window {
+                window_units = window_units.saturating_add(queued.shape.units);
+                window_items = window_items.saturating_add(queued.shape.items);
+                window_bytes = window_bytes.saturating_add(queued.shape.bytes);
+            }
             // The freshest items-per-unit and bytes-per-item sample, so it
             // converts the target below; one that priced nothing says nothing
             // and leaves the last sample standing.
