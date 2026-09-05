@@ -30,23 +30,22 @@ context to read. `VramLedger::resolve_gpu` then has nothing to join on, so
 the fixture is never admitted to a ledger and its windows run **unpriced** —
 which is the opposite of what the fixture scenarios are meant to exercise.
 
-**Correction (Phase 4, measured in `results/run1/S5-cpu-C2`):** the single-GPU
-fallback does **not** rescue them. `resolve_gpu` (`ledger.rs:1821`) requires
-`claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some()`
-before it will place a UUID-less worker on the only GPU, and a torch-free
-worker reports neither. On C2 all four `*_cpu` ids logged `the worker reports no
-GPU this GPU inventory lists; dispatching this model without VRAM admission …
-GPUs=1` and ran with **zero grants**. The `*_cpu` family is therefore an
-**unpriced-path** fixture on any CUDA host, one GPU or two; use the `*_cuda`
-ids whenever the ledger is the thing under test.
+The single-GPU fallback does **not** rescue them: `VramLedger::resolve_gpu`
+requires `claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb
+.is_some()` before it will place a UUID-less worker on the only GPU, and a
+torch-free worker reports neither. Measured on C2: all four `*_cpu` ids logged
+`the worker reports no GPU this GPU inventory lists; dispatching this model
+without VRAM admission … GPUs=1` and ran with **zero grants**. The `*_cpu`
+family is therefore an **unpriced-path** fixture on any CUDA host, one GPU or
+two; use the `*_cuda` ids whenever the ledger is the thing under test.
 
 Each variant therefore allocates and touches one `float32` tensor of
 `load_mb` MiB (default 64) on the pinned device inside `load()`, and holds it
 for the model's lifetime. That initialises CUDA and moves the allocator
 counters, which is all the two gates need.
 
-Measured on this host (Phase 0, direct `begin_load` / `load()` /
-`finish_load` in the venv, GPU 1, no gateway):
+Measured on this host (direct `begin_load` / `load()` / `finish_load` in the
+venv, GPU 1, no gateway):
 
 | field | value |
 |---|---|
@@ -104,20 +103,16 @@ The fixtures return `{"batch": n}` / `{"ok": true}`, not tags, so the natural
 way to drive them is `POST /api/inference/predict/calibfixture/<id>` (that is
 what `loadgen.py` does).
 
-**Correction (run2, measured in `results/run2/S5-failbatch-oomtext-job` and
-`results/run2/S5-dying-job`):** an **extraction job also works**. This note
-used to say the job would reject the payload against the declared
-`output_type = "tags"`; on the run2 binary it does not. A 180-item job over
+An **extraction job also works**, and is the path to use whenever the
+*job-side* behaviour is under test (re-queue, the failures endpoint, the
+`partial` / `failed` outcomes): the job does not reject the payload against
+the declared `output_type = "tags"`. Measured: a 180-item job over
 `calibfixture/failbatch_oomtext_cuda` recorded `outcome: "completed"`,
-`errors: 0`, and a 2 000-item job over `calibfixture/dying_cuda` recorded
+`errors: 0`; a 2 000-item job over `calibfixture/dying_cuda` recorded
 `outcome: "failed"` with 2 000 rows under `/api/jobs/data/failures` →
-`job_failures`. Use the job path whenever the *job-side* run2 behaviour is
-under test (R2a re-queue, R2b failures endpoint, `partial` / `failed`
-outcomes); a job needs the fixture's corpus indexed first (`POST
-/api/jobs/folders/rescan`). The `calib_hostless` policy the run2 configs
-carried for this is gone: defect P1 (an h2c request carries its authority in
-`:authority`, matched no policy and was refused 403 `no_policy`) is fixed by
-`74ca202c` / `4c2e00b6`, so the stock `localhost` policy matches again.
+`job_failures`. A job needs the fixture's corpus indexed first (`POST
+/api/jobs/folders/rescan`), and it runs on the stock `localhost` policy — the
+`calib_hostless` workaround is gone.
 
 Inference ids: `calibfixture/{oom_second_batch,oom,failbatch,dying}_{cuda,cpu}`,
 plus the two Phase-4 additions `calibfixture/oom_timed_cuda` (batch-1 OOM for
@@ -130,9 +125,9 @@ correction above).
 
 `oom_second_batch_cpu` (the shipped torch-free impl) tests `batches >= 2`, so
 it OOMs on the second batch **and on every batch after it, for the worker's
-whole lifetime**. Under a real gateway the per-request fallback turns that
-into one negative settle per retry: Phase 4's first S5 leg reached
-`deflation = 2 227` in 40 s. `oom_second_batch_cuda` therefore takes an
-`oom_batches` config key (default **1**), so it OOMs exactly once — which is
-the case §4 S5 describes. Set `oom_batches` high to get the old behaviour;
-use `calibfixture/oom_cuda` for a permanent OOM.
+whole lifetime** — under a real gateway the per-request fallback turns that
+into one negative settle per retry, reaching `deflation = 2 227` in 40 s.
+`oom_second_batch_cuda` therefore takes an `oom_batches` config key (default
+**1**), so it OOMs exactly once, which is the case §4 S5 describes. Set
+`oom_batches` high for the old behaviour; use `calibfixture/oom_cuda` for a
+permanent OOM.
