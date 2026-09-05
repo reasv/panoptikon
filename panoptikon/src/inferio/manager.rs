@@ -68,6 +68,7 @@ use super::worker::{
     LoadReport, MemorySample, TelemetryHandle, Worker, WorkerError, WorkerInput, WorkerOutput,
     WorkerSpawnConfig,
 };
+use crate::db::ledger::truncate_error;
 
 /// Manager configuration.
 pub struct ManagerConfig {
@@ -138,21 +139,6 @@ impl From<&crate::config::InferenceLocalConfig> for LoadPolicy {
 /// Wire `kind` of the load-failure cooldown error; `http.rs` answers 503.
 pub(crate) const LOAD_COOLDOWN_KIND: &str = "load_cooldown";
 
-/// Bound on the stored last-failure text: it is repeated on every refused
-/// request and every `/health` poll.
-const MAX_COOLDOWN_ERROR_BYTES: usize = 2000;
-
-fn clamp_cooldown_error(text: &str) -> String {
-    if text.len() <= MAX_COOLDOWN_ERROR_BYTES {
-        return text.to_owned();
-    }
-    let mut end = MAX_COOLDOWN_ERROR_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
-}
-
 /// The error a cooldown-refused load returns; `http.rs` matches it out of the
 /// `anyhow` chain.
 #[derive(Debug, Clone)]
@@ -189,23 +175,9 @@ impl std::error::Error for LoadCooldownError {}
 /// Why a `spawn_model` failed, in the one dimension the cooldown cares about.
 struct LoadFailure {
     error: anyhow::Error,
+    /// Whether a worker was actually spawned before the failure, and so cost
+    /// something; a configuration error costs nothing.
     costed_worker: bool,
-}
-
-impl LoadFailure {
-    fn config(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            costed_worker: false,
-        }
-    }
-
-    fn worker(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            costed_worker: true,
-        }
-    }
 }
 
 /// One model's load-failure history.
@@ -249,7 +221,9 @@ impl LoadCooldowns {
                 window: Duration::ZERO,
             });
         entry.failures = entry.failures.saturating_add(1);
-        entry.last_error = clamp_cooldown_error(error);
+        // Clamped: the text is repeated on every refused request and every
+        // `/health` poll.
+        entry.last_error = truncate_error(error).into_owned();
         // `failures - 1` doublings, clamped at the widest shift a `u32` can
         // represent: `1u32 << 32` panics, or wraps to 1 with checks off.
         let doublings = (entry.failures - 1).min(31);
@@ -1727,7 +1701,12 @@ impl ModelManager {
                 });
             match resolved {
                 Ok(resolved) => resolved,
-                Err(error) => return Err(LoadFailure::config(error)),
+                Err(error) => {
+                    return Err(LoadFailure {
+                        error,
+                        costed_worker: false,
+                    });
+                }
             }
         };
         tracing::debug!(
@@ -1890,7 +1869,10 @@ impl ModelManager {
             // Whole-set atomicity: kill the replicas that came up, un-charge.
             drop(admissions);
             futures_util::future::join_all(workers.into_iter().map(Worker::kill)).await;
-            return Err(LoadFailure::worker(err));
+            return Err(LoadFailure {
+                error: err,
+                costed_worker: true,
+            });
         }
         Ok(SpawnedModel {
             workers,
@@ -2009,10 +1991,11 @@ mod tests {
     use super::super::calibration::{ProfileQuery, ProfileSeed, ProfileUpdate};
     use super::super::registry::RegistryConfig;
     use super::super::worker::WorkerDeadlines;
+    use super::super::worker::testing::test_spawn_config;
     use super::*;
+    use crate::db::ledger::MAX_ERROR_BYTES;
     use serde_json::json;
     use std::fs;
-    use std::path::{Path, PathBuf};
 
     // Pure state-machine tests (no workers, injected clock).
 
@@ -2172,50 +2155,6 @@ config.impl_class = "cls"
     }
 
     // Integration tests with real worker subprocesses.
-
-    /// Repo root: the crate lives one level below the workspace root.
-    fn workspace_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
-    }
-
-    /// The managed venv if present, else the legacy root `.venv`.
-    fn test_venv_python(root: &Path, rel: &str) -> PathBuf {
-        let managed = root.join("python/.venv").join(rel);
-        if managed.is_file() {
-            managed
-        } else {
-            root.join(".venv").join(rel)
-        }
-    }
-
-    /// The same spawn setup as the worker.rs tests.
-    fn test_spawn_config() -> WorkerSpawnConfig {
-        let root = workspace_root();
-        // PANOPTIKON_TEST_PYTHON overrides the repo venv (any python with
-        // msgpack works), e.g. running the suite under WSL.
-        let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
-            Some(explicit) => PathBuf::from(explicit),
-            None if cfg!(windows) => test_venv_python(&root, "Scripts/python.exe"),
-            None => test_venv_python(&root, "bin/python"),
-        };
-        if !python.is_file() {
-            panic!(
-                "inferio manager tests need the repo venv interpreter at {} — create the dev venv first",
-                python.display()
-            );
-        }
-        WorkerSpawnConfig {
-            python,
-            impl_dirs: vec![root.join("python/tests/inferio_worker/fixture_impls")],
-            pythonpath: vec![root.join("python")],
-            env: vec![("NO_CUDNN".to_owned(), "true".to_owned())],
-            env_remove: Vec::new(),
-            cwd: Some(root),
-            deadlines: WorkerDeadlines::default(),
-            // The fixtures echo `CUDA_VISIBLE_DEVICES`.
-            pin_env_var: crate::inferio::gpu::CUDA_PIN_ENV_VAR,
-        }
-    }
 
     /// Synthetic registry covering every fixture impl.
     const TEST_REGISTRY_TOML: &str = r#"
@@ -3970,10 +3909,10 @@ config.replicas = 2
             "must not collide with the load-failure detail string http.rs matches"
         );
         // The stored text is clamped so /health and every refusal stay small.
-        let long = "x".repeat(MAX_COOLDOWN_ERROR_BYTES * 2);
-        let clamped = clamp_cooldown_error(&long);
-        assert_eq!(clamped.chars().count(), MAX_COOLDOWN_ERROR_BYTES + 1);
+        let long = "x".repeat(MAX_ERROR_BYTES * 2);
+        let clamped = truncate_error(&long);
+        assert_eq!(clamped.chars().count(), MAX_ERROR_BYTES + 1);
         assert!(clamped.ends_with('…'));
-        assert_eq!(clamp_cooldown_error("short"), "short");
+        assert_eq!(truncate_error("short"), "short");
     }
 }

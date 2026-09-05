@@ -508,28 +508,6 @@ impl DeathAttribution {
             DeathAttribution::StillRunning => "still_running",
         }
     }
-
-    /// The sentence the WARN line spells the attribution out in.
-    fn explanation(self) -> &'static str {
-        match self {
-            DeathAttribution::ReapedBeforeSignal => {
-                "the process had already exited before the gateway signalled it, so this exit \
-                 status is how it actually died — a signal 9 here came from outside (kernel OOM \
-                 killer, driver, operator)"
-            }
-            DeathAttribution::Dying => {
-                "the process was already on its way down before the gateway signalled it (its \
-                 stdout was at EOF, or the kernel still shows the leader unwinding), so the exit \
-                 status is not ours to explain — a signal 9 here came from outside; it reads as \
-                 'dying' rather than 'reaped' only because a thread-group leader is not reapable \
-                 while its threads are still unwinding"
-            }
-            DeathAttribution::StillRunning => {
-                "the process was still running and its stream still open when the gateway gave up \
-                 on it, so the signal here is the gateway's own SIGKILL and says nothing about why"
-            }
-        }
-    }
 }
 
 impl fmt::Display for DeathAttribution {
@@ -749,28 +727,17 @@ fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, spec: &SpawnSpec, devic
     if overrides.is_empty() {
         return;
     }
-    // Two messages: with no pin written the pinned wording would alarm about
-    // a pin that does not exist.
-    let message = if device.is_some() {
-        "this worker's env config sets or removes a device-selection variable \
-         (a GPU-visibility one, or the INFERIO_DEVICE coherence marker); it is \
-         applied after the device pin, so an entry naming the pin's own \
-         variable replaces (or deletes) the pin, and an entry naming another \
-         one is resolved against it by the runtime's own precedence — either \
-         way the worker may not end up on the GPU it was pinned to"
-    } else {
-        "this worker's env config sets or removes a device-selection variable \
-         (a GPU-visibility one, or the INFERIO_DEVICE coherence marker) while \
-         no device pin was written for this replica; the entry alone \
-         therefore decides where the model runs, and the orchestrator's \
-         ledger is pricing it against the GPU it believes rather than one \
-         it placed it on"
-    };
+    // One message for both cases: `pin` says which one this is — a written
+    // pin the entry can replace, delete or outrank, or `(none)`, where the
+    // entry alone decides.
     tracing::warn!(
         variables = overrides.join(", "),
         pin_variable = cfg.pin_env_var,
         pin = device.unwrap_or("(none)"),
-        "{message}"
+        "this worker's env config sets or removes a device-selection variable \
+         (a GPU-visibility one, or the INFERIO_DEVICE coherence marker); it is \
+         applied after the device pin, so the worker may not end up on the GPU \
+         the ledger is pricing it against"
     );
 }
 
@@ -1253,9 +1220,7 @@ impl Worker {
         };
         match outcome {
             Ok(status) => {
-                if let Some(task) = self.stderr_task.take() {
-                    let _ = timeout(STDERR_JOIN_GRACE, task).await;
-                }
+                self.drain_stderr().await;
                 Ok(status)
             }
             Err(err) => {
@@ -1301,6 +1266,14 @@ impl Worker {
             // the last resort if even this hangs.
             let _ = self.child.kill().await;
         }
+        self.drain_stderr().await;
+    }
+
+    /// Await the stderr forwarder before reading the tail: it ends on the
+    /// child's stderr EOF, so joining it is what completes the tail. Bounded
+    /// by [`STDERR_JOIN_GRACE`]; a forwarder still running after that is
+    /// abandoned rather than waited on.
+    async fn drain_stderr(&mut self) {
         if let Some(task) = self.stderr_task.take() {
             let _ = timeout(STDERR_JOIN_GRACE, task).await;
         }
@@ -1552,10 +1525,7 @@ impl Worker {
             }
             Err(_) => None,
         };
-        // The forwarder ends on stderr EOF; awaiting it completes the tail.
-        if let Some(task) = self.stderr_task.take() {
-            let _ = timeout(STDERR_JOIN_GRACE, task).await;
-        }
+        self.drain_stderr().await;
         let (signal, core_dumped) = status.as_ref().map(signal_of).unwrap_or((None, false));
         let death = WorkerDeath {
             worker: self.label.clone(),
@@ -1577,9 +1547,8 @@ impl Worker {
             core_dumped = death.core_dumped,
             attribution = death.attribution.as_str(),
             killed_by_gateway = death.attribution.killed_by_gateway(),
-            "an inferio worker process is gone. Cause: {}. {}. stderr tail:\n{}",
+            "an inferio worker process is gone. Cause: {}. stderr tail:\n{}",
             death.why,
-            death.attribution.explanation(),
             death.stderr_tail,
         );
         self.death = Some(death.clone());

@@ -455,6 +455,49 @@ enum SettleOutcome {
     End(End),
 }
 
+/// What one [`DispatchMsg`] did to the loop that received it.
+enum MsgEffect {
+    /// Applied in full, carry on. `Some(units)` when it queued a request, for
+    /// the settle's queued-units bound.
+    Applied(Option<u64>),
+    /// The dispatcher must leave its loop.
+    End(End),
+}
+
+/// Applies one dispatch message for the three loops that receive them: the
+/// settle, the main `select!` and its non-blocking drain. `None` is a closed
+/// channel, which ends the dispatcher exactly as [`DispatchMsg::Shutdown`]
+/// does. Acting here and reporting back, rather than three copies of the
+/// four-variant match, is what keeps a variant from being handled in one loop
+/// and forgotten in another.
+async fn apply_dispatch_msg(
+    msg: Option<DispatchMsg>,
+    ctx: &DispatcherContext,
+    queue: &mut VecDeque<Queued>,
+    free: &mut Vec<Replica>,
+    in_flight: &mut JoinSet<(Replica, BatchOutcome)>,
+) -> MsgEffect {
+    match msg {
+        None | Some(DispatchMsg::Shutdown) => MsgEffect::End(End::Graceful),
+        Some(DispatchMsg::Predict(request)) => {
+            let queued = enqueue(request, &ctx.cost);
+            let units = queued.shape.units;
+            queue.push_back(queued);
+            ctx.stats.queue_len.store(queue.len(), Relaxed);
+            ctx.stats.total_predict_requests.fetch_add(1, Relaxed);
+            MsgEffect::Applied(Some(units))
+        }
+        Some(DispatchMsg::Trim(worker_id)) => {
+            try_trim(ctx, free, in_flight, worker_id, queue.len());
+            MsgEffect::Applied(None)
+        }
+        Some(DispatchMsg::ReapIdle) => match reap_idle_replicas(ctx, free).await {
+            Some(message) => MsgEffect::End(End::Fatal(message)),
+            None => MsgEffect::Applied(None),
+        },
+    }
+}
+
 /// Wait, briefly and conditionally, for the arrivals the window that just
 /// finished will provoke. Ends on the first of: the queue reaching
 /// `bounds.units`, [`WINDOW_SETTLE_QUIET`] with no arrival, or `deadline`
@@ -484,26 +527,15 @@ async fn settle_refills(
         let quiet_until = (now + WINDOW_SETTLE_QUIET).min(deadline);
         tokio::select! {
             _ = tokio::time::sleep_until(quiet_until) => return SettleOutcome::Continue,
-            msg = rx.recv() => match msg {
-                None | Some(DispatchMsg::Shutdown) => return SettleOutcome::End(End::Graceful),
-                Some(DispatchMsg::Predict(request)) => {
-                    let queued = enqueue(request, &ctx.cost);
-                    queued_units = queued_units.saturating_add(queued.shape.units);
-                    queue.push_back(queued);
-                    ctx.stats.queue_len.store(queue.len(), Relaxed);
-                    ctx.stats.total_predict_requests.fetch_add(1, Relaxed);
+            msg = rx.recv() => match apply_dispatch_msg(msg, ctx, queue, free, in_flight).await {
+                MsgEffect::End(end) => return SettleOutcome::End(end),
+                MsgEffect::Applied(Some(units)) => {
+                    queued_units = queued_units.saturating_add(units);
                     if queued_units >= bounds.units {
                         return SettleOutcome::Continue;
                     }
                 }
-                Some(DispatchMsg::Trim(worker_id)) => {
-                    try_trim(ctx, free, in_flight, worker_id, queue.len());
-                }
-                Some(DispatchMsg::ReapIdle) => {
-                    if let Some(message) = reap_idle_replicas(ctx, free).await {
-                        return SettleOutcome::End(End::Fatal(message));
-                    }
-                }
+                MsgEffect::Applied(None) => {}
             },
         }
     }
@@ -589,18 +621,12 @@ pub(crate) async fn run_dispatcher(
             let shapes: Vec<WindowItem> = queue.iter().map(|queued| queued.shape).collect();
             let take = window_take_count(&shapes, bounds);
             let window: Vec<Queued> = queue.drain(..take).collect();
-            let window_units: u64 = window
-                .iter()
-                .map(|queued| queued.shape.units)
-                .fold(0u64, u64::saturating_add);
-            let window_items: usize = window
-                .iter()
-                .map(|queued| queued.shape.items)
-                .fold(0usize, usize::saturating_add);
-            let window_bytes: usize = window
-                .iter()
-                .map(|queued| queued.shape.bytes)
-                .fold(0usize, usize::saturating_add);
+            let (mut window_units, mut window_items, mut window_bytes) = (0u64, 0usize, 0usize);
+            for queued in &window {
+                window_units = window_units.saturating_add(queued.shape.units);
+                window_items = window_items.saturating_add(queued.shape.items);
+                window_bytes = window_bytes.saturating_add(queued.shape.bytes);
+            }
             // The freshest items-per-unit and bytes-per-item sample, so it
             // converts the target below; one that priced nothing says nothing
             // and leaves the last sample standing.
@@ -695,20 +721,10 @@ pub(crate) async fn run_dispatcher(
 
         // Wait for work or a freed replica.
         tokio::select! {
-            msg = rx.recv() => match msg {
-                None | Some(DispatchMsg::Shutdown) => break End::Graceful,
-                Some(DispatchMsg::Predict(request)) => {
-                    queue.push_back(enqueue(request, &ctx.cost));
-                    ctx.stats.queue_len.store(queue.len(), Relaxed);
-                    ctx.stats.total_predict_requests.fetch_add(1, Relaxed);
-                }
-                Some(DispatchMsg::Trim(worker_id)) => {
-                    try_trim(&ctx, &mut free, &mut in_flight, worker_id, queue.len());
-                }
-                Some(DispatchMsg::ReapIdle) => {
-                    if let Some(message) = reap_idle_replicas(&ctx, &mut free).await {
-                        break End::Fatal(message);
-                    }
+            msg = rx.recv() => {
+                match apply_dispatch_msg(msg, &ctx, &mut queue, &mut free, &mut in_flight).await {
+                    MsgEffect::End(end) => break end,
+                    MsgEffect::Applied(_) => {}
                 }
             },
             Some(finished) = in_flight.join_next(), if !in_flight.is_empty() => {
@@ -742,22 +758,10 @@ pub(crate) async fn run_dispatcher(
         }
         // Drain what is already queued without blocking; no batching timer.
         loop {
-            match rx.try_recv() {
-                Ok(DispatchMsg::Predict(request)) => {
-                    queue.push_back(enqueue(request, &ctx.cost));
-                    ctx.stats.queue_len.store(queue.len(), Relaxed);
-                    ctx.stats.total_predict_requests.fetch_add(1, Relaxed);
-                }
-                Ok(DispatchMsg::Trim(worker_id)) => {
-                    try_trim(&ctx, &mut free, &mut in_flight, worker_id, queue.len());
-                }
-                Ok(DispatchMsg::ReapIdle) => {
-                    if let Some(message) = reap_idle_replicas(&ctx, &mut free).await {
-                        break 'main End::Fatal(message);
-                    }
-                }
-                Ok(DispatchMsg::Shutdown) => break 'main End::Graceful,
-                Err(_) => break,
+            let Ok(msg) = rx.try_recv() else { break };
+            match apply_dispatch_msg(Some(msg), &ctx, &mut queue, &mut free, &mut in_flight).await {
+                MsgEffect::End(end) => break 'main end,
+                MsgEffect::Applied(_) => {}
             }
         }
     };

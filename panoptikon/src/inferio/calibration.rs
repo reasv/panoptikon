@@ -141,17 +141,36 @@ fn is_zero_u32(value: &u32) -> bool {
 }
 
 impl CalibrationProfile {
-    /// The key tuple, minus `torch` (which has its own fallback tier). A
-    /// mismatch is silent: the row sits in the file matching nothing, exactly
-    /// as a stale-epoch row does.
+    /// The key tuple this row is stored and looked up under, minus `torch`
+    /// (which has its own fallback tier) and `dtype` (absent from a query
+    /// before dtype negotiation resolves). Both readers below go through it, so
+    /// "what makes two rows the same entry" and "what makes a row answer a
+    /// query" cannot drift apart.
+    fn key(&self) -> (&str, u32, &str, &str, &str, &str, &str) {
+        (
+            &self.inference_id,
+            self.epoch,
+            &self.gpu,
+            &self.unit,
+            &self.aggregation,
+            &self.platform,
+            &self.backend,
+        )
+    }
+
+    /// Whether this row answers `query` under `env`. A mismatch is silent: the
+    /// row sits in the file matching nothing, exactly as a stale-epoch row does.
     fn matches_key(&self, query: &ProfileQuery<'_>, env: &StoreEnv) -> bool {
-        self.inference_id == query.inference_id
-            && self.epoch == query.epoch
-            && self.gpu == query.gpu_name
-            && self.unit == query.unit
-            && self.aggregation == query.aggregation
-            && self.platform == env.platform
-            && self.backend == env.backend
+        self.key()
+            == (
+                query.inference_id,
+                query.epoch,
+                query.gpu_name,
+                query.unit,
+                query.aggregation,
+                env.platform.as_str(),
+                env.backend.as_str(),
+            )
     }
 
     /// Drop every local-authority field, so a maintainer can copy a local file
@@ -164,20 +183,11 @@ impl CalibrationProfile {
         self.sample_reserved_mb.clear();
     }
 
-    /// Every field of the key an entry is stored under — what makes two
-    /// entries the *same* entry for merge purposes. Must agree with
-    /// [`Self::matches_key`]: rows that cannot answer one query must not
-    /// merge.
+    /// What makes two entries the *same* entry for merge purposes: the shared
+    /// [`Self::key`] plus the two fields a query cannot always state. Not
+    /// `dtype_method`, which keys nothing.
     fn same_entry(&self, other: &Self) -> bool {
-        self.inference_id == other.inference_id
-            && self.epoch == other.epoch
-            && self.gpu == other.gpu
-            && self.unit == other.unit
-            && self.aggregation == other.aggregation
-            && self.platform == other.platform
-            && self.backend == other.backend
-            && self.torch == other.torch
-            && self.dtype == other.dtype
+        self.key() == other.key() && self.torch == other.torch && self.dtype == other.dtype
     }
 
     /// The persisted sample ring, or empty when the two arrays disagree: a

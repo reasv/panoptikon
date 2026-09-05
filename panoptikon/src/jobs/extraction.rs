@@ -462,6 +462,36 @@ struct JobCounters {
     inference_time: PhaseTimer,
 }
 
+impl JobCounters {
+    /// The `data_log` row these counters make. Every writer of that row goes
+    /// through here, so the eight counted fields cannot drift between the
+    /// per-item progress updates and the two endings; the four the call site
+    /// owns are what is left, whether the job is over, its own word for how
+    /// it ended and why.
+    fn data_log_update(
+        &self,
+        total_remaining: i64,
+        finished: bool,
+        outcome: &'static str,
+        failure_reason: Option<String>,
+    ) -> DataLogUpdate {
+        DataLogUpdate {
+            image_files: self.image_files,
+            video_files: self.video_files,
+            other_files: self.other_files,
+            total_segments: self.total_segments,
+            errors: self.errors,
+            input_errors: self.input_errors,
+            total_remaining,
+            data_load_time: self.data_load_time.busy_secs(),
+            inference_time: self.inference_time.busy_secs(),
+            finished,
+            outcome,
+            failure_reason,
+        }
+    }
+}
+
 /// How many of a job's unexplained item failures are recorded individually.
 /// The count in `data_log` stays exact; this bounds only the *listing*, which
 /// would otherwise be one row per item whenever the inference server is down.
@@ -523,6 +553,13 @@ enum JobFailure {
     /// Every attempted item failed and at least one failure was not
     /// input-side: a systemic cause (inference server down, model broken).
     Systemic,
+}
+
+/// The reason a systemically failed job records and returns, in one place:
+/// the stored `failure_reason` and the error the caller sees are the same
+/// sentence about the same count.
+fn systemic_failure_reason(errors: i64) -> String {
+    format!("All {errors} attempted items failed; check the inference server")
 }
 
 /// Items this job attempted, could **not** finish, and has no verdict for:
@@ -738,24 +775,16 @@ async fn finalize_unfinished_job(
         let mut guard = counters.lock().await;
         let failures = std::mem::take(&mut guard.failures);
         let dropped = guard.failures_dropped;
-        let update = DataLogUpdate {
-            image_files: guard.image_files,
-            video_files: guard.video_files,
-            other_files: guard.other_files,
-            total_segments: guard.total_segments,
-            errors: guard.errors,
-            input_errors: guard.input_errors,
-            // Best available: the job stopped before it could re-run its own
-            // work query, so what is left is what it never got to.
-            total_remaining: total_remaining.saturating_sub(guard.processed),
-            data_load_time: guard.data_load_time.busy_secs(),
-            inference_time: guard.inference_time.busy_secs(),
-            // Not finished: `data_jobs.completed` must stay 0 so the
-            // atomic cleanup can do its work.
-            finished: false,
-            outcome: OUTCOME_FAILED,
-            failure_reason: Some(reason.to_string()),
-        };
+        // `total_remaining` is the best available: the job stopped before it
+        // could re-run its own work query, so what is left is what it never
+        // got to. Not finished, so `data_jobs.completed` stays 0 and the
+        // atomic cleanup can do its work.
+        let update = guard.data_log_update(
+            total_remaining.saturating_sub(guard.processed),
+            false,
+            OUTCOME_FAILED,
+            Some(reason.to_string()),
+        );
         (update, failures, dropped)
     };
     write_job_failures(index_db, job_id, failures, dropped).await;
@@ -1167,32 +1196,18 @@ async fn run_extraction_job_inner(
         let (outcome, failure_reason) = if let Some(reason) = abort.reason() {
             (OUTCOME_FAILED, Some(reason.to_string()))
         } else if failure == JobFailure::Systemic {
-            (
-                OUTCOME_FAILED,
-                Some(format!(
-                    "All {} attempted items failed; check the inference server",
-                    guard.errors
-                )),
-            )
+            (OUTCOME_FAILED, Some(systemic_failure_reason(guard.errors)))
         } else if let Some(reason) = &partial_reason {
             (OUTCOME_PARTIAL, Some(reason.clone()))
         } else {
             (OUTCOME_COMPLETED, None)
         };
-        let update = DataLogUpdate {
-            image_files: guard.image_files,
-            video_files: guard.video_files,
-            other_files: guard.other_files,
-            total_segments: guard.total_segments,
-            errors: guard.errors,
-            input_errors: guard.input_errors,
-            total_remaining: remaining_after,
-            data_load_time: guard.data_load_time.busy_secs(),
-            inference_time: guard.inference_time.busy_secs(),
-            finished: failure != JobFailure::Systemic && !abort.is_set(),
+        let update = guard.data_log_update(
+            remaining_after,
+            failure != JobFailure::Systemic && !abort.is_set(),
             outcome,
             failure_reason,
-        };
+        );
         // The stored times are phase wall-clock (busy); aggregate worker time
         // only goes to the log, where work / busy reads as average parallelism.
         tracing::info!(
@@ -1234,9 +1249,8 @@ async fn run_extraction_job_inner(
         return Err(ApiError::internal(reason.to_string()));
     }
     if failure == JobFailure::Systemic {
-        return Err(ApiError::internal(format!(
-            "All {} attempted items failed; check the inference server",
-            final_update.errors
+        return Err(ApiError::internal(systemic_failure_reason(
+            final_update.errors,
         )));
     }
     summary.or_with(ChangeSummary {
@@ -1367,40 +1381,51 @@ async fn process_item(
     let item_type = item.item_type.clone();
     let sha256 = item.sha256.clone();
     let path = item.path.clone();
+    // A verdict on the item's own media, written once for the two stages that
+    // can reach one: the ledger row and the log line, the item's
+    // finalisation, and then the error only if the failure was not recorded.
+    // A recorded verdict returns `Ok`, so the job carries on with the rest.
+    let record_verdict = async |stage: &str,
+                                sha256: &str,
+                                path: &str,
+                                item_type: &str,
+                                segments: i64,
+                                err: ApiError| {
+        let (outcome, returned) =
+            record_item_failure(index_db, model, job_id, stage, sha256, path, &counters, err).await;
+        finalize_item(
+            index_db,
+            job_id,
+            item_type,
+            segments,
+            outcome,
+            counters.clone(),
+            total_remaining,
+        )
+        .await;
+        match returned {
+            Some(err) => Err(err),
+            // Already logged with its path, sha256, stage and class, and
+            // recorded in the ledger: the item is done for this job and the
+            // job continues.
+            None => Ok(()),
+        }
+    };
     let load_span = counters.lock().await.data_load_time.start();
     let prepare_result = input_handlers::prepare_item(index_db, model, item, detect_outros).await;
     drop(load_span);
     let prepared = match prepare_result {
         Ok(prepared) => prepared,
         Err(err) => {
-            let (outcome, returned) = record_item_failure(
-                index_db,
-                model,
-                job_id,
+            return record_verdict(
                 crate::db::extraction_errors::STAGE_PREPARE,
                 &sha256,
                 &path,
-                &counters,
+                &item_type,
+                0,
                 err,
             )
             .await;
-            finalize_item(
-                index_db,
-                job_id,
-                &item_type,
-                0,
-                outcome,
-                counters,
-                total_remaining,
-            )
-            .await;
-            return match returned {
-                Some(err) => Err(err),
-                // Already logged with its path, sha256, stage and class, and
-                // recorded in the ledger: the item is done for this job and
-                // the job continues.
-                None => Ok(()),
-            };
         }
     };
 
@@ -1465,7 +1490,7 @@ async fn process_item(
         return Ok(());
     }
     let mut requeued = false;
-    let inference = match run_item_inference(
+    let inference_result = run_item_inference(
         &model.setter_name,
         pool,
         unit_slots,
@@ -1476,45 +1501,60 @@ async fn process_item(
         abort,
         &mut requeued,
     )
-    .await
-    {
+    .await;
+
+    // The transient item-failure sequence, written once for the three paths
+    // that reach it. A failure of the machinery, never a verdict on the
+    // media: no ledger row is written and the item stays selectable next run.
+    let note_transient = async |stage: &str, error: String, detail: String| {
+        tracing::error!(
+            path = %prepared.item.path,
+            sha256 = %prepared.item.sha256,
+            stage,
+            error_class = "transient",
+            error = %error,
+            "extraction item failed"
+        );
+        note_job_failure(
+            &counters,
+            &model.setter_name,
+            stage,
+            &prepared.item.sha256,
+            requeued,
+            detail,
+        )
+        .await;
+    };
+    // The two inference paths that give up on the item add its finalisation
+    // and the error the caller returns: only a *typed* worker verdict may say
+    // an item's payload is bad, so an unclassified failure is retried.
+    let fail_inference = async |error: String, detail: String| -> ApiError {
+        note_transient(
+            crate::db::extraction_errors::STAGE_INFERENCE,
+            error.clone(),
+            detail,
+        )
+        .await;
+        finalize_item(
+            index_db,
+            job_id,
+            &prepared.item.item_type,
+            segments,
+            ItemOutcome::Failed,
+            counters.clone(),
+            total_remaining,
+        )
+        .await;
+        ApiError::internal(format!("Inference failed: {error}"))
+    };
+
+    let inference = match inference_result {
         Ok(Some(inference)) => inference,
         // The abort was raised by *this* item's request: same rule as above,
         // nothing counted, the driver stops dispatching.
         Ok(None) => return Ok(()),
         Err(err) => {
-            // A failure of the predict call itself stays transient: only a
-            // *typed* worker verdict may say an item's payload is bad, so an
-            // unclassified failure is retried, never suppressed.
-            tracing::error!(
-                path = %prepared.item.path,
-                sha256 = %prepared.item.sha256,
-                stage = crate::db::extraction_errors::STAGE_INFERENCE,
-                error_class = "transient",
-                error = %err,
-                "extraction item failed"
-            );
-            let api_err = ApiError::internal(format!("Inference failed: {err}"));
-            note_job_failure(
-                &counters,
-                &model.setter_name,
-                crate::db::extraction_errors::STAGE_INFERENCE,
-                &prepared.item.sha256,
-                requeued,
-                format!("{err:#}"),
-            )
-            .await;
-            finalize_item(
-                index_db,
-                job_id,
-                &prepared.item.item_type,
-                segments,
-                ItemOutcome::Failed,
-                counters,
-                total_remaining,
-            )
-            .await;
-            return Err(api_err);
+            return Err(fail_inference(err.to_string(), format!("{err:#}")).await);
         }
     };
 
@@ -1544,65 +1584,22 @@ async fn process_item(
             inference.outputs
         }
         SlotVerdict::Transient(detail) => {
-            tracing::error!(
-                path = %prepared.item.path,
-                sha256 = %prepared.item.sha256,
-                stage = crate::db::extraction_errors::STAGE_INFERENCE,
-                error_class = "transient",
-                error = %detail,
-                "extraction item failed"
-            );
-            note_job_failure(
-                &counters,
-                &model.setter_name,
-                crate::db::extraction_errors::STAGE_INFERENCE,
-                &prepared.item.sha256,
-                requeued,
-                detail.clone(),
-            )
-            .await;
-            finalize_item(
-                index_db,
-                job_id,
-                &prepared.item.item_type,
-                segments,
-                ItemOutcome::Failed,
-                counters,
-                total_remaining,
-            )
-            .await;
-            return Err(ApiError::internal(format!("Inference failed: {detail}")));
+            return Err(fail_inference(detail.clone(), detail).await);
         }
         SlotVerdict::InputMedia(detail) => {
             // The worker — the component that actually decoded the bytes —
             // rejected every one of this item's inputs. That is a verdict on
             // the media, recorded at the inference stage with the confirmed
             // threshold (a decode of bytes the worker already had in hand).
-            let (outcome, returned) = record_item_failure(
-                index_db,
-                model,
-                job_id,
+            return record_verdict(
                 crate::db::extraction_errors::STAGE_INFERENCE,
                 &prepared.item.sha256,
                 &prepared.item.path,
-                &counters,
+                &prepared.item.item_type,
+                segments,
                 ApiError::input(detail),
             )
             .await;
-            finalize_item(
-                index_db,
-                job_id,
-                &prepared.item.item_type,
-                segments,
-                outcome,
-                counters,
-                total_remaining,
-            )
-            .await;
-            return match returned {
-                Some(err) => Err(err),
-                None => Ok(()),
-            };
         }
     };
 
@@ -1618,20 +1615,9 @@ async fn process_item(
     if let Err(err) = &result {
         // Storing the output is the gateway's own DB work: never a verdict on
         // the media, so it is counted and retried like any other transient.
-        tracing::error!(
-            path = %prepared.item.path,
-            sha256 = %prepared.item.sha256,
-            stage = STAGE_OUTPUT,
-            error_class = "transient",
-            error = %err.detail(),
-            "extraction item failed"
-        );
-        note_job_failure(
-            &counters,
-            &model.setter_name,
+        note_transient(
             STAGE_OUTPUT,
-            &prepared.item.sha256,
-            requeued,
+            err.detail().to_string(),
             err.detail().to_string(),
         )
         .await;
@@ -2329,21 +2315,12 @@ async fn finalize_item(
             }
         }
 
-        let remaining = total_remaining.saturating_sub(guard.processed);
-        DataLogUpdate {
-            image_files: guard.image_files,
-            video_files: guard.video_files,
-            other_files: guard.other_files,
-            total_segments: guard.total_segments,
-            errors: guard.errors,
-            input_errors: guard.input_errors,
-            total_remaining: remaining,
-            data_load_time: guard.data_load_time.busy_secs(),
-            inference_time: guard.inference_time.busy_secs(),
-            finished: false,
-            outcome: OUTCOME_RUNNING,
-            failure_reason: None,
-        }
+        guard.data_log_update(
+            total_remaining.saturating_sub(guard.processed),
+            false,
+            OUTCOME_RUNNING,
+            None,
+        )
     };
     let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
         job_id,

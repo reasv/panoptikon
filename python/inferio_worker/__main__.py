@@ -191,7 +191,7 @@ def _handshake(
 
 
 def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
-    from inferio_worker import memory, protocol
+    from inferio_worker import memory, packing, protocol
     from inferio_worker.inputs import prediction_input_from_frame
 
     impl_cls, batch_memory_frames = _handshake(proto_in, proto_out)
@@ -289,8 +289,6 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 report = memory.finish_load(before, instance)
                 # The per-item pixel canvas only this process can see: a
                 # ceiling in a downloaded processor config (protocol doc).
-                from inferio_worker import packing
-
                 canvas_pixels = packing.impl_canvas_pixels(instance)
                 if canvas_pixels is not None:
                     report["canvas_pixels"] = canvas_pixels
@@ -326,8 +324,6 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 # Admissibility gate: an impl that batches inside `predict`
                 # reports a size the peaks do not describe, so it takes the
                 # grantless path (protocol doc, "Memory grants").
-                from inferio_worker import packing
-
                 if packing.batching_disabled(instance):
                     if not batching_off_logged:
                         batching_off_logged = True
@@ -356,8 +352,6 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     )
                 else:
                     # Granted: the harness prices, packs, clamps, measures.
-                    from inferio_worker import packing
-
                     _send_ok(
                         proto_out,
                         req_id,
@@ -413,8 +407,6 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             # Orchestrator-initiated pool release: not unload, only the
             # allocator's unused blocks, and never an error (protocol doc,
             # "Reactive shrink and trim").
-            from inferio_worker import packing
-
             released = memory.empty_cache()
             if released:
                 # The pool regrows from here, so the comparator's rate and

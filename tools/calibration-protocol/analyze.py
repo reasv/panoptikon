@@ -318,11 +318,6 @@ class Context:
                 best = spawn
         return best
 
-    def replica_spawn_t(self, model: str, admitted_t: float) -> Optional[float]:
-        """`replica_spawn`'s timestamp alone."""
-        spawn = self.replica_spawn(model, admitted_t)
-        return None if spawn is None else spawn["t_wall"]
-
     def attribute_replica_pid(
         self, pids: List[int], admitted_t: float, spawn_t: Optional[float],
         spawn_pid: Optional[int] = None,

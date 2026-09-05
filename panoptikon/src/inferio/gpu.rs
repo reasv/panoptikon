@@ -248,6 +248,13 @@ fn probe_rocm() -> HostGpus {
         meminfo: roots.meminfo.clone(),
         ambient_hip_restriction,
     };
+    let host = |gpus: Option<Arc<[GpuInfo]>>| HostGpus {
+        caps: HostComputeCaps::unknown(),
+        inventory: GpuInventory {
+            gpus,
+            backend: backend.clone(),
+        },
+    };
     let gpus = match inventory {
         Some(Ok(gpus)) => gpus,
         // Unpriced is safe but indistinguishable from "the feature is not
@@ -255,23 +262,9 @@ fn probe_rocm() -> HostGpus {
         // WARN unless the deciding site already logged the detail.
         Some(Err(failure)) => {
             failure.log();
-            return HostGpus {
-                caps: HostComputeCaps::unknown(),
-                inventory: GpuInventory {
-                    gpus: None,
-                    backend,
-                },
-            };
+            return host(None);
         }
-        None => {
-            return HostGpus {
-                caps: HostComputeCaps::unknown(),
-                inventory: GpuInventory {
-                    gpus: None,
-                    backend,
-                },
-            };
-        }
+        None => return host(None),
     };
     for gpu in &gpus {
         tracing::info!(
@@ -285,13 +278,7 @@ fn probe_rocm() -> HostGpus {
             "detected GPU"
         );
     }
-    HostGpus {
-        caps: HostComputeCaps::unknown(),
-        inventory: GpuInventory {
-            gpus: Some(gpus.into()),
-            backend,
-        },
-    }
+    host(Some(gpus.into()))
 }
 
 /// One synthetic unified-memory device from macOS kernel facts (`mps.rs`);
@@ -704,38 +691,35 @@ impl GpuInventory {
         self.gpus.as_deref()
     }
 
+    /// The one unified-memory device's key and RAM figure, for the two
+    /// backends whose whole inventory is that device. The RAM comes off the
+    /// GPU itself — the same fact that flags it unified — so the refresh and
+    /// the flag can never disagree about which memory this GPU is made of.
+    /// `None` where there is no GPU at all (off macOS, or a reader that said
+    /// nothing) or no RAM figure: nothing to refresh either way.
+    fn first_unified_ram_mb(&self) -> Option<(String, u64)> {
+        let gpu = self.gpus().and_then(<[GpuInfo]>::first)?;
+        Some((gpu.uuid.clone(), gpu.unified_ram_mb?))
+    }
+
     /// The live-memory interface for these GPUs, resolved once so the
     /// ledger's refresh can never ask nvidia-smi about an AMD GPU. The ROCm
     /// arm is **total or nothing**: every row must carry the PCI address the
     /// counters are keyed by, or the refresh is withdrawn entirely.
     pub(super) fn memory_query(&self) -> MemoryQuery {
         if let MemoryBackend::Cpu { meminfo } = &self.backend {
-            // As on MPS, the RAM figure comes off the GPU itself — the same
-            // fact that flags it unified — so the refresh and the flag can
-            // never disagree about which memory this GPU is made of.
-            return match self.gpus().and_then(<[GpuInfo]>::first) {
-                Some(gpu) => match gpu.unified_ram_mb {
-                    Some(ram_mb) => MemoryQuery::Cpu {
-                        key: gpu.uuid.clone(),
-                        ram_mb,
-                        meminfo: meminfo.clone(),
-                    },
-                    None => MemoryQuery::Unavailable,
+            return match self.first_unified_ram_mb() {
+                Some((key, ram_mb)) => MemoryQuery::Cpu {
+                    key,
+                    ram_mb,
+                    meminfo: meminfo.clone(),
                 },
                 None => MemoryQuery::Unavailable,
             };
         }
         if matches!(self.backend, MemoryBackend::Mps) {
-            return match self.gpus().and_then(<[GpuInfo]>::first) {
-                Some(gpu) => match gpu.unified_ram_mb {
-                    Some(ram_mb) => MemoryQuery::Mps {
-                        key: gpu.uuid.clone(),
-                        ram_mb,
-                    },
-                    None => MemoryQuery::Unavailable,
-                },
-                // No GPU (off macOS, or sysctl said nothing): nothing to
-                // refresh, and not nvidia-smi's business.
+            return match self.first_unified_ram_mb() {
+                Some((key, ram_mb)) => MemoryQuery::Mps { key, ram_mb },
                 None => MemoryQuery::Unavailable,
             };
         }
@@ -1076,7 +1060,7 @@ impl GpuInventory {
     fn resolve_hip_pin_uninventoried(&self, requested: Option<&str>) -> Option<String> {
         // No request is no pin here: with no GPUs there is no default either.
         let trimmed = requested?.trim();
-        if let Some(pin) = canonical_hip_pin(trimmed) {
+        if let Some(pin) = canonical_index_list(trimmed) {
             return Some(pin);
         }
         tracing::warn!(
@@ -1091,18 +1075,10 @@ impl GpuInventory {
     }
 }
 
-/// The HIP-legal pin forms, canonicalised: one device index, or a list of
-/// them. `None` for anything HIP cannot read as an index, which on ROCm means
-/// "write no pin at all".
-fn canonical_hip_pin(value: &str) -> Option<String> {
-    if let Ok(index) = value.parse::<u32>() {
-        return Some(index.to_string());
-    }
-    canonical_index_list(value)
-}
-
-/// A HIP-shaped multi-device pin: at least one entry, every entry a device
-/// index; trailing and empty entries are ignored, as HIP's own parser does.
+/// A HIP-shaped pin: at least one entry, every entry a device index; a lone
+/// index is the one-entry case. Trailing and empty entries are ignored, as
+/// HIP's own parser does. `None` for anything HIP cannot read as an index,
+/// which on ROCm means "write no pin at all".
 /// Returns the **canonical** rendering — entries re-parsed and re-joined with
 /// `,` — because `prewarm.rs` claims a parked worker only when the two pin
 /// strings are byte-equal, so `" 0 "` and `"00"` would defeat pooling.
