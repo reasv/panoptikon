@@ -13,13 +13,12 @@ Usage
         --model 'id=tags/wd-vit-tagger-v3,concurrency=2,items=64' \
         --model 'id=clip/apple_MobileCLIP-S1,concurrency=2,items=64'
 
-Model spec (comma-separated `key=value`, repeatable `--model`):
+Model spec (comma-separated `key=value`, repeatable `--model`; defaults in ()):
     id=<inference_id>  required   | concurrency=N (1)   | items=N (8)
-    corpus=PATH (--corpus)        | group=NAME          | kind=NAME
-    mode=file|text|auto (auto)    | requests=N          | max_batch=N
+    corpus=PATH (--corpus) | group=NAME | kind=NAME | requests=N | max_batch=N
+    mode=file|text|auto (auto)
     cache_key=S (`loadgen`)       | lru_size=N (1)      | ttl_seconds=N (600)
-    order=sequential|random (sequential)
-    data=<json object>  merged into every input entry, e.g. {"threshold":0.1}
+    order=sequential|random (sequential)  | data=<json>, merged into each entry
     interval=SECONDS    minimum wall time between the *starts* of two requests
                         on one slot (0 = flat out), so a soak can hold a low
                         steady rate; with concurrency=N the rate is N/interval.
@@ -498,8 +497,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if deadline is not None and time.monotonic() >= deadline:
                 return
             if spec.interval > 0.0:
-                # Pace the *starts*, so a slow response does not add to the gap
-                # and the rate stays what the scenario asked for.
+                # Pace the *starts*: a slow response must not widen the gap.
                 while not _stop.is_set():
                     wait = next_start - time.monotonic()
                     if wait <= 0:

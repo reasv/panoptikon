@@ -17,10 +17,9 @@ Runs until SIGINT/SIGTERM (or `--duration`), flushes, exits 0. With no
 
 Output schema (JSONL)
 ---------------------
-Line 1 is a `"kind": "header"` object: the argv, interval and host, an
-`"nvml"` block (`available`, `driver_version`, `nvml_version`, `error`) and
-the `"gpus"` inventory (`index`, `uuid`, `name`, `total_mb`, `pci_bus_id`).
-Every later line is a sample:
+Line 1 is a `"kind": "header"` object: argv, interval, host, an `"nvml"` block
+(`available`, `driver_version`, `nvml_version`, `error`) and the `"gpus"`
+inventory (`index`, `uuid`, `name`, `total_mb`, `pci_bus_id`). Then samples:
 
     {"schema": "vramrec/1", "kind": "sample", "seq", "t_mono", "t_wall",
      "iso", "sample_ms",
@@ -35,7 +34,7 @@ Every later line is a sample:
 
 `used_mb` per process is NVML's `usedGpuMemory`, `null` (never 0) when the
 driver reports N/A -- on Windows WDDM, and in a container started without
-`--pid=host`, where NVML lists host PIDs. All MB are MiB.
+`--pid=host` (NVML then lists host PIDs). All MB are MiB.
 
 Top-level `procs` lists every process whose cmdline matches `--filter`, VRAM
 or not, so a CPU-GPU run and a worker's RSS/VmHWM come from one instrument. A
