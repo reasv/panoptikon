@@ -19,7 +19,7 @@ import logging
 import re
 import sys
 import time
-from typing import Any, Iterable, NamedTuple, Sequence
+from typing import Any, Callable, Iterable, NamedTuple, Sequence
 
 from inferio_worker import memory
 
@@ -1034,10 +1034,25 @@ def _note_throughput(
     _last_growth = (priced, rate)
 
 
-def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> dict[str, Any]:
+def run_window(
+    instance: Any,
+    inputs: Sequence[Any],
+    grant: dict[str, Any],
+    emit_memory: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Run one granted window and build the `predict` `ok` payload: outputs in
     the original input order, plus measurements and a memory sample. Raises
-    [`WindowFailure`] when a batch fails, carrying what ran."""
+    [`WindowFailure`] when a batch fails, carrying what ran.
+
+    `emit_memory`, when the orchestrator asked for it in the handshake
+    (`batch_memory_frames`), is called with a fresh memory sample after every
+    batch that is not the window's last — the per-batch memory frame of
+    docs/inferio-worker-protocol.md. It exists because a window is the only
+    time this process's pool grows while the orchestrator hears nothing: it
+    nets a device-wide free reading (which every *other* replica's replies keep
+    fresh) against our pool figure from our own last reply, and books the
+    difference as another process's memory. Nothing here reads it back, so a
+    window runs identically with or without it."""
     unit = str(grant.get("unit") or "item")
     aggregation = str(grant.get("aggregation") or "count")
     budget = grant.get("unit_budget")
@@ -1206,6 +1221,18 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
             outputs[index] = output
         remaining = set(pending) - set(batch)
         pending = [index for index in pending if index in remaining]
+
+        # The per-batch memory frame, and only while work remains: the reply
+        # below carries this same sample, so a frame after the last batch would
+        # buy the orchestrator nothing and cost one more driver query.
+        # `device_memory_sample` takes the free reading **beside** the pool
+        # reading rather than reusing the clamp's pre-batch `live.free_mb`:
+        # pairing a pre-batch free with a post-batch pool understates external
+        # usage, which is the one direction that is not safe to be wrong in.
+        if emit_memory is not None and pending:
+            sample = memory.device_memory_sample()
+            if sample is not None:
+                emit_memory(sample)
 
     payload: dict[str, Any] = {"outputs": outputs, "measurements": measurements}
     sample = memory.device_memory_sample()

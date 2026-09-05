@@ -20,6 +20,12 @@ worker ignores the request fields and omits the response ones, an older
 orchestrator sends neither and ignores whatever comes back — so the version
 stays 2.
 
+2026-09-05: the `batch_memory_frames` handshake capability and the
+mid-request `memory` frame it enables (see "Per-batch memory frames" below).
+Additive in both directions — an orchestrator predating it never sets the
+key and so never receives a frame, a worker predating it ignores the key like
+any other unknown one — so the version stays 2 here too.
+
 2026-08-01: MPS (Apple Silicon) reports memory like every other backend —
 `free_source: "mps"`, `base_method: "mps"`, an authoritative `gpu_total_mb`,
 and spawn-env lines for the allocator watermarks
@@ -126,7 +132,7 @@ continues (does not exit).
 
 | type | fields | semantics |
 |---|---|---|
-| `handshake` | `protocol_version` (int, =2), `impl_class` (str — value matched against impl `name()`), `impl_dirs` (array of str — absolute paths searched for impl modules, in order) | First frame after spawn. Worker locates the impl class and replies `ok`. Does NOT instantiate and does NOT load weights — the worker's identity is the impl class, so a prewarmed worker can later be claimed for any model of that family. |
+| `handshake` | `protocol_version` (int, =2), `impl_class` (str — value matched against impl `name()`), `impl_dirs` (array of str — absolute paths searched for impl modules, in order), `batch_memory_frames` (bool, optional — see "Per-batch memory frames") | First frame after spawn. Worker locates the impl class and replies `ok`. Does NOT instantiate and does NOT load weights — the worker's identity is the impl class, so a prewarmed worker can later be claimed for any model of that family. |
 | `prewarm` | — | Calls the impl's optional `prepare()` classmethod (imports heavy deps, must not load weights or touch the GPU allocator; default absent = no-op → plain `ok`). Allowed only between `handshake` and `configure`; idempotent. Errors are per-request (`error` reply, worker stays alive and still usable — a failed prepare just means the later `load` pays the imports). |
 | `configure` | `inference_id` (str, "group/name", for logs), `config` (map — resolved kwargs for the impl `__init__`) | Instantiates `impl_class(**config)`. Exactly once per worker, before `load`; a second `configure`, or `load`/`predict` before it, is a per-request `error`. |
 | `load` | — | Calls `instance.load()`. Requires prior `configure`. Idempotent (repeat → `ok` without reloading, matching today's `InferenceModel.load()` guard semantics). |
@@ -146,6 +152,7 @@ Normal spawn flow: `handshake` → `configure` → `load`. Pooled flow:
 |---|---|---|
 | `ok` | request-specific payload (below) | Success for the echoed `id`. |
 | `error` | `message` (str), `traceback` (str, may be empty) | Failure for the echoed `id`. The worker stays alive and serviceable after an `error` (a failed predict/load must not require a respawn) — except a failed `handshake`, after which it exits non-zero. |
+| `memory` | `memory` (a memory sample map) | **Not a response.** Telemetry for the request whose `id` it echoes, written *before* that request's `ok`/`error` — the only frame that may precede a terminal reply. Sent only from inside a granted `predict`, and only when the orchestrator set `batch_memory_frames` in the handshake. See "Per-batch memory frames". |
 
 ### Memory grants (optional `predict` request fields)
 
@@ -1146,6 +1153,66 @@ are per-batch rather than cumulative. A worker that packs one request frame
 into several GPU batches reports one entry per batch; a request with no
 `grant` reports a single entry covering the whole `predict` call, which is why
 the field is an array in both cases.
+
+### Per-batch memory frames
+
+Added 2026-09-05. Every field above reaches the orchestrator on a *response*,
+which is exactly when a replica spending a large grant cannot send one: it is
+inside a window, and its next reply is minutes away. Meanwhile `free_mb` is
+device-wide and refreshes from any *other* replica's batch or reply, so the
+orchestrator ends up netting a current free reading against this replica's
+pool figure from before the window and booking the difference — up to the
+whole grant — as another process's memory. Measured on the run2/S9 soak: on a
+GPU with two residents, 29 % of samples breached the external-usage oracle,
+median shortfall 52 GB, `headroom` pinned at 0 for 23.8 % of busy samples.
+
+So a granted `predict` may write, on the same stream and **before** its
+terminal reply, frames of the form:
+
+```
+{"type": "memory", "id": <the request now in flight>, "memory": <a memory sample>}
+```
+
+The payload is the same memory sample map as everywhere else in this section —
+no new vocabulary, and no sequence number, since ordering is stream order and
+every consumer rule is by capture instant. The rules:
+
+- **Opt-in, one-way.** The frame is written only when the handshake request
+  carried `batch_memory_frames: true`. An orchestrator that predates the
+  capability never sets the key and so receives nothing; a worker that
+  predates it ignores the key like any other unknown one and sends nothing.
+  Neither side needs the other's answer, which is why the version stays 2 —
+  it is exact-equality on both sides, and bumping it would break every stale
+  environment over an additive key.
+- **The id is the request in flight**, never a fresh one. A `memory` frame
+  carrying any other id is a desynchronized stream and is fatal, exactly as an
+  unexpected frame type is. An orchestrator that asked for the frames reads
+  them in a loop until a frame that is *not* one arrives, and judges that
+  frame exactly as it would have without the capability.
+- **Only from inside the window.** A frame written after a request's terminal
+  reply desynchronizes the stream permanently, so a worker emits them only
+  from the packing harness, bound to the id it was entered with. The
+  grantless `predict` path emits none (it has no batch boundaries).
+- **The sample is taken whole, at the frame.** Both halves — the pool figure
+  and the free reading — come from one instant. Reusing the defensive clamp's
+  *pre-batch* free reading beside a post-batch pool figure would understate
+  external usage, which is the one direction it is not safe to be wrong in, so
+  the frame pays its own driver query — the same query the clamp already pays
+  once per batch.
+- **Telemetry, never a measurement.** The frame states where the pool is, not
+  what a batch cost. It contributes nothing to the cost fit and moves no
+  measurement watermark.
+- Frames are skipped after the window's **last** batch: the reply that follows
+  carries the same sample.
+
+A worker with nothing to measure (no torch, no CUDA context, no driver source)
+sends no frames at all, whatever the handshake asked for — the same silence it
+answers every other memory-sensing field with.
+
+Timeouts are unchanged and cover the whole exchange rather than one frame, so
+a worker that streams frames instead of replying runs out of time exactly when
+a silent one would. On the deadline-less `predict` it can hang the request,
+which is what a hung `predict` already does.
 
 ### Memory sensing on `error` frames
 

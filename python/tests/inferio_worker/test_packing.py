@@ -1624,3 +1624,83 @@ def test_a_ceiling_that_cannot_be_trusted_is_no_ceiling_at_all():
     packing.run_window(model, image_items(3), grant(unit_budget=1, unit="item"))
     assert model.asked == []
     assert [len(batch) for batch in model.batches] == [1, 1, 1]
+
+
+# --- Per-batch memory frames ---
+
+
+def test_a_granted_window_reports_its_pool_after_every_batch_but_the_last(
+    fake_torch,
+):
+    """The frame the ledger needs mid-window: one sample per batch boundary,
+    carrying the pool *as it grew* and a free reading taken beside it.
+
+    The last batch is deliberately silent — the `ok` reply that follows it
+    microseconds later carries the same sample, so a frame there would buy
+    nothing and cost one more driver query."""
+    emitted: list[dict] = []
+    model = Recorder(grow=lambda count: fake_torch.grow_pool(100 * count))
+    payload = packing.run_window(
+        model, items(6), grant(unit_budget=2), emitted.append
+    )
+
+    assert [len(batch) for batch in model.batches] == [2, 2, 2]
+    assert len(emitted) == 2, "three batches, two batch boundaries"
+    # The pool the orchestrator would otherwise not hear about until the reply.
+    assert [sample["reserved_mb"] for sample in emitted] == [200, 400]
+    assert payload["memory"]["reserved_mb"] == 600, "the reply is still last"
+    # The free reading is the frame's own, taken with the pool reading and not
+    # borrowed from the clamp's pre-batch one: pairing a pre-batch free with a
+    # post-batch pool understates external usage.
+    for sample in emitted:
+        assert sample["free_source"] == "torch"
+        assert sample["free_mb"] is not None
+        assert sample["total_mb"] is not None
+
+
+def test_a_window_runs_identically_with_and_without_the_emitter(fake_torch):
+    """The old-orchestrator direction of the skew: no emitter, no frames, and
+    a payload that is the same object graph either way."""
+    without = packing.run_window(Recorder(), items(5), grant(unit_budget=2))
+    emitted: list[dict] = []
+    with_frames = packing.run_window(
+        Recorder(), items(5), grant(unit_budget=2), emitted.append
+    )
+    assert len(emitted) == 2
+    for payload in (without, with_frames):
+        payload["measurements"] = [
+            {key: value for key, value in measurement.items()
+             if key != "duration_ms"}
+            for measurement in payload["measurements"]
+        ]
+    assert without == with_frames
+
+
+def test_a_worker_that_can_measure_nothing_emits_nothing():
+    """No torch, no sample, no frame — the same silence a worker with no GPU
+    answers every other memory-sensing field with."""
+    emitted: list[dict] = []
+    packing.run_window(Recorder(), items(6), grant(unit_budget=2), emitted.append)
+    assert emitted == []
+
+
+def test_the_emitter_is_bound_to_the_request_in_flight():
+    """`_memory_frame_emitter` is the whole desynchronization argument: it
+    writes the id it was built with, and it does not exist at all unless the
+    orchestrator asked for the frames in its handshake."""
+    from inferio_worker import __main__ as worker_main
+    from inferio_worker import protocol
+
+    assert worker_main._memory_frame_emitter(io.BytesIO(), 7, False) is None
+
+    stream = io.BytesIO()
+    emit = worker_main._memory_frame_emitter(stream, 7, True)
+    emit({"free_mb": 10, "reserved_mb": 3})
+    stream.seek(0)
+    frame = protocol.read_frame(stream)
+    assert frame == {
+        "type": "memory",
+        "id": 7,
+        "memory": {"free_mb": 10, "reserved_mb": 3},
+    }
+    assert protocol.read_frame(stream) is None, "exactly one frame"

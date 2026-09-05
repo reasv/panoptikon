@@ -21,7 +21,10 @@
 //! - `error` frames are per-request failures; the worker stays alive and the
 //!   method returns a [`WorkerError`] (downcastable from the `anyhow` chain).
 //! - Framing violations (oversized frame, garbage, id mismatch, unexpected
-//!   type), deadline timeouts, and worker exit/EOF are fatal. Every such
+//!   type), deadline timeouts, and worker exit/EOF are fatal — with exactly
+//!   one frame excepted, the per-batch `memory` frame for the request already
+//!   in flight ([`BATCH_MEMORY_FRAMES_FIELD`]), which is telemetry rather than
+//!   a reply and is read and discarded before the reply arrives. Every such
 //!   path — and the requestless idle reap ([`Worker::reap_if_exited`]) —
 //!   funnels through [`Worker::record_death`], which kills and reaps the
 //!   child, poisons the `Worker`, and records and logs one [`WorkerDeath`].
@@ -58,6 +61,19 @@ use crate::process_tree::{
 /// Protocol version this orchestrator speaks; workers answering anything
 /// else in the handshake are killed.
 const PROTOCOL_VERSION: u64 = 2;
+
+/// Handshake capability: this orchestrator reads mid-request `memory` frames
+/// (protocol doc, "Per-batch memory frames"). Announced, never agreed — a
+/// worker that does not know the key ignores it and sends nothing, which is
+/// the whole of the compatibility story in that direction, and one that does
+/// needs no answer because the host tolerates the frames either way. Not a
+/// [`PROTOCOL_VERSION`] bump: the version is exact-equality on both sides, so
+/// bumping it would hard-break every stale user venv over an additive key.
+const BATCH_MEMORY_FRAMES_FIELD: &str = "batch_memory_frames";
+
+/// The type of that frame. It carries the **in-flight** request id and a
+/// memory sample, and nothing else.
+const MEMORY_FRAME_TYPE: &str = "memory";
 
 /// Max frame size (2 GiB; must stay below the u32 length-prefix ceiling).
 /// Either side treats a larger declared length as a fatal protocol error.
@@ -838,6 +854,7 @@ impl Worker {
             ),
             (Value::from("impl_class"), Value::from(impl_class)),
             (Value::from("impl_dirs"), Value::Array(impl_dirs)),
+            (Value::from(BATCH_MEMORY_FRAMES_FIELD), Value::from(true)),
         ];
         let deadline = worker.deadlines.handshake;
         let payload = match worker.roundtrip("handshake", fields, Some(deadline)).await {
@@ -1315,9 +1332,27 @@ impl Worker {
         self.in_flight = true;
         let stdin = &mut self.stdin;
         let stdout = &mut self.stdout;
+        // Disjoint field borrows: the reader below folds a per-batch frame into
+        // the shared telemetry without touching the streams.
+        let telemetry = &self.telemetry;
         let cycle = async {
             send_bytes(stdin, &bytes).await?;
-            read_frame(stdout).await
+            // Everything but the terminal reply for *this* id. Only the
+            // per-batch `memory` frame qualifies; anything else — an unexpected
+            // type, or any frame for another id, this one included — falls
+            // straight through to the checks below and is still fatal.
+            //
+            // The deadline covers the loop, not one frame, so a worker that
+            // streams frames instead of replying is out of time exactly when a
+            // silent one would be. A deadline-less `predict` it can hang, which
+            // is what a hung `predict` already does.
+            loop {
+                let frame = read_frame(stdout).await?;
+                if !is_batch_memory_frame(&frame, id) {
+                    return Ok(frame);
+                }
+                record_memory_frame(telemetry, &frame);
+            }
         };
         let outcome = match deadline {
             Some(limit) => match timeout(limit, cycle).await {
@@ -1746,6 +1781,43 @@ fn field_f64(map: &[(Value, Value)], key: &str) -> Option<f64> {
 
 fn field_string(map: &[(Value, Value)], key: &str) -> Option<String> {
     map_get(map, key)?.as_str().map(str::to_owned)
+}
+
+/// Is this frame the per-batch `memory` frame for the request now in flight?
+///
+/// Type **and** id, both: a `memory` frame for any other id is a
+/// desynchronized stream and keeps the fatal reading it has always had, and so
+/// does every other unexpected type, whatever id it carries. This is the only
+/// frame that is legal before a request's terminal reply, and only because the
+/// worker sends it exclusively from inside the window it belongs to
+/// (`packing.run_window`), against a capability this orchestrator announced.
+fn is_batch_memory_frame(frame: &Value, id: u64) -> bool {
+    let Value::Map(map) = frame else {
+        return false;
+    };
+    map_get(map, "type").and_then(Value::as_str) == Some(MEMORY_FRAME_TYPE)
+        && map_get(map, "id").and_then(Value::as_u64) == Some(id)
+}
+
+/// Fold one such frame into the shared telemetry, exactly as
+/// [`Worker::record_telemetry`] folds a reply's response-level sample: the
+/// ledger's rule is freshest-wins by capture instant, and this is the freshest
+/// thing it will hear about this replica until the reply lands. A frame that
+/// carries no readable sample is a no-op, not an error — the same silence a
+/// worker with nothing to measure answers every memory-sensing field with.
+///
+/// Deliberately **not** a measurement: the frame states where the pool is, not
+/// what a batch cost, so no watermark moves and the cost fit is untouched.
+fn record_memory_frame(telemetry: &TelemetryHandle, frame: &Value) {
+    let Value::Map(map) = frame else {
+        return;
+    };
+    let Some(sample) = MemorySample::parse(map_get(map, "memory")) else {
+        return;
+    };
+    if let Ok(mut telemetry) = telemetry.lock() {
+        telemetry.memory = Some(Timestamped::now(sample));
+    }
 }
 
 impl MemorySample {
@@ -2966,6 +3038,150 @@ mod tests {
             err.downcast_ref::<WorkerError>().is_none(),
             "a version mismatch is fatal supervision, not an error frame"
         );
+    }
+
+    /// A worker on the fake harness that writes the mid-request frame sequence
+    /// named by `mode` before each `predict` reply, already loaded.
+    async fn frame_harness(mode: &str, env: Vec<(&str, &str)>) -> Result<Worker> {
+        let mut cfg = test_spawn_config();
+        cfg.pythonpath.insert(
+            0,
+            workspace_root().join("python/tests/inferio_worker/fake_memory_frames_harness"),
+        );
+        cfg.env
+            .push(("INFERIO_FAKE_FRAMES".to_owned(), mode.to_owned()));
+        cfg.env.extend(
+            env.into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned())),
+        );
+        let mut worker =
+            Worker::spawn_configured(&cfg, "test/frames", &spec("echo_test"), None).await?;
+        worker.load().await?;
+        Ok(worker)
+    }
+
+    /// The pool figure and free reading the worker's telemetry currently holds.
+    fn pool_and_free(worker: &Worker) -> (Option<u64>, Option<u64>) {
+        let telemetry = worker.telemetry();
+        let telemetry = telemetry.lock().expect("telemetry lock");
+        let sample = telemetry
+            .memory
+            .as_ref()
+            .map(|stamped| stamped.value.clone());
+        (
+            sample.as_ref().and_then(|sample| sample.reserved_mb),
+            sample.and_then(|sample| sample.free_mb),
+        )
+    }
+
+    /// The frames a granted window writes *before* its reply are folded into
+    /// telemetry and are not the reply: the outputs still arrive intact and in
+    /// order, and the ledger sees this replica's pool as of its last batch
+    /// rather than as of its last response. This is the whole point of the
+    /// frame — a replica 60 s into a window otherwise reports nothing while a
+    /// neighbour's replies keep the device-wide free reading fresh.
+    #[tokio::test]
+    async fn per_batch_memory_frames_refresh_the_pool_before_the_reply_lands() {
+        // Reply-level sample suppressed, so what is read back is the frames'.
+        let mut worker = frame_harness(
+            "memory",
+            vec![
+                ("INFERIO_FAKE_FRAME_COUNT", "3"),
+                ("INFERIO_FAKE_REPLY_MEMORY", "0"),
+            ],
+        )
+        .await
+        .expect("the fake harness comes up");
+        let outputs = worker
+            .predict(&one(json!("x")), Some(&item_grant(4)), None)
+            .await
+            .expect("three memory frames then ok is one clean roundtrip");
+        assert_eq!(outputs.len(), 1, "the frames are not responses");
+        assert_eq!(
+            pool_and_free(&worker),
+            (Some(300), Some(4096 - 300)),
+            "the last frame's sample, pool and free together"
+        );
+
+        // And the reply's own sample still wins when it carries one: it is the
+        // freshest reading in the exchange, taken after the final batch.
+        let mut worker = frame_harness("memory", vec![("INFERIO_FAKE_FRAME_COUNT", "3")])
+            .await
+            .expect("the fake harness comes up");
+        worker
+            .predict(&one(json!("x")), Some(&item_grant(4)), None)
+            .await
+            .expect("ok");
+        assert_eq!(pool_and_free(&worker).0, Some(400));
+        worker.kill().await;
+    }
+
+    /// Both directions of the skew, and the two frames that must stay fatal.
+    ///
+    /// A worker predating the capability sends nothing and is served exactly
+    /// as before. A `memory` frame for another id is a desynchronized stream,
+    /// and so is any other unexpected type for the id in flight — neither
+    /// reading changed when the reader learned to loop.
+    #[tokio::test]
+    async fn only_a_memory_frame_for_the_id_in_flight_is_tolerated() {
+        let mut silent = frame_harness("silent", Vec::new())
+            .await
+            .expect("a worker that never sends frames comes up");
+        let outputs = silent
+            .predict(&one(json!("x")), Some(&item_grant(4)), None)
+            .await
+            .expect("an old worker's stream is untouched");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(pool_and_free(&silent).0, Some(300), "the reply's sample");
+        silent.kill().await;
+
+        for (mode, label, verdict) in [
+            (
+                "foreign",
+                "a memory frame for another id",
+                "does not match request id",
+            ),
+            (
+                "unknown",
+                "an unexpected frame type for the id in flight",
+                "unexpected response frame type",
+            ),
+        ] {
+            let mut worker = frame_harness(mode, Vec::new())
+                .await
+                .expect("the fake harness comes up");
+            let err = worker
+                .predict(&one(json!("x")), Some(&item_grant(4)), None)
+                .await
+                .expect_err(label);
+            let text = format!("{err:#}");
+            assert!(text.contains(verdict), "{label}: {text}");
+            assert!(
+                err.downcast_ref::<WorkerError>().is_none(),
+                "{label} is fatal supervision, not an error frame"
+            );
+            let after = format!("{:#}", worker.ping().await.expect_err(label));
+            assert!(
+                after.contains("dead after a previous fatal error"),
+                "{label} poisons the worker, as a desynchronized stream must: {after}"
+            );
+            worker.kill().await;
+        }
+    }
+
+    /// The host announces the capability in its handshake. Asserted against a
+    /// harness that refuses to come up without it, so the assertion is on the
+    /// bytes the orchestrator actually wrote.
+    #[tokio::test]
+    async fn the_handshake_announces_the_batch_memory_frame_capability() {
+        let mut worker = frame_harness("require", Vec::new())
+            .await
+            .expect("the handshake carried batch_memory_frames: true");
+        worker
+            .predict(&one(json!("x")), Some(&item_grant(4)), None)
+            .await
+            .expect("ok");
+        worker.kill().await;
     }
 
     fn measurement(items: u64) -> BatchMeasurement {
