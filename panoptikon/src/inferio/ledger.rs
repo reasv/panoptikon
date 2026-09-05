@@ -9594,17 +9594,18 @@ mod tests {
     /// read as one, and an abort is not a death anywhere.
     #[test]
     fn a_death_mid_window_deflates_only_a_unified_device() {
-        // (label, ledger, handle, gpu key, free sample, outcome, deflation, anchor)
-        let cases: Vec<(
-            &str,
+        /// `(label, ledger, handle, gpu key, free sample, outcome, deflation, anchor)`.
+        type DeathCase = (
+            &'static str,
             Arc<VramLedger>,
             TelemetryHandle,
-            &str,
-            (u64, Option<u64>, &str),
+            &'static str,
+            (u64, Option<u64>, &'static str),
             WindowOutcome,
             u32,
             u64,
-        )> = vec![
+        );
+        let cases: Vec<DeathCase> = vec![
             (
                 "a unified Apple GPU",
                 mps_ledger(),
