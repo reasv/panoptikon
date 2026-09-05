@@ -24,7 +24,7 @@ memory ≈ base + slope × units
 where *unit* is the model's declared cost dimension (`metadata.cost` in the
 registry). A profile is one such fit for one model on one **GPU model** in one
 software environment. It is a property of the silicon and the software, not of
-a particular card, so a 12 GB and a 6 GB variant of the same board share one
+a particular card, so a 12 GB and a 6 GB variant of the same GPU share one
 profile and differ only in budget.
 
 A profile is a **prior, never ground truth**: the driver version is
@@ -122,12 +122,12 @@ torch    = "2.11.0+rocm7.2"        # full torch.__version__, as always
 ```
 
 The `gpu` string is not read off any tool. The orchestrator *derives* it from
-kernel sysfs facts — the board's KFD `gfx_target_version` and its VRAM total
+kernel sysfs facts — the GPU's KFD `gfx_target_version` and its VRAM total
 rounded to the nearest GiB — so it is byte-identical on every host carrying
 that silicon and cannot appear, disappear or change spelling with what happens
 to be installed. An amd-smi/rocm-smi marketing name would have been
 environment-dependent, and a key that flips orphans every profile on the
-machine. Write it exactly as the running server names the board (it is the
+machine. Write it exactly as the running server names the GPU (it is the
 display name too, so `GET /api/inference/health` prints it); the VRAM figure
 is what separates SKUs that share a gfx target and do not price alike — a
 16 GB and a 24 GB gfx1100.
@@ -158,14 +158,14 @@ editing.
 `knee_units` itself is *not* stripped — a knee can only ever make a grant
 smaller, which is the one authority a foreign profile has beyond pricing. What
 does not travel with it is the progress towards re-testing it: those windows
-ran on your board, not on the importer's.
+ran on your GPU, not on the importer's.
 
 There is one cap the store deliberately cannot express, and it is worth
 knowing about when a model's `/health` reports a `unit_budget` far below its
 `max_units_measured`: the **shape ceiling** (run2 S1). Some impls have a hard,
 size-dependent kernel limit that is not a memory condition at all — easyOCR's
 detector hits a 32-bit index limit in CRAFT's first pooling kernel at 28 items
-of a 1824×2560 padded tensor, whatever the board has free — and the worker
+of a 1824×2560 padded tensor, whatever the GPU has free — and the worker
 reports the trim as `clamped.reason = "index_limit"`. The orchestrator caps the
 budget and the ramp at the reported size and shows it as `shape_ceiling_units`.
 
@@ -184,7 +184,7 @@ imports it (run2, R1e): it caps from the first grant, and it is re-tested after
 `KNEE_SEED_REVALIDATION_WINDOWS` = 4 clean windows run at it rather than the 12
 a locally measured knee gets, widening one log2 bucket at a time until either
 the importer's own observations re-fit it or it stops binding and is withdrawn.
-So a knee that is right for your board costs its importers a probing window
+So a knee that is right for your GPU costs its importers a probing window
 every five; a knee that is wrong for theirs costs them seconds. Contribute the
 one you measured, and do not hand-tune it downward "to be safe" — a knee too
 low is the failure mode that used to be permanent.
